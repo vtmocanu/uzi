@@ -62,7 +62,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 	}
 	if reason == "planning_diff_refused" {
 		switch req.PlanCrossCheckDiffRefusal {
-		case "base_unavailable", "diff_failed", "diff_too_large", "too_many_untracked", "secret_detected", "scan_failed":
+		case "base_unavailable", "diff_failed", "diff_too_large", "too_many_untracked", "secret_detected", "scan_failed", "unsupported_entry":
 		default:
 			return ErrInvalidState
 		}
@@ -119,7 +119,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 			return ErrInvalidState
 		}
 		switch req.PlanCrossCheckDiffRefusal {
-		case "base_unavailable", "diff_failed", "diff_too_large", "too_many_untracked", "secret_detected", "scan_failed":
+		case "base_unavailable", "diff_failed", "diff_too_large", "too_many_untracked", "secret_detected", "scan_failed", "unsupported_entry":
 			return nil
 		}
 	}

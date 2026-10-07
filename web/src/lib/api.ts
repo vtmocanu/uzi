@@ -23,6 +23,7 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
   AdminBlockedRepos,
+  AdminDockerAllowlistRepos,
   AdminCodexRateLimits,
   AdminRateLimits,
   AdminUsage,
@@ -840,6 +841,8 @@ const realApi = {
     ),
 
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
+  adminListDockerAllowlistRepos: () =>
+    request<AdminDockerAllowlistRepos>("GET", "/admin/docker-allowlist-repos"),
   setRepoEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
   // Explicit per-repo remove (PRD #357). Owner-scoped; the server permits it only

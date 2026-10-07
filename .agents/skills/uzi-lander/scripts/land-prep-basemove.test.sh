@@ -123,7 +123,7 @@ origin_main() { git --git-dir="$ORIGIN" rev-parse refs/heads/main; }
 mk_branch ba; printf 'a\n' > "$SEED/web/a.txt"; commit_push ba 'branch a'
 hook prds/1650-new.md 'prd\n' 'unrelated prd'
 : > "$TASK_LOG"
-run ba 201
+run ba 201 --gate auto
 [ "$rc" -eq 0 ] || fail "A: disjoint base move not tolerated, rc=$rc: $(cat "$WORK/out.201")"
 grep -q '^RESULT=pushed ' "$WORK/out.201" || fail "A: not pushed: $(cat "$WORK/out.201")"
 grep -q 'delta disjoint from the branch (1 files); rebased without re-gating: CI on the pushed head is the authoritative gate' "$WORK/out.201" \
@@ -135,7 +135,7 @@ git --git-dir="$ORIGIN" merge-base --is-ancestor "$(origin_main)" refs/heads/ba 
 mk_branch bb; printf 'l1-branch\nl2\nl3\nl4\nl5\n' > "$SEED/web/shared.txt"; commit_push bb 'branch b'
 BB_HEAD=$(git --git-dir="$ORIGIN" rev-parse refs/heads/bb)
 hook web/shared.txt 'l1\nl2\nl3\nl4\nl5-main\n' 'main edits shared'
-run bb 202
+run bb 202 --gate auto
 [ "$rc" -eq 8 ] || fail "B: overlapping base move returned rc=$rc, want 8: $(cat "$WORK/out.202")"
 grep -q '^RESULT=base_moved$' "$WORK/out.202" || fail "B: base_moved not named"
 grep -q 'during preparation; refusing stale-base push' "$WORK/out.202" || fail "B: the refusal message changed"
@@ -146,7 +146,7 @@ grep -q "touches the branch's own path(s): web/shared.txt" "$WORK/out.202" || fa
 mk_branch bc; printf 'file\n' > "$SEED/web/dfx"; commit_push bc 'branch c'
 BC_HEAD=$(git --git-dir="$ORIGIN" rev-parse refs/heads/bc)
 hook web/dfx/y.md 'dir\n' 'main adds a directory'
-run bc 203
+run bc 203 --gate auto
 [ "$rc" -eq 8 ] || fail "C: conflicting rebase returned rc=$rc, want 8: $(cat "$WORK/out.203")"
 grep -q '^RESULT=base_moved$' "$WORK/out.203" || fail "C: base_moved not named"
 grep -q 'conflicts; aborted, worktree back at' "$WORK/out.203" || fail "C: the rebase conflict was not the reason: $(cat "$WORK/out.203")"
@@ -167,7 +167,7 @@ case " \$* " in *" rebase --abort "*) echo "fatal: simulated abort failure" >&2;
 exec "$REAL_GIT" "\$@"
 STUB
 chmod +x "$WORK/bin/git"
-run bc2 216
+run bc2 216 --gate auto
 rm -f "$WORK/bin/git"
 [ "$rc" -eq 3 ] || fail "C2: a failed abort returned rc=$rc, want 3: $(cat "$WORK/out.216")"
 grep -q 'ERROR: git rebase --abort failed' "$WORK/out.216" || fail "C2: the failed abort was not named: $(cat "$WORK/out.216")"
@@ -176,11 +176,11 @@ git -C "$WORK/wt-216" rebase --abort
 
 # D. --skip-rebase re-entry after a disjoint move: rebased, gates run, prepared.
 mk_branch bd; printf 'd\n' > "$SEED/web/d.txt"; commit_push bd 'branch d'
-run bd 204 --no-push
+run bd 204 --no-push --gate auto
 [ "$rc" -eq 0 ] || fail "D: initial preparation failed, rc=$rc: $(cat "$WORK/out.204")"
 git -C "$SEED" switch -q main; mkdir -p "$SEED/prds"; printf 'x\n' > "$SEED/prds/other.md"; git -C "$SEED" add -A; git -C "$SEED" commit -qm 'other prd'; git -C "$SEED" push -q origin main
 : > "$TASK_LOG"
-run bd 204 --skip-rebase --no-push
+run bd 204 --skip-rebase --no-push --gate auto
 [ "$rc" -eq 0 ] || fail "D: disjoint move at re-entry not tolerated, rc=$rc: $(cat "$WORK/out.204")"
 grep -q '^RESULT=prepared ' "$WORK/out.204" || fail "D: not prepared"
 grep -q '^gate:web$' "$TASK_LOG" || fail "D: gates did not run after the re-entry rebase"
@@ -230,7 +230,7 @@ git -C "$SEED" commit -qam 'main h'
 git -C "$SEED" push -q origin main
 EOF
 : > "$TASK_LOG"
-run bh 208
+run bh 208 --gate auto
 [ "$rc" -eq 0 ] || fail "H: CHANGELOG-only overlap not tolerated, rc=$rc: $(cat "$WORK/out.208")"
 grep -q '^RESULT=pushed ' "$WORK/out.208" || fail "H: not pushed"
 grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.208" || fail "H: the conflict was not union-resolved: $(cat "$WORK/out.208")"

@@ -12,7 +12,7 @@ Sometimes a run ends with **failed** and the reason *"uzi stopped this run: its 
 
 ## What actually happens
 
-The agent streams its work back to uzi as messages. Occasionally a message is something Postgres genuinely cannot store — most often output containing raw NUL bytes (a headless Chromium's error spew is the case that first produced this), a broken Unicode fragment, or a number too large for the database's numeric type. An older worker image treats every rejection as "try again", so it re-sends the same message forever at roughly twice a second: the run reads `running` while producing nothing, spending nothing, and holding a slot until `RUN_TIMEOUT` (two hours by default).
+The agent streams its work back to uzi as messages. Occasionally a message is something Postgres genuinely cannot store — most often output containing raw NUL bytes (a headless Chromium's error spew is the case that first produced this), a broken Unicode fragment, or a number too large for the database's numeric type. An older worker image treats every rejection as "try again", so it re-sends the same message forever at roughly twice a second: the run reads `running` while producing nothing, spending nothing, and holding a slot until `RUN_TIMEOUT` (six hours by default, then parks at `budget_exhausted`).
 
 Modern workers (v0.10.1 and later) handle this themselves: they isolate the one bad message, replace it with a marker, and carry on — so you should rarely see an auto-stop at all. **The auto-stop exists mainly for workers on older images.** If you are seeing these, the first thing worth checking is your worker's version.
 
@@ -35,7 +35,7 @@ A run can carry the `looping` flag forever and never be auto-stopped. That is a 
 
 | Why | What to do |
 |---|---|
-| Nothing else on this uzi is saving messages — often because yours is the only active run | Nothing. The flag is the signal; the run ends at `RUN_TIMEOUT` if it never recovers. |
+| Nothing else on this uzi is saving messages — often because yours is the only active run | Nothing. The flag is the signal; the run parks at `RUN_TIMEOUT` if it never recovers. |
 | The failing requests are **malformed** | **Roll the worker image.** A malformed batch is not something a correct worker produces, so this says the worker *build* is broken — and a build defect hits every run that worker touches. Stopping them one at a time would hide the pattern while the same image kept claiming new work. Operators: the log line carries `failure_class=invalid`. |
 | The error keeps changing kind | Usually a transient infrastructure problem resolving itself. If it persists, check the api and database. |
 

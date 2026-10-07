@@ -154,7 +154,8 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin users | runs | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -172,10 +173,23 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 
 A few worth knowing:
 
-- **`uzi admin usage` includes failure recency.** The factory line and each
-  user's `SINCE` column show time since the last failed run in minutes, hours,
-  or days. A scope with finished runs but no failures shows `no failures`;
-  one with no finished runs shows `-`. These are the same lifetime definitions
+- **`uzi admin usage --window lifetime|last_7_days` selects the human report's
+  window (default `lifetime`).** The factory summary and per-user rows use
+  the same window for usage-bearing runs, tokens, metered cost, outcomes and
+  recoverable failures. Failure rate is failed runs divided by finished runs,
+  including runs without usage; `RUNS` counts runs with usage. Cost shows
+  `$0.00` for metered zero and discloses subscription/unreported run counts
+  whose costs are excluded. Recoverable work may already have been landed.
+  `--json` returns the complete API response with both windows and additive
+  per-user seven-day fields; the flag selects only the human report. Invalid
+  window values are rejected before a request, including with `--json`.
+  With an older API missing a user's `last_7_days`, the CLI returns an
+  upgrade error before printing a seven-day human report; lifetime and JSON
+  remain usable.
+  The factory's failure recency and each user's `SINCE` column stay lifetime
+  in both windows, showing minutes, hours or days since the last failed run.
+  A scope with lifetime finished runs but no failures shows `no failures`;
+  one with no lifetime finished runs shows `-`. These are the same definitions
   as Overview: chat, judge, and rejected plans do not count as failures.
 
 - **`--harness` picks the run's execution engine; omit it to let the server
@@ -407,7 +421,15 @@ A few worth knowing:
   number is repo-relative), so `--repo A --repo B ... --issue N` is a usage error
   (exit 2) before any create; `--sweep` and `--prompt` targets group freely.
   `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
-  gate); pass `--auto-approve=false` to keep the gate. `--wait-on-limit` also
+  gate); pass `--auto-approve=false` to keep the gate. **To start an
+  auto-approved run on one issue now**, use a disabled one-shot schedule:
+  `run create` has no auto-approve flag, since auto-approval is reserved for
+  unattended paths. Run `schedule create --repo <id> --issue <iid> --at <any
+  future time> --enabled=false`, then `schedule run-now <schedule-id>`, then
+  `schedule delete <schedule-id>`. `run-now` fires a disabled schedule and
+  never consumes a one-shot; an enabled one-shot remains scheduled at `--at`
+  and may start another run. The run takes the same auto-approve path as a
+  sweep, Plan cross-check included. `--wait-on-limit` also
   defaults **on** for a new schedule — a fired run parks until the Anthropic
   usage window reopens instead of failing — and this now takes effect even on
   the common auto-approve path (a schedule's own setting used to be silently
@@ -894,7 +916,7 @@ uzi job files <job-id>
 uzi job file get <file-id> [-o path]
 ```
 
-- **`create`** needs `--type` and exactly one of `--prompt <text>` or `--prompt-file <path>` (`-` reads stdin). `--input name=@file` attaches a named text input and repeats (at most 20, 1 MiB in total, UTF-8 regular files only). `--file <path>` attaches a file (PDF, PNG, JPEG, DOCX, XLSX or UTF-8 text; repeatable): each one is uploaded first, then attached to the job by id, so a rejected file stops the create before any job exists. `--title` overrides the title derived from the prompt; `--budget-seconds` sets the wall-clock limit (the server caps it at 8 hours). It prints the queued job.
+- **`create`** needs `--type` and exactly one of `--prompt <text>` or `--prompt-file <path>` (`-` reads stdin). `--input name=@file` attaches a named text input and repeats (at most 20, 1 MiB in total, UTF-8 regular files only). `--file <path>` attaches a file (PDF, PNG, JPEG, DOCX, XLSX or UTF-8 text; repeatable): each one is uploaded first, then attached to the job by id, so a rejected file stops the create before any job exists. `--title` overrides the title derived from the prompt; `--budget-seconds` sets the wall-clock limit (the server caps it at `RUN_WALL_CEILING`, 24 hours by default; without it the job gets 12 hours by default). It prints the queued job.
 - **`get`** shows the job's status; `REQUESTED_BY` is marked as reported by the product, not a verified identity.
 - **`result`** prints the job status, then findings, then the report indented under its label. A job that has not reported prints `no result yet`; a finished one that never reported prints `no result`.
 - **`cancel`** cancels a queued, running or waiting job; a running job may still read `running` for a moment. A finished job exits with a conflict error.
@@ -2232,9 +2254,14 @@ unavailable; subscription usage is distinguished from metered spend.
 
 The human view bounds findings to 20 items and sends displayed text through
 `Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for
-the structured `plan_cross_check_required`, `plan_cross_check_gate_reason`
-and optional `plan_cross_check_summary` fields, or
+the structured `plan_cross_check_required`, `plan_cross_check_gate_reason`,
+optional `plan_cross_check_diff_refusal` and optional `plan_cross_check_summary`
+fields, or
 `uzi run get <id> --field plan_cross_check_required` for the run's snapshot.
+While the gate reason is `planning_diff_refused`, the `PLAN_CROSS_CHECK` row
+appends the refusal sub-code with underscores shown as spaces, e.g.
+`(unsupported entry)`; see
+[planning-diff refusals](./cross-check.md#planning-diff-refusals).
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.

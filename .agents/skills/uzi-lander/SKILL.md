@@ -70,6 +70,13 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
 - **Never use `git stash` in landing work.** The stash list is shared by every worktree of
   the repo, so a `pop` can apply another session's entry. Commit work in progress in your
   own worktree, or save a patch file.
+- **CI is the gate; do not run full gates locally.** `land-prep.sh` runs none by default
+  (`LOCAL_GATES=none`; report "awaiting CI", never a local pass); `merge.sh` requires the exact
+  head's required checks green. Run locally only fast targeted checks (`go build`/`vet` of
+  touched packages, `gofmt -l`, a `sqlc generate` diff, `task docs:sync` + `check-docs:web`,
+  `check:changelog-entry`, the focused tests and their red/green mutation) and checks CI lacks.
+  `--gate auto` still runs full component gates; a local failure counts only after the same
+  named failures are compared on the base.
 - **Run long local checks from a pinned worktree.** An e2e or Docker check runs in a
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
   land-prep rebases that tree in place, so a check still running there tests a mixed tree.
@@ -320,17 +327,16 @@ changes it); trust it over a handover's claim.
 
    ```
    S/land-prep.sh OWNER/REPO PR            # sibling worktree, rebase onto base, task migration:renumber
-                                           # on a collision, task gate:<touched>, --force-with-lease push
+                                           # on a collision, --force-with-lease push; no local gate
    ```
 
    A many-commit branch conflicting with `main` gets `origin/main` merged in by hand (one
    resolution pass; the PR is squash-merged), then `task migration:renumber`, sqlc regenerated
-   (a renumber reorders generated columns) and the FULL gate: a clean merge can still break a
+   (a renumber reorders generated columns) and the full gate on CI: a clean merge can still break a
    signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
-   after its `queries/*.sql`, never by hand. Run the gate with `UZI_TEST_DATABASE_URL` unset
-   (LiveDB tests self-skip); when either side adds a migration, also run
-   `./e2e/run-store-it.sh`, since a test pinned to an older schema can break on the other
-   side's new columns. After a release folds `[Unreleased]`,
+   after its `queries/*.sql`, never by hand. When either side adds a migration, require the
+   `test-api-store-it` job's `LiveDB: N passed, 0 skipped` line on the exact head, since a test
+   pinned to an older schema can break on the other side's new columns. After a release folds `[Unreleased]`,
    keep only the branch's `CHANGELOG.md` bullets `main` lacks.
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
@@ -343,7 +349,7 @@ changes it); trust it over a handover's claim.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git -c merge.conflictStyle=diff3 rebase --continue` (a later
    CHANGELOG stop needs the diff3 base to auto-union), re-run with `--skip-rebase`. Exit 6 = the
-   renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
+   renumber helper reported references to fix by hand. Exit 7 = a `--gate auto|<list>` gate failed (log path
    printed; a missing or lockfile-stale `node_modules` is reinstalled first with
    `npm ci --ignore-scripts`). On macOS, treat Codex session-store failures as platform limitations only
    after reproducing the same named failures on the PR base with the same dependencies and
@@ -362,6 +368,7 @@ changes it); trust it over a handover's claim.
    `--allow-workflow-edit` only when no uzi push to the branch can follow.
    Exit 11 = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
    under a released section after a fold) or missing after the rebase: restore under `[Unreleased]`, `--skip-rebase`.
+   Changing only the renamed migration's number inside the branch's own bullet passes.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
@@ -577,7 +584,7 @@ wrapper always completes with 0.
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
   defer to uzi's rework.
-- `scripts/land-prep.sh` rebase / renumber / gate / lease push (`scripts/changelog-union.sh`
+- `scripts/land-prep.sh` rebase / renumber / optional gate / lease push (`scripts/changelog-union.sh`
   unions a CHANGELOG-only conflict or refuses); `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared

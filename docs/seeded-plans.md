@@ -98,7 +98,7 @@ A seeded run never reaches the plan gate, so it freezes no milestones — and th
 milestone-scaled budget only exists on the gated path, where the milestone count
 drives it. With no milestones its budget columns stay empty and it runs on the
 **global default**: `RUN_MAX_ITERATIONS` iterations and `RUN_TIMEOUT` wall-clock
-(out of the box 5 iterations / 2h; both are configurable server settings, not
+(out of the box 5 iterations / 6h; both are configurable server settings, not
 constants).
 
 So for a large, multi-component change, pick deliberately:

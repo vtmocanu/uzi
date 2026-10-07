@@ -2334,3 +2334,38 @@ func TestNotifierLegacyAnchorKeepsGenerationGuard(t *testing.T) {
 		t.Fatalf("a legacy anchor at the same generation must not re-card: blocks=%+v gen=%+v", fp.blocks, fs.gateSetGen)
 	}
 }
+
+func TestNotifierCrossCheckGateReasonDiffRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name, want  string
+		reason, sub pgtype.Text
+	}{
+		{"shown with planning_diff_refused", "planning diff refused (unsupported entry)", txt("planning_diff_refused"), txt("unsupported_entry")},
+		{"masked under another reason", "revise", txt("revise"), txt("unsupported_entry")},
+		{"absent sub-code", "planning diff refused", txt("planning_diff_refused"), pgtype.Text{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			fs := &fakeNotifStore{
+				rc: rc,
+				crossCheckRun: store.Run{ID: rc.ID, PlanCrossCheckRequired: true, Harness: "claude",
+					PlanCrossCheckGateReason: tc.reason, PlanCrossCheckDiffRefusal: tc.sub},
+				delivery:  txt("U1"),
+				msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount: 1,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate blocks = %+v", fp.blocks)
+			}
+			section := fp.blocks[0].sectionText
+			if !strings.Contains(section, "Plan cross-check: "+tc.want) {
+				t.Fatalf("section %q, want reason %q", section, tc.want)
+			}
+			if tc.name != "shown with planning_diff_refused" && strings.Contains(section, "unsupported") {
+				t.Fatalf("sub-code leaked: %q", section)
+			}
+		})
+	}
+}

@@ -593,14 +593,14 @@ Raising the cap is an informed trade-off, not a free speedup:
   there is no innocent-sibling exemption. At exhaustion, recorded recovery evidence
   or uncertainty holds for owner Resume; no recorded recovery evidence or unresolved
   custody keeps `worker_lost`, without proving absence of unrecorded work.
-  The API default is 1; 0 disables automatic requeues, but owner Resume still queues
+  The API default is 3; 0 disables automatic requeues, but owner Resume still queues
   one explicit attempt. For Helm, use the existing generic `api.config` route
   (`api.config.RUN_MAX_REQUEUES`), for example:
 
   ```yaml
   api:
     config:
-      RUN_MAX_REQUEUES: "3"
+      RUN_MAX_REQUEUES: "5"
   ```
 - **One Anthropic token, N runs.** Every slot on a worker shares that worker's
   credential, so a higher cap multiplies 429 pressure on it — the SDK's own

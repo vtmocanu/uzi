@@ -52,6 +52,60 @@ as history, without an automatic new checker round.
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
+## Planning-diff refusals
+
+When the worker cannot safely capture the planning diff it refuses, and the
+run parks at a human gate with reason `planning_diff_refused`. The refusal
+sub-code is shown with the gate reason, and only while that reason is
+current: the run page shows `Refusal: <label>`, `uzi run get` appends the
+sub-code with underscores shown as spaces (for example
+`(unsupported entry)`) to the `PLAN_CROSS_CHECK` row, and the Slack gate
+message carries it the same way. The feed line
+(`plan cross-check: planning diff refused (<refusal>: <diagnostic>)`) and
+the worker log's `refusal` and `diagnostic` fields use a fixed vocabulary;
+raw helper stderr and filenames are never logged or shown.
+
+| Sub-code | Meaning |
+|----------|---------|
+| `base_unavailable` | The base commit to diff against was not available. |
+| `diff_failed` | Computing the diff failed. |
+| `diff_too_large` | The diff or a capture budget exceeded its cap. |
+| `too_many_untracked` | More untracked files than the capture allows. |
+| `secret_detected` | The secret scan flagged the diff. |
+| `scan_failed` | The secret scan could not complete. |
+| `unsupported_entry` | The worktree, index or base holds an entry the capture does not support: a changed or untracked symlink, any submodule, a special file (FIFO, socket, device), or an unsupported file mode. |
+
+An **unchanged tracked symlink** does not block the check: its raw link
+target is compared with the base blob and is never opened or followed.
+Any other symlink case (added, removed, retargeted, file to link or link to
+file, or an untracked non-ignored symlink) refuses with `unsupported_entry`.
+A symlinked `.gitignore` is treated as absent, as Git does. **Any submodule
+gitlink also refuses** with `unsupported_entry`, changed or not. Submodule
+support is deferred: equal base and index gitlink ids do not prove that
+`git add -A` publishes nothing, because a moved submodule HEAD or a removed
+directory is staged. Supporting it needs a proof that the worktree preserves
+the base gitlink under publication.
+
+Capture runs under two independent 128 MiB budgets: one for source reads
+(worktree compare reads and verified object reads) and one for the
+object-store snapshot copy, which is streamed in small chunks so cleanup can
+run on SIGTERM. The snapshot is a temporary tree on the worker's disk,
+removed when capture ends. Measured once on a clone of the uzi repository
+(October 2026), capture used about a 74 MiB snapshot (the temporary tree
+peaks near that size) and about 100 MiB of source reads, in under 7 s
+against a 28 s deadline; a repository whose tracked text approaches
+128 MiB will refuse with `diff_too_large`.
+
+### Rollout
+
+The refusal sub-code needs two phases, and nothing orders them
+automatically. Deploy the api and its migration first and confirm it is
+ready, then let the worker pin advance (keep `workers.image.tag` at the
+previous release for the first deploy if the chart would move both). An older api rejects
+`unsupported_entry` from a newer worker. The chart's `Recreate` strategy
+orders pods within one Deployment only; it does not order the api against
+the controller or the worker pin.
+
 ## Terminal delivery failures
 
 Two delivery-loss exceptions fail the run instead of parking:

@@ -164,7 +164,7 @@ func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 		RunMaxIterations:         5,
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		RunTimeoutSeconds:        7200,
-		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		BudgetWallCeilingSeconds: 8 * 60 * 60,
 		ID:                       runID,
 		WorkerID:                 pgtype.UUID{Bytes: wid, Valid: true},
 	})
@@ -481,7 +481,7 @@ func TestSetRunRunningClearsCompletionMarkerLiveDB(t *testing.T) {
 		RunMaxIterations:         5,
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		RunTimeoutSeconds:        7200,
-		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
+		BudgetWallCeilingSeconds: 8 * 60 * 60,
 		ID:                       runID,
 		WorkerID:                 pgtype.UUID{Bytes: wid, Valid: true},
 	})

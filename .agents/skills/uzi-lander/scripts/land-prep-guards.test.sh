@@ -163,7 +163,7 @@ grep -q 'terminated with signal' "$WORK/out.101" && fail "a SIGPIPE surfaced in 
 
 # 2. a deleted base CHANGELOG line stops before gates and push, with exit 9.
 : > "$TASK_LOG"
-run clrm 102
+run clrm 102 --gate auto
 [ "$rc" -eq 9 ] || fail "CHANGELOG removal not stopped, rc=$rc: $(cat "$WORK/out.102")"
 grep -q '^RESULT=changelog_removal ' "$WORK/out.102" || fail "CHANGELOG removal not named"
 grep -q 'base entry two' "$WORK/out.102" || fail "the removed line was not printed"
@@ -203,7 +203,7 @@ grep -q 'NOTE: branch changes workflow files' "$WORK/out.106" || fail "the workf
 
 # 3a. A failing install stops as a gate failure whose LOG is a real file carrying npm's output.
 : > "$TASK_LOG"
-NPM_FAIL=1 run deps 104 --no-push
+NPM_FAIL=1 run deps 104 --no-push --gate auto
 [ "$rc" -eq 7 ] || fail "npm ci failure not exit 7, rc=$rc: $(cat "$WORK/out.104")"
 npmlog=$(sed -n 's/^RESULT=gate_failed GATE=gate:agent LOG=\([^ ]*\) .*/\1/p' "$WORK/out.104")
 [ -n "$npmlog" ] && [ -f "$npmlog" ] || fail "LOG is not a file: $(cat "$WORK/out.104")"
@@ -214,7 +214,7 @@ rm -f "$npmlog"
 
 # 3. gate:agent on a worktree with no node_modules installs them first, with --ignore-scripts.
 : > "$TASK_LOG"
-run deps 103 --no-push
+run deps 103 --no-push --gate auto
 [ "$rc" -eq 0 ] || fail "deps branch failed, rc=$rc: $(cat "$WORK/out.103")"
 grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "npm ci --ignore-scripts was not run: $(cat "$NPM_LOG")"
 grep -q '^gate:agent$' "$TASK_LOG" || fail "gate:agent did not run"
@@ -228,13 +228,13 @@ STAMP="$DEPS_WT/agent/node_modules/.uzi-lander-lock.sha256"
 
 # 4. A reused worktree: node_modules whose recorded hash matches the lockfile is kept...
 : > "$NPM_LOG"
-run deps 103 --skip-rebase --no-push
+run deps 103 --skip-rebase --no-push --gate auto
 [ "$rc" -eq 0 ] || fail "matching-hash re-run failed, rc=$rc: $(cat "$WORK/out.103")"
 [ ! -s "$NPM_LOG" ] || fail "npm ci ran although the lockfile hash matched: $(cat "$NPM_LOG")"
 # ...a lockfile changed since the install (a base move that bumped it) reinstalls...
 printf '{"lockfileVersion":3,"bumped":true}\n' > "$DEPS_WT/agent/package-lock.json"
 git -C "$DEPS_WT" commit -qam 'bump lockfile'
-run deps 103 --skip-rebase --no-push
+run deps 103 --skip-rebase --no-push --gate auto
 [ "$rc" -eq 0 ] || fail "changed-lockfile re-run failed, rc=$rc: $(cat "$WORK/out.103")"
 grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "a changed lockfile did not reinstall"
 grep -q 'package-lock.json changed' "$WORK/out.103" || fail "the reinstall reason was not logged"
@@ -242,7 +242,7 @@ grep -q 'package-lock.json changed' "$WORK/out.103" || fail "the reinstall reaso
 # ...and an install with no recorded hash reinstalls once.
 rm -f "$STAMP"
 : > "$NPM_LOG"
-run deps 103 --skip-rebase --no-push
+run deps 103 --skip-rebase --no-push --gate auto
 [ "$rc" -eq 0 ] || fail "missing-hash re-run failed, rc=$rc: $(cat "$WORK/out.103")"
 grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "node_modules without a recorded hash was not reinstalled"
 [ -s "$STAMP" ] || fail "the reinstall recorded no hash"

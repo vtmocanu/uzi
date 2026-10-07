@@ -14,7 +14,7 @@ explicitly authorizes public disclosure before the release.
   `gh api repos/<owner>/<fork>/branches/main` answers, then push the branch and open the PR
   against the fork's `main`.
 - Actions, CodeRabbit and Greptile do not run in the fork. The local `task gate:*` targets
-  are the CI; a peer session (Codex) is the reviewer. Ask it to review the exact pushed
+  are the CI (the one exception to *CI is the gate*: run them with `land-prep.sh --gate auto`); a peer session (Codex) is the reviewer. Ask it to review the exact pushed
   head SHA, not the working tree.
 - The fork's `main` may lag upstream. The PR diff is computed from the merge-base, so no
   sync is needed.

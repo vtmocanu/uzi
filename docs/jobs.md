@@ -22,7 +22,7 @@ A job never touches a forge. It has no repo, issue or branch, opens no merge req
  "requested_by_label": "Acme dashboard"}
 ```
 
-`title` is optional (derived from the first line of the prompt). Inputs are inline text (for a document, upload a file instead: see [Job files](#job-files)): at most 20, 1 MiB in total, names of 1 to 100 characters (letters, digits, `.`, `_`, `-`, starting with a letter or digit, no `..`). `wall_seconds` sets the wall-clock limit; it is clamped to 8 hours. `egress_profile` names a [site list](./egress-profiles.md) (see [Site lists](#site-lists)); leave it out for an ordinary job.
+`title` is optional (derived from the first line of the prompt). Inputs are inline text (for a document, upload a file instead: see [Job files](#job-files)): at most 20, 1 MiB in total, names of 1 to 100 characters (letters, digits, `.`, `_`, `-`, starting with a letter or digit, no `..`). `wall_seconds` sets a positive wall-clock limit; it is clamped to `RUN_WALL_CEILING` (24 hours by default). Omitted values default to `min(max(12h, RUN_TIMEOUT), max(RUN_WALL_CEILING, RUN_TIMEOUT))`, frozen at creation. With the default base timeout this is 12 hours. As a compatibility exception, an omitted budget preserves a larger base timeout even when it exceeds the derived 72h ceiling; explicit caller budgets still use the ceiling. A caller may request less than 12 hours. Jobs cannot be extended; they fail at the limit. `egress_profile` names a [site list](./egress-profiles.md) (see [Site lists](#site-lists)); leave it out for an ordinary job.
 
 The response is 201 with the queued job. Poll `GET /api/v1/jobs/{id}`, then read `GET /api/v1/jobs/{id}/result`. The full contract, including every field, is `api/openapi/v1.yaml`.
 

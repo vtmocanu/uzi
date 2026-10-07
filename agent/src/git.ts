@@ -12,6 +12,7 @@ import { PassThrough, Transform, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
 import type { Logger } from "./log.js";
+import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
@@ -1410,6 +1411,8 @@ export class GitCache {
    *  worker-only `repos/` bare cache, so the M3 ownership carve-out is a clean
    *  boundary: `runner/` is runner-writable, `repos/` stays worker-only. */
   private readonly runnerRoot: string;
+  /** Planning-capture budgets handed to the helper; the clone never supplies them. */
+  private planningLimits = { snapshotLimit: PLANNING_SNAPSHOT_LIMIT, totalLimit: PLANNING_TOTAL_LIMIT };
   /** issue #1315 — worker-only 0700 holding subtree for atomically-released clones.
    *  A SIBLING of runnerRoot under the SAME dataDir PATH, but OUTSIDE the runner-writable
    *  `runner/<repo>` tree: a retired clone lands here where the untrusted runner uid
@@ -4538,6 +4541,8 @@ export class GitCache {
     onStep?: (step: BoundaryStep) => void,
     /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
     sourceSha?: string,
+    /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
+    beforePack?: (wantedSha: string) => Promise<void>,
   ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
@@ -4558,6 +4563,7 @@ export class GitCache {
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
+      await beforePack?.(wanted);
       onStep?.("checkpoint_pack");
       const { stdout, exited } = await this.spawnGit(
         barePath,
@@ -4608,6 +4614,7 @@ export class GitCache {
     // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
+    await beforePack?.(wanted);
     onStep?.("checkpoint_pack");
     const { stdout, exited } = await this.spawnGit(
       barePath,
@@ -7825,7 +7832,13 @@ export class GitCache {
     }
     if (!/^[a-f0-9]{40}$/.test(baseCommit)) throw new Error("planning base must be immutable 40-hex");
     return this.readBoundedPlanningOutput(clonePath,
-      [process.execPath, "-e", PLANNING_CAPTURE_HELPER, clonePath, baseCommit, GIT_BIN], 30_000);
+      [process.execPath, "-e", PLANNING_CAPTURE_HELPER, clonePath, baseCommit, GIT_BIN,
+        JSON.stringify(this.planningLimits)], 30_000);
+  }
+
+  /** @internal Test-only: inject small planning-capture budgets. */
+  setPlanningLimitsForTest(limits: { snapshotLimit: number; totalLimit: number }): void {
+    this.planningLimits = { ...limits };
   }
 
   /**
@@ -8987,18 +9000,93 @@ try {
 }
 `;
 
+/** Default planning-capture budgets, passed to the helper as an argv JSON argument. */
+const PLANNING_SNAPSHOT_LIMIT = 128 * 1024 * 1024;
+const PLANNING_TOTAL_LIMIT = 128 * 1024 * 1024;
+
+/**
+ * Fixed refusal vocabulary of PLANNING_CAPTURE_HELPER. Each token is a literal
+ * the helper emits as `UZI-PLANNING-REFUSAL <token>`; none can carry a file name.
+ */
+export const PLANNING_REFUSAL_TOKENS: Readonly<Record<string, PlanCrossCheckDiffRefusal>> = {
+  untracked_path_cap: "too_many_untracked",
+  patch_cap: "diff_too_large", source_cap: "diff_too_large", total_source_cap: "diff_too_large",
+  base_source_cap: "diff_too_large", snapshot_cap: "diff_too_large",
+  base_object_type_mismatch: "base_unavailable", base_object_integrity: "base_unavailable",
+  invalid_base_commit_tree: "base_unavailable", "errno:ENOENT": "base_unavailable",
+  unsupported_symlink: "unsupported_entry", unsupported_gitlink: "unsupported_entry",
+  non_directory_ancestor: "unsupported_entry", nonregular_source: "unsupported_entry",
+  unsupported_base_mode: "unsupported_entry", unsupported_tracked_mode: "unsupported_entry",
+  "errno:ELOOP": "diff_failed", "errno:ENOTDIR": "diff_failed",
+  capture_deadline: "diff_failed", unsafe_root: "diff_failed", non_directory_root: "diff_failed",
+  unsafe_path: "diff_failed", source_changed: "diff_failed", git_pipe_cap: "diff_failed",
+  git_deadline: "diff_failed", git_refused: "diff_failed", incomplete_path_metadata: "diff_failed",
+  non_utf8_path: "diff_failed", non_utf8_object_filename: "diff_failed", unsafe_object_filename: "diff_failed",
+  unsupported_index: "diff_failed", index_checksum: "diff_failed", index_path_cap: "diff_failed",
+  short_index: "diff_failed", unsupported_index_flags: "diff_failed", short_index_path: "diff_failed",
+  duplicate_index_path: "diff_failed", unsupported_index_extension: "diff_failed",
+  short_index_extension: "diff_failed", object_alternates: "diff_failed",
+  neutral_attributes_unavailable: "diff_failed", directory_cap: "diff_failed",
+  metadata_entry_cap: "diff_failed", invalid_object_identity: "diff_failed", invalid_base_tree: "diff_failed",
+  invalid_base_tree_name: "diff_failed", noncanonical_base_tree: "diff_failed", base_path_cap: "diff_failed",
+  tracked_path_cap: "diff_failed", ignore_query_cap: "diff_failed", invalid_limits: "diff_failed",
+  unclassified: "diff_failed",
+};
+
+const PLANNING_PROCESS_FAILED = "bounded runner process failed: ";
+
+/**
+ * Map a capturePlanningDiff failure message to a fixed refusal and diagnostic.
+ * Only the exact helper protocol line is trusted: the text after the process
+ * failure prefix up to the FIRST newline must be `UZI-PLANNING-REFUSAL <token>`
+ * with a token from the fixed vocabulary (or a bare errno name). Later lines are
+ * never read, so a file name carrying a forged marker cannot influence the
+ * result, and no byte of the message reaches the returned diagnostic.
+ */
+export function classifyPlanningCaptureError(message: string): {
+  refusal: PlanCrossCheckDiffRefusal; diagnostic: string;
+} {
+  if (message === "planning base must be immutable 40-hex") return { refusal: "base_unavailable", diagnostic: "base_invalid" };
+  if (message === "bounded runner stdout exceeded 512 KiB") return { refusal: "diff_too_large", diagnostic: "output_cap" };
+  if (message === "bounded runner stdout timed out") return { refusal: "diff_failed", diagnostic: "timeout" };
+  if (message === "bounded runner stdout cleanup failed") return { refusal: "diff_failed", diagnostic: "cleanup_failed" };
+  if (message.startsWith(PLANNING_PROCESS_FAILED)) {
+    const rest = message.slice(PLANNING_PROCESS_FAILED.length);
+    const line = rest.slice(0, rest.includes("\n") ? rest.indexOf("\n") : rest.length);
+    const match = /^UZI-PLANNING-REFUSAL ([a-zA-Z0-9_:]+)$/.exec(line);
+    const token = match?.[1];
+    if (token !== undefined) {
+      const known = Object.hasOwn(PLANNING_REFUSAL_TOKENS, token) ? PLANNING_REFUSAL_TOKENS[token] : undefined;
+      if (known) return { refusal: known, diagnostic: token };
+      if (/^errno:E[A-Z]+$/.test(token)) return { refusal: "diff_failed", diagnostic: token };
+    }
+    return { refusal: "diff_failed", diagnostic: "unclassified" };
+  }
+  return { refusal: "diff_failed", diagnostic: "unclassified" };
+}
+
 /**
  * Trusted inline runner program, never loaded from the clone. Linux descriptor
  * traversal is deliberately required. Unsupported indexes/objects fail closed.
  * Metadata: 2 MiB per Git pipe/index, 20,000 tracked paths, 30,000 entries,
  * 2,048 directories, depth 64. Patches: 512 KiB total and per diff pipe.
- * Sources: 4 MiB per worktree file/blob, 128 MiB total including ignore/index,
- * object-store snapshot and authenticated commit/tree/blob pipe reads, plus one
- * overflow sentinel byte; 200 nonignored untracked files. Object files (including
- * packs) may use the remaining aggregate budget, without the 4 MiB file cap.
- * Copying the entire bounded object store can conservatively refuse large histories.
+ * Two independent 128 MiB budgets (limits arrive as a JSON argv argument built
+ * by GitCache, never from the clone): the object-store snapshot copy
+ * (snapshotLimit, charged per byte read while streaming) and source reads
+ * (totalLimit: ignore/index/worktree compare reads, symlink targets, and
+ * authenticated commit/tree/blob pipe reads), each plus one overflow sentinel
+ * byte. Snapshot bytes never charge the source budget. 4 MiB per worktree file
+ * or blob; 200 nonignored untracked files. Object files (including packs) are
+ * copied without the 4 MiB file cap, so copying a very large object store can
+ * conservatively refuse a large history.
+ * Tracked symlinks (mode 120000) are accepted only when unchanged: the link is
+ * read with readlink through the still-open pinned parent descriptor and its
+ * target hash must equal the base blob id; the target is never opened or
+ * followed. Every other symlink case and every gitlink (160000) is refused.
  * Patch pipes likewise consume at most 512 KiB total plus one sentinel byte.
- * One error aborts the entire capture.
+ * One error aborts the entire capture. Every refusal writes, as the very first
+ * stderr bytes, one "UZI-PLANNING-REFUSAL <token>" line with a token from a
+ * fixed vocabulary (see classifyPlanningCaptureError); free text may follow it.
  * Child commands have a 5s deadline; capture has a 30s whole-root deadline.
  */
 const PLANNING_CAPTURE_HELPER = String.raw`
@@ -9006,17 +9094,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
-const [clone, base, git] = process.argv.slice(1);
+const [clone, base, git, limitsJson] = process.argv.slice(1);
 const C = fs.constants;
 // Linux O_PATH is not exported by every Node build; this helper already uses Linux proc-fd paths.
 const O_PATH = 0x200000;
 const PATCH_LIMIT = 512 * 1024, METADATA_LIMIT = 2 * 1024 * 1024;
-const FILE_LIMIT = 4 * 1024 * 1024, TOTAL_LIMIT = 128 * 1024 * 1024;
+const FILE_LIMIT = 4 * 1024 * 1024, LINK_LIMIT = 4096;
+let SNAPSHOT_LIMIT = 0, TOTAL_LIMIT = 0;
 const PATH_LIMIT = 20000, ENTRY_LIMIT = 30000, DIR_LIMIT = 2048, DEPTH_LIMIT = 64;
-let total = 0, entries = 0, dirs = 0, temp, child;
+let total = 0, snapshotBytes = 0, entries = 0, dirs = 0, temp, child;
 const fds = new Set();
 const deadline = Date.now() + 28000;
-function check() { if (Date.now() > deadline) throw Error("capture deadline"); }
+function refusal(token) { const e = Error(token); e.refusal = token; return e; }
+function refuse(token) { throw refusal(token); }
+function check() { if (Date.now() > deadline) refuse("capture_deadline"); }
 function close(fd) { fs.closeSync(fd); fds.delete(fd); }
 function fdpath(fd) { return "/proc/" + process.pid + "/fd/" + fd; }
 function directory(parent, name) {
@@ -9032,9 +9123,9 @@ function pathOnly(p) {
 function absoluteDirectory(p) {
   let fd = pathOnly("/");
   for (const part of p.split("/").filter(Boolean)) {
-    if (part === "." || part === "..") throw Error("unsafe root");
+    if (part === "." || part === "..") refuse("unsafe_root");
     const next = pathOnly(fdpath(fd) + "/" + part);
-    if (!fs.fstatSync(next).isDirectory()) throw Error("non-directory root");
+    if (!fs.fstatSync(next).isDirectory()) refuse("non_directory_root");
     close(fd); fd = next;
   }
   // Ancestors need lookup authority only. Acquire read authority at the pinned checkout.
@@ -9043,10 +9134,10 @@ function absoluteDirectory(p) {
 function components(p) {
   const parts = p.split("/");
   if (!p || p.includes("\0") || parts.length > DEPTH_LIMIT + 1 || parts.some(x => !x || x === "." || x === ".." || x.toLowerCase() === ".git")
-      || Buffer.from(p).toString() !== p) throw Error("unsafe path");
+      || Buffer.from(p).toString() !== p) refuse("unsafe_path");
   return parts;
 }
-function openFile(root, p, replacementAbsent = false) {
+function openFile(root, p) {
   const parts = components(p); let parent = root, owned = false;
   try {
     for (const part of parts.slice(0, -1)) {
@@ -9054,9 +9145,7 @@ function openFile(root, p, replacementAbsent = false) {
       const st = fs.fstatSync(next);
       if (!st.isDirectory()) {
         close(next);
-        // Only a pinned regular file proves a former descendant is absent.
-        if (replacementAbsent && st.isFile()) return undefined;
-        throw Error("non-directory source ancestor");
+        refuse("non_directory_ancestor");
       }
       if (owned) close(parent); parent = next; owned = true;
     }
@@ -9065,28 +9154,69 @@ function openFile(root, p, replacementAbsent = false) {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) {
       close(fd);
-      if (replacementAbsent && st.isDirectory()) return undefined;
-      throw Error("nonregular source");
+      refuse("nonregular_source");
     }
     return fd;
   } finally { if (owned) close(parent); }
 }
+// Candidate-loop leaf open that also recognizes a symlink leaf. The pinned
+// parent descriptor stays open across the failed O_NOFOLLOW open and the
+// readlink, so the link is read through the same directory the open saw. The
+// target is only read, never opened or followed. Result: undefined (absent),
+// { fd } (regular file) or { link } (raw target bytes, charged to the source
+// budget).
+function openLeafOrLink(root, p) {
+  const parts = components(p); let parent = root, owned = false;
+  try {
+    for (const part of parts.slice(0, -1)) {
+      const next = pathOnly(fdpath(parent) + "/" + part);
+      const st = fs.fstatSync(next);
+      if (!st.isDirectory()) {
+        close(next);
+        if (st.isFile()) return undefined;
+        refuse("non_directory_ancestor");
+      }
+      if (owned) close(parent); parent = next; owned = true;
+    }
+    const leaf = fdpath(parent) + "/" + parts.at(-1);
+    let fd;
+    try { fd = fs.openSync(leaf, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK); }
+    catch (e) {
+      if (e.code === "ENOENT") return undefined;
+      if (e.code !== "ELOOP") throw e;
+      let link;
+      try { link = fs.readlinkSync(leaf, { encoding: "buffer" }); }
+      catch (r) { if (r.code === "EINVAL" || r.code === "ENOENT") refuse("source_changed"); throw r; }
+      if (link.length > LINK_LIMIT) refuse("unsupported_symlink");
+      total += link.length; if (total > TOTAL_LIMIT) refuse("total_source_cap");
+      return { link };
+    }
+    fds.add(fd);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      close(fd);
+      if (st.isDirectory()) return undefined;
+      refuse("nonregular_source");
+    }
+    return { fd };
+  } finally { if (owned) close(parent); }
+}
 function read(fd, cap) {
   const before = fs.fstatSync(fd, { bigint: true });
-  if (before.size > BigInt(cap)) throw Error("source cap");
+  if (before.size > BigInt(cap)) refuse("source_cap");
   const chunks = []; let n = 0;
   while (n <= cap) {
     check();
     const b = Buffer.alloc(Math.min(16384, cap + 1 - n, TOTAL_LIMIT + 1 - total));
     const got = fs.readSync(fd, b, 0, b.length, null);
     if (!got) break;
-    n += got; if (n > cap) throw Error("source cap");
-    total += got; if (total > TOTAL_LIMIT) throw Error("total source cap");
+    n += got; if (n > cap) refuse("source_cap");
+    total += got; if (total > TOTAL_LIMIT) refuse("total_source_cap");
     chunks.push(b.subarray(0, got));
   }
   const after = fs.fstatSync(fd, { bigint: true });
   if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
-    throw Error("source changed during read");
+    refuse("source_changed");
   return Buffer.concat(chunks, n);
 }
 function optional(root, p, cap) {
@@ -9134,10 +9264,10 @@ function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = tem
             n += b.length;
             if (source && !stderr) {
               total += b.length;
-              if (total > TOTAL_LIMIT) { fail(Error("total source cap")); break; }
+              if (total > TOTAL_LIMIT) { fail(refusal("total_source_cap")); break; }
             }
             if (stderr) errBytes = n; else bytes = n;
-            if (n > cap) { fail(Error("Git pipe cap")); break; }
+            if (n > cap) { fail(refusal("git_pipe_cap")); break; }
             if (!stderr) chunks.push(b);
           }
         } catch (e) { fail(e); }
@@ -9145,64 +9275,70 @@ function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = tem
       s.on("error", fail);
     }
     collect(p.stdout, false); collect(p.stderr, true);
-    const timer = setTimeout(() => fail(Error("Git deadline")), Math.min(5000, deadline - Date.now()));
+    const timer = setTimeout(() => fail(refusal("git_deadline")), Math.min(5000, deadline - Date.now()));
     p.on("error", fail);
     p.on("close", code => {
       clearTimeout(timer); child = undefined;
       if (error) reject(error);
-      else if (code !== 0 && !(allowDiff && code === 1)) reject(Error("Git refused capture"));
+      else if (code !== 0 && !(allowDiff && code === 1)) reject(refusal("git_refused"));
       else resolve(Buffer.concat(chunks, bytes));
     });
     p.stdin.on("error", fail); p.stdin.end(input);
   });
 }
 function paths(bytes) {
-  if (bytes.length && bytes.at(-1) !== 0) throw Error("incomplete path metadata");
+  if (bytes.length && bytes.at(-1) !== 0) refuse("incomplete_path_metadata");
   const text = bytes.toString("utf8");
-  if (!Buffer.from(text).equals(bytes)) throw Error("non UTF8 path metadata");
+  if (!Buffer.from(text).equals(bytes)) refuse("non_utf8_path");
   return bytes.length ? text.slice(0, -1).split("\0") : [];
 }
 function indexEntries(bytes) {
-  const result = new Set();
+  const result = new Map();
   if (!bytes) return result;
   if (bytes.length < 32 || bytes.toString("ascii", 0, 4) !== "DIRC"
-      || ![2, 3].includes(bytes.readUInt32BE(4))) throw Error("unsupported index");
+      || ![2, 3].includes(bytes.readUInt32BE(4))) refuse("unsupported_index");
   const checksum = createHash("sha1").update(bytes.subarray(0, -20)).digest();
-  if (!checksum.equals(bytes.subarray(-20))) throw Error("index checksum");
+  if (!checksum.equals(bytes.subarray(-20))) refuse("index_checksum");
   const count = bytes.readUInt32BE(8);
-  if (count > PATH_LIMIT) throw Error("index path cap");
+  if (count > PATH_LIMIT) refuse("index_path_cap");
   let offset = 12;
   for (let i = 0; i < count; i++) {
     const start = offset;
-    if (offset + 62 > bytes.length - 20) throw Error("short index");
+    if (offset + 62 > bytes.length - 20) refuse("short_index");
     const flags = bytes.readUInt16BE(offset + 60);
-    if (flags & 0x7000) throw Error("unsupported index flags/stage");
+    if (flags & 0x7000) refuse("unsupported_index_flags");
     const end = bytes.indexOf(0, offset + 62);
-    if (end < 0 || end >= bytes.length - 20) throw Error("short index path");
+    if (end < 0 || end >= bytes.length - 20) refuse("short_index_path");
     const raw = bytes.subarray(offset + 62, end), name = raw.toString("utf8");
-    if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 path");
+    if (!Buffer.from(name).equals(raw)) refuse("non_utf8_path");
     components(name);
     const mode = bytes.readUInt32BE(start + 24);
-    if (mode !== 0o100644 && mode !== 0o100755) throw Error("unsupported tracked mode");
-    if (result.has(name)) throw Error("duplicate index path");
-    result.add(name);
+    if (mode === 0o160000) refuse("unsupported_gitlink");
+    if (mode !== 0o100644 && mode !== 0o100755 && mode !== 0o120000) refuse("unsupported_tracked_mode");
+    if (result.has(name)) refuse("duplicate_index_path");
+    result.set(name, { mode });
     offset = start + Math.ceil((end + 1 - start) / 8) * 8;
   }
   // Optional extensions are skipped; required extensions (e.g. split index) refuse.
   while (offset < bytes.length - 20) {
     if (offset + 8 > bytes.length - 20 || bytes[offset] < 65 || bytes[offset] > 90)
-      throw Error("unsupported index extension");
+      refuse("unsupported_index_extension");
     offset += 8 + bytes.readUInt32BE(offset + 4);
   }
-  if (offset !== bytes.length - 20) throw Error("short index extension");
+  if (offset !== bytes.length - 20) refuse("short_index_extension");
   return result;
 }
 (async () => {
+  const limits = JSON.parse(limitsJson ?? "null");
+  const keys = limits && typeof limits === "object" && !Array.isArray(limits) ? Object.keys(limits).sort() : [];
+  if (keys.join() !== "snapshotLimit,totalLimit" || keys.some(k => !Number.isSafeInteger(limits[k]) || limits[k] <= 0))
+    refuse("invalid_limits");
+  SNAPSHOT_LIMIT = limits.snapshotLimit; TOTAL_LIMIT = limits.totalLimit;
   const root = absoluteDirectory(clone);
   const gd = directory(root, ".git"), objects = directory(gd, "objects");
   const info = directory(objects, "info");
   // Alternates could redirect base reads outside this clone. Missing objects refuse.
-  if (optional(info, "alternates", 65536) !== null) throw Error("object alternates unsupported");
+  if (optional(info, "alternates", 65536) !== null) refuse("object_alternates");
   temp = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "uzi-planning-"));
   fs.chmodSync(temp, 0o700);
   await command(["init", "--quiet", "--template=", temp]);
@@ -9212,80 +9348,111 @@ function indexEntries(bytes) {
   const attrNames = ["a/.gitattributes", "b/.gitattributes"];
   const attributes = await command(["check-attr", "-z", "diff", "filter", "--", ...attrNames]);
   const expectedAttributes = Buffer.from(attrNames.map(name => name + "\0diff\0set\0" + name + "\0filter\0unset\0").join(""));
-  if (!attributes.equals(expectedAttributes)) throw Error("neutral attributes unavailable");
+  if (!attributes.equals(expectedAttributes)) refuse("neutral_attributes_unavailable");
   // A directory descriptor pins traversal only: Git can follow links inside it.
   // Git receives only runner-owned copies, never paths into the mutable clone.
   const objectStore = path.join(temp, "object-store");
   fs.mkdirSync(objectStore);
-  function snapshot(fd, dst, depth) {
-    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+  // Yield to the event loop (so a pending SIGTERM runs cleanup) when more than
+  // ~20 ms of synchronous work has passed since the last yield. The clock is shared
+  // across chunks, files and directory entries, so many tiny files still yield.
+  let lastYield = Date.now();
+  async function maybeYield() {
+    if (Date.now() - lastYield < 20) return;
+    await new Promise(resolve => setImmediate(resolve));
+    lastYield = Date.now();
+  }
+  async function copySnapshotFile(src, target) {
+    const before = fs.fstatSync(src, { bigint: true });
+    if (before.size > BigInt(SNAPSHOT_LIMIT - snapshotBytes)) refuse("snapshot_cap");
+    const out = fs.openSync(target, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
+    try {
+      const buffer = Buffer.alloc(16384);
+      for (;;) {
+        check();
+        const got = fs.readSync(src, buffer, 0, Math.min(buffer.length, SNAPSHOT_LIMIT + 1 - snapshotBytes), null);
+        if (!got) break;
+        snapshotBytes += got;
+        if (snapshotBytes > SNAPSHOT_LIMIT) refuse("snapshot_cap");
+        for (let at = 0; at < got;) at += fs.writeSync(out, buffer, at, got - at);
+        await maybeYield();
+      }
+    } finally { fs.closeSync(out); }
+    const after = fs.fstatSync(src, { bigint: true });
+    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs)
+      refuse("source_changed");
+  }
+  async function snapshot(fd, dst, depth) {
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) refuse("directory_cap");
     const stream = fs.opendirSync(fdpath(fd), { encoding: "buffer" });
     try {
       let ent;
       while ((ent = stream.readSync())) {
-        check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+        check(); if (++entries > ENTRY_LIMIT) refuse("metadata_entry_cap");
+        await maybeYield();
         const raw = ent.name, name = raw.toString("utf8");
-        if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 object filename");
-        if (components(name).length !== 1) throw Error("unsafe object filename");
+        if (!Buffer.from(name).equals(raw)) refuse("non_utf8_object_filename");
+        if (components(name).length !== 1) refuse("unsafe_object_filename");
         const target = path.join(dst, name);
         if (ent.isDirectory()) {
           const sub = directory(fd, name);
           try {
             fs.mkdirSync(target);
-            snapshot(sub, target, depth + 1);
+            await snapshot(sub, target, depth + 1);
           } finally { close(sub); }
         } else {
           const src = openFile(fd, name);
-          try { fs.writeFileSync(target, read(src, TOTAL_LIMIT - total), { flag: "wx", mode: 0o600 }); }
+          try { await copySnapshotFile(src, target); }
           finally { close(src); }
         }
       }
     } finally { stream.closeSync(); }
   }
-  snapshot(objects, objectStore, 0);
+  await snapshot(objects, objectStore, 0);
   // Check the owned snapshot as well: alternates could have appeared during copying.
   for (const name of ["alternates", "http-alternates"]) {
-    if (fs.existsSync(path.join(objectStore, "info", name))) throw Error("object alternates unsupported");
+    if (fs.existsSync(path.join(objectStore, "info", name))) refuse("object_alternates");
   }
   const objectEnv = { GIT_OBJECT_DIRECTORY: objectStore };
   async function object(type, oid, cap) {
-    if (!/^[0-9a-f]{40}$/.test(oid)) throw Error("invalid object identity");
+    if (!/^[0-9a-f]{40}$/.test(oid)) refuse("invalid_object_identity");
     const description = (await command(["cat-file", "--batch-check=%(objecttype) %(objectsize)"],
       METADATA_LIMIT, oid + "\n", false, temp, objectEnv)).toString();
     const match = /^(commit|tree|blob) (0|[1-9][0-9]*)\n$/.exec(description);
-    if (!match || match[1] !== type) throw Error("base object type mismatch");
+    if (!match || match[1] !== type) refuse("base_object_type_mismatch");
     const size = Number(match[2]);
     if (!Number.isSafeInteger(size) || size > cap || total + size > TOTAL_LIMIT)
-      throw Error("base source cap");
+      refuse("base_source_cap");
     const bytes = await command(["cat-file", type, oid], size, undefined, false, temp, objectEnv, true);
     if (bytes.length !== size || createHash("sha1").update(type + " " + bytes.length + "\0")
-        .update(bytes).digest("hex") !== oid) throw Error("base object integrity mismatch");
+        .update(bytes).digest("hex") !== oid) refuse("base_object_integrity");
     return bytes;
   }
   const commit = await object("commit", base, METADATA_LIMIT);
   const treeHeader = /^tree ([0-9a-f]{40})\n/.exec(commit.subarray(0, 46).toString("ascii"));
-  if (!treeHeader || !commit.subarray(0, 46).equals(Buffer.from(treeHeader[0]))) throw Error("invalid base commit tree");
+  if (!treeHeader || !commit.subarray(0, 46).equals(Buffer.from(treeHeader[0]))) refuse("invalid_base_commit_tree");
   const old = new Map();
   let treeBytes = 0;
   async function tree(oid, prefix, depth) {
-    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) refuse("directory_cap");
     const bytes = await object("tree", oid, METADATA_LIMIT - treeBytes);
     treeBytes += bytes.length;
     let at = 0, prior = null;
     const names = new Set();
     while (at < bytes.length) {
-      check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+      check(); if (++entries > ENTRY_LIMIT) refuse("metadata_entry_cap");
       const space = bytes.indexOf(32, at), end = bytes.indexOf(0, at);
-      if (space < at || end <= space || end + 21 > bytes.length) throw Error("invalid base tree");
+      if (space < at || end <= space || end + 21 > bytes.length) refuse("invalid_base_tree");
       const mode = bytes.toString("ascii", at, space);
-      if (!["40000", "100644", "100755"].includes(mode)
-          || !bytes.subarray(at, space).equals(Buffer.from(mode))) throw Error("unsupported base mode");
+      if (mode === "160000") refuse("unsupported_gitlink");
+      if (!["40000", "100644", "100755", "120000"].includes(mode)
+          || !bytes.subarray(at, space).equals(Buffer.from(mode))) refuse("unsupported_base_mode");
       const raw = bytes.subarray(space + 1, end), name = raw.toString("utf8");
-      if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 path metadata");
-      if (components(name).length !== 1 || names.has(name)) throw Error("invalid base tree name");
+      if (!Buffer.from(name).equals(raw)) refuse("non_utf8_path");
+      if (components(name).length !== 1 || names.has(name)) refuse("invalid_base_tree_name");
       names.add(name);
       const key = Buffer.concat([raw, Buffer.from(mode === "40000" ? "/" : "\0")]);
-      if (prior && Buffer.compare(prior, key) >= 0) throw Error("noncanonical base tree");
+      if (prior && Buffer.compare(prior, key) >= 0) refuse("noncanonical_base_tree");
       prior = key;
       const childOid = bytes.subarray(end + 1, end + 21).toString("hex");
       at = end + 21;
@@ -9293,7 +9460,7 @@ function indexEntries(bytes) {
       if (mode === "40000") await tree(childOid, rel + "/", depth + 1);
       else {
         old.set(rel, { mode: parseInt(mode, 8), oid: childOid });
-        if (old.size > PATH_LIMIT) throw Error("base path cap");
+        if (old.size > PATH_LIMIT) refuse("base_path_cap");
       }
     }
   }
@@ -9306,7 +9473,7 @@ function indexEntries(bytes) {
   }
   const indexed = indexEntries(ix);
   const tracked = new Set([...old.keys(), ...indexed.keys()]);
-  if (tracked.size > PATH_LIMIT) throw Error("tracked path cap");
+  if (tracked.size > PATH_LIMIT) refuse("tracked_path_cap");
   const trackedParents = new Set();
   for (const name of tracked) {
     let end = name.lastIndexOf("/");
@@ -9322,8 +9489,11 @@ function indexEntries(bytes) {
     fs.writeFileSync(path.join(temp, ".git/info/exclude"), exclude);
   }
   async function walk(fd, prefix, depth) {
-    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) throw Error("directory cap");
-    const ignore = optional(fd, ".gitignore", 65536);
+    if (++dirs > DIR_LIMIT || depth > DEPTH_LIMIT) refuse("directory_cap");
+    // A symlinked .gitignore is ignored by Git (>= 2.32); the path itself is still a candidate.
+    let ignore = null;
+    try { ignore = optional(fd, ".gitignore", 65536); }
+    catch (e) { if (e.code !== "ELOOP") throw e; }
     if (ignore) {
       const dst = path.join(temp, prefix, ".gitignore");
       fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.writeFileSync(dst, ignore);
@@ -9333,9 +9503,9 @@ function indexEntries(bytes) {
     try {
       let ent;
       while ((ent = directoryStream.readSync())) {
-        check(); if (++entries > ENTRY_LIMIT) throw Error("metadata entry cap");
+        check(); if (++entries > ENTRY_LIMIT) refuse("metadata_entry_cap");
         const raw = ent.name, name = raw.toString("utf8");
-        if (!Buffer.from(name).equals(raw)) throw Error("non UTF8 filename");
+        if (!Buffer.from(name).equals(raw)) refuse("non_utf8_path");
         if (name.toLowerCase() === ".git") continue;
         const rel = prefix + name; components(rel);
         names.push({ name, rel, dir: ent.isDirectory() });
@@ -9343,7 +9513,7 @@ function indexEntries(bytes) {
     } finally { directoryStream.closeSync(); }
     const queries = names.map(x => x.rel + (x.dir ? "/" : ""));
     const queryBytes = Buffer.from(queries.join("\0") + (queries.length ? "\0" : ""));
-    if (queryBytes.length > METADATA_LIMIT) throw Error("ignore query cap");
+    if (queryBytes.length > METADATA_LIMIT) refuse("ignore_query_cap");
     const ignored = new Set(paths(await command(["check-ignore", "--no-index", "-z", "--stdin"],
       METADATA_LIMIT, queryBytes, true)));
     for (const item of names) {
@@ -9355,7 +9525,7 @@ function indexEntries(bytes) {
         try { await walk(sub, item.rel + "/", depth + 1); } finally { close(sub); }
       } else if (!tracked.has(item.rel)) {
         untracked.push(item.rel);
-        if (untracked.length > 200) throw Error("untracked path cap");
+        if (untracked.length > 200) refuse("untracked_path_cap");
       }
     }
   }
@@ -9365,9 +9535,20 @@ function indexEntries(bytes) {
   for (const name of candidates) {
     check();
     let fd, content = null, mode = 0o100644;
-    const previous = old.get(name);
+    const previous = old.get(name), staged = indexed.get(name);
     try {
-      try { fd = openFile(root, name, true); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      let leaf;
+      try { leaf = openLeafOrLink(root, name); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      if (leaf?.link) {
+        // Only an unchanged tracked symlink is supported; the target is never opened.
+        const unchanged = previous?.mode === 0o120000 && (!staged || staged.mode === 0o120000)
+          && createHash("sha1").update("blob " + leaf.link.length + "\0").update(leaf.link).digest("hex") === previous.oid;
+        if (!unchanged) refuse("unsupported_symlink");
+        continue;
+      }
+      // A base or index symlink whose worktree path is no longer that symlink.
+      if (previous?.mode === 0o120000 || staged?.mode === 0o120000) refuse("unsupported_symlink");
+      fd = leaf?.fd;
       if (fd !== undefined) {
         const st = fs.fstatSync(fd, { bigint: true });
         mode = st.mode & 0o111n ? 0o100755 : 0o100644;
@@ -9396,12 +9577,19 @@ function indexEntries(bytes) {
       before === null ? "/dev/null" : "a/" + name, content === null ? "/dev/null" : "b/" + name],
       PATCH_LIMIT - patchBytes, undefined, true);
     patchBytes += patch.length;
-    if (patchBytes > PATCH_LIMIT) throw Error("patch cap");
+    if (patchBytes > PATCH_LIMIT) refuse("patch_cap");
     if (!process.stdout.write(patch)) await new Promise(resolve => process.stdout.once("drain", resolve));
     for (const side of ["a", "b"]) fs.rmSync(path.join(temp, side), { recursive: true, force: true });
   }
 })().then(() => { cleanup(); }, (error) => {
-  try { cleanup(); } finally { process.stderr.write(String(error.stack)); process.exitCode = 1; }
+  let token = "unclassified";
+  if (typeof error?.refusal === "string") token = error.refusal;
+  else if (typeof error?.code === "string" && /^E[A-Z]+$/.test(error.code)) token = "errno:" + error.code;
+  try { cleanup(); } finally {
+    // The token line must be the first stderr bytes; the stack may follow it.
+    process.stderr.write("UZI-PLANNING-REFUSAL " + token + "\n" + String(error?.stack));
+    process.exitCode = 1;
+  }
 });
 `;
 

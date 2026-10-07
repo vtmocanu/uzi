@@ -130,7 +130,7 @@ type CreateJobParams struct {
 	InputFileIDs     []uuid.UUID
 	RequestedByLabel *string
 	// WallSeconds is the optional wall-clock limit; nil uses the instance default. Values above
-	// the 8h ceiling are clamped to it.
+	// the configured RUN_WALL_CEILING are clamped to it.
 	WallSeconds *int
 	// EgressProfile is the name of the site list (egress profile) the job is bound to; empty means
 	// an unbound job. A named profile must exist (ErrJobProfileNotFound) and, for a product-token
@@ -270,7 +270,7 @@ type validatedJob struct {
 	wall   pgtype.Int4
 }
 
-func validateCreateJob(p CreateJobParams) (validatedJob, error) {
+func validateCreateJob(p CreateJobParams, wallCeilingSeconds, baseTimeoutSeconds int32) (validatedJob, error) {
 	var v validatedJob
 	title := strings.TrimSpace(p.Title)
 	if title == "" {
@@ -334,15 +334,19 @@ func validateCreateJob(p CreateJobParams) (validatedJob, error) {
 		}
 	}
 
+	// Compatibility exception: base > ceiling is only possible with the derived 72h cap.
+	// Preserve the operator's no-wall job base, as unscaled 0/1-milestone runs do.
+	// Explicit ceilings are validated >= base, so they still cap a smaller job default.
+	v.wall = pgtype.Int4{Int32: min(max(defaultJobWallSeconds, baseTimeoutSeconds), max(wallCeilingSeconds, baseTimeoutSeconds)), Valid: true}
 	if p.WallSeconds != nil {
 		if *p.WallSeconds < 1 {
 			return v, jobInvalid("wall_seconds", "must be positive")
 		}
 		w := *p.WallSeconds
-		if w > budgetWallCeilingSeconds {
-			w = budgetWallCeilingSeconds
+		if w > int(wallCeilingSeconds) {
+			w = int(wallCeilingSeconds)
 		}
-		v.wall = pgtype.Int4{Int32: int32(w), Valid: true}
+		v.wall = pgtype.Int4{Int32: int32(w), Valid: true} //nolint:gosec // G115: w is positive and capped by the SQL-bounded ceiling, at most math.MaxInt32
 	}
 	return v, nil
 }
@@ -367,7 +371,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 	if !knownJobType(p.JobType) {
 		return JobView{}, ErrJobTypeUnknown
 	}
-	v, err := validateCreateJob(p)
+	v, err := validateCreateJob(p, budgetDurationSeconds(s.p.RunWallCeiling), budgetDurationSeconds(s.p.RunTimeout))
 	if err != nil {
 		return JobView{}, err
 	}

@@ -188,7 +188,8 @@ services:
       # these lines, setting them in .env is
       # inert and the API falls back to its Go defaults. (WORKER_HEARTBEAT_INTERVAL and
       # WORKER_POLL_INTERVAL are worker cadences consumed by the agent service, not here.)
-      RUN_TIMEOUT: ${RUN_TIMEOUT:-2h}
+      RUN_TIMEOUT: ${RUN_TIMEOUT:-6h}
+      RUN_WALL_CEILING: ${RUN_WALL_CEILING:-}
       RUN_IDLE_TIMEOUT: ${RUN_IDLE_TIMEOUT:-10m}
       RUN_MAX_ITERATIONS: ${RUN_MAX_ITERATIONS:-5}
       PLAN_MAX_REVISIONS: ${PLAN_MAX_REVISIONS:-3}
@@ -202,12 +203,12 @@ services:
       # death re-queues the run and both restart. Both are per RUN-ATTEMPT, not per
       # park: questionDeadlines is set once on the first park and cleared only by the
       # terminal finally, so N questions in one attempt SHARE one deadline. The lifetime
-      # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 10 questions
-      # and 48h of waiting, not 5 and 24h. A run that used the one-shot #1742
+      # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 20 questions
+      # and 96h of waiting, rather than the per-attempt 5 and 24h. A run that used the one-shot #1742
       # finalize-resume allowance gets one more attempt: x (RUN_MAX_REQUEUES + 2).
       QUESTION_MAX: ${QUESTION_MAX:-5}
       QUESTION_TIMEOUT_SECONDS: ${QUESTION_TIMEOUT_SECONDS:-86400}
-      RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}
+      RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-3}
       # PRD #108 M5's auto-stop kill switch. Passed through explicitly because the
       # comment above is load-bearing here in a way it is not for a tuning knob:
       # docs/run-auto-stopped.md TELLS an operator to set this to disable a behaviour
@@ -340,7 +341,7 @@ services:
     # run (WORKER_CHAT_SESSIONS is not compose-tunable here, so chat stays 1 slot).
     # OOM is a SHARED-cgroup event: an over-budget run OOM-kills the whole container,
     # requeuing ALL its in-flight runs together — safe for `main`, but after
-    # RUN_MAX_REQUEUES (api env above, default 1) an innocent sibling FAILS instead of
+    # RUN_MAX_REQUEUES (api env above, default 3) an innocent sibling FAILS instead of
     # requeuing. Raise RUN_MAX_REQUEUES alongside any cap>1. Full guidance: docs/worker-setup.md.
     cpus: ${AGENT_CPUS:-2}
     mem_limit: ${AGENT_MEM_LIMIT:-4g}

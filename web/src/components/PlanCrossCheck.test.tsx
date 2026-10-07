@@ -130,3 +130,23 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
     expect(r.getByText(/Checker cost: Unavailable/)).toBeTruthy();
   });
 });
+
+describe("planning-diff refusal sub-code", () => {
+  it.each([
+    ["unsupported_entry", "Unsupported entry (symlink, submodule or special file)"],
+    ["diff_too_large", "Diff too large"],
+    ["secret_detected", "Secret detected"],
+    ["future_code", "Reason unavailable"],
+  ])("shows %s with the planning_diff_refused gate", (code, label) => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_gate_reason: "planning_diff_refused", plan_cross_check_diff_refusal: code })} />);
+    expect(r.getByText("Current gate: Planning diff refused")).toBeTruthy();
+    expect(r.getByText(`Refusal: ${label}`)).toBeTruthy();
+  });
+  it("hides a stale sub-code under another gate reason or none", () => {
+    const other = render(<PlanCrossCheck run={run({ plan_cross_check_gate_reason: "revise", plan_cross_check_diff_refusal: "unsupported_entry" })} />);
+    expect(other.container.textContent).not.toContain("Refusal:");
+    cleanup();
+    const bare = render(<PlanCrossCheck run={run({ plan_cross_check_gate_reason: "planning_diff_refused", plan_cross_check_diff_refusal: null })} />);
+    expect(bare.container.textContent).not.toContain("Refusal:");
+  });
+});

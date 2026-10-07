@@ -12,7 +12,7 @@ import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle, cx } from "./ui";
 
 // PRD #40: one usage summary, with personal figures for everyone and factory
-// figures plus the lifetime per-user section only from the admin-gated response.
+// figures plus the selected-window per-user section only from the admin-gated response.
 
 // A RunUsage bundle split the way the run view splits it: fresh = fresh input +
 // cache creation, cached = cache reads, out = output; total = all three.
@@ -267,10 +267,9 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
         {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} runs with token usage by ${admin.users.length} ${admin.users.length === 1 ? "user" : "users"}${since ? ` since ${since}` : ""}`} />}
       </div>
       {admin && (
-        <section aria-label="Per-user usage, all time" className="mt-5 border-t border-edge pt-4">
-          <h3 className="text-sm font-semibold text-fg">Per user · all time</h3>
-          {window === "last_7_days" && <p className="mt-1 text-xs text-muted">Per-user figures are all time.</p>}
-          <PerUserUsageTable admin={admin} />
+        <section aria-label={`Per-user usage, ${window === "lifetime" ? "all time" : "last 7 days"}`} className="mt-5 border-t border-edge pt-4">
+          <h3 className="text-sm font-semibold text-fg">Per user · {window === "lifetime" ? "all time" : "last 7 days"}</h3>
+          <PerUserUsageTable admin={admin} window={window} />
         </section>
       )}
     </Card>
@@ -314,17 +313,33 @@ function Td({
   );
 }
 
-function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
+function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: UsageWindow }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
-  const factory = breakdown(admin.factory.lifetime);
-  const rows = admin.users.map((u) => ({ ...u, b: breakdown(u.usage) }));
+  const recent = window === "last_7_days";
+  const available = admin.users.every((u) =>
+    u.last_7_days != null && u.last7_run_count != null && u.last7_outcomes != null &&
+    u.last7_subscription_run_count != null && u.last7_unreported_run_count != null,
+  );
+  if (recent && !available) {
+    return <p className="mt-2 text-sm text-muted">Seven-day per-user usage is unavailable. Upgrade the API to view this period.</p>;
+  }
+  const factory = breakdown(admin.factory[window]);
+  const factoryOutcomes = admin.factory.outcomes[window];
+  const rows = admin.users.map((u) => ({
+    ...u,
+    b: breakdown(recent ? u.last_7_days! : u.usage),
+    selectedRuns: recent ? u.last7_run_count! : u.run_count,
+    selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
+    subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
+    unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
+  })).sort((a, b) => b.b.cost - a.b.cost || b.b.out - a.b.out ||
+    (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
   const shares = tokenShares(rows.map((r) => r.b.total), factory.total);
-  // The total row sums the per-user rows by construction, so its disclosure sums their
-  // counts too — reusing admin.factory's own counts rather than re-summing the rows.
+  const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
   const factoryDisclosure = aggregateDisclosure(
-    admin.factory.lifetime_subscription_run_count,
-    admin.factory.lifetime_unreported_run_count,
+    recent ? admin.factory.last7_subscription_run_count : admin.factory.lifetime_subscription_run_count,
+    recent ? admin.factory.last7_unreported_run_count : admin.factory.lifetime_unreported_run_count,
   );
   return (
     <>
@@ -351,17 +366,17 @@ function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                 // Share is by total tokens (not cost) — matches the mock's percentages.
                 // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
                 const pct = shares[i];
-                // PRD #1429 D7: this user's lifetime cost_usd is their metered subset —
+                // PRD #1429 D7: this user's selected cost_usd is their metered subset —
                 // disclose their own subscription/unreported counts beside it rather than
                 // let the dollar figure read as their complete total.
-                const rowDisclosure = aggregateDisclosure(u.subscription_run_count, u.unreported_run_count);
+                const rowDisclosure = aggregateDisclosure(u.subscription, u.unreported);
                 return (
                   <tr key={u.user_id}>
                     <Td left>{maskEmail(u.email, demo)}</Td>
-                    <Td>{u.run_count}</Td>
-                    <Td>{u.outcomes.failed}</Td>
-                    <Td title={`${u.outcomes.failed} of ${u.outcomes.finished} finished runs`}>
-                      {failRate(u.outcomes)}
+                    <Td>{u.selectedRuns}</Td>
+                    <Td>{u.selectedOutcomes.failed}</Td>
+                    <Td title={`${u.selectedOutcomes.failed} of ${u.selectedOutcomes.finished} finished runs`}>
+                      {failRate(u.selectedOutcomes)}
                     </Td>
                     <Td>{failureRecency(u.outcomes, now)}</Td>
                     <Td>{formatTokens(u.b.total)}</Td>
@@ -389,13 +404,13 @@ function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
               })}
               <tr>
                 <Td left total>uzi total</Td>
-                <Td total>{admin.factory.run_count}</Td>
-                <Td total>{admin.factory.outcomes.lifetime.failed}</Td>
+                <Td total>{factoryRuns}</Td>
+                <Td total>{factoryOutcomes.failed}</Td>
                 <Td
                   total
-                  title={`${admin.factory.outcomes.lifetime.failed} of ${admin.factory.outcomes.lifetime.finished} finished runs`}
+                  title={`${factoryOutcomes.failed} of ${factoryOutcomes.finished} finished runs`}
                 >
-                  {failRate(admin.factory.outcomes.lifetime)}
+                  {failRate(factoryOutcomes)}
                 </Td>
                 <Td total>{failureRecency(admin.factory.outcomes.lifetime, now)}</Td>
                 <Td total>{formatTokens(factory.total)}</Td>

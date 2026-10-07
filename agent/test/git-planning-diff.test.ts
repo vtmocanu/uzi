@@ -7,9 +7,9 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { getEventListeners } from "node:events";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { crc32, deflateSync } from "node:zlib";
-import { GitCache, gitEnv } from "../src/git.js";
+import { GitCache, PLANNING_REFUSAL_TOKENS, classifyPlanningCaptureError, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 import { runnerPath, runnerTmpdir } from "../src/runner-uid.js";
@@ -19,6 +19,7 @@ import { probeLandlockAvailability } from "../src/codex/codex-capability.js";
 
 const cap = 512 * 1024;
 const git = new GitCache(process.cwd(), nullLogger());
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -42,8 +43,39 @@ function run(handle: BoundaryProcessHandle, signal = new AbortController().signa
 }
 
 const exec = promisify(execFile);
-async function fixture(options: { seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean; sandbox?: boolean } = {}): Promise<{
-  cache: GitCache; clone: string; base: string; data: string;
+async function directoryBytes(dir: string): Promise<number> {
+  let bytes = 0;
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    const child = path.join(dir, entry.name);
+    bytes += entry.isDirectory() ? await directoryBytes(child) : (await fs.stat(child)).size;
+  }
+  return bytes;
+}
+// The classified outcome of a rejected capture; the raw message is never asserted for meaning.
+async function refusalOf(pending: Promise<unknown>): Promise<{ refusal: string; diagnostic: string; message: string }> {
+  try { await pending; } catch (error) {
+    const message = (error as Error).message;
+    return { ...classifyPlanningCaptureError(message), message };
+  }
+  assert.fail("expected the capture to be refused");
+}
+async function assertRefused(pending: Promise<unknown>, refusal: string, diagnostic: string): Promise<void> {
+  const got = await refusalOf(pending);
+  assert.deepEqual({ refusal: got.refusal, diagnostic: got.diagnostic }, { refusal, diagnostic });
+}
+async function fixture(options: {
+  seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean; sandbox?: boolean;
+  limits?: { snapshotLimit: number; totalLimit: number };
+  // JS run first inside the trusted helper process; __DATA__ is the fixture directory literal.
+  hook?: string;
+  // Give the helper a private TMPDIR so leftover uzi-planning-* trees are observable.
+  privateTmp?: boolean;
+  // TickSpawner SIGTERM-to-SIGKILL grace (default 100 ms); slowed-snapshot tests need more.
+  killGraceMs?: number;
+  // Add this many unreferenced tiny loose objects to the clone's object store.
+  looseObjects?: number;
+} = {}): Promise<{
+  cache: GitCache; clone: string; base: string; data: string; tmp: string;
   git: (...args: string[]) => Promise<string>;
   capture: (signal?: AbortSignal) => Promise<Buffer>;
   dispose: () => Promise<void>;
@@ -64,12 +96,30 @@ async function fixture(options: { seed?: (seed: string) => Promise<void>; shared
   await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
   await fs.mkdir(path.dirname(clone), { recursive: true });
   await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", seed, clone);
+  if (options.looseObjects) {
+    // A clone keeps its fetched objects in a pack, so write the tiny loose objects directly.
+    const hashing = exec("git", ["-C", clone, "hash-object", "-w", "--stdin"], { env: gitEnv(), timeout: 30000 });
+    hashing.child.stdin?.end("loose\n");
+    await hashing;
+    const paths: string[] = [];
+    for (let i = 0; i < options.looseObjects; i++) {
+      const file = path.join(data, "loose-" + i);
+      await fs.writeFile(file, "small " + i + "\n");
+      paths.push(file);
+    }
+    const bulk = exec("git", ["-C", clone, "hash-object", "-w", "--stdin-paths"], { env: gitEnv(), timeout: 60000 });
+    bulk.child.stdin?.end(paths.join("\n") + "\n");
+    await bulk;
+  }
   const base = (await run(clone, "rev-parse", "HEAD")).trim();
   const cache = new GitCache(data, nullLogger());
+  if (options.limits) cache.setPlanningLimitsForTest(options.limits);
+  const tmp = path.join(data, "private-tmp");
+  if (options.privateTmp) await fs.mkdir(tmp, { mode: 0o700 });
   return {
-    data, clone, base, cache, git: (...args) => run(clone, ...args),
+    data, tmp, clone, base, cache, git: (...args) => run(clone, ...args),
     capture: async (signal = new AbortController().signal) => {
-      const owner = new TickSpawner({ signal, killGraceMs: 100 });
+      const owner = new TickSpawner({ signal, killGraceMs: options.killGraceMs ?? 100 });
       const privateTmp = options.sandbox
         ? await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "planning-command-")) : undefined;
       try {
@@ -94,12 +144,14 @@ for (const denied of ["/", ${JSON.stringify(path.join(data, "seed", "tracked"))}
               env: { ...request.env, HOME: privateTmp, TMPDIR: privateTmp },
             });
           }
-          if (!options.meter) return owner.spawn(request);
+          const spawnRequest = options.privateTmp ? { ...request, env: { ...request.env, TMPDIR: tmp } } : request;
+          if (!options.meter && !options.hook) return owner.spawn(spawnRequest);
           // Instrument only the trusted inline capture program, preserving its argv and body.
-          const argv = [...request.argv];
+          const argv = [...spawnRequest.argv];
           assert.equal(argv[1], "-e");
           const metricPath = path.join(data, "read-metrics.json");
-          argv[2] = `
+          const hook = (options.hook ?? "").replaceAll("__DATA__", JSON.stringify(data));
+          argv[2] = hook + (options.meter ? `
 const meterFs = require("node:fs");
 const meterCp = require("node:child_process");
 const readMetrics = { source: 0, diff: 0, diffSpawned: 0, diffClosed: 0 };
@@ -133,8 +185,8 @@ meterCp.spawn = function(...args) {
   return p;
 };
 process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JSON.stringify(readMetrics)));
-` + argv[2];
-          return owner.spawn({ ...request, argv });
+` : "") + argv[2];
+          return owner.spawn({ ...spawnRequest, argv });
         }, signal, () => cache.capturePlanningDiff(clone, base));
       } finally {
         await owner.settled();
@@ -214,7 +266,11 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
           } else if (kind === "symlink to file") await fs.writeFile(outside, "outside\n");
           if (kind === "fifo") await exec("mkfifo", [path.join(f.clone, "a")], { timeout: 5000 });
           else await fs.symlink(outside, path.join(f.clone, "a"));
-          await assert.rejects(f.capture(), /process failed/);
+          const got = await refusalOf(f.capture());
+          assert.equal(got.refusal, "unsupported_entry");
+          assert.equal(got.diagnostic, kind === "fifo" ? (nested ? "non_directory_ancestor" : "nonregular_source")
+            : (nested ? "non_directory_ancestor" : "unsupported_symlink"));
+          assert.doesNotMatch(got.message, /outside/);
         } finally { await f.dispose(); }
       });
     }
@@ -312,7 +368,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
             { env: gitEnv(), timeout: 5000, encoding: "buffer" })).stdout;
           assert.notEqual(createHash("sha1").update(type + " " + served.length + "\0").update(served).digest("hex"), oid);
         }
-        await assert.rejects(f.capture(), kind.startsWith("forged") ? /base object integrity mismatch/ : /ELOOP|ENOTDIR/);
+        await assert.rejects(f.capture(), kind.startsWith("forged") ? /UZI-PLANNING-REFUSAL base_object_integrity/ : /ELOOP|ENOTDIR/);
       } finally { await f.dispose(); }
     });
   }
@@ -340,7 +396,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     try {
       await fs.unlink(Buffer.concat([Buffer.from(f.clone + "/"), Buffer.from([0xff])]));
       await f.git("add", "-u");
-      await assert.rejects(f.capture(), /non UTF8 path metadata/);
+      await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL non_utf8_path/);
     } finally { await f.dispose(); }
   });
   it("captures committed, staged, unstaged, deleted and nonignored untracked text against the immutable base", async () => {
@@ -419,7 +475,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     const f = await fixture();
     try {
       for (let i = 0; i < 201; i++) await fs.writeFile(path.join(f.clone, "extra-" + i), "x");
-      await assert.rejects(f.capture(), /process failed/);
+      await assertRefused(f.capture(), "too_many_untracked", "untracked_path_cap");
     } finally { await f.dispose(); }
   });
 
@@ -427,7 +483,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     const f = await fixture();
     try {
       await fs.writeFile(path.join(f.clone, "huge"), Buffer.alloc(4 * 1024 * 1024 + 1));
-      await assert.rejects(f.capture(), /process failed/);
+      await assertRefused(f.capture(), "diff_too_large", "source_cap");
     } finally { await f.dispose(); }
   });
 
@@ -437,11 +493,13 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       for (let i = 0; i < 33; i++) await fs.writeFile(path.join(seed, "unchanged-" + i), text);
     } });
     try {
-      // Every file hashes to its verified base OID; snapshot and raw object pipes also consume the budget.
-      await assert.rejects(f.capture(), /total source cap/);
+      // Every file hashes to its verified base OID; worktree compare reads consume the source
+      // budget. The object-store snapshot is metered too but charges its own budget only.
+      const snapshotBytes = await directoryBytes(path.join(f.clone, ".git/objects"));
+      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
       const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
-      console.log("aggregate source actual reads:", metrics.source);
-      assert.equal(metrics.source, 128 * 1024 * 1024 + 1);
+      console.log("aggregate source actual reads:", metrics.source, "snapshot bytes:", snapshotBytes);
+      assert.equal(metrics.source, snapshotBytes + 128 * 1024 * 1024 + 1);
       assert.equal(metrics.diff, 0);
     } finally { await f.dispose(); }
   });
@@ -460,7 +518,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       // Each patch is about 200 KiB; only their combined output exceeds the cap.
       for (let i = 0; i < 3; i++)
         await fs.writeFile(path.join(f.clone, "patch-" + i), ("x".repeat(199) + "\n").repeat(1000));
-      await assert.rejects(f.capture(), /Git pipe cap|patch cap/);
+      await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL (git_pipe_cap|patch_cap)/);
       const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
       console.log("aggregate inner diff actual reads:", metrics.diff);
       assert.equal(metrics.diff, cap + 1);
@@ -500,7 +558,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     try {
       const alternates = path.join(f.clone, ".git/objects/info/alternates");
       assert.ok((await fs.readFile(alternates)).length > 0);
-      await assert.rejects(f.capture(), /object alternates unsupported/);
+      await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL object_alternates/);
       // This is the materialization GitCache's existing selfContained preparation performs.
       await f.git("repack", "-a", "-d");
       await fs.unlink(alternates);
@@ -530,26 +588,369 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     try {
       await fs.writeFile(path.join(f.data, "outside"), "outside content\n");
       await fs.symlink(path.join(f.data, "outside"), path.join(f.clone, "escape"));
-      await assert.rejects(f.capture(), /process failed/);
+      await assertRefused(f.capture(), "unsupported_entry", "unsupported_symlink");
       await fs.unlink(path.join(f.clone, "escape"));
       await fs.mkdir(path.join(f.clone, "parent"));
       await fs.writeFile(path.join(f.clone, "parent", "file"), "inside\n");
       await f.git("add", "parent/file");
       await fs.rm(path.join(f.clone, "parent"), { recursive: true });
       await fs.symlink(f.data, path.join(f.clone, "parent"));
-      await assert.rejects(f.capture(), /process failed/);
+      await assertRefused(f.capture(), "unsupported_entry", "non_directory_ancestor");
       await fs.unlink(path.join(f.clone, "parent"));
       await fs.mkdir(path.join(f.clone, ".gitignore-bad"));
       await fs.unlink(path.join(f.clone, ".gitignore"));
       await fs.symlink(path.join(f.data, "outside"), path.join(f.clone, ".gitignore"));
-      await assert.rejects(f.capture(), /process failed/);
+      // A tracked .gitignore replaced by a link is a changed symlink candidate, never read through.
+      await assertRefused(f.capture(), "unsupported_entry", "unsupported_symlink");
       await fs.unlink(path.join(f.clone, ".gitignore"));
       await fs.writeFile(path.join(f.clone, ".gitignore"), "");
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal });
       await assert.rejects(f.cache.withBoundaryProcessSpawner(owner.spawn, ac.signal,
-        () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40))), /process failed/);
+        () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40))), /UZI-PLANNING-REFUSAL base_object_type_mismatch/);
       await owner.settled();
       assert.deepEqual(owner.survivors(), []);
+    } finally { await f.dispose(); }
+  });
+
+
+  // Tracked symlinks (mode 120000): unchanged ones are skipped without ever following the target.
+  const seedLinks = async (seed: string): Promise<void> => {
+    await fs.mkdir(path.join(seed, "sub"));
+    await fs.symlink("tracked", path.join(seed, "link"));
+    await fs.symlink("/does/not/exist", path.join(seed, "dangling"));
+    await fs.symlink("..", path.join(seed, "dir-link"));
+    await fs.symlink("../tracked", path.join(seed, "sub/nested-link"));
+  };
+
+  it("captures an unchanged tracked symlink tree as an empty patch", async () => {
+    const f = await fixture({ seed: seedLinks });
+    try {
+      assert.equal((await fs.lstat(path.join(f.clone, "link"))).isSymbolicLink(), true);
+      assert.equal((await f.capture()).length, 0);
+    } finally { await f.dispose(); }
+  });
+
+  it("captures edits elsewhere next to unchanged tracked symlinks", async () => {
+    const f = await fixture({ seed: seedLinks });
+    try {
+      await fs.writeFile(path.join(f.clone, "tracked"), "edited\n");
+      await fs.writeFile(path.join(f.clone, "fresh"), "fresh text\n");
+      const patch = (await f.capture()).toString();
+      assert.match(patch, /-base\n\+edited/);
+      assert.match(patch, /\+fresh text/);
+      assert.doesNotMatch(patch, /link|dangling/);
+    } finally { await f.dispose(); }
+  });
+
+  it("treats a symlinked .gitignore as absent while the path stays a candidate", async () => {
+    const f = await fixture({ seed: async seed => {
+      await fs.rm(path.join(seed, ".gitignore"));
+      await fs.writeFile(path.join(seed, "ignore-rules"), "ignored\n");
+      await fs.symlink("ignore-rules", path.join(seed, ".gitignore"));
+    } });
+    try {
+      assert.equal((await f.capture()).length, 0);
+      await fs.writeFile(path.join(f.clone, "ignored"), "not ignored without rules\n");
+      await fs.writeFile(path.join(f.clone, "tracked"), "edited\n");
+      const patch = (await f.capture()).toString();
+      assert.match(patch, /\+edited/);
+      assert.match(patch, /\+not ignored without rules/);
+      // Retargeting the link itself is a changed symlink and is refused.
+      await fs.rm(path.join(f.clone, ".gitignore"));
+      await fs.symlink("tracked", path.join(f.clone, ".gitignore"));
+      await assertRefused(f.capture(), "unsupported_entry", "unsupported_symlink");
+    } finally { await f.dispose(); }
+  });
+
+  for (const scenario of [
+    "retargeted", "non-UTF8 retarget", "staged added", "untracked", "deleted", "staged deleted",
+    "file to link", "link to file", "index mode differs from base", "nested retargeted",
+  ]) {
+    it(`refuses a changed symlink as unsupported_entry: ${scenario}`, async () => {
+      const f = await fixture({ seed: seedLinks });
+      try {
+        const link = path.join(f.clone, "link");
+        switch (scenario) {
+          case "retargeted": await fs.rm(link); await fs.symlink("deleted", link); break;
+          case "non-UTF8 retarget": await fs.rm(link); await fs.symlink(Buffer.from([0x74, 0xff, 0x6b]), link); break;
+          case "nested retargeted":
+            await fs.rm(path.join(f.clone, "sub/nested-link"));
+            await fs.symlink("../deleted", path.join(f.clone, "sub/nested-link"));
+            break;
+          case "staged added":
+            await fs.symlink("tracked", path.join(f.clone, "added-link"));
+            await f.git("add", "added-link");
+            break;
+          case "untracked": await fs.symlink("tracked", path.join(f.clone, "added-link")); break;
+          case "deleted": await fs.rm(link); break;
+          case "staged deleted": await f.git("rm", "-q", "link"); break;
+          case "file to link": {
+            await fs.rm(path.join(f.clone, "tracked"));
+            await fs.symlink("link", path.join(f.clone, "tracked"));
+            break;
+          }
+          case "link to file": await fs.rm(link); await fs.writeFile(link, "tracked\n"); break;
+          case "index mode differs from base": {
+            const oid = (await f.git("rev-parse", "HEAD:tracked")).trim();
+            await f.git("update-index", "--cacheinfo", `100644,${oid},link`);
+            break;
+          }
+        }
+        const got = await refusalOf(f.capture());
+        assert.equal(got.refusal, "unsupported_entry");
+        assert.equal(got.diagnostic, "unsupported_symlink");
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("never reads a symlink target's content", async () => {
+    const f = await fixture({ meter: true });
+    try {
+      await fs.writeFile(path.join(f.data, "outside"), Buffer.alloc(3 * 1024 * 1024, 111));
+      await fs.symlink(path.join(f.data, "outside"), path.join(f.clone, "escape"));
+      const got = await refusalOf(f.capture());
+      assert.equal(got.refusal, "unsupported_entry");
+      const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
+      assert.ok(metrics.source < 256 * 1024, "target bytes were not read: " + metrics.source);
+    } finally { await f.dispose(); }
+  });
+
+  // Test-only instrumentation of the trusted helper process: record every readlink and whether
+  // the descriptor named by its pinned proc-fd parent path was still open at that moment.
+  const linkHook = (swap: boolean): string => `
+const hookFs = require("node:fs");
+const hookOpen = new Set(), hookLog = [];
+const hookOpenSync = hookFs.openSync, hookCloseSync = hookFs.closeSync, hookReadlink = hookFs.readlinkSync;
+const hookPinned = new RegExp("^/" + "proc/\\\\d+/fd/(\\\\d+)/");
+hookFs.openSync = function(...args) { const fd = hookOpenSync.apply(this, args); hookOpen.add(fd); return fd; };
+hookFs.closeSync = function(fd) { hookOpen.delete(fd); return hookCloseSync.call(this, fd); };
+hookFs.readlinkSync = function(target, ...rest) {
+  const match = hookPinned.exec(String(target));
+  hookLog.push({ pinned: Boolean(match), parentOpen: match ? hookOpen.has(Number(match[1])) : false });
+  ${swap ? 'hookFs.unlinkSync(target); hookFs.writeFileSync(target, "swapped to a regular file\\n");' : ""}
+  return hookReadlink.call(this, target, ...rest);
+};
+process.on("exit", () => hookFs.writeFileSync(__DATA__ + "/hook.json", JSON.stringify(hookLog)));
+`;
+
+  it("reads each symlink only through its still-open pinned parent descriptor", async () => {
+    const f = await fixture({ seed: seedLinks, hook: linkHook(false) });
+    try {
+      assert.equal((await f.capture()).length, 0);
+      const log = JSON.parse(await fs.readFile(path.join(f.data, "hook.json"), "utf8")) as
+        { pinned: boolean; parentOpen: boolean }[];
+      // link, dangling and dir-link at the root plus sub/nested-link under an owned parent descriptor.
+      assert.equal(log.length, 4);
+      assert.ok(log.every(entry => entry.pinned && entry.parentOpen), JSON.stringify(log));
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses a leaf swapped to a regular file before readlink without resolving the pathname", async () => {
+    const f = await fixture({ seed: seedLinks, hook: linkHook(true) });
+    try {
+      const got = await refusalOf(f.capture());
+      assert.deepEqual({ refusal: got.refusal, diagnostic: got.diagnostic }, { refusal: "diff_failed", diagnostic: "source_changed" });
+      const log = JSON.parse(await fs.readFile(path.join(f.data, "hook.json"), "utf8")) as
+        { pinned: boolean; parentOpen: boolean }[];
+      assert.ok(log.length >= 1 && log.every(entry => entry.pinned && entry.parentOpen), JSON.stringify(log));
+    } finally { await f.dispose(); }
+  });
+
+  // Gitlinks (mode 160000) are never supported, whether in the base tree or the index.
+  const seedGitlink = async (seed: string): Promise<void> => {
+    const sub = path.join(seed, "submodule");
+    await fs.mkdir(sub);
+    const inner = (...args: string[]): Promise<unknown> => exec("git", ["-C", sub, ...args], { env: gitEnv(), timeout: 5000 });
+    await inner("init", "--quiet", "--template=");
+    await fs.writeFile(path.join(sub, "inner"), "inner\n");
+    await inner("add", "inner");
+    await inner("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "inner");
+  };
+
+  it("refuses a gitlink added only to the index", async () => {
+    const f = await fixture();
+    try {
+      await f.git("update-index", "--add", "--cacheinfo", `160000,${f.base},added-gitlink`);
+      await assertRefused(f.capture(), "unsupported_entry", "unsupported_gitlink");
+    } finally { await f.dispose(); }
+  });
+
+  for (const changed of [false, true]) {
+    it(`refuses a ${changed ? "changed" : "unchanged"} base gitlink`, async () => {
+      const f = await fixture({ seed: seedGitlink });
+      try {
+        assert.match(await f.git("ls-tree", f.base, "submodule"), /^160000 commit /);
+        if (changed) await f.git("update-index", "--cacheinfo", `160000,${f.base},submodule`);
+        await assertRefused(f.capture(), "unsupported_entry", "unsupported_gitlink");
+      } finally { await f.dispose(); }
+    });
+  }
+
+  // Budgets: the object-store snapshot and the source reads are independent 128 MiB-class budgets.
+  const seedRandom = async (seed: string): Promise<void> => {
+    await fs.writeFile(path.join(seed, "random"), randomBytes(300 * 1024));
+  };
+
+  it("refuses an object-store snapshot over its own budget", async () => {
+    const f = await fixture({ seed: seedRandom, limits: { snapshotLimit: 100 * 1024, totalLimit: 128 * 1024 * 1024 } });
+    try {
+      await assertRefused(f.capture(), "diff_too_large", "snapshot_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("splits the meter between snapshot and source reads when source reads overflow", async () => {
+    const f = await fixture({ meter: true, limits: { snapshotLimit: 8 * 1024 * 1024, totalLimit: 400 * 1024 },
+      seed: async seed => { for (let i = 0; i < 3; i++) await fs.writeFile(path.join(seed, "random-" + i), randomBytes(300 * 1024)); } });
+    try {
+      const snapshotBytes = await directoryBytes(path.join(f.clone, ".git/objects"));
+      assert.ok(snapshotBytes > 900 * 1024, "snapshot alone exceeds the source budget");
+      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
+      const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
+      assert.equal(metrics.source, snapshotBytes + 400 * 1024 + 1);
+    } finally { await f.dispose(); }
+  });
+
+  it("does not charge snapshot bytes to the source budget", async () => {
+    // Snapshot (~300 KiB) plus source reads (~300 KiB) would exceed one shared 400 KiB budget.
+    const f = await fixture({ seed: seedRandom, limits: { snapshotLimit: 1024 * 1024, totalLimit: 400 * 1024 } });
+    try {
+      assert.equal((await f.capture()).length, 0);
+      await fs.writeFile(path.join(f.clone, "tracked"), "changed\n");
+      assert.match((await f.capture()).toString(), /\+changed/);
+    } finally { await f.dispose(); }
+  });
+
+  it("cancels while the object-store snapshot streams and leaves no temp tree", async () => {
+    const hook = `
+const snapFs = require("node:fs");
+const snapRead = snapFs.readSync;
+let snapBytes = 0;
+snapFs.readSync = function(...args) {
+  const got = snapRead.apply(this, args);
+  snapBytes += got;
+  if (snapBytes > 64 * 1024) {
+    snapFs.writeFileSync(__DATA__ + "/snapshotting", "");
+    // Keep the large snapshot streaming long enough for the abort to land mid-copy.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 8);
+  }
+  return got;
+};
+`;
+    // The 3 MiB stream is slowed ~8 ms per 16 KiB read; a generous kill grace keeps a loaded
+    // CI host from SIGKILLing the helper before its cleanup turn runs. Without the yield the
+    // blocked turn still exceeds it.
+    const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000,
+      seed: async seed => { await fs.writeFile(path.join(seed, "big"), randomBytes(3 * 1024 * 1024)); } });
+    try {
+      const ac = new AbortController();
+      const pending = f.capture(ac.signal);
+      const settled = assert.rejects(pending, /aborted/);
+      const marker = path.join(f.data, "snapshotting");
+      for (let i = 0; i < 200 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(50);
+      assert.ok(await fs.stat(marker).then(() => true, () => false), "snapshot copy started");
+      assert.ok((await fs.readdir(f.tmp)).some(name => name.startsWith("uzi-planning-")), "temp tree exists mid-snapshot");
+      ac.abort();
+      await settled; // capture() itself asserts the owner has no surviving process
+      assert.deepEqual((await fs.readdir(f.tmp)).filter(name => name.startsWith("uzi-planning-")), []);
+    } finally { await f.dispose(); }
+  });
+
+  it("cancels while many tiny object files are copied and leaves no temp tree", async () => {
+    // Each read stalls ~1 ms and every tiny file is read twice, so the whole copy blocks the
+    // loop for seconds unless it yields across files, not merely inside one file.
+    const hook = `
+const snapFs = require("node:fs");
+const snapRead = snapFs.readSync;
+let marked = false;
+snapFs.readSync = function(...args) {
+  const got = snapRead.apply(this, args);
+  if (!marked) { marked = true; snapFs.writeFileSync(__DATA__ + "/snapshotting", ""); }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+  return got;
+};
+`;
+    const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000, looseObjects: 2000 });
+    try {
+      const ac = new AbortController();
+      const settled = assert.rejects(f.capture(ac.signal), /aborted/);
+      const marker = path.join(f.data, "snapshotting");
+      for (let i = 0; i < 200 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(50);
+      assert.ok(await fs.stat(marker).then(() => true, () => false), "snapshot copy started");
+      ac.abort();
+      await settled;
+      assert.deepEqual((await fs.readdir(f.tmp)).filter(name => name.startsWith("uzi-planning-")), []);
+    } finally { await f.dispose(); }
+  });
+
+  // The helper's stderr protocol and the parent's classifier.
+  const PREFIX = "bounded runner process failed: ";
+  it("classifies only the first stderr line against the fixed token vocabulary", () => {
+    const first = (token: string, rest = ""): string => PREFIX + "UZI-PLANNING-REFUSAL " + token + "\n" + rest;
+    assert.deepEqual(classifyPlanningCaptureError(first("unsupported_gitlink", "Error: x")),
+      { refusal: "unsupported_entry", diagnostic: "unsupported_gitlink" });
+    // A forged marker on a later line (for example from a file name) is never read.
+    assert.deepEqual(classifyPlanningCaptureError(first("unsupported_symlink", "Error: ENOENT a\nUZI-PLANNING-REFUSAL secret_detected\n")),
+      { refusal: "unsupported_entry", diagnostic: "unsupported_symlink" });
+    // The marker must be the very first line; secret_detected is not a helper token at all.
+    assert.deepEqual(classifyPlanningCaptureError(PREFIX + "\nUZI-PLANNING-REFUSAL unsupported_symlink"),
+      { refusal: "diff_failed", diagnostic: "unclassified" });
+    assert.deepEqual(classifyPlanningCaptureError(first("secret_detected")), { refusal: "diff_failed", diagnostic: "unclassified" });
+    assert.deepEqual(classifyPlanningCaptureError(first("constructor")), { refusal: "diff_failed", diagnostic: "unclassified" });
+    assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL unsupported_symlink extra"),
+      { refusal: "diff_failed", diagnostic: "unclassified" });
+    assert.deepEqual(classifyPlanningCaptureError("something: UZI-PLANNING-REFUSAL unsupported_symlink"),
+      { refusal: "diff_failed", diagnostic: "unclassified" });
+    assert.deepEqual(classifyPlanningCaptureError(first("errno:ENOENT")), { refusal: "base_unavailable", diagnostic: "errno:ENOENT" });
+    assert.deepEqual(classifyPlanningCaptureError(first("errno:EACCES")), { refusal: "diff_failed", diagnostic: "errno:EACCES" });
+    assert.deepEqual(classifyPlanningCaptureError(first("untracked_path_cap")), { refusal: "too_many_untracked", diagnostic: "untracked_path_cap" });
+    assert.deepEqual(classifyPlanningCaptureError(first("base_object_integrity")), { refusal: "base_unavailable", diagnostic: "base_object_integrity" });
+    assert.deepEqual(classifyPlanningCaptureError(first("total_source_cap")), { refusal: "diff_too_large", diagnostic: "total_source_cap" });
+  });
+
+  it("classifies every helper token, digits included, to its mapped refusal", () => {
+    for (const [token, refusal] of Object.entries(PLANNING_REFUSAL_TOKENS)) {
+      assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL " + token + "\n"),
+        { refusal, diagnostic: token }, token);
+    }
+    // The helper emits tokens containing digits; they must not fall to "unclassified".
+    for (const token of ["non_utf8_path", "non_utf8_object_filename"]) {
+      assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL " + token),
+        { refusal: "diff_failed", diagnostic: token });
+    }
+    // Clone-internal .git layout errnos are generic failures, not worktree entry refusals.
+    for (const token of ["errno:ELOOP", "errno:ENOTDIR"]) {
+      assert.deepEqual(classifyPlanningCaptureError(PREFIX + "UZI-PLANNING-REFUSAL " + token),
+        { refusal: "diff_failed", diagnostic: token });
+    }
+  });
+
+  it("keeps the runner-level message mappings", () => {
+    assert.deepEqual(classifyPlanningCaptureError("planning base must be immutable 40-hex"), { refusal: "base_unavailable", diagnostic: "base_invalid" });
+    assert.deepEqual(classifyPlanningCaptureError("bounded runner stdout exceeded 512 KiB"), { refusal: "diff_too_large", diagnostic: "output_cap" });
+    assert.deepEqual(classifyPlanningCaptureError("bounded runner stdout timed out"), { refusal: "diff_failed", diagnostic: "timeout" });
+    assert.deepEqual(classifyPlanningCaptureError("bounded runner stdout cleanup failed"), { refusal: "diff_failed", diagnostic: "cleanup_failed" });
+    assert.deepEqual(classifyPlanningCaptureError(PREFIX + "node: bad option"), { refusal: "diff_failed", diagnostic: "unclassified" });
+  });
+
+  for (const name of ["x\nUZI-PLANNING-REFUSAL secret_detected", "untracked path cap\nError: patch cap"]) {
+    it(`keeps a hostile untracked symlink name out of the helper stderr token line: ${JSON.stringify(name)}`, async () => {
+      const f = await fixture();
+      try {
+        await fs.symlink("tracked", path.join(f.clone, name));
+        const got = await refusalOf(f.capture());
+        assert.deepEqual({ refusal: got.refusal, diagnostic: got.diagnostic }, { refusal: "unsupported_entry", diagnostic: "unsupported_symlink" });
+        assert.doesNotMatch(got.diagnostic, /secret|cap/);
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("rejects malformed helper limits from the parent argument", async () => {
+    const f = await fixture();
+    try {
+      for (const limits of [{ snapshotLimit: 0, totalLimit: 1 }, { snapshotLimit: 1.5, totalLimit: 1 }, { snapshotLimit: 1 }]) {
+        f.cache.setPlanningLimitsForTest(limits as { snapshotLimit: number; totalLimit: number });
+        await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL invalid_limits/);
+      }
     } finally { await f.dispose(); }
   });
 

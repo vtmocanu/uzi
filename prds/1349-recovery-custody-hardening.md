@@ -199,7 +199,7 @@ All free-text labels are bounded, secret-scrubbed at their existing trust bounda
 
 The local browser mock must demonstrate:
 
-1. A self-hiding board alert below the existing stat tiles, escalating at the full admission limit.
+1. A self-hiding board alert below the existing stat tiles, using danger exactly when `blocked_runs > 0` and warning for every other visible state, including decision-bearing holds at capacity. With no blocked runs, decision-bearing holds use attention wording and the decision CTA; capacity alone explains that new code runs will wait and no action is needed.
 2. Workers detail with normal active holds separated from holds needing action, plus run-detail links.
 3. Available archive export and archive-delete confirmation on the Run view.
 4. Pending/actionable capture under an open hold.
@@ -267,6 +267,9 @@ After M1 freezes the shared wire and complete store-query contract, M2, M3, and 
 - **Parallel milestone conflict:** freeze shared wire/store contracts in M1, then keep M2 in agent files and M3 in server lifecycle files.
 
 ## Decision and progress log
+
+- 2026-10-07: #2444 supersedes full-limit danger escalation: the board uses danger only for reported blocked runs; decision-only and capacity-only states warn. Capacity alone needs no owner action, and admission resumes when counted holds settle. The helper and rendered alert regressions failed against the old capacity-only danger behavior and passed with the new warning, copy, and accessibility semantics. Admission accounting is unchanged by #2444; #2445 owns the canonical admission-count and decision-classification changes. M8 remains maintainer-owned and incomplete.
+- 2026-10-07: #2444 custody health remains Warn at the admission limit and separates owners with decisions from those without. Discard/resolve advice targets decision-bearing holds only; other owners need no decision while counted holds settle. Advice regressions failed against the old unconditional check and passed with the decision adapter. Owner reads share a four-second budget; failures or cancellation return Unknown without partial advice. This branch still uses the pre-#2445 classifier through `OwnerHoldNeedsDecision`; its integration contract switches that adapter to the canonical SQL-projected decision result after #2445, without recreating classification in health. No admission or settlement behavior changed.
 
 - 2026-09-14: Hosted acceptance of PRD #1296 exposed eight open holds, multiple generations on the same runs, idle workers, queued runs blocked by the owner limit, and no supported capture-less disposition. Direct database intervention restored service. Public artifacts retain only sanitized counts and mechanisms.
 - 2026-09-14: #1342 was expanded to exact hold disposition and #1346 filed for lifecycle correctness. Review found two additional defects: owner capture deletion never dispositions the hold, and direct run-plus-worker release can sweep sibling generations.

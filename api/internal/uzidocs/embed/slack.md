@@ -194,7 +194,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
     worker, so if that worker dies and the run is picked up again the clock
     restarts. With no other fresh executor execution, worker-death retries
     contribute `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` and
-    `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` (48h and 10 questions on defaults).
+    `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` (96h and 20 questions on defaults).
     Only the initial episode can use the once-per-run finalize-resume
     allowance (#1742) with a positive cap, giving the multiplier
     `RUN_MAX_REQUEUES + 2`. Ordinary transient/limit/credential redispatch

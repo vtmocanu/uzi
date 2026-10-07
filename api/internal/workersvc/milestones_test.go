@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -192,13 +193,14 @@ func TestSetStateRunningPassesProgressParams(t *testing.T) {
 // heartbeat, COALESCE-guarded in SQL).
 func TestSetStateRunningPassesBudgetConfig(t *testing.T) {
 	fs, svc, wkr, runID := milestonesRunFixture(t, runkind.Issue)
+	svc.p.RunWallCeiling = 13 * time.Hour
 	if _, _, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "running"}); err != nil {
 		t.Fatalf("SetState: %v", err)
 	}
 	p := fs.setRunningParams
 	if p.RunMaxIterations != 5 || p.RunTimeoutSeconds != 7200 ||
-		p.MilestoneBudgetCap != milestoneBudgetCap || p.BudgetWallCeilingSeconds != budgetWallCeilingSeconds {
-		t.Fatalf("budget config = %+v, want {5,7200,%d,%d}", p, milestoneBudgetCap, budgetWallCeilingSeconds)
+		p.MilestoneBudgetCap != milestoneBudgetCap || p.BudgetWallCeilingSeconds != 13*3600 {
+		t.Fatalf("budget config = %+v, want {5,7200,%d,%d}", p, milestoneBudgetCap, 13*3600)
 	}
 }
 

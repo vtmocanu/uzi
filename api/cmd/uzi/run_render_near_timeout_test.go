@@ -16,7 +16,7 @@ import (
 // near-timeout row carries all three clauses. deadline is `left` after now.
 func slowRun(now time.Time, left time.Duration) apitypes.RunDTO {
 	deadline := now.Add(left)
-	bw := 8 * 60 * 60 // 8h, the frozen ceiling every ≥2-milestone run rides
+	bw := 8 * 60 * 60 // 8h fixture budget for a run with a frozen scaled wall
 	return apitypes.RunDTO{
 		ID: "run-nt-1", Kind: "issue", Status: "running", IssueTitle: "do the thing",
 		Health: "slow", DeadlineAt: &deadline, BudgetWallSeconds: &bw,

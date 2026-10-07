@@ -32,6 +32,7 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Get("/users", h.ListUsers)
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
+			r.Get("/docker-allowlist-repos", h.AdminListDockerAllowlistRepos)
 			// Vault migration progress (PRD #32): count of still-master-sealed secrets.
 			r.Get("/vault-migration", h.VaultMigration)
 			// Lightweight live Slack connection state for the admin webui chip's poll

@@ -85,7 +85,7 @@ func TestCreateTaskRunMintsNamespacedBranch(t *testing.T) {
 
 // TestCreateTaskRunPersistsHandoffBudget: issue #785. A non-interactive handoff persists
 // the dedicated HANDOFF_RUN_TIMEOUT / HANDOFF_RUN_MAX_ITERATIONS budget onto the run
-// (budget_wall_seconds / budget_max_iterations), LEAST-capped to the 8h wall ceiling; an
+// (budget_wall_seconds / budget_max_iterations), LEAST-capped to the configured wall ceiling; an
 // interactive handoff persists both as NULL so the claim/sweeper COALESCE falls back to the
 // global default.
 func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
@@ -137,10 +137,11 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 		}
 	})
 
-	// A wall above the 8h ceiling is LEAST-capped to budgetWallCeilingSeconds (28800).
+	// A wall above the configured ceiling is capped server-side.
 	t.Run("non-interactive clamps to the wall ceiling", func(t *testing.T) {
 		p := testParams()
-		p.HandoffRunTimeout = 12 * time.Hour
+		p.HandoffRunTimeout = 20 * time.Hour
+		p.RunWallCeiling = 13 * time.Hour
 		p.HandoffRunMaxIterations = 10
 		fs := &fakeStore{repoRow: aValidRepoRow()}
 		if _, err := newSvc(fs, p).CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "do the thing", "", false, false, false, false); err != nil {
@@ -150,8 +151,8 @@ func TestCreateTaskRunPersistsHandoffBudget(t *testing.T) {
 		if got == nil {
 			t.Fatal("insert did not run")
 		}
-		if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != budgetWallCeilingSeconds {
-			t.Errorf("budget_wall_seconds = %v, want valid %d (ceiling)", got.BudgetWallSeconds, budgetWallCeilingSeconds)
+		if !got.BudgetWallSeconds.Valid || got.BudgetWallSeconds.Int32 != 13*3600 {
+			t.Errorf("budget_wall_seconds = %v, want valid %d (ceiling)", got.BudgetWallSeconds, 13*3600)
 		}
 	})
 

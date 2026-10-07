@@ -6229,3 +6229,18 @@ describe("SdkExecutor decisions memo (issue #2083)", () => {
     assert.strictEqual(injectedLines(probe.emits).length, 0);
   });
 });
+
+
+describe("SdkExecutor wall default", () => {
+  it("uses six hours when the claim omits run_timeout_seconds", async (t) => {
+    const timer = t.mock.method(globalThis, "setTimeout");
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("implemented"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(timer.mock.calls.some((call) => call.arguments[1] === 6 * 60 * 60 * 1000),
+      "the run wall watchdog must arm with the server's six-hour default");
+  });
+});

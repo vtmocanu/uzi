@@ -1,0 +1,57 @@
+{
+  "factory": {
+    "lifetime": {
+      "input_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 0,
+      "cost_usd": 0,
+      "cost_status": ""
+    },
+    "last_7_days": {
+      "input_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 0,
+      "cost_usd": 0,
+      "cost_status": ""
+    },
+    "run_count": 0,
+    "outcomes": {
+      "lifetime": {
+        "last_failed_at": null,
+        "last_failed_run_id": null,
+        "last_failed_origin": null,
+        "last_failed_user_id": null,
+        "completed_since_last_failure": null,
+        "finished": 0,
+        "completed": 0,
+        "cancelled": 0,
+        "plan_rejected": 0,
+        "failed": 0,
+        "needs_landing": 0,
+        "fail_origins": null
+      },
+      "last_7_days": {
+        "last_failed_at": null,
+        "last_failed_run_id": null,
+        "last_failed_origin": null,
+        "last_failed_user_id": null,
+        "completed_since_last_failure": null,
+        "finished": 0,
+        "completed": 0,
+        "cancelled": 0,
+        "plan_rejected": 0,
+        "failed": 0,
+        "needs_landing": 0,
+        "fail_origins": null
+      }
+    },
+    "lifetime_subscription_run_count": 0,
+    "lifetime_unreported_run_count": 0,
+    "last7_subscription_run_count": 0,
+    "last7_unreported_run_count": 0
+  },
+  "users": null,
+  "earliest_run": null
+}

@@ -272,3 +272,45 @@ func TestPlanCrossCheckRefusalStateBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestPlanCrossCheckDiffRefusalStateBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason, diff string
+		want               error
+	}{
+		{name: "unsupported entry", reason: "planning_diff_refused", diff: "unsupported_entry"},
+		{name: "scan failed", reason: "planning_diff_refused", diff: "scan_failed"},
+		{name: "unknown sub-code", reason: "planning_diff_refused", diff: "symlink", want: ErrInvalidState},
+		{name: "missing sub-code", reason: "planning_diff_refused", want: ErrInvalidState},
+		{name: "sub-code with another reason", reason: "candidate_refused", diff: "unsupported_entry", want: ErrInvalidState},
+		{name: "sub-code without reason", diff: "unsupported_entry", want: ErrInvalidState},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := worker()
+			r := store.Run{ID: uuid.New(), UserID: w.UserID, WorkerID: pgconv.UUID(w.ID), Kind: "issue",
+				Status: "running", Harness: "claude", PlanCrossCheckRequired: true, AutoApprove: true, ClaimGeneration: 1}
+			gen := int64(1)
+			plan := "plan"
+			req := StateRequest{State: "awaiting_approval", ClaimGeneration: &gen, PlanMd: &plan, PlanCrossCheckDiffRefusal: tc.diff}
+			if tc.reason != "" {
+				req.PlanCrossCheckGateReason = &tc.reason
+			}
+			if tc.reason == "candidate_refused" {
+				req.PlanCrossCheckRefusal = "candidate_invalid"
+			}
+			tx := &crossCheckBoundaryTx{t: t, checkErr: pgx.ErrNoRows, run: r}
+			svc := New(&fakeStore{runOwned: r}, newBox(t), testParams())
+			svc.SetTxBeginner(tx)
+			_, applied, err := svc.SetState(context.Background(), w, r.ID, req)
+			if applied || !errors.Is(err, tc.want) {
+				t.Fatalf("applied=%v err=%v want=%v", applied, err, tc.want)
+			}
+			if tc.want != nil && (tx.writes != 0 || tx.committed) {
+				t.Fatal("invalid diff refusal mutated/committed")
+			}
+			if tc.want == nil && (tx.writes != 1 || tx.reason != tc.reason || !tx.committed) {
+				t.Fatalf("park attempt: writes=%d reason=%s committed=%v", tx.writes, tx.reason, tx.committed)
+			}
+		})
+	}
+}

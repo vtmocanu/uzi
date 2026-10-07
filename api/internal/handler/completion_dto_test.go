@@ -183,3 +183,32 @@ func TestRunToDTOCompletionPhaseAwaitingInputMarker(t *testing.T) {
 		t.Fatalf("marker-unset awaiting_input CompletionPhase = %q, want empty (ordinary clarification)", got)
 	}
 }
+
+// The planning-diff refusal sub-code is exposed only while the current gate reason is
+// planning_diff_refused: the column outlives a later reason, so the DTO masks it.
+func TestRunToDTOPlanCrossCheckDiffRefusal(t *testing.T) {
+	sub := pgtype.Text{String: "unsupported_entry", Valid: true}
+	for _, tc := range []struct {
+		name   string
+		reason pgtype.Text
+		sub    pgtype.Text
+		want   string
+	}{
+		{"current reason", pgtype.Text{String: "planning_diff_refused", Valid: true}, sub, "unsupported_entry"},
+		{"later reason masks", pgtype.Text{String: "revise", Valid: true}, sub, ""},
+		{"cleared reason masks", pgtype.Text{}, sub, ""},
+		{"no sub-code", pgtype.Text{String: "planning_diff_refused", Valid: true}, pgtype.Text{}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dto := runToDTO(store.Run{ID: uuid.New(), Status: "awaiting_approval",
+				PlanCrossCheckGateReason: tc.reason, PlanCrossCheckDiffRefusal: tc.sub}, "normal", 0, 0, 0, dtoTestNow)
+			got := ""
+			if dto.PlanCrossCheckDiffRefusal != nil {
+				got = *dto.PlanCrossCheckDiffRefusal
+			}
+			if got != tc.want || (tc.want == "") != (dto.PlanCrossCheckDiffRefusal == nil) {
+				t.Fatalf("PlanCrossCheckDiffRefusal = %v, want %q", dto.PlanCrossCheckDiffRefusal, tc.want)
+			}
+		})
+	}
+}

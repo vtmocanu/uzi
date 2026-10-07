@@ -56,6 +56,9 @@ const (
 	// reconnect blip is not worth alarming (the manager auto-reconnects).
 	slackDisconnectedWarn = 5 * time.Minute
 
+	// custodyHoldsReadBudget bounds owner selection and all hold classifications together.
+	custodyHoldsReadBudget = 4 * time.Second
+
 	// board.drift: a given-up column move counts when its marker crossed the give-up
 	// boundary and is no older than this window.
 	boardDriftWindow = 24 * time.Hour

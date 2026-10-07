@@ -16,6 +16,16 @@ const reasons: Record<string, string> = {
   planning_diff_refused: "Planning diff refused", candidate_refused: "Candidate refused",
 };
 
+const diffRefusals: Record<string, string> = {
+  base_unavailable: "Base unavailable", diff_failed: "Diff failed", diff_too_large: "Diff too large",
+  too_many_untracked: "Too many untracked files", secret_detected: "Secret detected",
+  scan_failed: "Secret scan failed", unsupported_entry: "Unsupported entry (symlink, submodule or special file)",
+};
+
+function diffRefusalLabel(code: unknown): string {
+  return typeof code === "string" && Object.prototype.hasOwnProperty.call(diffRefusals, code) ? diffRefusals[code] : "Reason unavailable";
+}
+
 function reasonLabel(reason: unknown): string | undefined {
   return typeof reason === "string" && Object.prototype.hasOwnProperty.call(reasons, reason) ? reasons[reason] : undefined;
 }
@@ -93,6 +103,7 @@ export function PlanCrossCheck({ run }: { run: Run }) {
   return <section aria-label="Plan cross-check" className="rounded-md border border-edge p-3 text-sm space-y-2">
     <h3 className="font-semibold">Plan cross-check</h3>
     {gate && <p>Current gate: {reasonLabel(gate) ?? "Reason unavailable"}</p>}
+    {gate === "planning_diff_refused" && run.plan_cross_check_diff_refusal != null && <p>Refusal: {diffRefusalLabel(run.plan_cross_check_diff_refusal)}</p>}
     <p>{s ? `${s.historical ? "Earlier-plan evidence" : "Checked candidate"}: ${planCheckOutcome(s.verdict, s.reason_class)}` : "Outcome unavailable"}</p>
     {s?.historical && <p>These findings concern an earlier plan; they do not certify the current plan.</p>}
     {s && <>

@@ -88,6 +88,7 @@ type Store interface {
 	ListGaveUpColumnMoves(ctx context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
 	// custody.holds: owners at/over the custody admission limit.
 	ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error)
+	ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
 	// controller.report: the fleet-independent controller-report singleton's observed_at
 	// (pgx.ErrNoRows when the controller has never reported).
 	GetControllerReport(ctx context.Context) (pgtype.Timestamptz, error)

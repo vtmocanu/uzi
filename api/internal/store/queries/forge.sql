@@ -1,3 +1,12 @@
+-- name: AdminListDockerAllowlistRepos :many
+SELECT r.id, r.path_with_namespace, r.enabled, u.email AS owner_email,
+       r.connection_id, fc.forge_type, fc.base_url
+FROM repos r
+JOIN forge_connections fc ON fc.id = r.connection_id
+JOIN users u ON u.id = fc.user_id
+WHERE r.enabled OR r.id = ANY(@docker_repo_allowlist::uuid[])
+ORDER BY u.email, r.path_with_namespace, r.connection_id, r.id;
+
 -- Forge connections -------------------------------------------------------
 
 -- name: UpsertForgeConnection :one

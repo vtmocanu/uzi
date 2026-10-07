@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -112,6 +113,7 @@ func TestSubmitApprovalBuildsCompletionContract(t *testing.T) {
 		freezeSnapshot: store.GetRunMilestoneFreezeSnapshotRow{MilestonesCandidate: milestonesJSON(t, ms...)},
 	}
 	svc := New(fs, newBox(t), testParams())
+	svc.p.RunWallCeiling = 13 * time.Hour
 
 	sel := &AgentSelection{Source: AgentSourceOwn}
 	if _, err := svc.SubmitInput(context.Background(), uuid.New(), runID, "approve_plan", "", sel); err != nil {
@@ -121,6 +123,9 @@ func TestSubmitApprovalBuildsCompletionContract(t *testing.T) {
 		t.Fatal("CreateApprovePlanInput was not called")
 	}
 	assertStructuralContract(t, fs.createdApproval.CompletionContract, ms)
+	if fs.createdApproval.BudgetWallCeilingSeconds != 13*3600 {
+		t.Fatalf("approve ceiling = %d, want 46800", fs.createdApproval.BudgetWallCeilingSeconds)
+	}
 }
 
 // TestSubmitApprovalNoContractForLegacyRun is the negative (legacy) approve-path decision test:

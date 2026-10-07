@@ -57,11 +57,11 @@ describe("HealthOverviewCard", () => {
   });
 
   it("collapses to one quiet line when every check passes", async () => {
-    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 16 checks, all ok
+    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 17 checks, all ok
     renderCard();
     // A healthy card is a status region (not an alert), scoped by its label.
     const card = await screen.findByRole("status", { name: "System health" });
-    expect(within(card).getByText("System health: all 16 checks passing")).toBeTruthy();
+    expect(within(card).getByText("System health: all 17 checks passing")).toBeTruthy();
     // No verdict/attention items in the quiet form.
     expect(within(card).queryByText(/uzi cannot run work/)).toBeNull();
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();

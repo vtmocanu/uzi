@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -92,6 +93,12 @@ func TestLoadSecretKeyBootGuard(t *testing.T) {
 // legitimate "never re-queue" value, which the ordinary >0 int parser would
 // reject).
 func TestLoadAgentRuntimeDefaults(t *testing.T) {
+	for _, key := range []string{"RUN_TIMEOUT", "RUN_WALL_CEILING", "RUN_MAX_REQUEUES"} {
+		t.Setenv(key, "") // restores the original presence/value at cleanup
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
 	// Low-entropy but valid (non-placeholder, long-enough) signing key; a
 	// high-entropy literal would trip the secret scanner on a fresh add.
@@ -111,12 +118,13 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		got  any
 		want any
 	}{
-		{"RunTimeout", cfg.RunTimeout, 2 * time.Hour},
+		{"RunTimeout", cfg.RunTimeout, 6 * time.Hour},
+		{"RunWallCeiling", cfg.RunWallCeiling, 24 * time.Hour},
 		{"RunIdleTimeout", cfg.RunIdleTimeout, 10 * time.Minute},
 		{"RunMaxIterations", cfg.RunMaxIterations, 5},
 		{"HandoffRunTimeout", cfg.HandoffRunTimeout, 4 * time.Hour},
 		{"HandoffRunMaxIterations", cfg.HandoffRunMaxIterations, 10},
-		{"RunMaxRequeues", cfg.RunMaxRequeues, 1},
+		{"RunMaxRequeues", cfg.RunMaxRequeues, 3},
 		{"WorkerHeartbeatInterval", cfg.WorkerHeartbeatInterval, 15 * time.Second},
 		{"WorkerHeartbeatStale", cfg.WorkerHeartbeatStale, 45 * time.Second},
 		{"DiskPressureThreshold", cfg.DiskPressureThreshold, 0.90},
@@ -1077,5 +1085,99 @@ func TestNormalizeTrustedBotBaseURLMatchesConfig(t *testing.T) {
 		if got != want || (gotErr == nil) != (wantErr == nil) {
 			t.Errorf("%q: settings = (%q, %v), config = (%q, %v)", raw, got, gotErr, want, wantErr)
 		}
+	}
+}
+
+func TestRunWallCeilingValidationAndOverrides(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	key := make([]byte, secretbox.KeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(key))
+	t.Setenv("RUN_TIMEOUT", "4h")
+	t.Setenv("RUN_MAX_REQUEUES", "2")
+	for _, tc := range []struct {
+		wall string
+		bad  bool
+	}{
+		{"13h", false}, {"4h", false}, {"72h", false}, {"3h59m", true}, {"72h1s", true}, {"100h", true}, {"garbage", true}, {"0", true}, {"-1h", true}, {"", false}, {"   ", false},
+	} {
+		t.Run(tc.wall, func(t *testing.T) {
+			t.Setenv("RUN_WALL_CEILING", tc.wall)
+			cfg, err := Load()
+			if tc.bad {
+				if err == nil || !strings.Contains(err.Error(), "RUN_WALL_CEILING") {
+					t.Fatalf("Load() error = %v, want ceiling rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, _ := time.ParseDuration(tc.wall)
+			if strings.TrimSpace(tc.wall) == "" {
+				want = 24 * time.Hour
+			}
+			if cfg.RunWallCeiling != want || cfg.RunTimeout != 4*time.Hour || cfg.RunMaxRequeues != 2 {
+				t.Fatalf("operator values lost: ceiling=%v timeout=%v requeues=%d", cfg.RunWallCeiling, cfg.RunTimeout, cfg.RunMaxRequeues)
+			}
+		})
+	}
+
+	t.Setenv("RUN_TIMEOUT", "12h")
+	t.Setenv("RUN_WALL_CEILING", "10h")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RUN_WALL_CEILING") {
+		t.Fatalf("explicit10h ceiling under12h base: %v", err)
+	}
+}
+
+func TestRunWallCeilingRejectsSubsecondSQLBudget(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	key := make([]byte, secretbox.KeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(key))
+	t.Setenv("RUN_TIMEOUT", "100ms")
+	t.Setenv("RUN_WALL_CEILING", "500ms")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RUN_WALL_CEILING") {
+		t.Fatalf("Load()=%v, want reject subsecond ceiling", err)
+	}
+}
+
+func TestImplicitRunCeilingPreservesLongTimeout(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	key := make([]byte, secretbox.KeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(key))
+	for _, base := range []string{"30h", "100h"} {
+		t.Run(base, func(t *testing.T) {
+			t.Setenv("RUN_TIMEOUT", base)
+			for _, wall := range []string{"", "   "} {
+				t.Setenv("RUN_WALL_CEILING", wall)
+				cfg, err := Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, _ := time.ParseDuration(base)
+				want = min(want, 72*time.Hour)
+				if cfg.RunWallCeiling != want {
+					t.Fatalf("derived ceiling=%v want%v", cfg.RunWallCeiling, want)
+				}
+			}
+			t.Setenv("RUN_WALL_CEILING", "")
+			if err := os.Unsetenv("RUN_WALL_CEILING"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(); err != nil {
+				t.Fatalf("unset ceiling: %v", err)
+			}
+		})
 	}
 }

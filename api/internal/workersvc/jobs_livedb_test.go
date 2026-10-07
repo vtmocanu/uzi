@@ -708,3 +708,110 @@ func TestCreateJobRunProductWithoutTokenLiveDB(t *testing.T) {
 		t.Errorf("job rows = %d, want 0", n)
 	}
 }
+
+func TestJobConfiguredWallPersistedAtCreateLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	for _, tc := range []struct {
+		name      string
+		ceiling   time.Duration
+		requested *int
+		want      int32
+	}{
+		{"default12h", 24 * time.Hour, nil, 12 * 3600},
+		{"caller1h", 24 * time.Hour, func() *int { n := 3600; return &n }(), 3600},
+		{"caller30h", 24 * time.Hour, func() *int { n := 30 * 3600; return &n }(), 24 * 3600},
+		{"ceiling10h", 10 * time.Hour, nil, 10 * 3600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e.svc.p.RunWallCeiling = tc.ceiling
+			req := jobReq(cliCaller(u))
+			req.WallSeconds = tc.requested
+			view, err := e.svc.CreateJobRun(e.ctx, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := mustRun(t, e.codexTestEnv, view.ID)
+			if !run.BudgetWallSeconds.Valid || run.BudgetWallSeconds.Int32 != tc.want {
+				t.Fatalf("persisted wall=%v want=%d", run.BudgetWallSeconds, tc.want)
+			}
+		})
+	}
+}
+
+func TestLegacyNullJobWallClaimMatchesSweeperLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	e.makeTokenDefault(t, u)
+	e.svc.p.RunTimeout = 6 * time.Hour
+	e.svc.p.RunWallCeiling = 24 * time.Hour
+	w := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
+	id := e.seedRawJob(t, u, "running", &w, time.Minute, 600)
+	start := time.Now().Add(-5 * time.Hour)
+	e.exec(`UPDATE runs SET budget_wall_seconds=NULL,started_at=$2,claimed_at=$2 WHERE id=$1`, id, start)
+	run := mustRun(t, e.codexTestEnv, id)
+	pl, err := e.svc.assembleJobClaim(e.ctx, store.Worker{ID: w, UserID: u}, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.Config.RunTimeoutSeconds != 6*3600 || pl.BudgetWallSeconds == nil || *pl.BudgetWallSeconds != 6*3600 {
+		t.Fatalf("legacy claim wall=%v / %d want21600", pl.BudgetWallSeconds, pl.Config.RunTimeoutSeconds)
+	}
+	e.svc.now = func() time.Time { return start.Add(6*time.Hour - time.Second) }
+	if _, err := e.svc.FailJobsPastWallDeadline(e.ctx, e.svc.p.RunTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if run := mustRun(t, e.codexTestEnv, id); run.Status != "running" {
+		t.Fatalf("before deadline status=%s want running", run.Status)
+	}
+	e.svc.now = func() time.Time {
+		return start.Add(6*time.Hour + time.Duration(jobWallBackstopGraceSeconds)*time.Second + time.Second)
+	}
+	if _, err := e.svc.FailJobsPastWallDeadline(e.ctx, e.svc.p.RunTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if run := mustRun(t, e.codexTestEnv, id); run.Status != "failed" || run.FailOrigin.String != "run_timeout" {
+		t.Fatalf("past deadline status=%s origin=%v want failed/run_timeout", run.Status, run.FailOrigin)
+	}
+}
+
+func TestJobLongBaseDefaultPreservedAtCreateLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	e.svc.p.RunTimeout = 16 * time.Hour
+	e.svc.p.RunWallCeiling = 24 * time.Hour
+	view, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := mustRun(t, e.codexTestEnv, view.ID)
+	if !run.BudgetWallSeconds.Valid || run.BudgetWallSeconds.Int32 != 16*3600 {
+		t.Fatalf("wall=%v want57600 (existing larger base)", run.BudgetWallSeconds)
+	}
+}
+
+func TestJobDerivedCapPreservesLongBaseLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	e.svc.p.RunTimeout = 100 * time.Hour
+	e.svc.p.RunWallCeiling = 72 * time.Hour
+	omitted, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := mustRun(t, e.codexTestEnv, omitted.ID)
+	if !run.BudgetWallSeconds.Valid || run.BudgetWallSeconds.Int32 != 100*3600 {
+		t.Fatalf("omitted wall=%v want360000", run.BudgetWallSeconds)
+	}
+	requested := 200 * 3600
+	req := jobReq(cliCaller(u))
+	req.WallSeconds = &requested
+	explicit, err := e.svc.CreateJobRun(e.ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = mustRun(t, e.codexTestEnv, explicit.ID)
+	if !run.BudgetWallSeconds.Valid || run.BudgetWallSeconds.Int32 != 72*3600 {
+		t.Fatalf("caller wall=%v want259200", run.BudgetWallSeconds)
+	}
+}

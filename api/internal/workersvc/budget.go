@@ -1,9 +1,14 @@
 package workersvc
 
+import (
+	"math"
+	"time"
+)
+
 // Per-run budget scaling constants (PRD #122 M2, Decision 5/5b/12). The budget is
 // derived SERVER-SIDE at freeze from the frozen milestone count and persisted on the
-// run row (budget_max_iterations / budget_wall_seconds); these constants are the
-// caps the SQL freeze applies. A worker-side cap is not a control (Decision 12), so
+// run row (budget_max_iterations / budget_wall_seconds); the SQL freeze applies
+// these factors and the configured RUN_WALL_CEILING. A worker-side cap is not a control (Decision 12), so
 // the scaling lives where the server can enforce it.
 const (
 	// milestoneBudgetCap bounds the COUNT that scales the budget. It is separate from
@@ -11,16 +16,14 @@ const (
 	// but the budget scales by at most 12× so a lead that emits 40 milestones does not
 	// buy itself a 40× budget (Risks). factor = min(n, milestoneBudgetCap).
 	milestoneBudgetCap = 12
-	// budgetWallCeilingSeconds is the absolute 8h wall-clock ceiling on a scaled run's
-	// derived timeout, independent of milestone count — the second half of the hard
-	// ceiling the count cap gives (Risks). 8 * 60 * 60 = 28800.
-	budgetWallCeilingSeconds = 8 * 60 * 60
+	// defaultJobWallSeconds is the minimum job default; larger RUN_TIMEOUT values survive.
+	defaultJobWallSeconds = 12 * 60 * 60
 	// sizeBudgetFactorL floors the per-run budget for a LARGE-repo run (size_class='l')
 	// that froze 0 or 1 milestones — otherwise it would drop to the global default
-	// (RUN_MAX_ITERATIONS=5 / RUN_TIMEOUT=2h). The freeze CASE multiplies the base
+	// (RUN_MAX_ITERATIONS=5 / RUN_TIMEOUT=6h). The freeze CASE multiplies the base
 	// iteration/wall budget by this factor only in the count<=1 arm; 's'/'m'/'' stay NULL
 	// (unchanged). Chosen so an 'l' run floors to run_max_iterations*5 (=25 by default) and
-	// LEAST(run_timeout*5, budgetWallCeilingSeconds) (=8h), matching what the milestone-count
+	// LEAST(run_timeout*5, RUN_WALL_CEILING) (=24h on defaults), matching what the milestone-count
 	// path gives a ~5-milestone run. See runtime.sql CreateApprovePlanInput / SetRunRunning.
 	//
 	// Accepted risk (issue #1181, MR !1242 review — CWE-400 amplification lens): size_class is
@@ -30,8 +33,8 @@ const (
 	// directory-count scan in worker code (agent/src/toolchain-detect.ts sizeClassFor, computed
 	// once BEFORE the implementation loop), NOT agent/LLM or prompt-injection output, and there
 	// is no server-owned source since the api never clones the repo; (2) the 'l' floor
-	// (25 iters / 8h) is strictly <= the pre-existing, also-worker-reported milestone-count arm
-	// (run_max_iterations*milestoneBudgetCap = 60 iters / 8h), the two CASE arms are mutually
+	// (25 iters / 24h on defaults) is strictly <= the pre-existing, also-worker-reported milestone-count arm
+	// (run_max_iterations*milestoneBudgetCap = 60 iters / 24h on defaults), the two CASE arms are mutually
 	// exclusive and never stack, so it adds no new ceiling; (3) it is self-directed: SetState
 	// gates on runOwnedByWorker first, and the size_class WRITE is worker_id-scoped in both write
 	// paths (SetRunRunning / SetRunAwaitingApproval) — so the value can only reach the run's own
@@ -71,3 +74,9 @@ const (
 // constant (its docstring forbids importing this milestone's package). Exposing the one value
 // keeps both halves reading a single source rather than hardcoding 8 in two places.
 const CustodyHoldLimit = custodyHoldLimit
+
+// budgetDurationSeconds bounds server durations to the persisted SQL int4 range.
+// Ceilings are <=72h; the no-wall job compatibility floor preserves longer base values.
+func budgetDurationSeconds(d time.Duration) int32 {
+	return int32(min(max(d/time.Second, 0), time.Duration(math.MaxInt32)))
+}

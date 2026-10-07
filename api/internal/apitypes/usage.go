@@ -137,9 +137,17 @@ type SelfUsageDTO struct {
 	Last7UnreportedRunCount      int64 `json:"last7_unreported_run_count"`
 }
 
-// AdminUserUsageDTO is one user's lifetime consumption row on the admin factory
+// AdminUserUsageDTO is one user's lifetime and seven-day consumption row on the admin factory
 // breakdown; the client draws each user's share against the factory total.
 type AdminUserUsageDTO struct {
+	// Last7Days is always nonnil in handler responses, including outcomes-only users.
+	// Recency belongs to lifetime only; Last7Outcomes leaves every recency member null.
+	Last7Days                 *UsageDTO      `json:"last_7_days"`
+	Last7RunCount             int64          `json:"last7_run_count"`
+	Last7Outcomes             RunOutcomesDTO `json:"last7_outcomes"`
+	Last7SubscriptionRunCount int64          `json:"last7_subscription_run_count"`
+	Last7UnreportedRunCount   int64          `json:"last7_unreported_run_count"`
+
 	UserID   string   `json:"user_id"`
 	Email    string   `json:"email"`
 	Usage    UsageDTO `json:"usage"`
@@ -150,16 +158,16 @@ type AdminUserUsageDTO struct {
 	Outcomes RunOutcomesDTO `json:"outcomes"`
 	// The user's LIFETIME subscription/unreported run counts (PRD #1429 M1 / D7), so the admin
 	// per-user breakdown discloses a non-metered component the same way the factory total does.
-	// Lifetime-only here (the per-user row is a lifetime breakdown; the windowed counts live on
-	// the factory SelfUsageDTO). Copied from AdminUsagePerUser, which computes them per user.
+	// Copied from AdminUsagePerUser, which computes both windows per user.
 	SubscriptionRunCount int64 `json:"subscription_run_count"`
 	UnreportedRunCount   int64 `json:"unreported_run_count"`
 }
 
 // AdminUsageDTO is the admin factory view: the factory-wide totals plus the
-// per-user breakdown. By construction the per-user rows sum to factory.lifetime.
+// per-user breakdown. At the same snapshot and cutoff, each window's per-user
+// aggregates sum to its factory window; separate handler reads can observe concurrent changes.
 // The subscription/unreported run counts (PRD #1429 M1 / D7) ride here through its two
-// members: the windowed factory counts on Factory (a SelfUsageDTO) and the lifetime per-user
+// members: the windowed factory counts on Factory (a SelfUsageDTO) and the windowed per-user
 // counts on each Users row (AdminUserUsageDTO), so the admin dashboard shows the counts beside
 // numeric metered totals and never presents a partial dollar sum as complete.
 type AdminUsageDTO struct {

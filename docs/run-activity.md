@@ -153,9 +153,9 @@ A few things worth knowing:
   is no configurable default action. The timer is held by the worker, so if
   it dies and the run is picked up again the clock restarts. With no other
   fresh executor execution, worker-death retries contribute
-  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 48h on defaults.
+  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 96h on defaults.
   The question cap (`QUESTION_MAX`, default 5 per attempt) resets the same
-  way: `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` — 10 questions on defaults
+  way: `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` — 20 questions on defaults
   under that condition. Only the initial episode can use the once-per-run
   finalize-resume allowance (#1742) with a positive cap, making these
   multipliers `RUN_MAX_REQUEUES + 2`. Ordinary transient/limit/credential

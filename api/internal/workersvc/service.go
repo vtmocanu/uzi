@@ -1354,6 +1354,7 @@ type Store interface {
 type Params struct {
 	PlanCrossCheckTimeout time.Duration
 	RunTimeout            time.Duration
+	RunWallCeiling        time.Duration
 	RunIdleTimeout        time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
@@ -2189,6 +2190,11 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	}
 	if p.DispatchGrace <= 0 {
 		p.DispatchGrace = defaultDispatchGrace
+	}
+	// An unwired ceiling must not freeze 0-second walls (LEAST(…, 0)): fall back to the
+	// same derived default config.Load uses for an unset RUN_WALL_CEILING (#2279).
+	if p.RunWallCeiling <= 0 {
+		p.RunWallCeiling = min(max(24*time.Hour, p.RunTimeout), 72*time.Hour)
 	}
 	return &Service{
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
@@ -4290,7 +4296,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
 		runningParams.SizeBudgetFactorL = sizeBudgetFactorL
-		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
+		runningParams.BudgetWallCeilingSeconds = budgetDurationSeconds(s.p.RunWallCeiling)
 		// PRD #84 M4: an AUTOPILOT run auto-approves its own plan and NEVER reports
 		// awaiting_approval, so it rides the plan-time INFERRED requirement set on this
 		// self-contained `running` report instead (runner.ts toolchainReportFields, the
@@ -4350,9 +4356,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return owned, false, ErrInvalidState
 		}
 		approvalParams := store.SetRunAwaitingApprovalParams{
-			PlanCrossCheckGateReason: pgconv.TextPtr(req.PlanCrossCheckGateReason),
-			ClaimGeneration:          pgconv.Int8Ptr(req.ClaimGeneration),
-			PlanMd:                   stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			PlanCrossCheckGateReason:  pgconv.TextPtr(req.PlanCrossCheckGateReason),
+			PlanCrossCheckDiffRefusal: pgconv.TextOrNull(req.PlanCrossCheckDiffRefusal),
+			ClaimGeneration:           pgconv.Int8Ptr(req.ClaimGeneration),
+			PlanMd:                    stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
 			// contract. `owned` predates this report's plan_md write, which is what lets
@@ -7240,7 +7247,7 @@ func (s *Service) AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesR
 	return s.q.AdminRunOutcomes(ctx, AllHumanLandableFailOrigins())
 }
 
-// AdminRunOutcomesPerUser returns the per-user lifetime outcome counts for the admin
+// AdminRunOutcomesPerUser returns the per-user lifetime and seven-day outcome counts for the admin
 // factory breakdown (PRD #1293 M1, D5); joins users so an outcome-only user has an email.
 // needs_landing (issue #1418) keyed on the Go-owned human-landable set.
 func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {

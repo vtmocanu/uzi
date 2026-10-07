@@ -222,7 +222,7 @@ func main() {
 
 	q := store.New(pool)
 	box := newTestBox()
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{RunWallCeiling: 8 * time.Hour})
 
 	seed, err := seedFixtures(ctx, pool, q, box, wsvc, live)
 	if err != nil {

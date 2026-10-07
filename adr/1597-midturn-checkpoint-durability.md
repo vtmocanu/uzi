@@ -15,6 +15,12 @@ api-brokered checkpoint push this ADR's tick reuses without changing the broker)
 [ADR-1036](1036-checkpoint-workflow-overlay.md) (the workflow overlay this tick's
 overlay-less publish path deliberately does not build — see below).
 
+**Supersession (#1964, 2026-10-07)**: The original #1597 decision left unscanned
+checkpoint sinks able to publish a finding seen by a scanned sink. #1964 supersedes
+that current-policy claim with a shared, process-local remediation hold at the upload
+seam. Scanning coverage is unchanged; the hold and its explicit residual boundaries
+are recorded below.
+
 ## Decision (summary)
 
 A long implementation turn on a hosted worker previously reached no durable checkpoint at
@@ -46,7 +52,8 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
    untrusted scan skips the remote publish and falls back to the local fetch-back only. On
    a Codex run such an overlay-less (non-GitHub) milestone publish is instead deferred
    (`scan_deferred`) rather than scanned inside the boundary permit; a GitHub milestone —
-   Codex or otherwise — always carries an overlay context and publishes unscanned.
+   Codex or otherwise — always carries an overlay context and, when the #1964 hold
+   permits publication, publishes unscanned.
 5. **The tick runs in a cancellable process scope**: a quiescing run, shutdown, or a
    preempting sink waits for every tick child to exit, every lock wait to resolve, and any
    in-flight publish to settle before the clone or bare is touched again.
@@ -95,9 +102,10 @@ best-effort opportunity, not a guarantee: sink reachability alone does not provi
 holds only while the tick actually runs (the clone is not git-busy, the sink gate is free,
 and no retained bare lock remains), the scan of the pinned range is trusted and finding-free, and the broker accepts the
 publish. A git-busy marker defers the tick for as long as it is present, whatever its age; a
-finding or an untrusted scan keeps that tick's work on worker-local storage (a later
-unscanned park/shutdown/pause/capture or GitHub milestone publish may still ship it, so this
-is not a containment guarantee); and the tick retries a failed publish at most once per
+finding or an untrusted scan keeps that tick's work on worker-local storage. Under #1964,
+remembered findings also hold unscanned checkpoint uploads in the current flight; that
+memory is lost on reclaim or a new flight, so this is not durable containment (see the
+explicit residual boundaries below). The tick retries a failed publish at most once per
 `CHECKPOINT_INTERVAL`. In each of those cases the work is at risk from a worker-disk loss,
 and is never reported as durable.
 
@@ -118,8 +126,8 @@ the boundary permit — see the scan hardening section below. On GitHub, every m
 (`reap:true`) publish carries an overlay context and is therefore unscanned, whether or not
 an overlay commit is actually built (the overlay context is built for every GitHub milestone;
 the pack carries the agent's own commits either way). Explicitly, the unscanned set is: park,
-shutdown, pause, capture, and GitHub milestone publishes — all pushed unscanned to
-`refs/uzi-checkpoints/<branch>` by the api (`Service.Publish` in
+shutdown, pause, capture, and GitHub milestone publishes — when permitted by the #1964
+remediation hold, they are pushed unscanned to `refs/uzi-checkpoints/<branch>` by the api (`Service.Publish` in
 `api/internal/workersvc/service.go`). The rationale: those paths are narrow, already-audited
 windows (a park/shutdown/pause/capture publish happens once, at a boundary the agent does not
 control mid-flight; the overlay is a synthetic transport wrapper, not agent-authored content),
@@ -127,19 +135,57 @@ while the mid-turn tick fires repeatedly, unattended, deep inside a live agent t
 highest-frequency, highest-exposure publish path uzi has. Concretely: **a secret committed
 and then removed within the same single turn is caught by any scanned publish whose range
 contains the adding commit**, because gitleaks git mode scans each commit's patch. The
-unscanned publishers (park/shutdown/pause/capture, and GitHub milestone publishes) would ship
-it. **uzi's push-protection handling runs only at finalize** — it is not relied on as a
+original unscanned publishers (park/shutdown/pause/capture, and GitHub milestone publishes)
+could ship it under #1597. #1964 supersedes that policy: a finding remembered in the current
+flight holds those uploads too, while never-flagged content remains outside that hold.
+**uzi's push-protection handling runs only at finalize** — it is not relied on as a
 backstop for this path (`agent/src/secret-scan-guard.ts`'s pre-push scan plus the `GH013`
-remote parse), long after a checkpoint publish would already have shipped the range to the
+remote parse). It cannot undo content already shipped by an earlier checkpoint to the
 `refs/uzi-checkpoints/<branch>` mirror. Once a finding is in the unpublished range, it blocks
-every *scanned* publish until it leaves that range (fail closed); the unscanned
-park/shutdown/pause/capture and GitHub-milestone publishers would still ship it, unaffected by
-the block. gitleaks git mode also skips files with a NUL byte (binary content) — a known
+every *scanned* publish until it leaves that range (fail closed). The #1964 upload hold also
+checks retained flagged SHAs against the actual candidate's ancestry, independently of scan
+floors and finding-display metadata. gitleaks git mode also skips files with a NUL byte (binary content) — a known
 instrument limit this scan shares with the finalize pre-push scan, not a regression.
 Another known limit shared with the finalize scan: a multi-line secret (e.g. a PEM key
 body swapped between existing BEGIN/END lines) is not detected when only its middle lines
 are added — the same as gitleaks git mode for ordinary commits, and now for merges too
 (only the lines a merge adds are fed to gitleaks).
+
+### The #1964 remediation hold at the upload seam
+
+Every checkpoint upload goes through `RunRunner.publishCheckpointOutcome`: usage-limit
+park, graceful shutdown, pause, credentialed and credential-free recovery, credential
+switch, completion-hold/wall parks, and checkpoint-body publishes, including overlay and
+pinned-range variants. `checkpointRemediationHold` holds a candidate while the current
+`RunFlight.secretRemediation` has nonempty `known` or `blocked` findings, overflow, or a
+retained flagged SHA that is an ancestor of the candidate. Unknown ancestry, an unresolved
+candidate when retained SHAs need checking, or a git error holds the upload too.
+Boundary (`reap:true`) publishes after `everKnown` additionally require the **source** tip
+to equal `cleanTip`; `reap:false` retains its exemption from this clean-tip equality check,
+but still checks remembered findings, overflow and flagged ancestry.
+
+The shared seam checks the owned source first, then `GitCache.checkpointPack` checks the
+actual candidate after overlay construction and floor validation, immediately before
+`pack-objects`, for both pinned and ordinary packs. The source, not its synthetic wrapper,
+is compared with `cleanTip`; ancestry is checked against the wrapper too, including its
+retained confirmed/attempted checkpoint parents and bridges. A hold starts neither a pack
+producer nor a remote upload attempt. Local captures still run and are verified by their
+existing capture paths, but a held upload provides no origin durability. A fresh pause
+whose upload is held fails and the run continues; the already-durable pause shortcut is
+unchanged.
+
+### Explicit residual boundaries (#1964)
+
+The park/shutdown/pause/capture and GitHub-milestone sinks remain **UNSCANNED**; #1964
+adds no scan. Unknown, never-flagged content is outside the remembered-finding hold.
+Ancestry containment also does not cover workflow tree content copied into an overlay from
+a non-parent commit: copying its tree does not make that commit an ancestor.
+
+Remediation memory is process-local `RunFlight` state and is **lost on reclaim or a new
+flight**, including same-worker reclaim. Local commits can survive on that worker; a later
+unscanned publish before another finding is recorded may ship the previously flagged
+content. Persisting remediation evidence or mandating resume scans remains separate work
+under the approved plan's explicit residual boundaries; neither is provided by #1964.
 
 ### The scan hardening
 
@@ -371,7 +417,9 @@ substitute for.
   with no successful remote publish is reported exactly as before (never `published`).
 - **The claim boundary intentionally does not widen**: park/shutdown/pause/capture and every
   GitHub milestone publish remain unscanned, by design, not oversight — see the dedicated
-  section above. A future decision to scan them is a separate, larger piece of work.
+  section above. #1964 holds current-flight remembered findings at the shared upload seam,
+  but does not persist that memory or add resume scans. A future decision to scan these
+  sinks or persist remediation evidence is separate work.
 - **Neither `CHECKPOINT_TICK_INTERVAL` nor `CHECKPOINT_INTERVAL` is exposed via the chart or
   the controller**, so hosted workers run the defaults (`5m`/`20m`); overriding either needs
   a worker-env change outside the chart's current surface.

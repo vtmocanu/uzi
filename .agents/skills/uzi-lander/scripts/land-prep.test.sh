@@ -60,8 +60,10 @@ STUB
 cat > "$WORK/bin/task" <<'STUB'
 #!/usr/bin/env bash
 set -eu
+printf '%s\n' "$*" >> "$TASK_CALLS"
 [ "${1:-}" = gate:web ] || { echo "unexpected task: $*" >&2; exit 1; }
 STUB
+export TASK_CALLS="$WORK/task-calls"
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi" "$WORK/bin/task"
 
 PR_JSON=$(jq -cn --arg h "$FEATURE_HEAD" '{
@@ -73,9 +75,18 @@ PR_JSON=$(jq -cn --arg h "$FEATURE_HEAD" '{
   headRepositoryOwner:{login:"test"}
 }')
 export PR_JSON
+# The default runs NO local gate: CI on the pushed head is the gate, and the run says so.
+: > "$TASK_CALLS"
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --no-push > "$WORK/prepared.out" 2>&1 \
   || fail "initial preparation failed: $(cat "$WORK/prepared.out")"
 grep -q '^RESULT=prepared ' "$WORK/prepared.out" || fail "initial preparation did not stop before push"
+[ ! -s "$TASK_CALLS" ] || fail "the default ran a local gate: $(cat "$TASK_CALLS")"
+grep -q '^LOCAL_GATES=none ' "$WORK/prepared.out" || fail "the default did not report LOCAL_GATES=none: $(cat "$WORK/prepared.out")"
+# --gate auto still runs the full component gate the changed paths select (web/ -> gate:web).
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --skip-rebase --no-push --gate auto > "$WORK/auto.out" 2>&1 \
+  || fail "--gate auto preparation failed: $(cat "$WORK/auto.out")"
+grep -qx 'gate:web' "$TASK_CALLS" || fail "--gate auto did not run gate:web: $(cat "$TASK_CALLS")"
+grep -q '^LOCAL_GATES=none' "$WORK/auto.out" && fail "--gate auto reported LOCAL_GATES=none"
 
 # Move main after preparation, matching a long gate or delayed --skip-rebase re-entry. The
 # move touches base.txt, which the branch also changes, so it is not tolerated.

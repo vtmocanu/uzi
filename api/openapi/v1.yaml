@@ -713,8 +713,9 @@ components:
             - "null"
           description: >-
             A wall-clock limit for the job, in seconds. Values above the instance
-            ceiling (8 hours) are clamped to it. The instance default applies when
-            omitted.
+            RUN_WALL_CEILING (24 hours by default) are clamped to it. When omitted,
+            the limit is min(max(12 hours, RUN_TIMEOUT), max(RUN_WALL_CEILING, RUN_TIMEOUT)), frozen at creation.
+            Positive values below 12 hours are allowed. Jobs cannot be extended.
         egress_profile:
           type:
             - string
@@ -785,7 +786,7 @@ components:
           type:
             - integer
             - "null"
-          description: The job's wall-clock limit; null while the instance default applies.
+          description: The job's wall-clock limit, frozen at create; null only for a job created before defaults were frozen at create, which uses the instance `RUN_TIMEOUT`.
         created_at:
           type: string
           format: date-time

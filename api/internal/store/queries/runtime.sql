@@ -2137,6 +2137,14 @@ UPDATE runs SET
                 ELSE COALESCE(sqlc.narg('plan_cross_check_gate_reason')::text,
                     CASE WHEN runs.plan_md IS NOT DISTINCT FROM @plan_md THEN plan_cross_check_gate_reason END) END
         ELSE 'interrupted' END,
+    -- #2410: the planning-diff refusal sub-code. The ELSE deliberately keeps the old
+    -- value: a retained planning_diff_refused reason (the approval-race and
+    -- no-cross-check retention branches above) keeps its sub-code. Readers mask the
+    -- column unless the current gate reason is planning_diff_refused.
+    plan_cross_check_diff_refusal = CASE
+        WHEN sqlc.narg('plan_cross_check_gate_reason')::text = 'planning_diff_refused'
+            THEN sqlc.narg('plan_cross_check_diff_refusal')::text
+        ELSE runs.plan_cross_check_diff_refusal END,
     status     = 'awaiting_approval',
     status_since = now(),
     plan_md    = @plan_md,
@@ -5351,7 +5359,7 @@ RETURNING id, user_id, status;
 --   * Per-run interval (PRD #122 M2 Decision 5b): a scaled-budget run carries budget_wall_seconds;
 --     a NULL-budget run falls back to global_timeout_seconds (RUN_TIMEOUT). Computed against now so
 --     the per-run interval applies in SQL.
---   * The 8h wall CEILING (budget_wall_ceiling_seconds) is NOT re-applied here — it is enforced by
+--   * The configured wall CEILING (budget_wall_ceiling_seconds) is NOT re-applied here — it is enforced by
 --     the freeze WRITERS (SetRunRunning / CreateApprovePlanInput). This consumer trusts
 --     budget_wall_seconds as an already-capped, server-only, IMMUTABLE value.
 --   * budget_extension_seconds (PRD #1189) and budget_finalize_seconds (PRD #1497 Stop allowance)
@@ -7607,9 +7615,9 @@ FROM scoped;
 
 -- name: AdminUsageTotals :one
 -- Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
--- Same shape as SelfUsage without the user filter; by construction this equals the
--- SUM of the AdminUsagePerUser rows (both read run_usage_totals joined to non-chat
--- runs), which the handler test asserts.
+-- Same shape as SelfUsage without the user filter; at the same snapshot and cutoff
+-- this equals the SUM of AdminUsagePerUser rows (both read run_usage_totals joined
+-- to non-chat runs). Separate handler reads may observe concurrent changes.
 -- PRD #1332 M5A (D2): the factory-wide dollar sums carry subscription/unreported RUN COUNTS
 -- for both windows, mirroring SelfUsage, so a partial dollar total can never read as
 -- complete. M5A adds no public DTO field for the counts; M5B consumes them.
@@ -7642,14 +7650,9 @@ SELECT
 FROM scoped;
 
 -- name: AdminUsagePerUser :many
--- Per-user lifetime usage rows for the admin factory breakdown (PRD #40 M3). One row
--- per user WITH usage; the client computes each user's share against the factory
--- total. Ordered heaviest-cost first (output tokens tiebreak). Sums the same
--- run_usage_totals as AdminUsageTotals, so the rows sum to the factory lifetime total.
--- PRD #1332 M5A (D2): each user's lifetime dollar sum carries subscription/unreported RUN
--- COUNTS so a partial dollar total cannot read as complete. Lifetime-only here (this row is
--- the admin per-user lifetime breakdown; the windowed counts live in AdminUsageTotals). M5A
--- adds no public DTO field for the counts; M5B consumes them.
+-- Both windows over usage-bearing non-chat runs. Lifetime groups remain present
+-- even when their seven-day totals are zero; at the same snapshot and cutoff,
+-- each window sums to the factory.
 SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
     COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
@@ -7658,7 +7661,15 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription')::bigint AS subscription_run_count,
     count(*) FILTER (WHERE t.cost_status = 'unreported')::bigint   AS unreported_run_count,
-    count(t.run_id)::bigint AS run_count
+    count(t.run_id)::bigint AS run_count,
+    count(t.run_id) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint AS last7_run_count,
+    COALESCE(SUM(t.input_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_input_tokens,
+    COALESCE(SUM(t.cache_read_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_read_tokens,
+    COALESCE(SUM(t.cache_creation_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_creation_tokens,
+    COALESCE(SUM(t.output_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_output_tokens,
+    COALESCE(SUM(t.cost_usd) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*) FILTER (WHERE t.cost_status = 'subscription' AND r.created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
+    count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id
@@ -7832,10 +7843,10 @@ WHERE status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge', 'cross_check');
 
 -- name: AdminRunOutcomesPerUser :many
--- Per-user LIFETIME outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
+-- Per-user lifetime and seven-day outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
 -- Joins users so an outcome-only user (every run died before spending, so no usage row)
 -- still has an email to render; the handler merges this by user id against the usage
--- rows. Lifetime-only, matching the admin per-user table's lifetime figures.
+-- rows. Seven-day counts use runs.created_at and retain lifetime groups.
 WITH last_failure AS MATERIALIZED (
     SELECT DISTINCT ON (user_id) id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
@@ -7857,8 +7868,13 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint                                                                       AS last7_finished,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'completed')::bigint                                 AS last7_completed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'cancelled')::bigint                                 AS last7_cancelled,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
-    -- Lifetime-only, matching this query's other lifetime-only counts. The alias here is `r`,
+    -- The alias here is `r`,
     -- so the correlated EXISTS resolves to the OUTER `r` row (no JOIN — that would corrupt the
     -- sibling per-user counts).
     count(*) FILTER (
@@ -7868,6 +7884,13 @@ SELECT u.id AS user_id, u.email,
                        WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
                OR r.preserved_patch IS NOT NULL)
     )::bigint AS needs_landing,
+    count(*) FILTER (
+        WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed'
+          AND r.fail_origin = ANY(@landable_origins::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
+               OR r.preserved_patch IS NOT NULL)
+    )::bigint AS last7_needs_landing,
     -- fail_origins (issue #1451): this user's LIFETIME per-origin breakdown of `failed`, in
     -- this statement (one snapshot => sum(fail_origins) == failed by construction). Correlated
     -- on u.id; an empty group yields '{}'. See SelfRunOutcomes for the shape.
@@ -7877,7 +7900,14 @@ SELECT u.id AS user_id, u.email,
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
-              GROUP BY 1) o) AS fail_origins
+              GROUP BY 1) o) AS fail_origins,
+    (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
+        FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
+              FROM runs r2
+              WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')

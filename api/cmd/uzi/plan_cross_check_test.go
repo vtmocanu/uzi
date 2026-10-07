@@ -124,3 +124,33 @@ func TestRunGetPlanCrossCheckBounds(t *testing.T) {
 		t.Fatalf("unbounded findings: %s", out)
 	}
 }
+
+func TestRunGetPlanCrossCheckDiffRefusal(t *testing.T) {
+	sub := "unsupported_entry"
+	for _, tc := range []struct {
+		name, reason, want string
+		sub                *string
+	}{
+		{"with sub-code", "planning_diff_refused", "plan cross-check: planning diff refused (unsupported entry)", &sub},
+		{"without sub-code", "planning_diff_refused", "plan cross-check: planning diff refused", nil},
+		{"sub-code ignored for another reason", "revise", "plan cross-check: revise", &sub},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := tc.reason
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+				"r1": {ID: "r1", Kind: "issue", Harness: "claude", Status: "awaiting_approval", PlanCrossCheckRequired: true,
+					PlanCrossCheckGateReason: &reason, PlanCrossCheckDiffRefusal: tc.sub},
+			}}
+			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+			if code != uzicli.ExitOK {
+				t.Fatalf("run get exit %d: %s", code, stderr)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("missing %q in:\n%s", tc.want, out)
+			}
+			if tc.reason != "planning_diff_refused" && strings.Contains(out, "unsupported") {
+				t.Errorf("sub-code leaked in:\n%s", out)
+			}
+		})
+	}
+}

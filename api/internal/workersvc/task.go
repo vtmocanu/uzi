@@ -150,9 +150,8 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 }
 
 // handoffBudget computes the dedicated handoff run budget (issue #785) from config:
-// HANDOFF_RUN_TIMEOUT wall (LEAST-capped to budgetWallCeilingSeconds, the repo invariant
-// that every budget writer caps the wall to the 8h ceiling — see runtime.sql
-// SweepRunningTimeout) and HANDOFF_RUN_MAX_ITERATIONS. Both are NULL — so the claim/sweeper
+// HANDOFF_RUN_TIMEOUT wall (LEAST-capped to RUN_WALL_CEILING, the server invariant
+// that budget writers enforce the configured wall ceiling) and HANDOFF_RUN_MAX_ITERATIONS. Both are NULL — so the claim/sweeper
 // COALESCE falls back to the global RUN_TIMEOUT / RUN_MAX_ITERATIONS — for an interactive
 // handoff (idle-bounded by WorkerTaskIdleTimeout instead) OR a non-positive/out-of-range
 // knob. The guards check the COMPUTED integer seconds/iterations (not the raw duration): a
@@ -166,7 +165,7 @@ func (s *Service) handoffBudget(interactive bool) (budgetWall, budgetIters pgtyp
 		return
 	}
 	if secs := int(s.p.HandoffRunTimeout.Seconds()); secs > 0 {
-		budgetWall = pgtype.Int4{Int32: int32(min(secs, budgetWallCeilingSeconds)), Valid: true} //nolint:gosec // G115: min() bounds the value to budgetWallCeilingSeconds, a small constant well within int32
+		budgetWall = pgtype.Int4{Int32: int32(min(secs, int(budgetDurationSeconds(s.p.RunWallCeiling)))), Valid: true} //nolint:gosec // G115: min() bounds the value to the SQL-bounded ceiling, at most math.MaxInt32
 	}
 	if s.p.HandoffRunMaxIterations > 0 && s.p.HandoffRunMaxIterations <= math.MaxInt32 {
 		budgetIters = pgtype.Int4{Int32: int32(s.p.HandoffRunMaxIterations), Valid: true}

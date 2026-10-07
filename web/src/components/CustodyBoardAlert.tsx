@@ -8,11 +8,10 @@ import { cx } from "./ui";
 import { ShieldIcon, ChevronRightIcon } from "./icons";
 
 // CustodyBoardAlert is the board's conditional custody-pressure alert (PRD #1349 M6, D8).
-// It is mounted once, at the top of the dashboard, and it SELF-HIDES: nothing renders until
-// a hold needs an owner decision, a run is blocked, or the admission limit is reached — a
-// fleet with only healthy active protection shows nothing (D6). At the full admission limit
-// it ESCALATES from warning to error styling, because at the limit every further code-run
-// claim for the owner stops (D8).
+// It is mounted once, at the top of the dashboard, and SELF-HIDES unless an open hold
+// exists and a decision is needed, a run is blocked, or a positive capacity limit is reached.
+// A fleet with only healthy protection below capacity shows nothing. Only blocked runs
+// escalate to danger; decisions and capacity alone remain warnings.
 //
 // It owns its own data fetch (GET /api/recovery/holds) and refreshes on the same visible
 // poll cadence as the dashboard, so it updates live as holds change (D10 — the web state
@@ -45,19 +44,14 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
 
   const danger = view.tone === "danger";
   const accent = danger ? "text-danger" : "text-warn";
-  // The Workers "Held work" panel is now decision-only (PRD #1371): it self-hides unless a
-  // hold needs an owner decision. So the "Review held work" CTA — and the "resolve" body
-  // copy — only make sense when a decision is actually pending. When the alert is visible
-  // from admission pressure alone (at the limit or blocked runs with decision_needed == 0),
-  // there is nothing to review there, so we render no CTA and non-actionable wait copy.
-  // That wait copy ("all custody slots are in use") is truthful because a non-actionable alert
-  // only shows under admission pressure: custodyAlertView requires blocked_runs > 0 or at-limit
-  // when decision_needed == 0, so it never renders in a below-capacity state.
+  // The Workers "Held work" panel is decision-only. Offer review and targeted advice
+  // only for pending decisions. Blocked runs can exist below capacity; their wait copy
+  // describes queued admission without attributing all holds to active work.
   const actionable = view.decisionNeeded > 0;
 
   return (
     <section
-      // Danger (claims blocked) is an alert; the warning tier is a status region. Both are
+      // Danger (blocked runs reported) is an alert; the warning tier is a status region. Both are
       // live so an update announces while the region stays mounted.
       role={danger ? "alert" : "status"}
       aria-live={danger ? "assertive" : "polite"}
@@ -79,9 +73,11 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
             <p className="text-sm text-muted">
               {actionable
                 ? danger
-                  ? "Every custody slot is in use, so new code runs cannot claim a worker until you resolve held work."
-                  : "Some runs are retaining unpublished committed work that only you can resolve."
-                : "All custody slots are in use by active work. New code runs must wait for a hold to release."}
+                  ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
+                  : "Review the holds that need a decision and choose how to preserve their work."
+                : danger
+                  ? "Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle."
+                  : "Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle."}
             </p>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
               {/* Each count line renders only when its value > 0 (matching recoveryWaitCount),
@@ -131,9 +127,8 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
   );
 }
 
-// SlotMeter is the signature element: a row of custody "safety slots" filling toward a hard
-// wall. `limit` slots, `used` filled. Small counts render as discrete cells (the incident is
-// about the exact slot count); a large/absent limit falls back to a proportional bar so the
+// SlotMeter displays custody capacity: `limit` slots, `used` filled. Small counts
+// render as discrete cells; a large/absent limit falls back to a proportional bar so the
 // row never overflows. Decorative — the adjacent text carries the same numbers for AT users.
 function SlotMeter({ used, limit, danger }: { used: number; limit: number; danger: boolean }) {
   const fill = danger ? "bg-danger" : "bg-warn";
