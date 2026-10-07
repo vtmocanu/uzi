@@ -950,13 +950,7 @@ export class RecoveryCoordinator {
         journals.every(r => typeof r.generation === "number" && r.generation > record.generation!) &&
         producers.every(laterContext);
     };
-    // An earlier generation whose own covering FINAL is acknowledged (the same rule inventoryCleanupState
-    // applies) already archived its heads durably, so its source journals no longer constrain this one.
-    const settledEarlier = new Set<number>();
-    for (const generation of new Set(sources.filter(r => r.inventoryGuarded && typeof r.generation === "number" &&
-        r.generation < record.generation!).map(r => r.generation!))) {
-      if (await this.cleanupStateOf(sources, generation) === "acknowledged") settledEarlier.add(generation);
-    }
+    const settledEarlier = await this.settledEarlierGenerations(sources, record.generation!);
     const sourceHeads = sources.filter(r => !r.coverageDigest &&
       !(typeof r.generation === "number" && (r.generation > record.generation! || settledEarlier.has(r.generation)))).map(r => r.sourceSha);
     // Later claims have their own holds. Only positive later-generation evidence can
@@ -2021,6 +2015,17 @@ export class RecoveryCoordinator {
     return this.cleanupStateOf(await this.checkedRecords(runId), generation);
   }
 
+  /** Earlier generations whose own covering FINAL is acknowledged (cleanupStateOf says so): their
+   *  heads are archived durably, so a later generation's archive and cleanup need not cover their
+   *  source journals. The one decision shared by finalization and cleanup, so they cannot drift. */
+  private async settledEarlierGenerations(records: RecoveryRecord[], generation: number): Promise<Set<number>> {
+    const settled = new Set<number>();
+    const earlier = new Set(records.filter(r => r.inventoryGuarded === true && typeof r.generation === "number" &&
+      r.generation < generation).map(r => r.generation!));
+    for (const g of earlier) if (await this.cleanupStateOf(records, g) === "acknowledged") settled.add(g);
+    return settled;
+  }
+
   /** The one settlement rule, shared by cleanup authority and owed-context pruning. */
   private async cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
     const relevant = records.filter(r => r.generation === generation);
@@ -2030,8 +2035,10 @@ export class RecoveryCoordinator {
     if (!ack || ack.reason === "inventory_quiescence_breach" || ack.reason === "inventory_snapshot_changed") return "pending";
     // FINAL authenticated its frozen metadata. Later source records still require coverage;
     // no ACK can short-circuit an unreadable sibling or an unattributed source.
+    const settledEarlier = await this.settledEarlierGenerations(records, generation);
     for (const source of records) {
       if (source.generation !== undefined && source.generation > generation) continue;
+      if (source.generation !== undefined && settledEarlier.has(source.generation)) continue;
       if (source.captureId === ack.captureId) continue;
       if (source.finalRequest && !source.finalAcknowledged) return "pending";
       // Earlier recovery-only aggregates are not adopted original heads. Check their

@@ -70,6 +70,10 @@ it("issue1924 an acknowledged older generation's source journal does not block a
     await f.capture(rec7);
     assert.equal((await f.coordinator.inspect("run-1")).find(r => r.captureId === rec7.captureId)?.finalAcknowledged, true,
       "an older generation whose own FINAL is acknowledged must not block this generation's FINAL");
+    assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "acknowledged",
+      "a later FINAL accepted without the separately archived old head must authorize cleanup too");
+    assert.deepEqual([...await f.coordinator.unsettledGuardedGenerations("run-1")], [],
+      "neither acknowledged generation should keep its discovery context protected");
   } finally { await f.close(); }
 });
 
