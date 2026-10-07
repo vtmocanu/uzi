@@ -55,6 +55,7 @@ guarantees `[]`/non-null on the real wire, so the zero-marshal's `null` over-app
 | DTO | field | TS type | mapper guarantee |
 |---|---|---|---|
 | `Repo` | `required_capabilities` | `required_capabilities?: string[]` | `capsOrEmpty` (`handler/forge.go:148`) in `repoToDTO` (`handler/forge.go:174`) → `[]` |
+| `AdminDockerAllowlistRepos` | `repos` | `AdminDockerAllowlistRepo[]` | `handler/admin_docker_allowlist.go:23` initializes `make(...)`, including for empty results |
 | `Worker` / `AdminWorker` | `capabilities` | `capabilities?: string[]` | pgx yields a non-nil `[]` for the `text[]` column (WorkerDTO.Capabilities doc); passed through at `handler/workers.go:122` / `:171` |
 | `Schedule` | `override_subagent_model` | `override_subagent_model: boolean` | plain bool column the mapper ALWAYS sets (`handler/schedules_dto.go:111-112`) |
 | `UserSettings` | `sidebar_token_ids` | `sidebar_token_ids?: string[]` | `uuidStrings` returns a non-nil `[]` (`handler/user_settings.go:65`) |

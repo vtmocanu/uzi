@@ -90,10 +90,16 @@ func TestAdminDockerAllowlistReposAuthAndSelectionLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	byID := map[string]apitypes.AdminDockerAllowlistRepoDTO{}
-	order := make([]string, 0, len(body.Repos))
+	// Other packages leave repositories in this shared database. Restrict the
+	// bytewise order assertion to our fixed-format fixture values; unrelated text
+	// can have a different order under the database collation.
+	fixtureIDs := map[string]bool{a.String(): true, b.String(): true, c.String(): true, d.String(): true}
+	order := make([]string, 0, len(fixtureIDs))
 	for _, row := range body.Repos {
 		byID[row.ID] = row
-		order = append(order, strings.Join([]string{row.OwnerEmail, row.PathWithNamespace, row.ConnectionID, row.ID}, "\n"))
+		if fixtureIDs[row.ID] {
+			order = append(order, strings.Join([]string{row.OwnerEmail, row.PathWithNamespace, row.ConnectionID, row.ID}, "\n"))
+		}
 	}
 	if !sort.StringsAreSorted(order) {
 		t.Fatalf("nondeterministic order: %v", order)

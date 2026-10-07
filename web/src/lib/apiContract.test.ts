@@ -6,6 +6,8 @@ import type {
   RunListItem,
   RunJob,
   Repo,
+  AdminDockerAllowlistRepo,
+  AdminDockerAllowlistRepos,
   RunMessage,
   Schedule,
   ScheduleInput,
@@ -76,6 +78,10 @@ import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.j
 import runListItemFull from "../../../fixtures/api-contract/run_list_item.full.json";
 import repoZero from "../../../fixtures/api-contract/repo.zero.json";
 import repoFull from "../../../fixtures/api-contract/repo.full.json";
+import dockerAllowlistRepoZero from "../../../fixtures/api-contract/admin_docker_allowlist_repo.zero.json";
+import dockerAllowlistRepoFull from "../../../fixtures/api-contract/admin_docker_allowlist_repo.full.json";
+import dockerAllowlistReposZero from "../../../fixtures/api-contract/admin_docker_allowlist_repos.zero.json";
+import dockerAllowlistReposFull from "../../../fixtures/api-contract/admin_docker_allowlist_repos.full.json";
 import messageZero from "../../../fixtures/api-contract/message.zero.json";
 import messageFull from "../../../fixtures/api-contract/message.full.json";
 import scheduleZero from "../../../fixtures/api-contract/schedule.zero.json";
@@ -354,6 +360,29 @@ void _buildInfoFull;
   void _repoExtra;
   void _repoZero;
   void _repoFull;
+}
+
+// ── Admin Docker allowlist picker ───────────────────────────────────────────
+{
+  const _rowMissing: never = null as unknown as Exclude<keyof AdminDockerAllowlistRepo, keyof typeof dockerAllowlistRepoFull>;
+  const _rowExtra: never = null as unknown as Exclude<keyof typeof dockerAllowlistRepoFull, keyof AdminDockerAllowlistRepo>;
+  const _rowZero: ZeroOf<AdminDockerAllowlistRepo> = dockerAllowlistRepoZero;
+  const _rowFull: Widen<AdminDockerAllowlistRepo> = dockerAllowlistRepoFull;
+  void _rowMissing;
+  void _rowExtra;
+  void _rowZero;
+  void _rowFull;
+
+  const _listMissing: never = null as unknown as Exclude<keyof AdminDockerAllowlistRepos, keyof typeof dockerAllowlistReposFull>;
+  const _listExtra: never = null as unknown as Exclude<keyof typeof dockerAllowlistReposFull, keyof AdminDockerAllowlistRepos>;
+  // The handler initializes repos with make(...), including for an empty list.
+  // Its Go zero-value fixture has a nil slice, rather than the real wire's [].
+  const _listZero: ZeroOf<AdminDockerAllowlistRepos, "repos"> = dockerAllowlistReposZero;
+  const _listFull: Widen<AdminDockerAllowlistRepos> = dockerAllowlistReposFull;
+  void _listMissing;
+  void _listExtra;
+  void _listZero;
+  void _listFull;
 }
 
 // ── GuardrailOverrideRequest (issue #1432) ────────────────────────────────────
@@ -1292,6 +1321,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1908 D-D: inputs (nil slice), origin members and result are null in zero.json.
   { stem: "run_job", nullable: true },
   { stem: "repo", nullable: true },
+  { stem: "admin_docker_allowlist_repo", nullable: false },
+  { stem: "admin_docker_allowlist_repos", nullable: true },
   { stem: "message", nullable: true },
   { stem: "schedule", nullable: true },
   { stem: "schedule_input", nullable: true },
