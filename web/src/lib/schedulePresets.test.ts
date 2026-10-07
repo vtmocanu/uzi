@@ -1,3 +1,4 @@
+import canonical from "../../../fixtures/schedule-presets/canonical.json";
 import { describe, expect, it } from "vitest";
 import {
   cronFromPreset,
@@ -91,5 +92,33 @@ describe("humanizeCron", () => {
     expect(humanizeCron("0 9 * * 1")).toBe("Every Monday at 09:00");
     expect(humanizeCron("0 */6 * * *")).toBe("Every 6 hours");
     expect(humanizeCron("0 2 1 * *")).toBe("0 2 1 * *");
+  });
+});
+
+describe("shared Go/web canonical preset parity", () => {
+  it.each(canonical)("recognises and renders $cron", ({ cron, preset, hour, minute, ok }) => {
+    const names = { every_n_minutes: "everyNMinutes", every_n_hours: "everyNHours" };
+    const expected = names[preset as keyof typeof names] ?? preset;
+    const state = presetFromCron(cron);
+    expect(state.preset).toBe(expected);
+    if (ok) {
+      if (preset === "every_n_minutes" || preset === "every_n_hours") {
+        expect(state.everyN).toBe(hour);
+      } else {
+        expect(state.hour).toBe(hour);
+        expect(state.minute).toBe(minute);
+      }
+      expect(cronFromPreset(state)).toBe(cron);
+      expect(presetFromCron(cronFromPreset(state))).toEqual(state);
+    } else {
+      expect(state.preset).toBe("custom");
+      expect(humanizeCron(cron)).toBe(cron);
+    }
+  });
+  it.each([1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30])("round trips every %i minutes", (n) => {
+    const cron = `*/${n} * * * *`;
+    expect(cronFromPreset({ ...DEFAULT_PRESET_STATE, preset: "everyNMinutes", everyN: n })).toBe(cron);
+    expect(presetFromCron(cron)).toMatchObject({ preset: "everyNMinutes", everyN: n });
+    expect(humanizeCron(cron)).toBe(n === 1 ? "Every minute" : `Every ${n} minutes`);
   });
 });

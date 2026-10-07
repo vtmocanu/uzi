@@ -12,6 +12,7 @@ import { mockOtherRunOwners, mockRepos, mockSecrets } from "../data";
 import { minsAgo } from "../data/time";
 import { nextRunId, state } from "../store";
 import { delay, requireSession } from "./shared";
+import { appSettings } from "./settings";
 import { repos } from "./forge";
 
 // ── Scheduled runs (PRD #241) demo fixtures + helpers ──────────────────────
@@ -54,6 +55,21 @@ function applyCapacity(s: Schedule, input: ScheduleInput): void {
   }
   if (s.max_issues != null && (!Number.isInteger(s.max_issues) || s.max_issues < 1 || s.max_issues > 10000))
     throw new ApiError(400, "max_issues must be an integer between 1 and 10000");
+}
+
+function applyRemoval(s: Schedule, input: ScheduleInput): void {
+  if (input.remove_label_on_dispatch !== undefined) {
+    if (typeof input.remove_label_on_dispatch !== "boolean") throw new ApiError(400, "remove_label_on_dispatch must be a boolean");
+    s.remove_label_on_dispatch = input.remove_label_on_dispatch;
+  }
+  if (s.labels) s.labels = s.labels.map((label) => label.trim()).filter(Boolean);
+  if (!s.remove_label_on_dispatch) return;
+  const entry = s.origin === "default" && s.catalog_slug ? catalogBySlug(s.catalog_slug) : undefined;
+  const labels = s.origin === "default" ? entry?.labels : s.labels;
+  if (s.target !== "sweep" || s.timing !== "recurring" ||
+    (s.origin === "default" && (!entry || (entry.selector_kind ?? "label") !== "label")) ||
+    labels?.length !== 1 || !labels[0].trim() || labels[0] === appSettings.uzi_label)
+    throw new ApiError(400, "label removal requires a recurring sweep with one selector label other than the uzi label");
 }
 
 // PRD #1247 M6/M7: map a schedule's WRITE-side credential override ({mode, secret_id?})
@@ -164,6 +180,7 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 2 * * 1-5", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: 1,
@@ -198,6 +215,7 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 3 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(0, 3), auto_approve: false, wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -227,6 +245,7 @@ const userSchedules: Omit<
     timing: "once", cron_expr: "", run_at: daysFromNow(1, 9),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: null, auto_approve: true, wait_on_limit: false,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -246,6 +265,7 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 4 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(0, 4), auto_approve: false, wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -276,6 +296,7 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 9 * * 1", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-7, 9), auto_approve: true, wait_on_limit: false,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -292,6 +313,7 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "0 */6 * * *", run_at: null,
     timezone: "UTC", next_fire_at: null,
     last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: 3,
@@ -322,6 +344,7 @@ const userSchedules: Omit<
     timing: "recurring", cron_expr: "30 1 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -343,6 +366,7 @@ const userSchedules: Omit<
     timing: "once", cron_expr: "", run_at: minsAgo(226),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: minsAgo(226), auto_approve: true, wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -371,6 +395,7 @@ const userSchedules: Omit<
     timing: "once", cron_expr: "", run_at: minsAgo(11),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: minsAgo(11), auto_approve: false, wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: null,
@@ -405,6 +430,7 @@ const userSchedules: Omit<
 // Non-prompt entries have no output channel ("").
 const scheduleCatalog: CatalogEntry[] = [
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "test-improvement",
     name: "Weekly test improvement",
     description: "Weekly pass that finds one under-tested area and strengthens its tests.",
@@ -414,6 +440,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "docs-hygiene",
     name: "Docs hygiene",
     description: "Weekly sweep for mechanical documentation defects — dead links, stale references, drift.",
@@ -423,6 +450,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "bug-hunt",
     name: "Bug hunt — deep audit",
     description: "Deep audit of one subsystem for correctness bugs, confirmed by a reviewer and an auditor.",
@@ -432,6 +460,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "feature-bingo",
     name: "Feature bingo",
     description: "Weekly brainstorm that proposes one concrete new feature or improvement.",
@@ -441,6 +470,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "refactor-scout",
     name: "Refactor scout",
     description: "Biweekly scout that surveys the repo for one high-value structural refactor and files a proposal issue.",
@@ -450,6 +480,7 @@ const scheduleCatalog: CatalogEntry[] = [
     labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "bug-triage",
     name: "Bug triage sweep",
     description: "Daily sweep over open issues labelled \"bug\", starting a run for the oldest few.",
@@ -459,6 +490,7 @@ const scheduleCatalog: CatalogEntry[] = [
       "Triage the sweep's bug issue. Reproduce or confirm the reported problem, find its root cause, and fix it if the fix is small and well-contained; otherwise document the diagnosis and the minimal reproduction so a maintainer can act. Keep changes scoped to the bug at hand and back any fix with a test that would have caught it.",
   },
   {
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "planned-sweep",
     name: "Planned-work sweep",
     description: "Daily sweep over open issues labelled \"Planned\", starting a run for the oldest few.",
@@ -469,6 +501,7 @@ const scheduleCatalog: CatalogEntry[] = [
   },
   {
     selector_kind: "assigned",
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "assigned-sweep",
     name: "Assigned-work sweep",
     description: "Daily sweep over open issues assigned to the uzi bot account, starting a run for the oldest few.",
@@ -481,11 +514,22 @@ const scheduleCatalog: CatalogEntry[] = [
     // A self_improve entry (PRD #590) carries neither a prompt nor labels/guidance: the
     // orchestration lead resolves its own tracking issue at fire time. So it edits like a
     // prompt default (cadence/model only) but has no baked text to show.
+    remove_label_on_dispatch: false, capacity_limit: null, capacity_room_needed: null,
     slug: "self-improve",
     name: "Self-improvement",
     description: "Autonomous self-improvement — audit uzi's own codebase and open one improvement MR per cycle.",
     target: "self_improve", cron: "0 4 */2 * *", timezone: "UTC", model: "", output_mode: "",
     prompt: "", labels: [], guidance: "", max_issues: 0, auto_approve: true, wait_on_limit: true,
+  },
+  {
+    slug: "ondeck-sweep", name: "On-deck sweep",
+    description: "Drain a triaged on-deck backlog a little at a time when there is room, then remove the label.",
+    target: "sweep", selector_kind: "label", labels: ["on-deck"],
+    cron: "*/10 * * * *", timezone: "UTC", max_issues: 1,
+    capacity_limit: 4, capacity_room_needed: 2, remove_label_on_dispatch: true,
+    model: "", output_mode: "", prompt: "",
+    guidance: "Work the next on-deck issue. Keep the change focused and verify it before opening a merge request.",
+    auto_approve: true, wait_on_limit: true,
   },
 ];
 
@@ -523,8 +567,9 @@ function materializeDefault(
     // is inherit until an override sets it, so seed the explicit null sentinel here rather
     // than leaving the field undefined (which would diverge from the server response shape).
     mr_rework_enabled: null,
-    capacity_limit: null,
-    capacity_room_needed: null,
+    remove_label_on_dispatch: entry.remove_label_on_dispatch,
+    capacity_limit: entry.capacity_limit,
+    capacity_room_needed: entry.capacity_room_needed,
     max_issues: entry.target === "sweep" ? entry.max_issues : null,
     // Owner OVERLAY (issue #675): null by default; a seed sets it via `...over`.
     guidance: null,
@@ -609,7 +654,7 @@ let schedules: Schedule[] = [
   ...seededDefaults,
 ];
 
-// Capacity demos use custom rows; shipped catalog defaults remain ungated.
+// Capacity demos use custom rows alongside the On-deck catalog default.
 const capacityDemo = schedules.find((s) => s.target === "sweep" && s.origin === "user")!;
 schedules.push(
   { ...capacityDemo, id: "sch-capacity-blocked", capacity_limit: 4, capacity_room_needed: 2,
@@ -622,6 +667,14 @@ schedules.push(
       started: [{ issue_iid: 1001, run_id: "run-done", title: "Capacity demo" }], skips: [],
       capacity: { in_flight: 2, limit: 4, room_needed: 2, room: 2, blocked: false } } },
 );
+
+for (const failed of [false, true]) {
+  schedules.push({ ...capacityDemo, id: failed ? "sch-removal-failed" : "sch-removal-success",
+    labels: ["on-deck"], remove_label_on_dispatch: true, max_issues: 1,
+    last_fired_at: minsAgo(10), last_fire: { fired_at: minsAgo(10), matched: 1, capped: false,
+      started: [{ issue_iid: failed ? 1002 : 1001, run_id: "run-done", title: "On-deck demo",
+        selector_label: "on-deck", label_removed: !failed, label_remove_failed: failed }], skips: [] } });
+}
 
 // PRD #1732 D11: the schedules whose stored credential override pins the Anthropic token
 // `label`, for the dependents read behind the Disable dialog.
@@ -699,6 +752,7 @@ export const schedulesApi = {
           ? scheduleOverrideToRead(input.credential_override, target)
           : null,
       // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
+      remove_label_on_dispatch: false,
       capacity_limit: null,
       capacity_room_needed: null,
       max_issues: target === "sweep" ? (input.max_issues === undefined ? 10 : input.max_issues) : null,
@@ -727,6 +781,7 @@ export const schedulesApi = {
       next_fires: [],
     };
     applyCapacity(s, input);
+    applyRemoval(s, input);
     schedules = [s, ...schedules];
     return delay(scheduleDTO(s), 250);
   },
@@ -740,6 +795,15 @@ export const schedulesApi = {
     requireSession();
     const cur = schedules.find((x) => x.id === id);
     if (!cur) throw new ApiError(404, "schedule not found");
+    // Match schedules_request.go onlyEnabled: pause/resume skips config validation
+    // and preserves the stored config, including the default row's customized bit.
+    const onlyEnabled = input.enabled !== undefined &&
+      Object.entries(input).every(([key, value]) => key === "enabled" || value === undefined);
+    if (onlyEnabled) {
+      const m: Schedule = { ...cur, enabled: input.enabled!, updated_at: new Date().toISOString() };
+      schedules = schedules.map((x) => (x.id === id ? m : x));
+      return delay(scheduleDTO(m));
+    }
     // A catalog default is catalog-owned (PRD #589): the server's patchDefaultScheduleConfig
     // 400s ANY default patch whose body carries a catalog-owned field. Mirror that here so
     // the mock and the server agree — the drift that hid the buildDefaultInput `timing` bug.
@@ -822,6 +886,7 @@ export const schedulesApi = {
       m.repo_path = repo.path_with_namespace;
     }
     applyCapacity(m, input);
+    applyRemoval(m, input);
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.
     m.issue_iid = m.target === "issue" ? m.issue_iid : null;
@@ -845,7 +910,8 @@ export const schedulesApi = {
       const entry = catalogBySlug(m.catalog_slug);
       if (entry) {
         m.customized =
-          m.capacity_limit != null || m.capacity_room_needed != null ||
+          m.remove_label_on_dispatch !== entry.remove_label_on_dispatch ||
+          m.capacity_limit !== entry.capacity_limit || m.capacity_room_needed !== entry.capacity_room_needed ||
           m.cron_expr !== entry.cron ||
           m.timezone !== entry.timezone ||
           (m.model ?? "") !== entry.model ||
@@ -893,8 +959,14 @@ export const schedulesApi = {
     // Mock Run Now returns a summary only; it never persists last_fire or starts a worker.
     const count = capacity?.blocked ? 0 : s.target === "sweep"
       ? Math.min(s.max_issues ?? capacity?.room ?? 3, capacity?.room ?? Infinity) : 1;
+    const selectorLabel = s.origin === "default" && s.catalog_slug
+      ? catalogBySlug(s.catalog_slug)?.labels?.[0] : s.labels?.[0];
+    const removeAtFire = s.remove_label_on_dispatch && selectorLabel !== appSettings.uzi_label;
     const started = Array.from({ length: count }, (_, i) => ({
       issue_iid: s.target === "sweep" ? 1001 + i : s.issue_iid,
+      ...(s.remove_label_on_dispatch ? { selector_label: selectorLabel,
+        label_removed: removeAtFire && s.id !== "sch-removal-failed",
+        label_remove_failed: removeAtFire && s.id === "sch-removal-failed" } : {}),
       run_id: nextRunId(), title: s.prompt || `#${s.issue_iid ?? 1001 + i}`,
     }));
     return delay({ created: count, run_ids: started.map((r) => r.run_id),
@@ -965,6 +1037,8 @@ export const schedulesApi = {
     );
     if (existing) return delay(scheduleDTO(existing));
     const s = materializeDefault(entry, repoId, nextScheduleId());
+    applyCapacity(s, {});
+    applyRemoval(s, {});
     // On the fresh-materialize path only, an optional detected browser timezone (issue
     // #660) overrides the catalog zone; an empty/absent tz keeps the catalog zone. Mirror
     // the production handler: trim, and reject an invalid IANA name (Intl throws a
@@ -998,6 +1072,8 @@ export const schedulesApi = {
       last_fire: cur.last_fire,
       created_at: cur.created_at,
     });
+    applyCapacity(restored, {});
+    applyRemoval(restored, {});
     schedules = schedules.map((x) => (x.id === id ? restored : x));
     return delay(scheduleDTO(restored));
   },
@@ -1033,6 +1109,8 @@ export const schedulesApi = {
         src.origin === "default" && src.target === "sweep" ? src.baked_guidance : src.guidance,
       baked_guidance: null,
     };
+    applyRemoval(clone, {});
+    applyCapacity(clone, {});
     schedules = [clone, ...schedules];
     return delay(scheduleDTO(clone), 200);
   },
@@ -1063,6 +1141,8 @@ export const schedulesApi = {
     if (schedules.some((x) => (x.id === src.id || x.sibling_group_id === groupId) && x.repo_id === repoId)) {
       throw new ApiError(409, "that schedule is already on that repo");
     }
+    applyRemoval({ ...src }, {});
+    applyCapacity({ ...src }, {});
     if (!src.sibling_group_id) {
       schedules = schedules.map((x) => (x.id === src.id ? { ...x, sibling_group_id: groupId } : x));
     }

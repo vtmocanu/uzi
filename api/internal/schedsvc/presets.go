@@ -10,8 +10,8 @@ import (
 // offers on top of the raw cron field. Storage is ALWAYS the cron string + tz,
 // never one of these labels — these constants exist only so web, CLI, and api
 // name the same preset when translating to/from cron. The set matches the
-// approved mock exactly: Weekdays / Every day / Every week / Every N hours /
-// Custom.
+// approved cadences: Weekdays / Every day / Every week / Every N hours /
+// Every N minutes / Custom.
 const (
 	// PresetWeekdays fires Monday–Friday at a chosen hour:minute → "M H * * 1-5".
 	PresetWeekdays = "weekdays"
@@ -23,6 +23,8 @@ const (
 	// Its parameter is the interval N, not an hour:minute, so it is produced by
 	// EveryNHoursCron rather than PresetToCron.
 	PresetEveryNHours = "every_n_hours"
+	// PresetEveryNMinutes uses a fixed divisor of 60, keeping gaps uniform across hours.
+	PresetEveryNMinutes = "every_n_minutes"
 	// PresetCustom is the sentinel for a raw cron string that matches no preset;
 	// the modal flips its dropdown to "Custom" and shows the Advanced field.
 	PresetCustom = "custom"
@@ -30,8 +32,8 @@ const (
 
 // PresetToCron renders the cron string for a time-of-day preset (weekdays /
 // daily / weekly) at hour:minute in 24h time (Decision 6). It deliberately does
-// NOT handle PresetEveryNHours — that cadence has an interval, not a time — use
-// EveryNHoursCron for it; and PresetCustom has no canonical cron by definition.
+// NOT handle interval presets — use EveryNHoursCron or EveryNMinutesCron for
+// them; PresetCustom has no canonical cron by definition.
 func PresetToCron(preset string, hour, minute int) (string, error) {
 	if err := validClock(hour, minute); err != nil {
 		return "", err
@@ -45,6 +47,8 @@ func PresetToCron(preset string, hour, minute int) (string, error) {
 		return fmt.Sprintf("%d %d * * 1", minute, hour), nil
 	case PresetEveryNHours:
 		return "", fmt.Errorf("schedsvc: preset %q takes an interval; use EveryNHoursCron", preset)
+	case PresetEveryNMinutes:
+		return "", fmt.Errorf("schedsvc: preset %q takes an interval; use EveryNMinutesCron", preset)
 	case PresetCustom:
 		return "", fmt.Errorf("schedsvc: preset %q has no canonical cron", preset)
 	default:
@@ -62,6 +66,24 @@ func EveryNHoursCron(n int) (string, error) {
 	return fmt.Sprintf("0 */%d * * *", n), nil
 }
 
+// EveryNMinutesCron renders a uniform minute interval. Non-divisors such as 40
+// are custom cron cadences because the gap across the hour boundary differs.
+func EveryNMinutesCron(n int) (string, error) {
+	if !validMinuteInterval(n) {
+		return "", fmt.Errorf("schedsvc: unsupported every_n_minutes interval %d", n)
+	}
+	return fmt.Sprintf("*/%d * * * *", n), nil
+}
+
+func validMinuteInterval(n int) bool {
+	switch n {
+	case 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30:
+		return true
+	default:
+		return false
+	}
+}
+
 // CronToPreset recognizes a cron string that a preset produced and reports which
 // preset plus its parameters (Decision 6). This drives the modal's "flip to
 // Custom when the raw field diverges" behavior: any cron string not produced by
@@ -72,6 +94,8 @@ func EveryNHoursCron(n int) (string, error) {
 //   - every_n_hours → (PresetEveryNHours, N, 0, true): the interval N is carried
 //     in the `hour` return value (minute is always 0 for this cadence). Callers
 //     that need N should read `hour` when preset==PresetEveryNHours.
+//   - every_n_minutes → (PresetEveryNMinutes, N, 0, true): N also uses the
+//     hour return slot; callers must inspect the preset before interpreting it.
 //   - anything else → (PresetCustom, 0, 0, false)
 func CronToPreset(cronExpr string) (preset string, hour, minute int, ok bool) {
 	fields := strings.Fields(cronExpr)
@@ -79,6 +103,13 @@ func CronToPreset(cronExpr string) (preset string, hour, minute int, ok bool) {
 		return PresetCustom, 0, 0, false
 	}
 	min, hr, dom, mon, dow := fields[0], fields[1], fields[2], fields[3], fields[4]
+
+	if hr == "*" && dom == "*" && mon == "*" && dow == "*" && strings.HasPrefix(min, "*/") {
+		if n, err := strconv.Atoi(strings.TrimPrefix(min, "*/")); err == nil && validMinuteInterval(n) {
+			return PresetEveryNMinutes, n, 0, true
+		}
+		return PresetCustom, 0, 0, false
+	}
 
 	// every_n_hours: "0 */N * * *" (checked first — its hour field is a step,
 	// not a number, so the numeric-hour presets below never match it).

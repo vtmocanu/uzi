@@ -180,10 +180,10 @@ uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
 uzi run fetches <run-id> [--json]
-uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
+uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--remove-label-on-dispatch[=false]] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit] [--harness claude|codex|""]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--remove-label-on-dispatch[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit] [--harness claude|codex|""]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule pause-all --until <when>
@@ -839,6 +839,19 @@ nothing a manual start cannot.
   `credential_override`. A `HARNESS` row shows the pinned harness, or `implicit` when
   none is pinned (the server resolves the effective harness fresh at each fire); `--json`
   carries it as `harness` (`null` when unpinned).
+  A `REMOVE_LABEL_ON_DISPATCH` row shows whether selector-label removal is enabled.
+  Create or edit with `--remove-label-on-dispatch` to enable it, or
+  `--remove-label-on-dispatch=false` to disable it. Omission leaves the request field
+  absent; an edit (including a default schedule) keeps the stored setting.
+  Both `get`'s last-fire started lines and `run-now`'s per-started lines show removal
+  outcomes, for example `on-deck removed` or
+  `on-deck could not be removed (the run started; remove it by hand)`.
+  These names come only from the fire-time `selector_label` snapshot, even after
+  the schedule's selector changes. Older fires without that snapshot use generic
+  `label removed` / `label could not be removed` wording; fires without an outcome
+  show no removal message. JSON exposes `remove_label_on_dispatch` on the schedule
+  and `label_removed`, `label_remove_failed`, and optional `selector_label` on
+  each started entry.
 - `uzi schedule edit <schedule-id>` — change a schedule's mutable config in place, keeping
   its id and run history (unlike delete-and-recreate). Any flag you omit keeps its stored
   value; editing config revives a terminal schedule (status returns to active — a recurring

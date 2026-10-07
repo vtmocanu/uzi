@@ -17,10 +17,13 @@ import (
 
 // lastFireStarted is one run a fire actually created.
 type lastFireStarted struct {
-	IssueIID *int64 `json:"issue_iid"` // nil for a prompt schedule
-	RunID    string `json:"run_id"`    // uuid string
-	Title    string `json:"title"`
-	WebURL   string `json:"web_url"` // forge issue URL snapshotted at fire time (PRD #411); empty for prompt/unfetched
+	LabelRemoved      bool   `json:"label_removed,omitempty"`
+	LabelRemoveFailed bool   `json:"label_remove_failed,omitempty"`
+	SelectorLabel     string `json:"selector_label,omitempty"`
+	IssueIID          *int64 `json:"issue_iid"` // nil for a prompt schedule
+	RunID             string `json:"run_id"`    // uuid string
+	Title             string `json:"title"`
+	WebURL            string `json:"web_url"` // forge issue URL snapshotted at fire time (PRD #411); empty for prompt/unfetched
 }
 
 // lastFireSkip is one candidate a fire considered but started nothing for, with its
@@ -64,10 +67,13 @@ func marshalLastFire(out FireOutcome, firedAt time.Time) ([]byte, error) {
 	}
 	for _, s := range out.Started {
 		rec.Started = append(rec.Started, lastFireStarted{
-			IssueIID: s.IssueIID,
-			RunID:    s.RunID.String(),
-			Title:    s.Title,
-			WebURL:   s.WebURL,
+			LabelRemoved:      s.LabelRemoved,
+			LabelRemoveFailed: s.LabelRemoveFailed,
+			SelectorLabel:     s.SelectorLabel,
+			IssueIID:          s.IssueIID,
+			RunID:             s.RunID.String(),
+			Title:             s.Title,
+			WebURL:            s.WebURL,
 		})
 	}
 	for _, s := range out.Skips {

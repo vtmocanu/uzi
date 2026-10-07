@@ -1,0 +1,114 @@
+[
+  {
+    "cron": "*/1 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 1,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/2 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 2,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/3 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 3,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/4 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 4,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/5 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 5,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/6 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 6,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/10 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 10,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/12 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 12,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/15 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 15,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/20 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 20,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/30 * * * *",
+    "preset": "every_n_minutes",
+    "hour": 30,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "*/40 * * * *",
+    "preset": "custom",
+    "hour": 0,
+    "minute": 0,
+    "ok": false
+  },
+  {
+    "cron": "0 */6 * * *",
+    "preset": "every_n_hours",
+    "hour": 6,
+    "minute": 0,
+    "ok": true
+  },
+  {
+    "cron": "30 9 * * 1-5",
+    "preset": "weekdays",
+    "hour": 9,
+    "minute": 30,
+    "ok": true
+  },
+  {
+    "cron": "15 8 * * *",
+    "preset": "daily",
+    "hour": 8,
+    "minute": 15,
+    "ok": true
+  },
+  {
+    "cron": "0 7 * * 1",
+    "preset": "weekly",
+    "hour": 7,
+    "minute": 0,
+    "ok": true
+  }
+]

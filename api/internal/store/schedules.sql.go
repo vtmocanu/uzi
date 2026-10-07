@@ -20,7 +20,7 @@ SET last_fired_at = $1,
     last_fire     = $4,
     updated_at    = now()
 WHERE id = $5
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type AdvanceScheduleParams struct {
@@ -87,12 +87,13 @@ func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
 
 const claimDueSchedules = `-- name: ClaimDueSchedules :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch FROM run_schedules
 WHERE enabled AND status = 'active'
   AND next_fire_at IS NOT NULL AND next_fire_at <= now()
 ORDER BY next_fire_at
@@ -151,6 +152,7 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 			&i.CredentialOverrideSecretID,
 			&i.CapacityLimit,
 			&i.CapacityRoomNeeded,
+			&i.RemoveLabelOnDispatch,
 		); err != nil {
 			return nil, err
 		}
@@ -291,31 +293,34 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, catalog_slug, origin, customized,
     issue_iid, labels, prompt, guidance,
     timing, cron_expr, timezone, next_fire_at,
-    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model, output_mode, capacity_limit, capacity_room_needed
+    auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model, output_mode, remove_label_on_dispatch, capacity_limit, capacity_room_needed
 ) VALUES (
     $1, $2, $3, $4, 'default', false,
     NULL, NULL, NULL, NULL,
     'recurring', $5, $6, $7,
-    $8, $9, $10, true, $11, $12, $13, NULL, NULL
+    $8, $9, $10, true, $11, $12, $13, $14, $15, $16
 )
 ON CONFLICT (user_id, repo_id, catalog_slug) WHERE origin = 'default' DO NOTHING
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type CreateDefaultScheduleParams struct {
-	UserID          uuid.UUID          `json:"user_id"`
-	RepoID          uuid.UUID          `json:"repo_id"`
-	Target          string             `json:"target"`
-	CatalogSlug     pgtype.Text        `json:"catalog_slug"`
-	CronExpr        pgtype.Text        `json:"cron_expr"`
-	Timezone        string             `json:"timezone"`
-	NextFireAt      pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove     bool               `json:"auto_approve"`
-	WaitOnLimit     bool               `json:"wait_on_limit"`
-	MrReworkEnabled pgtype.Bool        `json:"mr_rework_enabled"`
-	MaxIssues       pgtype.Int4        `json:"max_issues"`
-	Model           pgtype.Text        `json:"model"`
-	OutputMode      pgtype.Text        `json:"output_mode"`
+	UserID                uuid.UUID          `json:"user_id"`
+	RepoID                uuid.UUID          `json:"repo_id"`
+	Target                string             `json:"target"`
+	CatalogSlug           pgtype.Text        `json:"catalog_slug"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	Timezone              string             `json:"timezone"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	Model                 pgtype.Text        `json:"model"`
+	OutputMode            pgtype.Text        `json:"output_mode"`
+	RemoveLabelOnDispatch bool               `json:"remove_label_on_dispatch"`
+	CapacityLimit         pgtype.Int4        `json:"capacity_limit"`
+	CapacityRoomNeeded    pgtype.Int4        `json:"capacity_room_needed"`
 }
 
 // Enable a builtin default scheduled job (PRD #589 M2) on a repo for an owner. A
@@ -345,6 +350,9 @@ func (q *Queries) CreateDefaultSchedule(ctx context.Context, arg CreateDefaultSc
 		arg.MaxIssues,
 		arg.Model,
 		arg.OutputMode,
+		arg.RemoveLabelOnDispatch,
+		arg.CapacityLimit,
+		arg.CapacityRoomNeeded,
 	)
 	var i RunSchedule
 	err := row.Scan(
@@ -383,6 +391,7 @@ func (q *Queries) CreateDefaultSchedule(ctx context.Context, arg CreateDefaultSc
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -618,14 +627,14 @@ INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
     auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, output_mode, override_subagent_model,
-    capacity_limit, capacity_room_needed, sibling_group_id, harness, credential_override_mode, credential_override_secret_id
+    remove_label_on_dispatch, capacity_limit, capacity_room_needed, sibling_group_id, harness, credential_override_mode, credential_override_secret_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25, $26
+    $21, $22, $23, $24, $25, $26, $27
 )
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type CreateRunScheduleParams struct {
@@ -649,6 +658,7 @@ type CreateRunScheduleParams struct {
 	Model                      pgtype.Text        `json:"model"`
 	OutputMode                 pgtype.Text        `json:"output_mode"`
 	OverrideSubagentModel      bool               `json:"override_subagent_model"`
+	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 	SiblingGroupID             pgtype.UUID        `json:"sibling_group_id"`
@@ -695,6 +705,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.Model,
 		arg.OutputMode,
 		arg.OverrideSubagentModel,
+		arg.RemoveLabelOnDispatch,
 		arg.CapacityLimit,
 		arg.CapacityRoomNeeded,
 		arg.SiblingGroupID,
@@ -739,6 +750,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -762,7 +774,7 @@ func (q *Queries) DeleteRunSchedule(ctx context.Context, arg DeleteRunSchedulePa
 }
 
 const getDefaultScheduleForRepoSlug = `-- name: GetDefaultScheduleForRepoSlug :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch FROM run_schedules
 WHERE user_id = $1 AND repo_id = $2 AND catalog_slug = $3
   AND origin = 'default'
 `
@@ -815,12 +827,13 @@ func (q *Queries) GetDefaultScheduleForRepoSlug(ctx context.Context, arg GetDefa
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
 
 const getRunSchedule = `-- name: GetRunSchedule :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed FROM run_schedules WHERE id = $1
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch FROM run_schedules WHERE id = $1
 `
 
 // Unscoped fetch by id (server-internal: the claimer/firing path already holds a
@@ -864,12 +877,13 @@ func (q *Queries) GetRunSchedule(ctx context.Context, id uuid.UUID) (RunSchedule
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
 
 const getRunScheduleForUser = `-- name: GetRunScheduleForUser :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed FROM run_schedules WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch FROM run_schedules WHERE id = $1 AND user_id = $2
 `
 
 type GetRunScheduleForUserParams struct {
@@ -918,6 +932,7 @@ func (q *Queries) GetRunScheduleForUser(ctx context.Context, arg GetRunScheduleF
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -981,7 +996,7 @@ func (q *Queries) ListEnabledDefaultsForUser(ctx context.Context, userID uuid.UU
 }
 
 const listRunSchedulesForUser = `-- name: ListRunSchedulesForUser :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
 `
 
 // The owner's schedules, newest first.
@@ -1030,6 +1045,7 @@ func (q *Queries) ListRunSchedulesForUser(ctx context.Context, userID uuid.UUID)
 			&i.CredentialOverrideSecretID,
 			&i.CapacityLimit,
 			&i.CapacityRoomNeeded,
+			&i.RemoveLabelOnDispatch,
 		); err != nil {
 			return nil, err
 		}
@@ -1147,32 +1163,36 @@ SET cron_expr     = $1,
     max_issues    = $7,
     guidance      = NULL,
     output_mode   = $8,
+    remove_label_on_dispatch = $9,
     override_subagent_model = false,
-    capacity_limit = NULL,
-    capacity_room_needed = NULL,
+    capacity_limit = $10,
+    capacity_room_needed = $11,
     harness       = NULL,
     credential_override_mode = NULL,
     credential_override_secret_id = NULL,
-    next_fire_at  = $9,
+    next_fire_at  = $12,
     customized    = false,
     status        = 'active',
     updated_at    = now()
-WHERE id = $10 AND user_id = $11 AND origin = 'default'
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+WHERE id = $13 AND user_id = $14 AND origin = 'default'
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type ResetDefaultScheduleParams struct {
-	CronExpr        pgtype.Text        `json:"cron_expr"`
-	Timezone        string             `json:"timezone"`
-	Model           pgtype.Text        `json:"model"`
-	AutoApprove     bool               `json:"auto_approve"`
-	WaitOnLimit     bool               `json:"wait_on_limit"`
-	MrReworkEnabled pgtype.Bool        `json:"mr_rework_enabled"`
-	MaxIssues       pgtype.Int4        `json:"max_issues"`
-	OutputMode      pgtype.Text        `json:"output_mode"`
-	NextFireAt      pgtype.Timestamptz `json:"next_fire_at"`
-	ID              uuid.UUID          `json:"id"`
-	UserID          uuid.UUID          `json:"user_id"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	Timezone              string             `json:"timezone"`
+	Model                 pgtype.Text        `json:"model"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	OutputMode            pgtype.Text        `json:"output_mode"`
+	RemoveLabelOnDispatch bool               `json:"remove_label_on_dispatch"`
+	CapacityLimit         pgtype.Int4        `json:"capacity_limit"`
+	CapacityRoomNeeded    pgtype.Int4        `json:"capacity_room_needed"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	ID                    uuid.UUID          `json:"id"`
+	UserID                uuid.UUID          `json:"user_id"`
 }
 
 // Restore a default-origin schedule's editable fields to the catalog defaults and clear
@@ -1205,6 +1225,9 @@ func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultSche
 		arg.MrReworkEnabled,
 		arg.MaxIssues,
 		arg.OutputMode,
+		arg.RemoveLabelOnDispatch,
+		arg.CapacityLimit,
+		arg.CapacityRoomNeeded,
 		arg.NextFireAt,
 		arg.ID,
 		arg.UserID,
@@ -1246,6 +1269,7 @@ func (q *Queries) ResetDefaultSchedule(ctx context.Context, arg ResetDefaultSche
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -1254,7 +1278,7 @@ const resumeRecurringSchedule = `-- name: ResumeRecurringSchedule :one
 UPDATE run_schedules
 SET enabled = $1, next_fire_at = $2, updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type ResumeRecurringScheduleParams struct {
@@ -1313,6 +1337,7 @@ func (q *Queries) ResumeRecurringSchedule(ctx context.Context, arg ResumeRecurri
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -1321,7 +1346,7 @@ const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one
 UPDATE run_schedules
 SET enabled = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type SetRunScheduleEnabledParams struct {
@@ -1370,6 +1395,7 @@ func (q *Queries) SetRunScheduleEnabled(ctx context.Context, arg SetRunScheduleE
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -1378,7 +1404,7 @@ const setRunScheduleStatus = `-- name: SetRunScheduleStatus :one
 UPDATE run_schedules
 SET status = $1, updated_at = now()
 WHERE id = $2
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type SetRunScheduleStatusParams struct {
@@ -1427,6 +1453,7 @@ func (q *Queries) SetRunScheduleStatus(ctx context.Context, arg SetRunScheduleSt
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }
@@ -1450,17 +1477,18 @@ SET target        = $1,
     guidance      = $15,
     model         = $16,
     output_mode   = $17,
-    override_subagent_model = $18,
-    capacity_limit = $19,
-    capacity_room_needed = $20,
-    harness       = $21,
-    credential_override_mode = $22,
-    credential_override_secret_id = $23,
-    customized    = $24,
+    remove_label_on_dispatch = $18,
+    override_subagent_model = $19,
+    capacity_limit = $20,
+    capacity_room_needed = $21,
+    harness       = $22,
+    credential_override_mode = $23,
+    credential_override_secret_id = $24,
+    customized    = $25,
     status        = 'active',
     updated_at    = now()
-WHERE id = $25 AND user_id = $26
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed
+WHERE id = $26 AND user_id = $27
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch
 `
 
 type UpdateRunScheduleParams struct {
@@ -1481,6 +1509,7 @@ type UpdateRunScheduleParams struct {
 	Guidance                   pgtype.Text        `json:"guidance"`
 	Model                      pgtype.Text        `json:"model"`
 	OutputMode                 pgtype.Text        `json:"output_mode"`
+	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	OverrideSubagentModel      bool               `json:"override_subagent_model"`
 	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
@@ -1521,6 +1550,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.Guidance,
 		arg.Model,
 		arg.OutputMode,
+		arg.RemoveLabelOnDispatch,
 		arg.OverrideSubagentModel,
 		arg.CapacityLimit,
 		arg.CapacityRoomNeeded,
@@ -1568,6 +1598,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		&i.CredentialOverrideSecretID,
 		&i.CapacityLimit,
 		&i.CapacityRoomNeeded,
+		&i.RemoveLabelOnDispatch,
 	)
 	return i, err
 }

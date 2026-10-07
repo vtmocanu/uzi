@@ -1,4 +1,5 @@
 {
+  "remove_label_on_dispatch": true,
   "capacity_limit": 1,
   "capacity_room_needed": 1,
   "id": "x",
@@ -50,6 +51,9 @@
     "ineligible_matched": 1,
     "started": [
       {
+        "label_removed": true,
+        "label_remove_failed": true,
+        "selector_label": "x",
         "issue_iid": 1,
         "run_id": "x",
         "title": "x",

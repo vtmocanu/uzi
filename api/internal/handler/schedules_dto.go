@@ -166,6 +166,7 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		dto.OutputMode = &v
 	}
 	// override_subagent_model is a plain bool column (never NULL, PRD #305), so always set it.
+	dto.RemoveLabelOnDispatch = s.RemoveLabelOnDispatch
 	ov := s.OverrideSubagentModel
 	dto.OverrideSubagentModel = &ov
 	// last_fire is the persisted jsonb summary of the most recent fire (PRD #308 M3). NULL

@@ -1139,6 +1139,7 @@ type RunSchedule struct {
 	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
 	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
+	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 }
 
 type RunUsage struct {

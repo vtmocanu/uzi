@@ -84,6 +84,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		[]string{"APPLY_MODEL_TO_AGENTS", boolStr(s.OverrideSubagentModel != nil && *s.OverrideSubagentModel)},
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
+		[]string{"REMOVE_LABEL_ON_DISPATCH", boolStr(s.RemoveLabelOnDispatch)},
 		[]string{"MR_REWORK", triStateStr(s.MrReworkEnabled)},
 		[]string{"TOKEN", scheduleTokenCell(s)},
 		// HARNESS (PRD #1429 M5, D2): the schedule's per-run harness pin. A null pin is an
@@ -212,7 +213,7 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 	p.Printf("  fired %s · examined %d · started %d · skipped %d\n",
 		lf.FiredAt.UTC().Format(time.RFC3339), lf.Matched, len(lf.Started), len(lf.Skips))
 	for _, st := range lf.Started {
-		p.Printf("    %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
+		renderStartedScheduleRun(p, "    ", st)
 	}
 	for _, sk := range lf.Skips {
 		p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), sk.Title)
@@ -264,7 +265,7 @@ func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 		p.Printf("\n")
 	}
 	for _, st := range res.Started {
-		p.Printf("  %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
+		renderStartedScheduleRun(p, "  ", st)
 	}
 	if len(res.Skips) > 0 {
 		p.Printf("Examined %d candidate(s), skipped %d:\n", res.Matched, len(res.Skips))
@@ -277,6 +278,24 @@ func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 		}
 	}
 	printIneligibleMatched(p, res.IneligibleMatched)
+}
+
+// renderStartedScheduleRun uses only the fire-time selector snapshot. Older fires
+// without a snapshot get generic wording rather than the schedule's current label.
+func renderStartedScheduleRun(p *uzicli.Printer, indent string, st apitypes.LastFireStarted) {
+	outcome := ""
+	label := "label"
+	if st.SelectorLabel != "" {
+		label = uzicli.CellText(st.SelectorLabel)
+	}
+	switch {
+	case st.LabelRemoveFailed:
+		outcome = " · " + label + " could not be removed (the run started; remove it by hand)"
+	case st.LabelRemoved:
+		outcome = " · " + label + " removed"
+	}
+	p.Printf("%s%s → run %s  %s%s\n", indent, fireCandidateLabel(st.IssueIID),
+		uzicli.CellText(st.RunID), uzicli.CellText(st.Title), outcome)
 }
 
 func scheduleCapacitySetting(s apitypes.ScheduleDTO) string {

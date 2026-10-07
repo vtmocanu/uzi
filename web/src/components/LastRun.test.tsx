@@ -35,6 +35,7 @@ function sched(over: Partial<Schedule> = {}): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: 3,
@@ -321,5 +322,27 @@ describe("capacity fire presentation", () => {
     expect(screen.getByText("1 started")).toBeTruthy();
     expect(screen.getByText(/2 unfinished runs, limit 4/)).toBeTruthy();
     expect(screen.queryByText("Waiting for room")).toBeNull();
+  });
+});
+
+describe("fire-time selector removal outcomes", () => {
+  it.each([
+    [{ label_removed: true }, "on-deck removed"],
+    [{ label_remove_failed: true }, "on-deck could not be removed (the run started; remove it by hand)"],
+    [{ label_removed: false, label_remove_failed: false }, null],
+    [{}, null],
+  ] as const)("renders snapshot outcomes %j after editing the selector and flag", (flags, message) => {
+    const snapshot: LastFire = { ...fire([]), matched: 1, started: [{ issue_iid: 1001, run_id: "run-done", title: "Demo", selector_label: "on-deck", ...flags }] };
+    const view = render(<MemoryRouter><LastFireDetail s={sched({ labels: ["changed"], remove_label_on_dispatch: false })} fire={snapshot} /></MemoryRouter>);
+    if (message) expect(screen.getByText(message)).toBeTruthy();
+    else expect(view.container.textContent).not.toMatch(/removed|remove it by hand/);
+    view.unmount();
+    render(<MemoryRouter><LastRunOutcome fire={snapshot} expanded={false} onToggle={vi.fn()} panelId="fire" /></MemoryRouter>);
+    if (message) expect(screen.getByText(message)).toBeTruthy();
+    else expect(screen.queryByText(/removed|remove it by hand/)).toBeNull();
+  });
+  it("uses generic label for a legacy fire without a snapshot", () => {
+    render(<MemoryRouter><LastFireDetail s={sched({ labels: ["changed"] })} fire={{ ...fire([]), started: [{ issue_iid: 1, run_id: "legacy", title: "", label_removed: true }] }} /></MemoryRouter>);
+    expect(screen.getByText("label removed")).toBeTruthy();
   });
 });

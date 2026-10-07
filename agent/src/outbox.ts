@@ -498,6 +498,8 @@ export class Outbox {
       if (e.isDir) runDirs.push(e.name);
     }
 
+    for (const runId of runDirs) await this.cleanupTerminalInstallTemps(runId);
+
     // Does any run carry a manifest? Presence of the FILE decides the key policy,
     // regardless of whether that manifest authenticates (a bad manifest still
     // proves records once existed, so minting a fresh key would orphan its MACs).
@@ -565,6 +567,38 @@ export class Outbox {
     // reserve, the next few terminal journals — can still be written on a full volume
     // (released on ENOSPC, then replenished). GROWS an undersized existing `.reserve`.
     await this.ensureReserve();
+  }
+
+  /** Boot only: init finishes before writers start. The run mutex is instance-local,
+   *  not cross-process; another Outbox must not write this root during init.
+   *  Runtime physical terminal protection remains conservative. */
+  private async cleanupTerminalInstallTemps(runId: string): Promise<void> {
+    if (!this.validRunId(runId)) return;
+    await this.withRunLock(runId, async () => {
+      let removed = false;
+      try {
+        if (!await this.terminalDirectorySafe(runId)) return;
+        const dir = this.runDir(runId);
+        // One finite directory snapshot, no retries. A failure stops this run's
+        // cleanup; sibling run directories still get their own attempt.
+        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+          if (!entry.isFile()) continue;
+          const match = /^(terminal-\d+\.json)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/.exec(entry.name);
+          if (!match?.[1]) continue;
+          const generation = parseTerminalFileName(match[1]);
+          if (generation === undefined || match[1] !== terminalFileName(generation)) continue;
+          const file = path.join(dir, entry.name);
+          if (!(await fs.lstat(file)).isFile()) continue;
+          await fs.unlink(file);
+          removed = true;
+        }
+      } catch {
+        // Do not include paths, names, contents or filesystem error text.
+        this.log.warn("outbox: terminal temp startup cleanup failed", {});
+      } finally {
+        if (removed) await this.fsyncDir(this.runDir(runId));
+      }
+    });
   }
 
   private async loadOrMintKey(hasRecords: boolean): Promise<boolean> {

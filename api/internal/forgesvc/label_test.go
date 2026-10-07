@@ -116,13 +116,12 @@ func TestSetIssueLabelRemovePreservesOtherLabels(t *testing.T) {
 	}
 	// Cache: only the one label dropped, everything else kept in order; has_prd_link
 	// preserved (true).
-	assertLabels(t, st.labelUpserts[0].Labels, []string{"PRD", "In Progress"})
-	if !st.labelUpserts[0].HasPrdLink {
-		t.Fatal("has_prd_link must be preserved verbatim (true)")
+	if len(st.labelUpserts) != 0 || len(st.labelRemovals) != 1 || st.labelRemovals[0].RepoID != issue.RepoID || st.labelRemovals[0].ForgeIssueIid != 4 || st.labelRemovals[0].Label != "uzi" {
+		t.Fatalf("cache removal=%+v upserts=%+v", st.labelRemovals, st.labelUpserts)
 	}
 }
 
-func TestSetIssueLabelRemoveIdempotentSkipsForge(t *testing.T) {
+func TestSetIssueLabelRemoveAbsentCacheStillRemovesOnForge(t *testing.T) {
 	st := &fakeStore{}
 	svc := newLabelSvc(st)
 	f := &fakeForge{}
@@ -131,8 +130,11 @@ func TestSetIssueLabelRemoveIdempotentSkipsForge(t *testing.T) {
 	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "uzi", PromoteLabelColor, false); err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
-	if len(f.updateCalls) != 0 || len(st.labelUpserts) != 0 {
-		t.Fatal("removing an already-absent label must be a local no-op with no forge or cache write")
+	if len(f.ensureCalls) != 0 || len(f.updateCalls) != 1 || len(f.updateCalls[0].add) != 0 || !slices.Equal(f.updateCalls[0].remove, []string{"uzi"}) {
+		t.Fatalf("absent cache must still send removal: ensure=%+v update=%+v", f.ensureCalls, f.updateCalls)
+	}
+	if len(st.labelUpserts) != 0 || len(st.labelRemovals) != 1 || st.labelRemovals[0].Label != "uzi" {
+		t.Fatalf("cache removal=%+v upserts=%+v", st.labelRemovals, st.labelUpserts)
 	}
 }
 

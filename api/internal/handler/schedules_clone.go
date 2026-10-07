@@ -107,6 +107,18 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	selector := schedtmpl.SelectorLabel
+	cloneLabels := cur.Labels
+	if cur.Origin == "default" {
+		if job, ok := schedtmpl.BySlug(cur.CatalogSlug.String); ok {
+			selector = job.SelectorKind
+			cloneLabels = marshalLabels(job.Labels)
+		}
+	}
+	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: cur.Target, Timing: cur.Timing, Labels: scheduleLabelsToSlice(cloneLabels), RemoveLabelOnDispatch: &cur.RemoveLabelOnDispatch}, selector); status != 0 {
+		httpx.Error(w, status, msg)
+		return
+	}
 	nextFire, err := cloneNextFire(cur, h.clock())
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
@@ -129,6 +141,7 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		WaitOnLimit:           cur.WaitOnLimit,
 		Enabled:               cur.Enabled,
 		MaxIssues:             cur.MaxIssues,
+		RemoveLabelOnDispatch: cur.RemoveLabelOnDispatch,
 		CapacityLimit:         cur.CapacityLimit,
 		CapacityRoomNeeded:    cur.CapacityRoomNeeded,
 		Guidance:              guidance,
@@ -211,6 +224,10 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: cur.Target, Timing: cur.Timing, Labels: scheduleLabelsToSlice(cur.Labels), RemoveLabelOnDispatch: &cur.RemoveLabelOnDispatch}, schedtmpl.SelectorLabel); status != 0 {
+		httpx.Error(w, status, msg)
+		return
+	}
 	nextFire, err := cloneNextFire(cur, h.clock())
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "could not compute the next fire time")
@@ -261,6 +278,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		WaitOnLimit:           cur.WaitOnLimit,
 		Enabled:               cur.Enabled,
 		MaxIssues:             cur.MaxIssues,
+		RemoveLabelOnDispatch: cur.RemoveLabelOnDispatch,
 		CapacityLimit:         cur.CapacityLimit,
 		CapacityRoomNeeded:    cur.CapacityRoomNeeded,
 		Guidance:              cur.Guidance,

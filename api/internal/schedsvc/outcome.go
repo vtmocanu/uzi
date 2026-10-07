@@ -6,9 +6,12 @@ import "github.com/google/uuid"
 // for an issue-less prompt schedule), the run it produced, and the issue/prompt title so
 // the UI can pair the issue with its run without a second fetch (PRD #308).
 type Started struct {
-	IssueIID *int64
-	RunID    uuid.UUID
-	Title    string
+	LabelRemoved      bool
+	LabelRemoveFailed bool
+	SelectorLabel     string
+	IssueIID          *int64
+	RunID             uuid.UUID
+	Title             string
 	// WebURL is the forge issue's web URL snapshotted at fire time (PRD #411); empty for
 	// prompt schedules and for skips that never fetched the issue.
 	WebURL string

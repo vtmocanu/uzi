@@ -58,6 +58,7 @@ const CATALOG = {
       slug: "bug-triage",
       name: "Bug triage sweep",
       description: "Daily bug sweep",
+      remove_label_on_dispatch: false,
       target: "sweep" as const,
       cron: "0 2 * * *",
       timezone: "UTC",
@@ -98,6 +99,7 @@ function sched(over: Partial<Schedule>): Schedule {
     last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
+    remove_label_on_dispatch: false,
     capacity_limit: null,
     capacity_room_needed: null,
     max_issues: 10,
@@ -255,6 +257,7 @@ describe("Schedules — enable-default sends the browser timezone (issue #660)",
         slug: "bug-triage",
         name: "Bug triage sweep",
         description: "Daily bug sweep",
+        remove_label_on_dispatch: false,
         target: "sweep" as const,
         cron: "0 2 * * *",
         timezone: "UTC",
@@ -2146,5 +2149,23 @@ describe("Schedules — M2 review notes", () => {
     await waitFor(() => expect(document.getElementById("schedule-name-g3")).not.toBeNull());
     await act(async () => {});
     expect(document.activeElement).not.toBe(document.getElementById("schedule-name-g3"));
+  });
+});
+
+describe("manual fire removal notice", () => {
+  it.each([
+    [{ label_removed: true }, "on-deck removed"],
+    [{ label_remove_failed: true }, "on-deck could not be removed (the run started; remove it by hand)"],
+    [{}, null],
+  ] as const)("shows snapshotted outcomes %j", async (flags, message) => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault({ customized: false, labels: ["edited"], remove_label_on_dispatch: false })]);
+    mockApi.runScheduleNow.mockResolvedValue({ created: 1, run_ids: ["r"], matched: 1, capped: false,
+      started: [{ issue_iid: 1001, run_id: "r", title: "", selector_label: "on-deck", ...flags }], skips: [] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Run now: Bug triage sweep on vtmocanu/uzi" }));
+    const notice = await screen.findByText(/Started 1 run from this schedule/);
+    if (message) expect(notice.textContent).toContain(message);
+    else expect(notice.textContent).not.toMatch(/removed|remove it by hand/);
   });
 });

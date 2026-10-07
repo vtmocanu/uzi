@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Recurring single-label sweeps can consume their selector label after dispatch ([#2344](https://github.com/vtmocanu/uzi/issues/2344)).**
+  Single-label recurring sweeps can remove their selector after a run starts, with API, CLI and web controls. Fire history reports removal success or failure using the original label; failures keep the started run, and owners re-add a successfully removed label to retry failed work. The new On-deck sweep (`ondeck-sweep`) provides a triaged `on-deck` backlog drain every 10 minutes (`*/10 * * * *`, UTC), starting at most one issue when at least two slots remain under an unfinished-work limit of four, with best-effort selector removal after creation and an advisory missing-label check. Enable and Reset persist catalog capacity and removal values; owner edits mark divergence, exact restoration or Reset clears it, and editable gate/removal settings are not overlaid at fire time. Older catalog entries retain null gates and removal off; existing schedules keep their settings. The Every N minutes preset accepts 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 and 30 as `*/N * * * *`; uneven steps such as `*/40` stay custom cron.
+
 - **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
   Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a read-only Codex child before implementing: an exact-plan pass permits implementation, while changes requested, blocked, timeout, unavailable checker or submission failure normally forces a human gate. Codex leads park as unsupported. Irrecoverable receipt loss fails with `plan cross-check: preparation receipts irrecoverably lost`; presentation ACK loss fails with `plan cross-check: human-presentation ACK unrecoverable`; unresolved preparation ACKs after three attempts and an acknowledged forced human gate fail with `plan cross-check: preparation ACKs unrecoverable`. None of these delivery failures approves, retries indefinitely or enters recovery wait.
 
@@ -51,6 +54,9 @@ through `[0.52.0]`.)
   Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
 
 ### Fixed
+
+- **Agent startup reclaims stale terminal journal temps ([#2308](https://github.com/vtmocanu/uzi/issues/2308)).**
+  Startup removes canonical regular-file terminal install temps before key loading so interrupted writes no longer pin empty runs; installed journals, unknown entries and live-write retirement protection remain intact.
 
 - **Recorded finding-group settlement errors no longer stop issue sync ([#1946](https://github.com/vtmocanu/uzi/issues/1946)).**
   Board refresh and polling continue updating the issue cache when a recorded finding group cannot settle. The failed group stays claimed, is logged for diagnosis, and is retried on a later pass while other recorded groups on the page still settle.
