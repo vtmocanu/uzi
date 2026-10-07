@@ -423,6 +423,31 @@ describe("verifyBundleReproduces judges completeness from the bundle bytes, not 
     }
   };
 
+  /** While `work` runs, write `content` to `rel` inside every `verify-*` repo that appears under the archive root. */
+  const withFilePlanting = async <T>(rel: string, content: string, work: () => Promise<T>): Promise<{ result: T; planted: number }> => {
+    let stop = false;
+    let planted = 0;
+    const seen = new Set<string>();
+    const poll = (async () => {
+      while (!stop) {
+        for (const d of fs.readdirSync(topo.archiveRoot).filter((n) => n.startsWith("verify-") && !seen.has(n))) {
+          seen.add(d);
+          const f = path.join(topo.archiveRoot, d, rel);
+          fs.mkdirSync(path.dirname(f), { recursive: true });
+          fs.writeFileSync(f, content);
+          planted++;
+        }
+        await new Promise((r) => setImmediate(r));
+      }
+    })();
+    try {
+      return { result: await work(), planted };
+    } finally {
+      stop = true;
+      await poll;
+    }
+  };
+
   const blobOid = (): string => git(topo.bare, ["rev-parse", `${topo.head}:${topo.blobPath}`]);
   const without = (rev: string, drop: string): string[] => closure(rev).map(([o]) => o).filter((o) => o !== drop);
 
@@ -505,6 +530,23 @@ describe("verifyBundleReproduces judges completeness from the bundle bytes, not 
     const b = craft(hdr(topo.head), closure(topo.baseSha).map(([o]) => o));
     const { result, planted } = await withPlanting(closure(topo.head).map(([o]) => o), () => verify(b));
     assert.ok(planted >= 1);
+    assert.match(String(result), /not self-contained and connected/);
+  });
+
+  // H's commit, tree and blobs, but not its parent commit (nor any ancestor commit).
+  const headWithoutParent = (): string[] => closure(topo.head).filter(([o, t]) => t !== "commit" || o === topo.head).map(([o]) => o);
+
+  it("rejects a bundle missing H's parent even when H is planted into the verify repository's shallow file", async () => {
+    const b = craft(hdr(topo.head), headWithoutParent());
+    const { result, planted } = await withFilePlanting("shallow", `${topo.head}\n`, () => verify(b));
+    assert.ok(planted >= 1, "the shallow file was planted");
+    assert.match(String(result), /not self-contained and connected/);
+  });
+
+  it("rejects a bundle missing H's parent even when H is planted into the verify repository's info/grafts", async () => {
+    const b = craft(hdr(topo.head), headWithoutParent());
+    const { result, planted } = await withFilePlanting("info/grafts", `${topo.head}\n`, () => verify(b));
+    assert.ok(planted >= 1, "the grafts file was planted");
     assert.match(String(result), /not self-contained and connected/);
   });
 

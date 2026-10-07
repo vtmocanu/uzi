@@ -3754,7 +3754,9 @@ export class GitCache {
    *      `git index-pack --stdin --strict --check-self-contained-and-connected` (an internal git
    *      option, pinned by tests) runs on it in a FRESH temporary bare repository: exit 0 and stdout
    *      exactly `pack\t<new trailer>\n` prove that every object reachable from `sha` is inside the
-   *      pack. The repository's store can only lower this verdict (never `--fix-thin`);
+   *      pack. The git environment pins `GIT_SHALLOW_FILE` and `GIT_GRAFT_FILE` to `/dev/null`, so a
+   *      planted `shallow` or `info/grafts` file in the temporary repository cannot cut the walk
+   *      short; the rest of the repository's store can only lower this verdict (never `--fix-thin`);
    *   3. `git bundle list-heads -` over stdin names exactly `sha` (cross-check).
    * SHA-256 repositories are rejected at step 1. Worker-uid, credential-free (`gitEnv()`); the
    * temporary repo is always removed. Returns undefined when verified, else a short reason (never
@@ -3762,11 +3764,11 @@ export class GitCache {
    */
   async verifyBundleReproduces(bundle: Buffer, sha: string, scratchRoot: string): Promise<string | undefined> {
     let dir: string | undefined;
-    const withStdin = async (cwd: string, args: string[], input: Buffer): Promise<string> => {
+    const withStdin = async (cwd: string, args: string[], input: Buffer, extraEnv: Record<string, string> = {}): Promise<string> => {
       const full = withDir(cwd, args);
       this.log.debug("git (stdin)", { cwd, args });
       const { stdout } = await this.execScoped("git", full, {
-        env: gitEnv(),
+        env: { ...gitEnv(), ...extraEnv },
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
         input,
@@ -3787,7 +3789,12 @@ export class GitCache {
       if (oids.size !== 1 || !oids.has(sha)) return "the bundle's heads are not exactly the committed head";
       let out: string;
       try {
-        out = await withStdin(dir, ["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"], parsed.probePack);
+        out = await withStdin(
+          dir,
+          ["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"],
+          parsed.probePack,
+          { GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" },
+        );
       } catch (err) {
         return `the bundle is not self-contained and connected: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
       }

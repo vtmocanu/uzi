@@ -111,7 +111,8 @@ deletes a pin or changes the journal or the hold:
    trailer checked) plus a probe-tag proof, an in-memory tag object naming H appended
    to the pack and fed to `git index-pack --strict --check-self-contained-and-connected`
    in a fresh temporary bare repository, computed from the snapshot bytes alone (the
-   object store can only lower the verdict), with `list-heads` as a cross-check. The
+   `GIT_SHALLOW_FILE` and `GIT_GRAFT_FILE` overrides neutralise a planted shallow or
+   graft file, and the remaining store state can only lower the verdict), with `list-heads` as a cross-check. The
    proof relies on an internal git option, pinned by tests. SHA-256 repositories get no
    archive (the head read already requires 40-hex);
 4. re-read the archive ref (still H);
