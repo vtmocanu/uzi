@@ -1393,7 +1393,8 @@ describe("m1 credential-free owner cancel", () => {
   const cases = [
     ...["clean", "dirty", "untracked", "committed", "replace", "forged-stat", "lossy-path", "hidden", "assume", "skip", "filter",
       "symlink-dangling", "symlink-outside", "symlink-changed", "symlink-file",
-      "info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules"].map(work => ({ work })),
+      "info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules",
+      "root-gitignore", "nested-gitignore"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
@@ -1618,6 +1619,17 @@ describe("m1 credential-free owner cancel", () => {
           }
           assert.equal(await git.worktreeHead(clone), startHead, "ignore fixture leaves HEAD unchanged");
         }
+        const ignoredSourcePaths = work === "root-gitignore" ? [".gitignore", "NEW.ts"] :
+          work === "nested-gitignore" ? ["hidden-source/.gitignore", "hidden-source/NEW.ts"] : [];
+        if (ignoredSourcePaths.length > 0) {
+          const directory = work === "root-gitignore" ? clone : path.join(clone, "hidden-source");
+          await fs.mkdir(directory, { recursive: true });
+          await fs.writeFile(path.join(directory, ".gitignore"), "*\n");
+          await fs.writeFile(path.join(directory, "NEW.ts"), "export const unpublished = true;\n");
+          assert.equal(gitInClone("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"),
+            "", "ordinary status hides wildcard-ignored unpublished source");
+          assert.equal(await git.worktreeHead(clone), startHead, "wildcard ignore fixture leaves HEAD unchanged");
+        }
         if (work === "dirty") await fs.appendFile(path.join(clone, "README.md"), "changed");
         if (work === "untracked" || work === "hidden") await fs.writeFile(path.join(clone, "NEW.txt"), "unpublished");
         if (work === "hidden") gitInClone("config", "status.showUntrackedFiles", "no");
@@ -1692,6 +1704,7 @@ describe("m1 credential-free owner cancel", () => {
         }
         const beforeCancel = new Map<string, Buffer>();
         for (const name of ["README.md", "NEW.txt", "RECOVERED.txt", ".gitattributes",
+          ...ignoredSourcePaths,
           ...(["forged-stat", "lossy-path"].includes(work) ? [".git/index", ".git/config"] : []),
           ...(work === "lossy-path" ? [twinName] : []),
           ...(excludeBeforeCancel !== undefined ? [".git/info/exclude"] : [])]) {
@@ -1700,6 +1713,9 @@ describe("m1 credential-free owner cancel", () => {
             throw error;
           });
           if (bytes !== undefined) beforeCancel.set(name, bytes);
+        }
+        for (const name of ignoredSourcePaths) {
+          assert.ok(beforeCancel.has(name), `${name} fixture exists and was read before cancellation`);
         }
         const rawBeforeCancel = work === "lossy-path" ? await fs.readFile(rawPath(clone)) : undefined;
         api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
@@ -1727,7 +1743,7 @@ describe("m1 credential-free owner cancel", () => {
         if (shouldRelease) assert.deepEqual(releases[0], [claim.run_id, 7]);
         else {
           assert.equal((await fs.stat(clone)).isDirectory(), true, "source retained");
-          if (work === "info-exclude" || work === "external-excludes") {
+          if (work === "info-exclude" || work === "external-excludes" || ignoredSourcePaths.length > 0) {
             assert.equal(await git.worktreeHead(clone), startHead, "retained HEAD unchanged");
           }
           if (work.startsWith("symlink-")) {
