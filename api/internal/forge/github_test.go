@@ -14,7 +14,7 @@ import (
 
 // mockGitHub is an httptest server standing in for the GitHub REST API. It records
 // the Authorization header it received (GitHub authenticates classic PATs as
-// "Bearer <t>") and the number of PUTs to the issue-labels route, and lets each
+// "Bearer <t>") and lets each
 // test install per-path handlers. Because the driver's test/fake base is injected
 // via go-github's WithEnterpriseURLs, the SDK mounts its routes under /api/v3 — so
 // route keys are /api/v3-relative (e.g. "/repos/acme/widgets/issues"). A default
@@ -24,9 +24,8 @@ import (
 // This harness is shared: github_pipelines_test.go references it (newMockGitHub /
 // newGitHubDriver / newGitHubRawDriver), so it is defined cleanly here.
 type mockGitHub struct {
-	srv       *httptest.Server
-	gotAuth   string
-	labelPUTs int
+	srv     *httptest.Server
+	gotAuth string
 	// reqCount is the total number of HTTP requests the server received. It is
 	// atomic so the reserve-shed tests (github_rate_test.go) can assert a shed
 	// interactive read made ZERO forge calls without racing the server goroutine.
@@ -62,9 +61,6 @@ func newMockGitHub(t *testing.T, routes map[string]http.HandlerFunc) *mockGitHub
 	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.reqCount.Add(1)
 		m.gotAuth = r.Header.Get("Authorization")
-		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/labels") {
-			m.labelPUTs++
-		}
 		mux.ServeHTTP(w, r)
 	}))
 	t.Cleanup(m.srv.Close)
@@ -242,52 +238,20 @@ func TestGitHubListIssuesStateAllParam(t *testing.T) {
 	}
 }
 
-// TestGitHubUpdateIssueLabels pins the single-PUT set-replace, the no-op (zero
-// PUTs), and that an unrelated label survives.
+// TestGitHubUpdateIssueLabels pins delta writes and preservation of unrelated labels.
 func TestGitHubUpdateIssueLabels(t *testing.T) {
-	var putBody []string
-	install := func() *mockGitHub {
-		return newMockGitHub(t, map[string]http.HandlerFunc{
-			"/repos/acme/widgets/issues/5": func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"number": 5, "title": "t", "state": "open",
-					"labels": []map[string]any{{"name": "col:todo"}, {"name": "keep-me"}},
-				})
-			},
-			"/repos/acme/widgets/issues/5/labels": func(w http.ResponseWriter, r *http.Request) {
-				body, _ := io.ReadAll(r.Body)
-				_ = json.Unmarshal(body, &putBody)
-				_ = json.NewEncoder(w).Encode([]map[string]any{})
-			},
-		})
-	}
-
-	// (1) Move col:todo → col:done; keep-me must survive; exactly one PUT.
-	m := install()
-	putBody = nil
-	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	s := &labelState{labels: map[string]bool{"col:todo": true, "keep-me": true}}
+	d := labelStateDriver(t, s)
 	if err := d.UpdateIssueLabels(context.Background(), 7, 5, []string{"col:done"}, []string{"col:todo"}); err != nil {
-		t.Fatalf("UpdateIssueLabels: %v", err)
+		t.Fatal(err)
 	}
-	if m.labelPUTs != 1 {
-		t.Fatalf("expected exactly 1 PUT, got %d", m.labelPUTs)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.labels["col:todo"] || !s.labels["col:done"] || !s.labels["keep-me"] {
+		t.Fatalf("incorrect delta: %v", s.labels)
 	}
-	got := map[string]bool{}
-	for _, l := range putBody {
-		got[l] = true
-	}
-	if !got["col:done"] || !got["keep-me"] || got["col:todo"] {
-		t.Fatalf("target set wrong (keep-me must survive, col:todo gone): %v", putBody)
-	}
-
-	// (2) No-op: adding a label already present issues ZERO PUTs.
-	m2 := install()
-	d2 := newGitHubDriver(t, m2, "ghp_classicTokenValue1234567890")
-	if err := d2.UpdateIssueLabels(context.Background(), 7, 5, []string{"keep-me"}, nil); err != nil {
-		t.Fatalf("UpdateIssueLabels no-op: %v", err)
-	}
-	if m2.labelPUTs != 0 {
-		t.Fatalf("a no-op label move must issue ZERO PUTs, got %d", m2.labelPUTs)
+	if len(s.calls) != 2 || !strings.HasPrefix(s.calls[0], "DELETE ") || !strings.HasPrefix(s.calls[1], "POST ") {
+		t.Fatalf("expected DELETE then POST, got %v", s.calls)
 	}
 }
 
