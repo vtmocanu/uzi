@@ -1026,6 +1026,15 @@ Tracked as GitHub issue vtmocanu/uzi#1695.
 
 - A top-level MR comment consisting solely of an allowlisted review-bot control command (CodeRabbit's `@coderabbitai review` family; Greptile's `@greptileai review` / `@greptile review`) is not actionable review feedback and never starts an mr_rework; any added prose, or an inline comment, still counts. (AI-synced 2026-09-25)
 
+## Feature #2347 — Author eligibility for MR review comments
+
+Tracked as GitHub issue vtmocanu/uzi#2347; design rationale in `adr/2347-review-comment-author-trust.md`.
+
+- An MR review comment reaches an mr_rework run, and can trigger one, only when its author has repository access or is an allowlisted review bot; comments from anyone else, and from authors whose access cannot be verified in time, are withheld (omitted, with counts shown to the agent). Unknown never triggers. (AI-synced 2026-10-07)
+- The instance setting `mr_review_trusted_bots` (admin-only, default empty) lists trusted bots as `<base_url>#<forge_user_id>`; a bot matches by forge instance plus numeric user id, never login. Allowlisting only permits ingestion: bot text stays untrusted, and a trusted bot's summary or walkthrough comment never triggers. (AI-synced 2026-10-07)
+- Reply/resolve is allowed only on a thread with an included (eligible) comment in the run's snapshot; a wholly withheld thread is refused 403. Snapshots from before this change are replayed empty and authorize no thread. (AI-synced 2026-10-07)
+- An outsider flood never suppresses or displaces an eligible finding, but may delay it, bounded only conditionally; this departs from the issue's zero-delay criterion and is pending maintainer confirmation. (AI-synced 2026-10-07)
+
 ## Feature #1732 — Disable and re-enable account credentials
 
 Tracked as GitHub issue vtmocanu/uzi#1732; PRD at `prds/done/1732-disable-account-credentials.md`.

@@ -26,19 +26,23 @@ it queues a new `mr_rework` run, auto-approved so it starts working right away:
 - the MR's head pipeline is **green**,
 - the review has **settled** (the newest comment is a few minutes old and
   was written against the current head commit, not a superseded one),
-- there's at least one **actionable** review comment uzi hasn't already acted
-  on; a review bot's walkthrough or summary note (the "here's what changed" or
+- there's at least one **eligible, actionable** review comment uzi hasn't
+  already acted on. Eligible means its author has access to the repository, or
+  is a [trusted review bot](#trusted-review-bots) (see [The trust
+  model](#the-trust-model)); a comment from anyone else never triggers a
+  rework. A review bot's walkthrough or summary note (the "here's what changed" or
   "no actionable comments" write-ups CodeRabbit and friends post at the top of a
   PR) does not count, and neither does a comment consisting solely of a review-bot
   control command: CodeRabbit's (`@coderabbitai review`, `@coderabbitai rate limit`,
   and similar) or Greptile's (`@greptileai review`, `@greptile review`); add any
-  other words and it counts again. A human's top-level note with actual feedback
+  other words and it counts again. A summary or walkthrough note never counts,
+  even from a trusted bot. A human's top-level note with actual feedback
   and any inline finding do count, and
 - the MR hasn't hit its [rework-cycle cap](#the-per-mr-cap).
 
-The rework run reads the MR's review comments (human reviewers and
-third-party review bots like CodeRabbit; uzi's own status notes are
-filtered out), reasons about each finding, implements the ones that are
+The rework run reads the MR's **eligible** review comments (reviewers with
+repository access and trusted review bots; uzi's own status notes are
+filtered out, and comments from anyone else are withheld), reasons about each finding, implements the ones that are
 still valid, and folds the result onto the **existing** branch and MR — it
 never creates a new one. For each finding it addressed, it replies
 in-thread ("done in `<sha>`" or "skipped because &lt;reason&gt;") and
@@ -52,8 +56,53 @@ reopen the review cycle.
 Review-comment text is the least trustworthy input uzi ingests: it's
 written by multiple, possibly-unvetted authors (any reviewer, any
 third-party bot on the MR), and a comment body can say anything, including
-something that reads like an instruction to the agent. uzi treats it as
-**data, never as commands**:
+something that reads like an instruction to the agent. uzi therefore
+decides **who may be read at all**, and treats what it does read as **data,
+never as commands**.
+
+### Who counts as eligible
+
+A review comment reaches the agent only when its author is eligible:
+
+- **A person with access to the repository.** This is the same question uzi
+  asks of issue authors (see [Issue input and the approval
+  gate](./scheduling.md#issue-input-and-the-approval-gate)): on GitHub
+  effective triage-or-higher permission, on GitLab Reporter or above, on
+  Forgejo ownership, direct collaboration or organization-team write access.
+- **A trusted review bot.** A bot an admin has allowlisted by forge instance
+  and numeric user id (see [Trusted review bots](#trusted-review-bots)).
+  Bots that aren't on the list face the same repository-access test as
+  anyone else, and most bots are not collaborators, so they fail it.
+
+Everyone else is **not eligible**. A deleted account (or one the forge
+reports with user id 0) is not eligible. When uzi can't tell, because the
+lookup failed, timed out, or wasn't reached this poll tick, the comment is
+treated as **permission unknown**, which is withheld exactly like not
+eligible and never triggers anything.
+
+### Withheld comments
+
+Only eligible comments enter the rework's snapshot and prompt. A withheld
+comment is **omitted**, not replaced by a placeholder, so its text never
+reaches the agent. The snapshot instead records how many comments were
+withheld as not eligible and how many as permission unknown, and the prompt
+shows the agent a fixed note with those two counts (outside the fenced
+comment block, so no comment can forge it). The agent is told not to guess
+what the withheld comments said. The caps (200 comments, 32 KiB) apply to
+eligible comments only, and the debounce and current-head checks look at the
+newest *eligible* comment, so an outsider posting late doesn't hold a rework
+back or make a review look unsettled.
+
+### Trusted bots: allowlisting is not obedience
+
+Allowlisting a bot only lets its comments **be ingested**. They stay
+untrusted data like any other comment: fenced, verified against the code,
+never followed as instructions. A trusted bot's summary or walkthrough note
+never triggers a rework either; only its actionable findings do.
+
+### Data, never commands
+
+What an eligible comment says is still untrusted:
 
 - every comment is rendered inside a per-prompt, unpredictable fence, so a
   comment body can't forge its own closing tag and break out of the block;
@@ -66,6 +115,100 @@ something that reads like an instruction to the agent. uzi treats it as
   server rejects a reply or resolve on any thread id the run didn't
   genuinely address, so an injected instruction can't silence a real
   human's (or another bot's) open finding.
+
+### Reply and resolve
+
+Because withheld comments aren't in the snapshot, the same rule covers them:
+a thread whose comments were *all* withheld can't be replied to or resolved
+(the server answers 403). A **mixed thread**, one with at least one eligible
+comment, is allowed through that eligible comment. The catch is that
+resolving a mixed GitLab discussion resolves the whole discussion, including
+the outsider's notes in it. On Forgejo and Gitea only inline threads can be
+replied to, and nothing can be resolved (see [Forge support](#forge-support)).
+
+### Runs started before the upgrade
+
+A run's snapshot taken before this protection existed can't be trusted to
+contain only eligible comments. Such a legacy snapshot is replayed as
+**empty** with a fixed "not available" note, and it authorizes no thread. An
+`mr_rework` run that was already in flight when you upgraded therefore sees
+no review comments and can't reply or resolve; start a fresh
+[rework on demand](#rework-on-demand) to get an assessed snapshot.
+
+### Fail closed, and "permission unknown"
+
+Every uncertain state fails closed. If uzi can't read the settings it needs
+(including the trusted-bot list), the watcher skips that poll tick and an
+on-demand rework is refused with a 409. A permission-unknown comment never
+triggers a rework. An empty eligible snapshot never starts an automatic
+rework, and an on-demand one only when you supply
+[guidance](#rework-on-demand), in which case your own text is the trigger.
+
+When new actionable comments exist but none could be verified yet, uzi says
+so instead of looking idle. The watcher logs `poller: mr-rework withheld:
+permission unknown` with reason `permission_unknown`, the count and how many
+lookups it attempted, and an on-demand rework returns a 409 whose message
+says the new comments' authors couldn't be verified yet and to try again
+shortly or give guidance. This is a transient state: uzi keeps the unknown
+comment ids on the MR's ledger (up to 200) and fires the rework on a later
+tick once their author checks out as eligible. A comment whose author turns
+out not to be eligible is dropped and never fires. If the review has so many
+comments that the snapshot caps push a remembered id out, it is dropped too
+and falls back to a human noticing it in review.
+
+### Fair progress under an outsider flood
+
+Verifying an author costs a forge call, and one MR can attract many
+outsiders. Each poll tick therefore makes a bounded number of lookups (at
+most 200 authors in a 30 second assessment, each lookup cut off after 5
+seconds), and the authors still waiting for an answer sit in a per-MR FIFO
+queue. Authors who were tried and came back unknown or not eligible go to the
+back; authors not reached keep their place; an eligible answer keeps its
+place. A new author joins behind those already waiting. A not-eligible answer
+is cached for 6 hours (per repository), so the same outsider isn't looked up
+every tick.
+
+What this guarantees, and what it doesn't. An eligible reviewer's finding is
+**never suppressed and never displaced from the agent's context** by a flood
+of outsider comments. It can be **delayed**, and the delay is bounded only
+under the conditions below. Let *R*0 be the number of not-eligible entries
+queued ahead of a waiting author *X* when *X* arrives, *A*t the number of
+lookups actually attempted on tick *t* (this is logged; only *A*t up to 200
+is guaranteed), and *E*t the number of eligible authors ahead of *X*. A tick
+**counts** when the shared eligibility evidence answered within the
+per-lookup timeout and *A*t - *E*t is at least 1. *X* is looked up on the
+first counted tick *k* where the running sum of (*A*t - *E*t) reaches *R*0 +
+1. With a constant *p* = *A*t - *E*t that is ceil((*R*0 + 1) / *p*) counted
+ticks. For example, with 2 not-eligible authors ahead and 2 lookups per tick,
+*X* is looked up on tick 2. On that tick the rework fires if the other gates
+pass, otherwise *X* keeps its place at the front.
+
+The bound assumes:
+
+- forge calls honor cancellation, and queue writes succeed;
+- the shared eligibility evidence (for example GitHub's collaborator list)
+  is available within the per-lookup timeout;
+- the connection token's rate limit, shared with every other MR on it, isn't
+  exhausted;
+- other MRs don't touch this MR's queue. They share only the verdict cache,
+  the rate limit and the single detector loop (about 30 seconds, plus one
+  lookup timeout per flooded MR, per tick);
+- eligible authors ahead of *X* are few.
+
+Ticks that don't count never move anyone ahead of *X*.
+
+> **Pending maintainer confirmation.** The originating issue asked that an
+> outsider flood not delay an eligible finding at all. This design instead
+> guarantees the finding is never lost or displaced and is delayed only by the
+> conditional bound above. That departure from the zero-delay criterion is
+> pending maintainer confirmation before the change merges. The rationale is
+> in [ADR-2347](../adr/2347-review-comment-author-trust.md).
+
+Smaller residuals: an outsider later promoted to collaborator is recognized
+within 6 hours (the cached verdict's lifetime); the cross-type comment-id
+limitation under [Known limitations](#known-limitations) also applies to
+remembered unknown ids; and a stale GitHub collaborator listing can cost a
+queue position, which affects fairness only, never who is trusted.
 
 ## Enablement
 
@@ -127,6 +270,39 @@ Every rework run spends the **run owner's own** Anthropic token, exactly
 like any other run, including one triggered on an unattended nightly sweep
 MR. If you'd rather review findings by hand before uzi acts on them, opt
 out in Settings.
+
+## Trusted review bots
+
+Review bots such as CodeRabbit or Greptile are usually not collaborators on
+your repository, so by default their comments are withheld like any outsider's.
+To let a bot's findings reach the rework, an admin allowlists it in the
+admin-only instance setting `mr_review_trusted_bots`. The default is empty:
+no bot is trusted.
+
+- **Format.** A comma-separated list of `<base_url>#<forge_user_id>` entries,
+  for example `https://github.com#136622811`.
+- **Base URL.** Written as `https://host` (optionally with a non-default
+  port), lower-case, with no path, query or user info. The default https port
+  `:443` is treated as absent on both sides, so `https://h#7` matches a
+  connection stored as `https://h:443`.
+- **User id.** The bot's numeric id on that forge, a positive integer. Never
+  its login or a `[bot]` suffix: logins can be re-registered, ids can't.
+- **Limits.** No duplicate entries, and at most 50.
+- **Matching.** An entry matches a comment when the comment's author id equals
+  the entry's id and the MR's connection is the same forge instance. The
+  GitHub API host `https://api.github.com` is treated as `https://github.com`.
+  Two forges served from one host under different paths share an entry.
+
+Edit it under Admin → Instance → **Trusted review bots** in the web UI, or
+through `PUT /api/admin/settings` (cookie session only). The CLI is read-only
+by design: `uzi admin review-bots` lists the entries (`--json` for scripts).
+See [Admin settings](./admin-settings.md#trusted-review-bots).
+
+> **Upgrade note.** CodeRabbit, Greptile and other bots that aren't
+> collaborators **stop triggering reworks and stop reaching the agent's
+> prompt** after you upgrade, until an admin allowlists them. Runs that were
+> in flight at upgrade time also lose their comments; see [Runs started
+> before the upgrade](#runs-started-before-the-upgrade).
 
 ## Decisions memo (experiment)
 
@@ -192,6 +368,14 @@ after the automatic cap is reached.
   on one MR at once, won't collide with an in-flight CI fix on the
   branch, respects the instance's admin kill-switch, needs your own
   Anthropic token, and needs the MR to still be open.
+- **Author checks still apply.** An on-demand rework reads the same eligible
+  comments an automatic one does. With nothing new and eligible and no
+  guidance it is refused with a 409. When the reason is that the new comments'
+  authors couldn't be verified yet, the 409 says so (access could not be
+  verified yet; try again shortly or give guidance), which is worth
+  retrying. If the settings can't be read it is a 409 too. With guidance it
+  always proceeds, and your guidance is the trigger. The assessment shares the
+  automatic watcher's 30 second deadline.
 - **Guidance.** You can attach optional guidance to steer the pass — for
   example "focus on the migration thread; skip the naming nits." It
   rides the run like any other steering text.
@@ -235,6 +419,14 @@ that count.
   deliberate fail-safe, not a bug: a skipped comment simply falls back to a
   human noticing it in review, and the rework loop never makes a wrong
   write because of it.
+- **Comments from authors without repository access never reach the
+  rework.** That includes most review bots until an admin
+  [allowlists](#trusted-review-bots) them, and an author whose access can't be
+  verified in time is held back until a later tick can check them; see
+  [Fair progress under an outsider flood](#fair-progress-under-an-outsider-flood)
+  for the delay bound and its assumptions.
+- **Resolving a mixed GitLab discussion resolves the outsider's notes too**
+  (see [Reply and resolve](#reply-and-resolve)).
 - CI failures are unaffected and unrelated: a red pipeline is still
   [automatic CI fixes](./ci-autofix.md)' job, not this feature's. The two
   coexist on one MR without sharing a loop guard, because they fire on

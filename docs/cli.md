@@ -154,7 +154,7 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -767,6 +767,17 @@ A few worth knowing:
   warns and the JSON `checks_unknown` is true, so an empty list means "unknown",
   not "none blocked". The table has `OWNER`, `PATH`, `BLOCKED`, `ALLOWED BY`
   (the admin who allowed it, or `—`). Allowing/revoking is done from the web UI.
+- **`admin review-bots` lists the trusted review-bot allowlist** (#2347) — the
+  `mr_review_trusted_bots` instance setting: bots (a forge base URL plus the
+  bot's numeric forge user id) whose MR review comments the
+  [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may ingest although
+  they are not repo collaborators. It is **read-only by design**: edit the list
+  from Admin Settings in the web UI or through the cookie-only
+  `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
+  `STATUS` (`ok`, or `malformed` for a hand-edited entry the server would
+  reject); an empty list prints a line saying third-party bots' comments are
+  withheld. `--json` returns `{source, entries[]}`, each entry with
+  `base_url`, `forge_user_id` (a string), `raw` and `malformed`.
 - **`admin health` is the instance health document** (PRD #1484) — a closed registry
   of checks over what uzi knows about itself (worker rolls, queue and capacity, the
   controller report, background loops, the database, integrations, housekeeping), with an
