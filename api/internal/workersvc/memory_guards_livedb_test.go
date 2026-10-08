@@ -177,7 +177,7 @@ func TestMemoryHoldNonOwnerGuardsLiveDB(t *testing.T) {
 		}
 		assertHeld()
 	}
-	// Both claim writers must refuse the memory hold.
+	// ClaimRun must refuse the issue hold; the chat lane is exercised separately.
 	if _, err := env.q.ClaimRun(env.ctx, claimRunParams(w)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("claim hold=%v", err)
 	}

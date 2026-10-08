@@ -66,6 +66,7 @@ SELECT (EXISTS (
  AND lead.id=checker.target_run_id AND lead.user_id=checker.user_id
  AND lead.kind <> 'cross_check'
  AND lead.claim_released_at IS NULL AND lead.status IN ('claimed','running')
+ AND cc.stage='plan' AND cc.round=1
  AND cc.verdict='pending' AND cc.deadline_at>now()
 ))::boolean;
 

@@ -331,10 +331,23 @@ func TestMemoryReservationHistoricalRetryAfterNewClaimLiveDB(t *testing.T) {
 	f := newMemoryFixture(t)
 	before := f.reserve(t, f.b)
 	next := seedSnapshotWorker(t, f.e, f.w.UserID, "next")
-	f.e.exec("UPDATE runs SET worker_id=$2,claim_generation=3,claim_released_at=NULL WHERE id=$1", f.b.RunID, next)
+	f.hold(t)
+	if _, err := f.e.q.ResumeMemoryEpisode(f.e.ctx, store.ResumeMemoryEpisodeParams{
+		ID: f.b.RunID, UserID: f.w.UserID, GlobalTimeoutSeconds: 86400}); err != nil {
+		t.Fatal(err)
+	}
+	w, err := f.e.q.GetWorkerByID(f.e.ctx, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := f.e.q.ClaimRun(f.e.ctx, claimRunParams(w))
+	if err != nil || claimed.ID != f.b.RunID || claimed.ClaimGeneration != 3 {
+		t.Fatalf("new claim=%+v err=%v", claimed, err)
+	}
+	memoryAssertOrdinaryReportsRefused(t, f)
 	r := f.reserve(t, f.b)
 	if r.Authorizing || r.MemoryBinding != before.MemoryBinding || r.Allowance != before.Allowance ||
-		f.run(t).MemoryInterventionCount != 1 {
+		f.run(t).MemoryInterventionCount != 0 {
 		t.Fatalf("historical retry=%+v", r)
 	}
 	outcome, err := f.s.RecordMemoryInterventionOutcome(f.e.ctx, f.w, MemoryOutcomeRequest{MemoryBinding: f.b, Outcome: "confirmed_drained"})
