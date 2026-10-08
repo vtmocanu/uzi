@@ -1,0 +1,647 @@
+[
+  {
+    "name": "product-and-sdk",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": null,
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "saved-lanes",
+    "default_claude_model": "haiku",
+    "default_codex_model": "gpt-6-sol",
+    "templates": null,
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "haiku",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6-sol",
+        "resolved_model": "gpt-6-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "pin-masks-template",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": [
+      {
+        "name": "LEAD",
+        "scope": "user",
+        "model": "haiku",
+        "allocated": true,
+        "foreign": false
+      }
+    ],
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "haiku",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "model-less-first",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": [
+      {
+        "name": "LEAD",
+        "scope": "user",
+        "model": null,
+        "allocated": true,
+        "foreign": false
+      },
+      {
+        "name": "ORCHESTRATOR",
+        "scope": "user",
+        "model": "opus",
+        "allocated": true,
+        "foreign": false
+      }
+    ],
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "unallocated",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": [
+      {
+        "name": "LEAD",
+        "scope": "user",
+        "model": "haiku",
+        "allocated": false,
+        "foreign": false
+      }
+    ],
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "foreign",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": [
+      {
+        "name": "LEAD",
+        "scope": "user",
+        "model": "haiku",
+        "allocated": true,
+        "foreign": true
+      }
+    ],
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "shared-name-precedence",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": [
+      {
+        "name": "LEAD",
+        "scope": "global",
+        "model": "opus",
+        "allocated": true,
+        "foreign": false
+      },
+      {
+        "name": "LEAD",
+        "scope": "user",
+        "model": "haiku",
+        "allocated": true,
+        "foreign": false
+      }
+    ],
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "opus",
+        "resolved_model": "opus",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": "opus",
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  },
+  {
+    "name": "shared-name-unallocated",
+    "default_claude_model": null,
+    "default_codex_model": null,
+    "templates": [
+      {
+        "name": "LEAD",
+        "scope": "global",
+        "model": "opus",
+        "allocated": false,
+        "foreign": false
+      },
+      {
+        "name": "LEAD",
+        "scope": "user",
+        "model": "haiku",
+        "allocated": true,
+        "foreign": false
+      }
+    ],
+    "put": {
+      "cross_check_pins": [
+        {
+          "stage": "plan",
+          "harness": "claude",
+          "model": "sonnet"
+        },
+        {
+          "stage": "plan",
+          "harness": "codex",
+          "model": "gpt-6-astra"
+        }
+      ]
+    },
+    "get_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ],
+    "put_cross_check_pins": [
+      {
+        "stage": "plan",
+        "harness": "claude",
+        "model": "sonnet",
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": "sonnet",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": false
+      },
+      {
+        "stage": "plan",
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6-astra",
+        "resolved_effort": "medium",
+        "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      }
+    ]
+  }
+]

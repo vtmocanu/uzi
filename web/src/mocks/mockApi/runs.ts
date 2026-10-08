@@ -118,6 +118,7 @@ function custodyResponse(): RecoveryCustodyHolds {
   return {
     aggregate: {
       open_holds: open.length,
+      admission_counted_holds: open.length,
       custody_hold_limit: 8,
       decision_needed: decisionNeeded,
       // Two queued code runs are wedged behind the owner limit in this scenario.

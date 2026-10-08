@@ -766,6 +766,7 @@ func run() error {
 		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
 		SaturationDelay:     cfg.EphemeralSaturationDelay,
+		BackgroundGrace:     cfg.WorkerBackgroundGrace,
 		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
 		// live lease and provisioning evicts the oldest releasable one at the cap.
 		Lease: cfg.EphemeralLease,
@@ -1059,7 +1060,7 @@ func run() error {
 	// suppresses it, exactly as it suppresses the per-run health nudge. It ticks on the sweep
 	// cadence (the SAME cadence the per-run health detector runs on), falling back to 15s when
 	// SWEEP_INTERVAL is unset (0), matching the sweeper's own default.
-	custodyEpisodeRec := slacksvc.NewCustodyEpisodeReconciler(q, notifier, settingsCache, workersvc.CustodyHoldLimit, slog.Default())
+	custodyEpisodeRec := slacksvc.NewCustodyEpisodeReconciler(q, notifier, settingsCache, workersvc.CustodyHoldLimit, cfg.WorkerHeartbeatStale, time.Now, slog.Default())
 	custodyEpisodeInterval := cfg.SweepInterval
 	if custodyEpisodeInterval <= 0 {
 		custodyEpisodeInterval = 15 * time.Second

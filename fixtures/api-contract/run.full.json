@@ -38,6 +38,8 @@
   "plan_cross_check_gate_reason": "x",
   "plan_cross_check_diff_refusal": "x",
   "plan_cross_check_summary": {
+    "checker_model_source": "x",
+    "checker_effort_source": "x",
     "round": 1,
     "verdict": "x",
     "reason_class": "x",

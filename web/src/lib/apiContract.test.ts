@@ -24,6 +24,7 @@ import type {
   AdminUsage,
   SelfUsage,
   UserSettings,
+  CrossCheckPinDTO,
   CatalogEntry,
   AdminCliToken,
   Board,
@@ -113,6 +114,8 @@ import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.js
 import runOutcomesFull from "../../../fixtures/api-contract/run_outcomes.full.json";
 import userSettingsZero from "../../../fixtures/api-contract/user_settings.zero.json";
 import userSettingsFull from "../../../fixtures/api-contract/user_settings.full.json";
+import settingsUserSettingsFull from "../../../fixtures/api-contract/settings_user_settings.full.json";
+import settingsUserSettingsZero from "../../../fixtures/api-contract/settings_user_settings.zero.json";
 import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.json";
 import catalogEntryFull from "../../../fixtures/api-contract/catalog_entry.full.json";
 import cliTokenZero from "../../../fixtures/api-contract/cli_token.zero.json";
@@ -131,6 +134,7 @@ import brandingZero from "../../../fixtures/api-contract/branding.zero.json";
 import brandingFull from "../../../fixtures/api-contract/branding.full.json";
 import chatZero from "../../../fixtures/api-contract/chat.zero.json";
 import chatFull from "../../../fixtures/api-contract/chat.full.json";
+import metadataCorpus from "../../../fixtures/api-contract/cross_check_metadata.behavior.json";
 import agentTemplateZero from "../../../fixtures/api-contract/agent_template.zero.json";
 import agentTemplateFull from "../../../fixtures/api-contract/agent_template.full.json";
 import schedulePauseZero from "../../../fixtures/api-contract/schedule_pause.zero.json";
@@ -728,17 +732,42 @@ void _buildInfoFull;
 // ZeroOf exemption: sidebar_token_ids and sidebar_codex_account_ids — the handler mapper
 // runs uuidStrings on both, which returns a non-nil [] (handler/user_settings.go), so the
 // wire is [] though the nil-slice zero marshals null. Every other field is typed X|null in
-// TS.
+// TS. cross_check_pins also exempts the Go nil-slice zero; GET always emits two cells.
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
+  const _settingsUserFull: Widen<UserSettings> = settingsUserSettingsFull;
+  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins"> = settingsUserSettingsZero;
+  void _settingsUserFull;
+  void _settingsUserZero;
   void _userSettingsMissing;
   void _userSettingsExtra;
   void _userSettingsZero;
   void _userSettingsFull;
 }
+
+// Nested members must match the Go recorder, including required nullable metadata.
+{
+  type RecordedCell = typeof userSettingsFull.cross_check_pins[number];
+  const missing: never = null as unknown as Exclude<keyof CrossCheckPinDTO, keyof RecordedCell>;
+  const extra: never = null as unknown as Exclude<keyof RecordedCell, keyof CrossCheckPinDTO>;
+  const nullable: CrossCheckPinDTO["worker_default_model"] = null;
+  // @ts-expect-error metadata is required even when its value is null
+  const absent: CrossCheckPinDTO = { stage: "plan", harness: "claude", model: null, effort: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false };
+  void missing; void extra; void nullable; void absent;
+}
+it("recorded nested checker metadata always has the nullable member", () => {
+  expect(metadataCorpus.some(c => c.get_cross_check_pins.some(p => p.worker_default_model === null))).toBe(true);
+  for (const fixture of [userSettingsFull, settingsUserSettingsFull, ...metadataCorpus.map(c => ({ cross_check_pins: c.get_cross_check_pins }))]) {
+    expect(fixture.cross_check_pins.length).toBeGreaterThan(0);
+    for (const cell of fixture.cross_check_pins) {
+      expect(Object.prototype.hasOwnProperty.call(cell, "worker_default_model")).toBe(true);
+      expect(cell.worker_default_model === null || typeof cell.worker_default_model === "string").toBe(true);
+    }
+  }
+});
 
 // ── Codex account rate limits (PRD #1209) ───────────────────────────────────
 // The per-account meter and its admin row. ZeroOf exemptions: aliases + buckets on the
@@ -1555,7 +1584,7 @@ it("plan-check findings permit a null item array", () => {
     findings: { summary: "ok", items: null },
     checker_run_id: null,
     checker_model: null,
-    checker_effort: null,
+    checker_effort: null, checker_model_source: null, checker_effort_source: null,
     usage: null,
     historical: false,
   };

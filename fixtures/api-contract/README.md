@@ -54,6 +54,17 @@ normalizes maps to {}), and per-user `last_7_days:null` (the new handler always
 allocates a usage bundle). Production TypeScript does not accept these fixture-only
 nulls. Nested factory SelfUsage and both outcome windows are checked in these pairs.
 
+Issue #2151 adds `cross_check_metadata.behavior.json`, recorded by
+`TestCrossCheckMetadataCorpusLiveDB` through live settings GET/PUT handlers.
+The web mock exercises the same eight cases through its public settings routes.
+This corpus checks nullable `worker_default_model` separately from pinned
+`resolved_model`, including allocation, ownership and shared-name precedence.
+Its matching template order is deterministic; the separate
+`TestCrossCheckMetadataNativeLocaleDiscriminatorLiveDB` checks native claim
+ordering under database collations. Re-record the corpus from the Go test's
+printed replacement JSON with `UZI_TEST_DATABASE_URL` set; a skipped test does
+not verify it.
+
 ### M2 `ZeroOf` exemptions, each cited (Decision 7)
 
 Every exemption below is a field the TS type says never-null while the Go **mapper**

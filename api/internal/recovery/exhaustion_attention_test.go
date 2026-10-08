@@ -10,6 +10,7 @@ import (
 
 // Parse the actual server-only vocabulary without importing workersvc into production.
 func TestCustodyExhaustionCauseMatchesServerVocabulary(t *testing.T) {
+	const custodyRecoveryCauseWorkerRequeueExhausted = "worker_requeue_exhausted"
 	file, err := parser.ParseFile(token.NewFileSet(), "../workersvc/forgepark.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)

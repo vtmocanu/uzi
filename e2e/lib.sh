@@ -2,6 +2,30 @@
 # sourced by run-e2e.sh; shared helpers used by >=2 phases (PRD #966 M1)
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
+# Failure-only metadata for a retained FINAL or an unstable custody baseline.
+# Local records are inspected, not independently MAC-verified by this diagnostic.
+_inventory_diagnostic_rows() {
+  printf '\nDIAGNOSTIC final inventory comparison %s\n' "$(date -u +%FT%TZ)"
+  "${COMPOSE[@]}" exec -T agent node --input-type=module < "$ROOT/e2e/inventory-snapshot.mjs"
+  db_psql_rows "SELECT json_build_object('kind','server','observed_at',clock_timestamp(),
+    'hold_id',h.id,'run_id',h.run_id,'generation',h.generation,
+    'hold_state',h.state,'inventory_guarded',h.inventory_guarded,'final_disposition',h.final_disposition,
+    'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,'final_coverage_digest',h.final_coverage_digest,
+    'release_evidence',h.release_evidence,'capture_id',c.id,'capture_state',c.state,'source_sha',c.source_sha,
+    'coverage_digest',c.coverage_digest,'manifest_bound',c.manifest_bound,'checksum',c.checksum,'byte_size',c.byte_size,
+    'expires_at',c.expires_at,'run_status',r.status,'claim_generation',r.claim_generation)::text
+    FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id LEFT JOIN recovery_captures c ON c.hold_id=h.id
+    WHERE h.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL') ORDER BY h.created_at,c.created_at"
+  apiget /api/recovery/holds | jq -c '{kind:"owner_recovery",aggregate,holds:[.holds[]|{id,run_id,generation,state,attention,has_available_capture,capture_state,final_receipt}]}'
+  apiget /api/workers | jq -c '{kind:"workers",workers:[.workers[]|{id,status,max_concurrent_runs,outbox_pending_messages,outbox_pending_terminal,outbox_blocked,reported_runs}]}'
+  local run
+  while IFS= read -r run; do
+    apiget "/api/runs/$run" | jq -c '{kind:"owner_run",run:(.run|{id,status,health,health_reason,outcome_pending,worker_recovery,fail_origin})}'
+  done < <(db_psql_rows "SELECT DISTINCT run_id FROM recovery_custody_holds WHERE user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")
+}
+inventory_diagnostic_snapshot() {
+  _inventory_diagnostic_rows | tee "$RUNROOT/inventory-diagnostic-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
+}
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
@@ -428,6 +452,49 @@ wait_custody_headroom() {
       fail "custody headroom timeout: open=$count limit=$limit needed=$needed after ${timeout}s; evidence preserved"
     fi
     sleep 2
+  done
+}
+
+# A completed status precedes the worker's final custody ACK. Wait only for this
+# run's current generation, preserving every older or unrelated source hold.
+wait_completed_custody_receipt() {
+  local run="$1" timeout="${2:-120}" start=$SECONDS snapshot generation expected=""
+  [[ "$run" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid completed receipt run: $run"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid completed receipt timeout: $timeout"
+  while :; do
+    snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'status',r.status,'generation',r.claim_generation,
+      'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'generation',h.generation,
+        'inventory_guarded',h.inventory_guarded,'state',h.state,'final_disposition',h.final_disposition,
+        'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,
+        'final_coverage_digest',h.final_coverage_digest,'release_evidence',h.release_evidence,
+        'after_outcome',h.released_at >= r.finished_at,'archive_matches',EXISTS(SELECT 1 FROM recovery_captures c
+          WHERE c.id=h.final_capture_id AND c.hold_id=h.id AND c.manifest_bound
+            AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest)))
+        FROM recovery_custody_holds h WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=r.claim_generation),'[]'::json))::text
+      FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")"
+    printf '%s' "$snapshot" | jq -e --arg run "$run" '
+      .run_id==$run and .status=="completed" and (.generation|type=="number" and .>0 and .==floor)
+      and (.holds|type=="array" and length==1) and .holds[0].generation==.generation' >/dev/null \
+      || fail "completed receipt missing exact run/generation/hold: $snapshot"
+    generation="$(printf '%s' "$snapshot" | jq -r '.generation')"
+    [ -z "$expected" ] && expected="$generation"
+    [ "$generation" = "$expected" ] || fail "completed receipt generation changed: $snapshot"
+    if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
+      printf '%s' "$snapshot" | jq -e '.holds[0] |
+        (.inventory_guarded==true and .after_outcome==true and (
+          (.final_disposition=="archive" and .release_evidence=="archive" and .archive_matches==true)
+          or (.final_disposition=="settled" and (.release_evidence|IN("publication","forge_no_output"))
+            and .final_capture_id==null and .final_source_sha==null
+            and .final_coverage_digest=="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")))
+        or (.inventory_guarded==false and (.release_evidence|IN("archive","publication")))' >/dev/null \
+        || fail "completed receipt lacks final custody proof: $snapshot"
+      pass "completed custody receipt: run=$run generation=$generation"
+      return
+    fi
+    printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null' >/dev/null \
+      || fail "completed receipt has unexpected disposition: $snapshot"
+    [ $((SECONDS - start)) -lt "$timeout" ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot"
+    sleep 0.5
   done
 }
 

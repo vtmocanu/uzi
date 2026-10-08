@@ -2,11 +2,14 @@ package slacksvc
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -26,19 +29,22 @@ type custodyEpisodeFakeStore struct {
 	agg         map[uuid.UUID]store.GetCustodyAggregateForOwnerRow
 	claimOrder  []uuid.UUID // every claim ATTEMPT, in order
 	clearedCall []uuid.UUID // every ClearCustodyEpisodeNotice call, in order
-	limitSeen   []int32     // every custody_hold_limit param passed to the list reads
+	cutoffs     []pgtype.Timestamptz
+	limitSeen   []int32 // every custody_hold_limit param passed to the list reads
 }
 
-func (f *custodyEpisodeFakeStore) ListOwnersOverCustodyLimit(_ context.Context, limit int32) ([]uuid.UUID, error) {
-	f.limitSeen = append(f.limitSeen, limit)
+func (f *custodyEpisodeFakeStore) ListOwnersOverCustodyLimit(_ context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
+	f.limitSeen = append(f.limitSeen, arg.CustodyHoldLimit)
+	f.cutoffs = append(f.cutoffs, arg.HeartbeatCutoff)
 	if f.overErr != nil {
 		return nil, f.overErr
 	}
 	return f.overLimit, nil
 }
 
-func (f *custodyEpisodeFakeStore) ListOwnersWithClearedCustodyEpisode(_ context.Context, limit int32) ([]uuid.UUID, error) {
-	f.limitSeen = append(f.limitSeen, limit)
+func (f *custodyEpisodeFakeStore) ListOwnersWithClearedCustodyEpisode(_ context.Context, arg store.ListOwnersWithClearedCustodyEpisodeParams) ([]uuid.UUID, error) {
+	f.limitSeen = append(f.limitSeen, arg.CustodyHoldLimit)
+	f.cutoffs = append(f.cutoffs, arg.HeartbeatCutoff)
 	if f.clearedErr != nil {
 		return nil, f.clearedErr
 	}
@@ -69,6 +75,7 @@ func (f *custodyEpisodeFakeStore) ClearCustodyEpisodeNotice(_ context.Context, u
 }
 
 func (f *custodyEpisodeFakeStore) GetCustodyAggregateForOwner(_ context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error) {
+	f.cutoffs = append(f.cutoffs, arg.HeartbeatCutoff)
 	if f.aggErr != nil {
 		return store.GetCustodyAggregateForOwnerRow{}, f.aggErr
 	}
@@ -76,7 +83,7 @@ func (f *custodyEpisodeFakeStore) GetCustodyAggregateForOwner(_ context.Context,
 		return row, nil
 	}
 	// Default: at the limit with no blocked runs.
-	return store.GetCustodyAggregateForOwnerRow{OpenHolds: 8, BlockedRuns: 0}, nil
+	return store.GetCustodyAggregateForOwnerRow{OpenHolds: 11, AdmissionCountedHolds: 8, BlockedRuns: 0}, nil
 }
 
 // custodyEpisodeFakeNotifier records every Notify.
@@ -104,7 +111,7 @@ func (s custodyEpisodeFakeSettings) PublicBaseURL(context.Context) (string, erro
 }
 
 func newCustodyEpisodeReconciler(st *custodyEpisodeFakeStore, notif *custodyEpisodeFakeNotifier, set custodyEpisodeFakeSettings) *CustodyEpisodeReconciler {
-	return NewCustodyEpisodeReconciler(st, notif, set, 8, nil)
+	return NewCustodyEpisodeReconciler(st, notif, set, 8, 73*time.Second, time.Now, nil)
 }
 
 // TestCustodyEpisodeCrossingSendsOneDM: one owner over the limit drives exactly one Notify with
@@ -114,7 +121,7 @@ func TestCustodyEpisodeCrossingSendsOneDM(t *testing.T) {
 	uid := uuid.New()
 	st := &custodyEpisodeFakeStore{
 		overLimit: []uuid.UUID{uid},
-		agg:       map[uuid.UUID]store.GetCustodyAggregateForOwnerRow{uid: {OpenHolds: 8, BlockedRuns: 3}},
+		agg:       map[uuid.UUID]store.GetCustodyAggregateForOwnerRow{uid: {OpenHolds: 11, AdmissionCountedHolds: 8, BlockedRuns: 3}},
 	}
 	notif := &custodyEpisodeFakeNotifier{}
 	r := newCustodyEpisodeReconciler(st, notif, custodyEpisodeFakeSettings{enabled: true, baseURL: "https://uzi.example.com"})
@@ -143,18 +150,13 @@ func TestCustodyEpisodeCrossingSendsOneDM(t *testing.T) {
 	if n.Slack.Link != "https://uzi.example.com/workers" {
 		t.Errorf("Slack.Link = %q, want the /workers custody surface deep link", n.Slack.Link)
 	}
-	// Facts: open holds, blocked runs, and the exact discard command chip.
-	if len(n.Slack.Facts) != 3 {
-		t.Fatalf("Facts = %v, want 3 (holds + runs + command)", n.Slack.Facts)
+	wantFacts := []string{"*8* admission-counted holds", "*11* held sources", "*3* blocked runs", "Discard held work: `" + custodyDiscardCommand + "`"}
+	if !reflect.DeepEqual(n.Slack.Facts, wantFacts) {
+		t.Fatalf("facts = %v, want %v", n.Slack.Facts, wantFacts)
 	}
-	if !strings.Contains(n.Slack.Facts[0], "8") || !strings.Contains(n.Slack.Facts[0], "sources") {
-		t.Errorf("holds fact = %q, want plural 8 sources", n.Slack.Facts[0])
-	}
-	if !strings.Contains(n.Slack.Facts[1], "3") || !strings.Contains(n.Slack.Facts[1], "runs") {
-		t.Errorf("runs fact = %q, want plural 3 runs", n.Slack.Facts[1])
-	}
-	if !strings.Contains(n.Slack.Facts[2], custodyDiscardCommand) {
-		t.Errorf("command fact = %q, want the exact discard command %q", n.Slack.Facts[2], custodyDiscardCommand)
+	payload, ok := n.Payload.(map[string]any)
+	if !ok || payload["open_holds"] != int64(11) || payload["admission_counted_holds"] != int64(8) || payload["blocked_runs"] != int64(3) {
+		t.Fatalf("payload = %v", n.Payload)
 	}
 	// The claim (mark) must have been recorded — claim-first before the send.
 	if len(st.claimOrder) != 1 || st.claimOrder[0] != uid {
@@ -206,7 +208,7 @@ func TestCustodyEpisodeReArmThenReCross(t *testing.T) {
 	uid := uuid.New()
 	st := &custodyEpisodeFakeStore{
 		overLimit: []uuid.UUID{uid},
-		agg:       map[uuid.UUID]store.GetCustodyAggregateForOwnerRow{uid: {OpenHolds: 8, BlockedRuns: 1}},
+		agg:       map[uuid.UUID]store.GetCustodyAggregateForOwnerRow{uid: {OpenHolds: 11, AdmissionCountedHolds: 8, BlockedRuns: 1}},
 	}
 	notif := &custodyEpisodeFakeNotifier{}
 	r := newCustodyEpisodeReconciler(st, notif, custodyEpisodeFakeSettings{enabled: true, baseURL: "https://uzi.example.com"})
@@ -304,7 +306,7 @@ func TestCustodyEpisodeListErrorNoOp(t *testing.T) {
 func TestCustodyEpisodeNonPositiveLimitNoop(t *testing.T) {
 	st := &custodyEpisodeFakeStore{overLimit: []uuid.UUID{uuid.New()}}
 	notif := &custodyEpisodeFakeNotifier{}
-	r := NewCustodyEpisodeReconciler(st, notif, custodyEpisodeFakeSettings{enabled: true}, 0, nil)
+	r := NewCustodyEpisodeReconciler(st, notif, custodyEpisodeFakeSettings{enabled: true}, 0, 73*time.Second, time.Now, nil)
 
 	r.Reconcile(context.Background())
 
@@ -320,23 +322,23 @@ func TestCustodyEpisodeNonPositiveLimitNoop(t *testing.T) {
 
 func TestBuildCustodyEpisodeNotificationFactsAndCommand(t *testing.T) {
 	uid := uuid.New()
-	n := buildCustodyEpisodeNotification("https://uzi.example.com/", uid, 8, 1)
+	n := buildCustodyEpisodeNotification("https://uzi.example.com/", uid, 8, 8, 1)
 	if n.Kind != KindCustodyEpisode {
 		t.Errorf("Kind = %q, want %q", n.Kind, KindCustodyEpisode)
 	}
 	if n.Slack.Link != "https://uzi.example.com/workers" {
 		t.Errorf("Link = %q, want trimmed base + /workers", n.Slack.Link)
 	}
-	if len(n.Slack.Facts) != 3 {
-		t.Fatalf("Facts = %v, want 3", n.Slack.Facts)
+	if len(n.Slack.Facts) != 4 {
+		t.Fatalf("Facts = %v, want 4", n.Slack.Facts)
 	}
 	// blocked_runs == 1 → singular "blocked run".
-	if !strings.Contains(n.Slack.Facts[1], "blocked run") || strings.Contains(n.Slack.Facts[1], "blocked runs") {
-		t.Errorf("runs fact = %q, want singular 'blocked run'", n.Slack.Facts[1])
+	if !strings.Contains(n.Slack.Facts[2], "blocked run") || strings.Contains(n.Slack.Facts[2], "blocked runs") {
+		t.Errorf("runs fact = %q, want singular 'blocked run'", n.Slack.Facts[2])
 	}
 	// The command fact carries the EXACT fixed string with literal placeholders, in a code chip.
-	if n.Slack.Facts[2] != "Discard held work: `uzi run discard <run-id> --hold <hold-id> --yes`" {
-		t.Errorf("command fact = %q, want the exact fixed discard command chip", n.Slack.Facts[2])
+	if n.Slack.Facts[3] != "Discard held work: `uzi run discard <run-id> --hold <hold-id> --yes`" {
+		t.Errorf("command fact = %q, want the exact fixed discard command chip", n.Slack.Facts[3])
 	}
 	// FACTS-ONLY: no free text carrying a run/hold uuid or any interpolated value.
 	for _, f := range n.Slack.Facts {
@@ -347,15 +349,36 @@ func TestBuildCustodyEpisodeNotificationFactsAndCommand(t *testing.T) {
 }
 
 func TestBuildCustodyEpisodeNotificationEmptyBaseOmitsLink(t *testing.T) {
-	n := buildCustodyEpisodeNotification("   ", uuid.New(), 9, 4)
+	n := buildCustodyEpisodeNotification("   ", uuid.New(), 9, 9, 4)
 	if n.Slack.Link != "" {
 		t.Errorf("Link = %q, want empty for a blank base URL", n.Slack.Link)
 	}
 	// Plural on both counts.
-	if !strings.Contains(n.Slack.Facts[0], "9") || !strings.Contains(n.Slack.Facts[0], "sources") {
-		t.Errorf("holds fact = %q, want plural 9 sources", n.Slack.Facts[0])
+	if !strings.Contains(n.Slack.Facts[1], "9") || !strings.Contains(n.Slack.Facts[1], "sources") {
+		t.Errorf("holds fact = %q, want plural 9 sources", n.Slack.Facts[1])
 	}
-	if !strings.Contains(n.Slack.Facts[1], "4") || !strings.Contains(n.Slack.Facts[1], "blocked runs") {
-		t.Errorf("runs fact = %q, want plural 4 blocked runs", n.Slack.Facts[1])
+	if !strings.Contains(n.Slack.Facts[2], "4") || !strings.Contains(n.Slack.Facts[2], "blocked runs") {
+		t.Errorf("runs fact = %q, want plural 4 blocked runs", n.Slack.Facts[2])
+	}
+}
+
+func TestCustodyEpisodeConfiguredCutoff(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	uid := uuid.New()
+	st := &custodyEpisodeFakeStore{overLimit: []uuid.UUID{uid}}
+	calls := 0
+	r := NewCustodyEpisodeReconciler(st, &custodyEpisodeFakeNotifier{}, custodyEpisodeFakeSettings{enabled: true}, 8, 73*time.Second, func() time.Time {
+		calls++
+		return now.Add(time.Duration(calls-1) * time.Hour)
+	}, nil)
+	r.Reconcile(context.Background())
+	want := time.Date(2026, 10, 7, 11, 58, 47, 0, time.UTC)
+	if calls != 1 || len(st.cutoffs) != 3 {
+		t.Fatalf("clock calls=%d cutoffs=%v", calls, st.cutoffs)
+	}
+	for _, cutoff := range st.cutoffs {
+		if !cutoff.Valid || !cutoff.Time.Equal(want) {
+			t.Fatalf("cutoff=%v, want %v for clear, crossing and aggregate", cutoff, want)
+		}
 	}
 }

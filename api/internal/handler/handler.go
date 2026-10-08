@@ -540,7 +540,8 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		// ceiling ClaimRun/health gate on, so the board alert and `uzi run recovery` never
 		// disagree with the claim path. Sourced from workersvc's exported constant rather than
 		// hardcoded here (a constant, so int32() is a compile-time conversion).
-		CustodyHoldLimit: int32(workersvc.CustodyHoldLimit),
+		CustodyHoldLimit:     int32(workersvc.CustodyHoldLimit),
+		WorkerHeartbeatStale: h.cfg.WorkerHeartbeatStale,
 	}
 }
 

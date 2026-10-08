@@ -988,7 +988,7 @@ func (s *Service) checkBoardDrift(ctx context.Context, now time.Time) apitypes.H
 // checkCustodyHolds warns when at least one owner is at the custody-hold admission limit.
 // `na` when the limit is non-positive (custody admission disabled) — a defensive guard the
 // caller's positive constant never trips in production.
-func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO {
+func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("custody.holds")
 	if s.cfg.CustodyHoldLimit <= 0 {
 		c.Severity = sevNA
@@ -1000,7 +1000,8 @@ func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO
 	if err := ctx.Err(); err != nil {
 		return degradeUnknown(c, "custody.holds", err)
 	}
-	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, s.cfg.CustodyHoldLimit)
+	cutoff := pgconv.Time(now.Add(-s.heartbeatStale()))
+	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, store.ListOwnersOverCustodyLimitParams{CustodyHoldLimit: s.cfg.CustodyHoldLimit, HeartbeatCutoff: cutoff})
 	if err != nil {
 		return degradeUnknown(c, "custody.holds", err)
 	}
@@ -1012,7 +1013,7 @@ func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO
 		c.Summary = "No owner is at the custody-hold admission limit."
 		return c
 	}
-	// Each selected owner is read once; the shared deadline bounds the whole loop.
+	// Each selected owner has one listing and one aggregate read; the shared deadline bounds both loops.
 	// Any failed read aborts classification, so partial counts never become advice.
 	withDecisions := 0
 	for _, owner := range owners {
@@ -1042,8 +1043,25 @@ func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO
 	withoutDecisions := len(owners) - withDecisions
 	c.Severity = sevWarn
 	c.Summary = fmt.Sprintf("%d owner(s) are at the custody-hold admission limit.", len(owners))
+	var total, counted int64
+	for _, owner := range owners {
+		if err := ctx.Err(); err != nil {
+			return degradeUnknown(c, "custody.holds", err)
+		}
+		agg, err := s.cfg.Store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{UserID: owner, CustodyHoldLimit: s.cfg.CustodyHoldLimit, HeartbeatCutoff: cutoff})
+		if err != nil {
+			return degradeUnknown(c, "custody.holds", err)
+		}
+		total += agg.OpenHolds
+		counted += agg.AdmissionCountedHolds
+	}
+	if err := ctx.Err(); err != nil {
+		return degradeUnknown(c, "custody.holds", err)
+	}
 	c.Evidence = []apitypes.HealthEvidenceDTO{
 		{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))},
+		{Label: "Admission-counted holds", Value: fmt.Sprint(counted)},
+		{Label: "Total open custody", Value: fmt.Sprint(total)},
 		{Label: "Owners with decisions", Value: fmt.Sprintf("%d", withDecisions)},
 		{Label: "Owners without decisions", Value: fmt.Sprintf("%d", withoutDecisions)},
 	}

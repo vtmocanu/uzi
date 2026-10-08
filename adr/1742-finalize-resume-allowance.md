@@ -171,8 +171,10 @@ snapshotted `pinned` record with `finalizationPin`:
   `no_unpublished_work_after_restart`; this reading is valid only for a finalization pin, never
   for an early pin;
 - otherwise the worker produces a self-contained bundle of H with **no forge fetch and no forge
-  PAT**, journals it, and uploads it at the record's exact generation. The hold becomes
-  `archive_ready` and `uzi run export` works without cluster access. An oversized bundle
+  PAT**, journals it, and uploads it at the record's exact generation. `uzi run export`
+  works without cluster access. Ordinary unguarded holds become `archive_ready`; an OPEN
+  `recovery_wait` / `worker_requeue_exhausted` hold instead remains a `source_only`
+  decision under the #2445 amendment below. An oversized bundle
   (`oversized`), a producer failure (`bundle_failed`) or an upload failure
   (`restart_upload_failed`, the bundle is kept for the next boot) leave the hold needing a
   decision.
@@ -213,9 +215,10 @@ exist. What happens in each case:
   existing path verifies the work and captures it under **G+1** (`recovery_wait` park, then
   settle). This is unchanged behaviour.
 - **The run is held for owner Resume** at exhaustion with unresolved source custody
-  (allowance spent, owner-started episode, or `RUN_MAX_REQUEUES=0`): without an
-  available independently verified capture, G's hold reports retained
-  **`source_only`** custody, not `active_protected`, with no available archive. An
+  (allowance spent, owner-started episode, or `RUN_MAX_REQUEUES=0`): G's OPEN hold
+  reports retained **`source_only`** custody, or `needs_action` after failed latest
+  capture, before archive readiness or capture progress. Export availability is
+  independent of attention; this early-cut case has no archive for G. An
   inventory-guarded hold also reports `source_only` while an EARLIER archive is available:
   that download does not cover the full inventory, so it is neither `archive_ready` nor
   settled custody.
@@ -225,9 +228,10 @@ exist. What happens in each case:
   not survive a pod loss; there the work that existed only in the clone is gone (whatever reached
   the worker's bare tracking ref at a checkpoint remains).
 
-**(c) No archive is stated, not implied.** The server still derives `source_only`; there is no DTO
-or server change and `--json` is unchanged. `uzi run recovery` (both the owner view and the per-run
-view) now prints, for a `source_only` hold, `hold <id>: no recovery archive; custody of worker
+**(c) No archive is stated only when absent.** `--json` is unchanged. Under the #2445
+amendment, attention is independent of archive availability and latest capture progress.
+`uzi run recovery` (both the owner view and the per-run view) prints, for a `source_only`
+hold without an archive or in-flight capture, `hold <id>: no recovery archive; custody of worker
 <name>'s local source is retained (export unavailable; it may be the only copy)`. It offers
 `uzi run export` only for an open hold that has an available archive, and suggests `uzi run
 discard` for holds awaiting a decision. The discard hint itself prints no warning: the only-copy
@@ -615,16 +619,32 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    custody exists; no recorded recovery evidence or unresolved custody keeps
    `failed` / `worker_lost` (not proof that no unrecorded work survives).
    `finalize_resume_generation` stays G (the allowance is not reused);
-   `uzi run recovery <B>` shows either an `archive_ready` hold
-   whose archive `uzi run export` downloads (a finalization-pinned source), or a `source_only` hold
-   printed as "no recovery archive; custody ... retained (export unavailable ...)", or an
-   inventory-guarded `source_only` hold whose earlier archive is still downloadable (custody
-   stays open; that archive does not settle it). It must never show a silent empty hold.
+   `uzi run recovery <B>` shows the OPEN exhaustion hold as `source_only`, or
+   `needs_action` if the latest capture failed, even when an independently verified
+   archive is available or the latest capture is preparing/uploading. `uzi run export`
+   downloads any available archive independently of attention; an earlier archive may
+   omit latest worker-local work. Without an archive, output states export is unavailable
+   and reports any capture progress. Guarded inventory warnings remain. Custody stays
+   open for owner Resume/Cancel; capture readiness never implicitly releases this
+   exhaustion hold. This supersedes only the exhaustion-specific `archive_ready`
+   expectation above; ordinary archive-backed settlement is unchanged. It must never
+   show a silent empty hold.
 9. Optional pod-loss variant (Docker lane): delete the pod instead of killing the process at step
    4. The finalize record on `/data` still drives the allowance. For a cut before fetch-back, G's
    hold reports `source_only` (D4b).
 10. Let the trap run (or run the explicit restore above), verify both restorations, and record the
     observed outcome on issue #1742.
+
+## Amendment 2026-10-08 — #2445 exhaustion attention
+
+OPEN custody for `recovery_wait` / `worker_requeue_exhausted` takes precedence over
+archive readiness and in-flight capture states: failed latest capture yields
+`needs_action`, otherwise `source_only`. Availability remains independent and permits
+export of an existing archive without promising full or latest-work coverage. Owner
+Resume/Cancel remains required; neither a download nor capture progress implicitly
+releases custody. This narrowly qualifies the earlier archive-ready/no-archive
+expectations for exhaustion, including D4 and the procedure above. Inventory-guarded
+warnings and release safeguards are unchanged.
 
 ## Amendment 2026-10-07 — #2394 owner-resumed recovery episodes
 

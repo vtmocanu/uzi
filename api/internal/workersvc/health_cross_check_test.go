@@ -9,10 +9,46 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func TestHealthCrossCheckPinsWorkerReason(t *testing.T) {
+	for _, tc := range []struct {
+		name                         string
+		pinned, pinAware, checkAware bool
+		want                         string
+	}{
+		{"missing pin support", true, false, true, reasonNoCrossCheckPinCapableWorker},
+		{"unPinned old worker", false, false, true, reasonWaitingWorker},
+		{"pin aware worker", true, true, true, reasonWaitingWorker},
+		{"missing check support", false, false, false, reasonNoCrossCheckCapableWorker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := stalledRunRow()
+			r.Status, r.Kind = "queued", runkind.CrossCheck
+			r.StatusSince = ago(2 * time.Hour)
+			r.CrossCheckPinRequired = tc.pinned
+			fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
+			fs.onlineWorkers, fs.freeSlotWorkers, fs.eligibleWorkers = 1, 1, 1
+			fs.crossCheckRun = store.Run{Kind: runkind.CrossCheck, Harness: "codex"}
+			caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+			if tc.checkAware {
+				caps = append(caps, capability.CrossCheckV1)
+			}
+			if tc.pinAware {
+				caps = append(caps, capability.CrossCheckPinsV1)
+			}
+			fs.crossCheckWorkers = []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: caps}}
+			svc.detectRunHealth(context.Background(), t0)
+			if w := lastWrite(t, fs, r.ID); w.HealthReason.String != tc.want {
+				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+			}
+		})
+	}
+}
 
 func TestHealthCrossCheckWaiting(t *testing.T) {
 	for _, mode := range []string{"silent", "no updates", "near budget", "long tool call"} {

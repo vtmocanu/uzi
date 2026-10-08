@@ -226,6 +226,17 @@ function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
 }
 
 describe("custodyAlertView — self-hide, capacity, and blocked-run severity", () => {
+  it.each([undefined, 0, 3, 8])("uses admission %s with presence-based fallback", (admission_counted_holds) => {
+    const view = custodyAlertView(agg({ open_holds: 12, admission_counted_holds, decision_needed: 1 }), 0);
+    expect(view?.slotsUsed).toBe(admission_counted_holds ?? 12);
+    expect(view?.atLimit).toBe((admission_counted_holds ?? 12) >= 8);
+    expect(view?.tone).toBe("warning");
+  });
+
+  it("hides discounted healthy holds above total capacity", () => {
+    expect(custodyAlertView(agg({ open_holds: 12, admission_counted_holds: 0 }), 3)).toBeNull();
+  });
+
   it.each([8, 9])("shows capacity-only holds at %i as a warning", (open_holds) => {
     const view = custodyAlertView(agg({ open_holds }), 0);
     expect(view?.tone).toBe("warning");
@@ -300,6 +311,26 @@ describe("custodyHoldView — terminal rejection", () => {
 });
 
 describe("custodyHoldView — attention → presentation + actions (D6/D8/D9)", () => {
+  it.each(["available", "preparing", "uploading"])("keeps source-only archive export independent of latest capture %s", (capture_state) => {
+    const view = custodyHoldView(hold({ attention: "source_only", has_available_capture: true, capture_state }));
+    expect(view.group).toBe("attention");
+    expect(view.needsDecision).toBe(true);
+    expect(view.autoReleasing).toBe(false);
+    expect(view.actions).toEqual(["export", "discard"]);
+    expect(view.summary).toContain("available to download");
+    expect(view.summary).toContain("may not cover the latest");
+    if (capture_state !== "available") expect(view.summary).toContain(`latest capture is ${capture_state}`);
+  });
+
+  it.each(["preparing", "uploading"])("keeps capture %s pending without promising download", (capture_state) => {
+    const view = custodyHoldView(hold({ attention: "source_only", capture_state }));
+    expect(view.summary).toContain(`latest capture is ${capture_state}`);
+    expect(view.summary).toContain("No server archive is available to download yet");
+    expect(view.needsDecision).toBe(true);
+    expect(view.autoReleasing).toBe(false);
+    expect(view.actions).toEqual(["discard"]);
+  });
+
   it("active protection needs no decision and offers no action", () => {
     const v = custodyHoldView(hold({ attention: "active" }));
     expect(v.needsDecision).toBe(false);
@@ -321,7 +352,7 @@ describe("custodyHoldView — attention → presentation + actions (D6/D8/D9)", 
     expect(v.actions).toEqual([]);
   });
 
-  it("source_only is a possible-only-copy decision offering discard, never export", () => {
+  it("source_only without an archive offers discard without export", () => {
     const v = custodyHoldView(hold({ attention: "source_only" }));
     expect(v.needsDecision).toBe(true);
     expect(v.actions).toEqual(["discard"]);

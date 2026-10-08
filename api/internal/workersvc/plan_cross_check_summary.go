@@ -38,7 +38,9 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 		return nil, err
 	}
 	dto := &apitypes.PlanCrossCheckSummaryDTO{
-		Round: row.Round, Verdict: scrubThenBound(row.Verdict, 512),
+		CheckerModelSource:  textPtr(row.CheckerModelSource),
+		CheckerEffortSource: textPtr(row.CheckerEffortSource),
+		Round:               row.Round, Verdict: scrubThenBound(row.Verdict, 512),
 		ReasonClass:   planCrossCheckSummaryLabel(row.ReasonClass),
 		CheckerModel:  planCrossCheckSummaryLabel(row.CheckerModel),
 		CheckerEffort: planCrossCheckSummaryLabel(row.CheckerEffort),

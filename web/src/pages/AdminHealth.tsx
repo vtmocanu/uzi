@@ -22,7 +22,7 @@
 // names, upgrade details, blocking reasons) are server-sanitized, but any that reach a
 // `title=` attribute are re-stripped with stripUnsafeChars first (FleetRow, BlockingCell).
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
@@ -107,17 +107,41 @@ export function AdminHealth() {
   );
 }
 
-function HeaderLine({ doc, nowMs }: { doc: HealthDoc | null; nowMs: number }) {
+function useCopiedFeedback() {
   const [copied, setCopied] = useState(false);
+  const timer = useRef<number | null>(null);
+  const mounted = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (timer.current !== null) window.clearTimeout(timer.current);
+      timer.current = null;
+    };
+  }, []);
+
+  const showCopied = useCallback(() => {
+    if (!mounted.current) return;
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    setCopied(true);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      if (mounted.current) setCopied(false);
+    }, 1600);
+  }, []);
+
+  return { copied, showCopied };
+}
+
+function HeaderLine({ doc, nowMs }: { doc: HealthDoc | null; nowMs: number }) {
+  const { copied, showCopied } = useCopiedFeedback();
   const copyDiagnostics = () => {
     if (!doc) return;
     // The whole document as JSON — the exact shape a bug report or a `uzi admin health --json`
     // probe carries. Best-effort: a blocked clipboard is silent, matching WorkerUpgradeDetail.
     void navigator.clipboard?.writeText(JSON.stringify(doc, null, 2)).then(
-      () => {
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1600);
-      },
+      showCopied,
       () => {},
     );
   };
@@ -259,7 +283,7 @@ function AttentionItem({ check, nowMs }: { check: HealthCheck; nowMs: number }) 
 }
 
 function CommandLine({ command }: { command: string }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, showCopied } = useCopiedFeedback();
   return (
     <div className="flex items-start gap-2">
       <pre className="console min-w-0 flex-1 overflow-x-auto rounded-lg border border-edge bg-ink px-2.5 py-1.5 font-mono text-xs text-fg">
@@ -271,8 +295,7 @@ function CommandLine({ command }: { command: string }) {
         aria-live="polite"
         onClick={() => {
           void navigator.clipboard?.writeText(command);
-          setCopied(true);
-          window.setTimeout(() => setCopied(false), 1600);
+          showCopied();
         }}
       >
         {copied ? "Copied" : "Copy"}

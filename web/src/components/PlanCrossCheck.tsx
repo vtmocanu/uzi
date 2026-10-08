@@ -92,6 +92,10 @@ export function PlanCrossCheckEvent({ payload, detail }: { payload: unknown; det
   </section>;
 }
 
+function sourceLabel(source: unknown): string {
+  return source === "pin" || source === "worker default" ? source : "unknown";
+}
+
 export function PlanCrossCheck({ run }: { run: Run }) {
   const s = run.plan_cross_check_summary;
   const gate = run.plan_cross_check_gate_reason;
@@ -108,7 +112,7 @@ export function PlanCrossCheck({ run }: { run: Run }) {
     {s?.historical && <p>These findings concern an earlier plan; they do not certify the current plan.</p>}
     {s && <>
       <Findings value={s.findings} />
-      <p>Model: {plain(s.checker_model) || "Unreported"} · Effort: {plain(s.checker_effort) || "Unreported"}</p>
+      <p>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)}) · Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</p>
       {usage && <p>Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</p>}
       <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : cost === "Unavailable" ? " · cost unavailable" : ""}</p>
       {childId(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}

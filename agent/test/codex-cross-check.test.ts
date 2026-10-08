@@ -6,6 +6,8 @@ import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "..
 import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { Logger } from "../src/log.js";
+import { recordingLogger } from "./helpers.js";
+import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
 const verdict = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
 const claim = (subscription = false): ClaimResponse => ({
@@ -29,6 +31,15 @@ type Emit = (frame: unknown) => void;
 // only its dictionary root. This proves functional wiring, not kernel isolation.
 function rig(options: {
  notes?: (emit: Emit) => void;
+ beforeResponse?: (frame: Frame, emit: Emit) => void;
+ afterResponse?: (frame: Frame, emit: Emit) => void;
+ coalesced?: boolean;
+ queuedResponse?: boolean;
+ failUsage?: boolean;
+ claim?: ClaimResponse;
+ rpcFailure?: string;
+ rpcError?: unknown;
+ authFailure?: boolean;
  onToolReply?: (frame: Frame, emit: Emit) => void;
  clean?: boolean;
  failDispose?: boolean;
@@ -55,7 +66,13 @@ function rig(options: {
    while ((newline = buffer.indexOf("\n")) >= 0) {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
-    onFrame(JSON.parse(line), emit);
+    if (options.coalesced) {
+     const frames: unknown[] = [];
+     let gathering = true;
+     onFrame(JSON.parse(line), (frame) => { if (gathering) frames.push(frame); else emit(frame); });
+     gathering = false;
+     stdout.write(frames.map((frame) => JSON.stringify(frame) + "\n").join(""));
+    } else onFrame(JSON.parse(line), emit);
    }
    done();
   } });
@@ -76,13 +93,18 @@ function rig(options: {
  };
  const provider = roots("provider", (frame, emit) => {
   requests.push(frame);
-  if (frame.method === "initialize") emit({ id: frame.id, result: { userAgent: "fake", codexHome: "/owned", platformFamily: "unix", platformOs: "linux" } });
+  options.beforeResponse?.(frame, emit);
+  if ((options.rpcFailure && frame.method === options.rpcFailure) || (options.authFailure && frame.method === "account/login/start")) {
+   const respond = (): void => { emit({ id: frame.id, error: options.rpcError }); };
+   if (options.queuedResponse) queueMicrotask(respond); else respond();
+  } else if (frame.method === "initialize") emit({ id: frame.id, result: { userAgent: "fake", codexHome: "/owned", platformFamily: "unix", platformOs: "linux" } });
   else if (frame.method === "account/login/start") emit({ id: frame.id, result: { type: options.subscription ? "chatgptAuthTokens" : "apiKey" } });
   else if (frame.method === "thread/start") emit({ id: frame.id, result: { thread: { id: "thread" } } });
   else if (frame.method === "turn/start") {
    emit({ id: frame.id, result: { turn: { id: "turn" } } });
    queueMicrotask(() => { if (!options.holdTurn) (options.notes ?? terminal)(emit); });
   } else if (!frame.method && frame.id !== undefined) options.onToolReply?.(frame, emit);
+  options.afterResponse?.(frame, emit);
  });
  const fileop = roots("fileop", (frame, emit) => {
   const op = frame as unknown as { id: number; op: string; path: string };
@@ -96,10 +118,11 @@ function rig(options: {
   launchFileop: async (spec) => { specs.push(spec); return fileop; },
   launchProvider: async (spec) => { specs.push(spec); return provider; },
  };
+ let releases = 0;
  const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> = {
-  releaseCodex: async () => options.subscription
+  releaseCodex: async () => { releases++; return options.subscription
    ? { auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }
-   : { auth_mode: "api_key", access_token: "released-token" },
+   : { auth_mode: "api_key", access_token: "released-token" }; },
   refreshCodex: async (_run, request, expected) => {
    if (!options.refresh) throw new Error("unused");
    refreshes.push({ request, expected });
@@ -107,12 +130,221 @@ function rig(options: {
     chatgpt_account_id: "account", chatgpt_plan_type: null, outcome: "advanced" };
   },
  };
- const log = { addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
+ const recorded = recordingLogger();
+ const log = { ...recorded.logger, addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
  const checker = new CodexCrossCheck(client, log, deps);
- return { requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
-  run: (signal = new AbortController().signal) => checker.run(claim(options.subscription), "/checkout", "/owned", signal,
-   async (payload) => { usage.push(payload); }) };
+ return { logs: recorded.lines, get releases() { return releases; }, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
+  run: (signal = new AbortController().signal) => checker.run(options.claim ?? claim(options.subscription), "/checkout", "/owned", signal,
+   async (payload) => { usage.push(payload); if (options.failUsage && payload.event === "result") throw new Error("usage failed"); }) };
 }
+
+// Synthetic 0.159.3 local Responses HTTP 400 selected frame (#2151),
+// copied after inspecting the capture/schema. Not hosted entitlement evidence.
+const capturedError = {
+ message: JSON.stringify({ error: { message: "SYNTHETIC model rejection marker B",
+  type: "invalid_request_error", param: "model", code: "model_not_found" } }),
+ codexErrorInfo: "other", additionalDetails: null, misalignment: null,
+};
+function pinnedClaim(): ClaimResponse {
+ const c = claim();
+ c.config = { default_model: "gpt-6-astra", default_effort: "xhigh" };
+ c.cross_check!.model_source = "pin";
+ c.cross_check!.effort_source = "pin";
+ return c;
+}
+function rejection(emit: Emit, error: unknown = capturedError, overrides: Record<string, unknown> = {}): void {
+ emit({ method: "error", params: { threadId: "thread", turnId: "turn", willRetry: false, error, ...overrides } });
+}
+function failedTerminal(emit: Emit, error: unknown = capturedError, threadId = "thread", id = "turn", items: unknown[] = []): void {
+ emit({ method: "turn/completed", params: { threadId, turn: { id, status: "failed", items, error } } });
+}
+function assertOneAttempt(r: ReturnType<typeof rig>, turn = true): void {
+ assert.equal(r.specs.filter((s) => "kind" in s && s.kind === "provider").length, 1);
+ assert.equal(r.requests.filter((f) => f.method === "thread/start").length, 1);
+ assert.equal(r.requests.filter((f) => f.method === "turn/start").length, turn ? 1 : 0);
+ for (const frame of r.requests.filter((f) => f.method === "thread/start" || f.method === "turn/start")) {
+  assert.equal(frame.params!.model, "gpt-6-astra");
+  if (frame.method === "turn/start") assert.equal(frame.params!.effort, "xhigh");
+ }
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+ assert.equal(r.secrets.size, 0);
+}
+for (const mode of ["async", "terminal", "thread/start", "turn/start"] as const) {
+ it("maps pinned startup rejection over real transport: " + mode, async () => {
+  const r = rig({ claim: pinnedClaim(),
+   ...(mode.includes("/") ? { rpcFailure: mode, rpcError: { code: -32000, message: capturedError.message } } : {}),
+   notes: (emit) => mode === "terminal" ? failedTerminal(emit) : rejection(emit) });
+  await assert.rejects(r.run(), CrossCheckCheckerUnavailableError);
+  assertOneAttempt(r, mode !== "thread/start");
+ });
+}
+for (const source of [undefined, "worker default", "effort-only"] as const) {
+ it("retains model error without model pin: " + source, async () => {
+  const c = pinnedClaim();
+  if (source === "worker default") c.cross_check!.model_source = source;
+  else delete c.cross_check!.model_source;
+  if (source !== "effort-only") delete c.cross_check!.effort_source;
+  const r = rig({ claim: c, notes: (emit) => rejection(emit) });
+  await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError) && /model error/.test(e.message));
+  assertOneAttempt(r);
+ });
+}
+for (const effort of ["", "minimal", "XHIGH", " xhigh", "xhigh ", "unknown"]) {
+ it("refuses pinned effort before release: " + JSON.stringify(effort), async () => {
+  const c = pinnedClaim(); c.config!.default_effort = effort as NonNullable<ClaimResponse["config"]>["default_effort"];
+  const r = rig({ claim: c });
+  await assert.rejects(r.run(), CrossCheckCheckerUnavailableError);
+  assert.equal(r.releases, 0); assert.equal(r.specs.length, 0); assert.equal(r.requests.length, 0);
+ });
+}
+for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
+ it("passes pinned effort unchanged: " + effort, async () => {
+  const c = pinnedClaim(); c.config!.default_effort = effort;
+  const r = rig({ claim: c });
+  assert.equal(await r.run(), verdict);
+  assert.equal(r.requests.find((f) => f.method === "turn/start")!.params!.effort, effort);
+ });
+}
+const otherCode = JSON.stringify({ error: { message: "model missing or unavailable", code: "unsupported_model",
+ param: "model", type: "invalid_request_error" } });
+const negatives: [string, unknown, Record<string, unknown>?][] = [
+ ["generic400", { message: "400 model missing", codexErrorInfo: "badRequest" }],
+ ["captured404", { message: "unexpected status 404 Not Found: SYNTHETIC model rejection marker A",
+  codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 404 } } }],
+ ["othercode", { ...capturedError, message: otherCode }],
+ ["prose", { ...capturedError, message: "model_not_found: model does not exist" }],
+ ["badRequest", { ...capturedError, codexErrorInfo: "badRequest" }],
+ ["auth", { ...capturedError, codexErrorInfo: "unauthorized" }],
+ ["rate", { ...capturedError, codexErrorInfo: "rateLimitExceeded" }],
+ ["transport", { ...capturedError, codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 400 } } }],
+ ["confinement", { ...capturedError, codexErrorInfo: "sandboxError" }],
+ ["foreignthread", capturedError, { threadId: "foreign" }],
+ ["foreignturn", capturedError, { turnId: "foreign" }],
+ ["retrying", capturedError, { willRetry: true }],
+ ["malformed", capturedError, { willRetry: "false" }],
+ ["array", { ...capturedError, message: "[" + capturedError.message + "]" }],
+ ["nestedstring", { ...capturedError, message: JSON.stringify(capturedError.message) }],
+ ["oversize", { ...capturedError, message: capturedError.message + " ".repeat(8192) }],
+];
+for (const [label, error, overrides] of negatives) {
+ it("does not map negative rejection control: " + label, async () => {
+  const r = rig({ claim: pinnedClaim(), notes: (emit) => rejection(emit, error, overrides) });
+  await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+  assertOneAttempt(r);
+ });
+}
+for (const activity of ["delta", "reasoning", "tool", "completed", "terminal-items", "usage-output"]) {
+ it("does not reclassify after model activity: " + activity, async () => {
+  const r = rig({ claim: pinnedClaim(), notes: (emit) => {
+   if (activity === "terminal-items") { failedTerminal(emit, capturedError, "thread", "turn", [{ type: "reasoning" }]); return; }
+   if (activity === "usage-output") {
+    const usage = { totalTokens: 2, inputTokens: 1, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0 };
+    emit({ method: "thread/tokenUsage/updated", params: { threadId: "thread", turnId: "turn", tokenUsage: { total: usage, last: usage } } });
+    rejection(emit); return;
+   }
+   emit({ ...(activity === "tool" ? { id: 90 } : {}),
+    method: activity === "delta" ? "item/agentMessage/delta" : activity === "tool" ? "item/tool/call"
+     : activity === "reasoning" ? "item/reasoning/textDelta" : "item/completed",
+    params: { threadId: "thread", turnId: "turn", itemId: "assistant", delta: "output",
+     callId: "read", tool: "Read", arguments: { path: "anchor.ts" },
+     item: { type: "agentMessage", id: "assistant", text: verdict } } });
+   rejection(emit);
+  } });
+  await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+  assertOneAttempt(r);
+ });
+}
+it("does not map authentication RPC rejection", async () => {
+ const r = rig({ claim: pinnedClaim(), authFailure: true, rpcError: { code: -32000, message: capturedError.message } });
+ await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+ assert.equal(r.requests.filter((f) => f.method === "thread/start").length, 0);
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+});
+it("does not classify unmatched RPC after authentication", async () => {
+ const r = rig({ claim: pinnedClaim(), notes: (emit) => emit({ id: 9999, error: { code: -32000, message: capturedError.message } }) });
+ await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+ assertOneAttempt(r);
+});
+it("cleanup failure overrides mapped model rejection and disposes both roots", async () => {
+ const r = rig({ claim: pinnedClaim(), failDispose: true, notes: (emit) => rejection(emit) });
+ await assert.rejects(r.run(), /cleanup unconfirmed/); assertOneAttempt(r);
+});
+it("cancellation retains disposition before rejection consumption", async () => {
+ const controller = new AbortController();
+ const r = rig({ claim: pinnedClaim(), notes: (emit) => { rejection(emit); controller.abort(); } });
+ await assert.rejects(r.run(controller.signal), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+ assertOneAttempt(r);
+});
+
+for (const bucket of ["outputTokens", "reasoningOutputTokens"] as const) {
+ for (const mode of ["async", "terminal"] as const) {
+  it("cumulative " + bucket + " closes startup with zero last usage: " + mode, async () => {
+   const r = rig({ claim: pinnedClaim(), notes: (emit) => {
+    const zero = { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    emit({ method: "thread/tokenUsage/updated", params: { threadId: "thread", turnId: "turn",
+     tokenUsage: { total: { ...zero, [bucket]: 1 }, last: zero } } });
+    if (mode === "async") rejection(emit); else failedTerminal(emit);
+   } });
+   await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+   assertOneAttempt(r);
+  });
+ }
+}
+for (const timing of ["coalesced", "queued"] as const) {
+ for (const binding of ["bound", "foreign-thread", "foreign-turn", "missing-start"] as const) {
+  it("arrival activity before rejected turn RPC: " + timing + "/" + binding, async () => {
+   const r = rig({ claim: pinnedClaim(), coalesced: timing === "coalesced", queuedResponse: timing === "queued",
+    rpcFailure: "turn/start", rpcError: { code: -32000, message: capturedError.message },
+    beforeResponse: (frame, emit) => {
+     if (frame.method !== "turn/start") return;
+     if (binding !== "missing-start") emit({ method: "turn/started", params: {
+      threadId: binding === "foreign-thread" ? "foreign" : "thread", turn: { id: "turn" } } });
+     emit({ method: "item/started", params: { threadId: "thread",
+      turnId: binding === "foreign-turn" ? "foreign" : "turn", item: { type: "reasoning" } } });
+    } });
+   await assert.rejects(r.run(), (e: Error) => binding === "bound"
+    ? !(e instanceof CrossCheckCheckerUnavailableError) : e instanceof CrossCheckCheckerUnavailableError);
+   assertOneAttempt(r);
+  });
+ }
+}
+for (const phase of ["initialize", "account/login/start", "turn/start"] as const) {
+ for (const mode of ["async", "terminal"] as const) {
+  it("rejection arrival provenance: " + phase + "/" + mode, async () => {
+   const r = rig({ claim: pinnedClaim(), coalesced: true, holdTurn: true,
+    beforeResponse: (frame, emit) => {
+     if (frame.method === phase) { if (mode === "async") rejection(emit); else failedTerminal(emit); }
+    } });
+   await assert.rejects(r.run(), (e: Error) => phase === "turn/start"
+    ? e instanceof CrossCheckCheckerUnavailableError : !(e instanceof CrossCheckCheckerUnavailableError));
+   assertOneAttempt(r);
+  });
+ }
+}
+for (const method of ["thread/start", "turn/start"] as const) {
+ it("coalesced malformed frame preserves RPC protocol failure: " + method, async () => {
+  const r = rig({ claim: pinnedClaim(), coalesced: true, rpcFailure: method,
+   rpcError: { code: -32000, message: capturedError.message },
+   afterResponse: (frame, emit) => { if (frame.method === method) emit([]); } });
+  await assert.rejects(r.run(), /received a non-object frame/);
+  assertOneAttempt(r, method !== "thread/start");
+ });
+}
+for (const cleanupFails of [false, true]) {
+ it("original failure survives usage failure with cleanup priority: " + cleanupFails, async () => {
+  const r = rig({ claim: pinnedClaim(), failUsage: true, failDispose: cleanupFails, notes: (emit) => rejection(emit) });
+  await assert.rejects(r.run(), (e: Error) => cleanupFails ? /cleanup unconfirmed/.test(e.message)
+   : e instanceof CrossCheckCheckerUnavailableError);
+  assertOneAttempt(r);
+  assert.equal(r.usage.at(-1)!.is_error, true);
+ });
+}
+it("successful verdict preserves usage settlement failure and removes secrets", async () => {
+ const r = rig({ failUsage: true });
+ await assert.rejects(r.run(), /usage failed/);
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+ assert.equal(r.secrets.size, 0);
+});
 
 it("uses claimed model/effort, required wrappers, real Read broker and strict complete verdict", async () => {
  const r = rig({
@@ -331,3 +563,36 @@ it("fences untrusted prompt fields and rejects oversized candidate inputs before
  c.cross_check!.planning_diff = "x".repeat(512 * 1024 + 1);
  assert.throws(() => crossCheckPrompt(c), /cap/);
 });
+
+for (const mode of ["rpc", "async", "terminal", "prose", "data"] as const) {
+ it("provider prose, raw data and secrets never enter new error/usage/logs: " + mode, async () => {
+  const secret = "glpat-" + "0123456789abcdefghij";
+  const message = JSON.stringify({ error: { message: secret, code: "model_not_found",
+   param: "model", type: "invalid_request_error" } });
+  const raw = { ...capturedError, message: mode === "prose" ? "model_not_found " + secret : message,
+   additionalDetails: secret, data: { raw: secret }, cause: secret };
+  const r = rig({ claim: pinnedClaim(),
+   ...(mode === "rpc" || mode === "data" ? { rpcFailure: "turn/start", rpcError: {
+    code: -32000, message: mode === "data" ? secret : message,
+    data: { error: { code: "model_not_found", param: "model", type: "invalid_request_error" }, secret },
+   } } : {}),
+   notes: (emit) => mode === "terminal" ? failedTerminal(emit, raw) : rejection(emit, raw) });
+  await assert.rejects(r.run(), (e: Error) => {
+   assert.equal(e instanceof CrossCheckCheckerUnavailableError, mode !== "prose" && mode !== "data");
+   assert.equal(String(e).includes(secret), false);
+   assert.equal(JSON.stringify(e).includes(secret), false);
+   assert.equal(Object.hasOwn(e, "cause"), false);
+   return true;
+  });
+  assert.equal(JSON.stringify(r.logs).includes(secret), false);
+  assert.equal(JSON.stringify(r.usage).includes(secret), false);
+  assertOneAttempt(r);
+ });
+}
+for (const ids of [{ threadId: "foreign", id: "turn" }, { threadId: "thread", id: "foreign" }]) {
+ it("terminal fallback requires matching thread and turn: " + JSON.stringify(ids), async () => {
+  const r = rig({ claim: pinnedClaim(), notes: (emit) => failedTerminal(emit, capturedError, ids.threadId, ids.id) });
+  await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError) && /foreign/.test(e.message));
+  assertOneAttempt(r);
+ });
+}

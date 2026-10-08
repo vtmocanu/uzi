@@ -280,6 +280,8 @@ type CrossCheck struct {
 	DecidedAt            pgtype.Timestamptz `json:"decided_at"`
 	DeadlineAt           pgtype.Timestamptz `json:"deadline_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	CheckerModelSource   pgtype.Text        `json:"checker_model_source"`
+	CheckerEffortSource  pgtype.Text        `json:"checker_effort_source"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -786,6 +788,20 @@ type RecoveryCustodyHold struct {
 	FinalCaptureID             pgtype.UUID        `json:"final_capture_id"`
 	FinalSourceSha             pgtype.Text        `json:"final_source_sha"`
 	FinalCoverageDigest        pgtype.Text        `json:"final_coverage_digest"`
+}
+
+type RecoveryCustodyHoldFact struct {
+	ID                  uuid.UUID `json:"id"`
+	UserID              uuid.UUID `json:"user_id"`
+	RunID               uuid.UUID `json:"run_id"`
+	State               string    `json:"state"`
+	InventoryGuarded    bool      `json:"inventory_guarded"`
+	HasAvailableCapture bool      `json:"has_available_capture"`
+	CaptureState        string    `json:"capture_state"`
+	RunStatus           string    `json:"run_status"`
+	RecoveryWaitCause   string    `json:"recovery_wait_cause"`
+	Attention           string    `json:"attention"`
+	DecisionNeeded      bool      `json:"decision_needed"`
 }
 
 type Repo struct {
@@ -1368,6 +1384,14 @@ type User struct {
 	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
 	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
 	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
+}
+
+type UserCrossCheckPin struct {
+	UserID  uuid.UUID   `json:"user_id"`
+	Stage   string      `json:"stage"`
+	Harness string      `json:"harness"`
+	Model   pgtype.Text `json:"model"`
+	Effort  pgtype.Text `json:"effort"`
 }
 
 type UserSecret struct {

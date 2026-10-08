@@ -37,11 +37,11 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 	exec("INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'offline')", worker, owner, worker.String(), worker[:])
 	wants := map[uuid.UUID]string{}
 	for i, tc := range []struct{ cause, capture, want string }{
-		{custodyRecoveryCauseWorkerRequeueExhausted, "", attentionSourceOnly},
-		{custodyRecoveryCauseWorkerRequeueExhausted, "available", attentionArchiveReady},
-		{custodyRecoveryCauseWorkerRequeueExhausted, "preparing", attentionCapturing},
-		{custodyRecoveryCauseWorkerRequeueExhausted, "needs_action", attentionNeedsAction},
-		{"provider_outage", "", attentionActive},
+		{"worker_requeue_exhausted", "", "source_only"},
+		{"worker_requeue_exhausted", "available", "source_only"},
+		{"worker_requeue_exhausted", "preparing", "source_only"},
+		{"worker_requeue_exhausted", "needs_action", "needs_action"},
+		{"provider_outage", "", "active"},
 	} {
 		run, hold := uuid.New(), uuid.New()
 		exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,recovery_wait_cause) VALUES($1,$2,$3,'issue',$4,'t','d','recovery_wait',$5)", run, owner, repo, int64(i+1), tc.cause)
@@ -59,7 +59,7 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 		t.Fatalf("owner listing rows=%d want=%d", len(owners), len(wants))
 	}
 	for _, row := range owners {
-		if got := custodyHoldToDTO(row).Attention; got != wants[row.RunID] {
+		if got := row.Attention; got != wants[row.RunID] || row.DecisionNeeded != (wants[row.RunID] != "active") {
 			t.Fatalf("owner %s attention=%s want=%s cause=%s", row.RunID, got, wants[row.RunID], row.RecoveryWaitCause)
 		}
 	}
@@ -70,10 +70,10 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 	if len(workers) != len(wants) {
 		t.Fatalf("worker listing rows=%d want=%d", len(workers), len(wants))
 	}
-	remaining := map[string]int{attentionSourceOnly: 1, attentionArchiveReady: 1, attentionCapturing: 1, attentionNeedsAction: 1, attentionActive: 1}
+	remaining := map[string]int{"source_only": 3, "needs_action": 1, "active": 1}
 	for _, row := range workers {
-		got := deriveHoldAttention(batchHoldAttentionInput(row))
-		if row.WorkerID != worker || remaining[got] == 0 {
+		got := row.Attention
+		if row.WorkerID != worker || remaining[got] == 0 || row.DecisionNeeded != (got != "active") {
 			t.Fatalf("unexpected worker listing attention=%s row=%+v", got, row)
 		}
 		remaining[got]--
@@ -87,7 +87,7 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts[worker] != 2 {
-		t.Fatalf("decision count=%d want=2 (source_only + needs_action)", counts[worker])
+	if counts[worker] != 4 {
+		t.Fatalf("decision count=%d want=4 (three source_only + needs_action)", counts[worker])
 	}
 }

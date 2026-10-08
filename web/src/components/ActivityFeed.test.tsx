@@ -1512,7 +1512,7 @@ it("M1 historical cross-check announces earlier candidate evidence independently
   const r = render(<MemoryRouter><ActivityFeed run={runFixture({
     plan_cross_check_gate_reason: "model_error",
     plan_cross_check_summary: { round: 1, verdict: "approve", reason_class: "approve", findings: null,
-      checker_run_id: checker, checker_model: null, checker_effort: null, usage: null, historical: true },
+      checker_run_id: checker, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: true },
   })} messages={[message]} connected runningLive={false} terminal={false} /></MemoryRouter>);
   expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toBe("Plan cross-check of earlier-plan candidate: Passed");
 });

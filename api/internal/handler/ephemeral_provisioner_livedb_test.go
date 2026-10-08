@@ -135,6 +135,7 @@ func (fx *ephemeralFixture) provisionerWithLane(instanceEnabled, laneEnabled boo
 		MaxPerUser:          maxPerUser,
 		DefaultSize:         "m",
 		SaturationDelay:     saturationDelay,
+		BackgroundGrace:     5 * time.Minute,
 		IsolatedLaneEnabled: laneEnabled,
 	})
 }

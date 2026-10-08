@@ -8,7 +8,8 @@ import { CodexCallbackBroker, type RunGrants } from "./broker.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { wireFileopHelper } from "./fileop-client.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "./registry.js";
-import { createCodexTransport, type CodexTransport } from "./transport.js";
+import { createCodexTransport, CodexTransportError, type CodexTransport, type CodexNotification, type CodexThreadTokenUsage } from "./transport.js";
+import { CrossCheckCheckerUnavailableError } from "./model-rejection.js";
 import { createCodexAppServerAuth, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import { selectCodexBinding } from "./select.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
@@ -89,6 +90,11 @@ export class CodexCrossCheck {
   const prompt = crossCheckPrompt(claim);
   const model = claim.config?.default_model?.trim();
   if (!model) throw new Error("cross-check claim has no model");
+  if (claim.cross_check?.effort_source === "pin"
+   && !["low", "medium", "high", "xhigh", "max"].includes(claim.config?.default_effort ?? "")) {
+   throw new CrossCheckCheckerUnavailableError();
+  }
+  const modelPinned = claim.cross_check?.model_source === "pin";
   const binding = selected.binding;
   const secrets = new Set<string>();
   const registerToken = (token: string): void => {
@@ -106,6 +112,7 @@ export class CodexCrossCheck {
   let cleanupOK = true;
   let succeeded = false;
   let completedText: string | undefined;
+  let failure: { error: unknown } | undefined;
   const failedRoot = new AbortController();
   signal = AbortSignal.any([signal, failedRoot.signal]);
   const stopAdmission = (): void => {
@@ -161,31 +168,65 @@ export class CodexCrossCheck {
    provider.transport.stderr?.resume();
    if (!provider.transport.stdin || !provider.transport.stdout) throw new Error("cross-check provider transport missing");
    signal.throwIfAborted();
+   let authenticated = false;
+   // Weak membership records arrival phase without retaining notes outside the bounded queue.
+   const authenticatedNotes = new WeakSet<CodexNotification>();
+   let threadId: string | undefined;
+   let startingTurn = false;
+   let startedTurnId: string | undefined;
+   let startupActivity = false;
    transport = createCodexTransport({ inbound: provider.transport.stdout, outbound: provider.transport.stdin,
-    maxProtocolBytes: 8 * 1024 * 1024, maxProtocolFrames: 10_000, maxInboundBytes: 8 * 1024 * 1024 });
+    maxProtocolBytes: 8 * 1024 * 1024, maxProtocolFrames: 10_000, maxInboundBytes: 8 * 1024 * 1024,
+    onNotification: (note) => {
+     if (!authenticated) return;
+     authenticatedNotes.add(note);
+     if (!startingTurn || !threadId) return;
+     if (note.kind === "turn_started" && note.threadId === threadId && note.turnId
+      && startedTurnId === undefined) startedTurnId = note.turnId;
+     if (!startedTurnId) return;
+     const params = object(note.params);
+     if (params?.threadId === threadId && params?.turnId === startedTurnId
+      && note.method?.startsWith("item/")) startupActivity = true;
+     if (note.kind === "token_usage_updated" && note.threadId === threadId && note.turnId === startedTurnId
+      && hasOutput(note.usage)) startupActivity = true;
+    } });
    await auth.authenticate(transport, signal);
+   authenticated = true;
+   // Only authenticated startup RPCs can map a recognized pinned-model rejection.
+   const startupRequest = async <T>(method: string, params: Record<string, unknown>): Promise<T> => {
+    try { return await transport!.request<T>(method, params, { signal }); }
+    catch (err) {
+     if (transport!.protocolFailure) throw transport!.protocolFailure;
+     if (!signal.aborted && !startupActivity && modelPinned && err instanceof CodexTransportError
+      && err.modelRejection === "model_not_found") throw new CrossCheckCheckerUnavailableError();
+     throw err;
+    }
+   };
    const broker = new CodexCallbackBroker({
     registry, fileop: fileopHandle.client, worktreePath: checkout, grants: GRANTS, signal,
     spawnCommand: async () => { throw new Error("checker has no command authority"); },
     delegate: async () => { throw new Error("checker has no delegation authority"); },
    });
-   const thread = await transport.request<{ thread?: { id?: string } }>("thread/start", {
+   const thread = await startupRequest<{ thread?: { id?: string } }>("thread/start", {
     model, modelProvider: "openai", cwd: checkout, approvalPolicy: "never", ephemeral: true,
     environments: [], dynamicTools: buildCodexDynamicTools(GRANTS), developerInstructions: BRIEF,
     config: { shell_tool: false, project_doc_max_bytes: 0, projects: { [checkout]: { trust_level: "untrusted" } } },
-   }, { signal });
-   const threadId = thread.thread?.id;
+   });
+   threadId = thread.thread?.id;
    if (typeof threadId !== "string" || !threadId) throw new Error("cross-check missing thread");
    accountant.registerThread(threadId, model, false);
    await postUsage({ event: "init", model, harness: "codex" });
    usageInit = true;
-   const turn = await transport.request<{ turn?: { id?: string } }>("turn/start", {
+   startingTurn = true;
+   const turn = await startupRequest<{ turn?: { id?: string } }>("turn/start", {
     threadId, model, ...(claim.config?.default_effort ? { effort: claim.config.default_effort } : {}),
     input: [{ type: "text", text: prompt }], environments: [],
-   }, { signal });
+   });
+   startingTurn = false;
    const turnId = turn.turn?.id;
    if (typeof turnId !== "string" || !turnId) throw new Error("cross-check missing turn");
    let calls = 0;
+   let modelActivity = false;
    let verdictText: string | undefined;
    let textBytes = 0;
    let streamedText = "";
@@ -195,7 +236,10 @@ export class CodexCrossCheck {
     if (await auth.handleServerRequest(transport, note, signal)) continue;
     const params = object(note.params);
     const bound = params?.threadId === threadId && params?.turnId === turnId;
+    // Any bound item activity (including reasoning or a tool call) closes startup.
+    if (bound && note.method?.startsWith("item/")) modelActivity = true;
     if (note.kind === "token_usage_updated" && note.threadId === threadId && note.turnId === turnId) {
+     if (hasOutput(note.usage)) modelActivity = true;
      accountant.record(threadId, note.usage);
     } else if (note.method === "item/tool/call" && note.kind === "activity" && note.requestId !== undefined) {
      if (++calls > 200) throw new Error("cross-check cumulative tool budget exceeded");
@@ -210,6 +254,11 @@ export class CodexCrossCheck {
     } else if (note.kind === "activity" && note.requestId !== undefined) {
      throw new Error("cross-check unsupported server request");
     } else if (note.method === "error") {
+     if (modelPinned && authenticatedNotes.has(note) && !modelActivity && bound && note.kind === "codex_error"
+      && !note.willRetry && note.modelRejection === "model_not_found") {
+      if (transport.protocolFailure) throw transport.protocolFailure;
+      throw new CrossCheckCheckerUnavailableError();
+     }
      throw new Error("cross-check model error");
     } else if (note.method === "item/agentMessage/delta") {
      if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant delta");
@@ -239,6 +288,11 @@ export class CodexCrossCheck {
      }
     } else if (note.kind === "turn_completed") {
      if (note.threadId !== threadId || note.turnId !== turnId) throw new Error("cross-check foreign terminal turn");
+     if (modelPinned && authenticatedNotes.has(note) && !modelActivity && note.status === "failed"
+      && note.modelRejection === "model_not_found") {
+      if (transport.protocolFailure) throw transport.protocolFailure;
+      throw new CrossCheckCheckerUnavailableError();
+     }
      if (note.status !== "completed" || verdictText === undefined) throw new Error("cross-check terminal turn has no complete verdict");
      validateVerdict(verdictText);
      await auth.drainInterceptedRequests();
@@ -252,6 +306,8 @@ export class CodexCrossCheck {
     }
    }
    if (!succeeded) throw new Error("cross-check ended without terminal turn");
+  } catch (error) {
+   failure = { error };
   } finally {
    signal.removeEventListener("abort", stopAdmission);
    auth?.closeAdmissionAndCancel();
@@ -267,14 +323,22 @@ export class CodexCrossCheck {
    try {
     if (usageInit) await postUsage({ event: "result", subtype: "cross_check", is_error: !succeeded || !cleanupOK || signal.aborted,
      modelUsage: accountant.aggregateByModel({ authMode: binding.authMode, now: new Date() }) ?? {} });
+   } catch (error) {
+    failure ??= { error };
    } finally {
     for (const secret of secrets) this.log.removeSecret(secret);
    }
   }
   if (!cleanupOK) throw new Error("cross-check cleanup unconfirmed");
+  if (failure) throw failure.error;
   if (completedText === undefined) throw new Error("cross-check ended without terminal turn");
   return completedText;
  }
+}
+
+function hasOutput(usage: CodexThreadTokenUsage): boolean {
+ return usage.total.outputTokens > 0 || usage.total.reasoningOutputTokens > 0
+  || usage.last.outputTokens > 0 || usage.last.reasoningOutputTokens > 0;
 }
 
 // Parse the entire assistant item; the ordinary lead tail parser is intentionally

@@ -54,25 +54,10 @@ deliberate / mock-only** label, and your choice from these:
   finding **cannot go to uzi at all** (worker lacks `workflow` scope). For tiny,
   well-localized findings a uzi round-trip is disproportionate — say so.
 
-  **A filed issue meant for UNATTENDED pickup must be sweepable AND self-contained**, or the
-  nightly sweep silently never fires it (the sweep table is in `CLAUDE.local.md`; the failure
-  mode and the fix are the `issue-triage` skill's whole subject). Three requirements:
-  1. **A sweep selector label** — `Planned` for feature/change work, `bug` for a defect.
-  2. **Eligibility** — the `uzi` label, or the issue **assigned to the uzi-bot account**
-     (a second, label-less way to be eligible, PRD #767); no PRD link, no PRD file, no
-     waiver needed. A selector label alone does **not** fire an issue that is neither
-     `uzi`-labelled nor bot-assigned. For an issue you're filing fresh here, the `uzi`
-     label is simpler than assigning the bot account — assignment matters mainly for an
-     issue a human already assigned to the bot before you got to it.
-  3. **A cold-readable body** — a swept worker reads ONLY the issue text (no chat, no memory
-     of this session), so name the exact files and `file:line` anchors, the precise change,
-     and acceptance criteria (a failing-first test where sensible). CodeRabbit's own finding
-     text is a good seed, but paste the concrete context — do not link to a PR comment the
-     worker cannot see.
-
-  **The inverse is just as deliberate:** an issue you intend a *human* to triage later must be
-  left **non-sweepable** — no `uzi`, no `Planned`/`bug` — so an unattended 02:00 run cannot
-  auto-implement a half-formed idea. Choose the labels for the outcome you want, every time.
+  **Label a filed issue per the *Filing default* in
+  `.agents/skills/issue-triage/references/on-deck.md`.** A swept worker reads ONLY the issue
+  text, so the body names the exact files and symbols, the change and the acceptance checks;
+  paste CodeRabbit's concrete context instead of linking a PR comment the worker cannot see.
 
 A finding on a **workflow file inherited from `main`** (base-realignment artifact) is not the
 PR's to fix at all — if it is worth doing, it is a separate CI-only PR (your token carries

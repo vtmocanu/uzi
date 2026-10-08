@@ -1178,6 +1178,9 @@ export interface ClaimJob {
  */
 /** Server-stored, bounded plan candidate for one live read-only child claim. */
 export interface ClaimPlanCrossCheck {
+  /** Independent provenance from the captured server snapshot; absent on legacy claims. */
+  model_source?: "pin" | "worker default";
+  effort_source?: "pin" | "worker default";
   stage: "plan";
   lead_run_id: string;
   round: number;

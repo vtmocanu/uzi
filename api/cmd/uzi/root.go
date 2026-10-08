@@ -337,6 +337,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newAuthCmd(env, gf),
 		newContextCmd(env, gf),
 		newWhoamiCmd(env, gf),
+		newSettingsCmd(env, gf),
 		newRunCmd(env, gf),
 		newPRCmd(env, gf),
 		newCICmd(env, gf),

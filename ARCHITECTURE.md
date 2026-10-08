@@ -628,9 +628,41 @@ isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
 confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. Dedicated
-slots, automatic checker revision, Codex-lead checking, stage-specific pins
-and Code cross-check remain outside this implementation.
+rationale, validation provenance and pending hosted acceptance.
+
+Plan checker pins live in `user_cross_check_pins`, keyed by owner, stage and
+family. Model and effort resolve independently from a claim-time statement
+snapshot; delivery and recording reuse that snapshot, including independent
+`pin` / `worker default` provenance. Legacy sources stay nullable/unknown
+and historical records are not recomputed after settings edits. The settings
+DTO also exposes read-only `worker_default_model` counterfactual metadata
+using the existing allocated lead/orchestrator selection in native SQL name
+order when the Claude worker model is unset; a null first-template model
+then means SDK/account default. Codex without a saved worker model falls
+back to `gpt-6.1-sol`.
+
+A non-null model or effort pin in the Codex cell requires
+`cross_check_pins_v1`; unpinned checks still accept older
+`cross_check_v1` workers. A custom resolved model separately requires
+`codex_custom_model_v1`, including a custom worker default. Placement
+mirrors enforce these requirements; both checks repeat in claim preflight
+before credential delivery, requeuing a capability race. Local syntax/family
+and effort validation also precedes delivery. Pins are hard: no model
+substitution, effort clamp or default retry.
+
+The API does not determine account model availability. Recognized
+authenticated pinned-model rejection at checker startup settles
+`checker_unavailable`, fails the child with
+`plan cross-check: checker unavailable` and forces the lead's human gate.
+Other startup failures retain #2149 handling, including model errors with
+worker defaults or effort-only pins. The Claude pin cell is stored and
+editable but inactive; only a Codex checker checks a Claude lead today.
+See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
+decision and validation limits, and
+[configuration](docs/configuration.md#plan-cross-check-model-and-effort-pins)
+for the settings contract. Dedicated slots (#2169), automatic checker
+revision, Codex-lead checking (#2460) and Code cross-check (#2170) remain
+outside this implementation.
 
 ### Run lifecycle
 
@@ -1148,9 +1180,11 @@ chain in the diagram above, with no intervening `running`.
   still-running turn from a local checkpoint, while this one preserves a
   run's original commits across a `failed` finalization and the worker's
   eventual teardown. A **claim-scoped custody hold** (`recovery_custody_holds`,
-  H-free, opened in the same `ClaimRun` transaction) reserves owner-scoped
-  admission capacity and blocks the worker's teardown while the work is
-  unpublished; the **archive capture** (`recovery_captures`) is the later,
+  H-free, opened in the same `ClaimRun` transaction) protects unpublished work
+  and blocks the worker's teardown. Admission counts open holds except at most
+  one per run backing a healthy current claim without an owner decision;
+  total custody remains protected. See [ADR-2445](adr/2445-custody-admission-accounting.md).
+  The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
   (a v2 worker advertises `recovery_archive_v2`; an ambiguous/older case
