@@ -6978,7 +6978,7 @@ describe("M1 plan cross-check detail refresh", () => {
     await r.settle();
     await r.update([message(3), message(4), message(5)], {
       round: 1, verdict: "approve", reason_class: "approve", findings: { summary: "# Refreshed evidence", items: null },
-      checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false,
+      checker_run_id: null, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: false,
     });
     expect(screen.getByRole("heading", { name: "Refreshed evidence" })).toBeTruthy();
     await r.update([message(3), message(4), message(5)]);
@@ -6988,7 +6988,7 @@ describe("M1 plan cross-check detail refresh", () => {
     const r = setup();
     await r.update([{ ...message(1), payload: { stage: "implementation" } }], {
       round: 1, verdict: "pending", reason_class: null, findings: null,
-      checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false,
+      checker_run_id: null, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: false,
     });
     expect(r.refreshRun).not.toHaveBeenCalled();
     expect(screen.getByText("Checked candidate: Pending")).toBeTruthy();
@@ -6997,7 +6997,7 @@ describe("M1 plan cross-check detail refresh", () => {
     await r.settle();
     await r.update([message(2)], {
       round: 1, verdict: "revise", reason_class: "revise", findings: { summary: "New checker evidence", items: null },
-      checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false,
+      checker_run_id: null, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: false,
     });
     expect(screen.getByText("New checker evidence")).toBeTruthy();
     expect(r.refreshRun).toHaveBeenCalledTimes(1);

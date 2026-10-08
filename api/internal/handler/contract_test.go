@@ -73,6 +73,7 @@ func contractCases() []contractCase {
 		newContractCase[columnDTO]("column"),
 		newContractCase[skillDTO]("skill"),
 		newContractCase[settingsResponse]("settings"),
+		newContractCase[userSettingsDTO]("settings_user_settings"),
 		newContractCase[brandingResponse]("branding"),
 		newContractCase[chatListDTO]("chat"),
 		newContractCase[agentTemplateDTO]("agent_template"),

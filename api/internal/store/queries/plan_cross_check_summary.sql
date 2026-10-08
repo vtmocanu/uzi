@@ -3,7 +3,7 @@
 -- or approval authority. Bound legacy text before transfer. Child metadata is
 -- optional after deletion, and usage is joined only through the same-owner child.
 SELECT cc.round, cc.verdict, cc.reason_class,
-    cc.findings, cc.checker_run_id, cc.checker_model, cc.checker_effort,
+    cc.findings, cc.checker_run_id, cc.checker_model, cc.checker_effort, cc.checker_model_source, cc.checker_effort_source,
     (checker.id IS NOT NULL)::boolean AS has_child,
     (usage.run_id IS NOT NULL)::boolean AS has_usage,
     COALESCE(usage.input_tokens, 0)::bigint AS input_tokens,

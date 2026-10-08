@@ -32,7 +32,7 @@ func (q *Queries) GetCrossCheckChildProtocol(ctx context.Context, childID uuid.U
 }
 
 const getExactPlanCrossCheck = `-- name: GetExactPlanCrossCheck :one
-SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited FROM cross_checks
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited FROM cross_checks
 WHERE lead_run_id = $1 AND stage = 'plan' AND round = $2 FOR UPDATE
 `
 
@@ -68,6 +68,8 @@ func (q *Queries) GetExactPlanCrossCheck(ctx context.Context, arg GetExactPlanCr
 		&i.DecidedAt,
 		&i.DeadlineAt,
 		&i.CreatedAt,
+		&i.CheckerModelSource,
+		&i.CheckerEffortSource,
 		&i.AutomaticRevisionLimit,
 		&i.AutomaticRoundsEnabled,
 		&i.InterruptedAt,
@@ -279,7 +281,7 @@ FROM runs lead WHERE lead.id = cc.lead_run_id AND lead.id = $1
  AND cc.lead_claim_generation <> lead.claim_generation AND cc.verdict = 'approve'
  AND cc.automatic_rounds_enabled
  AND lead.plan_md IS NULL AND lead.auto_approve AND lead.gate_revision = 0
-RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited
 `
 
 func (q *Queries) SupersedeUnstoredPlanApproval(ctx context.Context, leadRunID uuid.UUID) (CrossCheck, error) {
@@ -309,6 +311,8 @@ func (q *Queries) SupersedeUnstoredPlanApproval(ctx context.Context, leadRunID u
 		&i.DecidedAt,
 		&i.DeadlineAt,
 		&i.CreatedAt,
+		&i.CheckerModelSource,
+		&i.CheckerEffortSource,
 		&i.AutomaticRevisionLimit,
 		&i.AutomaticRoundsEnabled,
 		&i.InterruptedAt,

@@ -30,6 +30,11 @@ guarantee against every possible failure. It does **not** cover uncommitted
 files, the SDK transcript, the worker's HOME directory, or a worker that
 died before it reached this protected boundary.
 
+For operators investigating checkpoint acknowledgement failures, see
+[Checkpoint publish diagnostics](./checkpoint-publish-diagnostics.md) for the
+HTTP evidence boundary and a deployment comparison procedure. An unknown
+acknowledgement does not prove that origin rejected the update.
+
 ## What you'll see
 
 The run page shows a **Recovery archives** section on any run that failed to

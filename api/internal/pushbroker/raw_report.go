@@ -1,6 +1,7 @@
 package pushbroker
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/sideband"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 )
@@ -69,20 +71,35 @@ func (p *packetObserver) feed(data []byte, packet func([]byte)) {
 }
 
 type rawReport struct {
-	ref       string
-	sideband  bool
-	outer     packetObserver
-	inner     packetObserver
-	invalid   bool
-	exhausted bool
-	flushed   bool
-	unpack    string
-	marker    string
-	reason    string
+	ref         string
+	sideband    bool
+	sideband64k bool
+	outer       packetObserver
+	inner       packetObserver
+	invalid     bool
+	exhausted   bool
+	flushed     bool
+	unpack      string
+	marker      string
+	reason      string
+	terminal    bool
+	http        bool
+	attached    bool
+	eligible    bool
+	finalized   bool
+	eof         bool
+	bytes       int
+	readErr     error
+	closeErr    error
+	finalErr    error
 }
 
 func (r *rawReport) feed(data []byte) {
 	r.outer.feed(data, func(payload []byte) {
+		if r.terminal {
+			r.invalid = true
+			return
+		}
 		if !r.sideband {
 			r.reportPacket(payload)
 			return
@@ -92,14 +109,23 @@ func (r *rawReport) feed(data []byte) {
 			if !r.flushed {
 				r.invalid = true
 			}
+			r.terminal = true
 			return
 		}
-		if len(payload) == 0 {
+		limit := sideband.MaxPackedSize
+		if r.sideband64k {
+			limit = sideband.MaxPackedSize64k
+		}
+		if len(payload) == 0 || len(payload) > limit {
 			r.invalid = true
 			return
 		}
 		switch payload[0] {
 		case 1:
+			if r.flushed {
+				r.invalid = true
+				return
+			}
 			r.inner.feed(payload[1:], r.reportPacket)
 		case 2: // Progress is not report evidence.
 		default:
@@ -157,7 +183,7 @@ func (r *rawReport) reportPacket(payload []byte) {
 
 func (r *rawReport) complete() bool {
 	return !r.invalid && !r.outer.invalid && !r.inner.invalid &&
-		r.outer.have == 0 && r.inner.have == 0 && r.flushed
+		r.outer.have == 0 && r.inner.have == 0 && r.flushed && (!r.sideband || r.terminal)
 }
 
 // maxReportResponseBytes caps the actual single-command receive-pack response at
@@ -186,6 +212,7 @@ func (r *rawReportReader) Read(p []byte) (int, error) {
 	// boundary. Reaching the boundary conservatively invalidates prior evidence.
 	n, err := r.reader.Read(p[:min(len(p), remaining)])
 	r.read += n
+	r.report.bytes += n
 	r.report.feed(p[:n])
 	if r.read == maxReportResponseBytes {
 		r.report.invalid, r.report.exhausted = true, true
@@ -244,15 +271,64 @@ func nilReflectValue(v reflect.Value) bool {
 
 type rawReportRoundTripper struct {
 	original http.RoundTripper
-	endpoint *transport.Endpoint
 	report   *rawReport
 }
 
+// reportInvocationKey is private to the observer; only receiveObservedPack marks
+// the context of this invocation. Discovery redirects may canonicalize the URL.
+type reportInvocationKey struct{}
+
 func (t *rawReportRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.report.http = true
 	res, err := t.original.RoundTrip(req)
-	if res != nil && res.Body != nil && req.Method == http.MethodPost && req.URL.String() == t.endpoint.String()+"/"+transport.ReceivePackServiceName {
-		res.Body = &rawReportReader{reader: res.Body, report: t.report}
+	if req.Method != http.MethodPost || req.Context().Value(reportInvocationKey{}) != t.report ||
+		!strings.HasSuffix(req.URL.Path, "/"+transport.ReceivePackServiceName) {
+		return res, err
 	}
+	if res == nil || res.Body == nil {
+		t.report.finalErr = err
+		return res, err
+	}
+	r := t.report
+	r.attached = true
+	r.eligible = res.StatusCode == http.StatusOK && err == nil
+	original := res.Body
+	reader := &rawReportReader{reader: original, report: r}
+	var replay bytes.Buffer
+	buffer := make([]byte, 32<<10)
+	// The byte cap bounds productive reads; 100 consecutive empty reads bound a
+	// broken reader. The original request context bounds actual HTTP body stalls.
+	idle := 0
+	for {
+		if cause := req.Context().Err(); cause != nil {
+			r.readErr = cause
+			break
+		}
+		n, cause := reader.Read(buffer)
+		replay.Write(buffer[:n])
+		if cause != nil {
+			if cause == io.EOF {
+				r.eof = true
+			} else {
+				r.readErr = cause
+			}
+			break
+		}
+		if n == 0 {
+			idle++
+		} else {
+			idle = 0
+		}
+		if idle == 100 {
+			r.readErr = io.ErrNoProgress
+			break
+		}
+	}
+	r.closeErr = original.Close()
+	r.finalErr = errors.Join(err, r.readErr, r.closeErr, req.Context().Err())
+	r.finalized = r.eof && r.finalErr == nil && !r.exhausted
+	// Replays contain at most maxReportResponseBytes and never observe twice.
+	res.Body = io.NopCloser(bytes.NewReader(replay.Bytes()))
 	return res, err
 }
 
@@ -263,10 +339,10 @@ func rawHTTPTransport(ep *transport.Endpoint, report *rawReport) (transport.Tran
 		ep.InsecureSkipTLS || ep.Proxy != (transport.ProxyOptions{}) {
 		return nil, errors.New("pushbroker: raw HTTP observer does not support endpoint TLS/proxy options")
 	}
+	report.http = true
 	copied := *brokerHTTPClient
 	copied.Transport = &rawReportRoundTripper{
 		original: brokerHTTPClient.Transport,
-		endpoint: ep,
 		report:   report,
 	}
 	return githttp.NewClient(&copied), nil

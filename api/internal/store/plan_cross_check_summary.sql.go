@@ -14,7 +14,7 @@ import (
 
 const getLatestPlanCrossCheckSummary = `-- name: GetLatestPlanCrossCheckSummary :one
 SELECT cc.round, cc.verdict, cc.reason_class,
-    cc.findings, cc.checker_run_id, cc.checker_model, cc.checker_effort,
+    cc.findings, cc.checker_run_id, cc.checker_model, cc.checker_effort, cc.checker_model_source, cc.checker_effort_source,
     (checker.id IS NOT NULL)::boolean AS has_child,
     (usage.run_id IS NOT NULL)::boolean AS has_usage,
     COALESCE(usage.input_tokens, 0)::bigint AS input_tokens,
@@ -66,6 +66,8 @@ type GetLatestPlanCrossCheckSummaryRow struct {
 	CheckerRunID        pgtype.UUID    `json:"checker_run_id"`
 	CheckerModel        pgtype.Text    `json:"checker_model"`
 	CheckerEffort       pgtype.Text    `json:"checker_effort"`
+	CheckerModelSource  pgtype.Text    `json:"checker_model_source"`
+	CheckerEffortSource pgtype.Text    `json:"checker_effort_source"`
 	HasChild            bool           `json:"has_child"`
 	HasUsage            bool           `json:"has_usage"`
 	InputTokens         int64          `json:"input_tokens"`
@@ -91,6 +93,8 @@ func (q *Queries) GetLatestPlanCrossCheckSummary(ctx context.Context, arg GetLat
 		&i.CheckerRunID,
 		&i.CheckerModel,
 		&i.CheckerEffort,
+		&i.CheckerModelSource,
+		&i.CheckerEffortSource,
 		&i.HasChild,
 		&i.HasUsage,
 		&i.InputTokens,

@@ -773,6 +773,7 @@ f42_assert_capture_park "$RUN_F1" "$((GEN_F1 + 1))"
 [ "$(rb_run_field "$RUN_F1" claim_generation)" = "$((GEN_F1 + 2))" ] \
   || fail "case 7: run $RUN_F1 completed at generation $(rb_run_field "$RUN_F1" claim_generation), want $((GEN_F1 + 2)) after the proved G+1 capture park"
 pass "case 7: run $RUN_F1 captured at generation $((GEN_F1 + 1)) and completed at $((GEN_F1 + 2)); finalize_resume_generation=$GEN_F1, never worker_lost"
+resolve_fixture_source_hold "$RUN_F1" "$GEN_F1"
 
 # -----------------------------------------------------------------------------
 # CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 capture park, a second
@@ -811,6 +812,7 @@ f42_assert_capture_park "$RUN_F2" "$((GEN_F2 + 1))"
 pass "case 8: run $RUN_F2 used the allowance, captured at G+1, and is executing at generation $((GEN_F2 + 2)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
 # Second cut at the proved EXECUTING G+2: G+1 was the retained-clone capture, not an executor turn.
 GEN_F2B=$((GEN_F2 + 2))
+GEN_F2_OBSERVED="$(rb_run_field "$RUN_F2" claim_generation)"
 say "second cut: run $RUN_F2 at generation $GEN_F2B"
 rc=0; f42_cut "$RUN_F2" "$GEN_F2B" || rc=$?
 if [ "$rc" = 0 ]; then
@@ -871,6 +873,12 @@ pass "case 8: uzi run recovery on run $RUN_F2 shows no silent empty hold ($(prin
 apipost "/api/runs/$RUN_F2/inputs" '{"kind":"cancel","body":""}' >/dev/null
 wait_status "$RUN_F2" cancelled 30
 pass "case 8: owner cancelled the test-owned recovery hold without discarding its source"
+
+# Retention and non-discarding cancellation were proved above. The fixture owner
+# now makes the separate D13 decision for only the original and observed lost claim;
+# the available G+1 archive stays exportable. Case 3's completed hold is untouched.
+resolve_fixture_source_hold "$RUN_F2" "$GEN_F2"
+resolve_fixture_source_hold "$RUN_F2" "$GEN_F2_OBSERVED"
 
 # =============================================================================
 # RESTORE — return the api stale window and the agent outbox knobs to their defaults so
