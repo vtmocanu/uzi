@@ -1197,6 +1197,31 @@ it("guarded boot failure does not block a sibling run", async () => {
   } finally { await f.close(); }
 });
 
+it("issue2416 live FINAL success that forgets the generation reports uploaded, not record_removed", async () => {
+  const f = await fixture(false, os.tmpdir(), true);
+  try {
+    const record = await f.freeze();
+    assert.ok(record);
+    f.state.finalError = new Error("network unavailable");
+    assert.equal((await f.capture(record)).reason, "upload_transient");
+    const pending = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.equal(pending.state, "uploaded");
+    assert.ok(pending.finalRequest);
+    const outcomes: unknown[] = [];
+    f.log.info = (message, fields) => {
+      if (message === "recovery live re-drive") outcomes.push((fields as { outcome?: unknown }).outcome);
+    };
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
+    f.state.finalError = undefined;
+    f.state.now += 60_000;
+    await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+    assert.equal(f.finals.length, 2, "the live pass replays the saved FINAL");
+    assert.deepEqual(await f.coordinator.inspect("run-1"), [], "guarded cleanup removed the generation");
+    await assert.rejects(fs.readFile(pending.bundlePath!), { code: "ENOENT" });
+    assert.deepEqual(outcomes, ["uploaded"]);
+  } finally { await f.close(); }
+});
+
 for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "attention"] as const) {
   it(`issue2416 retained FINAL reconciliation preserves retry classification ${variant}`, async () => {
     const f = await fixture(false, os.tmpdir(), true);
