@@ -1215,6 +1215,7 @@ for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "att
         reconciliations++;
         const response = await reconcile(run, id, request);
         assert.equal(response.outcome, "retained");
+        assert.ok("reason" in response);
         assert.equal(response.reason, "capture_available");
         return { ...response, reason };
       };
