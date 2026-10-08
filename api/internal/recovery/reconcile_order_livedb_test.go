@@ -55,16 +55,23 @@ func awaitReconcileOperation[T any](t *testing.T, result <-chan reconcileOperati
 }
 
 // Observe a real PostgreSQL lock wait, rather than infer ordering from a sleep.
-// At most five seconds of polling; any query failure stops this test.
+// Use a dedicated connection: the holder, Reconcile, Release and Upload can fill
+// the service pool while blocked. At most five seconds, including connecting and
+// polling; any connection or query failure stops this test.
 func waitReconcileLock(t *testing.T, e *inventoryEnv, blocker int32, query string) int32 {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
 	defer cancel()
+	observer, err := pgx.ConnectConfig(ctx, e.pool.Config().ConnConfig.Copy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = observer.Close(ctx) }()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		var pid int32
-		err := e.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
+		err := observer.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
 			WHERE datname=current_database() AND wait_event_type='Lock'
 			AND strpos(query,$2)>0 AND cardinality(pg_blocking_pids(pid))>0
 			AND ($1::int=0 OR $1=ANY(pg_blocking_pids(pid))) LIMIT 1`, blocker, query).Scan(&pid)
@@ -149,7 +156,7 @@ func TestRecoveryReconcileFenceFirstOrderLiveDB(t *testing.T) {
 	upload := startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryCaptureStatusResponse, error) {
 		return e.svc.Upload(ctx, e.w, e.run, id, manifestOf(body), bytes.NewReader(body))
 	})
-	waitReconcileLock(t, e, 0, "FOR UPDATE OF c")
+	waitReconcileLock(t, e, fencePID, "WHERE c.id = $1 FOR UPDATE OF c")
 	if err := tx.Commit(e.ctx); err != nil {
 		t.Fatal(err)
 	}
