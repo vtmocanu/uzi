@@ -128,7 +128,20 @@ func TestPlanCrossCheckAutomaticRoundsFrozenInterruptionClockLiveDB(t *testing.T
 				// supplied custody observation determines supersession versus timeout.
 				deadline := observed.Add(-delta)
 				mustExec(ctx, t, f.pool, "UPDATE runs SET status='running',started_at=$2,status_since=$2,requeue_count=0 WHERE id=$1", f.runID, observed.Add(-time.Minute))
-				mustExec(ctx, t, f.pool, "UPDATE cross_checks SET created_at=$2,deadline_at=$3 WHERE id=$1", fx.crossCheckID, observed.Add(-10*time.Second), deadline)
+				mustExec(ctx, t, f.pool, "DELETE FROM cross_checks WHERE id=$1", fx.crossCheckID)
+				mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
+					(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,automatic_rounds_enabled,automatic_revision_limit,verdict,reason_class,created_at,deadline_at,decided_at,wait_credited)
+					VALUES ($1,'plan',1,1,'first plan','[]','s',repeat('a',40),$2,true,2,'revise','revise',$3,$4,$5,true)`,
+					f.runID, []byte("first digest"), observed.Add(-30*time.Second), observed.Add(-15*time.Second), observed.Add(-23*time.Second))
+				mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
+					(id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,automatic_rounds_enabled,automatic_revision_limit,created_at,deadline_at)
+					VALUES ($1,$2,$3,'plan',2,1,'second plan','[]','s',repeat('b',40),$4,true,2,$5,$6)`,
+					fx.crossCheckID, f.runID, fx.checkerID, []byte("second digest"), observed.Add(-10*time.Second), deadline)
+				beforeFirst, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				mustExec(ctx, t, f.pool, "UPDATE runs SET budget_paused_seconds=7 WHERE id=$1", f.runID)
 				if writer == "direct" {
 					mustExec(ctx, t, f.pool, "UPDATE runs SET status='queued',status_since=$2 WHERE id=$1", f.runID, observed)
 				} else {
@@ -165,10 +178,15 @@ func TestPlanCrossCheckAutomaticRoundsFrozenInterruptionClockLiveDB(t *testing.T
 						credit = 9
 					}
 				}
-				if cc.Verdict != "failed" || cc.ReasonClass.String != want || !cc.InterruptedAt.Valid ||
+				credit += 7 // Round 1 already banked its seven seconds before candidate 2.
+				if cc.Round != 2 || cc.Verdict != "failed" || cc.ReasonClass.String != want || !cc.InterruptedAt.Valid ||
 					!cc.InterruptedAt.Time.Equal(observed) || !cc.DecidedAt.Valid || !cc.DecidedAt.Time.Equal(decided) ||
 					!cc.WaitCredited || run.BudgetPausedSeconds != credit || child.Status != "cancelled" || !child.ClaimReleasedAt.Valid {
 					t.Fatalf("frozen settlement: reason=%s interruption=%s decision=%s credit=%d child=%s", cc.ReasonClass.String, cc.InterruptedAt.Time, cc.DecidedAt.Time, run.BudgetPausedSeconds, child.Status)
+				}
+				first, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 1})
+				if err != nil || !reflect.DeepEqual(first, beforeFirst) {
+					t.Fatalf("older round changed during settlement: %+v err=%v", first, err)
 				}
 				// Two later sweep attempts must preserve the first cause and timestamps,
 				// with no second cancellation or wait credit.
@@ -189,7 +207,11 @@ func TestPlanCrossCheckAutomaticRoundsFrozenInterruptionClockLiveDB(t *testing.T
 				if err != nil {
 					t.Fatal(err)
 				}
-				if again.Verdict != cc.Verdict || again.ReasonClass != cc.ReasonClass || again.InterruptedAt != cc.InterruptedAt ||
+				firstAfter, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 1})
+				if err != nil || !reflect.DeepEqual(firstAfter, beforeFirst) {
+					t.Fatalf("older round changed during later sweeps: %+v err=%v", firstAfter, err)
+				}
+				if again.Round != 2 || again.Verdict != cc.Verdict || again.ReasonClass != cc.ReasonClass || again.InterruptedAt != cc.InterruptedAt ||
 					again.DecidedAt != cc.DecidedAt || !again.WaitCredited || after.BudgetPausedSeconds != credit ||
 					childAfter.Status != child.Status || childAfter.FinishedAt != child.FinishedAt || childAfter.ClaimReleasedAt != child.ClaimReleasedAt {
 					t.Fatal("later sweep changed first settlement or repeated cancellation/credit")
