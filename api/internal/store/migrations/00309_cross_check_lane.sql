@@ -34,15 +34,16 @@ CREATE TRIGGER runs_reset_cross_check_lane
 -- Shared child-specific rules. Other claim fences remain at each caller.
 -- Strict health ignores occupancy, cordons and temporary affinity.
 CREATE FUNCTION fn_cross_check_child_eligible(w workers, r runs, availability boolean, lane text,
-    evaluated_at timestamptz, affinity_cutoff timestamptz)
+    check_stage text, evaluated_at timestamptz, affinity_cutoff timestamptz)
 RETURNS boolean LANGUAGE sql STABLE AS $$
 SELECT r.kind = 'cross_check'
+    AND check_stage = 'plan'
     AND 'cross_check_v1' = ANY(w.protocol_capabilities)
     AND NOT w.isolated_lane AND NOT w.maintenance_fenced
     AND EXISTS (
         SELECT 1 FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
         WHERE cc.checker_run_id = r.id AND cc.lead_run_id = r.target_run_id
-          AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+          AND cc.stage = check_stage AND cc.round = 1 AND cc.verdict = 'pending'
           AND cc.deadline_at > evaluated_at
           AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
           AND lead.claim_generation = cc.lead_claim_generation
@@ -74,7 +75,7 @@ $$;
 -- +goose StatementEnd
 
 -- +goose Down
-DROP FUNCTION fn_cross_check_child_eligible(workers, runs, boolean, text, timestamptz, timestamptz);
+DROP FUNCTION fn_cross_check_child_eligible(workers, runs, boolean, text, text, timestamptz, timestamptz);
 DROP TRIGGER runs_reset_cross_check_lane ON runs;
 DROP FUNCTION runs_reset_cross_check_lane();
 ALTER TABLE runs DROP COLUMN cross_check_lane_generation;

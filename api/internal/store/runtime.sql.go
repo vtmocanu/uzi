@@ -914,7 +914,7 @@ WITH claimant AS MATERIALIZED (
            OR (r.kind = 'cross_check' AND EXISTS (
                SELECT 1 FROM claimant c WHERE fn_cross_check_child_eligible(c, r, true,
                    CASE WHEN COALESCE($1::text, '') = '' THEN 'run' ELSE $1::text END,
-                   $4::timestamptz, $5::timestamptz))))
+                   'plan', $4::timestamptz, $5::timestamptz))))
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
       -- it before the branch exists (the claim-before-seed race). Every non-task kind is
@@ -2160,7 +2160,7 @@ const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableF
 WITH candidates AS (
 SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
-       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', $1::timestamptz, $2::timestamptz)
+       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', 'plan', $1::timestamptz, $2::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
@@ -2193,7 +2193,7 @@ CROSS JOIN LATERAL (
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
 WHERE run.id = $8
-  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', $1::timestamptz, $2::timestamptz))
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', $1::timestamptz, $2::timestamptz))
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= $6
   AND fn_worker_can_claim(
@@ -10014,7 +10014,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', $2::timestamptz, $3::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $2::timestamptz, $3::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -10061,7 +10061,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', $2::timestamptz, $3::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', $2::timestamptz, $3::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -10279,7 +10279,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', $3::timestamptz, $4::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $3::timestamptz, $4::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not

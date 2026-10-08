@@ -891,7 +891,7 @@ WITH claimant AS MATERIALIZED (
            OR (r.kind = 'cross_check' AND EXISTS (
                SELECT 1 FROM claimant c WHERE fn_cross_check_child_eligible(c, r, true,
                    CASE WHEN COALESCE(@lane::text, '') = '' THEN 'run' ELSE @lane::text END,
-                   @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))))
+                   'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))))
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
       -- it before the branch exists (the claim-before-seed race). Every non-task kind is
@@ -9180,7 +9180,7 @@ WHERE w.user_id = @user_id
 WITH candidates AS (
 SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
-       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
+       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
@@ -9213,7 +9213,7 @@ CROSS JOIN LATERAL (
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
 WHERE run.id = @run_id
-  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= @heartbeat_cutoff
   AND fn_worker_can_claim(
@@ -9577,7 +9577,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -9729,7 +9729,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
@@ -9776,7 +9776,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not

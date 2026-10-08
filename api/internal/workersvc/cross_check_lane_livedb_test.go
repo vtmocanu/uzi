@@ -287,14 +287,27 @@ func TestCrossCheckLaneEligibilityLiveDB(t *testing.T) {
 		{"ephemeral-foreign", `UPDATE workers SET ephemeral=true,ephemeral_run_id=(SELECT target_run_id FROM runs WHERE id<>$2 AND kind='cross_check' AND user_id=(SELECT user_id FROM workers WHERE id=$1) LIMIT 1) WHERE id=$1`, false},
 		{"expired-parent", `UPDATE cross_checks SET deadline_at=now()-interval '1 second' WHERE checker_run_id=$2`, false},
 		{"stale-parent-generation", `UPDATE runs SET claim_generation=2 WHERE id=(SELECT target_run_id FROM runs WHERE id=$2)`, false},
+		{"decided-verdict", `UPDATE cross_checks SET verdict='approve',decided_at=now() WHERE checker_run_id=$2`, false},
+		{"second-round", `UPDATE cross_checks SET round=2 WHERE checker_run_id=$2`, false},
+		{"inactive-parent", `UPDATE runs SET status='completed' WHERE id=(SELECT target_run_id FROM runs WHERE id=$2)`, false},
+		{"released-parent", `UPDATE runs SET claim_released_at=now() WHERE id=(SELECT target_run_id FROM runs WHERE id=$2)`, false},
+		{"target-mismatch", `UPDATE runs SET target_run_id=(SELECT target_run_id FROM runs WHERE id<>$2 AND kind='cross_check' AND user_id=(SELECT user_id FROM workers WHERE id=$1) LIMIT 1) WHERE id=$2`, false},
+		{"attempt-mismatch", `UPDATE cross_checks SET lead_run_id=(SELECT target_run_id FROM runs WHERE id<>$2 AND kind='cross_check' AND user_id=(SELECT user_id FROM workers WHERE id=$1) LIMIT 1) WHERE checker_run_id=$2`, false},
 		{"docker-denied", `UPDATE workers SET docker_enabled=true WHERE id=$1`, false},
+		{"docker-allowlisted", `UPDATE workers SET docker_enabled=true WHERE id=$1`, true},
 		{"overflow", `UPDATE workers SET pending_overflow_until=now()+interval '5 minutes' WHERE id=$1`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := laneFixture(t)
-			if tc.name == "ephemeral-foreign" {
+			if tc.name == "ephemeral-foreign" || tc.name == "target-mismatch" || tc.name == "attempt-mismatch" {
 				foreignChild := cloneLaneChild(t, f)
 				f.env.exec(`UPDATE runs SET status='failed' WHERE id=$1`, foreignChild)
+				if tc.name == "attempt-mismatch" {
+					f.env.exec(`DELETE FROM cross_checks WHERE checker_run_id=$1`, foreignChild)
+				}
+			}
+			if tc.name == "docker-allowlisted" {
+				f.svc.SetDockerAllowlist(fakeDockerAllowlist{list: []uuid.UUID{uuid.UUID(mustRun(t, f.env, f.runID).RepoID.Bytes)}})
 			}
 			// Literal fixture statements are split for parameter-count correctness.
 			for _, sql := range strings.Split(tc.sql, ";") {
@@ -312,6 +325,10 @@ func TestCrossCheckLaneEligibilityLiveDB(t *testing.T) {
 				}
 			}
 			before := mustRun(t, f.env, f.runID)
+			var checkBefore string
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT to_jsonb(cc)::text FROM cross_checks cc WHERE checker_run_id=$1`, f.runID).Scan(&checkBefore); err != nil {
+				t.Fatal(err)
+			}
 			p := laneClaim(t, f, "cross_check", nil)
 			if (p != nil) != tc.want {
 				t.Fatalf("payload present=%v want=%v", p != nil, tc.want)
@@ -323,7 +340,32 @@ func TestCrossCheckLaneEligibilityLiveDB(t *testing.T) {
 				}
 			} else {
 				f.unchanged(t, before)
+				var checkAfter string
+				if err := f.env.pool.QueryRow(f.env.ctx, `SELECT to_jsonb(cc)::text FROM cross_checks cc WHERE checker_run_id=$1`, f.runID).Scan(&checkAfter); err != nil {
+					t.Fatal(err)
+				}
+				if checkAfter != checkBefore {
+					t.Fatal("refused claim changed cross-check metadata")
+				}
 			}
+		})
+	}
+}
+
+func TestCrossCheckLaneStageInputLiveDB(t *testing.T) {
+	f := laneFixture(t)
+	before := mustRun(t, f.env, f.runID)
+	for _, stage := range []string{"plan", "code"} {
+		t.Run(stage, func(t *testing.T) {
+			var eligible bool
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT fn_cross_check_child_eligible(w,r,true,'cross_check',$3,now(),now()-interval '2 minutes')
+				FROM workers w CROSS JOIN runs r WHERE w.id=$1 AND r.id=$2`, f.workerID, f.runID, stage).Scan(&eligible); err != nil {
+				t.Fatal(err)
+			}
+			if eligible != (stage == "plan") {
+				t.Fatalf("stage %q eligibility=%v", stage, eligible)
+			}
+			f.unchanged(t, before)
 		})
 	}
 }
