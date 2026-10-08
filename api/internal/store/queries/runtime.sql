@@ -9730,7 +9730,9 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
+        AND NOT w.maintenance_fenced
+        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+             OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
@@ -9894,7 +9896,9 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
+        AND NOT w.maintenance_fenced
+        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+             OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
@@ -9955,7 +9959,9 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND (r.kind = 'cross_check' OR (w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')))
+        AND NOT w.maintenance_fenced
+        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+             OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
