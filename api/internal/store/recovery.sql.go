@@ -377,13 +377,16 @@ func (q *Queries) GetCaptureForOwner(ctx context.Context, arg GetCaptureForOwner
 }
 
 const getCustodyAggregateForOwner = `-- name: GetCustodyAggregateForOwner :one
+WITH admission AS MATERIALIZED (
+    SELECT fn_custody_admission_count($1::uuid, $3::timestamptz)::bigint AS counted
+)
 SELECT
+    admission.counted::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
         WHERE h.user_id = $1::uuid AND h.state = 'open')::bigint AS open_holds,
     (CASE
         WHEN $2::int > 0
-             AND (SELECT count(*) FROM recovery_custody_holds h2
-                    WHERE h2.user_id = $1::uuid AND h2.state = 'open') >= $2::int
+             AND admission.counted >= $2::int
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = $1::uuid
                   AND r.status = 'queued'
@@ -395,24 +398,27 @@ SELECT
                                   WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $2::int))
         ELSE 0
      END)::bigint AS blocked_runs
+FROM admission
 `
 
 type GetCustodyAggregateForOwnerParams struct {
-	UserID           uuid.UUID `json:"user_id"`
-	CustodyHoldLimit int32     `json:"custody_hold_limit"`
+	UserID           uuid.UUID          `json:"user_id"`
+	CustodyHoldLimit int32              `json:"custody_hold_limit"`
+	HeartbeatCutoff  pgtype.Timestamptz `json:"heartbeat_cutoff"`
 }
 
 type GetCustodyAggregateForOwnerRow struct {
-	OpenHolds   int64 `json:"open_holds"`
-	BlockedRuns int64 `json:"blocked_runs"`
+	AdmissionCountedHolds int64 `json:"admission_counted_holds"`
+	OpenHolds             int64 `json:"open_holds"`
+	BlockedRuns           int64 `json:"blocked_runs"`
 }
 
 // PRD #1349 M1 (D6/D10): the owner-level custody aggregate the board alert and one-per-episode
-// Slack DM read (M6). open_holds is the owner's UNRESOLVED (state='open') hold count — the SAME
-// admission signal ClaimRun blocks on. blocked_runs is the count of the owner's QUEUED
+// Slack DM read (M6). open_holds is total open custody; admission_counted_holds is the
+// shared live-claim-discounted admission signal (ADR-2445). blocked_runs counts the owner's QUEUED
 // code-publishing runs currently blocked by the custody-admission predicate: it mirrors the
 // reasonCustodyLimit predicate in workersvc/health.go — a run stays queued for custody ONLY when
-// the owner is AT/OVER the limit — so it is 0 unless open_holds >= @custody_hold_limit (and a
+// the owner is AT/OVER the limit — so it is 0 unless admission_counted_holds >= @custody_hold_limit (and a
 // non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
 // The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
 // task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
@@ -420,15 +426,15 @@ type GetCustodyAggregateForOwnerRow struct {
 // bound that stops a never-started sweep loop) is NOT blocked — ClaimRun admits it at/over the
 // cap — so blocked_runs excludes it with the SAME expression ClaimRun and
 // GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
-// Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
+// Count columns are cast ::bigint so sqlc types them as int64, never interface{}.
 // Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
-// top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
+// SELECT over a single-row CTE, so sqlc's param-type inference cannot pick a single relation
 // for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column
 // (it reports "column reference user_id is ambiguous"). The cast types the param directly.
 func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustodyAggregateForOwnerParams) (GetCustodyAggregateForOwnerRow, error) {
-	row := q.db.QueryRow(ctx, getCustodyAggregateForOwner, arg.UserID, arg.CustodyHoldLimit)
+	row := q.db.QueryRow(ctx, getCustodyAggregateForOwner, arg.UserID, arg.CustodyHoldLimit, arg.HeartbeatCutoff)
 	var i GetCustodyAggregateForOwnerRow
-	err := row.Scan(&i.OpenHolds, &i.BlockedRuns)
+	err := row.Scan(&i.AdmissionCountedHolds, &i.OpenHolds, &i.BlockedRuns)
 	return i, err
 }
 
@@ -864,20 +870,13 @@ SELECT
     h.final_source_sha,
     h.final_coverage_digest,
     COALESCE(w.name, '')::text AS worker_name,
-    (EXISTS (SELECT 1 FROM recovery_captures c
-        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
-    COALESCE((SELECT c.state FROM recovery_captures c
-        WHERE c.hold_id = h.id
-        ORDER BY c.created_at DESC, c.id DESC
-        LIMIT 1), '')::text AS capture_state,
-    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
-    COALESCE(r.status, '')::text AS run_status,
+    f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed,
     cr.ref AS checkpoint_ref,
     cr.tip AS checkpoint_tip,
     cr.state AS checkpoint_state
 FROM recovery_custody_holds h
+JOIN recovery_custody_hold_facts f ON f.id = h.id AND f.user_id = h.user_id
 LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
-LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
 LEFT JOIN checkpoint_retentions cr ON cr.run_id = h.run_id AND cr.user_id = h.user_id
     AND cr.state <> 'deleted' AND cr.state <> 'abandoned'
 WHERE h.user_id = $1
@@ -912,8 +911,10 @@ type ListCustodyHoldsForOwnerRow struct {
 	WorkerName              string             `json:"worker_name"`
 	HasAvailableCapture     bool               `json:"has_available_capture"`
 	CaptureState            string             `json:"capture_state"`
-	RecoveryWaitCause       string             `json:"recovery_wait_cause"`
 	RunStatus               string             `json:"run_status"`
+	RecoveryWaitCause       string             `json:"recovery_wait_cause"`
+	Attention               string             `json:"attention"`
+	DecisionNeeded          bool               `json:"decision_needed"`
 	CheckpointRef           pgtype.Text        `json:"checkpoint_ref"`
 	CheckpointTip           pgtype.Text        `json:"checkpoint_tip"`
 	CheckpointState         pgtype.Text        `json:"checkpoint_state"`
@@ -974,8 +975,10 @@ func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyH
 			&i.WorkerName,
 			&i.HasAvailableCapture,
 			&i.CaptureState,
-			&i.RecoveryWaitCause,
 			&i.RunStatus,
+			&i.RecoveryWaitCause,
+			&i.Attention,
+			&i.DecisionNeeded,
 			&i.CheckpointRef,
 			&i.CheckpointTip,
 			&i.CheckpointState,
@@ -1056,17 +1059,10 @@ func (q *Queries) ListCustodyHoldsForWorkerRun(ctx context.Context, arg ListCust
 
 const listOpenCustodyHoldsForWorkers = `-- name: ListOpenCustodyHoldsForWorkers :many
 SELECT w.id AS worker_id, h.state, h.inventory_guarded,
-    (EXISTS (SELECT 1 FROM recovery_captures c
-        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
-    COALESCE((SELECT c.state FROM recovery_captures c
-        WHERE c.hold_id = h.id
-        ORDER BY c.created_at DESC, c.id DESC
-        LIMIT 1), '')::text AS capture_state,
-    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
-    COALESCE(r.status, '')::text AS run_status
+       f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed
 FROM workers w
 JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
-LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+JOIN recovery_custody_hold_facts f ON f.id = h.id AND f.user_id = h.user_id
 WHERE w.id = ANY($1::uuid[]) AND h.state = 'open'
 `
 
@@ -1076,12 +1072,13 @@ type ListOpenCustodyHoldsForWorkersRow struct {
 	InventoryGuarded    bool      `json:"inventory_guarded"`
 	HasAvailableCapture bool      `json:"has_available_capture"`
 	CaptureState        string    `json:"capture_state"`
-	RecoveryWaitCause   string    `json:"recovery_wait_cause"`
 	RunStatus           string    `json:"run_status"`
+	RecoveryWaitCause   string    `json:"recovery_wait_cause"`
+	Attention           string    `json:"attention"`
+	DecisionNeeded      bool      `json:"decision_needed"`
 }
 
-// Display-only attention inputs for the authorized workers returned by a list endpoint.
-// Live custody determines which worker holds the source; original custody is provenance.
+// Canonical facts for only the authorized input workers' open holds.
 func (q *Queries) ListOpenCustodyHoldsForWorkers(ctx context.Context, workerIds []uuid.UUID) ([]ListOpenCustodyHoldsForWorkersRow, error) {
 	rows, err := q.db.Query(ctx, listOpenCustodyHoldsForWorkers, workerIds)
 	if err != nil {
@@ -1097,8 +1094,10 @@ func (q *Queries) ListOpenCustodyHoldsForWorkers(ctx context.Context, workerIds 
 			&i.InventoryGuarded,
 			&i.HasAvailableCapture,
 			&i.CaptureState,
-			&i.RecoveryWaitCause,
 			&i.RunStatus,
+			&i.RecoveryWaitCause,
+			&i.Attention,
+			&i.DecisionNeeded,
 		); err != nil {
 			return nil, err
 		}
@@ -1116,27 +1115,32 @@ SELECT h.user_id
 FROM recovery_custody_holds h
 WHERE h.state = 'open'
 GROUP BY h.user_id
-HAVING count(*) >= $1::int
+HAVING fn_custody_admission_count(h.user_id, $1::timestamptz) >= $2::int
 `
+
+type ListOwnersOverCustodyLimitParams struct {
+	HeartbeatCutoff  pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	CustodyHoldLimit int32              `json:"custody_hold_limit"`
+}
 
 // ════════════════════════════════════════════════════════════════════════════════════════
 // PRD #1349 M6: the owner custody-episode reconciler's find-owners reads. The one-per-episode
 // owner Slack DM (slacksvc.CustodyEpisodeReconciler, D10) coalesces the blocked-custody crossing
 // by owner, so it needs (a) the owners currently AT/OVER the admission limit to notify and
 // (b) the already-notified owners who have dropped BELOW it, to re-arm (clear) their episode
-// notice for a later crossing. Both key off the SAME open-hold admission signal ClaimRun and
+// notice for a later crossing. Both key off the SAME admission-counted signal ClaimRun and
 // GetCustodyAggregateForOwner gate on. Added strictly ADDITIVELY (M1/M4/M5 queries UNTOUCHED).
 // ════════════════════════════════════════════════════════════════════════════════════════
-// PRD #1349 M6 (D10): the owners whose OPEN (unresolved) custody-hold count is AT/OVER the
+// PRD #1349 M6 (D10): the owners whose admission-counted open holds are AT/OVER the
 // admission limit — the crossing set the episode reconciler considers for a one-per-episode DM.
-// Grouped over the partial idx_recovery_custody_holds_owner_open index; HAVING count(*) >=
-// @custody_hold_limit is the SAME predicate ClaimRun's custody-admission clause blocks on, so a
+// Grouped over owners with open holds; fn_custody_admission_count >= @custody_hold_limit
+// is the SAME predicate ClaimRun's custody-admission clause blocks on (ADR-2445), so a
 // notified owner is exactly one whose runs are (or can be) blocked. The reconciler then claims
 // at-most-once and reads GetCustodyAggregateForOwner for the exact DM facts, so this returns only
 // the user_id. The caller guards a non-positive @custody_hold_limit (the admission gate is then
 // disabled), so this is never called with one — a non-positive limit here would match every owner.
-func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listOwnersOverCustodyLimit, custodyHoldLimit)
+func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, arg ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listOwnersOverCustodyLimit, arg.HeartbeatCutoff, arg.CustodyHoldLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1158,18 +1162,22 @@ func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLim
 const listOwnersWithClearedCustodyEpisode = `-- name: ListOwnersWithClearedCustodyEpisode :many
 SELECT n.user_id
 FROM custody_episode_notices n
-WHERE (SELECT count(*) FROM recovery_custody_holds h
-       WHERE h.user_id = n.user_id AND h.state = 'open') < $1::int
+WHERE fn_custody_admission_count(n.user_id, $1::timestamptz) < $2::int
 `
 
-// PRD #1349 M6 (D10): the already-notified owners whose OPEN custody-hold count has dropped
+type ListOwnersWithClearedCustodyEpisodeParams struct {
+	HeartbeatCutoff  pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	CustodyHoldLimit int32              `json:"custody_hold_limit"`
+}
+
+// PRD #1349 M6 (D10): the already-notified owners whose admission-counted holds have dropped
 // BELOW the admission limit — the episode has closed, so the reconciler clears their notice
 // (ClearCustodyEpisodeNotice) to re-arm a later re-crossing. A row in custody_episode_notices
-// means "already DM'd for this episode"; the correlated open-hold count mirrors the same
+// means "already DM'd for this episode"; the shared admission count mirrors the same
 // admission signal, so this returns exactly the owners whose episode should re-arm. Returns only
 // the user_id; the reconciler clears each.
-func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listOwnersWithClearedCustodyEpisode, custodyHoldLimit)
+func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, arg ListOwnersWithClearedCustodyEpisodeParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listOwnersWithClearedCustodyEpisode, arg.HeartbeatCutoff, arg.CustodyHoldLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1200,6 +1208,12 @@ SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_w
     END::text AS reason
 FROM recovery_custody_holds h
 WHERE h.state = 'open' AND NOT h.inventory_guarded
+  -- Archive readiness cannot implicitly resolve an owner retry-exhaustion decision,
+  -- including an older available capture alongside a newer upload for this hold.
+  AND NOT EXISTS (SELECT 1 FROM runs r
+                    WHERE r.id = h.run_id
+                      AND r.status = 'recovery_wait'
+                      AND r.recovery_wait_cause = 'worker_requeue_exhausted')
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -1265,9 +1279,9 @@ type ListReleasableCustodyHoldsRow struct {
 //	    This is already a strict per-hold test, so a sibling hold's ready capture never
 //	    qualifies it.
 //
-// It NEVER infers success from an arbitrary terminal status: a 'failed'/'cancelled'/future
-// 'partial' run with no ready capture, and a 'running'/'queued' run, are excluded (a failed
-// run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
+// Source-only failed/cancelled/partial/running/queued holds remain open. A ready capture
+// qualifies its exact legacy hold via (b), even before run completion.
+// Returns oldest-first for stable reconcile order;
 // the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
 // and release agree per-hold and a sibling hold is never collaterally released.
 //
@@ -1574,11 +1588,23 @@ func (q *Queries) ReleaseClaimCustodyNoAdoptedSource(ctx context.Context, arg Re
 }
 
 const releaseCustodyHold = `-- name: ReleaseCustodyHold :execrows
-UPDATE recovery_custody_holds
+WITH locked_run AS MATERIALIZED (
+    SELECT r.id, r.status, r.recovery_wait_cause
+    FROM runs r
+    JOIN recovery_custody_holds h ON h.run_id = r.id
+    WHERE h.id = $2
+    FOR UPDATE OF r
+)
+UPDATE recovery_custody_holds AS target
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = $1,
     released_at = now(), updated_at = now()
-WHERE id = $2 AND state = 'open' AND NOT inventory_guarded
+WHERE target.id = $2 AND target.state = 'open' AND NOT target.inventory_guarded
+  AND NOT EXISTS (
+      SELECT 1 FROM locked_run r
+      WHERE r.status = 'recovery_wait'
+        AND r.recovery_wait_cause = 'worker_requeue_exhausted'
+  )
 `
 
 type ReleaseCustodyHoldParams struct {
@@ -1599,6 +1625,10 @@ type ReleaseCustodyHoldParams struct {
 // reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
 // for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
 // classes (migration 00232).
+// Worker retry exhaustion requires an owner decision even with an available archive.
+// Lock the run before updating its hold, matching the lifecycle's run-before-hold order.
+// Read status from the locked tuple: if exhaustion commits while this statement waits,
+// locked_run observes it and the delayed reconciler candidate moves zero rows.
 func (q *Queries) ReleaseCustodyHold(ctx context.Context, arg ReleaseCustodyHoldParams) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseCustodyHold, arg.ReleaseEvidence, arg.ID)
 	if err != nil {

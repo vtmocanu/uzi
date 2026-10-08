@@ -1804,7 +1804,7 @@ func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.
 	return f.openCustodyHolds, nil
 }
 func (f *fakeStore) GetCustodyAdmissionForRun(_ context.Context, _ store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
-	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds}, nil
+	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds, AdmissionCountedHolds: f.openCustodyHolds}, nil
 }
 func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return f.releasableHolds, nil

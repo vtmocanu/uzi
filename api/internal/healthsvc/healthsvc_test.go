@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,33 +30,37 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
-	enabledIDs      []uuid.UUID
-	enabledErr      error
-	workers         []store.ListAllWorkersRow
-	workersErr      error
-	capacityRows    []store.ListOwnersWaitingNoCapacityRow
-	capacityErr     error
-	capacityQueries atomic.Int32
-	waitingQueries  atomic.Int32
-	waitingRows     []store.ListWaitingWorkerRunsRow
-	waitingErr      error
-	undispatched    pgtype.Timestamptz
-	undispatchErr   error
-	pausedCount     int64
-	pausedErr       error
-	gaveUp          []store.ListGaveUpColumnMovesRow
-	gaveUpErr       error
-	custodyOwners   []uuid.UUID
-	custodyErr      error
-	custodySelect   func(context.Context, int32) ([]uuid.UUID, error)
-	custodyList     func(context.Context, store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
-	custodyQueries  []store.ListCustodyHoldsForOwnerParams
-	controller      pgtype.Timestamptz
-	controllerErr   error
-	ciwatch         []store.CountEligibleCIWatchRefsPerRepoRow
-	ciwatchErr      error
-	runDisk         []store.WorkerRunDisk
-	runDiskErr      error
+	custodyAggregateErr    error
+	custodyAggregate       store.GetCustodyAggregateForOwnerRow
+	custodyListParams      []store.ListOwnersOverCustodyLimitParams
+	custodyAggregateParams []store.GetCustodyAggregateForOwnerParams
+	enabledIDs             []uuid.UUID
+	enabledErr             error
+	workers                []store.ListAllWorkersRow
+	workersErr             error
+	capacityRows           []store.ListOwnersWaitingNoCapacityRow
+	capacityErr            error
+	capacityQueries        atomic.Int32
+	waitingQueries         atomic.Int32
+	waitingRows            []store.ListWaitingWorkerRunsRow
+	waitingErr             error
+	undispatched           pgtype.Timestamptz
+	undispatchErr          error
+	pausedCount            int64
+	pausedErr              error
+	gaveUp                 []store.ListGaveUpColumnMovesRow
+	gaveUpErr              error
+	custodyOwners          []uuid.UUID
+	custodyErr             error
+	custodySelect          func(context.Context, store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error)
+	custodyList            func(context.Context, store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
+	custodyQueries         []store.ListCustodyHoldsForOwnerParams
+	controller             pgtype.Timestamptz
+	controllerErr          error
+	ciwatch                []store.CountEligibleCIWatchRefsPerRepoRow
+	ciwatchErr             error
+	runDisk                []store.WorkerRunDisk
+	runDiskErr             error
 }
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
@@ -82,11 +87,16 @@ func (f *fakeStore) CountUsersPausedWithEnabledSchedules(context.Context, pgtype
 func (f *fakeStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
 	return f.gaveUp, f.gaveUpErr
 }
-func (f *fakeStore) ListOwnersOverCustodyLimit(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+func (f *fakeStore) ListOwnersOverCustodyLimit(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
+	f.custodyListParams = append(f.custodyListParams, arg)
 	if f.custodySelect != nil {
-		return f.custodySelect(ctx, limit)
+		return f.custodySelect(ctx, arg)
 	}
 	return f.custodyOwners, f.custodyErr
+}
+func (f *fakeStore) GetCustodyAggregateForOwner(_ context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error) {
+	f.custodyAggregateParams = append(f.custodyAggregateParams, arg)
+	return f.custodyAggregate, f.custodyAggregateErr
 }
 func (f *fakeStore) ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
 	f.custodyQueries = append(f.custodyQueries, arg)
@@ -606,7 +616,7 @@ func TestCustodyHolds(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := New(Config{Store: &fakeStore{custodyOwners: tc.owners}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, CustodyHoldLimit: tc.limit})
-			c := svc.checkCustodyHolds(context.Background())
+			c := svc.checkCustodyHolds(context.Background(), svc.now())
 			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
 				t.Fatalf("got %q / %q", c.Severity, c.Summary)
 			}
@@ -615,13 +625,15 @@ func TestCustodyHolds(t *testing.T) {
 }
 
 func TestCustodyHoldsAdvice(t *testing.T) {
-	active := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", RunID: uuid.New(), Generation: 2}
-	capturing := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed", CaptureState: "uploading"}
-	ready := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "failed", HasAvailableCapture: true, CaptureState: "needs_action"}
-	decision := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "running", CaptureState: "needs_action"}
-	sourceOnly := store.ListCustodyHoldsForOwnerRow{State: "open", RunStatus: "completed", RunID: uuid.New(), Generation: 1}
+	active := store.ListCustodyHoldsForOwnerRow{Attention: "active", DecisionNeeded: false, State: "open", RunStatus: "running", RunID: uuid.New(), Generation: 2}
+	capturing := store.ListCustodyHoldsForOwnerRow{Attention: "capturing", DecisionNeeded: false, State: "open", RunStatus: "failed", CaptureState: "uploading"}
+	ready := store.ListCustodyHoldsForOwnerRow{Attention: "archive_ready", DecisionNeeded: false, State: "open", RunStatus: "failed", HasAvailableCapture: true, CaptureState: "needs_action"}
+	decision := store.ListCustodyHoldsForOwnerRow{Attention: "needs_action", DecisionNeeded: true, State: "open", RunStatus: "running", CaptureState: "needs_action"}
+	sourceOnly := store.ListCustodyHoldsForOwnerRow{Attention: "source_only", DecisionNeeded: true, State: "open", RunStatus: "completed", RunID: uuid.New(), Generation: 1}
 	guarded := ready
 	guarded.InventoryGuarded = true
+	guarded.DecisionNeeded = true
+	guarded.Attention = "needs_action"
 	for _, tc := range []struct {
 		name          string
 		holds         [][]store.ListCustodyHoldsForOwnerRow
@@ -634,6 +646,8 @@ func TestCustodyHoldsAdvice(t *testing.T) {
 			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
 		{"mixed", [][]store.ListCustodyHoldsForOwnerRow{{decision, sourceOnly}, {active, capturing, ready}}, "1", "1",
 			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle. Other at-limit owners need no decision; admission resumes when their counted holds settle."},
+		{"SQL decision overrides raw labels", [][]store.ListCustodyHoldsForOwnerRow{{{State: "released", HasAvailableCapture: true, Attention: "active", DecisionNeeded: true}}}, "1", "0",
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
 		// A hold from the terminal predecessor still needs a decision even when
 		// the same owner's newer run has an active hold.
 		{"terminal predecessor", [][]store.ListCustodyHoldsForOwnerRow{{sourceOnly, active}}, "1", "0",
@@ -650,12 +664,14 @@ func TestCustodyHoldsAdvice(t *testing.T) {
 			fs.custodyList = func(_ context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
 				return byOwner[arg.UserID], nil
 			}
-			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background())
+			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background(), fixedNow)
 			if c.Severity != sevWarn || c.Action == nil || *c.Action != tc.action {
 				t.Fatalf("advice = %+v (action %v), want warn with %q", c, c.Action, tc.action)
 			}
 			want := []apitypes.HealthEvidenceDTO{
 				{Label: "Owners", Value: fmt.Sprint(len(tc.holds))},
+				{Label: "Admission-counted holds", Value: "0"},
+				{Label: "Total open custody", Value: "0"},
 				{Label: "Owners with decisions", Value: tc.with},
 				{Label: "Owners without decisions", Value: tc.without},
 			}
@@ -677,7 +693,7 @@ func TestCustodyHoldsAdvice(t *testing.T) {
 
 func TestCustodyHoldsReadFailures(t *testing.T) {
 	owners := []uuid.UUID{uuid.New(), uuid.New()}
-	decision := []store.ListCustodyHoldsForOwnerRow{{State: "open", RunStatus: "failed"}}
+	decision := []store.ListCustodyHoldsForOwnerRow{{State: "open", RunStatus: "failed", DecisionNeeded: true}}
 	for _, tc := range []struct {
 		name string
 		at   int
@@ -693,7 +709,7 @@ func TestCustodyHoldsReadFailures(t *testing.T) {
 				}
 				return decision, nil
 			}
-			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background())
+			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background(), fixedNow)
 			if c.Severity != sevUnknown || c.Action != nil || len(c.Evidence) != 0 {
 				t.Fatalf("failed listing returned advice or partial evidence: %+v", c)
 			}
@@ -708,7 +724,7 @@ func TestCustodyHoldsCancellation(t *testing.T) {
 			defer cancel()
 			owner := uuid.New()
 			fs := &fakeStore{custodyOwners: []uuid.UUID{owner}}
-			fs.custodySelect = func(readCtx context.Context, _ int32) ([]uuid.UUID, error) {
+			fs.custodySelect = func(readCtx context.Context, _ store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
 				switch stage {
 				case "selection wait":
 					<-readCtx.Done()
@@ -729,13 +745,13 @@ func TestCustodyHoldsCancellation(t *testing.T) {
 				if stage == "before advice" {
 					cancel()
 				}
-				return []store.ListCustodyHoldsForOwnerRow{{State: "open", RunStatus: "failed"}}, nil
+				return []store.ListCustodyHoldsForOwnerRow{{State: "open", RunStatus: "failed", DecisionNeeded: true}}, nil
 			}
 			if stage == "pre-cancel" {
 				cancel()
 			}
 			start := time.Now()
-			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(ctx)
+			c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(ctx, fixedNow)
 			if c.Severity != sevUnknown || c.Action != nil || len(c.Evidence) != 0 {
 				t.Fatalf("cancelled read returned health, advice or partial evidence: %+v", c)
 			}
@@ -754,9 +770,9 @@ func TestCustodyHoldsSharedReadBudget(t *testing.T) {
 	fs := &fakeStore{}
 	var selectionCtx context.Context
 	start := time.Now()
-	fs.custodySelect = func(ctx context.Context, limit int32) ([]uuid.UUID, error) {
-		if limit != 3 {
-			t.Fatalf("owner selection limit = %d, want 3", limit)
+	fs.custodySelect = func(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
+		if arg.CustodyHoldLimit != 3 {
+			t.Fatalf("owner selection limit = %d, want 3", arg.CustodyHoldLimit)
 		}
 		deadline, ok := ctx.Deadline()
 		if !ok || deadline.Before(start.Add(3*time.Second)) || deadline.After(start.Add(4*time.Second+100*time.Millisecond)) {
@@ -771,7 +787,7 @@ func TestCustodyHoldsSharedReadBudget(t *testing.T) {
 		}
 		return nil, nil
 	}
-	c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background())
+	c := newSvc(fs, &fakeSettings{}).checkCustodyHolds(context.Background(), fixedNow)
 	if c.Severity != sevWarn {
 		t.Fatalf("severity = %q, want warn", c.Severity)
 	}
@@ -792,13 +808,13 @@ func TestCustodyHoldsSkipListing(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &fakeStore{custodyOwners: tc.owners}
-			fs.custodySelect = func(context.Context, int32) ([]uuid.UUID, error) {
+			fs.custodySelect = func(context.Context, store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
 				if tc.limit == 0 {
 					t.Fatal("selected owners when disabled")
 				}
 				return tc.owners, nil
 			}
-			c := New(Config{Store: fs, CustodyHoldLimit: tc.limit}).checkCustodyHolds(context.Background())
+			c := New(Config{Store: fs, CustodyHoldLimit: tc.limit}).checkCustodyHolds(context.Background(), fixedNow)
 			if c.Severity != tc.want || len(fs.custodyQueries) != 0 || c.Action != nil {
 				t.Fatalf("skip listing = %+v, calls = %d", c, len(fs.custodyQueries))
 			}
@@ -1002,7 +1018,7 @@ func TestDegradeUnknownOnQueryError(t *testing.T) {
 	t.Run("custody.holds", func(t *testing.T) {
 		// CustodyHoldLimit is 3 (via newSvc), so the na guard does not fire first.
 		svc := newSvc(&fakeStore{custodyErr: boom}, &fakeSettings{})
-		assertUnknown(t, svc.checkCustodyHolds(context.Background()), degradeSummary)
+		assertUnknown(t, svc.checkCustodyHolds(context.Background(), svc.now()), degradeSummary)
 	})
 	t.Run("release.check enabled read", func(t *testing.T) {
 		svc := newSvc(&fakeStore{}, &fakeSettings{relEnabledErr: boom})
@@ -1435,4 +1451,50 @@ func TestFleetQuarantine(t *testing.T) {
 			t.Fatalf("action = %v, want it to name uzi admin workers --json and uzi tui", c.Action)
 		}
 	})
+}
+
+func TestCustodyHoldsConfiguredCutoffAndFacts(t *testing.T) {
+	owners := []uuid.UUID{uuid.New(), uuid.New()}
+	st := &fakeStore{custodyOwners: owners, custodyAggregate: store.GetCustodyAggregateForOwnerRow{OpenHolds: 11, AdmissionCountedHolds: 8}}
+	calls := 0
+	svc := New(Config{Store: st, Settings: &fakeSettings{}, CustodyHoldLimit: 8, HeartbeatStale: 73 * time.Second, Now: func() time.Time {
+		calls++
+		return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC).Add(time.Duration(calls-1) * time.Hour)
+	}})
+	doc, err := svc.Evaluate(context.Background())
+	if err != nil || calls != 1 {
+		t.Fatalf("Evaluate err=%v clock calls=%d", err, calls)
+	}
+	var got apitypes.HealthCheckDTO
+	for _, check := range doc.Checks {
+		if check.ID == "custody.holds" {
+			got = check
+		}
+	}
+	want := []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: "2"}, {Label: "Admission-counted holds", Value: "16"}, {Label: "Total open custody", Value: "22"}, {Label: "Owners with decisions", Value: "0"}, {Label: "Owners without decisions", Value: "2"}}
+	if got.Severity != sevWarn || !reflect.DeepEqual(got.Evidence, want) {
+		t.Fatalf("custody check=%+v, want evidence=%v", got, want)
+	}
+	cutoff := time.Date(2026, 10, 7, 11, 58, 47, 0, time.UTC)
+	if len(st.custodyListParams) != 1 || len(st.custodyAggregateParams) != 2 {
+		t.Fatalf("list=%v aggregates=%v", st.custodyListParams, st.custodyAggregateParams)
+	}
+	list := st.custodyListParams[0]
+	if list.CustodyHoldLimit != 8 || !list.HeartbeatCutoff.Valid || !list.HeartbeatCutoff.Time.Equal(cutoff) {
+		t.Fatalf("list params=%v", list)
+	}
+	for i, arg := range st.custodyAggregateParams {
+		if arg.UserID != owners[i] || arg.CustodyHoldLimit != 8 || arg.HeartbeatCutoff != list.HeartbeatCutoff {
+			t.Fatalf("aggregate params=%v", arg)
+		}
+	}
+}
+
+func TestCustodyHoldsAggregateError(t *testing.T) {
+	st := &fakeStore{custodyOwners: []uuid.UUID{uuid.New()}, custodyAggregateErr: errors.New("aggregate failed")}
+	svc := New(Config{Store: st, CustodyHoldLimit: 8, HeartbeatStale: 73 * time.Second})
+	got := svc.checkCustodyHolds(context.Background(), fixedNow)
+	if got.Severity != sevUnknown || len(got.Evidence) != 0 {
+		t.Fatalf("failed aggregate check=%+v", got)
+	}
 }

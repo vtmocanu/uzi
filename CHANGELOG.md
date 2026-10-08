@@ -32,6 +32,10 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Healthy live custody no longer consumes a recovery admission slot ([#2445](https://github.com/vtmocanu/uzi/issues/2445)).**
+  The fixed owner limit remains 8, but admission excludes at most one non-decision hold per run with exact current-generation, unreleased live ownership and a fresh worker heartbeat. Total open custody remains visible and protected; decision holds, older generations and unknown or stale claims still count. CLI, queued-run health, owner health and Slack capacity facts use the admission count separately from total holds; older API responses fall back to total when the new field is absent, preserving explicit zero. Continuations retain their 1–7 own-open-hold exemption. This is a statement-snapshot gate, so concurrent claims and later staleness can exceed the limit. No-action UX copy and tone stay with #2444.
+  Exhaustion custody remains a source-only owner decision (needs action after failed capture) even with an available archive or a latest capture preparing/uploading. Web and CLI keep export access separate from latest-work coverage warnings; capacity-only alerts warn, while reported blocked runs use danger.
+
 - **Terminal protection recognizes case-only run directory aliases on case-insensitive filesystems ([#2309](https://github.com/vtmocanu/uzi/issues/2309)).**
   On a case-insensitive filesystem such as default macOS APFS, a valid UUID run directory whose stored name differs from its id only by letter case is no longer read as unsafe, so a run with no terminal files is not kept under physical terminal protection indefinitely. Symlinked run directories and any other path difference stay unsafe; Linux workers are unaffected.
 

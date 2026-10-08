@@ -324,14 +324,16 @@ type RecoveryCustodyHoldDTO struct {
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the
 // one-per-episode Slack DM read (PRD #1349 M1 D6/D10). OpenHolds is the owner's unresolved
 // (state='open') hold count; CustodyHoldLimit is the configured per-owner admission ceiling;
+// AdmissionCountedHolds is the subset counted by the custody-admission predicate.
 // DecisionNeeded is how many holds await an owner decision; BlockedRuns is the count of the
-// owner's queued code-publishing runs blocked by the custody-admission gate. All four are
+// owner's queued code-publishing runs blocked by the custody-admission gate. All five are
 // plain ints (0 is meaningful), always on the wire.
 type RecoveryCustodyAggregateDTO struct {
-	OpenHolds        int `json:"open_holds"`
-	CustodyHoldLimit int `json:"custody_hold_limit"`
-	DecisionNeeded   int `json:"decision_needed"`
-	BlockedRuns      int `json:"blocked_runs"`
+	OpenHolds             int `json:"open_holds"`
+	AdmissionCountedHolds int `json:"admission_counted_holds"`
+	CustodyHoldLimit      int `json:"custody_hold_limit"`
+	DecisionNeeded        int `json:"decision_needed"`
+	BlockedRuns           int `json:"blocked_runs"`
 }
 
 // RecoveryCustodyHoldsDTO is the owner GET /api/recovery/holds response (PRD #1349 M1 D7). M5

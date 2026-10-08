@@ -87,7 +87,8 @@ type Store interface {
 	// board.drift: given-up column moves in a cutoff window (issue_iid filtered in Go, D12).
 	ListGaveUpColumnMoves(ctx context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
 	// custody.holds: owners at/over the custody admission limit.
-	ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error)
+	ListOwnersOverCustodyLimit(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error)
+	GetCustodyAggregateForOwner(ctx context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error)
 	ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
 	// controller.report: the fleet-independent controller-report singleton's observed_at
 	// (pgx.ErrNoRows when the controller has never reported).
@@ -272,7 +273,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkSlackSocket(now),
 		s.checkSchedulesPaused(ctx, now),
 		s.checkBoardDrift(ctx, now),
-		s.checkCustodyHolds(ctx),
+		s.checkCustodyHolds(ctx, now),
 		s.checkReleaseCheck(ctx, now),
 	}
 

@@ -97,7 +97,8 @@ AS_GOT="$(as_run_credential "$AS_RUN")"
 [ "$AS_GOT" = "spare-key|auto|95" ] || fail \
   "auto run recorded '$AS_GOT', want 'spare-key|auto|95'. The default token has 8 points of headroom and the spare 95, so a selector that ignored the gauge, or that fell through to the owner default, lands on 'default' here"
 pass "an auto worker spent the emptiest pooled token (spare-key, auto, 95% headroom)"
-apipost "/api/runs/$AS_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+apipost "/api/runs/$AS_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN"
+wait_status "$AS_RUN" cancelled
 
 # ── (b) #754: a stale pool FLOORS onto the best pooled token, NEVER the out-of-pool default ─
 # Pre-#754 an auto run whose every reading had aged out fell back to the owner DEFAULT and
@@ -121,7 +122,8 @@ AS_GOT2="$(as_run_credential "$AS_RUN2")"
 [ "$AS_GOT2" = "spare-key|pool_stale|null" ] || fail \
   "stale-pool run recorded '$AS_GOT2', want 'spare-key|pool_stale|null'. #754: a stale pool floors onto the pooled token (spare-key), reason pool_stale, with NO headroom — it must NEVER reach for the out-of-pool default"
 pass "an entirely stale pool floors onto the pooled token, never the out-of-pool default (spare-key, pool_stale, no headroom)"
-apipost "/api/runs/$AS_RUN2/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+apipost "/api/runs/$AS_RUN2/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN2"
+wait_status "$AS_RUN2" cancelled
 
 # ── (c) #754: a GENUINELY empty pool HOLDS in pool_wait and spends nothing, then RESUMES ──
 # Pre-#754 an empty pool fell through to the owner default at awaiting_approval and recorded
@@ -162,14 +164,13 @@ case "$AS_GOT3B" in
   *)
     fail "resumed pool_wait run recorded '$AS_GOT3B', want the pooled 'spare-key' with reason auto or pool_stale — it must spend the re-pooled spare, NEVER the out-of-pool default" ;;
 esac
-apipost "/api/runs/$AS_RUN3/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+apipost "/api/runs/$AS_RUN3/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN3"
+wait_status "$AS_RUN3" cancelled
 
 # ── leave the stack exactly as this phase found it ──────────────────────────────
-# The three runs this phase created are NOT deleted, and that is checked rather than
-# assumed: measured at this commit, nothing after this line reads /api/runs at all —
-# the only later references are this phase's own cancels. `uzi run list` matches
-# GET /api/runs ~3100 lines EARLIER, so it is unaffected. If a later phase ever starts
-# counting runs, this is the note that says why it broke.
+# Keep the three fixture runs as history. Each cancellation must settle before the
+# next leg changes eligibility or this teardown restores binding and deletes the
+# spare credential, so later phases inherit no executing auto-selection run.
 # 🔴 THIS IS NOT TIDINESS. The harness is one sequential stack, so anything left
 # behind is an input to every later phase — and the first version of this block
 # omitted the token delete, which broke PRD #104's binding phase 350 lines further
@@ -202,4 +203,3 @@ apiget /api/me/secrets \
 # later reader of /api/me/rate-limits sees what that phase established rather than what
 # this one needed.
 as_gauge "$AS_DEFAULT_SECRET" 55 12 "now()"
-

@@ -4,7 +4,7 @@
 # usage: scripts/migration-renumber.sh
 #        scripts/migration-renumber.sh --rewrite-comments <mapfile> <sqlfile>
 #
-# 🔴 WHAT THIS IS FOR. A maintainer rebased their branch onto main; their new goose
+# 🔴 WHAT THIS IS FOR. A maintainer integrated main into their branch; their new goose
 # migration(s) are already COMMITTED, but a draft number now COLLIDES with a migration
 # that landed on main in the meantime (the exact thing check-migration-numbering.sh
 # reddens: goose panics `duplicate version N detected` at boot and in every *LiveDB
@@ -30,6 +30,13 @@
 # lines (never SQL bodies, where a 5-digit literal could be data) and as ONE simultaneous
 # token pass, because old and new ranges can overlap (draft 00231/00232 -> new 00232/00233
 # aliases 00232) and a per-number sed in sequence would double-substitute.
+#
+# ENVIRONMENT:
+#     MIGRATION_RENUMBER_NO_FETCH unset or 0: fetch origin main (default).
+#     MIGRATION_RENUMBER_NO_FETCH=1: use the existing local origin/main without fetching.
+#       The caller is responsible for refreshing that ref before an offline run.
+#     Any other value (including empty) refuses before any mutation.
+#     Clean-tree and origin/main ancestry checks apply in both modes; merges are accepted.
 #
 # EXIT CODES:
 #     2 = usage / bad subcommand / wrong subcommand argument count
@@ -103,6 +110,12 @@ rewrite_comments() {
   fi
 }
 
+# Validate before even the file-writing subcommand or scratch creation can mutate files.
+case "${MIGRATION_RENUMBER_NO_FETCH-0}" in
+  0|1) ;;
+  *) die "MIGRATION_RENUMBER_NO_FETCH must be unset, 0, or 1" ;;
+esac
+
 # ---- subcommand dispatch -------------------------------------------------------------
 # The --rewrite-comments subcommand is a pure file operation: it deliberately runs BEFORE
 # any git/cd/precondition work so it can be unit-tested in isolation on an arbitrary
@@ -157,13 +170,17 @@ if [ -n "$porcelain" ]; then
   helper git mv's them and rewrites comments, so it refuses to touch a dirty tree."
 fi
 
-# 2. Resolvable base.
-git fetch origin main || die "git fetch origin main failed; cannot resolve the landing base"
-git rev-parse --verify origin/main >/dev/null 2>&1 || die "origin/main is not resolvable after fetch"
+# 2. Resolvable base: offline mode uses the caller's existing local tracking ref.
+if [ "${MIGRATION_RENUMBER_NO_FETCH-0}" = 0 ]; then
+  git fetch origin main || die "git fetch origin main failed; cannot resolve the landing base"
+  git rev-parse --verify origin/main >/dev/null 2>&1 || die "origin/main is not resolvable after fetch"
+else
+  git rev-parse --verify origin/main >/dev/null 2>&1 || die "local origin/main is not resolvable (MIGRATION_RENUMBER_NO_FETCH=1)"
+fi
 
-# 3. Rebased onto current main.
+# 3. Main must be an ancestor, whether integrated by merge or otherwise.
 if ! git merge-base --is-ancestor origin/main HEAD; then
-  die "HEAD is not rebased onto current origin/main. Rebase the branch first, then rerun."
+  die "origin/main is not an ancestor of HEAD. Integrate origin/main into the branch first, then rerun."
 fi
 
 # ---- live main head (max arithmetic value of the leading digit-run of the BASENAMES) --
@@ -197,7 +214,7 @@ git diff --no-renames --name-only --diff-filter=A origin/main HEAD -- "$MIGRATIO
 # Branch-new set empty -> refuse (nothing to renumber; likely the wrong branch/dir).
 if [ ! -s "$WORKDIR/branch_new" ]; then
   die "no migrations added by HEAD over origin/main under $MIGRATIONS_DIR -- nothing to
-  renumber. (Are you on the right branch, and is it rebased onto current main?)"
+  renumber. (Are you on the right branch, and does it include origin/main?)"
 fi
 
 # Validate each basename is exactly NNNNN_slug.sql, and build a `oldnum<TAB>path` list.

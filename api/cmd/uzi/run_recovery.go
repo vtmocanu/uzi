@@ -38,7 +38,10 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
 			"archive: recover it with `run export`; the hold releases itself once the archive is " +
 			"durable. A `source_only` or `needs_action` hold retains local inventory and awaits your " +
-			"decision to discard it with `run discard <run-id> --hold <hold-id> --yes`. `source_only` " +
+			"decision to discard it with `run discard <run-id> --hold <hold-id> --yes`. " +
+			"Archive availability is independent of attention: export an available archive even for a " +
+			"decision hold; it may not cover the latest work. A latest preparing/uploading capture is " +
+			"not yet downloadable and does not settle custody. `source_only` " +
 			"means the worker's local inventory remains in custody until a final disposition. For " +
 			"`source_only` and `needs_action` holds the retained source may be the only copy, so " +
 			"discarding one can destroy the work. `active` is healthy protection " +
@@ -164,8 +167,8 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		}
 	}
 	a := dto.Aggregate
-	p.Printf("open_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
-		a.OpenHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
+	p.Printf("open_holds: %d  admission_counted_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
+		a.OpenHolds, a.AdmissionCountedHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
 	if !gf.quiet {
 		first := true
 		for _, h := range open {
@@ -203,9 +206,25 @@ func sourceOnlyLine(h apitypes.RecoveryCustodyHoldDTO) string {
 	if h.Attention != "source_only" {
 		return ""
 	}
-	if h.InventoryGuarded && h.HasAvailableCapture {
-		return fmt.Sprintf("hold %s: earlier recovery archive available; final inventory disposition is pending; custody of worker %s is retained",
+	if h.HasAvailableCapture && !h.InventoryGuarded {
+		line := fmt.Sprintf("hold %s: recovery archive available to export; it may not cover the latest worker-local work; custody of worker %s is retained for your decision",
 			cellText(h.ID), cellText(recoveryWorkerLabel(h)))
+		if h.CaptureState == "preparing" || h.CaptureState == "uploading" {
+			line += fmt.Sprintf("; latest capture is %s (coverage not yet verified)", cellText(h.CaptureState))
+		}
+		return line
+	}
+	if h.InventoryGuarded && h.HasAvailableCapture {
+		line := fmt.Sprintf("hold %s: earlier recovery archive available; final inventory disposition is pending; custody of worker %s is retained",
+			cellText(h.ID), cellText(recoveryWorkerLabel(h)))
+		if h.CaptureState == "preparing" || h.CaptureState == "uploading" {
+			line += fmt.Sprintf("; latest capture is %s (coverage not yet verified)", cellText(h.CaptureState))
+		}
+		return line
+	}
+	if h.CaptureState == "preparing" || h.CaptureState == "uploading" {
+		return fmt.Sprintf("hold %s: no recovery archive available to export yet; latest capture is %s (coverage not yet verified); custody of worker %s's local source is retained for your decision (it may be the only copy)",
+			cellText(h.ID), cellText(h.CaptureState), cellText(recoveryWorkerLabel(h)))
 	}
 	return fmt.Sprintf("hold %s: no recovery archive; custody of worker %s's local source is retained (export unavailable; it may be the only copy)",
 		cellText(h.ID), cellText(recoveryWorkerLabel(h)))

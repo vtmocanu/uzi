@@ -160,7 +160,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
-| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you until you resolve or discard some. A requeued run that still holds its own unresolved work is still admitted, even past the limit, until that one run alone holds 8. Fixed today, not yet an environment variable. |
+| Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 ### Shared stored-file budget
 
@@ -348,10 +348,10 @@ completed-run check above.
 
 ## Reviewing and resolving held work
 
-At most **8 unresolved holds per owner** (the *Unresolved recovery holds*
-limit above) can accumulate before uzi pauses admitting **new** runs for you.
-A run that was interrupted and requeued while it still has its own unresolved
-hold keeps resuming, until that one run alone holds 8.
+Once **8 admission-counted holds per owner** (the *Admission-counted recovery
+holds* limit above) accumulate, uzi pauses admitting **new** runs for you.
+A run that was interrupted and requeued while it has 1 to 7 of its own open
+holds keeps resuming; once that one run alone holds 8, it loses the exemption.
 When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
@@ -411,10 +411,14 @@ rejection prose above. This is an unauthenticated record, distinct from a
 trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
-stays in custody. For a terminal run or a non-terminal worker-exhaustion hold
-without an available
-independently verified recovery capture, it reports `source_only`, rather than
-`active_protected`. An inventory-guarded hold also reports `source_only` while an
+stays in custody. An OPEN hold for `recovery_wait` /
+`worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
+capture failed, before archive readiness or capture progress is considered. An
+available archive remains exportable; a latest preparing/uploading capture is not
+yet downloadable, and an earlier archive may omit latest worker-local work. These
+capture facts do not settle the owner decision or implicitly release custody.
+Other terminal holds without a verified available capture report `source_only`,
+rather than `active_protected`. An inventory-guarded hold also reports `source_only` while an
 earlier archive is downloadable: that archive does not cover the full inventory
 and does not settle custody. Recorded evidence or uncertainty at exhaustion holds the
 run for owner Resume; the MAC rejection grants no extra allowance. Absence of

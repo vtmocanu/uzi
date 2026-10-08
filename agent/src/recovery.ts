@@ -341,9 +341,9 @@ function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRe
   );
 }
 
-/** A record the live pass may re-drive: a journaled bundle that is `bundled`, or `needs_action`
- *  for a transient reason or `credential_rejected` (gated by the caller). Never pinned,
- *  bundle-less, uploaded, or permanent. */
+/** Guarded FINAL retries may include uploaded records.
+ *  Legacy records need a journaled bundle that is bundled or needs_action for a
+ *  transient/credential reason; pinned, bundle-less and permanent legacy records are skipped. */
 function isLiveCandidate(record: RecoveryRecord): boolean {
   if (record.inventoryGuarded && record.coverageDigest && !record.finalAcknowledged) {
     if (record.reason === "inventory_quiescence_breach" || record.reason === "inventory_snapshot_changed") return false;

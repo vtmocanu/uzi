@@ -51,7 +51,7 @@
 #   same-worker two-generation release (M4) ....... api/internal/workersvc/custody_multihold_livedb_test.go
 #                                                    (TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB)
 #   generation-exact reserve/release (M1/M4) ...... api/internal/recovery/reserve_release_generation_livedb_test.go
-#   8 open holds block a 9th claim / aggregate (M1) api/internal/store/recovery_exact_livedb_test.go,
+#   8 admission-counted holds block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
 #                                                    api/internal/workersvc/claim_custody_livedb_test.go
 #   owner discard + confirm gate + owner scope +
 #     sibling safety + Bearer/cookie mount (M5) ... api/internal/handler/recovery_owner_holds_livedb_test.go
@@ -64,9 +64,11 @@
 #   No scenario in the matrix is uncovered; this phase is the integrated proof M7 asks for.
 # =============================================================================
 say "PRD #1349 M7: custody-limit wedge repro + owner-disposition unblock"
+trap 'if [ "$?" -ne 0 ]; then cat "$RUNROOT/custody-window.jsonl" 2>/dev/null || true; inventory_diagnostic_snapshot || true; fi' EXIT
 
-# The admission ceiling (workersvc.custodyHoldLimit / apitypes CustodyHoldLimit). The
-# production claim path always passes this positive default, so the live stack enforces it.
+# The fixed admission limit (workersvc.custodyHoldLimit / apitypes CustodyHoldLimit).
+# ADR-2445 uses admission_counted_holds, separate from total open_holds. This is a
+# statement-snapshot gate, not a strict ceiling under concurrency or late staleness.
 LIMIT=8
 SEED_IDENT="e2e-72-custody-seed"
 
@@ -95,8 +97,9 @@ pass "preconditions: worker online + idle, owner has $C0 open hold(s) (< limit $
 # These are HOLD-only fixtures (no captures/chunks): they mirror how the live incident's
 # abruptly-lost, capture-less sources sit 'open' awaiting an owner decision, and how
 # api/internal/store/recovery_exact_livedb_test.go seeds the same admission fixture.
-# live_worker_id/live_run_id stay NULL (no FK dependency); each row gets a distinct
-# generation. run_id is a plain column here — a real owned run_id is attached to the ONE
+# live_worker_id/live_run_id stay NULL (no FK dependency), so ADR-2445 keeps every
+# seed admission-counted: no seed proves an exact healthy live current-generation claim.
+# Each row gets a distinct generation. run_id is a plain column here — a real owned run_id is attached to the ONE
 # hold that gets discarded, below.
 NEED=$((LIMIT - C0))
 db_psql "INSERT INTO recovery_custody_holds
@@ -108,13 +111,16 @@ AFTER_SEED="$(open_holds_db)"
 pass "seeded $NEED open custody hold(s); owner now at the admission limit ($AFTER_SEED/$LIMIT)"
 
 # The owner-wide aggregate (GET /api/recovery/holds — the board alert / Workers surface /
-# `uzi run recovery` all read it) must agree with the raw count and echo the ceiling.
+# `uzi run recovery` all read it) must agree with total custody, separately establish
+# admission pressure (including the baseline holds), and echo the fixed limit.
 AGG="$(apiget /api/recovery/holds)"
 [ "$(printf '%s' "$AGG" | jq -r '.aggregate.open_holds')" = "$LIMIT" ] \
   || fail "aggregate.open_holds != $LIMIT (got $(printf '%s' "$AGG" | jq -r '.aggregate.open_holds'))"
 [ "$(printf '%s' "$AGG" | jq -r '.aggregate.custody_hold_limit')" = "$LIMIT" ] \
   || fail "aggregate.custody_hold_limit != $LIMIT (got $(printf '%s' "$AGG" | jq -r '.aggregate.custody_hold_limit'))"
-pass "owner aggregate agrees: open_holds=$LIMIT, custody_hold_limit=$LIMIT"
+[ "$(printf '%s' "$AGG" | jq -r '.aggregate.admission_counted_holds')" = "$LIMIT" ] \
+  || fail "aggregate.admission_counted_holds != $LIMIT (got $(printf '%s' "$AGG" | jq -r '.aggregate.admission_counted_holds'))"
+pass "owner aggregate agrees: open_holds=$LIMIT, admission_counted_holds=$LIMIT, custody_hold_limit=$LIMIT"
 
 # --- 2) create a code run — it must WEDGE (stay queued, blocked by custody) ----
 IID="$(apipost "/api/repos/$REPO_ID/issues" \
@@ -131,6 +137,15 @@ pass "created code run $WEDGE_RUN for issue #$IID (owner at the custody limit)"
 NEG_WINDOW=12
 start=$SECONDS
 while [ $((SECONDS - start)) -lt "$NEG_WINDOW" ]; do
+  # Record the actual admission baseline, including receipt transitions. Print
+  # only on failure; the retained rundir also carries the rows for post-mortem.
+  db_psql_rows "SELECT json_build_object('kind','custody_window','observed_at',clock_timestamp(),
+    'hold_id',h.id,'run_id',h.run_id,'generation',h.generation,'state',h.state,
+    'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
+    'released_at',h.released_at,'updated_at',h.updated_at,
+    'open_count',(SELECT count(*) FROM recovery_custody_holds WHERE user_id='$ADMIN_ID' AND state='open'),
+    'wedge_run','$WEDGE_RUN','wedge_status',(SELECT status FROM runs WHERE id='$WEDGE_RUN'))::text
+    FROM recovery_custody_holds h WHERE h.user_id='$ADMIN_ID' ORDER BY h.id" >> "$RUNROOT/custody-window.jsonl"
   s="$(apiget "/api/runs/$WEDGE_RUN" | jq -r '.run.status')"
   [ "$s" = queued ] || fail "wedge run left 'queued' (got '$s') while the owner is at the custody limit — the admission gate did not block the claim"
   sleep 0.5
@@ -139,8 +154,10 @@ record_margin "custody wedge: run stayed queued" "$((SECONDS - start))" "$NEG_WI
 pass "wedge reproduced: run $WEDGE_RUN stayed queued for ${NEG_WINDOW}s against an online, idle worker"
 
 # The server's OWN custody-block signal: blocked_runs counts the owner's queued
-# code-publishing runs ONLY when open_holds >= the limit (recovery.sql GetCustodyAggregateForOwner,
-# the same predicate ClaimRun and health.go's reasonCustodyLimit use). >= 1 here proves the
+# non-exempt code-publishing runs when admission_counted_holds >= the limit
+# (recovery.sql GetCustodyAggregateForOwner, the same accounting ClaimRun and health.go's
+# reasonCustodyLimit use). Continuation's own-hold bound still uses total open holds.
+# >= 1 here proves the
 # run is queued FOR CUSTODY, not for a worker/capability/priority reason.
 BLOCKED="$(apiget /api/recovery/holds | jq -r '.aggregate.blocked_runs')"
 [ "$BLOCKED" -ge 1 ] || fail "aggregate.blocked_runs is $BLOCKED, want >= 1 — the server does not see the run as custody-blocked"
@@ -186,13 +203,21 @@ pass "owner disposed the exact hold: uzi run discard $WEDGE_RUN --hold $HOLD_ID 
 wait_status "$WEDGE_RUN" awaiting_approval 60
 pass "unblock proven: run $WEDGE_RUN was claimed and reached the plan gate after the disposition"
 
-# The claim minted its own fresh hold (recovery-capable worker on a code kind), so the
-# owner is protected again — and the wedge is cleared: no queued run remains blocked.
+# The claim minted its own fresh hold (recovery-capable worker on a code kind), so
+# total custody is back at LIMIT. The healthy current-generation non-decision hold at
+# awaiting_approval is excluded from admission: counted holds stay at LIMIT-1. The
+# hold is still open and protects source; accounting has released/discarded nothing.
+# The wedge is cleared: no queued run remains custody-blocked.
 BLOCKED_AFTER="$(apiget /api/recovery/holds | jq -r '.aggregate.blocked_runs')"
 [ "$BLOCKED_AFTER" = 0 ] || fail "aggregate.blocked_runs is $BLOCKED_AFTER after the unblock, want 0 (the episode did not clear)"
 NEW_HOLD="$(uzi_cli run recovery "$WEDGE_RUN" --json | jq -r 'map(select(.state == "open")) | length')"
 [ "$NEW_HOLD" -ge 1 ] || fail "the unblocked claim did not open a fresh custody hold for run $WEDGE_RUN"
-pass "episode cleared: blocked_runs=0 and the claimed run holds its own fresh open custody hold"
+AGG_AFTER="$(apiget /api/recovery/holds)"
+[ "$(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.open_holds')" = "$LIMIT" ] \
+  || fail "aggregate.open_holds != $LIMIT after the healthy claim (got $(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.open_holds'))"
+[ "$(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.admission_counted_holds')" = "$((LIMIT - 1))" ] \
+  || fail "aggregate.admission_counted_holds != $((LIMIT - 1)) after the healthy claim (got $(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.admission_counted_holds'))"
+pass "episode cleared: blocked_runs=0, open_holds=$LIMIT, admission_counted_holds=$((LIMIT - 1)); fresh custody remains open"
 
 # --- 5) cleanup: leave the owner as we found it (self-cleaning; 72 is the last phase) ---
 # Cancel the wedge run so the end-of-phase quarantine finds nothing to reap, then remove
