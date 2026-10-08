@@ -2748,9 +2748,12 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   it("(6) a cancel beats the raw aborted error the transport throws mid-setup", async () => {
     const controller = new AbortController();
     const rig = makeRig();
+    let signalTurnStart!: () => void;
+    const turnStarted = new Promise<void>(resolve => { signalTurnStart = resolve; });
     // turn/start pends until its signal aborts, then rejects with a RAW aborted error.
     rig.transport.requestOverride = (c, opts) => {
       if (c.method !== "turn/start") return undefined;
+      signalTurnStart();
       return new Promise((_, reject) => {
         const sig = opts?.signal;
         const fail = (): void => reject(new Error("AbortError: the transport request was aborted"));
@@ -2761,7 +2764,8 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     rig.transport.push(threadStarted());
     const { ctx } = makeCtx({ signal: controller.signal });
     const p = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    await tick();
+    // Cancel only once setup reaches the transport request this test exercises.
+    await withTimeout(turnStarted, 3000, "turn/start pending before cancellation");
     controller.abort();
     await assert.rejects(withTimeout(p, 3000, "cancel run"), (e: Error) => {
       assert.equal(e.message, "run cancelled", "the trip wins over the raw AbortError");
