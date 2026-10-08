@@ -469,14 +469,20 @@ it("true, undefined, throw, rejection and missing predicate/API fail closed", as
     await worker(outbox, runner as Partial<RunRunner>).sweepPendingFinalizes();
     assert.equal(deleted.length, 0, String(result));
   }
+  // Positive control: the same rig retires on custody false, so the refusals above are not vacuous.
+  const control = fakeOutbox([entry()]);
   let checks = 0;
+  const countingRunner = { recoveryInventoryPending: async () => { checks++; return false; } };
+  await worker(control.outbox, countingRunner).sweepPendingFinalizes();
+  assert.equal(control.deleted.length, 1, "custody false retires");
+  assert.equal(checks, 1, "complete outbox consults custody");
+  checks = 0;
   for (const partial of [
     {},
     { listPendingFinalizeGenerations: () => [entry()] },
     { retireFinalizeIfEligible: async () => {} },
   ]) {
-    await worker(partial as unknown as Outbox, { recoveryInventoryPending: async () => { checks++; return false; } })
-      .sweepPendingFinalizes();
+    await worker(partial as unknown as Outbox, countingRunner).sweepPendingFinalizes();
   }
   assert.equal(checks, 0);
 });
