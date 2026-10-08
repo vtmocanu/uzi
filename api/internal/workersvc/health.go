@@ -430,9 +430,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
-		// A live plan cross-check is expected waiting, not an owner-actionable warning.
+		// A live plan cross-check is expected waiting. A worker-pickup nudge would
+		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
-		if reason == reasonPlanCrossCheckWaiting {
+		if reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
 			nudge = false
 		}
 		notifiedAt := pgtype.Timestamptz{}
