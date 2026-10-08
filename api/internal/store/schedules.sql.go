@@ -37,11 +37,13 @@ type AdvanceScheduleParams struct {
 // so the firing code decides the next fire.
 //
 // It also writes last_fire (PRD #308 M2): the serialized summary of THIS fire
-// (matched/started/skipped + typed reasons). This is the ONLY write site for last_fire —
-// the park/transient paths never advance, so a parked/transient fire keeps the prior
-// last_fire (Decision 5). last_fire is a jsonb column, so the param is []byte; passing
-// nil writes SQL NULL (the caller does this when the summary could not be serialized, so
-// a serialization hiccup never wedges the cadence).
+// (matched/started/skipped + typed reasons). This is the only write site on the normal
+// fire path; a credential-disabled hold (RecordScheduleHeldFire) also records last_fire,
+// without advancing. The park/transient paths never advance, so a parked/transient fire
+// keeps the prior last_fire (Decision 5).
+// last_fire is a jsonb column, so the param is []byte; passing nil writes SQL NULL (the
+// caller does this when the summary could not be serialized, so a serialization hiccup
+// never wedges the cadence).
 func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, advanceSchedule,
 		arg.LastFiredAt,
