@@ -16,6 +16,7 @@
 // supervisor); everything here is unit-testable with fakes.
 
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
+import { CheckpointChildStartupTimeoutError } from "../harness.js";
 import type {
   BoundaryPermit,
   BoundaryProcessHandle,
@@ -586,8 +587,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.cancelReservation(reservation.reservation);
       if (request.recoverableTimeout && !permit.signal.aborted &&
         remainingMs(this.currentDeadlineAt) > 0 && verifiedStartupCleanup(cause)) {
-        // M2 maps this typed rejected startup to checkpoint recovery. No fake handle.
-        throw cause;
+        // The launcher and cache have already settled the authentic rejection.
+        // This recovery result carries no authority to certify another cleanup.
+        throw new CheckpointChildStartupTimeoutError(cause);
       }
       const classification = classifyCodexLaunchFailure(cause);
       const error = new CodexLaunchError(classification, "unconfirmed", cause);

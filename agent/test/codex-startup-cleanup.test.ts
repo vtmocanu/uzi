@@ -8,6 +8,7 @@ import { boundaryProcessSpawnerForTest, HeldRunCommandCache } from "../src/codex
 import { createCodexExecutionSafety, CodexBoundaryError } from "../src/codex/safety.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { COMMAND_UID } from "../src/runner-uid.js";
+import { CheckpointChildStartupTimeoutError } from "../src/harness.js";
 import type { StartupCleanupAuthorization, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 
 type Variant = "valid" | "unconfirmed" | "wrong_authority" | "bad_array" | "wrong_id" |
@@ -212,26 +213,50 @@ function cache() {
 describe("M1 boundary and cache authority", () => {
   it("keeps the reservation pending, preserves hard deadline through cache/spawner, then throws recoverable typed startup", async () => {
     const held = cache();
-    let seenContext: StartupCleanupAuthorization | undefined;
+    let seamContext: StartupCleanupAuthorization | undefined;
+    let cacheContext: StartupCleanupAuthorization | undefined;
+    let launcherContext: StartupCleanupAuthorization | undefined;
+    let authenticError: unknown;
+    let startupBudget: number | undefined;
     let registry: ExecutionRegistry;
     const wrapped = held.track(async (_spec, startupMs, context) => {
-      seenContext = context;
+      launcherContext = context;
+      startupBudget = startupMs;
       assert.equal(registry.pendingLaunchCount(), 1);
       const t = transport();
       t.control.on("data", () => assert.equal(registry.pendingLaunchCount(), 1, "cleanup retains launch reservation"));
-      return launch(t, context, startupMs);
+      try { return await launch(t, context, startupMs); }
+      catch (error) { authenticError = error; throw error; }
     });
-    const rig = safetyFor(boundaryProcessSpawnerForTest("required", wrapped));
+    const boundarySeam = boundaryProcessSpawnerForTest("required", async (launchSpec, ms, context) => {
+      cacheContext = context;
+      return wrapped(launchSpec, ms, context);
+    });
+    const rig = safetyFor(async (processRequest, ms, context) => {
+      seamContext = context;
+      return boundarySeam(processRequest, ms, context);
+    });
     registry = rig.registry;
-    const before = Date.now();
     await rig.safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async (permit) => {
       const error = await rejection(rig.safety.spawnBoundaryProcess(permit, request));
-      assert.ok(error instanceof launcher.CodexLaunchError);
-      assert.equal(certificate(error, seenContext), true);
+      assert.ok(error instanceof CheckpointChildStartupTimeoutError);
+      assert.equal(error.cause, authenticError);
+      assert.ok(authenticError instanceof launcher.CodexLaunchError);
+      assert.equal(error.classification, "started_deadline");
+      assert.equal(error.cleanupStatus, "verified");
+      assert.equal(certificate(error, seamContext), false, "the recovery marker is not cleanup authority");
+      assert.equal(certificate(authenticError, seamContext), true);
+      assert.equal(seamContext, cacheContext);
+      assert.equal(cacheContext, launcherContext);
+      assert.ok(Object.isFrozen(seamContext));
+      assert.equal(seamContext!.hardDeadlineAt,
+        (rig.safety as unknown as { currentDeadlineAt: number }).currentDeadlineAt);
+      assert.equal(cacheContext!.hardDeadlineAt, seamContext!.hardDeadlineAt);
+      assert.equal(launcherContext!.hardDeadlineAt, seamContext!.hardDeadlineAt);
+      assert.ok(startupBudget! > 0 && startupBudget! <= request.timeoutMs);
       assert.equal(registry.pendingLaunchCount(), 0);
       assert.equal(registry.isPoisoned(), false);
-      assert.ok(seenContext!.hardDeadlineAt >= before + 1000);
-      assert.ok(seenContext!.hardDeadlineAt <= Date.now() + 1000);
+      assert.equal(held.drained(), true, "cache settled authentic rejection before safety wrapped it");
     });
     assert.equal(held.drained(), true, "only certified rejected roots count as clean");
   });
@@ -275,10 +300,11 @@ describe("M1 boundary and cache authority", () => {
     assert.equal(registry.isPoisoned(), true);
     assert.equal(held.drained(), false);
   });
-  for (const fabricated of [false, true]) {
-    it(`poisons ${fabricated ? "fabricated typed clean error" : "untyped startup-message rejection"}`, async () => {
+  for (const fabricated of ["untyped", "launcher", "worker_marker"] as const) {
+    it(`poisons fabricated ${fabricated} rejection`, async () => {
       const held = cache();
-      const cause = fabricated ? new launcher.CodexLaunchError("started_deadline", "verified", undefined) :
+      const cause = fabricated === "launcher" ? new launcher.CodexLaunchError("started_deadline", "verified", undefined) :
+        fabricated === "worker_marker" ? new CheckpointChildStartupTimeoutError(new Error("private-input")) :
         new Error("started deadline exceeded private-input");
       const { registry, safety } = safetyFor(boundaryProcessSpawnerForTest("required",
         held.track(async () => { throw cause; })));
