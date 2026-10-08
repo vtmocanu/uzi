@@ -150,6 +150,61 @@ func TestMemoryHoldResumeClaimIncarnationLiveDB(t *testing.T) {
 	}
 }
 
+// A transient redispatch and registration renewal must not buy a fresh allowance.
+func TestMemoryOrdinaryRedispatchPreservesAllowanceLiveDB(t *testing.T) {
+	f := newMemoryFixture(t)
+	original := f.reserve(t, f.b)
+	second := f.b
+	second.InterventionID = uuid.New()
+	f.reserve(t, second)
+	before := f.run(t)
+	n, err := f.e.q.SetRunRecoveryWait(f.e.ctx, store.SetRunRecoveryWaitParams{
+		ID: f.b.RunID, WorkerID: pgconv.UUID(f.w.ID), ClaimGeneration: pgconv.Int8Ptr(&f.b.ClaimGeneration),
+		RecoveryCause: pgconv.Text("provider_outage"), RetryNotBefore: pgconv.Time(time.Now().Add(-time.Minute)),
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("transient park rows=%d err=%v", n, err)
+	}
+	n, err = f.e.q.PromoteRecoveryWaitRunNow(f.e.ctx, store.PromoteRecoveryWaitRunNowParams{ID: f.b.RunID, UserID: f.w.UserID})
+	if err != nil || n != 1 {
+		t.Fatalf("transient promotion rows=%d err=%v", n, err)
+	}
+	w, nonce, err := f.s.Register(f.e.ctx, f.w, "fixture", "", nil, nil,
+		[]string{capability.WorkerMemoryPressureV1}, nil)
+	if err != nil || nonce == "" || nonce == f.b.RegisterNonce {
+		t.Fatalf("registration nonce=%q err=%v", nonce, err)
+	}
+	claimed, err := f.e.q.ClaimRun(f.e.ctx, claimRunParams(w))
+	if err != nil || claimed.ID != f.b.RunID || claimed.ClaimGeneration != f.b.ClaimGeneration+1 ||
+		claimed.MemoryEpisode != before.MemoryEpisode || claimed.MemoryInterventionCount != 2 ||
+		string(claimed.MemoryPolicy) != string(before.MemoryPolicy) ||
+		claimed.WorkerRecoveryEpisode != before.WorkerRecoveryEpisode || claimed.RequeueCount != before.RequeueCount {
+		t.Fatalf("ordinary redispatch changed allowance/history: claim=%+v err=%v", claimed, err)
+	}
+	historical := f.reserve(t, f.b)
+	if historical.Authorizing || historical.Allowance != original.Allowance || historical.MemoryBinding != original.MemoryBinding {
+		t.Fatalf("old reservation renewed authority/allowance: %+v", historical)
+	}
+	fresh := f
+	fresh.w = w
+	b := f.b
+	b.RegisterNonce, b.ClaimGeneration, b.InterventionID = nonce, claimed.ClaimGeneration, uuid.New()
+	last := fresh.reserve(t, b)
+	if !last.Admitted || !last.Authorizing || last.Allowance.Used != 3 || last.Allowance.Remaining != 0 {
+		t.Fatalf("remaining slot was renewed: %+v", last)
+	}
+	b.InterventionID = uuid.New()
+	denied := fresh.reserve(t, b)
+	if denied.Admitted || denied.Authorizing || denied.Allowance.Used != 3 || fresh.run(t).MemoryInterventionCount != 3 {
+		t.Fatalf("redispatch escaped episode cap: %+v", denied)
+	}
+	_, err = fresh.s.ReserveMemoryIntervention(f.e.ctx, w, MemoryReservationRequest{
+		MemoryBinding: b, Policy: MemoryPolicy{Version: 1, MaxInterventions: 4}})
+	if !errors.Is(err, ErrMemoryBinding) || fresh.run(t).MemoryInterventionCount != 3 {
+		t.Fatalf("registration unfroze policy: %v", err)
+	}
+}
+
 func TestMemoryBindingCollisionAndOutcomeLiveDB(t *testing.T) {
 	f := newMemoryFixture(t)
 	f.reserve(t, f.b)
