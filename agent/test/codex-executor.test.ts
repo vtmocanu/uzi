@@ -5282,6 +5282,30 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
 // are fail-old/pass-fixed: without the signals frame planResult.plan is undefined and run()
 // throws "produced no plan" before the gate, so a resolving success test can only pass wired.
 describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
+  it("refuses automatic plan revision before feedback or another provider turn", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let gates = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => {
+        gates++;
+        return { kind: "revise", automatic: true, round: 1, feedback: "checker advice" };
+      },
+    });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "automatic revision refusal"),
+      /codex cannot consume automatic plan revision/,
+    );
+    assert.equal(gates, 1);
+    assert.equal(rig.epochs.length, 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    assert.ok(!emitted.some((m) => m.kind === "plan_feedback" || m.kind === "plan_revising"));
+  });
   it("refuses checked plan approval before provider epoch recreation or implementation", async () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {

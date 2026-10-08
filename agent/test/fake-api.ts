@@ -237,6 +237,9 @@ export class FakeApi {
   /** Hold a pending status response until the owning client's HTTP request aborts. */
   holdCrossCheckStatusUntilAbort?: (runId: string) => boolean;
   abortedHeldCrossCheckStatuses = 0;
+  crossCheckLatestHandler?: (request: { runId: string; generation: number }) =>
+    Promise<{ status: number; body: unknown }> | { status: number; body: unknown };
+  readonly crossCheckLatestRequests: { runId: string; generation: number }[] = [];
   readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
   readonly crossCheckReplies: { runId: string; method: string; status: number; acceptedCandidate: boolean; dropped: boolean }[] = [];
   usageHandler?: () => { status: number; body: unknown };
@@ -1186,7 +1189,17 @@ export class FakeApi {
       return send(res, answer.status, answer.body);
     }
 
-    const crossCheckMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks(?:\/plan\/1)?$/.exec(p);
+    const latestMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks\/plan\/latest$/.exec(p);
+    if (req.method === "GET" && latestMatch) {
+      const request = { runId: latestMatch[1]!, generation: Number(url.searchParams.get("claim_generation")) };
+      this.crossCheckLatestRequests.push(request);
+      const answer = this.crossCheckLatestHandler ? await this.crossCheckLatestHandler(request) :
+        { status: 200, body: { result: "no_row", round: 0, candidate_generation: 0,
+          automatic_revision_limit: 0, automatic_rounds_enabled: false, next_round: 1,
+          next_round_eligible: true, fallback_reason: "" } };
+      return send(res, answer.status, answer.body);
+    }
+    const crossCheckMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks(?:\/plan\/[1-5])?$/.exec(p);
     if (crossCheckMatch && this.crossCheckHandler) {
       const request = { runId: crossCheckMatch[1]!, method: req.method ?? "", body: json };
       this.crossCheckRequests.push(request);

@@ -76,7 +76,7 @@ export class CrossCheckRunner {
       if (ack?.staleClaim) return;
       const candidate = claim.cross_check;
       if (claim.kind !== "cross_check" || selectCodexBinding(claim.secrets).kind !== "codex"
-        || !candidate || candidate.stage !== "plan" || candidate.round !== 1
+        || !candidate || candidate.stage !== "plan" || !Number.isInteger(candidate.round) || candidate.round < 1 || candidate.round > 5
         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)) throw new Error("invalid plan checker claim");
       const deadline = Date.parse(candidate.deadline_at);
       const timeout = Math.min(this.opts.modelTimeoutMs ?? 15 * 60_000, deadline - Date.now());

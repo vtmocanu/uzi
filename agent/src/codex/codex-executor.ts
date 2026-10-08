@@ -2563,6 +2563,8 @@ export class CodexExecutor implements Executor {
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         let revisions = 0;
         while (verdict.kind === "revise") {
+          if (verdict.automatic === true)
+            throw new TrustedExecutionRefusal("codex cannot consume automatic plan revision");
           const feedback = verdict.feedback;
           // Issue #1604: the re-gate below settles this revise once the revised plan is persisted.
           const settles = verdict.inputId;

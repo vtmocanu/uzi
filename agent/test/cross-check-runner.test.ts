@@ -126,12 +126,13 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 
-for (const mode of ["approve", "invalidfinding"] as const) {
+for (const mode of ["approve", "approve-round2", "invalidfinding"] as const) {
 it("outer checker uses real Read broker, actual HTTP verdict delivery and journaled child completion: " + mode, async () => {
- const expectedVerdict = mode === "approve" ? "approve" : "failed";
- const expectedReason = mode === "approve" ? "approve" : "malformed";
- const expectedStatus = mode === "approve" ? "completed" : "failed";
- const assistantText = mode === "approve" ? verdict : JSON.stringify({
+ const approves = mode !== "invalidfinding";
+ const expectedVerdict = approves ? "approve" : "failed";
+ const expectedReason = approves ? "approve" : "malformed";
+ const expectedStatus = approves ? "completed" : "failed";
+ const assistantText = approves ? verdict : JSON.stringify({
   verdict: "approve", summary: "Anchors checked",
   items: [{ file: "anchor.ts", severity: "invalid", summary: "Finding", rationale: "Read anchor" }],
  });
@@ -156,6 +157,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   },
  });
  const c = { ...claim(), claim_generation: 7 };
+ c.cross_check!.round = mode === "approve-round2" ? 2 : 1;
  const server = http.createServer(async (req, res) => {
   let raw = "";
   for await (const chunk of req) raw += chunk;
@@ -203,7 +205,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   const delivered = posts.filter((p) => p.url.endsWith("/messages"));
   assert.deepEqual(delivered.map((p) => p.body.messages[0].seq), [1, 2]);
   assert.deepEqual(delivered.map((p) => p.body.messages[0].payload.event), ["init", "result"]);
-  assert.equal(delivered[1]!.body.messages[0].payload.is_error, mode !== "approve");
+  assert.equal(delivered[1]!.body.messages[0].payload.is_error, !approves);
   assert.equal(r.secrets.size, 0);
   assert.ok(posts.every((p) => p.url.includes("/runs/check/")));
   const verdictIndex = posts.findIndex((p) => p.url.endsWith("/cross-check-verdict"));

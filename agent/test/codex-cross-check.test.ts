@@ -28,6 +28,7 @@ type Emit = (frame: unknown) => void;
 // Both injected roots speak the real NDJSON contracts. The fileop stand-in exposes
 // only its dictionary root. This proves functional wiring, not kernel isolation.
 function rig(options: {
+ round?: number;
  notes?: (emit: Emit) => void;
  onToolReply?: (frame: Frame, emit: Emit) => void;
  clean?: boolean;
@@ -110,9 +111,35 @@ function rig(options: {
  const log = { addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
  const checker = new CodexCrossCheck(client, log, deps);
  return { requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
-  run: (signal = new AbortController().signal) => checker.run(claim(options.subscription), "/checkout", "/owned", signal,
-   async (payload) => { usage.push(payload); }) };
+  run: (signal = new AbortController().signal) => {
+   const c = claim(options.subscription);
+   c.cross_check!.round = options.round ?? 1;
+   return checker.run(c, "/checkout", "/owned", signal, async (payload) => { usage.push(payload); });
+  } };
 }
+
+it("round two runs the confined checker and fences its round without a child budget snapshot", async () => {
+ const r = rig({ round: 2 });
+ assert.equal(await r.run(), verdict);
+ assert.equal(r.specs.length, 2);
+ assert.ok("args" in r.specs[0]! && r.specs[0].args.includes("--cross-check"));
+ const turn = r.requests.find((frame) => frame.method === "turn/start");
+ assert.ok(turn);
+ assert.match(JSON.stringify(turn.params), /round.*2/);
+ assert.deepEqual(r.ops, ["stat"]);
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+});
+
+it("checker rejects rounds outside positive integers one through five before launch", async () => {
+ for (const round of [0, 6, 1.5, NaN]) {
+  const r = rig({ round });
+  await assert.rejects(r.run(), /unsupported cross-check candidate/);
+  assert.deepEqual(r.specs, []);
+ }
+ const c = claim();
+ c.cross_check!.round = 5;
+ assert.match(crossCheckPrompt(c), /"round":5/);
+});
 
 it("uses claimed model/effort, required wrappers, real Read broker and strict complete verdict", async () => {
  const r = rig({

@@ -128,11 +128,14 @@ export type MessageKind =
    *  human files or dismisses it later from the backlog. All fields are model-authored
    *  from attacker-influenceable repo content: escaped sinks only (web M7). */
   | "finding"
-  /** PRD #41: the user's revision feedback at the approval gate (payload
-   *  `{ feedback: string }`), echoed to the feed so the revision is auditable. */
+  /** Revision feedback at the approval gate: human payload `{ feedback: string }`;
+   *  automatic advice adds `{ automatic: true, cross_check_round: number }` and
+   *  carries no human input receipt. Echoed so the revision is auditable. */
   | "plan_feedback"
-  /** PRD #41: the lead is revising the plan for round N (payload `{ round: number }`);
-   *  the UI derives its "revising" gate state from this. */
+  /** The lead is revising the plan: human payload `{ round: number }`;
+   *  automatic payload `{ automatic: true, cross_check_round: number }` uses the
+   *  checked round independently of the human counter. The UI derives its
+   *  "revising" gate state from this. */
   | "plan_revising"
   /** PRD #88: the lead is asking the human a question and the run is parking.
    *  Payload is a QuestionPayload. Emitted BEFORE the awaiting_input state report,

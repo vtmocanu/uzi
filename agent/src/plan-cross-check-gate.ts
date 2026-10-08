@@ -23,18 +23,29 @@ export interface PlanCrossCheckTiming {
 type CandidateResponse = Extract<PlanCrossCheckResponse, { result: "candidate" }>;
 export type CheckedPlanDecision =
   | { kind: "approve"; response: CandidateResponse }
+  | { kind: "revise"; response: CandidateResponse }
   | { kind: "human"; fields: PlanCrossCheckStateRequest; reservation?: CandidateTransportReservation;
       completePreparation?: (signal: AbortSignal) => Promise<void> };
 
 /** One checker candidate, bounded preparation and submission retries, owner-cancellable polling.
  * Each failed HTTP attempt is awaited through cancellation before any sibling request starts.
  */
-export async function checkPlan(options: {
+interface CheckPlanOptions {
   client: WorkerClient; runId: string; generation: number; candidate: PlanCrossCheckCandidate;
   batcher: MessageBatcher; signal: AbortSignal; timing?: PlanCrossCheckTiming;
-}): Promise<CheckedPlanDecision> {
+  round?: number;
+  allowAutomaticRevision?: boolean;
+}
+
+export function checkPlan(options: CheckPlanOptions & { allowAutomaticRevision?: false }):
+  Promise<Exclude<CheckedPlanDecision, { kind: "revise" }>>;
+export function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision>;
+export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision> {
   const { client, runId, generation, candidate, batcher, signal } = options;
   const timing = options.timing;
+  const round = options.round ?? 1;
+  if (!Number.isSafeInteger(round) || round < 1 || round > 5)
+    throw new Error("plan cross-check: invalid round");
   signal.throwIfAborted();
   if (!Number.isSafeInteger(generation) || generation <= 0)
     throw new Error("plan cross-check: invalid claim generation");
@@ -58,7 +69,7 @@ export async function checkPlan(options: {
     if (response.candidate_generation !== generation)
       return { invalid: response.candidate_generation < generation ? "interrupted" : "checker_failed" };
     const deadline = Date.parse(response.deadline_at);
-    if (response.round !== 1 ||
+    if (response.round !== round ||
         !Number.isSafeInteger(response.candidate_generation) || generation <= 0 ||
         !/^[a-f0-9]{64}$/.test(response.candidate_digest) ||
         response.candidate.base_commit !== candidate.base_commit ||
@@ -66,6 +77,8 @@ export async function checkPlan(options: {
         (identity && (response.candidate_digest !== identity.candidate_digest ||
           response.checker_run_id !== identity.checker_run_id ||
           response.deadline_at !== identity.deadline_at ||
+          response.automatic_revision_limit !== identity.automatic_revision_limit ||
+          response.automatic_rounds_enabled !== identity.automatic_rounds_enabled ||
           JSON.stringify(response.candidate) !== JSON.stringify(identity.candidate))))
       return { invalid: "checker_failed" };
     identity ??= response;
@@ -143,7 +156,7 @@ export async function checkPlan(options: {
       if (!await checkTransport()) return heldHuman();
       reservation.markSubmitted();
       try {
-        response = await request((owned) => client.submitPlanCrossCheck(runId, generation, candidate, owned));
+        response = await request((owned) => client.submitPlanCrossCheck(runId, generation, candidate, owned, round));
       } catch (error) {
         signal.throwIfAborted();
         if (error instanceof RequestError && error.status >= 400 && error.status < 500) {
@@ -152,12 +165,12 @@ export async function checkPlan(options: {
           if (error.status === 413) return await human("candidate_refused", "envelope_too_large");
           if (error.status === 400) return await human("candidate_refused",
             reason === "candidate_too_large" ? "candidate_too_large" : "candidate_invalid");
-          if (error.status === 409 && (reason === "checker_unavailable" || reason === "interrupted"))
+          if (error.status === 409 && (reason === "checker_unavailable" || reason === "interrupted" || reason === "revisions_exhausted"))
             return await human(reason);
           return await human("checker_failed", "submit_failed");
         }
         try {
-          const status = await request((owned) => client.planCrossCheckStatus(runId, generation, 1, owned));
+          const status = await request((owned) => client.planCrossCheckStatus(runId, generation, round, owned));
           if (status.result !== "no_row") response = status;
         } catch (statusError) {
           signal.throwIfAborted();
@@ -185,7 +198,7 @@ export async function checkPlan(options: {
       if (Date.now() >= Date.parse(current.deadline_at)) return await human("timed_out");
       let polled: PlanCrossCheckResponse;
       try {
-        polled = await request((owned) => client.planCrossCheckStatus(runId, generation, 1, owned),
+        polled = await request((owned) => client.planCrossCheckStatus(runId, generation, round, owned),
           Math.max(1, Math.min(timing?.requestMs ?? 3000, Date.parse(current.deadline_at) - Date.now())));
       } catch (error) {
         signal.throwIfAborted();
@@ -208,6 +221,15 @@ export async function checkPlan(options: {
       if (!reservation.release(current))
         return await human("checker_failed", "submit_failed");
       return { kind: "approve", response: current };
+    }
+    if (current.verdict === "revise" && options.allowAutomaticRevision && current.automatic_rounds_enabled) {
+      if (round >= current.automatic_revision_limit + 1) return await human("revisions_exhausted");
+      // A decided REVISE was accepted before the server deadline. A delayed ACK does
+      // not turn that decision back into a pending timeout; fresh submit revalidates eligibility.
+      if (!reservation.release(current))
+        throw new Error("plan cross-check: revision settlement receipts unavailable");
+      signal.throwIfAborted();
+      return { kind: "revise", response: current };
     }
     // Keep the reservation until the applied forced gate fences any delayed submit.
     return await human(current.verdict === "revise" ? "revise" : current.verdict === "block" ? "block" :

@@ -57,7 +57,7 @@ export function crossCheckPrompt(claim: ClaimResponse): string {
   if (typeof text !== "string" || Buffer.byteLength(text) > cap) throw new Error("cross-check issue input exceeds UTF-8 cap");
  }
  const c = claim.cross_check;
- if (!c || c.stage !== "plan" || c.round !== 1 || !/^[a-f0-9]{40}$/.test(c.base_commit)) {
+ if (!c || c.stage !== "plan" || !Number.isInteger(c.round) || c.round < 1 || c.round > 5 || !/^[a-f0-9]{40}$/.test(c.base_commit)) {
   throw new Error("unsupported cross-check candidate");
  }
  if (typeof c.plan_md !== "string" || Buffer.byteLength(c.plan_md) > 256 * 1024

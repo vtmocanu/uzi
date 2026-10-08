@@ -9416,6 +9416,8 @@ export class RunRunner {
     let checkedHuman: CheckedHumanGate | undefined;
     let continueCheckedStorage: (() => Promise<PlanVerdict>) | undefined;
     let crossCheckSelected = false;
+    let crossCheckRound = 1;
+    let crossCheckDiscoveryDone = false;
     // Each strict operation freezes generation/session and the complete request before first send.
     const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
     const reportCheckedState = (body: StateRequest): Promise<StateAck> => {
@@ -9660,8 +9662,9 @@ export class RunRunner {
         let releaseStateBarrier: (() => void) | undefined;
         let failStateBarrier: ((error: unknown) => void) | undefined;
         if (eligible && !crossCheckSelected && !checkedHuman) {
-          crossCheckSelected = true; // One candidate per execution, including refusal/fallback.
-          checkedHuman = { phase: "publishinginitial" };
+          const discoverRound = !crossCheckDiscoveryDone && flight.claimGeneration > 1;
+          crossCheckDiscoveryDone = true;
+          crossCheckSelected = true;
           const barrier = new Promise<void>((resolve, reject) => {
             releaseStateBarrier = () => { flight.checkedStateBarrier = undefined; resolve(); };
             failStateBarrier = (error) => { flight.checkedStateBarrier = undefined; reject(error); };
@@ -9674,28 +9677,67 @@ export class RunRunner {
             // separately drains usage debounce/in-flight HTTP and outbox delivery receipts.
             await Promise.all(flight.stateSenders ?? []);
             steering.lifecycleSignal().throwIfAborted();
-            if (claim.secrets.codex) {
+            if (discoverRound && !claim.secrets.codex) {
+              // One bounded, owner-cancellable discovery per reclaimed execution. Metadata
+              // selects a submit attempt; it never supplies content or an approval grant.
+              const owner = steering.lifecycleSignal();
+              const latest = await this.client.planCrossCheckLatest(runId, flight.claimGeneration,
+                AbortSignal.any([owner, AbortSignal.timeout(this.planCrossCheckTiming?.requestMs ?? 3000)]));
+              owner.throwIfAborted();
+              if (latest.candidate_generation > flight.claimGeneration)
+                throw new Error("plan cross-check: future candidate generation");
+              if (latest.next_round_eligible && latest.next_round !== null) {
+                crossCheckRound = latest.next_round;
+              } else if (latest.result === "latest" &&
+                  latest.candidate_generation === flight.claimGeneration &&
+                  (latest.fallback_reason === "" || latest.fallback_reason === "approve")) {
+                crossCheckRound = latest.round; // Retry exact current attempt; submit revalidates.
+              } else {
+                if (latest.result !== "latest")
+                  throw new Error("plan cross-check: latest metadata cannot select an attempt");
+                const reason = latest.fallback_reason === "" || latest.fallback_reason === "approve"
+                  ? "interrupted" : latest.fallback_reason;
+                checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: reason };
+                crossCheckReason = `plan cross-check: ${reason.replaceAll("_", " ")}`;
+                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
+              }
+            }
+            if (checkedHuman) {
+              // Discovery selected an existing fallback, without adopting a human presentation.
+            } else if (claim.secrets.codex) {
               crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
-              checkedHuman.onApplied = () => releaseStateBarrier?.();
+              checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
               const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
                   plan_cross_check_diff_refusal: captured.refusal };
-                checkedHuman.onApplied = () => releaseStateBarrier?.();
+                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
                 const decision = await checkPlan({ client: this.client, runId, generation: flight.claimGeneration,
                   candidate: { plan_md: planMd, milestones: milestones ?? [],
                     required_capabilities: toolchainDetection?.required_capabilities ?? [],
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-                    planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming });
+                    planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
+                  round: crossCheckRound, allowAutomaticRevision: true });
                 if (decision.kind === "approve") {
                   checkedApproval = decision.response;
-                  checkedHuman = undefined;
+                } else if (decision.kind === "revise") {
+                  // checkPlan has released the decided proof and settled usage. Release and
+                  // await this exact barrier before allowing another executor planning turn.
+                  releaseStateBarrier?.();
+                  await barrier;
+                  steering.lifecycleSignal().throwIfAborted();
+                  crossCheckRound = decision.response.round + 1;
+                  crossCheckSelected = false;
+                  return { kind: "revise", automatic: true, round: decision.response.round,
+                    feedback: decision.response.findings?.summary ?? "Plan cross-check requested changes.",
+                    ...(decision.response.findings ? { items: decision.response.findings.items } : {}) };
                 } else {
+                  checkedHuman = { phase: "publishinginitial" };
                   checkedFields = decision.fields;
                   const reason = checkedFields.plan_cross_check_gate_reason!;
                   crossCheckReason = reason === "revise" ? "plan cross-check: changes requested" :

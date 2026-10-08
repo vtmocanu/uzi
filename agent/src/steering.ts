@@ -54,8 +54,9 @@ import { errMessage, sleep } from "./util.js";
 /** The outcome of the plan-approval gate. On approve, `selection` is the parsed
  *  `approve_plan` body (PRD #37): the executor resolves it against the run's
  *  detected roster (absent → run default; malformed → own, never repo). A `revise`
- *  (PRD #41) carries the user's feedback: the executor runs a fresh plan turn with it
- *  and re-enters the gate (approve/reject/cancel are terminal; revise is not). */
+ *  (PRD #41) carries revision feedback and re-enters the gate. External steering
+ *  constructs only the human variant; automatic provenance is worker-only and has
+ *  no input receipt to settle (approve/reject/cancel are terminal; revise is not). */
 export type PlanVerdict =
   | { kind: "approve"; approval?: "human"; selection: AgentSelectionParse }
   | {
@@ -73,7 +74,9 @@ export type PlanVerdict =
     }
   | { kind: "reject"; reason: string }
   | { kind: "cancel" }
-  | { kind: "revise"; feedback: string; inputId?: number };
+  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number }
+  | { kind: "revise"; automatic: true; feedback: string; round: number;
+      items?: import("./client.js").PlanCrossCheckFindings["items"]; inputId?: never };
 
 /** The resolution of an ask_user park (PRD #88 M1). `cancel` is the same abort the
  *  plan gate sees; it is question-identity-exempt and always wins. */

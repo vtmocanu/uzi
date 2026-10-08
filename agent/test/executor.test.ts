@@ -280,6 +280,39 @@ describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
 });
 
 describe("StubExecutor — PRD #41 plan gate revision loop", () => {
+  it("automatic stub rounds keep human numbering and receipts separate, then refuse checked approval", async () => {
+    const wt = makeWorktree();
+    const settlements: (number | undefined)[] = [];
+    const verdicts: PlanVerdict[] = [
+      { kind: "revise", automatic: true, round: 1, feedback: "auto one", inputId: 88 } as unknown as PlanVerdict,
+      { kind: "revise", automatic: true, round: 2, feedback: "auto two" },
+      { kind: "revise", feedback: "human", inputId: 89 },
+      { kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 } },
+    ];
+    let call = 0;
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      gatePlan: async (_plan, _milestones, _hook, settles) => {
+        settlements.push(settles);
+        return verdicts[call++]!;
+      },
+    });
+    try {
+      await assert.rejects(new StubExecutor(nullLogger(), { planGate: true }).run(ctx), /stub cannot consume checked plan approval/);
+      assert.deepEqual(settlements, [undefined, undefined, undefined, 89]);
+      assert.deepEqual(emitted.filter((m) => m.kind === "plan_revising").map((m) => m.payload), [
+        { automatic: true, cross_check_round: 1 }, { automatic: true, cross_check_round: 2 }, { round: 1 },
+      ]);
+      assert.deepEqual(emitted.filter((m) => m.kind === "plan_feedback").map((m) => m.payload), [
+        { feedback: "auto one", automatic: true, cross_check_round: 1 },
+        { feedback: "auto two", automatic: true, cross_check_round: 2 },
+        { feedback: "human" },
+      ]);
+    } finally {
+      wt.cleanup();
+    }
+  });
   it("refuses checked plan approval because the stub cannot implement canonical prose", async () => {
     const wt = makeWorktree();
     let iterations = 0;
