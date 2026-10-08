@@ -309,6 +309,10 @@ export class FakeApi {
     runId: string;
     body: Record<string, unknown>;
   }> = [];
+  readonly codexReleaseSequences = new Map<string, Array<{ status: number; body?: unknown; drop?: boolean }>>();
+  /** Refresh faults are separate from release faults so an epoch can authorize before losing a refresh reply. */
+  readonly codexRefreshSequences = new Map<string, Array<{ status: number; body?: unknown; drop?: boolean }>>();
+  readonly codexAuthModes = new Map<string, "subscription" | "api_key">();
   readonly codexRequests: Array<{
     runId: string;
     operation: "release" | "refresh";
@@ -994,7 +998,18 @@ export class FakeApi {
         this.codexResponseOverride = undefined;
         return send(res, 200, override);
       }
-      if (operation === "release" && runId === "api-key") {
+      const releaseReply = (operation === "release" ? this.codexReleaseSequences : this.codexRefreshSequences).get(runId)?.shift();
+      if (releaseReply) {
+        if (releaseReply.drop) {
+          res.writeHead(releaseReply.status, { "Content-Type": "application/json", "Content-Length": "1000" });
+          res.flushHeaders();
+          res.write("{");
+          setImmediate(() => res.destroy());
+          return;
+        }
+        return send(res, releaseReply.status, releaseReply.body ?? {});
+      }
+      if (operation === "release" && (runId === "api-key" || this.codexAuthModes.get(runId) === "api_key")) {
         return send(res, 200, { auth_mode: "api_key", access_token: "api-key-access" });
       }
       const observed = json.observed_generation;

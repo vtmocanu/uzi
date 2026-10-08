@@ -342,6 +342,8 @@ export interface RunContext {
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
   signal?: AbortSignal;
+  /** Stable terminal cancellation, independent of rearmed pause lifecycles. */
+  terminalLifecycleSignal?: AbortSignal;
   /**
    * M4 plan gate. Called by the executor after the lead submits a plan: the
    * runner posts /state awaiting_approval with the plan and returns the user's

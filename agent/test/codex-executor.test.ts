@@ -47,7 +47,7 @@ import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
-import { makeClaim, testGitCacheOptions, recordingLogger } from "./helpers.js";
+import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand } from "../src/runner-uid.js";
@@ -71,7 +71,7 @@ import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
-import { PauseNowSignal } from "../src/steering.js";
+import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
@@ -936,6 +936,548 @@ describe("Codex usage-limit wall and vault precedence #2360", () => {
     assert.equal(refreshes, 1);
     assert.equal(rig.transport.turnStartCount, 1);
     assert.equal(rig.client.releaseCalls.length, 1);
+  });
+});
+
+describe("#2493 initial credential release", () => {
+  for (const mode of ["subscription", "api_key"] as const) {
+    const binding = () => bindingOf(mode === "subscription" ? SUBSCRIPTION : API_KEY);
+    for (const fault of ["transport", "http_timeout", 503, 408, 429, 500, 502, 599] as const) {
+      it(`${mode} retries ${fault} and registers token before login`, async () => {
+        const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", t => {
+          t.push(signalDone()).push(turnCompleted());
+        })]);
+        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+        const release = rig.client.releaseCodex.bind(rig.client);
+        let calls = 0;
+        rig.client.releaseCodex = async (...args) => {
+          if (++calls === 1) throw typeof fault === "number"
+            ? new RequestError("POST", "/private-canary", fault, "private-canary")
+            : new CodexRequestFailure(fault);
+          return release(...args);
+        };
+        const log = recordingLog();
+        await makeExecutor(rig, binding(), log.log).run(makeCtx().ctx);
+        assert.equal(calls, 2, "retry classifier permits temporary release faults");
+        assert.equal(rig.providerLaunches(), 1);
+        assert.ok(log.added.includes(FRESH_TOKEN), "released token registered");
+        assert.doesNotMatch(log.lines.join("\n"), /private-canary/);
+      });
+    }
+    for (const fault of [400, 401, 403, 404, 409, "response", "local", "unknown"] as const) {
+      it(`${mode} refuses ${fault} without retry`, async () => {
+        const rig = makeMultiEpochRig([]);
+        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+        const error = typeof fault === "number" ? new RequestError("POST", "/private-canary", fault, "")
+          : fault === "unknown" ? new Error("private-canary") : new CodexRequestFailure(fault);
+        let calls = 0;
+        rig.client.releaseCodex = async () => { calls++; throw error; };
+        await assert.rejects(makeExecutor(rig, binding()).run(makeCtx().ctx), err => err === error);
+        assert.equal(calls, 1, "definite refusal must stop at one attempt");
+        assert.equal(rig.providerLaunches(), 0);
+      });
+    }
+  }
+
+  it("default six attempts use exact five waits with no early or final call", async t => {
+    const rig = makeMultiEpochRig([]);
+    let calls = 0;
+    rig.client.releaseCodex = async () => {
+      if (++calls === 1) t.mock.timers.enable({ apis: ["setTimeout"] });
+      throw new CodexRequestFailure("transport");
+    };
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx).catch(e => e);
+    try {
+      await waitFor(() => calls === 1, "first release");
+      await tick();
+      for (const [index, delay] of [2000, 4000, 8000, 8000, 8000].entries()) {
+        t.mock.timers.tick(delay - 1);
+        await tick();
+        assert.equal(calls, index + 1, "no release before scheduled delay");
+        t.mock.timers.tick(1);
+        await tick(); await tick();
+        assert.equal(calls, index + 2, "one release per scheduled wait");
+      }
+      const error = await run;
+      assert.equal(error.name, "CodexInitialCredentialUnavailableError");
+      assert.equal(error.deferral, "credential_release_unavailable");
+      assert.equal(error.cause, undefined);
+      assert.equal(rig.providerLaunches(), 0);
+      t.mock.timers.tick(100000);
+      await tick();
+      assert.equal(calls, 6, "exhaustion leaves no timer that releases again");
+    } finally { t.mock.timers.reset(); await run; }
+  });
+
+  for (const stage of ["entry", "backoff", "inflight", "final"] as const) {
+    it(`abort ${stage} preserves parent_abort and leaves no release timer`, async t => {
+      const rig = makeMultiEpochRig([]);
+      const controller = new AbortController();
+      let calls = 0;
+      rig.deps = { ...rig.deps, initialCredentialAttempts: stage === "final" ? 1 : 6 };
+      if (stage === "entry") controller.abort(new Error("private-canary"));
+      rig.client.releaseCodex = async () => {
+        calls++;
+        if (stage === "inflight" || stage === "final") controller.abort(new Error("private-canary"));
+        if (stage === "backoff") t.mock.timers.enable({ apis: ["setTimeout"] });
+        throw new CodexRequestFailure("transport");
+      };
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ signal: controller.signal }).ctx).catch(e => e);
+      try {
+        if (stage === "backoff") {
+          await waitFor(() => calls === 1, "backoff entered"); await tick();
+          controller.abort(new Error("private-canary"));
+        }
+        const error = await run;
+        assert.ok(error instanceof CodexRequestFailure);
+        assert.equal(error.kind, "parent_abort", "terminal cancellation wins at every release stage");
+        assert.equal(calls, stage === "entry" ? 0 : 1);
+        assert.equal(rig.providerLaunches(), 0);
+        if (stage === "backoff") { t.mock.timers.tick(100000); await tick(); assert.equal(calls, 1); }
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+      } finally { t.mock.timers.reset(); await run; }
+    });
+  }
+
+  it("quarantine closing between attempts prevents a second request", async () => {
+    const rig = makeMultiEpochRig([]);
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    let calls = 0;
+    rig.client.releaseCodex = async () => {
+      calls++;
+      latchResidueQuarantine({ cause: "release retry fixture", site: "provider_turn", runId: "run-1" }, noopLog);
+      throw new CodexRequestFailure("transport");
+    };
+    try {
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), err => err instanceof ResidueQuarantinedError);
+      assert.equal(calls, 1);
+      assert.equal(rig.providerLaunches(), 0);
+    } finally { resetResidueQuarantineForTests(); }
+  });
+
+  it("declined production steering pause then cancel interrupts epoch release backoff", async () => {
+    const inputs: Array<{ id: number; kind: "pause" | "pause_cancel" | "cancel"; body: string | null }> =
+      [{ id: 1, kind: "pause", body: "now" }];
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: inputs.splice(0) }) } as never),
+      "run-1", 1, noopLog, cancel);
+    const terminal = ch.terminalLifecycleSignal();
+    ch.start();
+    const rig = makeMultiEpochRig([]);
+    rig.deps = { ...rig.deps, initialCredentialAttempts: 2 };
+    let calls = 0;
+    rig.client.releaseCodex = async () => { calls++; throw new CodexRequestFailure("transport"); };
+    try {
+      await waitFor(() => cancel.signal.aborted, "owner pause");
+      inputs.push({ id: 2, kind: "pause_cancel", body: null });
+      await waitFor(() => ch.getPauseMode() === null, "declined pause cleared");
+      ch.rearmLifecycle();
+      assert.equal(terminal.aborted, false);
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        signal: cancel.signal, terminalLifecycleSignal: terminal,
+      }).ctx).catch(e => e);
+      await waitFor(() => calls === 1, "release backoff");
+      inputs.push({ id: 3, kind: "cancel", body: null });
+      const error = await withTimeout(run, 3000, "production steering cancel");
+      assert.ok(error instanceof CodexRequestFailure);
+      assert.equal(error.kind, "parent_abort", "terminal steering signal survives spent pause signal");
+      assert.equal(calls, 1);
+      assert.equal(terminal.aborted, true);
+    } finally { await ch.stop(); }
+  });
+
+  it("each recreated epoch obtains a fresh release with its own retry budget", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    const release = rig.client.releaseCodex.bind(rig.client);
+    let calls = 0;
+    rig.client.releaseCodex = async (...args) => {
+      if (++calls % 2 === 1) throw new CodexRequestFailure("transport");
+      return release(...args);
+    };
+    await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ checkpoint: async () => undefined }).ctx);
+    assert.equal(calls, 4, "both epochs freshly authorize after their own temporary failure");
+    assert.equal(rig.providerLaunches(), 2);
+  });
+
+  it("real HTTP interrupted409 stops executor at one release without vault deferral", async () => {
+    const api = new FakeApi("lost-body-worker");
+    const url = await api.listen();
+    const rig = makeMultiEpochRig([]);
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    api.codexReleaseSequences.set("run-1", [{ status: 409, drop: true }]);
+    const client = new WorkerClient(url, "lost-body-worker", "test", noopLog);
+    try {
+      await assert.rejects(makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), error => {
+        assert.ok(error instanceof RequestError, "received409 HTTP remains definite");
+        assert.equal(error.status, 409);
+        assert.equal(error.body, "");
+        return true;
+      });
+      assert.equal(api.codexRequests.length, 1, "lost409 release is never retried");
+      assert.equal(rig.providerLaunches(), 0);
+    } finally { await api.close(); }
+  });
+
+  for (const mode of ["subscription", "api_key"] as const) {
+    for (const outage of ["confirm", "refused-park", "lost-persisted-park", "successor-ownership", "stale-park"] as const) {
+      it(`real HTTP ${mode} ${outage} handles release-unavailable recovery`, async () => {
+        const api = new FakeApi("recovery-release-worker");
+        const url = await api.listen();
+        const fx = makeFixture();
+        const rig = makeMultiEpochRig([]);
+        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+        const diagnostics = recordingLog();
+        const client = new WorkerClient(url, "recovery-release-worker", "test", diagnostics.log,
+          { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+        const secrets = mode === "subscription" ? SUBSCRIPTION : API_KEY;
+        const claim = makeClaim({
+          claim_generation: 1,
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+          plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+          secrets: { forge_pat: "fixture-forge-pat-000000", codex: secrets as never },
+        });
+        api.recoveryWaitRequiresRunning = true;
+        api.codexAuthModes.set(claim.run_id, mode);
+        api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
+        api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({
+          status: 503, body: { error: "private-canary" },
+        })));
+        const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(secrets), diagnostics.log);
+        const homeDir = path.join(fx.dataDir, "release-home");
+        let source = "";
+        const session = path.join(homeDir, "codex-session-store", "release-session.txt");
+        const run = executor.run.bind(executor);
+        let deferredStatesAt = 0;
+        let successorObserved = false;
+        executor.run = async ctx => {
+          source = ctx.worktreePath;
+          commitInTree(source, "RELEASE.txt", "identifiable committed release work\n");
+          await fs.mkdir(path.dirname(session), { recursive: true });
+          await fs.writeFile(session, "identifiable committed release session");
+          // Model the already-approved gate row before the newly-created epoch's release.
+          await client.reportState(claim.run_id, { status: "awaiting_approval" });
+          assert.equal(api.states.at(-1)?.body.status, "awaiting_approval");
+          deferredStatesAt = api.states.length;
+          if (outage === "successor-ownership") api.afterPersistState(claim.run_id, b => {
+            if (b.status !== "running") return false;
+            successorObserved = true;
+            api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation! + 1);
+            return true;
+          }, Promise.resolve());
+          if (outage === "stale-park") api.failStateWhen(claim.run_id, b => {
+            if (b.status !== "recovery_wait") return false;
+            successorObserved = true;
+            api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation! + 1);
+            return true;
+          }, { httpStatus: 409, runStatus: "running", disposition: "stale_claim" });
+          if (outage === "confirm") api.failStateWhen(claim.run_id, b => b.status === "running", { httpStatus: 503 });
+          if (outage === "refused-park") api.failStateWhen(claim.run_id, b => b.status === "recovery_wait", { httpStatus: 503 });
+          return run(ctx);
+        };
+        const runner = new RunRunner(client, new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions()),
+          () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
+            pollMs: 5, recoveryRetryMs: 5,
+            quiesceRun: async () => ({
+              process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+              docker: { state: "not_wired", removed: [], detail: "not wired" },
+            }),
+          });
+        let custodyCalls = 0;
+        const custody = runner as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+        for (const name of ["reapThenSettleRecoveryGeneration", "settleRecoveryGeneration"]) {
+          const original = custody[name]!.bind(runner);
+          custody[name] = async (...args) => { custodyCalls++; return original(...args); };
+        }
+        let persistedBeforeDrop = false;
+        if (outage === "lost-persisted-park") api.afterPersistState(claim.run_id, b => {
+          if (b.status !== "recovery_wait") return false;
+          assert.equal(api.states.at(-1)?.body.status, "recovery_wait", "park persisted before ACK drop");
+          assert.equal(custodyCalls, 0, "custody retained while persisted park ACK is unknown");
+          assert.equal(readFileSync(path.join(source, "RELEASE.txt"), "utf8"), "identifiable committed release work\n");
+          assert.equal(readFileSync(session, "utf8"), "identifiable committed release session");
+          persistedBeforeDrop = true;
+          return true;
+        }, "drop");
+        try {
+          await runner.execute(claim);
+          const reports = api.states.slice(deferredStatesAt);
+          assert.equal(reports[0]?.body.status, "running", "post-approval outage confirms running before park");
+          if (outage === "successor-ownership" || outage === "stale-park") {
+            assert.equal(successorObserved, true, "generation changed after running confirmation");
+            assert.equal((await client.getRunOwnership(claim.run_id)).claim_generation, 2);
+            assert.equal(api.states.at(-1)?.body.status, "running");
+            assert.equal(reports.filter(s => s.body.status === "recovery_wait").length, 0, "successor receives no stale park");
+            assert.ok(!api.states.some(s => s.body.status === "failed"), "superseded flight never fails successor");
+            assert.equal(custodyCalls, 0);
+            assert.equal(api.codexRequests.length, 6);
+            assert.equal(rig.providerLaunches(), 0);
+            return;
+          }
+          assert.equal(api.states.at(-1)?.body.status, "recovery_wait");
+          assert.equal(custodyCalls, 0, "release unavailable park never uses credentialed custody settlement");
+          assert.ok(!api.states.some(s => s.body.status === "failed"));
+          assert.equal(api.codexRequests.filter(r => r.operation === "release").length, 6);
+          assert.equal(rig.providerLaunches(), 0);
+          const parks = reports.filter(s => s.body.status === "recovery_wait");
+          assert.ok(parks.length >= (outage === "lost-persisted-park" ? 2 : 1), "lost persisted ACK is idempotently reconciled");
+          assert.ok(parks.every(s => !("recovery_cause" in s.body)), "release unavailable stays untyped");
+          if (outage === "lost-persisted-park") assert.equal(persistedBeforeDrop, true);
+          assert.equal(readFileSync(session, "utf8"), "identifiable committed release session");
+          assert.doesNotMatch(JSON.stringify({ lines: diagnostics.lines, messages: api.messages(claim.run_id) }), /private-canary|vault is locked/);
+        } finally { await api.close(); fx.cleanup(); }
+      });
+    }
+  }
+
+  for (const stop of ["shutdown", "cancel"] as const) {
+  it(`declined runner pause then ${stop} aborts real HTTP release backoff`, async () => {
+    const api = new FakeApi("shutdown-release-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const rig = makeMultiEpochRig([]);
+    const client = new WorkerClient(url, "shutdown-release-worker", "test", noopLog,
+      { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    client.protocolFeatures = ["run_checkpoint_durability"];
+    client.publishCheckpoint = async (_id, _tip, pack) => {
+      for await (const _chunk of pack) { /* Drain the runner's actual pack. */ }
+      return { ok: false, httpStatus: 503 };
+    };
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503 })));
+    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+    const homeDir = path.join(fx.dataDir, "shutdown-home");
+    const original = executor.run.bind(executor);
+    let releaseError: unknown;
+    let terminal: AbortSignal | undefined;
+    executor.run = async ctx => {
+      api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+      await waitFor(() => ctx.signal!.aborted, "runner owner pause");
+      assert.ok(ctx.signal!.reason instanceof PauseNowSignal);
+      terminal = ctx.terminalLifecycleSignal;
+      assert.equal(terminal?.aborted, false);
+      assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false, "actual runner declines undurable pause");
+      api.appendInputs(claim.run_id, [{ id: 2, kind: "pause_cancel" }]);
+      await waitFor(() => ctx.pauseModeRequested!() === null, "runner clears declined pause");
+      try { return await original(ctx); } catch (e) { releaseError = e; throw e; }
+    };
+    const runner = new RunRunner(client, new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions()),
+      () => ({ executor, homeDir }), noopLog, 20, undefined, {
+        pollMs: 5, recoveryRetryMs: 5,
+        quiesceRun: async () => ({
+          process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      });
+    const execution = runner.execute(claim);
+    try {
+      await waitFor(() => api.codexRequests.length === 1, "real HTTP release entered", 10000);
+      await tick(); await tick();
+      assert.equal(terminal?.aborted, false, "release backoff is still live before terminal stop");
+      if (stop === "shutdown") runner.shutdown();
+      else api.appendInputs(claim.run_id, [{ id: 3, kind: "cancel" }]);
+      await withTimeout(execution, 10000, `runner ${stop}`);
+      assert.ok(releaseError instanceof CodexRequestFailure, "shutdown cancels initial release");
+      assert.equal(releaseError.kind, "parent_abort", "runner terminal wiring bypasses spent pause signal");
+      assert.equal(terminal?.aborted, true);
+      assert.equal(api.codexRequests.length, 1);
+      assert.equal(rig.providerLaunches(), 0);
+      if (stop === "shutdown") assert.ok(!api.states.some(s => s.body.status === "failed"));
+      else assert.ok(api.inputReceiptCalls.some(r => r.kind === "ack" && r.ids.includes(3)),
+        "production steering received the owner cancel");
+    } finally {
+      runner.shutdown();
+      try { await withTimeout(execution, 10000, "bounded runner cleanup"); }
+      finally { await api.close(); fx.cleanup(); }
+    }
+  });
+  }
+
+  it("real runner reclaims release-unavailable park, adopts stored rollout and completes the same thread", async () => {
+    const api = new FakeApi("resume-release-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const diagnostics = recordingLog();
+    const client = new WorkerClient(url, "resume-release-worker", "test", diagnostics.log,
+      { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    const homeDir = path.join(fx.dataDir, "resume-home");
+    await fs.mkdir(homeDir, { recursive: true });
+    const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const rolloutName = `rollout-${thread}.jsonl`;
+    let rollout = "";
+    const first = makeMultiEpochRig([epochResponder(thread, "tn-first", (t, th, tn) => {
+      t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+    })]);
+    const second = makeMultiEpochRig([resumedEpochResponder(thread, "tn-resume", (t, th, tn) => {
+      t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+    })]);
+    const claim = makeClaim({
+      claim_generation: 1,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    // The app-server fixture writes a valid rollout for the thread it actually reports.
+    // Real CodexSessionStore persist/adopt carries it between the two executor claims.
+    for (const [index, rig] of [first, second].entries()) {
+      const launch = rig.deps.launchProviderRoot!;
+      const effect = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, sessionStore: {
+          ...CodexSessionStore,
+          adopt: async (store, destination, opts) => {
+            // The injected launcher owns its filesystem; provision its fresh destination
+            // before exercising the real session-store adoption seam.
+            await fs.mkdir(destination, { recursive: true });
+            return CodexSessionStore.adopt(store, destination, opts);
+          },
+        }, deferRegistryTeardown: true,
+        initialCredentialBaseDelayMs: 1,
+        launchProviderRoot: async (spec, mode) => {
+          const sessions = path.join(spec.ownedDataRoot, "codex", "sessions");
+          await fs.mkdir(sessions, { recursive: true });
+          if (index === 0) {
+            rollout = JSON.stringify({ type: "session_meta", payload: { id: thread, cwd: spec.cwd } }) + "\n"
+              + JSON.stringify({ type: "response_item", payload: { type: "message", role: "user",
+                content: [{ type: "input_text", text: "identifiable prior conversation" }] } }) + "\n";
+            await fs.writeFile(path.join(sessions, rolloutName), rollout);
+          } else {
+            assert.equal(await fs.readFile(path.join(sessions, rolloutName), "utf8"), rollout,
+              "fresh provider epoch receives the exact prior rollout, not dummy session bytes");
+          }
+          return launch(spec, mode);
+        },
+        launchEffectRoot: async (spec, deadline) => {
+          const handle = await effect(spec, deadline);
+          const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+            ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+          if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+          // Only runner-owned durability sinks execute here.
+          const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+          const timer = setTimeout(() => child.kill(), deadline);
+          const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+          });
+          return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+            waitChild: async () => exited, dispose: async ms => { await exited; return handle.dispose(ms); } };
+        },
+      };
+    }
+    const priorHome = path.join(fx.dataDir, "prior-session-home");
+    await fs.mkdir(path.join(priorHome, "sessions"), { recursive: true });
+    await fs.writeFile(path.join(priorHome, "sessions", rolloutName),
+      JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
+    await CodexSessionStore.persist(priorHome, path.join(homeDir, "codex-session-store"));
+    const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    const quiesceRun = async () => ({
+      process: { state: "quiescent" as const, processes: [], killed: [], detail: "fixture roots reaped" },
+      docker: { state: "not_wired" as const, removed: [], detail: "not wired" },
+    });
+    const executorFor = (rig: MultiRig) => new CodexExecutor(diagnostics.log, homeDir,
+      { binding: bindingOf(SUBSCRIPTION), client, provider },
+      { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!) });
+    const firstExecutor = executorFor(first);
+    const firstRun = firstExecutor.run.bind(firstExecutor);
+    firstExecutor.run = async ctx => {
+      commitInTree(ctx.worktreePath, "RESUME.txt", "identifiable committed release recovery\n");
+      const checkpoint = ctx.checkpoint!;
+      ctx.checkpoint = async opts => {
+        await checkpoint(opts);
+        api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503 })));
+      };
+      return firstRun(ctx);
+    };
+    try {
+      await new RunRunner(client, git, () => ({ executor: firstExecutor, homeDir }), diagnostics.log, 20,
+        undefined, { pollMs: 5, recoveryRetryMs: 5, quiesceRun }).execute({ ...claim, session_id: thread });
+      assert.equal(api.states.at(-1)?.body.status, "recovery_wait", diagnostics.lines.join("\n"));
+      assert.equal(api.states.at(-1)?.body.session_id, thread);
+      assert.equal(await CodexSessionStore.inspectSession(path.join(homeDir, "codex-session-store"), thread), "present");
+      const releasesBefore = api.codexRequests.filter(r => r.operation === "release").length;
+      const resumedExecutor = executorFor(second);
+      const resumeRun = resumedExecutor.run.bind(resumedExecutor);
+      resumedExecutor.run = async ctx => {
+        assert.equal(ctx.sessionId, thread, "runner resolves the parked session on reclaim");
+        assert.equal(await fs.readFile(path.join(ctx.worktreePath, "RESUME.txt"), "utf8"),
+          "identifiable committed release recovery\n");
+        const tree = spawnSync("/usr/bin/git", ["-C", ctx.worktreePath, "show", "HEAD:RESUME.txt"], { encoding: "utf8" });
+        assert.equal(tree.status, 0, tree.stderr);
+        assert.equal(tree.stdout, "identifiable committed release recovery\n");
+        return resumeRun(ctx);
+      };
+      api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation! + 1);
+      await new RunRunner(client, git, () => ({ executor: resumedExecutor, homeDir }), diagnostics.log, 20,
+        undefined, { pollMs: 5, recoveryRetryMs: 5, quiesceRun, gitlab: fakeGitlab().gitlab })
+        .execute({ ...claim, claim_generation: claim.claim_generation! + 1, session_id: thread, last_seq: 1000 });
+      assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
+      assert.ok(api.codexRequests.filter(r => r.operation === "release").length > releasesBefore, "reclaim freshly authorizes");
+      const requests = second.epochs[0]!.transport.requests;
+      assert.equal(rec(requests.find(r => r.method === "thread/resume")!.params).threadId, thread);
+      assert.equal(requests.some(r => r.method === "thread/start"), false);
+      assert.equal(second.epochs[0]!.transport.turnStartCount, 1);
+      assert.ok(!api.states.some(s => s.body.status === "failed"));
+    } finally { await api.close(); fx.cleanup(); }
+  });
+
+  it("executor retries transport then succeeds", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push(signalDone()).push(turnCompleted("completed", th, tn));
+    })]);
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    const release = rig.client.releaseCodex.bind(rig.client);
+    let calls = 0;
+    rig.client.releaseCodex = async (...args) => {
+      if (++calls === 1) throw new CodexRequestFailure("transport");
+      return release(...args);
+    };
+    let error: unknown;
+    await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx).catch(e => { error = e; });
+    assert.equal(error, undefined, "transient release must retry then succeed");
+    assert.equal(calls, 2);
+    assert.equal(rig.providerLaunches(), 1);
+  });
+
+  it("real executor client HTTP exhaustion reaches runner recovery_wait", async () => {
+    const api = new FakeApi("release-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const rig = makeMultiEpochRig([]);
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    api.recoveryWaitRequiresRunning = true;
+    const client = new WorkerClient(url, "release-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503, body: { error: "private-canary" } })));
+    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+    const homeDir = path.join(fx.dataDir, "release-home");
+    try {
+      await new RunRunner(client, new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions()),
+        () => ({ executor, homeDir }), noopLog, 20, undefined, {
+          pollMs: 5, recoveryRetryMs: 5,
+          quiesceRun: async () => ({
+            process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+            docker: { state: "not_wired", removed: [], detail: "not wired" },
+          }),
+        }).execute(claim);
+      assert.equal(api.states.at(-1)?.body.status, "recovery_wait", "HTTP release exhaustion must park, never agent_failure");
+      assert.ok(!api.states.some(s => s.body.status === "failed"));
+      assert.equal(api.codexRequests.length, 6);
+      assert.equal(rig.providerLaunches(), 0);
+    } finally { await api.close(); fx.cleanup(); }
   });
 });
 

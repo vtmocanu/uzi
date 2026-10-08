@@ -2726,6 +2726,7 @@ export class WorkerClient {
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/release`,
       req,
       signal,
+      "release",
     );
     return validateCodexReleaseResponse(raw, expected);
   }
@@ -2790,7 +2791,7 @@ export class WorkerClient {
     return text ? JSON.parse(text) : undefined;
   }
 
-  private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+  private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal, errorPolicy?: "release"): Promise<unknown> {
     let serialized: string | undefined;
     try { serialized = JSON.stringify(body); } catch { throw new CodexRequestFailure("local"); }
     const timeout = AbortSignal.timeout(this.codexHTTPTimeoutMs);
@@ -2814,8 +2815,8 @@ export class WorkerClient {
       try {
         text = (await readBoundedText(res, ERROR_BODY_MAX_BYTES)).trim();
       } catch {
-        // A received authorization refusal is definite even if its body is lost.
-        if ([400, 401, 403, 404].includes(res.status)) throw new RequestError("POST", path, res.status, "");
+        // Release refusals remain definite when their body is lost; refresh keeps its ambiguity contract.
+        if ((errorPolicy === "release" && !isTransientStatus(res.status)) || [400, 401, 403, 404].includes(res.status)) throw new RequestError("POST", path, res.status, "");
         throw failure();
       }
       throw new RequestError("POST", path, res.status, text);

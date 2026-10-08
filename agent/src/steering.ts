@@ -1346,13 +1346,19 @@ export class SteeringChannel {
   /** The tick's abort generation. Unlike the executor's shared cancel signal, a declined park
    *  can replace this controller so a later tick may run. */
   private lifecycle = new AbortController();
+  private readonly terminalLifecycle = new AbortController();
   private lifecycleEnded = false;
 
   lifecycleSignal(): AbortSignal {
     return this.lifecycle.signal;
   }
 
+  terminalLifecycleSignal(): AbortSignal {
+    return this.terminalLifecycle.signal;
+  }
+
   abortLifecycle(reason?: unknown, terminal = true): void {
+    if (terminal && !(reason instanceof PauseNowSignal)) this.terminalLifecycle.abort(reason);
     if (terminal) this.lifecycleEnded = true;
     if (!this.lifecycle.signal.aborted) this.lifecycle.abort(reason);
   }

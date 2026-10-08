@@ -264,7 +264,7 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  reports just a count of the in-scope processes that outlived the reap. Any capture outcome that
  *  is NOT a blocked proof resets the count. The wall time before that failure is typically about
  *  30 s at the defaults (5 reap deadlines of 5 s plus 4 recoveryRetryMs backoffs), with no terminal cap for
- *  vault_locked or refresh_unknown credential deferrals: those retain custody and retry with
+ *  credential deferrals: those retain custody and retry with
  *  capped exponential waits until a valid proof or an ownership/cancel/shutdown exit. For other
  *  causes this is not a strict ceiling: it runs faster when
  *  a proof returns early (a `survivors` proof with nothing left to kill returns at once, so the
@@ -423,12 +423,16 @@ class BoundaryStepTracker {
  *  boundary-reconcile block (`CodexBoundaryError`, finalize/checkpoint sinks) or as a failed epoch
  *  credential release or a mid-turn app-server refresh (`CodexCredentialDeferredError`, epoch
  *  recreation / issue #1789). An ambiguous subscription refresh carries refresh_unknown through
- *  the boundary error. Like
+ *  the boundary error. Epoch-start retry exhaustion carries credential_release_unavailable
+ *  through CodexInitialCredentialUnavailableError. Like
  *  {@link isCodexBoundaryError} it reads only the error's `name` and its `deferral` field (never
  *  `instanceof`, never the message text), so the runner never imports agent/src/codex/**. Returns
- *  "vault_locked" or "refresh_unknown" only for those two names carrying an exact deferral. */
-function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | undefined {
+ *  the fixed deferral only for its matching error name and field. */
+function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | "credential_release_unavailable" | undefined {
   if (!(err instanceof Error)) return undefined;
+  if (err.name === "CodexInitialCredentialUnavailableError") {
+    return (err as { deferral?: unknown }).deferral === "credential_release_unavailable" ? "credential_release_unavailable" : undefined;
+  }
   if (err.name !== "CodexBoundaryError" && err.name !== "CodexCredentialDeferredError") return undefined;
   const deferral = (err as { deferral?: unknown }).deferral;
   return deferral === "vault_locked" || deferral === "refresh_unknown" ? deferral : undefined;
@@ -507,7 +511,7 @@ interface ExecutionRejection {
 
 type RecoveryParkCause =
   | { kind: "transient" }
-  | { kind: "vault_locked" | "refresh_unknown" }
+  | { kind: "vault_locked" | "refresh_unknown" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean };
 
 /** What {@link RunRunner.captureRecoveryRestorePoint} reports. `residueBlocked` (issue #1783 M3)
@@ -545,6 +549,16 @@ const VAULT_PARK_FEED = {
     "The run owner's vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
   held:
     "The run owner's vault is locked and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
+} as const;
+
+/** An unavailable initial release carries no inferred vault cause. */
+const RELEASE_UNAVAILABLE_PARK_FEED = {
+  ...CREDENTIAL_PARK_FEED,
+  published: "Paused: credential release is temporarily unavailable. The recovery checkpoint is published; this run can resume at its next retry.",
+  local: "Paused: credential release is temporarily unavailable. The recovery checkpoint is saved only on this worker; this run can resume at its next retry.",
+  confirmUnknown: "Could not confirm this run is still running; keeping its local work and session and retrying before pausing.",
+  reportFailed: "Could not record the recovery pause yet; keeping the local work and session and retrying.",
+  held: "This run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
 
 /** An ambiguous refresh has no inferred vault cause; notices remain neutral and deduplicated. */
@@ -3399,8 +3413,8 @@ export class RunRunner {
         );
         await batcher.close().catch(() => undefined);
       } else if (codexDeferralOf(err) !== undefined) {
-        // Codex credentials were deferred by a confirmed vault lock or an unknown boundary
-        // refresh outcome. Vault locks also arise during epoch release and mid-turn refresh.
+        // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
+        // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
         // That
         // is recoverable, never a failed run: park it for recovery, credential-free. Placed AFTER the
         // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
@@ -3446,7 +3460,7 @@ export class RunRunner {
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
       // a committed publish still propagates to the failed-run report below, unless it carries a
-      // credential deferral (vault_locked or refresh_unknown), which the catch chain parks instead. Once phasePublish
+      // credential deferral, which the catch chain parks instead. Once phasePublish
       // registers the committed terminal callback, however, the pushed branch/open MR is the
       // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
@@ -9291,7 +9305,7 @@ export class RunRunner {
         // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
         // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
         // fails the run — the intended fail-closed behavior for a credentialed durability boundary —
-        // EXCEPT a credential deferral (vault_locked or refresh_unknown): that error still propagates, but executeClaim's
+        // EXCEPT a credential deferral: that error still propagates, but executeClaim's
         // catch chain parks the run for recovery credential-free instead of failing it.
         // issue #1783 (auditor M2): the flight rides along, so the milestone proves the clone
         // quiescent first. On survivors/unverified THIS checkpoint's publish (and its overlay PAT
@@ -9547,6 +9561,7 @@ export class RunRunner {
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
+      terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       // PRD #1190 rework (N2/N1): expose the steering channel's sticky pause/cancel state to the
       // implement loop, because the single shared abort controller (cancel/ctx.signal) fires
       // 'abort' exactly once and cannot deliver a second steering signal. cancelRequested lets the
@@ -13117,7 +13132,8 @@ export class RunRunner {
    * recovery_wait status, including an idempotent 409 after a lost success ACK.
    *
    * Issue #1766: `cause` selects the park. `transient` (the default) is the path above, unchanged.
-   * `vault_locked` and `refresh_unknown` credential deferrals differ in these ways:
+   * Credential deferrals (vault lock, unknown refresh or unavailable initial release) differ
+   * from ordinary transient recovery in these ways:
    *   - it first confirms the run is `running` at this claim's generation
    *     ({@link confirmRunningForCredentialPark}); a stale claim or another generation stops silently, a
    *     server wall park retains everything, and a 404 keeps the clone and session unless a
@@ -13143,7 +13159,7 @@ export class RunRunner {
    *     settle is observed empty;
    *   - the capture publishes with no overlay and no boundary (credentialFree);
    *   - only a confirmed vault lock is typed `recovery_cause: "vault_locked"` when the api advertises
-   *     `recovery_cause_vault_locked`; refresh_unknown is always untyped and uses neutral notices;
+   *     `recovery_cause_vault_locked`; the other credential deferrals are untyped with neutral notices;
    *   - it never runs the credentialed reap-then-settle (which would retry the deferred credential
    *     operation and could release custody), so the custody hold is kept;
    *   - a cancel captures, then reports `run cancelled` without the credentialed pre-report reap;
@@ -13162,11 +13178,11 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
     opts: { terminalDisk?: boolean } = {},
   ): Promise<boolean> {
-    // Both credential deferrals use the same credential-free proof/custody posture.
+    // Credential deferrals share the credential-free proof/custody posture.
     // Unknown outcomes never imply a locked vault or send an API recovery cause.
-    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown";
+    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown" || cause.kind === "credential_release_unavailable";
     if (credentialDeferred) flight.keepGuardedInventoryOpen = true;
-    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : cause.kind === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
     // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
     // stop's counted one). The transient park's steps, with the typed cause on the park report and
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
@@ -13485,7 +13501,7 @@ export class RunRunner {
               cause = { kind: deferral };
               credentialDeferred = true;
               flight.keepGuardedInventoryOpen = true;
-              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : deferral === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
               settled = false;
             }
