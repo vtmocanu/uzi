@@ -113,7 +113,7 @@ servers. It runs with an isolated environment holding only your Anthropic token
 Direct reads are limited to its own checkout, plus its own SDK spill files for
 oversized tool output. Glob and Grep patterns that are absolute, home-relative
 or have a `..` path segment in any brace expansion are denied, as are patterns
-with unbalanced braces or too many expansions. That
+with a backslash, unbalanced braces, or too many braces or expansions. That
 pattern check is defense in depth; the runner user's operating-system
 permissions are the boundary. See
 [worker setup](./worker-setup.md#run-artifacts-and-the-sandbox) for the

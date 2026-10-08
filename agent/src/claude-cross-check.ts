@@ -89,10 +89,22 @@ function expandBraces(pattern: string): string[] | null {
   return walk(pattern) ? out : null;
 }
 
+/** Bounds before expanding, so the recursive walk stays shallow and cheap. */
+const MAX_PATTERN_LENGTH = 1024;
+const MAX_BRACE_GROUPS = 32;
+
+// A backslash is denied outright: on Linux workers it is only an escape, and an escaped brace or
+// comma would group alternatives differently from expandBraces. Any error denies (fail closed).
 const escapesCheckout = (pattern: string): boolean => {
-  if (ESCAPING_PATTERN.test(pattern)) return true;
-  const expansions = expandBraces(pattern);
-  return expansions === null || expansions.some(e => ESCAPING_PATTERN.test(e));
+  try {
+    if (pattern.length > MAX_PATTERN_LENGTH || pattern.includes("\\")) return true;
+    if ((pattern.match(/\{/g)?.length ?? 0) > MAX_BRACE_GROUPS) return true;
+    if (ESCAPING_PATTERN.test(pattern)) return true;
+    const expansions = expandBraces(pattern);
+    return expansions === null || expansions.some(e => ESCAPING_PATTERN.test(e));
+  } catch {
+    return true;
+  }
 };
 
 /** Defense in depth for the one path the path guard cannot see: extractToolPaths screens only
