@@ -3,11 +3,10 @@ import { PassThrough } from "node:stream";
 import { createInterface } from "node:readline";
 import assert from "node:assert/strict";
 import { COMMAND_UID, WORKER_UID } from "../src/runner-uid.js";
-import type { SupervisorProcess } from "../src/codex/launcher.js";
 
 /** Withholds started until the real launcher's started timer requests disposal.
  * The caller gates cleanup explicitly; no fixture timer fabricates a rejection. */
-export class RejectedStartupTransport extends EventEmitter implements SupervisorProcess {
+export class RejectedStartupTransport extends EventEmitter {
   readonly pid = 12345;
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();

@@ -35,7 +35,7 @@ import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
 import type { BoundaryProcessRequest, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
 import {
   SupervisedChildExitTimeoutError, launchCodexEffectRoot, CodexLaunchError,
-  hasVerifiedStartupCleanup, type StartupCleanupAuthorization,
+  hasVerifiedStartupCleanup, type StartupCleanupAuthorization, type SupervisorProcess,
 } from "../src/codex/launcher.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
 import { COMMAND_UID, WORKER_UID } from "../src/runner-uid.js";
@@ -3814,7 +3814,7 @@ describe("RunRunner M2 fatal rejected startup", () => {
                     if (scenario.mode === "exit") child.exitBeforeStarted(rawDiagnostic);
                   });
                 }
-                return child;
+                return child as unknown as SupervisorProcess;
               },
             });
           });
@@ -3897,7 +3897,8 @@ describe("RunRunner M2 fatal rejected startup", () => {
       }
       const diagnostic = lines.find((line) => (line as { msg?: string }).msg === "codex boundary failed") as
         { detail?: string } | undefined;
-      assert.ok(diagnostic?.detail?.includes(scenario.classification), JSON.stringify(lines));
+      assert.ok(diagnostic?.detail, JSON.stringify(lines));
+      assert.ok(diagnostic.detail.includes(scenario.classification));
       assert.ok(diagnostic.detail.length <= 500, "CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS");
       const published = JSON.stringify({ logs: lines, failed });
       for (const sentinel of [privatePath, provider, evidence]) assert.ok(!published.includes(sentinel), sentinel);
@@ -3983,7 +3984,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
               env: { UZI_UID_SPLIT: "1" },
               resolveWorkerUid: () => WORKER_UID, resolveCommandUid: () => COMMAND_UID,
               startupCleanup: authorization, deadlines: { started: launchMs },
-              spawnSupervisor: () => childTransport,
+              spawnSupervisor: () => childTransport as unknown as SupervisorProcess,
             });
           });
           const launch = spawner(request, startupMs, startupCleanup);
