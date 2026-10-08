@@ -142,13 +142,16 @@ func (a *ReviewAssessor) QueueBound(ctx context.Context, repoID uuid.UUID, ref s
 
 // ReviewAssessParams is one assessment's input.
 type ReviewAssessParams struct {
-	RepoID         uuid.UUID
-	Ref            string
-	ProjectID      int64
-	BaseURL        string // the connection's base URL, for the trusted-bot instance match
-	BotForgeUserID int64
-	Lookup         issueinput.AuthorLookup
-	Trusted        []settings.TrustedBot
+	// AssessmentTimeout bounds both phases together; zero uses the 30-second
+	// background default. ReviewAssessor.Timeout independently bounds each lookup.
+	AssessmentTimeout time.Duration
+	RepoID            uuid.UUID
+	Ref               string
+	ProjectID         int64
+	BaseURL           string // the connection's base URL, for the trusted-bot instance match
+	BotForgeUserID    int64
+	Lookup            issueinput.AuthorLookup
+	Trusted           []settings.TrustedBot
 	// Comments is the MR's complete comment list, oldest first (the driver guarantee).
 	Comments []forge.MRComment
 	// HighWater and Pending come from the ledger row: a comment is NEW when its id is above
@@ -265,7 +268,7 @@ func (a *ReviewAssessor) Begin(ctx context.Context, p ReviewAssessParams) (*Revi
 	r := &ReviewAssessment{
 		assessor: a,
 		p:        p,
-		asmt:     issueinput.NewAssessment(ctx, timeoutLookup{p.Lookup, a.timeout()}, p.ProjectID),
+		asmt:     issueinput.NewAssessmentWithTimeout(ctx, timeoutLookup{p.Lookup, a.timeout()}, p.ProjectID, p.AssessmentTimeout),
 		kept:     kept,
 		pending:  map[int64]bool{},
 		trusted:  map[int64]bool{},

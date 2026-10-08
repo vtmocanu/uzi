@@ -209,7 +209,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	if err != nil {
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
 	}
-	capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID)
+	capture, err := issueinput.FetchWithTimeout(ctx, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
