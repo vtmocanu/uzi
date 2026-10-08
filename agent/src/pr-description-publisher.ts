@@ -698,7 +698,7 @@ export class PrDescriptionPublication {
       const previous = this.state?.published_version?.fields ?? null;
       const context = await this.spec.context(snapshot, this.deadline, previous);
       return await pass.generateDeliverySummary({ claim: this.spec.claim, context, deadlineMs: this.deadline });
-    } catch (e) {
+    } catch {
       diagramEvent(log, this.spec.claim, "editor", "omitted", "pass_failed", { claim_generation: this.spec.claimGeneration }, [this.spec.pat]);
       log.warn("PR description: the editor pass failed", { run_id: this.spec.runId, reason: "pass_failed" });
       return null;
