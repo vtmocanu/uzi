@@ -1041,6 +1041,119 @@ awk '
   { print }
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
 
+
+# Memory guard configuration: a finite case matrix, no retries. Any failure stops
+# sibling cases. These renders use explicit synthetic values, not sizing advice.
+memory_guard_render() {
+  helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true "$@"
+}
+memory_guard_env() {
+  awk -v enabled="$1" '
+    /- name: UZI_WORKER_MEMORY_GUARD_/ { name=$3; names[name]++; next }
+    name != "" && /^[[:space:]]*value:/ { values[name]=$2; name="" }
+    END {
+      prefix="UZI_WORKER_MEMORY_GUARD_"
+      want[prefix "ENABLED"]="\"" enabled "\""
+      if (enabled == "true") {
+        want[prefix "RESERVE_BYTES"]="\"11\""
+        want[prefix "SAMPLE_MS"]="\"12\""
+        want[prefix "HYSTERESIS_BYTES"]="\"13\""
+        want[prefix "REARM_MS"]="\"14\""
+        want[prefix "RESPONSE_BUDGET_MS"]="\"15\""
+        want[prefix "MAX_INTERVENTIONS"]="\"16\""
+      }
+      bad=0
+      for (n in want) if (names[n] != 1 || values[n] != want[n]) {
+        print "FAIL: memory guard env " n " = " values[n] ", expected " want[n]; bad=1
+      }
+      for (n in names) if (!(n in want)) {
+        print "FAIL: unexpected memory guard env " n; bad=1
+      }
+      exit bad
+    }
+  ' "$2"
+}
+# Start with the actual default-off guard while hosting is on, then every disabled
+# alias with meaningful but invalid numeric garbage (ignored, as in the agent).
+memory_guard_render > "$WORK/memory-default.yaml"
+memory_guard_env false "$WORK/memory-default.yaml"
+for flag in '' 0 false no off ' FALSE '; do
+  memory_guard_render --set-string "workers.memoryGuard.enabled=$flag" \
+    --set-string "workers.memoryGuard.reserveBytes=garbage" \
+    --set-string "workers.memoryGuard.sampleMs=garbage" \
+    --set-string "workers.memoryGuard.hysteresisBytes=garbage" \
+    --set-string "workers.memoryGuard.rearmMs=garbage" \
+    --set-string "workers.memoryGuard.responseBudgetMs=garbage" \
+    --set-string "workers.memoryGuard.maxInterventions=garbage" > "$WORK/memory-disabled.yaml"
+  memory_guard_env false "$WORK/memory-disabled.yaml"
+done
+# Unique values catch swapped/misnamed fields.
+set -- \
+  --set-string "workers.memoryGuard.reserveBytes=11" \
+  --set-string "workers.memoryGuard.sampleMs=12" \
+  --set-string "workers.memoryGuard.hysteresisBytes=13" \
+  --set-string "workers.memoryGuard.rearmMs=14" \
+  --set-string "workers.memoryGuard.responseBudgetMs=15" \
+  --set-string "workers.memoryGuard.maxInterventions=16"
+for flag in 1 true yes on ' ON '; do
+  memory_guard_render "$@" --set-string "workers.memoryGuard.enabled=$flag" > "$WORK/memory-enabled.yaml"
+  memory_guard_env true "$WORK/memory-enabled.yaml"
+done
+# Invalid configuration must fail through worker-invariants even when both the
+# controller and hosting are off. No controller Deployment can carry that check.
+for hosting in true false; do
+  for flag in garbage 2 -1; do
+    if memory_guard_render "$@" --set "workers.enabled=$hosting" \
+      --set workers.controller.enabled=false --set-string "workers.memoryGuard.enabled=$flag" \
+      > "$WORK/memory-invalid.yaml" 2> "$WORK/err"; then
+      echo "FAIL: invalid memory guard flag accepted with controller off" >&2; exit 1
+    fi
+    grep -F "workers.memoryGuard.enabled must be a boolean" "$WORK/err" >/dev/null || {
+      cat "$WORK/err" >&2; exit 1;
+    }
+  done
+  for setting in reserveBytes sampleMs hysteresisBytes rearmMs responseBudgetMs maxInterventions; do
+    case "$setting" in
+      reserveBytes|hysteresisBytes) ceiling=9007199254740991; overflow=9007199254740992 ;;
+      maxInterventions) ceiling=9999; overflow=10000 ;;
+      *) ceiling=2147483647; overflow=2147483648 ;;
+    esac
+    # A boundary accepted by the agent must also render here.
+    memory_guard_render "$@" --set-string workers.memoryGuard.enabled=true \
+      --set-string "workers.memoryGuard.$setting=$ceiling" > "$WORK/memory-boundary.yaml"
+    for bad in '' 0 -1 +1 1.5 1e2 garbage "$overflow" 9223372036854775808; do
+      if memory_guard_render "$@" --set "workers.enabled=$hosting" \
+        --set workers.controller.enabled=false --set-string workers.memoryGuard.enabled=true \
+        --set-string "workers.memoryGuard.$setting=$bad" \
+        > "$WORK/memory-invalid.yaml" 2> "$WORK/err"; then
+        echo "FAIL: invalid memory guard $setting=$bad accepted with controller off" >&2; exit 1
+      fi
+      grep -F "workers.memoryGuard.$setting must be an explicit positive decimal integer" "$WORK/err" >/dev/null || {
+        cat "$WORK/err" >&2; exit 1;
+      }
+    done
+  done
+done
+# Compose must pass exactly the seven agent names, with disabled/empty defaults.
+awk '
+  /^[[:space:]]*WORKER_MEMORY_GUARD_/ {
+    name=$1; sub(/:$/, "", name); seen[name]++
+    expected="${" name ":-}"
+    if (name == "WORKER_MEMORY_GUARD_ENABLED") expected="${" name ":-false}"
+    if ($2 != expected) { print "FAIL: compose memory guard default " name; bad=1 }
+  }
+  END {
+    split("ENABLED RESERVE_BYTES SAMPLE_MS HYSTERESIS_BYTES REARM_MS RESPONSE_BUDGET_MS MAX_INTERVENTIONS", suffix, " ")
+    for (i in suffix) if (seen["WORKER_MEMORY_GUARD_" suffix[i]] != 1) {
+      print "FAIL: compose memory guard name " suffix[i]; bad=1
+    }
+    for (name in seen) count++
+    if (count != 7) { print "FAIL: compose memory guard env inventory"; bad=1 }
+    exit bad
+  }
+' "$SCRIPT_DIR/../docker-compose.yml"
+echo "OK: memory guard defaults, aliases, explicit env values, numeric bounds, controller-off invariants and compose inventory"
+
 # The existing api.config path carries the requeue budget as a quoted string and
 # injects it into the API through the SAME ConfigMap. Three independent offline
 # renders cover the API default budget, a raised budget and disabled requeue.

@@ -663,6 +663,17 @@ workers:
   # it for burst capacity on one worker no longer risks piling two simultaneously
   # queued runs onto whichever worker happens to poll first while a sibling sits idle.
   maxConcurrentRuns: 1
+  # Explicit opt-in; supply all six positive decimal settings when enabled.
+  # No calibrated production settings are supplied. The worker checks thresholds
+  # against its actual finite cgroup limit; the controller has no live limit.
+  memoryGuard:
+    enabled: false
+    reserveBytes: ""
+    sampleMs: ""
+    hysteresisBytes: ""
+    rearmMs: ""
+    responseBudgetMs: ""
+    maxInterventions: ""
   # The WORKER container's requests.ephemeral-storage (issue #224 →
   # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
   # INSTEAD of this, not on top of it.

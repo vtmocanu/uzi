@@ -155,6 +155,23 @@ spec:
             # (workers.maxConcurrentRuns: 1), so the controller always receives it and
             # the default (1) is explicit in the rendered pod rather than implied by the
             # env being absent. The controller rejects a non-integer or a value < 1.
+            {{- $memoryGuardEnabled := include "uzi.workerMemoryGuardEnabled" . }}
+            - name: UZI_WORKER_MEMORY_GUARD_ENABLED
+              value: {{ $memoryGuardEnabled | quote }}
+            {{- if eq $memoryGuardEnabled "true" }}
+            - name: UZI_WORKER_MEMORY_GUARD_RESERVE_BYTES
+              value: {{ .Values.workers.memoryGuard.reserveBytes | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_SAMPLE_MS
+              value: {{ .Values.workers.memoryGuard.sampleMs | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_HYSTERESIS_BYTES
+              value: {{ .Values.workers.memoryGuard.hysteresisBytes | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_REARM_MS
+              value: {{ .Values.workers.memoryGuard.rearmMs | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS
+              value: {{ .Values.workers.memoryGuard.responseBudgetMs | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_MAX_INTERVENTIONS
+              value: {{ .Values.workers.memoryGuard.maxInterventions | toString | trim | quote }}
+            {{- end }}
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
             # PRD #422 M5 drain knobs. The deadline bounds how long a cordoned BUSY worker

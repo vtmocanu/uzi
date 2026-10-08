@@ -112,13 +112,20 @@ func main() {
 		DockerEphemeralRequest: cfg.WorkerDockerEphemeralRequest,
 		// Each tier's PVC admission ceiling (issue #224). Renders nothing; checked once
 		// at boot, just below.
-		MaxPVCStorage:       cfg.WorkerMaxPVCStorage,
-		DockerMaxPVCStorage: cfg.WorkerDockerMaxPVCStorage,
-		ServiceAccountName:  cfg.WorkerServiceAccount,
-		APIURL:              cfg.WorkerAPIURL,
-		StorageClass:        cfg.WorkerStorageClass,
-		PriorityClassName:   cfg.WorkerPriorityClassName,
-		MaxConcurrentRuns:   cfg.WorkerMaxConcurrentRuns,
+		MaxPVCStorage:               cfg.WorkerMaxPVCStorage,
+		DockerMaxPVCStorage:         cfg.WorkerDockerMaxPVCStorage,
+		ServiceAccountName:          cfg.WorkerServiceAccount,
+		APIURL:                      cfg.WorkerAPIURL,
+		StorageClass:                cfg.WorkerStorageClass,
+		PriorityClassName:           cfg.WorkerPriorityClassName,
+		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
+		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,
+		MemoryGuardReserveBytes:     cfg.WorkerMemoryGuardReserveBytes,
+		MemoryGuardSampleMs:         cfg.WorkerMemoryGuardSampleMs,
+		MemoryGuardHysteresisBytes:  cfg.WorkerMemoryGuardHysteresisBytes,
+		MemoryGuardRearmMs:          cfg.WorkerMemoryGuardRearmMs,
+		MemoryGuardResponseBudgetMs: cfg.WorkerMemoryGuardResponseBudgetMs,
+		MemoryGuardMaxInterventions: cfg.WorkerMemoryGuardMaxInterventions,
 		// The Codex uid-split worker profile (PRD #1493 M1): when on, the worker + seed-nix
 		// containers start as root with a short capability set so the image entrypoint can
 		// establish the split. CommandSandbox rides the worker env only when it is not the

@@ -368,6 +368,14 @@ services:
       # it but warns at boot). Raising it multiplies memory/CPU/token pressure — size
       # cpus/mem_limit above and RUN_MAX_REQUEUES with it. See docs/worker-setup.md.
       WORKER_MAX_CONCURRENT_RUNS: ${WORKER_MAX_CONCURRENT_RUNS:-1}
+      # Explicit opt-in; numeric settings deliberately have no defaults.
+      WORKER_MEMORY_GUARD_ENABLED: ${WORKER_MEMORY_GUARD_ENABLED:-false}
+      WORKER_MEMORY_GUARD_RESERVE_BYTES: ${WORKER_MEMORY_GUARD_RESERVE_BYTES:-}
+      WORKER_MEMORY_GUARD_SAMPLE_MS: ${WORKER_MEMORY_GUARD_SAMPLE_MS:-}
+      WORKER_MEMORY_GUARD_HYSTERESIS_BYTES: ${WORKER_MEMORY_GUARD_HYSTERESIS_BYTES:-}
+      WORKER_MEMORY_GUARD_REARM_MS: ${WORKER_MEMORY_GUARD_REARM_MS:-}
+      WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS: ${WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS:-}
+      WORKER_MEMORY_GUARD_MAX_INTERVENTIONS: ${WORKER_MEMORY_GUARD_MAX_INTERVENTIONS:-}
       # PRD #83 M2: the DinD sidecar socket the worker probes. Unset by DEFAULT (empty):
       # a plain `--profile agent` worker then does ONE fast probe of the default path and
       # NEVER blocks. When you run `--profile agent-docker`, SET this (to

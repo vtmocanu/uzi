@@ -161,6 +161,16 @@ type Config struct {
 	// semaphore, so this pod env is the only thing pinning a hosted worker to 1.
 	WorkerMaxConcurrentRuns int
 
+	// WorkerMemoryGuard settings have no numeric defaults. The worker validates
+	// limit-relative thresholds against its live finite cgroup memory limit.
+	WorkerMemoryGuardEnabled          bool
+	WorkerMemoryGuardReserveBytes     int64
+	WorkerMemoryGuardSampleMs         int64
+	WorkerMemoryGuardHysteresisBytes  int64
+	WorkerMemoryGuardRearmMs          int64
+	WorkerMemoryGuardResponseBudgetMs int64
+	WorkerMemoryGuardMaxInterventions int64
+
 	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
 	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
 	// (UZI_WORKER_UID_SPLIT, default false). When on, the controller renders the
@@ -433,6 +443,10 @@ func loadWorkerSettings(cfg *Config) error {
 	// does not reject), so a typo like 100000 would otherwise boot and render into the
 	// pod. Raising it opts into the intra-user concurrency residuals documented in
 	// docs/worker-setup.md (PRD #58 Decision 7).
+	if err := loadWorkerMemoryGuard(cfg); err != nil {
+		return err
+	}
+
 	cfg.WorkerMaxConcurrentRuns = 1
 	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_MAX_CONCURRENT_RUNS")); raw != "" {
 		n, err := strconv.Atoi(raw)

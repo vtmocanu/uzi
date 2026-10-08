@@ -517,6 +517,15 @@ type RenderConfig struct {
 	// which validates and defaults it. Raising it opts into the intra-user concurrency
 	// residuals documented in docs/worker-setup.md (PRD #58 Decision 7).
 	MaxConcurrentRuns int
+
+	// MemoryGuard is opt-in; zero RenderConfig renders an explicit disabled flag.
+	MemoryGuardEnabled          bool
+	MemoryGuardReserveBytes     int64
+	MemoryGuardSampleMs         int64
+	MemoryGuardHysteresisBytes  int64
+	MemoryGuardRearmMs          int64
+	MemoryGuardResponseBudgetMs int64
+	MemoryGuardMaxInterventions int64
 	// APICAPEM is the api's CA, relayed to workers through the per-worker Secret this
 	// controller already creates — no new RBAC verb, so Decision 1's Secrets line
 	// stays verbatim. Empty means the worker verifies against the system roots.
@@ -900,6 +909,17 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		{Name: "UZI_WORKER_TOKEN_FILE", Value: cfg.tokenPath()},
 		{Name: "UZI_DATA_DIR", Value: dataMountPath},
 		{Name: "WORKER_MAX_CONCURRENT_RUNS", Value: strconv.Itoa(maxConcurrentRuns)},
+	}
+	env = append(env, corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_ENABLED", Value: strconv.FormatBool(cfg.MemoryGuardEnabled)})
+	if cfg.MemoryGuardEnabled {
+		env = append(env,
+			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_RESERVE_BYTES", Value: strconv.FormatInt(cfg.MemoryGuardReserveBytes, 10)},
+			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_SAMPLE_MS", Value: strconv.FormatInt(cfg.MemoryGuardSampleMs, 10)},
+			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_HYSTERESIS_BYTES", Value: strconv.FormatInt(cfg.MemoryGuardHysteresisBytes, 10)},
+			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_REARM_MS", Value: strconv.FormatInt(cfg.MemoryGuardRearmMs, 10)},
+			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS", Value: strconv.FormatInt(cfg.MemoryGuardResponseBudgetMs, 10)},
+			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_MAX_INTERVENTIONS", Value: strconv.FormatInt(cfg.MemoryGuardMaxInterventions, 10)},
+		)
 	}
 	if len(cfg.APICAPEM) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch
