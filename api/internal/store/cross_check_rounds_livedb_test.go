@@ -127,7 +127,11 @@ func TestPlanCrossCheckAutomaticRoundsFrozenInterruptionClockLiveDB(t *testing.T
 				// All deadlines predate the later sweep clock. Only the first
 				// supplied custody observation determines supersession versus timeout.
 				deadline := observed.Add(-delta)
-				mustExec(ctx, t, f.pool, "UPDATE runs SET status='running',started_at=$2,status_since=$2,requeue_count=0 WHERE id=$1", f.runID, observed.Add(-time.Minute))
+				// The wall guard must count both Round 1's banked seven seconds and
+				// Round 2's pending ten (or nine): 60-7-10=43 (or 44) fits
+				// the 50-second budget. A Round 1-only pending predicate leaves
+				// 60-7=53 seconds spent and wrongly refuses the frozen requeue.
+				mustExec(ctx, t, f.pool, "UPDATE runs SET status='running',started_at=$2,status_since=$2,requeue_count=0,interactive=false,completion_attempts=0,budget_wall_seconds=50,budget_finalize_seconds=0,budget_extension_seconds=0 WHERE id=$1", f.runID, observed.Add(-time.Minute))
 				mustExec(ctx, t, f.pool, "DELETE FROM cross_checks WHERE id=$1", fx.crossCheckID)
 				mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
 					(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,automatic_rounds_enabled,automatic_revision_limit,verdict,reason_class,created_at,deadline_at,decided_at,wait_credited)
@@ -151,7 +155,7 @@ func TestPlanCrossCheckAutomaticRoundsFrozenInterruptionClockLiveDB(t *testing.T
 					}
 					defer func() { _ = tx.Rollback(ctx) }()
 					frozen, parents := freezeWorkerSnapshot(ctx, t, tx, f.workerID, []uuid.UUID{f.runID})
-					rows, err := store.New(tx).FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{WorkerID: pgU(f.workerID), Now: planCrossCheckTime(observed), MissingCutoff: planCrossCheckTime(observed.Add(-time.Second)), MaxRequeues: 5, GlobalTimeoutSeconds: 3600, FrozenTargets: frozen, LockedParentIds: parents})
+					rows, err := store.New(tx).FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{WorkerID: pgU(f.workerID), Now: planCrossCheckTime(observed), MissingCutoff: planCrossCheckTime(observed.Add(-time.Second)), MaxRequeues: 5, GlobalTimeoutSeconds: 50, FrozenTargets: frozen, LockedParentIds: parents})
 					if err != nil || len(rows) != 1 || rows[0].ID != f.runID {
 						t.Fatalf("frozen write: rows=%v err=%v", rows, err)
 					}
