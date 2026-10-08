@@ -46,6 +46,12 @@ function asString(v: unknown): string | undefined {
 function asNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
+function automaticCrossCheckRoundLabel(rec: Record<string, unknown> | undefined): string {
+  const round = asNumber(rec?.["cross_check_round"]);
+  return round != null && Number.isInteger(round) && round >= 1 && round <= 4
+    ? ` (cross-check round ${round})`
+    : "";
+}
 function asStringArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
@@ -1120,21 +1126,24 @@ export const RunEventRow = memo(function RunEventRow({
           plan submitted (awaiting approval)
         </div>
       );
-    // PRD #41: the planner is reworking the plan after the user requested changes.
+    // The planner is reworking after human feedback or an automated cross-check.
     // A terse, info-toned one-liner — the plan body itself re-arrives as a `plan`
     // event, so this row only marks the round transition.
     case "plan_revising": {
+      const automatic = rec?.["automatic"] === true;
       const round = asNumber(rec?.["round"]);
       return (
         <div className="inline-flex items-center gap-1.5 rounded-md border border-info/40 bg-info/10 px-2 py-1 text-xs text-info">
           <span aria-hidden="true">
             <FileTextIcon />
           </span>
-          revising plan{round != null ? ` (round ${round})` : ""}
+          {automatic
+            ? `revising plan after automated cross-check${automaticCrossCheckRoundLabel(rec)}`
+            : `revising plan${round != null ? ` (round ${round})` : ""}`}
         </div>
       );
     }
-    // PRD #41: the user's steering text for a revision. UNTRUSTED, so it is rendered
+    // Human steering or automated cross-check feedback. UNTRUSTED, so it is rendered
     // through the hardened <Markdown> (react-markdown, no raw-HTML sink) — never a
     // raw injection point. Since issue #319 <Markdown> also strips Cf/bidi control
     // characters centrally, so this sink is scrubbed by construction (no per-site wrap).
@@ -1143,7 +1152,9 @@ export const RunEventRow = memo(function RunEventRow({
       return (
         <div className="rounded-md border border-brand/30 bg-brand/[0.08] px-2.5 py-1.5 text-sm">
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-brand">
-            requested changes
+            {rec?.["automatic"] === true
+              ? `automated cross-check feedback${automaticCrossCheckRoundLabel(rec)}`
+              : "requested changes"}
           </div>
           {feedback ? (
             <Markdown content={feedback} />

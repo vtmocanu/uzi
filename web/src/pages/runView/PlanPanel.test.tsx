@@ -8,7 +8,7 @@
 // and preserve the exact 1-arg onApprove contract.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { PlanPanel } from "./PlanPanel";
+import { PlanPanel, derivePlanRevision } from "./PlanPanel";
 import { act } from "react";
 import { api, ApiError, type AgentSelectionInput, type Run, type RunMessage, type SecretMeta } from "../../lib/api";
 
@@ -124,6 +124,49 @@ function renderPanel(over: Partial<Run> = {}, onApprove = vi.fn()) {
   );
   return { onApprove };
 }
+
+describe("derivePlanRevision — human and automatic feedback", () => {
+  function message(seq: number, kind: string, payload: unknown): RunMessage {
+    return { seq, kind, payload, agent: "lead", agent_instance: null, agent_label: null, created_at: "2026-01-01T00:00:00Z" };
+  }
+
+  const automatic = [
+    message(1, "plan", { plan_md: "v1" }),
+    message(2, "plan_feedback", { feedback: "auto first", automatic: true, cross_check_round: 1 }),
+    message(3, "plan_revising", { automatic: true, cross_check_round: 1 }),
+    message(4, "plan", { plan_md: "v2" }),
+    message(5, "plan_feedback", { feedback: "auto second", automatic: true, cross_check_round: 2 }),
+    message(6, "plan_revising", { automatic: true, cross_check_round: 2 }),
+  ];
+
+  it("keeps automatic revisions planning without consuming human rounds or a user bubble", () => {
+    expect(derivePlanRevision(automatic)).toEqual({
+      versions: 2, rounds: 0, latestFeedback: null, revising: true, priorPlans: ["v1"],
+    });
+    const regated = [...automatic, message(7, "plan", { plan_md: "v3" })];
+    expect(derivePlanRevision(regated).revising).toBe(false);
+    expect(derivePlanRevision([...regated].reverse()).revising).toBe(false);
+  });
+
+  it("retains legacy human feedback even when automatic advice has a newer seq", () => {
+    const messages = [
+      ...automatic,
+      message(7, "plan_feedback", { feedback: "human request" }),
+      message(8, "plan_revising", { round: 1 }),
+      message(9, "plan_feedback", { feedback: "new automatic advice", automatic: true, cross_check_round: 3 }),
+    ];
+    const revision = derivePlanRevision(messages.reverse());
+    expect(revision.rounds).toBe(1);
+    expect(revision.latestFeedback).toBe("human request");
+    expect(revision.revising).toBe(true);
+  });
+
+  it.each([false, "true", 1, null])("only strict true marks automatic feedback (%s)", (automatic) => {
+    const revision = derivePlanRevision([message(1, "plan_feedback", { feedback: "human", automatic })]);
+    expect(revision.rounds).toBe(1);
+    expect(revision.latestFeedback).toBe("human");
+  });
+});
 
 describe("PlanPanel — gate credential path (PRD #1247 M7)", () => {
   it("sets the run credential BEFORE onApprove when the user pins a token", async () => {

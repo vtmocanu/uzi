@@ -44,7 +44,7 @@
 // unbound approve (sent while no gate was visible) is disposed of; an unbound reject or revise and
 // every legacy row keep the epoch rules above; a malformed binding fails closed.
 
-import { RequestError, type InputReceipt, type WorkerClient } from "./client.js";
+import { RequestError, type InputReceipt, type PlanCrossCheckFindings, type WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
 import { InclusionReporter } from "./inclusion-reporter.js";
 import type { Logger } from "./log.js";
@@ -76,7 +76,7 @@ export type PlanVerdict =
   | { kind: "cancel" }
   | { kind: "revise"; automatic?: false; feedback: string; inputId?: number }
   | { kind: "revise"; automatic: true; feedback: string; round: number;
-      items?: import("./client.js").PlanCrossCheckFindings["items"]; inputId?: never };
+      items?: PlanCrossCheckFindings["items"]; inputId?: never };
 
 /** The resolution of an ask_user park (PRD #88 M1). `cancel` is the same abort the
  *  plan gate sees; it is question-identity-exempt and always wins. */

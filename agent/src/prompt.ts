@@ -13,6 +13,7 @@
 
 import { randomBytes } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
+import type { PlanCrossCheckFindings } from "./client.js";
 import type {
   IssueCommentsSnapshot,
   MemoryBasis,
@@ -1834,7 +1835,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
 /** Automated advice has no independent execution authority, in either stage. */
 export function buildAutomaticRevisionPrompt(
   stage: "plan" | "code",
-  feedback: string | { summary: string; items: import("./client.js").PlanCrossCheckFindings["items"] },
+  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] },
   priorPlan?: string,
   nonceSource: () => string = fenceNonce,
 ): string {

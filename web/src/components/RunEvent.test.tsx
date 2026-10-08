@@ -357,6 +357,57 @@ describe("RunEventRow rendering", () => {
     expect(container.textContent).toContain("drop step 1");
   });
 
+  it.each([1, 2, 4])("labels automatic feedback and revisions with cross-check round %s", (round) => {
+    for (const kind of ["plan_feedback", "plan_revising"]) {
+      const { container, unmount } = render(
+        <RunEventRow msg={msg({ seq: 1, kind, payload: {
+          automatic: true, cross_check_round: round, round: 99,
+          feedback: '> quoted **advice** <script>alert(1)</script> <img src=x onerror=alert(2)>',
+        } })} live={false} />,
+      );
+      expect(container.textContent).toContain(kind === "plan_feedback" ? "automated cross-check feedback" : "revising plan after automated cross-check");
+      expect(container.textContent).toContain(`cross-check round ${round}`);
+      expect(container.textContent).not.toContain("of 4"); // The immutable server budget is not in this event.
+      expect(container.textContent).not.toContain("requested changes");
+      expect(container.textContent).not.toContain("round 99");
+      expect(container.querySelector("script, img, button, input")).toBeNull();
+      if (kind === "plan_feedback") {
+        expect(container.querySelector("blockquote")?.textContent).toContain("quoted advice");
+        expect(container.querySelector("strong")?.textContent).toBe("advice");
+      }
+      unmount();
+    }
+  });
+
+  it.each(["2", "<img src=x onerror=alert(1)>", 0, -1, Infinity, NaN, 5, 1.5, null])(
+    "suppresses malformed automatic round %s",
+    (cross_check_round) => {
+      for (const kind of ["plan_feedback", "plan_revising"]) {
+        const { container, unmount } = render(
+          <RunEventRow msg={msg({ seq: 1, kind, payload: {
+            automatic: true, cross_check_round, round: 99, feedback: "safe advice",
+          } })} live={false} />,
+        );
+        expect(container.textContent).toContain("automated cross-check");
+        expect(container.textContent).not.toContain("round");
+        expect(container.querySelector("img, button, input")).toBeNull();
+        unmount();
+      }
+    },
+  );
+
+  it.each([false, "true", 1, null])("keeps human event labels unless automatic is strict true (%s)", (automatic) => {
+    const { container } = render(
+      <>
+        <RunEventRow msg={msg({ seq: 1, kind: "plan_feedback", payload: { automatic, feedback: "human request", cross_check_round: 2 } })} live={false} />
+        <RunEventRow msg={msg({ seq: 2, kind: "plan_revising", payload: { automatic, round: 1, cross_check_round: 2 } })} live={false} />
+      </>,
+    );
+    expect(container.textContent).toContain("requested changes");
+    expect(container.textContent).toContain("revising plan (round 1)");
+    expect(container.textContent).not.toContain("cross-check");
+  });
+
   // ── PRD #88: the clarification round-trip in the feed ──────────────────────
 
   it("renders NO ordinal marker — a row cannot count what only the feed knows (D-R)", () => {

@@ -847,10 +847,12 @@ function parkPaused(runId: string): void {
   appendMessage(runId, "status", null, { text: "‖ paused — checkpoint pushed, clock stopped" });
 }
 
-// countPlanFeedback counts the revision rounds already recorded, so the `plan_revising`
+// countPlanFeedback counts the human revision rounds already recorded, so the `plan_revising`
 // message carries the round number the panel's counter reads.
 function countPlanFeedback(runId: string): number {
-  return listMessages(runId).filter((m) => m.kind === "plan_feedback").length;
+  return listMessages(runId).filter(
+    (m) => m.kind === "plan_feedback" && (m.payload as { automatic?: unknown } | null)?.automatic !== true,
+  ).length;
 }
 
 // parseAnswerInput reads the `answer` steering body. It is JSON — the only kind that is
