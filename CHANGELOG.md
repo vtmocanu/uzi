@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
+  Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
+
 - **Claude plans automatically revise eligible cross-check feedback before implementation ([#2150](https://github.com/vtmocanu/uzi/issues/2150)).**
   Codex changes requested return to the Claude lead as fenced advisory feedback for up to two automatic revisions by default, without spending the human revision allowance. `PLAN_CROSS_CHECK_MAX_REVISIONS` accepts 0–4; the budget includes eligible recovery attempts, and only approval of the latest exact plan permits implementation. Worker recovery and owner Resume honor the latest eligible pending round, preserving exhaustion holds, custody, and one-time wait credit. The feed distinguishes rounds. Older workers keep the human fallback; blockers, timeouts, checker failures and terminal delivery losses retain their dispositions, as do established human gates. Codex leads, dedicated checker slots, stage pins and Code cross-check remain outside this change.
 
