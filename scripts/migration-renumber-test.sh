@@ -87,7 +87,16 @@ assert_nonzero() {
   if [ "$2" -ne 0 ]; then pass "$1 (refused, exit $2)"; else fail "$1 (expected non-zero exit, got 0)"; fi
 }
 
-ROOT="$(mktemp -d)"
+# Keep fixtures and every helper scratch directory inside the runtime scratch area.
+SCRATCH="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
+mkdir -p "$SCRATCH"
+TMPDIR="$SCRATCH"
+export TMPDIR
+# Ambient mode must not change the default-mode cases.
+unset MIGRATION_RENUMBER_NO_FETCH
+ROOT="$(mktemp -d "$TMPDIR/migration-renumber-test.XXXXXX")"
+TMPDIR="$ROOT"
+export TMPDIR
 trap 'rm -rf "$ROOT"' EXIT
 
 # --- fixture builders --------------------------------------------------------
@@ -177,23 +186,41 @@ SQL
   git -C "$_r" commit -q -m "branch: colliding forge pair (draft 00230/00231)"
 }
 
-# run_refusal <label> <repo> <expected-message-fragment> [path] -- snapshot the tree, run
+# run_refusal <label> <repo> <expected-message-fragment> [path] [mode] -- snapshot the tree, run
 # the helper (cwd in the repo), and assert it exits non-zero for the EXPECTED reason and
 # leaves the tree byte-identical. Checking only the status would let an earlier unrelated
 # refusal make a later case read green (CodeRabbit review on PR #1410). The optional PATH
-# lets one case inject a git wrapper that fails only `git status --porcelain`.
+# lets cases inject status/fetch failures; mode defaults to 0.
 run_refusal() {
   _label="$1"
   _repo="$2"
   _needle="$3"
   _path="${4:-$PATH}"
   _before="$(tree_state "$_repo")"
-  _out="$( ( cd "$_repo" && PATH="$_path" sh "$HELPER" ) 2>&1 )"
+  _out="$( ( cd "$_repo" && PATH="$_path" MIGRATION_RENUMBER_NO_FETCH="${5-0}" sh "$HELPER" ) 2>&1 )"
   _rc=$?
   _after="$(tree_state "$_repo")"
   assert_nonzero "$_label" "$_rc"
   assert_contains "$_label: refused for expected reason" "$_needle" "$_out"
   assert_eq "$_label: tree UNCHANGED (nothing renamed/edited)" "$_before" "$_after"
+}
+
+# fetch_failing_wrapper <case-dir> -- delegate all git except fetch, which records an
+# attempt outside the fixture repo and fails. An empty marker proves no fetch was tried.
+fetch_failing_wrapper() {
+  _wrapdir="$1/bin"
+  _real_git="$(command -v git)"
+  mkdir -p "$_wrapdir"
+  : > "$1/fetch-attempts"
+  wf "$_wrapdir/git" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "fetch" ]; then
+  printf '%s\\n' "\$*" >> "$1/fetch-attempts"
+  exit 73
+fi
+exec "$_real_git" "\$@"
+EOF
+  chmod +x "$_wrapdir/git"
 }
 
 # =============================================================================
@@ -320,7 +347,7 @@ add_forge_pair "$RB2"
 git -C "$RB2" remote remove origin
 run_refusal "B2 unresolvable base (no origin remote)" "$RB2" "git fetch origin main failed"
 
-# B3. not rebased: origin/main advances to a commit that is NOT an ancestor of HEAD.
+# B3. missing ancestry: origin/main advances to a commit that is NOT an ancestor of HEAD.
 CB3="$ROOT/caseB3"; build_base "$CB3"; RB3="$CB3/repo"
 add_forge_pair "$RB3"
 git -C "$RB3" checkout -q main
@@ -329,7 +356,80 @@ git -C "$RB3" add -A
 git -C "$RB3" commit -q -m "main advances after branch cut"
 git -C "$RB3" push -q origin main
 git -C "$RB3" checkout -q feature
-run_refusal "B3 branch not rebased onto origin/main" "$RB3" "HEAD is not rebased onto current origin/main"
+run_refusal "B3 branch missing origin/main ancestry" "$RB3" "origin/main is not an ancestor of HEAD"
+
+# B3b. Unset and explicit 0 both attempt fetch, even with a valid local ref.
+CB3B="$ROOT/caseB3b"; build_base "$CB3B"; RB3B="$CB3B/repo"
+add_forge_pair "$RB3B"
+fetch_failing_wrapper "$CB3B"
+B3B_BEFORE="$(tree_state "$RB3B")"
+B3B_OUT="$( ( cd "$RB3B" && PATH="$CB3B/bin:$PATH" sh "$HELPER" ) 2>&1 )"
+B3B_RC=$?
+assert_nonzero "B3b unset mode refuses failed fetch" "$B3B_RC"
+assert_contains "B3b unset mode fetch refusal" "git fetch origin main failed" "$B3B_OUT"
+assert_eq "B3b unset mode tree unchanged" "$B3B_BEFORE" "$(tree_state "$RB3B")"
+assert_eq "B3b unset mode attempts fetch" "fetch origin main" "$(cat "$CB3B/fetch-attempts")"
+: > "$CB3B/fetch-attempts"
+run_refusal "B3b explicit 0 fetch refusal" "$RB3B" "git fetch origin main failed" "$CB3B/bin:$PATH" 0
+assert_eq "B3b explicit 0 attempts fetch" "fetch origin main" "$(cat "$CB3B/fetch-attempts")"
+
+# B3c. Offline mode refuses an absent tracking ref without attempting fetch.
+CB3C="$ROOT/caseB3c"; build_base "$CB3C"; RB3C="$CB3C/repo"
+add_forge_pair "$RB3C"
+git -C "$RB3C" update-ref -d refs/remotes/origin/main
+fetch_failing_wrapper "$CB3C"
+run_refusal "B3c offline missing local ref" "$RB3C" "local origin/main is not resolvable" "$CB3C/bin:$PATH" 1
+assert_eq "B3c no fetch attempted" "" "$(cat "$CB3C/fetch-attempts")"
+
+# B3d. Strict validation rejects empty, numeric aliases, and text before mutation/fetch.
+CB3D="$ROOT/caseB3d"; build_base "$CB3D"; RB3D="$CB3D/repo"
+add_forge_pair "$RB3D"
+fetch_failing_wrapper "$CB3D"
+for BAD_MODE in "" 2 01 true; do
+  run_refusal "B3d invalid mode '$BAD_MODE'" "$RB3D" "MIGRATION_RENUMBER_NO_FETCH must be unset, 0, or 1" "$CB3D/bin:$PATH" "$BAD_MODE"
+done
+assert_eq "B3d invalid modes never fetch" "" "$(cat "$CB3D/fetch-attempts")"
+
+# B3e. Offline mode retains the dirty-tree and ancestry refusals.
+fetch_failing_wrapper "$CB1"
+run_refusal "B3e offline dirty tree" "$RB1" "working tree is not clean" "$CB1/bin:$PATH" 1
+assert_eq "B3e dirty tree never fetches" "" "$(cat "$CB1/fetch-attempts")"
+fetch_failing_wrapper "$CB3"
+run_refusal "B3e offline missing ancestry" "$RB3" "origin/main is not an ancestor of HEAD" "$CB3/bin:$PATH" 1
+assert_eq "B3e missing ancestry never fetches" "" "$(cat "$CB3/fetch-attempts")"
+
+# B3f. A genuine merge of diverged main/feature histories satisfies ancestry. Main's
+# extra migration advances the live head to 232; the colliding pair must become 233/234.
+CB3F="$ROOT/caseB3f"; build_base "$CB3F"; RB3F="$CB3F/repo"
+add_forge_pair "$RB3F"
+git -C "$RB3F" checkout -q main
+mk_goose "$RB3F/$MIGDIR/00232_landed.sql" "main advanced independently"
+git -C "$RB3F" add -- "$MIGDIR/00232_landed.sql"
+git -C "$RB3F" commit -q -m "main: independently landed migration"
+git -C "$RB3F" push -q origin main
+git -C "$RB3F" checkout -q feature
+git -C "$RB3F" merge -q --no-ff main -m "feature: integrate main by merge"
+assert_eq "B3f genuine merge has two parents" "3" "$(git -C "$RB3F" rev-list --parents -n 1 HEAD | awk '{ print NF }')"
+git -C "$RB3F" merge-base --is-ancestor origin/main HEAD
+assert_eq "B3f origin/main is ancestor" "0" "$?"
+B3F_MAIN_BEFORE="$(cat "$RB3F/$MIGDIR/00232_landed.sql")"
+B3F_BODY_BEFORE="$(body_lines "$RB3F/$MIGDIR/00230_forge_x.sql")"
+fetch_failing_wrapper "$CB3F"
+B3F_OUT="$( ( cd "$RB3F" && PATH="$CB3F/bin:$PATH" MIGRATION_RENUMBER_NO_FETCH=1 sh "$HELPER" ) 2>&1 )"
+B3F_RC=$?
+assert_eq "B3f offline merge renumber exits 0" "0" "$B3F_RC"
+assert_contains "B3f summary uses local main head" "renamed 2 migration(s) above live main head 232" "$B3F_OUT"
+assert_eq "B3f offline merge never fetches" "" "$(cat "$CB3F/fetch-attempts")"
+assert_contains "B3f first migration renumbered" "00233_forge_x.sql" "$(git -C "$RB3F" ls-files -- "$MIGDIR")"
+assert_contains "B3f second migration renumbered" "00234_validate_forge_x.sql" "$(git -C "$RB3F" ls-files -- "$MIGDIR")"
+assert_absent "B3f old first path removed" "00230_forge_x.sql" "$(git -C "$RB3F" ls-files -- "$MIGDIR")"
+assert_absent "B3f old second path removed" "00231_validate_forge_x.sql" "$(git -C "$RB3F" ls-files -- "$MIGDIR")"
+assert_contains "B3f forward cross-reference rewritten" "00234_validate_forge_x" "$(cat "$RB3F/$MIGDIR/00233_forge_x.sql")"
+assert_contains "B3f backward cross-reference rewritten" "00233_forge_x" "$(cat "$RB3F/$MIGDIR/00234_validate_forge_x.sql")"
+assert_eq "B3f SQL body unchanged" "$B3F_BODY_BEFORE" "$(body_lines "$RB3F/$MIGDIR/00233_forge_x.sql")"
+assert_eq "B3f main migration unchanged" "$B3F_MAIN_BEFORE" "$(cat "$RB3F/$MIGDIR/00232_landed.sql")"
+( cd "$RB3F" && ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary "$MIGDIR" ) >/dev/null 2>&1
+assert_eq "B3f renumbered merged tree passes numbering check" "0" "$?"
 
 # B4. empty branch-new set: a clean rebased branch that adds NO migration.
 CB4="$ROOT/caseB4"; build_base "$CB4"; RB4="$CB4/repo"
