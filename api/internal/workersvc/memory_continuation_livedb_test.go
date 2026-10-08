@@ -153,6 +153,7 @@ func TestMemoryHoldResumeClaimIncarnationLiveDB(t *testing.T) {
 // A transient redispatch and registration renewal must not buy a fresh allowance.
 func TestMemoryOrdinaryRedispatchPreservesAllowanceLiveDB(t *testing.T) {
 	f := newMemoryFixture(t)
+	f.e.exec("UPDATE runs SET worker_recovery_episode=4 WHERE id=$1", f.b.RunID)
 	original := f.reserve(t, f.b)
 	second := f.b
 	second.InterventionID = uuid.New()
@@ -198,6 +199,7 @@ func TestMemoryOrdinaryRedispatchPreservesAllowanceLiveDB(t *testing.T) {
 	if denied.Admitted || denied.Authorizing || denied.Allowance.Used != 3 || fresh.run(t).MemoryInterventionCount != 3 {
 		t.Fatalf("redispatch escaped episode cap: %+v", denied)
 	}
+	b.InterventionID = uuid.New()
 	_, err = fresh.s.ReserveMemoryIntervention(f.e.ctx, w, MemoryReservationRequest{
 		MemoryBinding: b, Policy: MemoryPolicy{Version: 1, MaxInterventions: 4}})
 	if !errors.Is(err, ErrMemoryBinding) || fresh.run(t).MemoryInterventionCount != 3 {
