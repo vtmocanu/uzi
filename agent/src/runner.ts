@@ -4384,8 +4384,8 @@ export class RunRunner {
     });
 
     if (features.includes("recovery_park_cause")) {
-      // Full #1392 api: the TYPED report. The api's park transaction settles this generation's
-      // hold and parks (or fails at the cap) in one shot, so the worker calls NO release endpoint.
+      // Full #1392 api: the TYPED report parks (or fails at the cap) atomically. Legacy holds
+      // settle in that transaction; guarded holds require worker evidence after the ack below.
       const body: StateRequest = {
         status: "recovery_wait",
         recovery_cause: "forge_unreachable",

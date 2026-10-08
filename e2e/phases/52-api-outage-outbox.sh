@@ -305,18 +305,11 @@ wait_http
 login
 pass "api recreated with a 300s heartbeat-stale window so the outage cannot requeue the running run"
 
-# Clear the admin owner's accumulated cross-phase recovery custody holds so the claim
-# admission gate (workersvc/budget.go: custodyHoldLimit=8) does not wedge our claims in
-# 'queued' — the same guard phase 46 applies (the cross-phase accumulation is tracked
-# with the custody-recovery work). A CTE keeps the TOP-LEVEL statement a SELECT so the scalar
-# read is a bare count; db_psql also strips any DML command tag at the chokepoint now (#1351).
-OB_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
-[ -n "$OB_ADMIN_ID" ] || fail "outbox phase: could not resolve the admin owner id for '$ADMIN_EMAIL'"
-OB_CLEARED="$(db_psql "WITH del AS (DELETE FROM recovery_custody_holds
-                                     WHERE user_id = '$OB_ADMIN_ID' AND state = 'open'
-                                     RETURNING 1)
-                       SELECT count(*) FROM del")"
-pass "cleared ${OB_CLEARED:-0} accumulated custody hold(s) so the admission gate does not wedge the outbox claims"
+# Reserve headroom for the worker's advertised concurrency, read from the live API.
+# Outbox legs run sequentially, but final custody acknowledgement can lag completion.
+OB_CAP="$(apiget /api/workers | jq -er '[.workers[] | select(.status=="online") | .max_concurrent_runs] | max | select(type=="number" and .>0 and .==floor)')" \
+  || fail "outbox phase: no online worker advertises a positive concurrency"
+wait_custody_headroom "$OB_CAP"
 
 # =============================================================================
 # CASE 1 — spill + drain, contiguous, no drops, no `failed` report.
