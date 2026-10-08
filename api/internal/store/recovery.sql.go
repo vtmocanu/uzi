@@ -330,6 +330,53 @@ func (q *Queries) ExpireStalledUploads(ctx context.Context, retryWindow pgtype.I
 	return result.RowsAffected(), nil
 }
 
+const fenceUnacceptedInventoryCapture = `-- name: FenceUnacceptedInventoryCapture :execrows
+WITH fenced AS (
+    UPDATE recovery_captures c
+    SET state = 'expired', reserved_bytes = NULL,
+        reason = 'unaccepted_capture_replaced', updated_at = now()
+    WHERE c.id = $1 AND c.hold_id = $2 AND c.run_id = $3
+      AND c.user_id = $4 AND c.original_worker_id = $5::uuid
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+        WHERE h.id = c.hold_id AND h.run_id = c.run_id AND h.user_id = c.user_id
+          AND h.original_worker_id = $5::uuid AND h.generation = $6
+          AND h.live_worker_id = $5::uuid AND h.inventory_guarded AND h.state = 'open'
+          AND h.final_disposition IS NULL AND h.final_capture_id IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id = c.id)
+    RETURNING c.id
+), deleted AS (
+    DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM fenced)
+    RETURNING capture_id
+)
+SELECT id FROM fenced WHERE (SELECT count(*) FROM deleted) >= 0
+`
+
+type FenceUnacceptedInventoryCaptureParams struct {
+	ID         uuid.UUID `json:"id"`
+	HoldID     uuid.UUID `json:"hold_id"`
+	RunID      uuid.UUID `json:"run_id"`
+	UserID     uuid.UUID `json:"user_id"`
+	WorkerID   uuid.UUID `json:"worker_id"`
+	Generation int64     `json:"generation"`
+}
+
+// The caller holds worker/run/hold/capture locks. Delete bytes only for the
+// guarded update's returned IDs, so a failed ownership/receipt guard deletes none.
+func (q *Queries) FenceUnacceptedInventoryCapture(ctx context.Context, arg FenceUnacceptedInventoryCaptureParams) (int64, error) {
+	result, err := q.db.Exec(ctx, fenceUnacceptedInventoryCapture,
+		arg.ID,
+		arg.HoldID,
+		arg.RunID,
+		arg.UserID,
+		arg.WorkerID,
+		arg.Generation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getCaptureForOwner = `-- name: GetCaptureForOwner :one
 SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds FROM recovery_captures
 WHERE id = $1 AND run_id = $2 AND user_id = $3

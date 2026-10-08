@@ -343,6 +343,27 @@ type RecoveryCustodyHoldsDTO struct {
 	Holds     []RecoveryCustodyHoldDTO    `json:"holds"`
 }
 
+// RecoveryReconcileRequest names the saved archive identity for one ended generation.
+type RecoveryReconcileRequest struct {
+	Generation     int64  `json:"generation"`
+	SourceSha      string `json:"source_sha"`
+	CoverageDigest string `json:"coverage_digest"`
+	Checksum       string `json:"checksum"`
+	ByteSize       int64  `json:"byte_size"`
+}
+
+// RecoveryReconcileResponse echoes immutable FINAL receipts; callers must compare
+// the receipt with their saved identity before disposing of local source.
+type RecoveryReconcileResponse struct {
+	RunID           string                    `json:"run_id"`
+	Generation      int64                     `json:"generation"`
+	CaptureID       string                    `json:"capture_id"`
+	Outcome         string                    `json:"outcome"`
+	FinalReceipt    *RecoveryFinalDisposition `json:"final_receipt,omitempty"`
+	ReleaseEvidence string                    `json:"release_evidence,omitempty"`
+	Reason          string                    `json:"reason,omitempty"`
+}
+
 // RecoveryFinalDisposition binds a final archive or empty settled inventory to an exact hold.
 // It is also the owner's read-only receipt after worker deletion.
 type RecoveryFinalDisposition struct {
