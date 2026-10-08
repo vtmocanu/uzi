@@ -118,7 +118,13 @@ class FakeSupervisor extends EventEmitter {
   writeRawEvidence(text: string): void { this.evidence.write(`${text}\n`); }
   emitAbnormal(reason: string): void { this.writeEvidence({ event: "abnormal", reason, cleanup: { state: "unconfirmed" } }); }
   emitChildExit(code: number): void { this.writeEvidence({ event: "child_exit", code }); }
-  exitWith(code: number, signal: NodeJS.Signals | null = null): void { this.emit("exit", code, signal); }
+  exitWith(code: number, signal: NodeJS.Signals | null = null): void {
+    this.emit("exit", code, signal);
+    this.stdout.end();
+    this.stderr.end();
+    this.evidence.end();
+    setImmediate(() => this.emit("close", code, signal));
+  }
 
   private onControl(line: string): void {
     const cmd = JSON.parse(line) as { op: string; id: number; timeoutMs?: number };
@@ -308,17 +314,17 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
 
   it("rejects a started posture that does not match the expected runner uid", async () => {
     const fake = newFake({ uid: 12345 });
-    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture/);
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /posture; cleanup unconfirmed/);
   });
 
   it("rejects a started posture with nondumpable=false (the channel-boundary anchor)", async () => {
     const fake = newFake({ nondumpable: false });
-    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*nondumpable=false/s);
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /posture; cleanup unconfirmed/);
   });
 
   it("rejects a started posture with an unexpected capability bounding set", async () => {
     const fake = newFake({ capBoundingSet: "0xff" });
-    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /unsafe start posture.*capBoundingSet=0xff/s);
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake)), /posture; cleanup unconfirmed/);
   });
 });
 
@@ -534,8 +540,8 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
 
 describe("launchCodexEffectRoot: supervised command identity", () => {
   // PRD #1493 M3: the missing negative twin of launchCodexRoot's supported-profile gate.
-  // Both launcher guards stay EXACTLY as they are; this only pins the effect-root refusal.
-  it("REFUSES to launch (CodexUnsupportedProfileError) when the uid split is not active", async () => {
+  // Effect-root refusal is classified safely and preserves the profile cause internally.
+  it("REFUSES to launch with a typed profile classification when the uid split is not active", async () => {
     const fake = newFake({ uid: COMMAND_UID });
     await assert.rejects(
       launchCodexEffectRoot(
@@ -551,8 +557,8 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
         baseDeps(fake, { env: { PATH: "/usr/bin" }, resolveCommandUid: () => COMMAND_UID }),
       ),
       (err: unknown) => {
-        assert.ok(err instanceof CodexUnsupportedProfileError);
-        assert.match((err as Error).message, /effect roots require the A1 uid split/);
+        assert.ok(err instanceof Error && err.cause instanceof CodexUnsupportedProfileError);
+        assert.match(err.message, /profile_quarantine; cleanup unconfirmed/);
         return true;
       },
     );
@@ -633,7 +639,7 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
         { ...spec, env: { PATH: "/usr/bin:/bin", GIT_CONFIG_VALUE_0: "Authorization: Basic ZmFrZTpmYWtl" } },
         baseDeps(fake, { resolveWorkerUid: () => WORKER_UID }),
       ),
-      ResidueQuarantinedError,
+      (error: unknown) => error instanceof Error && error.cause instanceof ResidueQuarantinedError,
     );
     assert.equal(spawnCalls.length, 0);
     await launchCodexEffectRoot({ ...spec, env: { PATH: "/usr/bin:/bin" } }, baseDeps(fake, { resolveWorkerUid: () => WORKER_UID }));
@@ -949,7 +955,7 @@ describe("createHandle: tmpCleanup must carry meaning, not just shape", () => {
       event: "started", supervisorPid: fake.pid, childPid: fake.pid + 1, subreaper: true, nondumpable: true, uid: RUNNER_UID,
       liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true, tmpCleanup: valid,
     });
-    await assert.rejects(launched, /malformed tmpCleanup evidence/);
+    await assert.rejects(launched, /protocol_evidence; cleanup unconfirmed/);
   });
 
   it("surfaces a drained abnormal's retained tmpCleanup on the unclean dispose outcome", async () => {
@@ -1067,7 +1073,7 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     const fake = newFake({ autoStarted: false });
     await assert.rejects(
       launchCodexRoot(baseSpec(), baseDeps(fake, { deadlines: { started: 40, snapshot: 40, dispose: 40, exit: 40 } })),
-      /started deadline exceeded/,
+      /started_deadline; cleanup unconfirmed/,
     );
   });
 });
