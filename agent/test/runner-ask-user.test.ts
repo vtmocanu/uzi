@@ -358,6 +358,7 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
             supervisorPid: 200,
             transport: { stdin: child?.stdin ?? new PassThrough(), stdout: child?.stdout ?? new PassThrough(), stderr: child?.stderr ?? new PassThrough() },
             snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+            observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
             waitChild: async () => ({ event: "child_exit", ...(await terminal) }),
             dispose: async () => {
               if (child && child.exitCode === null) child.kill("SIGKILL");

@@ -94,11 +94,11 @@ func tickSupervisor(t *testing.T, children []int, reap func(int) (int, error)) (
 	sup.control = &controlReader{r: reader}
 	sup.seams.childReady = ready
 	var cleared atomic.Bool
-	sup.seams.directChildren = func() []int {
+	sup.seams.directChildren = func() ([]observationRow, error) {
 		if cleared.Load() {
-			return nil
+			return nil, nil
 		}
-		return children
+		return testChildRows(children), nil
 	}
 	sup.seams.adoptedTick = func() (<-chan time.Time, func()) { return ticks, func() {} }
 	sup.seams.reapAdopted = func(pid int) (int, error) {

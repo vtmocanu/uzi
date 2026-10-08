@@ -17,11 +17,11 @@ type (
 	// their intermediates die, so re-reading this each pass is what lets the
 	// drain adopt a code-mode host that setsid'd into its own group — a
 	// process-group kill would miss it.
-	childLister func() []int
+	childLister func() ([]observationRow, error)
 
 	// childKiller pidfd-opens the pid and sends SIGKILL. A vanished child
 	// (ESRCH) is not an error the drain records as killed.
-	childKiller func(pid int) error
+	childKiller func(child processIdentity) error
 
 	// childReaper is one Wait4(-1, WNOHANG|__WALL) step: (pid>0, nil) reaped a
 	// child; (0, nil) no child is ready right now; (0, ECHILD) no children
@@ -47,22 +47,30 @@ func drain(
 	killed := map[int]bool{}
 	reaped := map[int]bool{}
 	for {
-		for _, pid := range children() {
-			if err := kill(pid); err == nil {
-				killed[pid] = true
+		listed, listErr := children()
+		if listErr != nil {
+			return drainResult{State: stateUnconfirmed, Reason: "enumeration", Killed: sortedKeys(killed), Reaped: sortedKeys(reaped)}
+		}
+		for _, child := range listed {
+			if err := kill(child.processIdentity); err == nil {
+				killed[child.Pid] = true
 			}
 		}
 		for {
 			pid, err := reap()
 			if err != nil {
 				if errors.Is(err, syscall.ECHILD) {
-					if remaining := children(); len(remaining) > 0 {
+					remaining, err := children()
+					if err != nil {
+						return drainResult{State: stateUnconfirmed, Reason: "enumeration", Killed: sortedKeys(killed), Reaped: sortedKeys(reaped)}
+					}
+					if len(remaining) > 0 {
 						return drainResult{
 							State:    stateUnconfirmed,
 							Reason:   reasonEchildContradicted,
 							Killed:   sortedKeys(killed),
 							Reaped:   sortedKeys(reaped),
-							Children: remaining,
+							Children: identities(remaining),
 						}
 					}
 					return drainResult{
@@ -87,7 +95,7 @@ func drain(
 				Reason:   reasonDeadline,
 				Killed:   sortedKeys(killed),
 				Reaped:   sortedKeys(reaped),
-				Children: children(),
+				Children: identities(listed),
 			}
 		}
 		sleep()

@@ -20,6 +20,7 @@ type seams struct {
 	reapAdopted    func(pid int) (int, error)
 	reapChild      func(pid int) (code int, err error)
 	snapshot       func() ([]procRow, error)
+	observe        func(time.Time) observationEvidence
 	now            func() time.Time
 	sleep          func()
 	// tmpCleanup removes the command tmp, giving up at deadline, and reports
@@ -121,7 +122,12 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 			// so the controller can drain any remaining descendants explicitly.
 			childReady = nil
 		case <-ticks:
-			for _, pid := range s.seams.directChildren() {
+			children, err := s.seams.directChildren()
+			if err != nil {
+				continue
+			}
+			for _, child := range children {
+				pid := child.Pid
 				if primaryPending && pid == childPid {
 					continue
 				}
@@ -154,6 +160,13 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 			}
 
 			switch op.Op {
+			case opObserve:
+				result := observationEvidence{Event: opObserve, State: "unavailable", Reason: "unreadable", Processes: []observationRow{}}
+				if s.seams.observe != nil {
+					result = s.seams.observe(s.seams.now().Add(time.Duration(op.TimeoutMs) * time.Millisecond))
+				}
+				result.ID = op.ID
+				_ = s.ev.writeObservation(result)
 			case opSnapshot:
 				rows, serr := s.seams.snapshot()
 				if serr != nil {

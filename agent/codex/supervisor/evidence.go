@@ -148,3 +148,28 @@ func intSlice(v []int) []int {
 	}
 	return v
 }
+
+// writeObservation has a per-response budget; observations never spend the
+// lifecycle line allowance. The bounded walker caps all input rows first.
+func (e *evidence) writeObservation(v observationEvidence) error {
+	if len(v.Processes) > observationItems {
+		v.State = "unavailable"
+		v.Reason = "oversize"
+		v.Processes = []observationRow{}
+	}
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if len(payload)+1 > observationBytes {
+		v.State = "unavailable"
+		v.Reason = "oversize"
+		v.Processes = []observationRow{}
+		payload, err = json.Marshal(v)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = e.w.Write(append(payload, '\n'))
+	return err
+}

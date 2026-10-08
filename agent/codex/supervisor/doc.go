@@ -14,23 +14,41 @@
 // production port deliberately does NOT copy the fixture's fixed 30-second
 // lifetime, its noSignal control, its full-command-line snapshots, or its
 // unbounded/sensitive exception strings; per-op deadlines are bounded and the
-// only process detail exported is /proc/<pid>/comm.
+// only process-name detail exported is /proc/<pid>/comm.
 //
 // # Wire protocol
 //
 // CONTROL (fd 3, one JSON object per line, a line > 8192 bytes is abnormal):
 //
 //	{"op":"snapshot","id":<int>}
+//	{"op":"observe","id":<int>,"timeoutMs":<int>}   // read-only, bounded timeout
 //	{"op":"dispose","id":<int>,"timeoutMs":<int>}   // clamped to a bounded max
 //
-// EVIDENCE (fd 4, one JSON object per line, each <= 65536 bytes, <= 256 lines):
+// EVIDENCE (fd 4, one JSON object per line, each <= 65536 bytes;
+// <= 256 lifecycle lines, independent of repeated observations):
 //
 //	{"event":"started",...}
 //	{"event":"child_exit","code":<int>}
 //	{"event":"snapshot","id":<int>,"processes":[{pid,ppid,pgid,comm}...]}
+//	{"event":"observe","id":<int>,"state":"complete","supervisor":{pid,startTime},"root":{pid,startTime},"processes":[{pid,startTime,ppid,rss}...]}
+//	{"event":"observe","id":<int>,"state":"unavailable","reason":"unreadable"|"oversize"|"stale"|"timeout",...}
 //	{"event":"dispose","id":<int>,"state":"drained",...[,"tmpCleanup":{...}]}
 //	{"event":"dispose","id":<int>,"state":"unconfirmed","reason":"...",...}
 //	{"event":"abnormal","reason":"<short sanitized>","cleanup":{...}[,"tmpCleanup":{...}]}
+//
+// Observation reads at most 64 KiB of proc data, at most 4 KiB per file (plus
+// one overflow byte charged within the aggregate limit), 256 thread entries
+// across both passes, and 256 child IDs, queued descendants and process rows.
+// Rows contain RSS in bytes and exact decimal start-time ticks as strings;
+// no argv, environment, paths or process names are included. Two overlapping
+// passes validate identities and parent links, including adopted descendants.
+// A missing ancestry link is stale; an unreadable link rejects the whole sample.
+// An exited primary may be absent, while remaining adopted descendants are kept.
+// Observation never signals, waits, cleans up, or attests a drained tree.
+// Its unavailable response leaves control usable. Legacy snapshot errors still
+// take the abnormal best-effort drain path. The TS handle allows one pending
+// observation; busy, timeout and transport are local unavailable reasons, and
+// late request IDs are ignored without a retained tombstone set.
 //
 // The optional tmpCleanup field is {"state":"removed"|"retained","reason":"<word>"},
 // where reason is "" when removed and otherwise one of the fixed words

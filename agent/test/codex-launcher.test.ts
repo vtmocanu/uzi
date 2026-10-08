@@ -61,6 +61,7 @@ function baseSpec(overrides: Partial<CodexLaunchSpec> = {}): CodexLaunchSpec {
 }
 
 interface FakeOpts {
+  observeReply?: (id: number) => unknown;
   uid?: number;
   nondumpable?: boolean;
   capBoundingSet?: "0x0" | "0xc0" | "0xff";
@@ -93,9 +94,12 @@ class FakeSupervisor extends EventEmitter {
   private readonly exitDelayMs: number;
   private readonly tmpCleanup: { value: unknown } | undefined;
   readonly disposeTimeouts: number[] = [];
+  readonly observeRequests: number[] = [];
+  private readonly observeReply: ((id: number) => unknown) | undefined;
 
   constructor(opts: FakeOpts = {}) {
     super();
+    this.observeReply = opts.observeReply;
     this.stdio = [this.stdin, this.stdout, this.stderr, this.control, this.evidence];
     this.disposeState = opts.disposeState ?? "drained";
     this.singleDisposeResponse = opts.singleDisposeResponse ?? false;
@@ -122,7 +126,11 @@ class FakeSupervisor extends EventEmitter {
 
   private onControl(line: string): void {
     const cmd = JSON.parse(line) as { op: string; id: number; timeoutMs?: number };
-    if (cmd.op === "snapshot") {
+    if (cmd.op === "observe") {
+      this.observeRequests.push(cmd.id);
+      const result = this.observeReply?.(cmd.id);
+      if (result !== undefined) this.writeEvidence(result);
+    } else if (cmd.op === "snapshot") {
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
@@ -1081,6 +1089,7 @@ describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
       supervisorPid: 1,
       transport: { stdin: null, stdout: null, stderr: null },
       snapshot: () => Promise.reject(new Error("unused")),
+      observe: () => Promise.resolve({ event: "observe" as const, id: 1, state: "unavailable" as const, reason: "unreadable" as const }),
       waitChild: () => Promise.resolve({ event: "child_exit" as const, code: 0 }),
       dispose: () => { disposed.push(1); return Promise.resolve({ clean: true as const, event: { event: "dispose" as const, id: 1, state: "drained" as const } }); },
       failed: undefined,
@@ -1285,5 +1294,110 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     assert.match(tree, /^runner-owned tree creation failed \(exit 1\): mkdir: \*\*\*REDACTED\*\*\* exists$/);
     const write = await failure({ write: { status: 1, stderr: "cat: denied" } }, { redactDiagnostic });
     assert.match(write, /^runner-owned file write failed for \S+ \(exit 1\): cat: denied$/);
+  });
+});
+
+
+describe("launcher observation contract", () => {
+  const complete = (id: number) => ({
+    event: "observe", id, state: "complete",
+    supervisor: { pid: 4242, startTime: "9007199254740993" },
+    root: { pid: 4243, startTime: "9007199254740994" },
+    processes: [{ pid: 4243, startTime: "9007199254740994", ppid: 4242, rss: 8192 }],
+  });
+  it("serves more than 256 observations without spending the lifecycle budget", async () => {
+    const fake = newFake({ observeReply: complete });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    for (let i = 0; i < 300; i++) {
+      const outcome = await handle.observe();
+      assert.equal(outcome.state, "complete");
+      if (outcome.state === "complete") assert.equal(outcome.root.startTime, "9007199254740994");
+    }
+    assert.equal(fake.observeRequests.length, 300);
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("keeps unavailable responses and timed-out late replies nondestructive and single-flight", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const first = handle.observe(10);
+    const busy = await handle.observe(10);
+    assert.equal(busy.state, "unavailable");
+    if (busy.state === "unavailable") assert.equal(busy.reason, "busy");
+    assert.equal(fake.observeRequests.length, 1);
+    const timeout = await first;
+    assert.equal(timeout.state, "unavailable");
+    if (timeout.state === "unavailable") assert.equal(timeout.reason, "timeout");
+    const second = handle.observe(1000);
+    fake.writeEvidence(complete(fake.observeRequests[0]!));
+    // A late oversized reply is discarded too; it cannot settle the new request.
+    fake.evidence.write(`{"event":"observe","id":${fake.observeRequests[0]!},"payload":"${"x".repeat(100000)}"}\n`);
+    const id = fake.observeRequests[1]!;
+    fake.writeEvidence({ event: "observe", id, state: "unavailable", reason: "unreadable" });
+    const unavailable = await second;
+    assert.equal(unavailable.state, "unavailable");
+    if (unavailable.state === "unavailable") assert.equal(unavailable.reason, "unreadable");
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("rejects missing ancestry, identity drift, duplicates and malformed observations without poisoning control", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const request = async (mutate: (value: ReturnType<typeof complete>) => unknown) => {
+      const promise = handle.observe();
+      fake.writeEvidence(mutate(complete(fake.observeRequests.at(-1)!)));
+      return promise;
+    };
+    assert.equal((await request((v) => v)).state, "complete");
+    for (const mutate of [
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: "7" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, pid: 4244 } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, supervisor: { ...v.supervisor, pid: 4244 } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: "020" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: "18446744073709551616" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: 9007199254740994 } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: [{ ...v.processes[0]!, ppid: 4243 }] }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: [{ ...v.processes[0]!, ppid: 8888 }] }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: [...v.processes, ...v.processes] }),
+      (v: ReturnType<typeof complete>) => ({ ...v, supervisor: { ...v.supervisor, startTime: "5" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: Array(257).fill(v.processes[0]) }),
+      (v: ReturnType<typeof complete>) => ({ ...v, tmpCleanup: { state: "removed", reason: "" } }),
+    ]) {
+      const outcome = await request(mutate);
+      assert.equal(outcome.state, "unavailable");
+      if (outcome.state === "unavailable") assert.equal(outcome.reason, "stale");
+    }
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("bounds chunked and single-chunk oversized observation records before materialization", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    for (const chunked of [false, true]) {
+      const promise = handle.observe();
+      const prefix = `{"event":"observe","id":${fake.observeRequests.at(-1)!},"payload":"`;
+      if (chunked) {
+        fake.evidence.write(prefix);
+        for (let i = 0; i < 80; i++) fake.evidence.write("x".repeat(1024));
+        fake.evidence.write('"}\n');
+      } else fake.evidence.write(prefix + "x".repeat(100000) + '"}\n');
+      const outcome = await promise;
+      assert.equal(outcome.state, "unavailable");
+      if (outcome.state === "unavailable") assert.equal(outcome.reason, "oversize");
+    }
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("retains transport death as unavailable observation and unconfirmed disposal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const promise = handle.observe();
+    fake.exitWith(1);
+    const outcome = await promise;
+    assert.equal(outcome.state, "unavailable");
+    if (outcome.state === "unavailable") assert.equal(outcome.reason, "transport");
+    assert.equal((await handle.dispose()).clean, false);
   });
 });

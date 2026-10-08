@@ -31,20 +31,20 @@ func seqReaper(steps ...reapStep) childReaper {
 // then empty once exhausted.
 func seqChildren(slices ...[]int) childLister {
 	i := 0
-	return func() []int {
+	return func() ([]observationRow, error) {
 		if i < len(slices) {
 			s := slices[i]
 			i++
-			return s
+			return testChildRows(s), nil
 		}
-		return nil
+		return nil, nil
 	}
 }
 
 func recordingKiller() (childKiller, *[]int) {
 	var killed []int
-	return func(pid int) error {
-		killed = append(killed, pid)
+	return func(child processIdentity) error {
+		killed = append(killed, child.Pid)
 		return nil
 	}, &killed
 }
@@ -91,8 +91,8 @@ func TestDrainDeadlineUnconfirmed(t *testing.T) {
 		return tm
 	}
 	kill, _ := recordingKiller()
-	children := func() []int { return []int{10} } // never drains
-	reap := func() (int, error) { return 0, nil } // WNOHANG, never ready
+	children := func() ([]observationRow, error) { return testChildRows([]int{10}), nil } // never drains
+	reap := func() (int, error) { return 0, nil }                                         // WNOHANG, never ready
 
 	got := drain(deadline, clock, func() {}, children, kill, reap)
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline {
@@ -106,7 +106,7 @@ func TestDrainDeadlineUnconfirmed(t *testing.T) {
 func TestDrainEchildContradicted(t *testing.T) {
 	deadline, clock, sleep := farClock()
 	kill, _ := recordingKiller()
-	children := func() []int { return []int{11} } // still present when ECHILD claimed
+	children := func() ([]observationRow, error) { return testChildRows([]int{11}), nil } // still present when ECHILD claimed
 	reap := seqReaper(reapStep{0, syscall.ECHILD})
 
 	got := drain(deadline, clock, sleep, children, kill, reap)
@@ -161,4 +161,13 @@ func TestDrainIdempotentOnEmptyTree(t *testing.T) {
 	if len(*killed) != 0 {
 		t.Errorf("kill calls = %v, want none", *killed)
 	}
+}
+
+// testChildRows adapts scripted PID lists to the identity-carrying seam.
+func testChildRows(pids []int) []observationRow {
+	rows := make([]observationRow, 0, len(pids))
+	for _, pid := range pids {
+		rows = append(rows, observationRow{processIdentity: processIdentity{pid, "1"}})
+	}
+	return rows
 }

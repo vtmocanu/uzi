@@ -541,6 +541,7 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
         supervisorPid: 200,
         transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async () => ({ event: "child_exit", code: 0 }),
         dispose: async () => {
           effectDisposes += 1;
@@ -691,6 +692,7 @@ function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {
         supervisorPid: 200,
         transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async () => ({ event: "child_exit", code: 0 }),
         dispose: async () => {
           effectDisposes += 1;
@@ -4319,6 +4321,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
         supervisorPid: 10,
         transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async () => ({ event: "child_exit", code }),
         dispose: async () => {
           if (!disposed) { disposed = true; stdout.end(); stderr.end(); }
@@ -4423,6 +4426,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
         supervisorPid: 20,
         transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async () => new Promise(() => undefined),
         dispose: async () => {
           disposes += 1;
@@ -4465,6 +4469,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
         supervisorPid: 20,
         transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async (ms: number) => {
           state.waitMs = ms;
           await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -4945,6 +4950,7 @@ describe("CodexExecutor: retained command tmp is logged, never an unclean reap",
       supervisorPid: 40,
       transport: { stdin: new PassThrough(), stdout, stderr },
       snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
       waitChild: async () => ({ event: "child_exit", code: 0 }),
       dispose: async () => {
         disposes += 1;
@@ -5050,6 +5056,7 @@ describe("CodexExecutor: F1 registry teardown relocation", () => {
       supervisorPid: 30,
       transport: { stdin: null, stdout: null, stderr: null },
       snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
       waitChild: async () => ({ event: "child_exit", code: 0 }),
       dispose: async () => ({ clean: false, reason: "deadline" }),
       failed: undefined,
@@ -8531,6 +8538,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       supervisorPid: 60,
       transport: { stdin: new PassThrough(), stdout, stderr },
       snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
       waitChild: async () => ({ event: "child_exit", code: 0 }),
       dispose: async (): Promise<DisposeOutcome> => {
         if (!ended) { ended = true; stdout.end(); stderr.end(); }
@@ -11958,6 +11966,7 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
       supervisorPid: 70,
       transport: { stdin: new PassThrough(), stdout, stderr },
       snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
       waitChild: async () => {
         if (opts.stdout !== undefined) stdout.write(opts.stdout);
         return { event: "child_exit", code: 0 };

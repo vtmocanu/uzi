@@ -2,8 +2,6 @@ package main
 
 import (
 	"errors"
-	"os"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -45,75 +43,36 @@ func sanitizeComm(raw string) string {
 	return c
 }
 
-// childrenOf reads the direct children of pid via /proc/<pid>/task/*/children.
-func childrenOf(pid int) []int {
-	set := map[int]bool{}
-	taskDir := "/proc/" + strconv.Itoa(pid) + "/task"
-	entries, err := os.ReadDir(taskDir)
-	if err != nil {
-		return nil
-	}
-	for _, e := range entries {
-		data, err := os.ReadFile(taskDir + "/" + e.Name() + "/children")
-		if err != nil {
-			continue
-		}
-		for _, f := range strings.Fields(string(data)) {
-			if n, err := strconv.Atoi(f); err == nil {
-				set[n] = true
-			}
-		}
-	}
-	out := make([]int, 0, len(set))
-	for k := range set {
-		out = append(out, k)
-	}
-	sort.Ints(out)
-	return out
-}
-
-// readProcRow builds one sanitized snapshot row from /proc. ppid/pgid come from
-// stat; comm comes from the dedicated comm file. A row is dropped (ok=false) if
-// the process vanished mid-walk.
-func readProcRow(pid int) (procRow, bool) {
-	statData, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return procRow{}, false
-	}
-	ppid, pgid, err := parseStatPPidPgid(string(statData))
-	if err != nil {
-		return procRow{}, false
-	}
-	comm := ""
-	if commData, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm"); err == nil {
-		comm = sanitizeComm(string(commData))
-	}
-	return procRow{Pid: pid, PPid: ppid, Pgid: pgid, Comm: comm}, true
-}
-
-// walkDescendants returns the sanitized snapshot of every descendant of rootPid,
-// bounded at maxSnapshotDescendants to reject a hostile/large tree.
+// walkDescendants retains the legacy snapshot shape and destructive error path,
+// but uses the same bounded, identity-validated proc traversal as observation.
 func walkDescendants(rootPid int) ([]procRow, error) {
-	pending := childrenOf(rootPid)
-	visited := map[int]bool{}
-	rows := []procRow{}
-	for len(pending) > 0 {
-		pid := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		if visited[pid] {
-			continue
-		}
-		visited[pid] = true
-		if len(visited) > maxSnapshotDescendants {
-			return nil, errSnapshotTooLarge
-		}
-		row, ok := readProcRow(pid)
-		if !ok {
-			continue
-		}
-		rows = append(rows, row)
-		pending = append(pending, childrenOf(pid)...)
+	p := &observationProc{root: "/proc"}
+	root, err := p.row(rootPid)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Pid < rows[j].Pid })
+	observed, err := p.walk(root.processIdentity, root.processIdentity)
+	if err != nil {
+		return nil, err
+	}
+	if len(observed) > maxSnapshotDescendants {
+		return nil, errSnapshotTooLarge
+	}
+	rows := make([]procRow, 0, len(observed))
+	for _, row := range observed {
+		stat, err := p.read(strconv.Itoa(row.Pid) + "/stat")
+		if err != nil {
+			return nil, err
+		}
+		ppid, pgid, err := parseStatPPidPgid(string(stat))
+		if err != nil {
+			return nil, err
+		}
+		comm, err := p.read(strconv.Itoa(row.Pid) + "/comm")
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, procRow{Pid: row.Pid, PPid: ppid, Pgid: pgid, Comm: sanitizeComm(string(comm))})
+	}
 	return rows, nil
 }

@@ -1031,6 +1031,7 @@ describe("CodexCallbackBroker: issue #2048 command deadline through the real def
         supervisorPid: 20,
         transport: { stdin: new PassThrough(), stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async (ms: number) => {
           await new Promise<void>((resolve) => setTimeout(resolve, 10));
           throw new SupervisedChildExitTimeoutError(ms);

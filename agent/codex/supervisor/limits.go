@@ -30,6 +30,7 @@ const (
 
 // Control op names carried on fd 3.
 const (
+	opObserve  = "observe"
 	opSnapshot = "snapshot"
 	opDispose  = "dispose"
 )

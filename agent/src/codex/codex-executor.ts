@@ -3214,6 +3214,7 @@ export class CodexExecutor implements Executor {
             get failed() { return handle.failed; },
             get whenFailed() { return handle.whenFailed; },
             snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+            observe: (timeoutMs) => handle.observe(timeoutMs),
             waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
             dispose: async (timeoutMs) => {
               await settleDepsInstall();
@@ -4460,6 +4461,7 @@ export class HeldRunCommandCache implements RunCommandCache {
         supervisorPid: handle.supervisorPid,
         transport: handle.transport,
         snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+        observe: (timeoutMs) => handle.observe(timeoutMs),
         waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
         dispose: async (timeoutMs) => {
           let outcome: DisposeOutcome;

@@ -40,6 +40,8 @@ func realMain(args []string) int {
 	if !ok {
 		return 2
 	}
+	supervisorIdentity, _ := readIdentity(os.Getpid())
+	primaryIdentity, _ := readIdentity(childPid)
 	sup := &supervisor{
 		ev:      ev,
 		control: &controlReader{r: os.NewFile(3, "control")},
@@ -54,10 +56,13 @@ func realMain(args []string) int {
 				return ticker.C, ticker.Stop
 			},
 			reapAdopted: realReapAdopted,
-			snapshot:    func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
-			now:         time.Now,
-			sleep:       func() { time.Sleep(2 * time.Millisecond) },
-			tmpCleanup:  tmpCleanupFor(tmp),
+			observe: func(deadline time.Time) observationEvidence {
+				return observe("/proc", supervisorIdentity, primaryIdentity, deadline)
+			},
+			snapshot:   func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
+			now:        time.Now,
+			sleep:      func() { time.Sleep(2 * time.Millisecond) },
+			tmpCleanup: tmpCleanupFor(tmp),
 		},
 	}
 	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
@@ -440,18 +445,25 @@ func launchChild(childArgv []string) (int, error) {
 }
 
 // selfDirectChildren lists the supervisor's current direct children.
-func selfDirectChildren() []int {
-	return childrenOf(os.Getpid())
+func selfDirectChildren() ([]observationRow, error) {
+	return (&observationProc{root: "/proc", deadline: time.Now().Add(time.Second)}).direct(os.Getpid())
 }
 
 // realKill pidfd-opens the pid and delivers SIGKILL. A vanished process (ESRCH)
 // is returned as an error so the drain does not record it as killed.
-func realKill(pid int) error {
-	fd, err := unix.PidfdOpen(pid, 0)
+func realKill(child processIdentity) error {
+	fd, err := unix.PidfdOpen(child.Pid, 0)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
+	live, err := readIdentity(child.Pid)
+	if err != nil {
+		return err
+	}
+	if live != child {
+		return errObservationStale
+	}
 	return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 }
 

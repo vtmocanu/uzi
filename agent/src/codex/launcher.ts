@@ -14,8 +14,12 @@
 //
 // WIRE PROTOCOL (the Go supervisor emits/consumes exactly this — we implement the
 // launcher side to match; we invent no fields):
-//   control  → fd3 (we WRITE): {"op":"snapshot","id"} / {"op":"dispose","id","timeoutMs"}
-//   evidence ← fd4 (we READ):  started / snapshot / dispose(drained|unconfirmed) / abnormal
+//   control  → fd3 (we WRITE): snapshot / observe / dispose (request id, bounded timeout)
+//   evidence ← fd4 (we READ):  started / snapshot / observe(complete|unavailable) / dispose / abnormal
+// Observe is read-only, identity-bearing RSS evidence with one pending request.
+// Its 64 KiB records and 256 rows are bounded independently of lifecycle lines;
+// unavailable/late samples do not drain or poison the root. Legacy snapshot
+// errors retain the destructive abnormal drain path. Observe proves no disposal.
 //            (a drained dispose, or an abnormal whose cleanup drained, may carry an
 //             optional, strictly validated tmpCleanup; on any other event it is a breach)
 //   argv: <supervisor> --expect-uid <N> [--cleanup-token <uuid>] -- <child> <argv...>
@@ -35,7 +39,6 @@ import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
 import {
@@ -246,6 +249,63 @@ export interface SnapshotEvidence {
   readonly id: number;
   readonly processes: ReadonlyArray<{ readonly pid: number; readonly ppid: number; readonly pgid: number; readonly comm: string }>;
 }
+export interface ObservationIdentity {
+  readonly pid: number;
+  /** Exact decimal kernel ticks, never rounded through a JS number. */
+  readonly startTime: string;
+}
+export type ObservationReason = "unreadable" | "oversize" | "stale" | "timeout" | "busy" | "transport";
+export type ObservationOutcome =
+  | {
+    readonly event: "observe";
+    readonly id: number;
+    readonly state: "complete";
+    readonly supervisor: ObservationIdentity;
+    readonly root: ObservationIdentity;
+    readonly processes: ReadonlyArray<ObservationIdentity & { readonly ppid: number; readonly rss: number }>;
+  }
+  | { readonly event: "observe"; readonly id: number; readonly state: "unavailable"; readonly reason: ObservationReason };
+
+function validObservation(value: Record<string, unknown>, started: StartedEvidence): ObservationOutcome | undefined {
+  const identity = (v: unknown): v is ObservationIdentity => {
+    if (typeof v !== "object" || v === null) return false;
+    const r = v as Record<string, unknown>;
+    return Number.isSafeInteger(r.pid) && Number(r.pid) > 0
+      && typeof r.startTime === "string" && /^[1-9][0-9]{0,19}$/.test(r.startTime)
+      && BigInt(r.startTime) <= 18446744073709551615n;
+  };
+  if (!Number.isSafeInteger(value.id) || Number(value.id) <= 0) return undefined;
+  if (value.state === "unavailable") {
+    if (!["unreadable", "oversize", "stale", "timeout"].includes(String(value.reason))) return undefined;
+    return { event: "observe", id: Number(value.id), state: "unavailable", reason: value.reason as ObservationReason };
+  }
+  if (value.state !== "complete" || !identity(value.supervisor) || !identity(value.root)
+    || value.supervisor.pid !== started.supervisorPid || value.root.pid !== started.childPid
+    || !Array.isArray(value.processes) || value.processes.length > 256 || "reason" in value) return undefined;
+  const rows = new Map<number, ObservationIdentity & { ppid: number; rss: number }>();
+  for (const candidate of value.processes) {
+    if (!identity(candidate)) return undefined;
+    const row = candidate as ObservationIdentity & { ppid: number; rss: number };
+    if (!Number.isSafeInteger(row.ppid) || row.ppid <= 0
+      || !Number.isSafeInteger(row.rss) || row.rss < 0 || rows.has(row.pid) || row.pid === value.supervisor.pid) return undefined;
+    rows.set(row.pid, row);
+  }
+  const primary = rows.get(value.root.pid);
+  if (primary && primary.startTime !== value.root.startTime) return undefined;
+  for (const row of rows.values()) {
+    let parent = row.ppid;
+    const visited = new Set<number>([row.pid]);
+    while (parent !== value.supervisor.pid) {
+      if (visited.has(parent)) return undefined;
+      visited.add(parent);
+      const link = rows.get(parent);
+      if (!link) return undefined;
+      parent = link.ppid;
+    }
+  }
+  return value as unknown as ObservationOutcome;
+}
+
 export interface ChildExitEvidence {
   readonly event: "child_exit";
   readonly code: number;
@@ -326,6 +386,8 @@ export interface CodexRootHandle {
   /** The app-server TRANSPORT (fds 0/1/2) — a caller speaks app-server JSONL RPC here. */
   readonly transport: { readonly stdin: Writable | null; readonly stdout: Readable | null; readonly stderr: Readable | null };
   snapshot(timeoutMs?: number): Promise<SnapshotEvidence>;
+  /** Read-only, bounded RSS sample; unavailable never attests disposal. */
+  observe(timeoutMs?: number): Promise<ObservationOutcome>;
   /** Await the supervised primary child's normalized terminal status. */
   waitChild(timeoutMs?: number): Promise<ChildExitEvidence>;
   dispose(timeoutMs?: number): Promise<DisposeOutcome>;
@@ -522,6 +584,7 @@ function withOwnedTreeCleanup(
     supervisorPid: handle.supervisorPid,
     transport: handle.transport,
     snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+    observe: (timeoutMs) => handle.observe(timeoutMs),
     waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
     dispose: async (timeoutMs) => {
       const outcome = await handle.dispose(timeoutMs);
@@ -905,23 +968,45 @@ async function createHandle(
     }
     for (const p of pending.values()) p.reject(failure);
     pending.clear();
+    if (observation) settleObservation(unavailable(observation.id, "transport"));
     // Closing the trusted control endpoint makes the real supervisor take its abnormal
     // controller-loss path and perform a bounded best-effort drain. The evidence channel
     // is already untrusted/unavailable on these paths, so no clean result is inferred.
     try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* primary failure already recorded */ }
   }
 
-  const lines = createInterface({ input: evidence });
-  lines.on("line", (line) => {
-    lineCount += 1;
-    if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); lines.close(); return; }
-    if (Buffer.byteLength(line) > MAX_EVIDENCE_LINE_BYTES) { fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`)); return; }
+  let observation: { id: number; resolve: (outcome: ObservationOutcome) => void; timer: ReturnType<typeof setTimeout> } | undefined;
+  let observationIdentity: { supervisor: string; root: string } | undefined;
+  const unavailable = (id: number, reason: ObservationReason): ObservationOutcome => ({ event: "observe", id, state: "unavailable", reason });
+  function settleObservation(outcome: ObservationOutcome): void {
+    if (!observation || observation.id !== outcome.id) return;
+    const current = observation;
+    observation = undefined;
+    clearTimeout(current.timer);
+    current.resolve(outcome);
+  }
+  const stopLines = readBoundedRecords(evidence, MAX_EVIDENCE_LINE_BYTES, (line) => {
     let value: unknown;
     try { value = JSON.parse(line); } catch { fail(new TrustedExecutionRefusal("malformed evidence line (not JSON)")); return; }
+    const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+    if (record?.event !== "observe") {
+      lineCount += 1;
+      if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); stopLines(); return; }
+    }
     dispatch(value);
+  }, (why, prefix) => {
+    // Oversized observation records are discarded through the next newline.
+    // Only the bounded prefix is inspected; no oversized text is materialized.
+    if (why === "oversized line" && /^\s*\{\s*"event"\s*:\s*"observe"[,}]/.test(prefix)) {
+      const replyId = /^\s*\{\s*"event"\s*:\s*"observe"\s*,\s*"id"\s*:\s*([0-9]+)(?=\s*[,}])/.exec(prefix);
+      if (observation && replyId && Number(replyId[1]) === observation.id) {
+        settleObservation(unavailable(observation.id, "oversize"));
+      }
+      return;
+    }
+    fail(new TrustedExecutionRefusal(why === "oversized line" ? `oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)` : `evidence ${why}`));
   });
-  lines.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err })));
-  lines.on("close", () => {
+  evidence.on("end", () => {
     if (failure || cleanDisposed || exited) return;
     if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
   });
@@ -930,7 +1015,7 @@ async function createHandle(
   function dispatch(value: unknown): void {
     if (typeof value !== "object" || value === null) { fail(new TrustedExecutionRefusal("evidence line is not a JSON object")); return; }
     const record = value as Record<string, unknown>;
-    if ("tmpCleanup" in record && (!tmpCleanupAllowed(record) || !isValidTmpCleanup(record.tmpCleanup))) {
+    if (record.event !== "observe" && "tmpCleanup" in record && (!tmpCleanupAllowed(record) || !isValidTmpCleanup(record.tmpCleanup))) {
       fail(new TrustedExecutionRefusal("malformed tmpCleanup evidence"));
       return;
     }
@@ -955,6 +1040,22 @@ async function createHandle(
         }
         startedEvent = ev;
         resolveStarted(ev);
+        return;
+      }
+      case "observe": {
+        // One outstanding request, no tombstone set: every other request ID is
+        // ignored, including timed-out replies and duplicate replies.
+        if (!observation || record.id !== observation.id) return;
+        const outcome = startedEvent && !("tmpCleanup" in record) ? validObservation(record, startedEvent) : undefined;
+        if (!outcome) { settleObservation(unavailable(observation.id, "stale")); return; }
+        if (outcome.state === "complete") {
+          if (observationIdentity && (observationIdentity.supervisor !== outcome.supervisor.startTime
+            || observationIdentity.root !== outcome.root.startTime)) {
+            settleObservation(unavailable(observation.id, "stale")); return;
+          }
+          observationIdentity = { supervisor: outcome.supervisor.startTime, root: outcome.root.startTime };
+        }
+        settleObservation(outcome);
         return;
       }
       case "snapshot":
@@ -1018,6 +1119,18 @@ async function createHandle(
       if (failure) { reject(failure); return; }
       pending.set(id, { resolve, reject });
       if (!writeControl(frame)) { pending.delete(id); reject(new TrustedExecutionRefusal("control write failure (channel unavailable)")); }
+    });
+  }
+
+  function observe(timeoutMs = deadlines.snapshot): Promise<ObservationOutcome> {
+    if (observation) return Promise.resolve(unavailable(observation.id, "busy"));
+    const id = nextId++;
+    if (failure || exited || control.destroyed || control.writableEnded) return Promise.resolve(unavailable(id, "transport"));
+    const budget = Number.isFinite(timeoutMs) ? Math.max(0, Math.min(10000, timeoutMs)) : 0;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => settleObservation(unavailable(id, "timeout")), budget);
+      observation = { id, resolve, timer };
+      if (!writeControl({ op: "observe", id, timeoutMs: Math.floor(budget) })) settleObservation(unavailable(id, "transport"));
     });
   }
 
@@ -1120,7 +1233,7 @@ async function createHandle(
     startedEvent = await withDeadline(startedPromise, deadlines.started, "started");
   } catch (error) {
     try { if (!control.destroyed) control.end(); } catch { /* cleanup error is separate from the primary failure */ }
-    lines.close();
+    stopLines();
     throw error;
   }
 
@@ -1130,6 +1243,7 @@ async function createHandle(
     supervisorPid: child.pid,
     transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
     snapshot,
+    observe,
     waitChild,
     dispose,
     get failed() { return failure; },
@@ -1240,6 +1354,47 @@ function spawnStandaloneMode(
   });
 }
 
+/** Frame bytes before decoding or JSON parsing. The retained fragment is at
+ * most limit bytes even for one huge chunk or an unterminated record. After
+ * overflow, discard through newline, then resume at the next bounded record. */
+function readBoundedRecords(
+  stream: Readable, limit: number, onLine: (line: string) => void,
+  onBreach: (why: string, prefix: string) => void,
+): () => void {
+  let pending = Buffer.alloc(0);
+  let dropping = false;
+  let stopped = false;
+  const data = (chunk: Buffer | string): void => {
+    if (stopped) return;
+    const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    let offset = 0;
+    while (offset < bytes.length && !stopped) {
+      const nl = bytes.indexOf(0x0a, offset);
+      const end = nl < 0 ? bytes.length : nl;
+      if (!dropping) {
+        const size = end - offset;
+        if (size > limit - pending.length) {
+          const room = limit - pending.length;
+          const prefix = Buffer.concat([pending, bytes.subarray(offset, offset + room)]).toString("utf8");
+          pending = Buffer.alloc(0);
+          dropping = true;
+          onBreach("oversized line", prefix);
+        } else {
+          pending = Buffer.concat([pending, bytes.subarray(offset, end)]);
+          if (nl >= 0) { const line = pending.toString("utf8"); pending = Buffer.alloc(0); onLine(line); }
+        }
+      }
+      if (nl < 0) break;
+      dropping = false;
+      offset = nl + 1;
+    }
+  };
+  stream.on("data", data);
+  stream.on("end", () => { if (!stopped && (pending.length > 0 || dropping)) onBreach("truncated line", ""); });
+  stream.on("error", () => { if (!stopped) onBreach("stream error", ""); });
+  return () => { stopped = true; pending = Buffer.alloc(0); stream.off("data", data); };
+}
+
 /** Split a mode's stdout into bounded lines. Any breach (an over-long line, more lines
  *  than the mode may print, a trailing partial line, a stream error) is reported once and
  *  every later byte is ignored, so garbage can never be half-believed. */
@@ -1249,7 +1404,6 @@ function readModeLines(
   onLine: (line: string) => void,
   onBreach: (why: string) => void,
 ): void {
-  let pending = Buffer.alloc(0);
   let lines = 0;
   let broken = false;
   const breach = (why: string): void => {
@@ -1257,24 +1411,12 @@ function readModeLines(
     broken = true;
     onBreach(why);
   };
-  stream.on("data", (chunk: Buffer | string) => {
+  readBoundedRecords(stream, MAX_MODE_LINE_BYTES, (line) => {
     if (broken) return;
-    pending = Buffer.concat([pending, typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk]);
-    for (;;) {
-      const nl = pending.indexOf(0x0a);
-      if (nl < 0) break;
-      const line = pending.subarray(0, nl);
-      pending = pending.subarray(nl + 1);
-      if (line.length > MAX_MODE_LINE_BYTES) { breach("oversized line"); return; }
-      lines += 1;
-      if (lines > maxLines) { breach("too many lines"); return; }
-      onLine(line.toString("utf8"));
-      if (broken) return;
-    }
-    if (pending.length > MAX_MODE_LINE_BYTES) breach("oversized line");
-  });
-  stream.on("end", () => { if (pending.length > 0) breach("truncated line"); });
-  stream.on("error", () => breach("stream error"));
+    lines += 1;
+    if (lines > maxLines) { breach("too many lines"); return; }
+    onLine(line);
+  }, breach);
 }
 
 /** Parse one line as a JSON object with EXACTLY `keys`; undefined on anything else. */

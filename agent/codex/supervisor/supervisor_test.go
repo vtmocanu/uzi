@@ -62,8 +62,8 @@ func newTestSupervisor(frames string, reap childReaper) (*supervisor, *bytes.Buf
 		control: &controlReader{r: strings.NewReader(frames)},
 		seams: seams{
 			supervisorPid:  1,
-			directChildren: func() []int { return nil },
-			kill:           func(int) error { return nil },
+			directChildren: func() ([]observationRow, error) { return nil, nil },
+			kill:           func(processIdentity) error { return nil },
 			reap:           reap,
 			reapChild:      func(int) (int, error) { return 0, nil },
 			snapshot:       func() ([]procRow, error) { return nil, nil },
