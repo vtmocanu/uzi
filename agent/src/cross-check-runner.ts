@@ -8,6 +8,9 @@ import type { Logger } from "./log.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Outbox } from "./outbox.js";
 import { CodexCrossCheck, CrossCheckMalformedError } from "./codex/cross-check.js";
+import type { SdkQueryFn } from "./sdk-executor.js";
+import { ClaudeCrossCheck } from "./claude-cross-check.js";
+import { SECRET_PATH_PREFIXES } from "./guardrails.js";
 import { selectCodexBinding } from "./codex/select.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import { ChatSteering } from "./steering.js";
@@ -35,15 +38,26 @@ interface CrossCheckRunnerOptions {
   outboxTerminalMaxBytes?: number;
   gapFillMax?: number;
   model?: Pick<CodexCrossCheck, "run">;
+  /** The Claude checker (PRD #2460), used for a claim that carries only an Anthropic credential. */
+  claudeModel?: Pick<ClaudeCrossCheck, "run">;
+  /** Worker credential paths the Claude checker's path guard denies (default: the built-in prefix). */
+  secretPaths?: readonly string[];
+  /** Test seam for the default Claude checker's SDK query (UZI_EXECUTOR=stub injects the canned one). */
+  claudeQueryFn?: SdkQueryFn;
 }
 
 /** Report-only plan checker. The child owns its checkout, usage and terminal journal. */
 export class CrossCheckRunner {
   private readonly model: Pick<CodexCrossCheck, "run">;
+  private readonly claudeModel: Pick<ClaudeCrossCheck, "run">;
   private readonly terminalDeps;
   constructor(private readonly client: WorkerClient, private readonly git: GitCache,
     private readonly log: Logger, private readonly opts: CrossCheckRunnerOptions = {}) {
     this.model = opts.model ?? new CodexCrossCheck(client, log);
+    this.claudeModel = opts.claudeModel ?? new ClaudeCrossCheck(log, {
+      secretPaths: opts.secretPaths ?? SECRET_PATH_PREFIXES,
+      ...(opts.claudeQueryFn ? { queryFn: opts.claudeQueryFn } : {}),
+    });
     this.terminalDeps = makeTerminalOutboxDeps(opts.outbox, client, {
       gapFillMax: opts.gapFillMax ?? 10_000,
       terminalMaxBytes: opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024), log,
@@ -76,7 +90,13 @@ export class CrossCheckRunner {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
       const candidate = claim.cross_check;
-      if (claim.kind !== "cross_check" || selectCodexBinding(claim.secrets).kind !== "codex"
+      // Single-family custody: a Codex checker holds only a Codex credential, a Claude checker only
+      // the Anthropic token (PRD #2460); a claim carrying both, or neither, is invalid.
+      const family = selectCodexBinding(claim.secrets).kind;
+      const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token);
+      const checker = family === "codex" ? (hasAnthropic ? undefined : this.model)
+        : hasAnthropic ? this.claudeModel : undefined;
+      if (claim.kind !== "cross_check" || !checker
         || !candidate || candidate.stage !== "plan" || !Number.isInteger(candidate.round) || candidate.round < 1 || candidate.round > 5
         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)) throw new Error("invalid plan checker claim");
       const deadline = Date.parse(candidate.deadline_at);
@@ -98,7 +118,7 @@ export class CrossCheckRunner {
       home = await fs.mkdtemp(path.join(this.opts.homeRoot ?? os.tmpdir(), "uzi-cross-check-"));
       if (uidSplitActive()) await fs.chmod(home, 0o2770);
       reason = "model_error";
-      const text = await this.model.run(claim, checkout, home, cancel.signal, async (payload) => {
+      const text = await checker!.run(claim, checkout, home, cancel.signal, async (payload) => {
         await this.client.postMessages(runId, [{ seq: ++seq, kind: "status", agent: "cross-checker", payload }], generation);
       });
       cancel.signal.throwIfAborted();
