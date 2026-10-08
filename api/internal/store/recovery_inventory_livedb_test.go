@@ -93,6 +93,7 @@ func TestRecoveryInventoryClaimLiveDB(t *testing.T) {
 			}
 			exec("UPDATE recovery_captures SET state='available',expires_at=now()+interval '1 hour' WHERE id=$1", cap.ID)
 			exec("UPDATE runs SET status='completed',branch='agent/issue-1' WHERE id=$1", run)
+			testPrerequisiteSQLGuards(t, ctx, pool, cap, hold, worker, user, run)
 			exec("UPDATE workers SET ephemeral=true,ephemeral_run_id=$2 WHERE id=$1", worker, run)
 			if n, err := q.EnterEphemeralLease(ctx, store.EnterEphemeralLeaseParams{WorkerID: worker, RunID: run}); err != nil || n != 0 {
 				t.Fatalf("open hold lease: %d %v", n, err)

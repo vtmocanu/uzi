@@ -32,7 +32,8 @@ SET manifest_bound = true,
     prerequisite_shas = $4,
     updated_at = now()
 WHERE id = $5
-  AND (manifest_bound = false OR (byte_size = $1 AND checksum = $2))
+  AND (manifest_bound = false OR (byte_size = $1 AND checksum = $2
+    AND COALESCE(prerequisite_shas, '{}'::text[]) = COALESCE($4::text[], '{}'::text[])))
 RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds
 `
 
@@ -50,7 +51,7 @@ type BindCaptureManifestParams struct {
 // Custody holds are opened atomically with the claim (runtime.sql ClaimRun); everything
 // below operates on the already-open hold and its captures.
 // D2/D4: compare-and-set the byte manifest ONCE. The first bind (manifest_bound=false)
-// always wins; a retry with the SAME byte_size+checksum is idempotent (the second
+// always wins; a retry with the SAME byte_size+checksum+ordered prerequisites is idempotent (the second
 // disjunct matches and re-stamps updated_at); a DIFFERENT manifest under the same
 // capture_id matches neither disjunct and returns zero rows (a conflict the caller must
 // surface, never an overwrite of bound bytes). Manifest size/checksum/prerequisites need
@@ -1580,6 +1581,7 @@ UPDATE recovery_captures c SET local_replica_worker_id = $1::uuid,
 WHERE c.id = $3 AND c.hold_id = $4 AND c.original_worker_id = $1::uuid
   AND c.source_sha = $5 AND c.coverage_digest = $6
   AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+  AND COALESCE(cardinality(c.prerequisite_shas), 0) = 0
   AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.id = c.hold_id
     AND h.inventory_guarded AND h.state = 'open' AND h.live_worker_id = $1::uuid)
 `
@@ -1755,6 +1757,7 @@ WHERE h.id = $6 AND h.run_id = $7 AND h.user_id = $8
         AND c.original_worker_id = h.original_worker_id AND c.source_sha = $3::text
         AND c.coverage_digest = $4::text
         AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+        AND COALESCE(cardinality(c.prerequisite_shas), 0) = 0
         AND c.local_replica_worker_id = h.original_worker_id AND c.ready_retention_seconds > 0))
     OR ($1::text = 'settled' AND $2::uuid IS NULL
       AND $3::text IS NULL

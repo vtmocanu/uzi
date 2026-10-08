@@ -168,6 +168,7 @@ type lockedCapture struct {
 	expiresAt     pgtype.Timestamptz
 	reason        pgtype.Text
 	reservedBytes pgtype.Int8
+	prerequisites []string
 }
 
 // Upload streams one octet-stream bundle into AAD-sealed ~1 MiB chunks and commits them
@@ -238,11 +239,11 @@ func (s *Service) upload(ctx context.Context, wkr store.Worker, runID, captureID
 func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest) (lockedCapture, error) {
 	var lc lockedCapture
 	err := tx.QueryRow(ctx, `SELECT c.run_id, c.user_id, c.original_worker_id, c.state, c.manifest_bound,
-			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes
+			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes, c.prerequisite_shas
 		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id = c.hold_id
 		WHERE c.id = $1 FOR UPDATE OF c`, captureID).Scan(
 		&lc.runID, &lc.userID, &lc.origWorker, &lc.state, &lc.bound,
-		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes)
+		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes, &lc.prerequisites)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return lockedCapture{}, ErrCaptureNotFound
@@ -258,6 +259,12 @@ func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captur
 	if lc.holdState != "open" {
 		return lockedCapture{}, ErrNotAuthorized
 	}
+	// The trusted worker declaration is immutable, including on receipt-only retries.
+	// slices.Equal preserves order and treats omitted and empty lists alike.
+	if lc.bound && !slices.Equal(lc.prerequisites, manifest.PrerequisiteShas) {
+		return lockedCapture{}, ErrManifestConflict
+	}
+	// Available receipts retain their existing byte/checksum authority.
 	if lc.state != "available" && lc.bound &&
 		(lc.byteSize.Int64 != manifest.ByteSize || !strings.EqualFold(lc.checksum.String, manifest.Checksum)) {
 		return lockedCapture{}, ErrManifestConflict

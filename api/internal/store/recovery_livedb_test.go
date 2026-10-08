@@ -180,7 +180,7 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 	manifest := store.BindCaptureManifestParams{
 		ID: cap1.ID, ByteSize: pgtype.Int8{Int64: 4096, Valid: true},
 		Checksum: pgtype.Text{String: "sha256:abc", Valid: true}, ChunkCount: pgtype.Int4{Int32: 2, Valid: true},
-		PrerequisiteShas: []string{"base1"},
+		PrerequisiteShas: []string{"base1", "base2"},
 	}
 	bound, err := q.BindCaptureManifest(ctx, manifest)
 	if err != nil {
@@ -198,6 +198,48 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 	conflict.Checksum = pgtype.Text{String: "sha256:DIFFERENT", Valid: true}
 	if _, err := q.BindCaptureManifest(ctx, conflict); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("BindCaptureManifest(conflicting) = %v, want pgx.ErrNoRows (no overwrite of bound bytes)", err)
+	}
+
+	for _, prerequisites := range [][]string{{"base2"}, {"base2", "base1"}, {"BASE1", "base2"}, nil, {}} {
+		conflict := manifest
+		conflict.PrerequisiteShas = prerequisites
+		if _, err := q.BindCaptureManifest(ctx, conflict); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("changed prerequisites %v: %v, want CAS conflict", prerequisites, err)
+		}
+	}
+	// An empty declaration has one identity, whether omitted or explicitly empty.
+	emptyTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = emptyTx.Rollback(ctx) }()
+	emptyQ := store.New(emptyTx)
+	emptyReserve := reserve
+	emptyReserve.IdempotencyKey = "empty-manifest"
+	emptyCap, err := emptyQ.ReserveCaptureExact(ctx, emptyReserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyManifest := manifest
+	emptyManifest.ID, emptyManifest.PrerequisiteShas = emptyCap.ID, nil
+	if _, err := emptyQ.BindCaptureManifest(ctx, emptyManifest); err != nil {
+		t.Fatal(err)
+	}
+	emptyManifest.PrerequisiteShas = []string{}
+	if _, err := emptyQ.BindCaptureManifest(ctx, emptyManifest); err != nil {
+		t.Fatalf("nil to empty CAS: %v", err)
+	}
+	emptyManifest.PrerequisiteShas = nil
+	if _, err := emptyQ.BindCaptureManifest(ctx, emptyManifest); err != nil {
+		t.Fatalf("empty to nil CAS: %v", err)
+	}
+	emptyManifest.PrerequisiteShas = []string{"base1"}
+	if _, err := emptyQ.BindCaptureManifest(ctx, emptyManifest); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("empty to nonempty CAS: %v", err)
+	}
+
+	if err := emptyTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	// ── (b cont.) chunks + ready + read-back. ──

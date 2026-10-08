@@ -31,7 +31,12 @@ func inventoryGit(t *testing.T, dir string, args ...string) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: fixed Git binary; args are test-only literal operations and owned fixture paths/SHAs, no shell.
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GIT_") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
@@ -41,6 +46,11 @@ func inventoryGit(t *testing.T, dir string, args ...string) string {
 
 // inventoryBundle anchors both unrelated roots under a synthetic aggregate Q with the H2 tree.
 func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
+	data, q, h, h2, _, _ := inventoryBundleFixture(t, false)
+	return data, q, h, h2
+}
+
+func inventoryBundleFixture(t *testing.T, thin bool) ([]byte, string, string, string, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	inventoryGit(t, dir, "init")
@@ -54,6 +64,14 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 		}
 		inventoryGit(t, dir, "add", "work.txt")
 		inventoryGit(t, dir, "commit", "-m", "inventory fixture")
+	}
+	var forge, prerequisite string
+	if thin {
+		write("published base content\n")
+		prerequisite = inventoryGit(t, dir, "rev-parse", "HEAD")
+		forge = filepath.Join(t.TempDir(), "forge.git")
+		// Publish only the base, before private roots and aggregate exist.
+		inventoryGit(t, dir, "clone", "--bare", "--no-local", dir, forge)
 	}
 	write("original H content\n")
 	h := inventoryGit(t, dir, "rev-parse", "HEAD")
@@ -71,7 +89,11 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 	}
 	inventoryGit(t, dir, "update-ref", "refs/heads/recovered-source", q)
 	path := filepath.Join(dir, "aggregate.bundle")
-	inventoryGit(t, dir, "bundle", "create", path, "refs/heads/recovered-source")
+	if thin {
+		inventoryGit(t, dir, "bundle", "create", path, "refs/heads/recovered-source", "^"+prerequisite)
+	} else {
+		inventoryGit(t, dir, "bundle", "create", path, "refs/heads/recovered-source")
+	}
 	if got := inventoryGit(t, dir, "bundle", "list-heads", path); got != q+" refs/heads/recovered-source" {
 		t.Fatalf("bundle refs = %q, want only recovered-source at Q", got)
 	}
@@ -79,17 +101,22 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return data, q, h, h2
+	return data, q, h, h2, forge, prerequisite
 }
 
 func inventoryImport(t *testing.T, data []byte, h, h2 string) {
 	t.Helper()
 	dir := t.TempDir()
+	inventoryGit(t, dir, "init")
+	inventoryImportInto(t, dir, data, h, h2)
+}
+
+func inventoryImportInto(t *testing.T, dir string, data []byte, h, h2 string) {
+	t.Helper()
 	path := filepath.Join(dir, "download.bundle")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	inventoryGit(t, dir, "init")
 	inventoryGit(t, dir, "bundle", "verify", path)
 	inventoryGit(t, dir, "fetch", path, "refs/heads/recovered-source:refs/heads/recovered-source")
 	for _, tc := range []struct{ sha, content string }{
