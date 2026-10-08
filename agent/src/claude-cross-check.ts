@@ -51,11 +51,49 @@ const REASON_PATTERN = "denied: a Glob or Grep pattern must be relative to the c
 // An absolute or home-relative pattern, or a `..` segment, at the start or after a `/`, `{` or `,`
 // (brace alternatives expand to separate patterns).
 const ESCAPING_PATTERN = /(^|[{,])\s*[/\\~]|(^|[/\\{,])\.\.([/\\},]|$)/;
-// Brace syntax can assemble a `..` segment from pieces (`.{.,}/*` expands to `../*`), so the
-// pattern is also screened with its brace punctuation removed. This over-approximates every
-// expansion and may deny a harmless pattern; it never allows an escaping one the plain form hides.
-const escapesCheckout = (pattern: string): boolean =>
-  ESCAPING_PATTERN.test(pattern) || ESCAPING_PATTERN.test(pattern.replace(/[{},]/g, ""));
+// Brace syntax can assemble a `..` segment from pieces of different alternatives (`{a,.}./*`
+// expands to `../*`), so every expansion is screened. A pattern with unbalanced braces or more
+// than MAX_BRACE_EXPANSIONS expansions is denied rather than screened partially.
+const MAX_BRACE_EXPANSIONS = 256;
+
+/** All brace expansions of `pattern`, or null when the braces are unbalanced or the expansion
+ *  count exceeds the cap. Nested and sequential groups expand; `{x}` counts as one alternative. */
+function expandBraces(pattern: string): string[] | null {
+  const out: string[] = [];
+  const walk = (s: string): boolean => {
+    const open = s.indexOf("{");
+    if (open < 0) {
+      if (s.includes("}")) return false;
+      out.push(s);
+      return out.length <= MAX_BRACE_EXPANSIONS;
+    }
+    if (s.slice(0, open).includes("}")) return false;
+    let depth = 0;
+    let start = open + 1;
+    const alternatives: string[] = [];
+    for (let i = open; i < s.length; i++) {
+      const c = s[i];
+      if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        alternatives.push(s.slice(start, i));
+        const prefix = s.slice(0, open);
+        const suffix = s.slice(i + 1);
+        return alternatives.every(alt => walk(prefix + alt + suffix));
+      } else if (c === "," && depth === 1) {
+        alternatives.push(s.slice(start, i));
+        start = i + 1;
+      }
+    }
+    return false;
+  };
+  return walk(pattern) ? out : null;
+}
+
+const escapesCheckout = (pattern: string): boolean => {
+  if (ESCAPING_PATTERN.test(pattern)) return true;
+  const expansions = expandBraces(pattern);
+  return expansions === null || expansions.some(e => ESCAPING_PATTERN.test(e));
+};
 
 /** Defense in depth for the one path the path guard cannot see: extractToolPaths screens only
  *  file_path/path/notebook_path, so a Glob `pattern` or Grep `glob` is screened here. A pattern
