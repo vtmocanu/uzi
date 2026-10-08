@@ -341,7 +341,7 @@ function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRe
   );
 }
 
-/** Guarded inventories awaiting FINAL remain eligible, including uploaded records.
+/** Guarded FINAL retries may include uploaded records.
  *  Legacy records need a journaled bundle that is bundled or needs_action for a
  *  transient/credential reason; pinned, bundle-less and permanent legacy records are skipped. */
 function isLiveCandidate(record: RecoveryRecord): boolean {

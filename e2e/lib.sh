@@ -480,13 +480,13 @@ wait_completed_custody_receipt() {
     [ -z "$expected" ] && expected="$generation"
     [ "$generation" = "$expected" ] || fail "completed receipt generation changed: $snapshot"
     if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
-      printf '%s' "$snapshot" | jq -e '.holds[0] | .after_outcome==true and (
-        (.inventory_guarded==true and (
+      printf '%s' "$snapshot" | jq -e '.holds[0] |
+        (.inventory_guarded==true and .after_outcome==true and (
           (.final_disposition=="archive" and .release_evidence=="archive" and .archive_matches==true)
           or (.final_disposition=="settled" and (.release_evidence|IN("publication","forge_no_output"))
             and .final_capture_id==null and .final_source_sha==null
             and .final_coverage_digest=="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")))
-        or (.inventory_guarded==false and (.release_evidence|IN("archive","publication"))))' >/dev/null \
+        or (.inventory_guarded==false and (.release_evidence|IN("archive","publication")))' >/dev/null \
         || fail "completed receipt lacks final custody proof: $snapshot"
       pass "completed custody receipt: run=$run generation=$generation"
       return

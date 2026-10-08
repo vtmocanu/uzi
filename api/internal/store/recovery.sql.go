@@ -1265,9 +1265,9 @@ type ListReleasableCustodyHoldsRow struct {
 //	    This is already a strict per-hold test, so a sibling hold's ready capture never
 //	    qualifies it.
 //
-// It NEVER infers success from an arbitrary terminal status: a 'failed'/'cancelled'/future
-// 'partial' run with no ready capture, and a 'running'/'queued' run, are excluded (a failed
-// run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
+// Source-only failed/cancelled/partial/running/queued holds remain open. A ready capture
+// qualifies its exact legacy hold via (b), even before run completion.
+// Returns oldest-first for stable reconcile order;
 // the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
 // and release agree per-hold and a sibling hold is never collaterally released.
 //

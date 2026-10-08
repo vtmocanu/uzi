@@ -444,6 +444,7 @@ completed_receipt_fixture() {
         elif $step=="settled" then .holds[0] += {final_disposition:"settled",release_evidence:"publication",
           final_capture_id:null,final_source_sha:null,final_coverage_digest:"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
         elif $step=="legacy" then .holds[0] += {inventory_guarded:false,final_disposition:null}
+        elif $step=="legacy-before-completion" then .holds[0] += {inventory_guarded:false,final_disposition:null,after_outcome:false}
         elif $step=="failed" then .status="failed"
         else . end' >> "$SEQ_DIR/seq"
   done
@@ -477,6 +478,8 @@ completed_receipt_fixture settled
 custody_case "completed publication accepts an empty settled FINAL" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
 completed_receipt_fixture legacy
 custody_case "completed legacy hold accepts its authoritative release" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture legacy-before-completion
+custody_case "legacy archive receipt may precede completion" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
 completed_receipt_fixture failed
 custody_case "failed run cannot satisfy completed custody boundary" fail 'missing exact run/generation/hold' wait_completed_custody_receipt "$UUID" 2
 
@@ -505,6 +508,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 82 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 83 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 82 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 83 ] && [ "$cases" -eq "$passed" ]
