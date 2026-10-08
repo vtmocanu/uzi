@@ -50,7 +50,7 @@ function stat(raw: string): Extract<Sample, { available: true }>["stat"] {
   for (const line of raw.trim().split("\n")) {
     const parts = line.trim().split(/\s+/);
     if (!required.some((key) => key === parts[0])) continue;
-    if (parts.length !== 2 || fields.has(parts[0])) throw new Error("malformed");
+    if (parts.length !== 2 || parts[0] === undefined || parts[1] === undefined || fields.has(parts[0])) throw new Error("malformed");
     fields.set(parts[0], integer(parts[1]));
   }
   for (const key of required) if (!fields.has(key)) throw new Error("malformed");
@@ -73,7 +73,7 @@ function pressure(raw: string): { some: Psi; full: Psi } {
     for (const part of parts) {
       const pair = part.split("=");
       const [key, value] = pair;
-      if (pair.length !== 2 || fields.has(key)) throw new Error("malformed");
+      if (pair.length !== 2 || key === undefined || value === undefined || fields.has(key)) throw new Error("malformed");
       if (key === "total") fields.set(key, integer(value));
       else {
         if (!["avg10", "avg60", "avg300"].includes(key) || !/^[0-9]+(?:\.[0-9]+)?$/.test(value)) {

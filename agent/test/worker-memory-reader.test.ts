@@ -99,8 +99,8 @@ test("aggregate budget shrinks and oversized input aborts before parsing", () =>
   const result = reader.sample();
   assert.equal(result.available, false);
   if (!result.available) assert.equal(result.reason, "oversized");
-  assert.equal(reads[0].budget, 65536);
-  assert.equal(reads[1].budget, 65531);
+  assert.equal(reads[0]!.budget, 65536);
+  assert.equal(reads[1]!.budget, 65531);
   assert.equal(reads.length, 4);
 });
 test("production bounded read seam works on fake proc/cgroup files only", () => {
