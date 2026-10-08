@@ -85,7 +85,7 @@ import type {
 } from "./protocol.js";
 import type { PrSummaryClaim } from "./signals.js";
 import { diagramEvent, type DiagramReason } from "./diagram-diagnostic.js";
-import { parseDeliveryDiagramResult, type DeliverySummary, type DeliverySummaryClaimView, type DeliverySummaryInput } from "./summary-runner.js";
+import { parseDeliveryDiagram, type DeliverySummary, type DeliverySummaryClaimView, type DeliverySummaryInput } from "./summary-runner.js";
 
 // ── Seams ──────────────────────────────────────────────────────────────────────────────────
 
@@ -613,14 +613,15 @@ export class PrDescriptionPublication {
           scope_notes: generated.scope_notes.map((n) => ({ ...n })),
           verification: leadVerification(spec.lead),
         };
-        const parsed = parseDeliveryDiagramResult(generated.diagram);
-        if (parsed.reason !== "absent" && parsed.reason !== "valid") {
-          diagramEvent(deps.log, spec.claim, "agent_parser", "dropped", parsed.reason, { claim_generation: spec.claimGeneration }, [spec.pat]);
-        }
-        if (zeroCode && parsed.diagram) {
+        const parsed = parseDeliveryDiagram(generated.diagram, (reason) => {
+          if (reason !== "absent" && reason !== "valid") {
+            diagramEvent(deps.log, spec.claim, "agent_parser", "dropped", reason, { claim_generation: spec.claimGeneration }, [spec.pat]);
+          }
+        });
+        if (zeroCode && parsed) {
           diagramEvent(deps.log, spec.claim, "zero_code", "dropped", "zero_code", { claim_generation: spec.claimGeneration }, [spec.pat]);
         }
-        const diagram = !zeroCode && parsed.diagram;
+        const diagram = !zeroCode && parsed;
         if (diagram) fields.diagram = diagram;
         else delete fields.diagram;
       } else if (lead) {
@@ -697,7 +698,7 @@ export class PrDescriptionPublication {
     try {
       const previous = this.state?.published_version?.fields ?? null;
       const context = await this.spec.context(snapshot, this.deadline, previous);
-      return await pass.generateDeliverySummary({ claim: this.spec.claim, context, deadlineMs: this.deadline });
+      return await pass.generateDeliverySummary({ claim: this.spec.claim, claimGeneration: this.spec.claimGeneration, context, deadlineMs: this.deadline });
     } catch {
       diagramEvent(log, this.spec.claim, "editor", "omitted", "pass_failed", { claim_generation: this.spec.claimGeneration }, [this.spec.pat]);
       log.warn("PR description: the editor pass failed", { run_id: this.spec.runId, reason: "pass_failed" });

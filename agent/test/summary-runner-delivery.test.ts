@@ -167,6 +167,7 @@ describe("diagram diagnostics", () => {
     assert.equal(records[0]!.outcome, "omitted");
     assert.equal(records[0]!.harness, "codex");
     assert.equal(records[0]!.editor_model, "unknown");
+    assert.equal(Object.hasOwn(records[0]!, "claim_generation"), false);
   });
   it("distinguishes editor omission and parser rejection before missing prose is erased", async () => {
     for (const [raw, stage, reason] of [
@@ -177,7 +178,8 @@ describe("diagram diagnostics", () => {
       const records: Record<string, unknown>[] = [];
       const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
       const r = await runner(claudeQueryFn(JSON.stringify(raw)), { log });
-      await r.generateDeliverySummary(await deliveryInput());
+      await r.generateDeliverySummary(await deliveryInput({ claimGeneration: 7 }));
+      assert.equal(records[0]!.claim_generation, 7);
       assert.equal(records[0]!.stage, stage);
       assert.equal(records[0]!.outcome, stage === "editor" ? "omitted" : "dropped");
       assert.equal(records[0]!.reason, reason);
@@ -187,11 +189,57 @@ describe("diagram diagnostics", () => {
     }
   });
 
+  it("correlates pass errors without leaking their messages", async () => {
+    const records: Record<string, unknown>[] = [];
+    const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
+    const query = (async function* () {
+      await Promise.reject(new Error("private model response"));
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const r = await runner(query, { log });
+    assert.equal(await r.generateDeliverySummary(await deliveryInput({ claimGeneration: 7 })), null);
+    assert.deepEqual(records.map((record) => [record.stage, record.outcome, record.reason, record.claim_generation]),
+      [["editor", "omitted", "pass_failed", 7]]);
+    assert.equal(JSON.stringify(records).includes("private model response"), false);
+  });
+
+  it("emits fixed rejection classes through model parsing without graph text", async () => {
+    const privateText = "private graph text";
+    const cases: [unknown, string][] = [
+      [privateText, "shape"],
+      [{ ...diagram, nodes: privateText }, "shape"],
+      [{ ...diagram, edges: privateText }, "shape"],
+      [{ ...diagram, kind: privateText }, "kind"],
+      [{ ...diagram, nodes: [] }, "entries"],
+      [{ ...diagram, title: 42 }, "title"],
+      [{ ...diagram, nodes: [privateText, diagram.nodes[1]] }, "node_shape"],
+      [{ ...diagram, nodes: [{ ...diagram.nodes[0], key: privateText }, diagram.nodes[1]] }, "key"],
+      [{ ...diagram, nodes: [{ ...diagram.nodes[0], label: 42 }, diagram.nodes[1]] }, "node_label"],
+      [{ ...diagram, edges: [privateText, diagram.edges[1]] }, "edge_shape"],
+      [{ ...diagram, edges: [{ ...diagram.edges[0], to: privateText }, diagram.edges[1]] }, "endpoints"],
+      [{ ...diagram, edges: [{ ...diagram.edges[0], label: 42 }, diagram.edges[1]] }, "edge_label"],
+      [{ ...diagram, title: "x".repeat(81) + privateText + "@hidden" }, "title"],
+      [{ ...diagram, nodes: [{ ...diagram.nodes[0], label: "x".repeat(61) + privateText + "@hidden" }, diagram.nodes[1]] }, "node_label"],
+      [{ ...diagram, edges: [{ ...diagram.edges[0], label: "x".repeat(61) + privateText + "@hidden" }, diagram.edges[1]] }, "edge_label"],
+    ];
+    for (const [raw, reason] of cases) {
+      const records: Record<string, unknown>[] = [];
+      const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
+      const r = await runner(claudeQueryFn(JSON.stringify({ ...good, diagram: raw })), { log });
+      assert.deepEqual(await r.generateDeliverySummary(await deliveryInput({ claimGeneration: 7 })), good);
+      assert.deepEqual(records.map((record) => [record.stage, record.outcome, record.reason, record.claim_generation]),
+        [["agent_parser", "dropped", reason, 7]]);
+      assert.equal(JSON.stringify(records).includes(privateText), false);
+      assert.equal(JSON.stringify(records).includes("@hidden"), false);
+    }
+  });
+
   it("reports deadline unavailability without calling the model", async () => {
     const records: Record<string, unknown>[] = [];
     const log = { ...nullLogger(), info: (_message: string, fields?: Record<string, unknown>) => { records.push(fields!); } };
     const r = await runner(forbiddenQueryFn(), { log, now: () => 1000 });
-    assert.equal(await r.generateDeliverySummary(await deliveryInput({ deadlineMs: 999 })), null);
+    assert.equal(await r.generateDeliverySummary(await deliveryInput({ deadlineMs: 999, claimGeneration: 7 })), null);
+    assert.equal(records[0]!.claim_generation, 7);
     assert.equal(records[0]!.stage, "editor");
     assert.equal(records[0]!.outcome, "omitted");
     assert.equal(records[0]!.reason, "deadline");

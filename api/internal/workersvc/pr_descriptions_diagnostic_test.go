@@ -156,3 +156,35 @@ func TestStagePrDescriptionDiagramCorrelationLiveDB(t *testing.T) {
 		t.Fatal("committed row does not match correlated sanitized version")
 	}
 }
+
+func TestDiagramSanitationFixedReasons(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*apitypes.PrDescriptionDiagram)
+		reason string
+	}{
+		{"kind", func(d *apitypes.PrDescriptionDiagram) { d.Kind = "private graph" }, "kind"},
+		{"entries", func(d *apitypes.PrDescriptionDiagram) { d.Nodes = d.Nodes[:2] }, "entries"},
+		{"title", func(d *apitypes.PrDescriptionDiagram) { d.Title = "Closes #7" }, "title"},
+		{"node key", func(d *apitypes.PrDescriptionDiagram) { d.Nodes[1].Key = d.Nodes[0].Key }, "node key"},
+		{"node label", func(d *apitypes.PrDescriptionDiagram) { d.Nodes[0].Label = "Closes #7" }, "node label"},
+		{"edge endpoint", func(d *apitypes.PrDescriptionDiagram) { d.Edges[0].To = "missing" }, "edge endpoint"},
+		{"edge label", func(d *apitypes.PrDescriptionDiagram) { d.Edges[0].Label = "Closes #7" }, "edge label"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &apitypes.PrDescriptionDiagram{
+				Kind:  "flow",
+				Nodes: []apitypes.PrDescriptionDiagramNode{{Key: "a", Label: "A"}, {Key: "b", Label: "B"}, {Key: "c", Label: "C"}},
+				Edges: []apitypes.PrDescriptionDiagramEdge{{From: "a", To: "b"}, {From: "b", To: "c"}},
+			}
+			tc.mutate(d)
+			var reasons []string
+			fields, err := sanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{Summary: "Retained", Diagram: d}, func(reason string) {
+				reasons = append(reasons, reason)
+			})
+			if err != nil || fields.Diagram != nil || fields.Summary != "Retained" || len(reasons) != 1 || reasons[0] != tc.reason {
+				t.Fatalf("whole-graph rejection or fixed reason changed: fields=%+v reasons=%v err=%v", fields, reasons, err)
+			}
+		})
+	}
+}

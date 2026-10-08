@@ -123,6 +123,8 @@ export interface DeliverySummaryClaimView {
 
 export interface DeliverySummaryInput {
   claim: DeliverySummaryClaimView;
+  /** Publication generation, when known, for local diagram diagnostics. */
+  claimGeneration?: number;
   /** The redacted, budgeted input (pr-description-context.ts buildDeliveryContext). */
   context: DeliveryContext;
   /** PRD #1798 D2: the absolute deadline (epoch ms) shared by the context build and every pass of
@@ -247,6 +249,7 @@ export class SummaryRunner {
    */
   async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
     const runId = input.claim.run_id;
+    const correlation = input.claimGeneration === undefined ? {} : { claim_generation: input.claimGeneration };
     const failureReasons = {
       "the publication's summary deadline is spent": "deadline",
       "the claim's codex block is invalid": "invalid_codex",
@@ -257,7 +260,7 @@ export class SummaryRunner {
       "the output had no usable summary": "missing_summary",
     } as const satisfies Record<string, DiagramReason>;
     const fail = (reason: keyof typeof failureReasons, err?: unknown): null => {
-      diagramEvent(this.log, input.claim, "editor", "omitted", failureReasons[reason]);
+      diagramEvent(this.log, input.claim, "editor", "omitted", failureReasons[reason], correlation);
       this.log.warn("delivery summary skipped", {
         run_id: runId,
         reason,
@@ -295,8 +298,8 @@ export class SummaryRunner {
     try {
       out = parseDeliverySummary(text, (raw) => {
         const parsed = parseDeliveryDiagramResult(raw);
-        if (parsed.reason === "absent") diagramEvent(this.log, input.claim, "editor", "omitted", "editor_omission");
-        else if (parsed.reason !== "valid") diagramEvent(this.log, input.claim, "agent_parser", "dropped", parsed.reason);
+        if (parsed.reason === "absent") diagramEvent(this.log, input.claim, "editor", "omitted", "editor_omission", correlation);
+        else if (parsed.reason !== "valid") diagramEvent(this.log, input.claim, "agent_parser", "dropped", parsed.reason, correlation);
       });
     } catch (err) {
       return fail("unparseable output", err);
@@ -607,12 +610,14 @@ function unsafeDiagramClip(raw: string, maxBytes: number): boolean {
 }
 
 /** Validate the graph shape before stage; the api remains the authority for label sanitization. */
-export function parseDeliveryDiagram(raw: unknown): PrDescriptionDiagram | null {
-  return parseDeliveryDiagramResult(raw).diagram;
+export function parseDeliveryDiagram(raw: unknown, reportReason?: (reason: DiagramParserReason) => void): PrDescriptionDiagram | null {
+  const parsed = parseDeliveryDiagramResult(raw);
+  reportReason?.(parsed.reason);
+  return parsed.diagram;
 }
 
 /** Fixed rejection reasons; no graph text may escape through this diagnostic seam. */
-export function parseDeliveryDiagramResult(raw: unknown): { diagram: PrDescriptionDiagram | null; reason: DiagramParserReason } {
+function parseDeliveryDiagramResult(raw: unknown): { diagram: PrDescriptionDiagram | null; reason: DiagramParserReason } {
   if (raw === undefined) return { diagram: null, reason: "absent" };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { diagram: null, reason: "shape" };
   const d = raw as Record<string, unknown>;

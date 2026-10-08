@@ -29,7 +29,7 @@ import {
 } from "../src/pr-description.js";
 import { PR_DESC_ACK_OUTCOMES, type PrDescriptionSize, type PrDescriptionState } from "../src/protocol.js";
 import type { PrSummaryClaim } from "../src/signals.js";
-import type { DeliverySummary } from "../src/summary-runner.js";
+import type { DeliverySummary, DeliverySummaryInput } from "../src/summary-runner.js";
 import { FakePrDescApi, clientFor } from "./fake-pr-desc-api.js";
 import { nullLogger } from "./helpers.js";
 
@@ -121,13 +121,15 @@ class FakeForge implements PublisherForge {
 class FakePass implements DeliveryPass {
   deadlines = 0;
   readonly calls: number[] = [];
+  readonly generations: (number | undefined)[] = [];
   constructor(private readonly out: DeliverySummary | null) {}
   deliverySummaryDeadline(): number {
     this.deadlines++;
     return 1_000_000;
   }
-  async generateDeliverySummary(input: { deadlineMs: number }): Promise<DeliverySummary | null> {
+  async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
     this.calls.push(input.deadlineMs);
+    this.generations.push(input.claimGeneration);
     return this.out;
   }
 }
@@ -204,6 +206,13 @@ function apiWith(over: Partial<PublisherApi>): PublisherApi {
 }
 
 describe("diagram diagnostics", () => {
+  it("forwards the publication generation to the editor", async () => {
+    const pass = new FakePass(SUMMARY);
+    const r = rig(pass);
+    await r.publisher.prepare(makeSpec({ claimGeneration: 7 }), { headSha: H1, targetBranch: "main" });
+    assert.deepEqual(pass.generations, [7]);
+  });
+
   it("does not report a provisional cap reversed by the final interlock rewrite", async () => {
     const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
     const pub = await r.publisher.prepare(makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: () => completion(false) }), { headSha: H1, targetBranch: "main" });
