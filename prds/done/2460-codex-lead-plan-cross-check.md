@@ -1,6 +1,6 @@
 # PRD #2460: Plan cross-check for Codex-lead runs (Claude checker)
 
-**Status**: Implemented / complete (M1 landed on the issue #2460 branch). Child 4 of 6 under umbrella #2148 (Cross-check). Split from PRD #2150 on 2026-10-07 (PRD #2150 D5). Blocked by PRD #2150 (both change the plan-gate code; automatic rounds land first). Naming follows PRD #2149 (D13, D14).
+**Status**: Done (2026-10-08). Child 4 of 6 under umbrella #2148 (Cross-check). Split from PRD #2150 on 2026-10-07 (PRD #2150 D5). Was blocked by PRD #2150 (both change the plan-gate code; automatic rounds landed first). Naming follows PRD #2149 (D13, D14).
 
 Resolved facts below were read at `main` `58cee732`.
 
@@ -55,6 +55,7 @@ Acceptance examples:
 ## Milestones
 
 - [x] **M1: A Codex lead's plan is cross-checked on Claude.** Server acceptance of Codex leads and opposite-family child creation, single-family claim assembly, the Claude `CrossCheckRunner` path with path-guard confinement, Codex-executor checked-approval handoff and round handling, the capability and its mirrors, lifting the runner park, pins delivery when PRD #2151 is present, docs (`docs/cross-check.md`, `docs/worker-setup.md`, then `task docs:sync`), `specs/human.md`, CHANGELOG. Blocked by: PRD #2150 M1. Gates: `task gate:agent`, `task gate:api`, LiveDB via `./e2e/run-store-it.sh`, `task gate:repo`.
+  - Gate evidence (2026-10-08, branch head before merge): `task gate:api`, `task gate:web` and `task gate:repo` passed; `./e2e/run-store-it.sh` reported `LiveDB: 2443 passed, 0 skipped`. `task gate:agent` was red on two load-sensitive tests, "a real usage 400 irrecoverably loses preparation receipts and terminates before submit" and "the live trigger never blocks execution". Both also fail at base `fdaef448` under parallel load, and both pass in isolation at the branch head. CI on the merged head is the authoritative gate.
 
 No `.github/workflows/**` change in implementation or validation.
 
