@@ -410,6 +410,72 @@ const CHILD_TOOL_OUTPUT_OMITTED = "[output not shown: subagent output cap reache
 /** The output synthesized for a child tool still open when its dispatch was closed. */
 const CHILD_TOOL_UNCONFIRMED = "tool result not confirmed: delegation closed";
 
+/** Count raw normalized JSON exactly, without recursion or a serialized copy. Traversal
+ * stops as soon as the remaining queue budget is exceeded; no input is projected or changed.
+ * Only JSON values (and optional undefined fields) occur in transport notifications. */
+function boundedJsonBytes(value: unknown, limit: number): number {
+  type Container = { value: Record<string, unknown> | unknown[]; keys: string[] | undefined; index: number; emitted: boolean };
+  const stack: Container[] = [];
+  const ancestors = new Set<object>();
+  let bytes = 0;
+  const stringBytes = (text: string): void => {
+    bytes += 2;
+    for (let i = 0; i < text.length && bytes <= limit; i++) {
+      const code = text.charCodeAt(i);
+      if (code === 34 || code === 92 || code === 8 || code === 9 || code === 10 || code === 12 || code === 13) bytes += 2;
+      else if (code < 32) bytes += 6;
+      else if (code < 128) bytes++;
+      else if (code < 2048) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else if (code >= 0xd800 && code <= 0xdfff) bytes += 6;
+      else bytes += 3;
+    }
+  };
+  let current = value;
+  for (;;) {
+    if (current !== null && typeof current === "object") {
+      if (ancestors.has(current)) throw new TypeError("cyclic notification JSON");
+      ancestors.add(current);
+      const array = Array.isArray(current);
+      stack.push({ value: current as Record<string, unknown> | unknown[], keys: array ? undefined : Object.keys(current), index: 0, emitted: false });
+      bytes += 2; // Container delimiters.
+    } else if (typeof current === "string") stringBytes(current);
+    else if (current === undefined || current === null) bytes += 4; // Undefined array entries serialize as null.
+    else if (typeof current === "number" || typeof current === "boolean") bytes += JSON.stringify(current).length;
+    else throw new TypeError("non-JSON notification value");
+    if (bytes > limit) return bytes;
+
+    let found = false;
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      const length = frame.keys ? frame.keys.length : (frame.value as unknown[]).length;
+      if (frame.index === length) {
+        ancestors.delete(frame.value);
+        stack.pop();
+        continue;
+      }
+      const index = frame.index++;
+      if (frame.keys) {
+        const key = frame.keys[index]!;
+        current = (frame.value as Record<string, unknown>)[key];
+        if (current === undefined) continue; // Optional object fields are omitted.
+        if (frame.emitted) bytes++;
+        frame.emitted = true;
+        stringBytes(key);
+        bytes++;
+      } else {
+        if (index > 0) bytes++;
+        current = (frame.value as unknown[])[index];
+      }
+      found = true;
+      break;
+    }
+    if (!found || bytes > limit) return bytes;
+  }
+}
+
 // --- the harness --------------------------------------------------------------
 
 export class CodexHarness implements RunHarness {
@@ -1113,7 +1179,11 @@ export class CodexHarness implements RunHarness {
           yield* this.drainOutbox();
           return;
         }
-        if (!mapping && deferred.length > 0) {
+        // A retained read can fail while the consumer is suspended at a yield.
+        // Keep normal readiness/drain ordering, but never admit a queued callback
+        // once EOF or failure is already known.
+        const readEnded = read?.ready !== undefined && (read.failed || read.step?.done);
+        if (!mapping && deferred.length > 0 && !readEnded) {
           const entry = deferred.shift()!;
           deferredBytes -= entry.bytes;
           beginMapping(entry.note);
@@ -1232,7 +1302,17 @@ export class CodexHarness implements RunHarness {
         }
         if (step.value.kind === "activity" && step.value.requestId !== undefined) {
           if (mapping || deferred.length > 0) {
-            const bytes = Buffer.byteLength(JSON.stringify(step.value), "utf8");
+            let bytes: number;
+            try {
+              bytes = deferred.length >= 4096 ? Infinity : boundedJsonBytes(step.value, 64 * 1024 * 1024 - deferredBytes);
+            } catch {
+              // This request is not yet in deferred: refuse it explicitly before
+              // failing siblings; routeToolCall still owns the active callback's reply.
+              refuse(transport, step.value);
+              refuseDeferred();
+              yield* this.closeDispatchesOnFailure(ordinal);
+              throw new CodexHarnessError({ category: "protocol", message: "codex deferred request accounting failed" });
+            }
             // Bound before admission. Overflow refuses this request and all queued siblings;
             // the already-dispatched callback retains routeToolCall's sole reply ownership.
             if (deferred.length >= 4096 || bytes > 64 * 1024 * 1024 - deferredBytes) {

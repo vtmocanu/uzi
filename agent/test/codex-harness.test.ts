@@ -2618,6 +2618,96 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     assert.fail(`missing ${wanted}`);
   }
 
+  it("deep queued B preserves dispatch and exactly one reply", async () => {
+    const { broker: wedged, release } = wedgeBroker();
+    let expectedArgs: unknown;
+    let receivedArgs: unknown;
+    const calls: string[] = [];
+    const broker = stubBroker((rt, name, args, origin) => {
+      calls.push(String(rec(args).command));
+      if (calls.length === 2) receivedArgs = args;
+      return calls.length === 1 ? wedged.handleToolCall(rt, name, args, origin) :
+        Promise.resolve({ ok: true, output: {} });
+    });
+    const { harness, transport } = makeHarness({ broker });
+    const ac = new AbortController();
+    transport.push(toolCall(1, "Bash", { command: "A" }, "th-1", "tn-1", "A"));
+    const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+    let observed: unknown;
+    try {
+      await iter.next();
+      await pullUntil(iter, "started");
+      let deep: unknown = null;
+      for (let i = 0; i < 20000; i++) deep = { a: deep };
+      expectedArgs = { command: "B", deep };
+      transport.push(toolCall(2, "Bash", expectedArgs, "th-1", "tn-1", "B"))
+        .push(agentMessage("commentary C"));
+      try {
+        await pullUntil(iter, "commentary");
+        assert.deepEqual(calls, ["A"]);
+        release({ ok: true, output: {} });
+        transport.push(turnCompleted());
+        await collect({ [Symbol.asyncIterator]: () => iter });
+      } catch (error) { observed = error; }
+      release({ ok: true, output: {} });
+      await tick();
+
+      assert.equal(observed, undefined, "queued deep JSON must not crash or lose request B reply");
+      assert.deepEqual(calls, ["A", "B"]);
+      assert.deepEqual(transport.responses.map(r => r.requestId), [1, 2]);
+      assert.equal(transport.respondAttempts, 2);
+      assert.equal(receivedArgs, expectedArgs, "broker receives the unchanged raw arguments");
+    } finally {
+      ac.abort(); release({ ok: true, output: {} });
+      await iter.return?.(); await harness.close();
+    }
+  });
+  for (const failure of ["EOF", "read failure"] as const) {
+    it(failure + " at A activity yield refuses B without brokerage", async () => {
+      const { broker: wedged, release } = wedgeBroker();
+      const calls: string[] = [];
+      const broker = stubBroker((rt, name, args, origin) => {
+        calls.push(String(rec(args).command));
+        return calls.length === 1 ? wedged.handleToolCall(rt, name, args, origin) :
+          Promise.resolve({ ok: true, output: {} });
+      });
+      const { harness, transport } = makeHarness({ broker });
+      transport.push(toolCall(1, "Bash", { command: "A" }, "th-1", "tn-1", "A"));
+      const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+      try {
+        await iter.next(); await pullUntil(iter, "started");
+        transport.push(toolCall(2, "Bash", { command: "B" }, "th-1", "tn-1", "B"))
+          .push(agentMessage("commentary C"));
+        await pullUntil(iter, "commentary");
+        release({ ok: true, output: {} });
+        await pullUntil(iter, "finished"); await pullUntil(iter, "activity");
+        assert.deepEqual(calls, ["A"], "B remains deferred at the activity suspension");
+        if (failure === "EOF") transport.end(); else transport.fail(new Error("tester-1 notification failure"));
+        await tick();
+        const events: string[] = [];
+        let observed: unknown;
+        try {
+          for (let n = 0; n < 20; n++) {
+            const step = await withTimeout(iter.next(), 1000, "read termination");
+            if (step.done) break;
+            events.push(label(step.value!));
+          }
+        } catch (error) { observed = error; }
+        await tick();
+
+        assert.ok(observed instanceof Error);
+        assert.match(observed.message, failure === "EOF" ? /stream ended before turn completion/ : /tester-1 notification failure/);
+        assert.deepEqual(calls, ["A"], "B must not be brokered after ready EOF/read failure");
+        assert.equal(transport.responses.filter(r => r.requestId === 2).length, 1);
+        assert.deepEqual(transport.responses.find(r => r.requestId === 2)?.response,
+          { result: { success: false, contentItems: [{ type: "inputText", text: "callback does not match the active turn" }] } });
+      } finally {
+        release({ ok: true, output: {} });
+        await iter.return?.(); await harness.close();
+      }
+    });
+  }
+
   for (const ordering of ["notification-first", "completion-first", "co-ready notification-first", "co-ready completion-first"] as const) {
     it(`${ordering}: retained read and finished projection follow readiness order`, async () => {
       const ac = new AbortController();
@@ -2850,6 +2940,91 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
       }
     });
   }
+
+  for (const encoding of ["UTF8", "escaped"] as const) {
+    for (const extra of [0, 1]) {
+      it(`${encoding} serialized queue bytes at 64MiB + ${extra} respect the exact boundary`, async () => {
+        const ac = new AbortController();
+        const { broker: wedged, release } = wedgeBroker();
+        let calls = 0;
+        const broker = stubBroker((rt, name, args, origin) => {
+          calls++;
+          return wedged.handleToolCall(rt, name, args, origin);
+        });
+        const { harness, transport } = makeHarness({ broker });
+        transport.push(toolCall(1, "Bash", {}));
+        const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+        try {
+          await iter.next();
+          await pullUntil(iter, "started");
+          const pattern = encoding === "UTF8" ? "é漢😀" : "\"\\\n\t\u0001\ud800";
+          const first = toolCall(2, "Bash", {
+            data: pattern.repeat(1024 * 1024),
+            omitted: undefined,
+            nested: { omitted: undefined, "é\"": [undefined, null, true, false, 1.5, -0, 1e30] },
+          });
+          const second = toolCall(3, "Bash", { data: "", omitted: undefined });
+          // The oracle uses the actual normalized notification, including omitted fields,
+          // escaped keys, surrogate handling, array nulls and notification envelope.
+          const overhead = Buffer.byteLength(JSON.stringify(first), "utf8") + Buffer.byteLength(JSON.stringify(second), "utf8");
+          rec(rec(second.params).arguments).data = "x".repeat(64 * 1024 * 1024 - overhead + extra);
+          assert.equal(Buffer.byteLength(JSON.stringify(first), "utf8") + Buffer.byteLength(JSON.stringify(second), "utf8"),
+            64 * 1024 * 1024 + extra);
+          transport.push(first).push(second).push(agentMessage("commentary"));
+          if (extra) {
+            await assert.rejects(withTimeout(iter.next(), 10000, "byte boundary refusal"), /deferred request queue overflow/);
+          } else {
+            await pullUntil(iter, "commentary");
+            assert.equal(transport.responses.length, 0, "both requests fit exactly");
+            ac.abort();
+            await iter.next();
+          }
+          assert.equal(calls, 1);
+          assert.deepEqual(transport.responses.map(r => r.requestId).sort(), [2, 3]);
+          assert.equal(transport.respondAttempts, 2);
+          for (const response of transport.responses) assert.deepEqual(response.response,
+            { result: { success: false, contentItems: [{ type: "inputText", text: "callback does not match the active turn" }] } });
+        } finally {
+          ac.abort();
+          release({ ok: true, output: {} });
+          await iter.return?.();
+          await harness.close();
+        }
+      });
+    }
+  }
+
+  it("accounting failure refuses the current request and queued siblings once", async () => {
+    const { broker: wedged, release } = wedgeBroker();
+    let calls = 0;
+    const broker = stubBroker((rt, name, args, origin) => {
+      calls++;
+      return wedged.handleToolCall(rt, name, args, origin);
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(toolCall(1, "Bash", {}));
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    try {
+      await iter.next();
+      await pullUntil(iter, "started");
+      const cyclic: Record<string, unknown> = {};
+      cyclic.self = cyclic;
+      transport.push(toolCall(2, "Bash", {})).push(toolCall(3, "Bash", cyclic));
+      await assert.rejects(withTimeout(iter.next(), 1000, "accounting failure"), /deferred request accounting failed/);
+      assert.equal(calls, 1);
+      assert.deepEqual(transport.responses.map(r => r.requestId).sort(), [2, 3]);
+      assert.equal(transport.respondAttempts, 2);
+      for (const response of transport.responses) assert.deepEqual(response.response,
+        { result: { success: false, contentItems: [{ type: "inputText", text: "callback does not match the active turn" }] } });
+      release({ ok: true, output: {} });
+      await tick();
+      assert.equal(transport.respondAttempts, 3);
+    } finally {
+      release({ ok: true, output: {} });
+      await iter.return?.();
+      await harness.close();
+    }
+  });
 
   for (const limit of ["count", "bytes"] as const) {
     it(`${limit} overflow refuses overflow and every undispatched request exactly once`, async () => {
