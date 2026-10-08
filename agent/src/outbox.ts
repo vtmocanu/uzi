@@ -319,6 +319,8 @@ export interface OutboxOptions {
   /** Bound terminal reads before JSON; defaults to the config's 1.25 MiB cap. */
   terminalMaxBytes?: number;
   now?: () => number;
+  /** Optional canonical-path seam for terminal directory safety checks (tests). */
+  realpath?: (filePath: string) => Promise<string>;
   /** Optional raw-write seam to simulate `ENOSPC` (tests). */
   rawWrite?: RawWriteSeam;
   /**
@@ -412,6 +414,7 @@ export class Outbox {
   private terminalScanTail: Promise<unknown> = Promise.resolve();
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
+  private readonly realpath: (filePath: string) => Promise<string>;
   private readonly classifyWriteFailure: OutboxOptions["classifyWriteFailure"];
 
   private readonly runs = new Map<string, RunState>();
@@ -445,6 +448,7 @@ export class Outbox {
         : OUTBOX_RANGE_RESERVE_BYTES;
     this.now = opts.now ?? (() => Date.now());
     this.rawWrite = opts.rawWrite ?? ((write) => write());
+    this.realpath = opts.realpath ?? ((filePath) => fs.realpath(filePath));
     this.classifyWriteFailure = opts.classifyWriteFailure;
   }
 
@@ -1947,8 +1951,13 @@ export class Outbox {
     if (!this.validRunId(runId)) return false;
     const root = await fs.lstat(this.root);
     const dir = await fs.lstat(this.runDir(runId));
-    return root.isDirectory() && !root.isSymbolicLink() && dir.isDirectory() && !dir.isSymbolicLink() &&
-      await fs.realpath(this.runDir(runId)) === path.join(await fs.realpath(this.root), runId);
+    if (!root.isDirectory() || root.isSymbolicLink() || !dir.isDirectory() || dir.isSymbolicLink()) return false;
+    const realRoot = await this.realpath(this.root);
+    const realRun = await this.realpath(this.runDir(runId));
+    const expected = path.join(realRoot, runId);
+    return realRun === expected || (terminalRunUUID(runId) &&
+      path.dirname(realRun) === realRoot &&
+      path.basename(realRun).toLowerCase() === path.basename(expected).toLowerCase());
   }
 
   private async inspectTerminal(runId: string, generation: number | undefined, fileName: string): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
