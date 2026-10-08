@@ -1439,6 +1439,10 @@ class OwedCandidateLimitError extends Error {
   }
 }
 
+export type InventoryReadCause =
+  | "attribution_unreadable" | "clone_ancestor_invalid" | "clone_path_invalid"
+  | "clone_head_unreadable" | "git_or_filesystem_error" | "other";
+
 export class GitCache {
   private readonly reposRoot: string;
   /** Runner-owned clone store (the working trees). A distinct /data subtree from the
@@ -4196,15 +4200,24 @@ export class GitCache {
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
   async readInventoryCloneHeads(barePath: string, runId: string): Promise<
-    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown" }
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
+    let cause: InventoryReadCause = "other";
+    function refuse(failure: InventoryReadCause, message: string): never {
+      cause = failure;
+      throw new Error(message);
+    }
+    // Classification is scoped to the failing operation, never a phase left by a sibling.
+    const atFailure = async <T>(failure: InventoryReadCause, operation: () => Promise<T>): Promise<T> => {
+      try { return await operation(); } catch (err) { cause = failure; throw err; }
+    };
     try {
       if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
-          await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return { kind: "unknown" };
+          await atFailure("git_or_filesystem_error", () => this.resolveRecoveryBareDir(path.basename(barePath))) !== barePath) return { kind: "unknown", cause };
       return await this.withLock(barePath, async () => {
         const paths = new Map<string, { branch: string; runId: string }>();
         const foreignOwners = new Set<string>();
-        const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+        const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
         const entries = config.split("\0");
         const journals = new Map<string, string>();
         for (const item of entries) {
@@ -4217,20 +4230,20 @@ export class GitCache {
           // Retirement clears this key to empty. Like readRecoveryCapture, the
           // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
           if (value === "") continue;
-          const journal = await this.readRecoveryCapture(barePath, branch, entries);
-          if (!journal) throw new Error("unreadable recovery attribution");
+          const journal = await atFailure("attribution_unreadable", () => this.readRecoveryCapture(barePath, branch, entries));
+          if (!journal) refuse("attribution_unreadable", "unreadable recovery attribution");
           if (journal.attemptId !== undefined &&
               (parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot))?.attemptId ?? "") !== journal.attemptId) {
-            throw new Error("recovery attempt identity disagrees with clone path");
+            refuse("clone_path_invalid", "recovery attempt identity disagrees with clone path");
           }
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
           paths.set(journal.clonePath, { branch, runId });
         }
         // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
-        for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
-          if (!parseAttemptLedgerEntry(raw)) throw new Error("unreadable attempt attribution");
+        for (const [, raw] of await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgerRaw(barePath))) {
+          if (!parseAttemptLedgerEntry(raw)) refuse("attribution_unreadable", "unreadable attempt attribution");
         }
-        for (const entry of (await this.readAllAttemptLedgers(barePath)).values()) {
+        for (const entry of (await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgers(barePath))).values()) {
           if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
@@ -4239,64 +4252,67 @@ export class GitCache {
         clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
-          if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("unknown canonical clone key");
-          if (!await this.classifyOwnerClonePath(barePath, owner.branch, key, runId, clone)) {
-            throw new Error("unknown retained clone path");
+          if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) refuse("clone_path_invalid", "unknown canonical clone key");
+          if (!await atFailure("git_or_filesystem_error", () => this.classifyOwnerClonePath(barePath, owner.branch, key, runId, clone))) {
+            refuse("clone_path_invalid", "unknown retained clone path");
           }
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
-              path.dirname(path.dirname(clone)) !== root) throw new Error("unsafe clone path");
+              path.dirname(path.dirname(clone)) !== root) refuse("clone_path_invalid", "unsafe clone path");
           // After attribution validation, probe outer-to-inner: ENOENT skips this clone
           // without reading descendants; every existing ancestor must be a non-symlink directory.
           for (const dir of [root, path.dirname(clone)]) {
             let st: Stats;
             try { st = await fs.lstat(dir); }
-            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; throw err; }
-            if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone parent");
+            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; cause = "clone_ancestor_invalid"; throw err; }
+            if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_ancestor_invalid", "unsafe clone parent");
           }
           let st: Stats;
           try { st = await fs.lstat(clone); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; throw err; }
-          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone");
-          const gitdir = path.join(clone, ".git");
-          const gs = await fs.lstat(gitdir);
-          if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
-          const readRef = async (relative: string): Promise<string> => {
-            const parts = relative.split("/");
-            for (let i = 1; i < parts.length; i++) {
-              const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
-              if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; cause = "git_or_filesystem_error"; throw err; }
+          if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
+          const head = await atFailure("clone_head_unreadable", async () => {
+            const gitdir = path.join(clone, ".git");
+            const gs = await fs.lstat(gitdir);
+            if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
+            const readRef = async (relative: string): Promise<string> => {
+              const parts = relative.split("/");
+              for (let i = 1; i < parts.length; i++) {
+                const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
+                if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+              }
+              const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+              try {
+                const stat = await file.stat();
+                if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
+                const bytes = Buffer.alloc(1024 * 1024 + 1);
+                const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+                if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
+                return bytes.subarray(0, bytesRead).toString("utf8").trim();
+              } finally { await file.close(); }
+            };
+            let head = await readRef("HEAD");
+            if (head.startsWith("ref: ")) {
+              const ref = head.slice(5);
+              if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
+                  ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
+              try { head = await readRef(ref); }
+              catch (err) {
+                if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+                const packed = await readRef("packed-refs");
+                head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+              }
             }
-            const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-            try {
-              const stat = await file.stat();
-              if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
-              const bytes = Buffer.alloc(1024 * 1024 + 1);
-              const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-              if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
-              return bytes.subarray(0, bytesRead).toString("utf8").trim();
-            } finally { await file.close(); }
-          };
-          let head = await readRef("HEAD");
-          if (head.startsWith("ref: ")) {
-            const ref = head.slice(5);
-            if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
-                ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
-            try { head = await readRef(ref); }
-            catch (err) {
-              if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-              const packed = await readRef("packed-refs");
-              head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
-            }
-          }
-          if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+            if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+            return head;
+          });
           heads.add(head);
           clones.push({ clonePath: clone, ...owner });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
       });
     } catch {
-      return { kind: "unknown" };
+      return { kind: "unknown", cause };
     }
   }
 

@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Guarded recovery records safe inventory-source refusal diagnostics ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
+  Worker logs and authenticated local recovery reasons identify the first failed source check and a bounded inventory-read cause without raw errors or paths. Existing custody and release decisions stay unchanged; the observed automatic hold-release failure still needs live evidence.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

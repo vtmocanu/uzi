@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { RunRunner } from "../src/runner.js";
 import { RequestError } from "../src/client.js";
 import type { RecoveryFinalDisposition, RecoveryReserveRequest } from "../src/protocol.js";
 import { execFileSync } from "node:child_process";
@@ -6,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { RecoveryCoordinator, canonicalJson, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
+import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
 import { createHash, createHmac } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
@@ -528,7 +529,136 @@ it("issue1924 a symlinked ancestor of the recovery root still finalizes; a symli
   } finally { await fs.rm(outer, { recursive: true, force: true }); }
 });
 
-async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receiptModel = false) {
+const sourceDiagnosticCauses = [
+  "attribution_unreadable", "clone_ancestor_invalid", "clone_path_invalid",
+  "clone_head_unreadable", "git_or_filesystem_error", "other",
+] as const;
+
+for (const cause of [...sourceDiagnosticCauses, undefined, "unknown/raw/error"]) {
+  for (const actionTime of [false, true]) it(`#2507 fallback cause ${cause} actionTime=${actionTime} authenticates across restart`, async () => {
+    const f = await fixture();
+    try {
+      const record = await f.freeze();
+      assert.ok(record);
+      let reads = 0;
+      f.git.readInventoryCloneHeads = async () => ++reads === (actionTime ? 3 : 1)
+        ? { kind: "unknown", cause } as never : { kind: "verified", heads: [], clones: [], foreignOwners: [] };
+      const outcome = await f.capture(record);
+      const normalized = sourceDiagnosticCauses.includes(cause as never) ? cause : "other";
+      const reason = "inventory_source_not_quiescent:inventory_read_not_verified:" + normalized;
+      assert.equal(outcome.reason, reason);
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(before.reason, reason);
+      assert.equal(before.state, "uploaded");
+      assert.equal(before.finalAcknowledged, undefined);
+      assert.equal(f.state.open, true);
+      assert.deepEqual(f.finals, []);
+      assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7, capture_id: record.captureId,
+        source_boundary_reason: "inventory_read_not_verified", inventory_read_cause: normalized }]);
+      const restarted = f.make();
+      assert.equal((await restarted.inspect("run-1"))[0]!.reason, reason, "fresh MAC-authenticated read");
+      f.git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [], clones: [], foreignOwners: [] });
+      await restarted.resumePending(undefined, [before]);
+      const after = (await restarted.inspect("run-1"))[0]!;
+      assert.equal(after.finalAcknowledged, true);
+      assert.equal(after.reason, reason, "last failure survives success");
+      for (const key of ["captureId", "serverCaptureId", "sourceSha", "checksum", "coverageDigest"] as const)
+        assert.equal(after[key], before[key]);
+      if (before.finalRequest) assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.reserves(), 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const original of [false, true]) for (const actionTime of [false, true]) {
+  it(`#2507 boot refusal logs independently of writes original=${original} actionTime=${actionTime}`, async () => {
+    const f = await fixture(true);
+    try {
+      if (original) await f.coordinator.pin({ runId: "run-1", generation: 7, kind: "issue",
+        branch: "task", sourceSha: H, inventoryGuarded: true });
+      await f.coordinator.snapshotOwedInventory();
+      const before = await f.coordinator.inspect("run-1");
+      f.state.diagnostic = { check: "inventory_read_not_verified", cause: "attribution_unreadable" };
+      f.state.sourceRefused = !actionTime;
+      f.state.sourceProofRefused = actionTime;
+      assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+      assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7,
+        ...(original ? { capture_id: before[0]!.captureId } : {}),
+        source_boundary_reason: "inventory_read_not_verified", inventory_read_cause: "attribution_unreadable" }]);
+      const after = await f.make(true).inspect("run-1");
+      if (original && !actionTime) {
+        assert.equal(after[0]!.reason, "inventory_source_not_quiescent:inventory_read_not_verified:attribution_unreadable");
+        assert.equal(after[0]!.captureId, before[0]!.captureId);
+      } else assert.deepEqual(after, before, "outer passed or no original must not write");
+      assert.deepEqual(f.finals, []);
+    } finally { await f.close(); }
+  });
+}
+
+for (const source of ["missing", "unknown", "malformed", "empty", "physical", "legacy"] as const) {
+  it(`#2507 coordinator boundary ${source} preserves custody decisions`, async () => {
+    const f = await fixture(source === "legacy");
+    try {
+      const record = await f.freeze();
+      assert.ok(record);
+      if (source === "missing") delete (f.git as { readInventoryCloneHeads?: unknown }).readInventoryCloneHeads;
+      if (source === "unknown") f.state.cloneReadable = false;
+      if (source === "malformed") f.git.readInventoryCloneHeads = async () => ({ kind: "verified", clones: [null] }) as never;
+      if (source === "physical") f.git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [H],
+        clones: [{ clonePath: "/fixture/clone", runId: "run-1", branch: "task" }], foreignOwners: [] }) as never;
+      if (source === "legacy") f.state.sourceRefused = true;
+      await f.capture(record);
+      const retained = (await f.make().inspect("run-1"))[0]!;
+      if (source === "empty") {
+        assert.equal(retained.finalAcknowledged, true);
+        assert.deepEqual(f.logs, []);
+      } else {
+        const check = source === "legacy" ? "inventory_source_not_quiescent" :
+          source === "physical" || source === "malformed" ? "physical_sources_without_boundary" : "inventory_read_not_verified";
+        assert.equal(retained.reason, source === "legacy" ? check : "inventory_source_not_quiescent:" + check +
+          (check === "inventory_read_not_verified" ? ":other" : ""));
+        assert.equal(f.logs[0]!.source_boundary_reason, check);
+        assert.equal(f.finals.length, 0);
+        assert.equal(f.state.open, true);
+        assert.equal(retained.finalAcknowledged, undefined);
+      }
+    } finally { await f.close(); }
+  });
+}
+
+for (const kind of ["issue", "mr_rework"] as const) for (const cause of sourceDiagnosticCauses)
+  for (const finalRead of [false, true]) {
+    it(`#2507 real runner to coordinator completed ${kind} cause=${cause} finalRead=${finalRead}`, async () => {
+      const f = await fixture("runner");
+      try {
+        f.context.kind = kind;
+        f.state.candidates[0]!.contexts = [structuredClone(f.context)];
+        f.state.status = "completed";
+        const record = await f.freeze();
+        assert.ok(record);
+        let reads = 0;
+        f.git.readInventoryCloneHeads = async () => ++reads === (finalRead ? 2 : 1)
+          ? { kind: "unknown", cause } : { kind: "verified", heads: [], clones: [], foreignOwners: [] };
+        const outcome = await f.capture(record);
+        const reason = "inventory_source_not_quiescent:inventory_read_not_verified:" + cause;
+        assert.equal(outcome.reason, reason);
+        const retained = (await f.make("runner").inspect("run-1"))[0]!;
+        assert.equal(retained.reason, reason, "diagnostic survives authenticated restart");
+        assert.equal(retained.kind, kind);
+        assert.equal(retained.state, "uploaded");
+        assert.equal(retained.finalAcknowledged, undefined);
+        assert.equal(f.state.open, true);
+        assert.deepEqual(f.finals, []);
+        assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7, capture_id: record.captureId,
+          source_boundary_reason: "inventory_read_not_verified", inventory_read_cause: cause }]);
+        assert.equal(f.state.uploads, 1);
+        assert.equal(f.reserves(), 1);
+      } finally { await f.close(); }
+    });
+  }
+
+async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false) {
   const root = await fs.mkdtemp(path.join(rootParent, "inventory-"));
   const context: PositiveOwedCandidateContext = {
     runId: "run-1", generation: 7, kind: "issue", branch: "task",
@@ -543,11 +673,12 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
-    sourceRefused: false, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
+    sourceRefused: false, sourceProofRefused: false, diagnostic: undefined as InventorySourceDiagnostic | undefined, cloneCause: undefined as string | undefined, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
     beforeFinalAck: undefined as (() => Promise<void>) | undefined,
   };
+  const logs: Array<Record<string, unknown>> = [];
   const aggregates: string[][] = [];
   const finals: unknown[][] = [];
   let reserves = 0;
@@ -654,9 +785,10 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
     },
   };
   const git = {
+    recoverySettlementRoot: path.join(root, "settlement"),
     deleteRecoveryPin: async () => { state.pinDeletes++; state.candidates = []; },
     readInventoryCloneHeads: async () => state.cloneReadable
-      ? ({ kind: "verified", heads: state.cloneHeads, clones: [], foreignOwners: [] }) : ({ kind: "unknown" }),
+      ? ({ kind: "verified", heads: state.cloneHeads, clones: [], foreignOwners: [] }) : ({ kind: "unknown", cause: state.cloneCause }),
     ancestry: async (_bare: string, head: string, target?: string) =>
       state.ancestors.has(head) && state.refused.get(head) !== target ? "ancestor" : "unknown",
     enumerateOwedCandidates: async () => structuredClone(state.candidates),
@@ -687,15 +819,36 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
     },
   };
   const log = nullLogger();
-  const make = (sourceBoundary = false) => new RecoveryCoordinator({
+  log.warn = (message, fields) => {
+    if (message === "recovery: inventory source boundary retained") logs.push(fields!);
+  };
+  const make = (sourceBoundary: boolean | "runner" = false) => {
+    let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
+      action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
+    const coordinator = new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
     log, client: client as never, git: git as never, now: () => state.now,
-    withInventorySourceBoundary: sourceBoundary ? async (_context, action) => {
-      if (state.sourceRefused) return "retained";
-      await action(async () => !state.sourceRefused);
+    withInventorySourceBoundary: sourceBoundary === "runner" ? (context, action) =>
+      physical.withInventorySourceBoundary(context, action) : sourceBoundary ? async (context, action) => {
+      if (state.sourceRefused) {
+        if (state.diagnostic) context.reportDiagnostic?.(state.diagnostic);
+        return "retained";
+      }
+      await action(async () => {
+        if (state.sourceRefused || state.sourceProofRefused) {
+          if (state.diagnostic) context.reportDiagnostic?.(state.diagnostic);
+          return false;
+        }
+        return true;
+      });
       return "passed";
     } : undefined,
-  });
+    });
+    if (sourceBoundary === "runner") physical = new RunRunner(client as never, git as never,
+      () => { throw new Error("unreached executor"); }, nullLogger(), 20, undefined,
+      { recovery: coordinator }) as unknown as typeof physical;
+    return coordinator;
+  };
   const coordinator = make(sourceBoundary);
   const freeze = (originalSourceSha = H) => coordinator.freezeInventory({
     context, currentSha: H, originalSourceSha, defaultBranch: "main",
@@ -703,7 +856,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
   const capture = (record: RecoveryRecord) => coordinator.captureAndUpload({
     record, barePath: context.barePath, defaultBranch: "main",
   });
-  return { root, context, state, aggregates, finals, coordinator, make, freeze, capture, git,
+  return { root, context, state, logs, aggregates, finals, coordinator, make, freeze, capture, git,
     captures, reserveKeys, committedReceipts, client, log,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
 }
@@ -2072,8 +2225,87 @@ it("a guarded journal never uses the legacy release RPC after feature loss", asy
 });
 
 
-for (const pendingFinal of [false, true]) {
-  it(`source refusal repeats backoff without replacing uploaded identity pendingFINAL=${pendingFinal}`, async () => {
+const diagnosticRetryReasons = [
+  "inventory_source_not_quiescent", "inventory_source_not_quiescent:inventory_read_not_verified",
+  ...["execution_tail_present", "boundary_exception", "non_linux_host", "live_attempt_path",
+    "process_not_quiescent_before_git", "process_not_quiescent_after_git", "worktree_status_dirty",
+    "worktree_status_unreadable", "source_identity_changed", "physical_sources_without_boundary"]
+    .map(check => "inventory_source_not_quiescent:" + check),
+  ...sourceDiagnosticCauses.map(cause => "inventory_source_not_quiescent:inventory_read_not_verified:" + cause),
+];
+const unknownDiagnosticReasons = [
+  "inventory_source_not_quiescent:invented",
+  "inventory_source_not_quiescent:worktree_status_dirty:extra",
+  "inventory_source_not_quiescent:inventory_read_not_verified:invented",
+  "inventory_source_not_quiescent:inventory_read_not_verified:other:extra",
+];
+
+async function authenticateDiagnosticRecord(f: Awaited<ReturnType<typeof fixture>>, record: RecoveryRecord, state: string, reason: string) {
+  const file = path.join(f.root, "journal", "run-1", record.captureId + ".json");
+  const saved = JSON.parse(await fs.readFile(file, "utf8"));
+  const { mac: _oldMac, ...payload } = { ...saved, state, reason };
+  const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+  const mac = createHmac("sha256", key).update(canonicalJson(payload)).digest("hex");
+  await fs.writeFile(file, JSON.stringify({ ...payload, mac }));
+}
+
+for (const reason of [...diagnosticRetryReasons, ...unknownDiagnosticReasons]) {
+  it(`#2507 needs_action exact retry allowlist ${reason}`, async () => {
+    const f = await fixture(true);
+    try {
+      const record = await f.freeze();
+      assert.ok(record);
+      f.state.finalError = new Error("ACK unavailable");
+      await f.capture(record);
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      await authenticateDiagnosticRecord(f, before, "needs_action", reason);
+      delete (f.git as { discoverOwedCandidates?: unknown }).discoverOwedCandidates;
+      f.state.finalError = undefined;
+      f.state.sourceRefused = true;
+      f.state.diagnostic = { check: "worktree_status_dirty" };
+      const restarted = f.make(true);
+      await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const after = (await restarted.inspect("run-1"))[0]!;
+      const eligible = diagnosticRetryReasons.includes(reason);
+      assert.equal(after.reason, eligible ? "inventory_source_not_quiescent:worktree_status_dirty" : reason);
+      assert.equal(after.finalAcknowledged, undefined);
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(f.logs.length, eligible ? 1 : 0);
+      assert.equal(f.state.open, true);
+      assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const reason of unknownDiagnosticReasons) {
+  it(`#2507 uploaded unknown suffix still eligible without transient backoff ${reason}`, async () => {
+    const f = await fixture();
+    try {
+      const record = await f.freeze();
+      assert.ok(record);
+      f.state.expires = "invalid";
+      await f.capture(record);
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      await authenticateDiagnosticRecord(f, before, "uploaded", reason);
+      delete (f.git as { discoverOwedCandidates?: unknown }).discoverOwedCandidates;
+      const restarted = f.make();
+      for (let i = 0; i < 2; i++) {
+        await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+        f.state.now += 30_000;
+      }
+      f.state.expires = "2099-01-01T00:00:00Z";
+      await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const after = (await restarted.inspect("run-1"))[0]!;
+      assert.equal(after.finalAcknowledged, true, "unknown reason does not grow transient backoff");
+      assert.equal(after.reason, reason);
+      assert.equal(after.captureId, before.captureId);
+      assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const pendingFinal of [false, true]) for (const cause of [undefined, ...sourceDiagnosticCauses]) {
+  it(`source refusal repeats backoff without replacing uploaded identity pendingFINAL=${pendingFinal} cause=${cause}`, async () => {
     const f = await fixture(true);
     try {
       const record = await f.freeze();
@@ -2086,12 +2318,13 @@ for (const pendingFinal of [false, true]) {
         await f.capture(record);
       }
       f.state.sourceRefused = true;
+      if (cause) f.state.diagnostic = { check: "inventory_read_not_verified", cause };
       const before = (await f.coordinator.inspect("run-1"))[0]!;
       const identity = (r: RecoveryRecord) => [r.captureId, r.serverCaptureId, r.sourceSha,
         r.coverageDigest, r.checksum, r.finalRequest];
       await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
       const first = (await f.coordinator.inspect("run-1"))[0]!;
-      assert.equal(first.reason, "inventory_source_not_quiescent");
+      assert.equal(first.reason, cause ? "inventory_source_not_quiescent:inventory_read_not_verified:" + cause : "inventory_source_not_quiescent");
       assert.equal(first.state, "uploaded");
       assert.deepEqual(identity(first), identity(before));
       f.state.now += 30_000;
@@ -2133,7 +2366,7 @@ it("physical clones fail closed without runner boundary even when heads are cove
     assert.equal(f.state.open, true);
     const retained = (await f.coordinator.inspect("run-1"))[0]!;
     assert.equal(retained.state, "uploaded", "available bytes remain uploaded while FINAL is refused");
-    assert.equal(retained.reason, "inventory_source_not_quiescent");
+    assert.equal(retained.reason, "inventory_source_not_quiescent:physical_sources_without_boundary");
     assert.equal(retained.finalAcknowledged, undefined);
   } finally { await f.close(); }
 });

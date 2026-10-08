@@ -84,7 +84,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
+import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type RecoveryRecord } from "./recovery.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -2447,12 +2447,13 @@ export class RunRunner {
   }
 
   private async withInventorySourceBoundary(
-    context: { runId: string; generation: number; barePath: string },
+    context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ): Promise<"passed" | "retained"> {
     const { runId, barePath } = context;
+    const refuse = inventorySourceReporter(context);
     // Never wait on an executing lane: terminal-journal drain can call recovery itself.
-    if (this.executionTails.has(runId)) return "retained";
+    if (this.executionTails.has(runId)) { refuse({ check: "execution_tail_present" }); return "retained"; }
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
@@ -2461,9 +2462,10 @@ export class RunRunner {
       let sourceIdentity: string | undefined;
       const prove = async (): Promise<boolean> => {
         const inventory = await this.git.readInventoryCloneHeads(barePath, runId);
-        if (inventory.kind !== "verified") return false;
+        if (inventory.kind !== "verified")
+          return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
         const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
-        if (sourceIdentity !== undefined && sourceIdentity !== identity) return false;
+        if (sourceIdentity !== undefined && sourceIdentity !== identity) return refuse({ check: "source_identity_changed" });
         sourceIdentity = identity;
         // Each owned physical source is checked once per proof; a failed sibling blocks FINAL.
         for (const clone of inventory.clones) {
@@ -2475,21 +2477,27 @@ export class RunRunner {
             otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
             site: "inventory_source",
           };
-          if (process.platform !== "linux" || this.liveAttempts.isLivePath(clone.clonePath)) return false;
+          if (process.platform !== "linux") return refuse({ check: "non_linux_host" });
+          if (this.liveAttempts.isLivePath(clone.clonePath)) return refuse({ check: "live_attempt_path" });
           const before = await this.quiesceImpl(request);
-          if (before.process?.state !== "quiescent") return false;
+          if (before.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_before_git" });
           const status = await this.git.worktreeStatus(clone.clonePath);
           const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
-          if (status === null || status.length !== 0 || after.process?.state !== "quiescent") return false;
+          if (status === null) return refuse({ check: "worktree_status_unreadable" });
+          if (status.length !== 0) return refuse({ check: "worktree_status_dirty" });
+          if (after.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_after_git" });
         }
         const afterGit = await this.git.readInventoryCloneHeads(barePath, runId);
-        return afterGit.kind === "verified" &&
-          JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) === sourceIdentity;
+        if (afterGit.kind !== "verified")
+          return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(afterGit) });
+        return JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) === sourceIdentity ||
+          refuse({ check: "source_identity_changed" });
       };
       if (!await prove()) return "retained";
       await action(prove);
       return "passed";
     } catch (err) {
+      refuse({ check: "boundary_exception" });
       this.log.warn("recovery: physical source retained", { run_id: runId, error: errMessage(err) });
       return "retained";
     } finally {
