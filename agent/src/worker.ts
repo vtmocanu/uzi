@@ -178,8 +178,16 @@ export class Worker {
         throw new Error("enabled memory guard requires a worker runtime");
       }
       sampler = this.memory?.run();
-      // A sampler failure is fatal and stops the lifecycle, with its original error joined below.
-      void sampler?.catch(abort);
+      // Fatal sampler failure uses the worker-wide shutdown authority, unlike a
+      // one-tree pressure intervention. Revoke memory authority before cancelling
+      // executions, then stop the loops so their drains can join the unwinding runs.
+      // The original sampler error is joined below.
+      void sampler?.catch(() => {
+        void this.shutdownMemory();
+        this.runner.shutdown();
+        this.isolatedRunner?.shutdown();
+        controller.abort();
+      });
       await this.runLifecycle(controller);
     } finally {
       abort();

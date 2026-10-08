@@ -6,6 +6,7 @@ import { performance } from "node:perf_hooks";
 import { Worker } from "../src/worker.js";
 import { WorkerClient } from "../src/client.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
+import type { WorkerMemoryReader } from "../src/worker-memory-reader.js";
 import { Outbox } from "../src/outbox.js";
 import { StatsCollector } from "../src/stats.js";
 import type { Config } from "../src/config.js";
@@ -13,6 +14,7 @@ import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
+import type { IsolatedRunner } from "../src/isolated-runner.js";
 import { nullLogger } from "./helpers.js";
 
 const workerId = "22222222-2222-4222-8222-222222222222";
@@ -37,16 +39,16 @@ async function until(predicate: () => boolean) {
   }
 }
 function build(cfg: Config, client: WorkerClient, memory?: WorkerMemoryRuntime,
-  outbox?: Outbox, runnerOverrides: object = {}) {
-  const runner = { resumePendingRecoveries: async () => {}, settlePendingPredecessors: async () => {},
+  outbox?: Outbox, runnerOverrides: object = {}, isolatedRunner?: IsolatedRunner) {
+  const runner = { shutdown: () => {}, resumePendingRecoveries: async () => {}, settlePendingPredecessors: async () => {},
     observeSettlementTerminalAck: async () => {}, ...runnerOverrides } as unknown as RunRunner;
   return new Worker(cfg, client, runner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
     nullLogger(), () => ({ ok: true, missing: [] }), outbox, undefined, undefined, undefined,
     undefined, undefined, undefined,
     (dataDir) => new StatsCollector({ dataDir, processRss: () => 1 }),
-    undefined, undefined, undefined, undefined, undefined, memory);
+    isolatedRunner, undefined, undefined, undefined, undefined, memory);
 }
-function rig(overrides: object = {}) {
+function rig(overrides: object = {}, reader?: Pick<WorkerMemoryReader, "sample">) {
   let samples = 0;
   let reservations = 0;
   let invalidation: (() => void) | undefined;
@@ -65,7 +67,7 @@ function rig(overrides: object = {}) {
     ...overrides,
   } as unknown as WorkerClient;
   const memory = new WorkerMemoryRuntime(settings, client, nullLogger(), {
-    reader: { sample: () => {
+    reader: reader ?? { sample: () => {
       const time = performance.now();
       return { available: true, sampleId: ++samples, startedAtMs: time, completedAtMs: time,
         currentBytes: 950, limitBytes: 1000, stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
@@ -165,6 +167,93 @@ test("sampler failure is fatal and joins the stopped runtime", async () => {
   const worker = build(config(), f.client, memory);
   await assert.rejects(worker.run(new AbortController().signal), /sample fixture failure/);
   assert.equal(f.client.memoryIncarnation, undefined);
+});
+
+for (const lane of ["run", "isolated"] as const) test("fatal sampler failure cancels active " + lane + " execution before joining", async () => {
+  const entered = deferred();
+  const cancelled = deferred();
+  const drain = deferred();
+  const cancel = new AbortController();
+  const failure = new Error("active sample fixture failure");
+  let failSample = false, claimed = false, finished = false, settled = false;
+  let sampleId = 0;
+  const events: string[] = [];
+  const shutdownObservations: { incarnation: WorkerClient["memoryIncarnation"]; current: boolean }[] = [];
+  const active = rig({ claimRun: async () => {
+    if (claimed) return null;
+    claimed = true;
+    return { run_id: runId, kind: "task", claim_generation: 1,
+      ...(lane === "isolated" ? { isolated_fetch: {} } : {}) };
+  } }, { sample: () => {
+    if (failSample) throw failure;
+    const time = performance.now();
+    return { available: false, reason: "absent", sampleId: ++sampleId,
+      startedAtMs: time, completedAtMs: time };
+  } });
+  const memory = active.memory;
+  const context = memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
+    claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 },
+    { feedback: async () => {}, preserve: async () => {} });
+  const execution = {
+    execute: async () => {
+      events.push("execute");
+      const aborted = new Promise<void>((resolve) => {
+        cancel.signal.addEventListener("abort", () => {
+          events.push("cancel");
+          cancelled.resolve();
+          resolve();
+        }, { once: true });
+      });
+      entered.resolve();
+      await aborted;
+      await drain.promise;
+      finished = true;
+      events.push("drained");
+    },
+    shutdown: () => {
+      shutdownObservations.push({ incarnation: active.client.memoryIncarnation,
+        current: memory.commands.isCurrent(context) });
+      events.push("shutdown");
+      cancel.abort();
+    },
+  };
+  const worker = build(config(), active.client, memory, undefined,
+    lane === "run" ? execution : { shutdown: () => {
+      shutdownObservations.push({ incarnation: active.client.memoryIncarnation,
+        current: memory.commands.isCurrent(context) });
+      events.push("run shutdown");
+    } },
+    lane === "isolated" ? execution as unknown as IsolatedRunner : undefined);
+  const controller = new AbortController();
+  const done = worker.run(controller.signal);
+  const outcome = done.then(() => { settled = true; return undefined; },
+    (error: unknown) => { settled = true; return error; });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const bounded = new Promise<never>((_resolve, reject) => {
+    deadline = setTimeout(() => reject(new Error("active execution shutdown did not join within 2s")), 2000);
+  });
+  try {
+    await Promise.race([entered.promise, bounded]);
+    failSample = true;
+    await Promise.race([cancelled.promise, bounded]);
+    assert.equal(settled, false, "worker must await the execution's unwind");
+    assert.equal(finished, false);
+    assert.deepEqual(shutdownObservations, Array.from({ length: lane === "run" ? 1 : 2 },
+      () => ({ incarnation: undefined, current: false })));
+    drain.resolve();
+    assert.equal(await Promise.race([outcome, bounded]), failure, "retain the original sampler error");
+    assert.equal(finished, true);
+    assert.deepEqual(events, lane === "run"
+      ? ["execute", "shutdown", "cancel", "drained"]
+      : ["execute", "run shutdown", "shutdown", "cancel", "drained"]);
+  } finally {
+    if (deadline !== undefined) clearTimeout(deadline);
+    controller.abort();
+    cancel.abort();
+    drain.resolve();
+    await outcome;
+    await active.memory.stop();
+  }
 });
 
 test("repeated Worker.run and client registration rotations keep a single sampler", async () => {
