@@ -9,6 +9,7 @@ import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Outbox } from "./outbox.js";
 import { CodexCrossCheck, CrossCheckMalformedError } from "./codex/cross-check.js";
 import { selectCodexBinding } from "./codex/select.js";
+import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, isStaleClaimRefusal } from "./terminal-resolve.js";
 import { errMessage } from "./util.js";
@@ -124,6 +125,7 @@ export class CrossCheckRunner {
       if (isStaleClaimRefusal(err) || steering?.claimLost()) return;
       if (checkerClaimRefused(err) && await custodyLost()) return;
       if (timedOut) reason = "model_timeout";
+      else if (!cancel.signal.aborted && err instanceof CrossCheckCheckerUnavailableError) reason = "checker_unavailable";
       else if (err instanceof CrossCheckMalformedError) reason = "malformed";
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
       try {

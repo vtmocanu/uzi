@@ -30,6 +30,7 @@
 
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import { modelRejectionTag, type ModelRejectionTag } from "./model-rejection.js";
 
 import type { HarnessError, HarnessErrorCategory } from "../harness.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -81,11 +82,19 @@ const DEFAULT_MAX_INBOUND_BYTES = 64 * 1024 * 1024;
  */
 export class CodexTransportError extends Error {
   readonly failure: HarnessError;
-  constructor(failure: HarnessError) {
+  constructor(failure: HarnessError, readonly modelRejection?: ModelRejectionTag) {
     super(failure.message);
     this.name = "CodexTransportError";
     this.failure = failure;
   }
+}
+
+// The captured TurnError uses "other"; auth/rate/badRequest/HTTP failures
+// retain their existing disposition even when their message imitates the envelope.
+function rejectionMetadata(error: unknown): { modelRejection?: ModelRejectionTag } {
+  if (readStringProp(error, "codexErrorInfo") !== "other") return {};
+  const tag = modelRejectionTag(readStringProp(error, "message"));
+  return tag ? { modelRejection: tag } : {};
 }
 
 function fail(category: HarnessErrorCategory, message: string): CodexTransportError {
@@ -155,6 +164,7 @@ export type CodexNotification =
       readonly threadId: string;
       readonly turnId: string;
       readonly status?: string;
+      readonly modelRejection?: ModelRejectionTag;
       readonly params: unknown;
     }
   | {
@@ -179,6 +189,7 @@ export type CodexNotification =
       readonly threadId: string;
       readonly turnId: string;
       readonly willRetry: boolean;
+      readonly modelRejection?: ModelRejectionTag;
       readonly params: unknown;
     }
   | {
@@ -694,12 +705,16 @@ class CodexTransportImpl implements CodexTransport {
         if (threadId !== undefined && turnId !== undefined) return { kind: "turn_started", method, threadId, turnId, params };
       } else if (method === "turn/completed") {
         const threadId = readStringProp(params, "threadId");
-        const turnId = readStringProp((params as Record<string, unknown> | undefined)?.turn, "id");
-        const status = readStringProp((params as Record<string, unknown> | undefined)?.turn, "status");
+        const turn = readObjectProp(params, "turn");
+        const turnId = readStringProp(turn, "id");
+        const status = readStringProp(turn, "status");
         if (threadId !== undefined && turnId !== undefined) {
           return status === undefined
             ? { kind: "turn_completed", method, threadId, turnId, params }
-            : { kind: "turn_completed", method, threadId, turnId, status, params };
+            : { kind: "turn_completed", method, threadId, turnId, status, params,
+                ...(threadId.length > 0 && turnId.length > 0 && status === "failed"
+                  && Array.isArray(turn?.items) && turn.items.length === 0
+                  ? rejectionMetadata(readObjectProp(turn, "error")) : {}) };
         }
       } else if (method === "thread/tokenUsage/updated") {
         // PRD #1332 C4a / D5: decode as a TYPED usage notification. It requires threadId,
@@ -746,7 +761,8 @@ class CodexTransportImpl implements CodexTransport {
           turnId.length > 0 &&
           willRetry !== undefined
         ) {
-          return { kind: "codex_error", method, threadId, turnId, willRetry, params };
+          return { kind: "codex_error", method, threadId, turnId, willRetry, params,
+            ...rejectionMetadata(readObjectProp(params, "error")) };
         }
       }
     }
@@ -773,9 +789,10 @@ class CodexTransportImpl implements CodexTransport {
       if (typeof c === "number") code = c;
     }
     // The provider `message` is NOT embedded — it can be attacker-shaped and must never
-    // reach a log through an error string. Only the bounded numeric code is retained.
+    // reach a log through an error string. Only the numeric code and closed safe tag are retained.
     const suffix = code === undefined ? "" : ` (code ${code})`;
-    return fail("protocol", `codex app-server returned a JSON-RPC error${suffix}`);
+    return new CodexTransportError({ category: "protocol", message: `codex app-server returned a JSON-RPC error${suffix}` },
+      typeof code === "number" && Number.isInteger(code) ? modelRejectionTag(readStringProp(err, "message")) : undefined);
   }
 
   // --- notification delivery (bounded, single-consumer) -----------------------

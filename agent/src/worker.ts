@@ -560,6 +560,7 @@ export class Worker {
           // until the checker arrives in M2. The server only offers them to workers
           // that advertise this fail-closed gate.
           "cross_check_v1",
+          "cross_check_pins_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
