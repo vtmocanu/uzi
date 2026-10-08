@@ -210,6 +210,16 @@ export interface Config {
    * only — the chat lane has its own, distinct ceiling (chatSessions above).
    */
   maxConcurrentRuns: number;
+  /** Explicit opt-in; limit-relative thresholds are validated by the future guard. */
+  memoryGuard?: { enabled: false } | {
+    enabled: true;
+    reserveBytes: number;
+    sampleMs: number;
+    hysteresisBytes: number;
+    rearmMs: number;
+    responseBudgetMs: number;
+    maxInterventions: number;
+  };
   /**
    * The worker's resolved docker wiring (PRD #83 M1 keystone). `loadConfig` leaves it
    * `{}` — resolution runs a bounded liveness PROBE (async), so it cannot happen in the
@@ -513,6 +523,31 @@ function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
   return required(env, "UZI_WORKER_TOKEN");
 }
 
+function memoryGuardConfig(env: NodeJS.ProcessEnv): NonNullable<Config["memoryGuard"]> {
+  const flag = env.WORKER_MEMORY_GUARD_ENABLED?.trim().toLowerCase() ?? "";
+  if (["", "0", "false", "no", "off"].includes(flag)) return { enabled: false };
+  if (!["1", "true", "yes", "on"].includes(flag)) {
+    throw new Error("WORKER_MEMORY_GUARD_ENABLED must be a boolean");
+  }
+  function explicitInteger(name: string, ceiling: number): number {
+    const raw = env[name]?.trim() ?? "";
+    const value = Number(raw);
+    if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(value) || value <= 0 || value > ceiling) {
+      throw new Error(`${name} must be an explicit positive integer <= ${ceiling}`);
+    }
+    return value;
+  }
+  return {
+    enabled: true,
+    reserveBytes: explicitInteger("WORKER_MEMORY_GUARD_RESERVE_BYTES", Number.MAX_SAFE_INTEGER),
+    sampleMs: explicitInteger("WORKER_MEMORY_GUARD_SAMPLE_MS", 2147483647),
+    hysteresisBytes: explicitInteger("WORKER_MEMORY_GUARD_HYSTERESIS_BYTES", Number.MAX_SAFE_INTEGER),
+    rearmMs: explicitInteger("WORKER_MEMORY_GUARD_REARM_MS", 2147483647),
+    responseBudgetMs: explicitInteger("WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS", 2147483647),
+    maxInterventions: explicitInteger("WORKER_MEMORY_GUARD_MAX_INTERVENTIONS", 9999),
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
@@ -589,6 +624,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // the safe default. The soft-ceiling warn lives in main.ts (needs the logger,
     // built after this parse) — see MAX_CONCURRENT_RUNS_SOFT_CEILING.
     maxConcurrentRuns: positiveInt(env, "WORKER_MAX_CONCURRENT_RUNS", 1),
+    memoryGuard: memoryGuardConfig(env),
     // Populated by main.ts after an async liveness probe (see the field doc); the sync
     // parse cannot probe, so the default is "no daemon wired".
     dockerWiring: {},
