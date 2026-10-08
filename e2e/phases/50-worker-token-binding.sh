@@ -19,7 +19,7 @@
 # the real worker-Bearer auth — which is the whole product claim ("worker alpha spends
 # console-key").
 #
-# It runs LAST and drives the claim endpoint with curl instead of the agent container,
+# It drives the claim endpoint with curl instead of the agent container,
 # for two reasons that are not laziness:
 #   - the claim payload is the only place the token is legible, and the agent
 #     deliberately never writes it anywhere (the secret-hygiene phase above asserts
@@ -27,14 +27,12 @@
 #   - both claims must come from ONE worker with nothing restarted in between, which
 #     is the property under test. A second container would test two workers instead.
 # The live agent is stopped first: it shares the admin's queue and would otherwise
-# claim these runs itself. Nothing follows this phase, so the stop is free.
+# claim these runs itself. Phase 51 also needs it stopped; the outbox and restart
+# phases recreate it before later lifecycle scenarios.
 #
-# 🔴 THAT LAST SENTENCE IS A CONSTRAINT ON EVERY FUTURE PHASE, not a description. The
-# `stop agent` below is never undone, so ANY phase appended after this one runs against
-# a stack with no worker: its runs are created fine, sit in `queued`, and time out at
-# whatever it waits for. PRD #35 M6 was written here first and died exactly that way
-# (2026-07-28). Append below only what needs no worker — otherwise put the phase ahead
-# of this one, or restart the agent yourself.
+# A new phase needing the real agent must recreate it or follow the explicit
+# restart boundary. This phase itself keeps the agent stopped for the next
+# synthetic-worker scenario.
 say "PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim"
 login
 # ClaimRun still applies owner count < limit to these non-recovery-capable
