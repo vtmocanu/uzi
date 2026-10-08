@@ -140,11 +140,11 @@ WITH locked_run AS MATERIALIZED (
     WHERE h.id = @id
     FOR UPDATE OF r
 )
-UPDATE recovery_custody_holds
+UPDATE recovery_custody_holds AS target
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
     released_at = now(), updated_at = now()
-WHERE id = @id AND state = 'open' AND NOT inventory_guarded
+WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
   AND NOT EXISTS (
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
