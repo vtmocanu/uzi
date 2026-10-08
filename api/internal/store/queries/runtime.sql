@@ -9608,7 +9608,7 @@ WHERE w.user_id = @user_id
 --     under the lock. It can also transiently exclude a run whose owner has just dropped
 --     below the cap; the next tick surfaces it, so no run is lost.
 --
--- ORDER BY r.created_at ASC so the oldest waiting run is provisioned first; LIMIT
+-- Effective run priority comes first, then created_at breaks equal-rank ties by age; LIMIT
 -- @max_rows bounds the work per tick.
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
