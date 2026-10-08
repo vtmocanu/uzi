@@ -64,9 +64,12 @@ alone does not establish dependency availability.
 For inventory-guarded capture (#2476), try self-contained first. Only a size-cap
 refusal permits a capped thin fallback using the exact cached worker-bare
 default-branch tip and all its merge bases with the captured source, without a
-forge PAT. Record actual bundle-header dependencies and verify import in an
-isolated no-alternates repository supplied only with that cached closure. This
-proves local import, not fresh public availability. A thin archive remains
+forge PAT. If a merge base equals the captured source H, exclude H's verified
+parents instead so H remains advertised; a root H has no useful boundary and
+keeps the self-contained/oversized outcome. Record actual bundle-header
+dependencies. Production verifies the bundle in the trusted worker bare;
+conformance tests verify and import it in isolated no-alternates destination
+clones. These checks do not guarantee fresh public availability. A thin archive remains
 owner-downloadable but never authorizes archive-backed FINAL or source cleanup,
 even with complete root coverage. Holds, pins and clones stay retained until
 independently verified empty-inventory settlement or explicit owner discard.

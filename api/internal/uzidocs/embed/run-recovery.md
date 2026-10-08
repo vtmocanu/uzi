@@ -137,7 +137,10 @@ source before importing. Do not discard the source on the strength of a checksum
 
 Inventory-guarded capture tries a self-contained bundle first. Only a size-cap
 refusal permits a thin fallback using the exact worker-bare cached default-branch
-tip and **all** its merge bases with the captured source. This needs no forge PAT
+tip and **all** its merge bases with the captured source. If a merge base equals
+the source H, it excludes H's verified parents instead so H remains in the
+bundle; a root H has no useful boundary and keeps the self-contained/oversized
+outcome. This needs no forge PAT
 and makes no fresh public-availability guarantee. The prerequisite list records
 the dependencies actually written in the bundle header. Legacy capture using a
 fresh verified forge tip is unchanged; restart and quarantine capture without the
