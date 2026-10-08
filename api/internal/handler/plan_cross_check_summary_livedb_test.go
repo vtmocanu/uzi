@@ -300,8 +300,23 @@ func TestPlanCrossCheckSummaryQueryLiveDB(t *testing.T) {
 	}
 	// Reading expiry is observational; settlement remains the lifecycle's job.
 	cliMustExec(t, pool, `UPDATE cross_checks SET verdict='pending',reason_class=NULL,findings=NULL,decided_at=NULL,interrupted_at=NULL,wait_credited=false,created_at=now()-interval '2 minutes',deadline_at=now()-interval '1 minute' WHERE lead_run_id=$1`, lead)
+	persistedState := func() string {
+		t.Helper()
+		var snapshot string
+		if err := pool.QueryRow(t.Context(), `SELECT jsonb_build_object(
+			'check',to_jsonb(cc),'lead',to_jsonb(parent),'child',to_jsonb(checker))::text
+			FROM cross_checks cc JOIN runs parent ON parent.id=cc.lead_run_id
+			JOIN runs checker ON checker.id=cc.checker_run_id WHERE cc.lead_run_id=$1`, lead).Scan(&snapshot); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	beforeRead := persistedState()
 	if got := read(); got.Verdict != "pending" || got.ReasonClass != nil || got.Findings != nil {
 		t.Fatal("read invented expiry result")
+	}
+	if persistedState() != beforeRead {
+		t.Fatal("observational summary read changed persisted check, parent or child")
 	}
 	cliMustExec(t, pool, `UPDATE cross_checks SET created_at=now(),deadline_at=now()+interval '1 minute',decided_at=NULL,interrupted_at=NULL,wait_credited=false WHERE lead_run_id=$1`, lead)
 	cliMustExec(t, pool, `UPDATE runs SET status='running',claim_released_at=NULL,claim_generation=1 WHERE id=$1`, lead)

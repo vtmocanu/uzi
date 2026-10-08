@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -209,6 +210,10 @@ func TestPlanCrossCheckAutomaticRoundsLatestSettlementLiveDB(t *testing.T) {
 	mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
 		(id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,automatic_rounds_enabled,automatic_revision_limit,created_at,deadline_at)
 		VALUES ($1,$2,$3,'plan',2,1,'second plan','[]','s',repeat('b',40),$4,true,2,'2020-01-01 00:00:00+00','2020-01-01 00:00:17.25+00')`, fx.crossCheckID, f.runID, fx.checkerID, []byte("second digest"))
+	beforeFirst, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
 	mustExec(ctx, t, f.pool, "UPDATE runs SET budget_paused_seconds=7 WHERE id=$1", f.runID)
 	mustExec(ctx, t, f.pool, "UPDATE runs SET status='queued' WHERE id=$1", f.runID)
 	latest, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 2})
@@ -222,7 +227,7 @@ func TestPlanCrossCheckAutomaticRoundsLatestSettlementLiveDB(t *testing.T) {
 		t.Fatalf("round 2 credit=%d want 25", credit)
 	}
 	first, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 1})
-	if err != nil || first.Verdict != "revise" || first.InterruptedAt.Valid {
+	if err != nil || !reflect.DeepEqual(first, beforeFirst) {
 		t.Fatalf("older round changed: verdict=%s interrupted=%v err=%v", first.Verdict, first.InterruptedAt.Valid, err)
 	}
 }

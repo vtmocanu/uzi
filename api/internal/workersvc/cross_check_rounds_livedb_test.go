@@ -206,6 +206,64 @@ func TestPlanCrossCheckAutomaticRoundsConcurrentRequestedRoundLiveDB(t *testing.
 	}
 }
 
+func TestPlanCrossCheckAutomaticRoundsConflictingCandidatesLiveDB(t *testing.T) {
+	env, svc, w, lead, c := newAutomaticRoundsFixture(t, 2)
+	other := c
+	other.PlanMd += "\nconflicting proposal"
+	for round := int32(1); round <= 2; round++ {
+		ctx, cancel := context.WithTimeout(env.ctx, 10*time.Second)
+		start := make(chan struct{})
+		type result struct {
+			cc        store.CrossCheck
+			candidate PlanCrossCheckCandidate
+			err       error
+		}
+		results := make(chan result, 2)
+		for _, candidate := range []PlanCrossCheckCandidate{c, other} {
+			go func() {
+				<-start
+				cc, err := svc.SubmitPlanCrossCheck(ctx, w, lead, 1, candidate, round)
+				results <- result{cc, candidate, err}
+			}()
+		}
+		close(start)
+		winner, loser := <-results, <-results
+		cancel()
+		if winner.err != nil {
+			winner, loser = loser, winner
+		}
+		if winner.err != nil || !errors.Is(loser.err, ErrCrossCheckRefused) || winner.cc.Round != round {
+			t.Fatalf("conflicting round %d: winner err=%v loser err=%v", round, winner.err, loser.err)
+		}
+		stored, err := env.q.GetExactPlanCrossCheck(env.ctx, store.GetExactPlanCrossCheckParams{LeadRunID: lead, Round: round})
+		if err != nil || stored.ID != winner.cc.ID || stored.PlanMd != winner.candidate.PlanMd {
+			t.Fatalf("winning candidate not immutable: err=%v", err)
+		}
+		retry, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, winner.candidate, round)
+		if err != nil || retry.ID != stored.ID {
+			t.Fatalf("winning candidate retry: %v", err)
+		}
+		if _, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, loser.candidate, round); !errors.Is(err, ErrCrossCheckRefused) {
+			t.Fatalf("conflicting candidate retry: %v", err)
+		}
+		var attempts, children, humanRevisions int
+		if err := env.pool.QueryRow(env.ctx, `SELECT
+			(SELECT count(*) FROM cross_checks WHERE lead_run_id=$1),
+			(SELECT count(*) FROM runs WHERE target_run_id=$1 AND kind='cross_check'),
+			revise_count FROM runs WHERE id=$1`, lead).Scan(&attempts, &children, &humanRevisions); err != nil {
+			t.Fatal(err)
+		}
+		if attempts != int(round) || children != int(round) || humanRevisions != 0 {
+			t.Fatalf("conflict created extra rows: attempts=%d children=%d human revisions=%d", attempts, children, humanRevisions)
+		}
+		child := uuid.UUID(stored.CheckerRunID.Bytes)
+		env.exec("UPDATE runs SET worker_id=$2,status='running',claim_generation=1 WHERE id=$1", child, w.ID)
+		if _, err := svc.DecidePlanCrossCheck(env.ctx, w, child, 1, "revise", "revise", []byte(`{"summary":"revise","items":[]}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestPlanCrossCheckAutomaticRoundsRecoveryConsumesBudgetLiveDB(t *testing.T) {
 	for _, approval := range []bool{false, true} {
 		for limit := int32(0); limit <= 4; limit++ {
