@@ -1009,7 +1009,7 @@ WITH claimant AS MATERIALIZED (
                              WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
                AND (SELECT count(*) FROM recovery_custody_holds oh2
                       WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $10::int)
-           OR fn_custody_admission_count($2::uuid, $3::timestamptz) < $10::int)
+           OR (SELECT fn_custody_admission_count($2::uuid, $3::timestamptz)) < $10::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';

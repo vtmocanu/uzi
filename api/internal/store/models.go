@@ -797,6 +797,7 @@ type RecoveryCustodyHoldFact struct {
 	HasAvailableCapture bool      `json:"has_available_capture"`
 	CaptureState        string    `json:"capture_state"`
 	RunStatus           string    `json:"run_status"`
+	RecoveryWaitCause   string    `json:"recovery_wait_cause"`
 	Attention           string    `json:"attention"`
 	DecisionNeeded      bool      `json:"decision_needed"`
 }

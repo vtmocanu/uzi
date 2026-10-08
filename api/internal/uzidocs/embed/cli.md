@@ -1001,12 +1001,16 @@ uzi run recovery [--json]
   Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
   `admission_counted_holds` against the limit for capacity, and `open_holds` for total
-  custody. `blocked_runs` excludes continuations eligible for the exemption. For each `source_only` hold it prints
+  custody. `blocked_runs` excludes continuations eligible for the exemption. For each
+  `source_only` hold it reports retained source and archive availability independently.
+  An available archive can be exported but may omit latest worker-local work; a latest
+  preparing/uploading capture is reported as progress, without promising download or
+  coverage. With no archive or in-flight capture it prints
   `run <run-id> hold <hold-id>: no recovery archive; custody of worker <name>'s local source
   is retained (export unavailable; it may be the only copy)`. Then it prints hints: a
-  `uzi run export` hint only when an open hold has an available archive (an `archive_ready`
-  hold), and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
-  `needs_action`, which have no archive to export). With no open holds it says so and
+  `uzi run export` hint when an open hold has an available archive, regardless of attention,
+  and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
+  `needs_action`). With no open holds it says so and
   still prints the aggregate.
 - Without a run id, `--json` returns the endpoint's `aggregate` and `holds` object,
   including settled holds. The current server emits `admission_counted_holds` even
@@ -1021,11 +1025,13 @@ uzi run recovery <run-id> [--json]
 - The per-run view shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
-  The status also distinguishes a capture-less source that needs a decision and shows
-  the latest capture state. A `source_only`
-  hold prints `hold <hold-id>: no recovery archive; custody of worker <name>'s local source is
-  retained (export unavailable; it may be the only copy)`, and the same export and discard
-  hints as above follow. `--json` prints
+  The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
+  `worker_requeue_exhausted`: it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Owner Resume/Cancel
+  remains required; archive readiness does not implicitly release this custody.
+  The latest capture state and available archive are independent: an older download may
+  omit latest work while a newer capture prepares/uploads. The same source, coverage,
+  export and discard guidance as above follows. `--json` prints
   the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives

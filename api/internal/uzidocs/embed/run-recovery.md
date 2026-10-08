@@ -411,10 +411,14 @@ rejection prose above. This is an unauthenticated record, distinct from a
 trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
-stays in custody. For a terminal run or a non-terminal worker-exhaustion hold
-without an available
-independently verified recovery capture, it reports `source_only`, rather than
-`active_protected`. An inventory-guarded hold also reports `source_only` while an
+stays in custody. An OPEN hold for `recovery_wait` /
+`worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
+capture failed, before archive readiness or capture progress is considered. An
+available archive remains exportable; a latest preparing/uploading capture is not
+yet downloadable, and an earlier archive may omit latest worker-local work. These
+capture facts do not settle the owner decision or implicitly release custody.
+Other terminal holds without a verified available capture report `source_only`,
+rather than `active_protected`. An inventory-guarded hold also reports `source_only` while an
 earlier archive is downloadable: that archive does not cover the full inventory
 and does not settle custody. Recorded evidence or uncertainty at exhaustion holds the
 run for owner Resume; the MAC rejection grants no extra allowance. Absence of
