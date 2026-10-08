@@ -2,9 +2,11 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -111,7 +113,11 @@ func TestExhaustionConcurrentReleaseRechecksLockedRunLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(f.ctx)
+	defer func() {
+		if err := tx.Rollback(f.ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Errorf("rollback exhaustion transaction: %v", err)
+		}
+	}()
 	if _, err := tx.Exec(ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[0]); err != nil {
 		t.Fatal(err)
 	}

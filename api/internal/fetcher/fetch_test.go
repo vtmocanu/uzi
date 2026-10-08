@@ -585,15 +585,15 @@ func TestFetchDNSFailure(t *testing.T) {
 
 func TestSanitizeContentType(t *testing.T) {
 	cases := map[string]string{
-		"":                                  "application/octet-stream",
-		"application/pdf":                   "application/pdf",
-		"Text/HTML; Charset=UTF-8":          "text/html; charset=UTF-8",
-		"text/html; charset=utf-8; foo=bar": "text/html; charset=utf-8",
-		"text/html\r\nX-Injected: 1":        "application/octet-stream",
-		"not a type":                        "application/octet-stream",
-		"text/plain; charset=\"a\u202eb\"":  "text/plain",
-		"application/json; charset=\"x y\"": "application/json",
-		strings.Repeat("a", 300) + "/b":     "application/octet-stream",
+		"":                                                "application/octet-stream",
+		"application/pdf":                                 "application/pdf",
+		"Text/HTML; Charset=UTF-8":                        "text/html; charset=UTF-8",
+		"text/html; charset=utf-8; foo=bar":               "text/html; charset=utf-8",
+		"text/html\r\nX-Injected: 1":                      "application/octet-stream",
+		"not a type":                                      "application/octet-stream",
+		"text/plain; charset=\"a\u202eb\"":                "text/plain",
+		"application/json; charset=\"x y\"":               "application/json",
+		strings.Repeat("a", 300) + "/b":                   "application/octet-stream",
 		"text/plain; charset=" + strings.Repeat("u", 100): "text/plain",
 	}
 	for in, want := range cases {
