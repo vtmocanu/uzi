@@ -18,9 +18,10 @@ func TestCrossCheckEphemeralBindingLiveDB(t *testing.T) {
 					f.svc.SetEphemeralLease(2 * time.Hour)
 					f.env.exec(`UPDATE runs SET worker_id=$2 WHERE id=$1`, f.lead, f.workerID)
 					bound := f.lead
-					if binding == "child" {
+					switch binding {
+					case "child":
 						bound = f.runID
-					} else if binding == "foreign" {
+					case "foreign":
 						foreignChild := cloneLaneChild(t, f)
 						bound = mustRun(t, f.env, foreignChild).TargetRunID.Bytes
 						f.env.exec(`UPDATE runs SET status='cancelled' WHERE id=$1`, foreignChild)

@@ -27,9 +27,10 @@ func TestPlanCrossCheckEphemeralProvisioningMirrorsLiveDB(t *testing.T) {
 					VALUES ($1,$2,$3,'plan',1,1,'plan','[]'::jsonb,'s',repeat('a',40),
 					$4,'codex',now()+interval '5 minutes')`, uuid.New(), lead, child, []byte("test-digest"))
 				bound := lead
-				if scenario == "provisioned-child" {
+				switch scenario {
+				case "provisioned-child":
 					bound = child
-				} else if scenario == "foreign-parent" {
+				case "foreign-parent":
 					bound = fx.queuedRun()
 				}
 				w := seedEphemeralWorkerBound(fx, bound)
