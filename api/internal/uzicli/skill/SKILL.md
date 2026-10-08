@@ -157,6 +157,7 @@ uzi context rm <name>
 uzi run list
 uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
+uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
 uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex]
@@ -343,6 +344,15 @@ uzi version
   `milestones`, `own_agents`, `agent_exclusions`, `usage` (read those with
   `--json`) — is a usage error (exit 2); `--field` and `--json` are mutually
   exclusive.
+- `uzi run plan <run-id>` — print the latest plan Markdown verbatim; use
+  `--version N` to read a historical version (numbered from 1). `--diff` compares
+  against the immediately preceding plan only when feedback arrived between
+  those plans, including automatic feedback. With no base it prints the plan
+  and a note on stderr; an identical revision prints no diff and warns on stderr.
+  Comparisons ignore trailing CR/LF only and accept at most 200 KiB per plan;
+  plain output has no size cap. `--json` returns the version, nullable base version,
+  original plan Markdown, nullable diff, and whether feedback produced an identical
+  revision. Combine it with `--diff` for unified diff text in the JSON object.
 - `uzi run logs <run-id>` — the run's message history. `--follow` polls until the
   run reaches a terminal state (then exits 0, so a `--follow` on a finished run
   does not hang); `--after <seq>` resumes after a sequence number. In `--json`
