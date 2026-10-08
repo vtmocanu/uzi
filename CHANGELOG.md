@@ -29,7 +29,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
-- Codex runs retry temporary initial credential-release outages, then preserve work for recovery instead of failing; cancellation remains responsive after a declined pause.
+- **Codex runs recover from temporary credential-release outages ([#2493](https://github.com/vtmocanu/uzi/issues/2493)).**
+  Codex runs retry temporary outages when releasing a credential at epoch start, then preserve work and session for recovery instead of failing. Cancellation remains responsive after a declined pause.
 
 - **Healthy live custody no longer consumes a recovery admission slot ([#2445](https://github.com/vtmocanu/uzi/issues/2445)).**
   The fixed owner limit remains 8, but admission excludes at most one non-decision hold per run with exact current-generation, unreleased live ownership and a fresh worker heartbeat. Total open custody remains visible and protected; decision holds, older generations and unknown or stale claims still count. CLI, queued-run health, owner health and Slack capacity facts use the admission count separately from total holds; older API responses fall back to total when the new field is absent, preserving explicit zero. Continuations retain their 1–7 own-open-hold exemption. This is a statement-snapshot gate, so concurrent claims and later staleness can exceed the limit. No-action UX copy and tone stay with #2444.

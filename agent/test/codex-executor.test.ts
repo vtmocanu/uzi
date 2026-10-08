@@ -11556,7 +11556,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
     assert.equal(rig.providerLaunches(), 2, "the cancel landed on the fresh epoch's turn");
   });
 
-  it("(T9 lifecycle) a ctx.signal already aborted by a genuine cancel aborts the release signal; a PauseNowSignal does not", async () => {
+  it("(T9 lifecycle) a ctx.signal already aborted by a genuine cancel prevents release; a PauseNowSignal does not", async () => {
     for (const [reason, expectAborted] of [[new Error("shutdown"), true], [new PauseNowSignal(), false]] as const) {
       const rig = makeRig();
       rig.transport.push(threadStarted());
@@ -11574,14 +11574,22 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
       });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
       if (expectAborted) {
-        await assert.rejects(withTimeout(running, 3000, "pre-aborted cancel"), /run cancelled/);
+        await assert.rejects(withTimeout(running, 3000, "pre-aborted cancel"), error => {
+          assert.ok(error instanceof CodexRequestFailure);
+          assert.equal(error.kind, "parent_abort");
+          return true;
+        });
+        assert.equal(signals.length, 0, "a pre-aborted cancel makes no release request");
+        assert.equal(rig.transport.requests.length, 0);
+        assert.equal(rig.providerLaunches(), 0);
       } else {
         await waitFor(() => rig.transport.turnStartCount >= 1, "the turn started despite the stale pause abort");
         rig.transport.push(signalDone()).push(turnCompleted("completed"));
         await withTimeout(running, 3000, "pre-aborted pause");
+        assert.equal(signals.length, 1);
+        assert.equal(signals[0]?.aborted, false, `release signal for a pre-aborted ${reason.name}`);
+        assert.equal(rig.providerLaunches(), 1);
       }
-      assert.equal(signals.length, 1);
-      assert.equal(signals[0]?.aborted, expectAborted, `release signal for a pre-aborted ${reason.name}`);
     }
   });
 
