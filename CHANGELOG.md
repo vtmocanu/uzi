@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Ground PR description diagrams in visible flows**
+  The editor now requests compact diagrams for evidenced flows, fallback chains and component interactions; an opt-in Claude/Codex evaluator compares a frozen baseline with five fixed fixtures through the real sanitizer and publication rendering pipeline.
+
 - **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
   Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
 

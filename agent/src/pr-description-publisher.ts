@@ -351,6 +351,23 @@ function leadFields(lead: PrSummaryClaim | undefined): RawPrDescriptionFields | 
   return empty ? null : fields;
 }
 
+/** Shared production assembly: unknown code size stays eligible; known zero code suppresses graphs. */
+export function assembleGeneratedFields(
+  generated: DeliverySummary,
+  lead: PrSummaryClaim | undefined,
+  zeroCode: boolean,
+): RawPrDescriptionFields {
+  const fields: RawPrDescriptionFields = {
+    ...generated,
+    scope_notes: generated.scope_notes.map((n) => ({ ...n })),
+    verification: leadVerification(lead),
+  };
+  const diagram = !zeroCode && parseDeliveryDiagram(generated.diagram);
+  if (diagram) fields.diagram = diagram;
+  else delete fields.diagram;
+  return fields;
+}
+
 const EMPTY_FIELDS: RawPrDescriptionFields = { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] };
 
 const SIZE_LINE_RE = /^\*\*Size:\*\* [^\n]*$/u;
@@ -608,11 +625,7 @@ export class PrDescriptionPublication {
         source = "generated";
         const zeroCode = facts && !facts.size.size.unavailable &&
           facts.size.size.code.added + facts.size.size.code.deleted === 0;
-        fields = {
-          ...generated,
-          scope_notes: generated.scope_notes.map((n) => ({ ...n })),
-          verification: leadVerification(spec.lead),
-        };
+        fields = assembleGeneratedFields(generated, spec.lead, !!zeroCode);
         const parsed = parseDeliveryDiagram(generated.diagram, (reason) => {
           if (reason !== "absent" && reason !== "valid") {
             diagramEvent(deps.log, spec.claim, "agent_parser", "dropped", reason, { claim_generation: spec.claimGeneration }, [spec.pat]);
@@ -621,9 +634,6 @@ export class PrDescriptionPublication {
         if (zeroCode && parsed) {
           diagramEvent(deps.log, spec.claim, "zero_code", "dropped", "zero_code", { claim_generation: spec.claimGeneration }, [spec.pat]);
         }
-        const diagram = !zeroCode && parsed;
-        if (diagram) fields.diagram = diagram;
-        else delete fields.diagram;
       } else if (lead) {
         source = "lead_only";
         fields = lead;
