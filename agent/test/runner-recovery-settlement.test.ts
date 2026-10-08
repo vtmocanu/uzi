@@ -760,6 +760,7 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
  *  call's signal aborts (the "hanging settle" case). */
 class FakeLiveSettleClient extends FakeSettleClient {
   liveCalls: Array<{ runId: string; holdId: string; req: RecoveryLiveSettleRequest }> = [];
+  liveSignals: Array<AbortSignal | undefined> = [];
   liveAnswer: (holdId: string) => RecoverySettleResponse | Error | "hang" = () => new Error("no live answer configured");
   async settleRecoveryHoldLive(
     runId: string,
@@ -768,6 +769,7 @@ class FakeLiveSettleClient extends FakeSettleClient {
     signal?: AbortSignal,
   ): Promise<RecoverySettleResponse> {
     this.liveCalls.push({ runId, holdId, req });
+    this.liveSignals.push(signal);
     const a = this.liveAnswer(holdId);
     if (a === "hang") {
       return new Promise((_resolve, reject) => {
@@ -1172,6 +1174,9 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       await Promise.resolve();
       assert.equal(settlementCompleted, false, "the publish returned while the live settlement remained pending");
       flight.cancel.abort();
+      const rpcSignal = r.settleClient.liveSignals[0];
+      assert.ok(rpcSignal?.aborted, "the flight cancellation aborts the live RPC signal");
+      assert.equal(rpcSignal.reason, flight.cancel.signal.reason, "the live RPC carries the flight cancellation reason");
       await completion;
       assert.equal(settlementCompleted, true, "the flight's cancel signal ends the hanging settle");
       const [rec] = await r.settlement.listRun(RUN_ID);
