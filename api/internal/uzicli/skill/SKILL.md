@@ -604,6 +604,11 @@ uzi version
   the bump: it removes the manual override and returns the run to its kind default
   priority (it does **not** demote it below normal). Prints the updated run; `--json`
   emits the run object, whose `priority` pill reads `expedited` after a bump.
+  Expedite also orders new ephemeral worker provisioning by priority within
+  each eligible trigger class. Class precedence stays **isolated lane → capability
+  gap → saturation**, regardless of priority. Saturation debounce, placement
+  eligibility and per-user caps still apply; expedite does not guarantee global
+  priority precedence or immediate provisioning.
 - `uzi run resume-now <run-id>` — resume a run held in `pool_wait`, an `auto` run
   parked because its owner's Anthropic token pool was empty when it claimed (PRD
   #754). It flips the hold straight to **queued** instead of waiting up to a sweeper

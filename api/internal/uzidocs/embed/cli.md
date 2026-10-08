@@ -652,6 +652,11 @@ A few worth knowing:
   to its kind default priority (it does **not** demote it below normal). It
   prints the updated run; `--json` emits the run object, whose `priority` reads
   `expedited` after a bump.
+  Expedite also orders new ephemeral worker provisioning by priority within
+  each eligible trigger class. Class precedence stays **isolated lane → capability
+  gap → saturation**, regardless of priority. Saturation debounce, placement
+  eligibility and per-user caps still apply; expedite does not guarantee global
+  priority precedence or immediate provisioning.
 - **`run rework <id>`** starts ONE on-demand MR-rework cycle on a **completed**
   run whose MR is open, past the automatic cap — the way to rework an MR after the
   automatic watcher has stopped. It skips the cap, the quiet-period debounce, the
