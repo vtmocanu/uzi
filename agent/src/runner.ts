@@ -10784,11 +10784,20 @@ export class RunRunner {
       const outcome = await this.recovery.captureAndUpload({
         record, barePath, defaultBranch: record.defaultBranch!, signal,
       });
-      if (outcome.state !== "uploaded" || await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged") flight.preserveRecoveryClone = true;
+      // captureAndUpload persists the bundle facts on a newer journal revision.
+      const uploaded = outcome.state === "uploaded"
+        ? (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId)
+        : undefined;
+      // A self-contained upload may still need the terminal quiescence/FINAL pass.
+      // Thin or unknown captures retain the clone; cleanup keeps its independent ACK guard.
+      if (outcome.state !== "uploaded" ||
+          (await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged" &&
+           (uploaded?.state !== "uploaded" || uploaded.selfContained !== true ||
+            !Array.isArray(uploaded.prerequisiteShas) || uploaded.prerequisiteShas.length !== 0))) {
+        flight.preserveRecoveryClone = true;
+      }
       this.announceOwedHeads(flight, record.originalRoots?.map(r => r.sha) ?? [], outcome.state === "uploaded");
       if (outcome.state === "uploaded") {
-        // captureAndUpload persists the reservation on a newer journal revision.
-        const uploaded = (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId);
         if (uploaded?.serverCaptureId && uploaded.state === "uploaded") {
           const noticeIdentity = JSON.stringify([uploaded.serverCaptureId, uploaded.finalAcknowledged === true]);
           const text = uploaded.finalAcknowledged

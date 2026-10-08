@@ -703,7 +703,6 @@ export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: st
       throw new Error("invalid or excessive recovery bundle header");
     }
     const header = bytes.subarray(0, end);
-    if (header.some(byte => byte < 32 && byte !== 10 || byte === 127)) throw new Error("invalid recovery header encoding");
     // Latin-1 preserves opaque prerequisite comment bytes without masking structural bytes.
     const lines = header.toString("latin1").split("\n");
     const version = lines.shift();
@@ -712,7 +711,7 @@ export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: st
     const prerequisites: string[] = [];
     while (lines[0]?.startsWith("-")) {
       const line = lines.shift()!;
-      const match = /^-([0-9a-f]{40}) (.*)$/.exec(line);
+      const match = /^-([0-9a-f]{40}) /.exec(line);
       if (!match || prerequisites.length >= 64 || prerequisites.includes(match[1]!)) throw new Error("invalid recovery prerequisites");
       prerequisites.push(match[1]!);
     }

@@ -151,9 +151,11 @@ it("production 64MiB cap captures real coverage of divergent retained roots into
   } finally { cleanup(f); }
 });
 
-for (const guarded of [true, false]) {
-  it(`${guarded ? "guarded" : "legacy"} thin Unicode prerequisite imports into a fresh forge clone`, async () => {
-    const f = fixture(256 * 1024, "公開された履歴");
+for (const guarded of [true, false]) for (const [label, subject] of [
+  ["Unicode", "公開された履歴"], ["TAB", "public\tdeletion"],
+] as const) {
+  it(`${guarded ? "guarded" : "legacy"} thin ${label} prerequisite imports into a fresh forge clone`, async () => {
+    const f = fixture(256 * 1024, subject);
     try {
       const bundle = guarded
         ? await produce(f, f.head, "unicode-guarded", 32 * 1024)
@@ -163,7 +165,7 @@ for (const guarded of [true, false]) {
         });
       const repo = fresh(f, "unicode-import");
       git(repo, "bundle", "verify", bundle.bundlePath);
-      assert.ok(fs.readFileSync(bundle.bundlePath).includes(Buffer.from("公開された履歴")));
+      assert.ok(fs.readFileSync(bundle.bundlePath).includes(Buffer.from(subject)));
       assert.deepEqual(await readRecoveryBundleHeader(bundle.bundlePath, f.head),
         { prerequisiteShas: [f.tip], selfContained: false });
       assert.equal(bundle.selfContained, false);
@@ -294,7 +296,7 @@ it("producer options are exclusive and header parser bounds actual dependencies 
     const prereqs = Array.from({ length: 65 }, (_, i) => (i + 1).toString(16).padStart(40, "0"));
     const header = (deps: string[], source = f.head, ref = RECOVERY_BUNDLE_REF) =>
       "# v2 git bundle\n" + deps.map(d => "-" + d + " boundary\n").join("") + source + " " + ref + "\n\nPACK";
-    const read = (text: string) => { fs.writeFileSync(out, text); return readRecoveryBundleHeader(out, f.head); };
+    const read = (text: string | Buffer) => { fs.writeFileSync(out, text); return readRecoveryBundleHeader(out, f.head); };
     assert.deepEqual(await read(header([])), { prerequisiteShas: [], selfContained: true });
     assert.deepEqual(await read(header(prereqs.slice(0, 64).reverse())),
       { prerequisiteShas: prereqs.slice(0, 64), selfContained: false });
@@ -304,6 +306,9 @@ it("producer options are exclusive and header parser bounds actual dependencies 
     await assert.rejects(read(header([], f.head, "refs/heads/wrong")), /source\/ref mismatch/);
     await assert.rejects(read(header(["invalid"])), /prerequisites/);
     await assert.rejects(read(header([]).replace("PACK", "NOPE")), /header/);
+    await assert.rejects(read(Buffer.concat([
+      Buffer.from(header([]).slice(0, -4)), Buffer.from([0xd0, 0xc1, 0xc3, 0xcb]),
+    ])), /header/);
     // PACK must fit in the same bounded 16KiB read as the complete header.
     const prefix = "# v2 git bundle\n-" + f.tip + " ";
     const suffix = "\n" + f.head + " " + RECOVERY_BUNDLE_REF + "\n\nPACK";
