@@ -1114,40 +1114,36 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
 	} else if run.PlanCrossCheckRequired || run.Kind == "cross_check" {
 		requiredProtocol := capability.CrossCheckV1
-		associationValid := true
+		protocolAvailable := true
 		if run.Kind == "cross_check" {
-			reader, ok := s.q.(interface {
-				GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
-			})
-			if !ok {
-				associationValid = false
-			} else {
-				round, err := reader.GetCrossCheckChildProtocol(ctx, run.ID)
-				if err != nil {
-					associationValid = false
-				} else if round > 1 {
-					requiredProtocol = capability.CrossCheckRoundsV1
-				}
+			round, err := s.q.GetCrossCheckChildProtocol(ctx, run.ID)
+			if err != nil {
+				slog.Error("health: read cross-check child protocol", "run_id", run.ID, "error", err)
+				protocolAvailable = false
+			} else if round > 1 {
+				requiredProtocol = capability.CrossCheckRoundsV1
 			}
 		}
-		workers, werr := s.q.ListWorkersByUser(ctx, r.UserID)
-		if werr != nil {
-			slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
-		} else {
-			capable := false
-			for _, worker := range workers {
-				if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
-					associationValid && slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
-					slices.Contains(worker.ProtocolCapabilities, requiredProtocol) {
-					capable = true
-					break
+		if protocolAvailable {
+			workers, werr := s.q.ListWorkersByUser(ctx, r.UserID)
+			if werr != nil {
+				slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
+			} else {
+				capable := false
+				for _, worker := range workers {
+					if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
+						slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
+						slices.Contains(worker.ProtocolCapabilities, requiredProtocol) {
+						capable = true
+						break
+					}
 				}
-			}
-			if !capable {
-				if requiredProtocol == capability.CrossCheckRoundsV1 {
-					return reasonNoCrossCheckRoundsCapableWorker
+				if !capable {
+					if requiredProtocol == capability.CrossCheckRoundsV1 {
+						return reasonNoCrossCheckRoundsCapableWorker
+					}
+					return reasonNoCrossCheckCapableWorker
 				}
-				return reasonNoCrossCheckCapableWorker
 			}
 		}
 	}

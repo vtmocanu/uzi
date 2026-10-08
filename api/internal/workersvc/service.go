@@ -435,6 +435,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
 	// Workers.
 	CreateWorker(ctx context.Context, arg store.CreateWorkerParams) (store.Worker, error)
