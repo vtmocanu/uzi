@@ -56,7 +56,7 @@ describe("mock checker pins", () => {
     ] });
     await api.putMySettings({ default_claude_model: "haiku", default_codex_model: "worker-codex", default_codex_effort: "xhigh" });
     cells = (await api.getMySettings()).settings.cross_check_pins!;
-    expect(cells.find(p => p.harness === "claude")).toMatchObject({ model: "custom-claude", effort: "max", worker_default_model: "haiku", resolved_model: "custom-claude", active: false });
+    expect(cells.find(p => p.harness === "claude")).toMatchObject({ model: "custom-claude", effort: "max", worker_default_model: "haiku", resolved_model: "custom-claude", active: true });
     expect(cells.find(p => p.harness === "codex")).toMatchObject({ worker_default_model: "worker-codex", resolved_model: "custom-codex", resolved_effort: "xhigh", effort_source: "worker default" });
     cells[0].model = "mutated-return";
     expect((await api.getMySettings()).settings.cross_check_pins![0].model).toBe("custom-claude");
@@ -152,7 +152,7 @@ describe("mock checker pins", () => {
     expect(lead).toBeTruthy();
     await api.updateAgentTemplate(lead.id, { description: lead.description, model: "custom-template", tools: lead.tools, prompt_body: lead.prompt_body });
     await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "claude", effort: "max" }] });
-    expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "claude")).toMatchObject({ resolved_model: "custom-template", resolved_effort: "max", active: false });
+    expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "claude")).toMatchObject({ resolved_model: "custom-template", resolved_effort: "max", active: true });
     await api.updateAgentTemplate(lead.id, { description: lead.description, model: null, tools: lead.tools, prompt_body: lead.prompt_body });
     expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "claude")?.resolved_model).toBeNull();
     await api.setTemplateAllocations({ global_default_ids: [] });

@@ -63,7 +63,6 @@ export function CrossCheckDefaults({ settings, onSaved }: {
             <label htmlFor={`checker-${harness}-effort`}>{harness === "claude" ? "Claude" : "Codex"} checker effort</label>
             <EffortSelect id={`checker-${harness}-effort`} value={draft[harness].effort} onChange={v => change("effort", v)}
               defaultLabel={`Default · ${workerEffort} (worker default)`} />
-            {harness === "claude" && <p className="text-muted">Used once Codex-lead runs are cross-checked</p>}
           </td>;
         })}</tr></tbody>
       </table>

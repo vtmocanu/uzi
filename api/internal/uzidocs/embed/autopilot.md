@@ -13,8 +13,9 @@ GitLab issue starts a run for you, unattended: no plan-approval step,
 spending your own Anthropic token. The plan is still recorded in run
 history as an audit trail, and the merge request stays your human review
 gate. Off by default, and opt-in per user — see below. If you also opt in to
-[Plan cross-check](./cross-check.md), a Claude lead's plan must pass a Codex
-check before implementation. Eligible changes requested go back to the lead
+[Plan cross-check](./cross-check.md), a plan must pass a check by the other
+model family (Codex for a Claude lead, Claude for a Codex lead) before
+implementation. Eligible changes requested go back to the lead
 for bounded automatic revisions. Exhaustion, blockers and check failures
 normally require a human decision; irrecoverable delivery losses fail the run.
 
@@ -69,11 +70,11 @@ candidates once the autopilot label lands.
 
 - **Eligible**: the issue moves to In Progress, a run starts, the plan is
   recorded, and on success a comment lands on the issue with the merge
-  request link. With Plan cross-check enabled, a Claude lead proceeds after
-  the latest exact-plan pass, with bounded automatic revisions on eligible
-  changes requested. Exhaustion, blockers and check failures normally park
-  for your plan decision.
-  Codex leads park as unsupported. See [Cross-check](./cross-check.md) for
+  request link. With Plan cross-check enabled, a Claude or Codex lead proceeds
+  after the latest exact-plan pass by the other family, with bounded automatic
+  revisions on eligible changes requested. Exhaustion, blockers and check
+  failures normally park for your plan decision. A Codex lead on a worker
+  without `cross_check_codex_lead_v1` parks for a human. See [Cross-check](./cross-check.md) for
   terminal delivery exceptions.
 - **The agent never stops to ask you something, either** — with one
   exception. If it would otherwise pause for an ordinary clarifying question
