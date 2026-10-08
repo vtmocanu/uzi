@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -288,8 +289,11 @@ func TestCrossCheckPinsPlacementMirrorsLiveDB(t *testing.T) {
 			}
 			assertTriggers := func(wantUnplaceable, wantSaturated bool) {
 				t.Helper()
+				now := time.Now()
 				u, err := e.q.ListUnplaceableQueuedRunsForEphemeral(e.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
-					CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{},
+					CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+					CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+					CodexCuratedModels:       codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{},
 					EphemeralLease: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000,
 				})
 				if err != nil {
@@ -300,7 +304,9 @@ func TestCrossCheckPinsPlacementMirrorsLiveDB(t *testing.T) {
 					unplaceable = unplaceable || r.ID == f.runID
 				}
 				s, err := e.q.ListSaturationQueuedRunsForEphemeral(e.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
-					CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{},
+					CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+					CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+					CodexCuratedModels:       codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{},
 					EphemeralLease: pgtype.Interval{Valid: true}, SaturationDelay: pgtype.Interval{Valid: true},
 					MaxPerUser: 1000, MaxRows: 10000,
 				})
