@@ -18,7 +18,8 @@ import (
 )
 
 // Read the real fixture header for the authenticated trusted-worker declaration.
-// Production keeps the archive opaque; header-derived worker metadata is a later milestone.
+// The API keeps the archive opaque; the worker derives these prerequisites from the
+// bundle header and declares them.
 func inventoryPrerequisites(t *testing.T, data []byte) []string {
 	t.Helper()
 	header, _, ok := bytes.Cut(data, []byte("\n\n"))
