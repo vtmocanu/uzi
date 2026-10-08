@@ -498,6 +498,43 @@ for phase in 60-schedules-sweep 72-custody-lifecycle; do
   else echo "FAIL: $phase invoked diagnostic snapshot on success"; fi
 done
 
+# Accepted cancellation is asynchronous. Execute the real phase's cancellation
+# statements and the real wait_status against delayed terminal responses before
+# permitting the next leg's credential changes or final token teardown.
+autoselect_cancel_boundary() {
+  local mode="${1:-delayed}" run
+  AS_RUN=A; AS_RUN2=B; AS_RUN3=C
+  eval "$(awk '/^wait_status\(\) \{/,/^\}/' "$LIB")"
+  for run in "$AS_RUN" "$AS_RUN2" "$AS_RUN3"; do
+    echo 0 > "$SEQ_DIR/as-$run-polls"
+    echo pending > "$SEQ_DIR/as-$run-state"
+  done
+  apipost() {
+    [ "$2" = '{"kind":"cancel","body":""}' ] || fail 'unexpected autoselect input'
+    case "$1" in /api/runs/A/inputs|/api/runs/B/inputs|/api/runs/C/inputs) ;; *) fail 'unexpected autoselect cancel route';; esac
+    [ "$mode" != post-failed ] || return 1
+    echo '{}'
+  }
+  apiget() {
+    local run="${1##*/}" n status=awaiting_approval
+    case "$run" in A|B|C) ;; *) fail 'unexpected autoselect status route';; esac
+    n="$(cat "$SEQ_DIR/as-$run-polls")"
+    echo $((n + 1)) > "$SEQ_DIR/as-$run-polls"
+    if [ "$mode" = failed ]; then status=failed
+    elif [ "$n" -ge 1 ]; then status=cancelled; echo cancelled > "$SEQ_DIR/as-$run-state"
+    fi
+    jq -nc --arg status "$status" '{run:{status:$status,failure_reason:"fixture terminal outcome"}}'
+  }
+  eval "$(awk '/^apipost "\/api\/runs\/\$AS_RUN[23]?\/inputs"/ || /^wait_status "\$AS_RUN[23]?" cancelled/' "$ROOT/e2e/phases/48-auto-selection.sh")"
+  for run in "$AS_RUN" "$AS_RUN2" "$AS_RUN3"; do
+    [ "$(cat "$SEQ_DIR/as-$run-state")" = cancelled ] || fail 'token teardown would start with cancellation still pending'
+  done
+  echo 'all owned cancellations observed before token teardown'
+}
+custody_case "autoselect observes all three cancellations before credential teardown" pass 'all owned cancellations observed' autoselect_cancel_boundary delayed
+custody_case "autoselect cancel POST failure cannot proceed to teardown" fail 'could not cancel auto-selection run' autoselect_cancel_boundary post-failed
+custody_case "autoselect unexpected failed outcome cannot proceed to teardown" fail "entered 'failed'" autoselect_cancel_boundary failed
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -508,6 +545,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 83 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 86 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 83 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 86 ] && [ "$cases" -eq "$passed" ]
