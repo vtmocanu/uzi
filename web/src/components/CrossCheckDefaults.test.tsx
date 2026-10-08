@@ -67,7 +67,7 @@ describe("checker defaults", () => {
     fireEvent.click(save());
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith());
     expect(save().disabled).toBe(true);
-    expect((screen.getByLabelText("Custom codex checker model ID") as HTMLInputElement).value).toBe("arbitrary-codex-id");
+    await waitFor(() => expect((screen.getByLabelText("Custom codex checker model ID") as HTMLInputElement).value).toBe("arbitrary-codex-id"));
   });
 
   it("refreshes committed worker defaults without pinning resolved values or overwriting drafts, then resets only model", async () => {
