@@ -455,6 +455,7 @@ describe("issue #1828: the predecessor capture", { skip: process.platform !== "l
       const iid = 18340 + (c.reap === LEFT ? 1 : 0);
       const runId = randomUUID();
       const clonePath = await seedPredecessor(iid, runId);
+      api.setOwnershipStatus(runId, "running", 2);
       let started = 0;
       const factory: ExecutorFactory = (id) => ({
         homeDir: path.join(homeDir, id),
@@ -472,25 +473,31 @@ describe("issue #1828: the predecessor capture", { skip: process.platform !== "l
         quiesceRun,
         dockerHost: "unix:///nonexistent-docker.sock",
         liveAttempts: new LiveAttemptRegistry(),
-      }).execute(gitlabClaim(iid, { run_id: runId }));
+      }).execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
       assert.equal(calls[0]?.site, "predecessor_capture");
       assert.equal(calls[0]?.mode, "capture");
       assert.equal(lastFailed(runId)?.fail_origin, "worker_residue_blocked");
-      assert.match(String(lastFailed(runId)?.failure_reason), c.reason);
+      assert.match(String(lastFailed(runId)?.failure_reason), /Retained recovery blocked: quiescence failed/);
+      assert.ok(calls.every(q => q.mode === "capture" && q.targetPaths?.includes(clonePath)), "all reached proofs cover the retained source");
       assert.equal(started, 0);
-      assert.equal(fs.existsSync(path.join(clonePath, "ONLY_COPY.txt")), true);
+      assert.equal(fs.readFileSync(path.join(clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
       assert.equal(trackingSha(iid), null, "no fetch-back ran");
       assert.ok(!statuses(runId).includes("recovery_wait"));
     });
   }
 
-  it("control: a complete reap lets the predecessor capture verify and park", TIMEOUT, async () => {
+  it("control: a complete reap lets the predecessor capture verify and start a fresh successor", TIMEOUT, async () => {
     const iid = 18342;
     const runId = randomUUID();
-    await seedPredecessor(iid, runId);
+    const clonePath = await seedPredecessor(iid, runId);
+    api.setOwnershipStatus(runId, "running", 2);
+    let modelPath = "";
     const factory: ExecutorFactory = (id) => ({
       homeDir: path.join(homeDir, id),
-      executor: { run: async (): Promise<ExecutorResult> => { throw new Error("must not start"); } },
+      executor: { run: async (ctx): Promise<ExecutorResult> => {
+        modelPath = ctx.worktreePath;
+        throw new Error("fixture stops after model admission");
+      } },
     });
     const { gitlab } = fakeGitlab();
     const { quiesceRun } = quiescentProof();
@@ -499,8 +506,13 @@ describe("issue #1828: the predecessor capture", { skip: process.platform !== "l
       quiesceRun,
       dockerHost: "unix:///nonexistent-docker.sock",
       liveAttempts: new LiveAttemptRegistry(),
-    }).execute(gitlabClaim(iid, { run_id: runId }));
-    assert.ok(statuses(runId).includes("recovery_wait"), statuses(runId).join(","));
+    }).execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assert.ok(modelPath, "verified predecessor capture admits the model in this claim");
+    assert.notEqual(modelPath, clonePath);
+    assert.match(modelPath, /\.attempt-.*-g2-/);
+    assert.equal(fs.readFileSync(path.join(modelPath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+    assert.equal(fs.readFileSync(path.join(clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+    assert.ok(!statuses(runId).includes("recovery_wait"), statuses(runId).join(","));
     assert.notEqual(trackingSha(iid), null, "the predecessor's work was fetched back");
   });
 });

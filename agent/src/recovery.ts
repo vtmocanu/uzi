@@ -1382,6 +1382,19 @@ export class RecoveryCoordinator {
    * authenticated LATEST journaled record rather than the caller's copy, and never re-produces
    * bytes a record already journaled.
    */
+  /** Positive local capture proof for claim-local adoption, independent of upload/final ACK.
+   * This proof grants no cleanup or custody-release authority. */
+  async verifiedLocalCapture(record: RecoveryRecord): Promise<RecoveryRecord | undefined> {
+    const latest = await this.readLatest(record);
+    if (latest.kind !== "ok") return undefined;
+    const local = latest.record;
+    if (!hasJournaledBundle(local) || !await verifyJournaledBytes(local)) return undefined;
+    const header = await readRecoveryBundleHeader(local.bundlePath, local.sourceSha);
+    if (header.selfContained !== local.selfContained ||
+        canonicalJson(header.prerequisiteShas) !== canonicalJson(local.prerequisiteShas)) return undefined;
+    return local;
+  }
+
   async captureAndUpload(input: CaptureInput): Promise<RecoveryOutcome> {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.

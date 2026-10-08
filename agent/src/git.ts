@@ -1041,6 +1041,10 @@ function recoveryCaptureKey(branch: string): string {
 /** The recovery-capture journal value (one per branch, in the bare's `config --local`). A
  *  Docker-wired worker (issue #1783 M2) adds the attempt id; an entry an older worker wrote has
  *  none, and is still read. */
+export class ForeignRetainedRecoveryError extends Error {
+  constructor() { super("foreign retained recovery"); }
+}
+
 export class RetainedRecoveryBlockedError extends Error {
   readonly reason = "source_missing";
   constructor(readonly barePath: string, readonly branch: string, readonly key: string,
@@ -1517,6 +1521,19 @@ export class GitCache {
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  private readonly recoveryOperations = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number }>();
+
+  /** Local recovery clock, including queued locks and actual child settlement. */
+  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const timeout = new AbortController();
+    const combined = AbortSignal.any([signal, timeout.signal]);
+    const timer = setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()));
+    if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
+    try {
+      combined.throwIfAborted();
+      return await this.recoveryOperations.run({ signal: combined, deadline }, () => action(combined));
+    } finally { clearTimeout(timer); }
+  }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
   private readonly maxOwedCandidates: number;
@@ -4253,7 +4270,7 @@ export class GitCache {
 
   private recoverySources(journal: RecoveryJournalEntry): RecoverySource[] {
     const sources = [journal, ...(journal.retainedSources ?? []),
-      ...(journal.recovery ? [journal.recovery.source] : [])];
+      ...(journal.recovery ? [journal.recovery.source, ...(journal.recovery.successor ? [journal.recovery.successor] : [])] : [])];
     return sources.filter((s, i) => sources.findIndex(p => sameRecoverySource(p, s)) === i);
   }
 
@@ -4302,7 +4319,11 @@ export class GitCache {
           break;
         }
       }
-      if (absent) { missing = true; continue; }
+      if (absent) {
+        if (journal.recovery?.successor && sameRecoverySource(source, journal.recovery.successor) &&
+            !sameRecoverySource(source, journal)) continue; // identity was journaled before creation
+        missing = true; continue;
+      }
       const st = await fs.lstat(path.join(source.clonePath, ".git"));
       if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe recovery source path");
     }
@@ -4310,10 +4331,11 @@ export class GitCache {
     return journal;
   }
 
-  private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry): Promise<void> {
+  private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void): Promise<void> {
     const value = JSON.stringify(journal);
     parseRecoveryJournal(value);
     await this.assertRecoveryBare(barePath);
+    guard?.();
     await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);
   }
 
@@ -4358,7 +4380,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const journal = await this.readRecoveryCapture(barePath, branch);
       if (!journal) return undefined;
-      if (journal.runId !== runId) throw new Error("foreign retained recovery");
+      if (journal.runId !== runId) throw new ForeignRetainedRecoveryError();
       await this.checkedRecovery(barePath, branch, key, journal);
       return { barePath, journal };
     });
@@ -4396,6 +4418,29 @@ export class GitCache {
       await this.writeRecovery(barePath, branch, { ...journal, recovery });
       return recovery;
     });
+  }
+
+  async verifiedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoverySource, tip: string): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      await this.checkedRecovery(barePath, branch, key, expected);
+      if (!await this.verifyRecoveryClosure(barePath, tip)) return false;
+      if (await this.revParse(barePath, `refs/uzi-recovery-episode/${expected.runId}/${tip}`) !== tip) return false;
+      const head = (await this.runGitAsRunner(expected.clonePath, ["rev-parse", "HEAD"])).trim();
+      const tree = (await this.runGitAsRunner(expected.clonePath, ["write-tree"])).trim();
+      const expectedTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      return tree === expectedTree && await this.isAncestor(barePath, head, tip) &&
+        (await this.runGitAsRunner(expected.clonePath, ["diff", "--name-only"])).trim() === "" &&
+        (await this.runGitAsRunner(expected.clonePath, ["ls-files", "--others", "--exclude-standard"])).trim() === "";
+    });
+  }
+
+  async verifyRecoveryClosure(barePath: string, tip: string): Promise<boolean> {
+    if (!SHA40_RE.test(tip)) return false;
+    try {
+      await this.runGit(barePath, ["rev-parse", "--verify", `${tip}^{commit}`]);
+      await this.runGit(barePath, ["rev-list", "--objects", "--missing=error", tip]);
+      return true;
+    } catch { this.recoveryOperations.getStore()?.signal.throwIfAborted(); return false; }
   }
 
   /** Verify the local captured commit's complete object closure and pin BEFORE journaling.
@@ -4470,7 +4515,11 @@ export class GitCache {
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
       if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw new Error("successor identity already used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
-      const retainedSources = this.recoverySources(journal).map(s => recoverySource({
+      const existingSources: RecoverySource[] = [];
+      for (const s of this.recoverySources(journal)) {
+        if (await this.pathPresent(s.clonePath)) existingSources.push(s);
+      }
+      const retainedSources = existingSources.map(s => recoverySource({
         runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
         ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
       }));
@@ -4501,6 +4550,7 @@ export class GitCache {
   async completeRecoveryEpisode(
     barePath: string, branch: string, key: string, expected: RecoverySource,
     evidence: { settled: true; processedEvents: number; attemptId: string },
+    guard?: () => void,
   ): Promise<void> {
     if (evidence.settled !== true || !Number.isSafeInteger(evidence.processedEvents) ||
         evidence.processedEvents <= 0 || evidence.attemptId !== expected.attemptId) throw new Error("model processing evidence required");
@@ -4510,7 +4560,7 @@ export class GitCache {
           !journal.recovery.successor || !sameRecoverySource(journal, journal.recovery.successor)) throw new Error("episode cannot complete");
       if (!await this.recoveryClockCurrent(barePath, branch, journal, true)) throw new Error("episode cannot complete: invalid recovery clock");
       const { recovery: _completed, ...retained } = journal;
-      await this.writeRecovery(barePath, branch, retained);
+      await this.writeRecovery(barePath, branch, retained, guard);
     });
   }
 
@@ -8046,6 +8096,8 @@ export class GitCache {
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    recovery?.signal.throwIfAborted();
     const { input, ...execOptions } = options;
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
@@ -8053,13 +8105,25 @@ export class GitCache {
       assertNoCredentialedGitWhileQuarantined(options.env);
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
-      const pending = execFileAsync(command, args, execOptions);
+      const pending = execFileAsync(command, args, { ...execOptions,
+        ...(recovery ? { signal: recovery.signal, timeout: Math.min(options.timeout ?? Infinity, Math.max(1, recovery.deadline - Date.now())) } : {}),
+      });
+      const closed = new Promise<void>(resolve => pending.child.once("close", () => resolve()));
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const abort = () => { killTimer = setTimeout(() => pending.child.kill("SIGKILL"), 1_000); };
+      recovery?.signal.addEventListener("abort", abort, { once: true });
       if (input !== undefined) {
         pending.child.stdin?.on("error", () => undefined);
         pending.child.stdin?.end(input);
       }
-      const result = await pending;
-      return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      try {
+        const result = await pending;
+        return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      } finally {
+        await closed;
+        if (killTimer) clearTimeout(killTimer);
+        recovery?.signal.removeEventListener("abort", abort);
+      }
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
@@ -8068,9 +8132,9 @@ export class GitCache {
       throw new CheckpointSoftDeadlineError();
     }
     const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
-    const childTimeout = remainingSoft === undefined
-      ? options.timeout
-      : Math.min(options.timeout ?? Infinity, remainingSoft);
+    const childTimeout = recovery
+      ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, Math.max(1, recovery.deadline - Date.now()))
+      : remainingSoft === undefined ? options.timeout : Math.min(options.timeout ?? Infinity, remainingSoft);
     // issue #2213: as above, on the Codex boundary path. boundary.spawn is awaited and its own
     // chain (the tick spawner's lock snapshot, the safety spawn boundary) awaits before the actual
     // spawn, so this check is early; TickSpawner.spawnWith and launchCodexEffectRoot repeat it
@@ -8085,6 +8149,10 @@ export class GitCache {
     } catch (cause) {
       throw this.boundaryAbortError(cause) ?? cause;
     }
+    let cancellation: Promise<unknown> | undefined;
+    const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+    recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+    if (recovery?.signal.aborted) abortRecovery();
     process.stdin?.on("error", () => undefined);
     process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
@@ -8152,6 +8220,9 @@ export class GitCache {
     // A collector can close/error before a timed-out child is fully disposed.
     // Keep the bare lock until the safety owner has verified full-root reap.
     const settled = await Promise.allSettled([collect(process.stdout), collect(process.stderr), process.completed] as const);
+    recovery?.signal.removeEventListener("abort", abortRecovery);
+    await cancellation;
+    recovery?.signal.throwIfAborted();
     if (settled[2].status === "rejected") {
       throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
     }
@@ -8266,15 +8337,17 @@ export class GitCache {
     const env = gitEnv();
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    recovery?.signal.throwIfAborted();
     if (boundary) {
       if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
       if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
       const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
-      const childTimeout = remainingSoft === undefined
-        ? opts.timeoutMs
-        : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
+      const childTimeout = recovery
+        ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, Math.max(1, recovery.deadline - Date.now()))
+        : remainingSoft === undefined ? opts.timeoutMs : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
       let process: BoundaryProcessHandle;
       try {
         process = await boundary.spawn({
@@ -8314,10 +8387,30 @@ export class GitCache {
       // uncaught EPIPE; the exit status already errors the stream with the failure.
       process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
-      const exited = process.completed.then(({ code }) => code, () => -1);
+      let cancellation: Promise<unknown> | undefined;
+      const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+      recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+      if (recovery?.signal.aborted) abortRecovery();
+      const exited = process.completed.then(({ code }) => code, () => -1).finally(async () => {
+        recovery?.signal.removeEventListener("abort", abortRecovery);
+        await cancellation;
+      });
       return { stdout: gated.out, exited };
     }
     const child = spawn("git", withDir(cwd, args), { env });
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const abortRecovery = () => {
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
+    };
+    recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+    const timeout = recovery ? setTimeout(abortRecovery, Math.max(1, recovery.deadline - Date.now())) : undefined;
+    child.once("close", () => {
+      recovery?.signal.removeEventListener("abort", abortRecovery);
+      if (timeout) clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+    });
+    if (recovery?.signal.aborted) abortRecovery();
     const exited = new Promise<number>((resolve) => {
       child.once("error", () => resolve(-1));
       child.once("close", (code) => resolve(code ?? -1));
@@ -8517,8 +8610,17 @@ export class GitCache {
     };
     const stderrText = (): string => Buffer.concat(stderrChunks).toString().trim();
     const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    recovery?.signal.throwIfAborted();
     if (boundary) {
-      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command" });
+      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command",
+        ...(recovery ? { timeoutMs: Math.max(1, recovery.deadline - Date.now()) } : {}),
+      });
+      let cancellation: Promise<unknown> | undefined;
+      const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+      recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+      if (recovery?.signal.aborted) abortRecovery();
+      void process.completed.finally(() => recovery?.signal.removeEventListener("abort", abortRecovery)).catch(() => undefined);
       if (!process.stdin) {
         // Nothing can be streamed; still settle the root before reporting.
         await process.completed.catch(() => undefined);
@@ -8531,11 +8633,19 @@ export class GitCache {
       const exited = process.completed.then(
         ({ code }) => ({ code, stderr: stderrText() }),
         (error: unknown) => ({ code: -1, stderr: stderrText() || gitErrorMessage(error) }),
-      );
+      ).finally(async () => { await cancellation; });
       return { stdin, exited, abort: () => stdin.destroy() };
     }
     const wrapped = runnerCommand("git", withDir(cwd, args));
     const child = spawn(wrapped.command, wrapped.args, { env, stdio: ["pipe", "pipe", "pipe"] });
+    const abortRecovery = () => { child.stdin.destroy(); child.kill("SIGKILL"); };
+    recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+    const timer = recovery ? setTimeout(abortRecovery, Math.max(1, recovery.deadline - Date.now())) : undefined;
+    child.once("close", () => {
+      recovery?.signal.removeEventListener("abort", abortRecovery);
+      if (timer) clearTimeout(timer);
+    });
+    if (recovery?.signal.aborted) abortRecovery();
     child.stdin.on("error", () => undefined);
     child.stdout.resume();
     child.stderr.on("data", keepStderr);
@@ -9434,7 +9544,11 @@ export class GitCache {
    * let a later mutation overtake the holder and violate serialization. */
   private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
-    const scope = this.boundaryProcesses.getStore();
+    const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    const scope = boundary ? { ...boundary, signal: recovery ? AbortSignal.any([boundary.signal, recovery.signal]) : boundary.signal }
+      : recovery;
+    const softSignal = boundary?.softSignal;
     let started = false;
     let settled = false;
     let removeAbortListener = (): void => {};
@@ -9455,17 +9569,17 @@ export class GitCache {
     if (scope) {
       removeAbortListener = (): void => {
         scope.signal.removeEventListener("abort", abortBeforeAcquisition);
-        scope.softSignal?.removeEventListener("abort", abortBeforeAcquisition);
+        softSignal?.removeEventListener("abort", abortBeforeAcquisition);
       };
-      if (scope.signal.aborted || scope.softSignal?.aborted) abortBeforeAcquisition();
+      if (scope.signal.aborted || softSignal?.aborted) abortBeforeAcquisition();
       else {
         scope.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
-        scope.softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
       }
     }
     const run = async (): Promise<void> => {
       if (settled) return;
-      if (scope?.signal.aborted || scope?.softSignal?.aborted) {
+      if (scope?.signal.aborted || softSignal?.aborted) {
         abortBeforeAcquisition();
         return;
       }
@@ -9480,8 +9594,8 @@ export class GitCache {
       // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
       // below does not advance until `run` returns), so a cancelled tick can settle its children and
       // reconcile lock files before any other bare mutation starts. It never fails the op.
-      if (scope?.beforeLockRelease) {
-        await scope.beforeLockRelease(key).catch(() => undefined);
+      if (boundary?.beforeLockRelease) {
+        await boundary.beforeLockRelease(key).catch(() => undefined);
       }
       settled = true;
       if (outcome.ok) resolveResult(outcome.value);

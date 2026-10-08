@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { Readable } from "node:stream";
 import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
@@ -322,6 +323,119 @@ test("failed fresh successor retains adopting evidence and cannot be mistaken fo
   assert.equal(journal().recovery.stage, "adopting");
   assert.equal(journal().recovery.successor.attemptId, aid(2));
   assert.equal((await recreate().reserveRecoveryIteration(bare, branch, key, source)).attempts, 2);
+});
+
+test("captured restart evidence verifies source tree and refuses changed work without refunding attempts", async () => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+  const first = journal();
+  assert.equal(await recreate().verifiedRecoveryRestorePoint(bare, branch, key, source, tip), true);
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  assert.equal(journal().recovery.attempts, 2);
+  assert.equal(journal().recovery.deadline, first.recovery.deadline);
+  assert.equal(await cache.verifiedRecoveryRestorePoint(bare, branch, key, source, tip), true);
+  fs.writeFileSync(path.join(source.clonePath, "work.txt"), "changed since capture");
+  assert.equal(await cache.verifiedRecoveryRestorePoint(bare, branch, key, source, tip), false);
+  assert.equal(journal().recovery.attempts, 2);
+});
+
+test("an existing orphan successor remains attributed when a retry adopts another fresh path", async () => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+  const base = git(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const tree = git(bare, ["rev-parse", `${tip}^{tree}`]);
+  const root = git(bare, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", "unrelated"]);
+  git(bare, ["update-ref", "refs/remotes/origin/main", root]);
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, 1, aid(2)), /history/);
+  const orphan = journal().recovery.successor;
+  fs.cpSync(source.clonePath, orphan.clonePath, { recursive: true });
+  git(bare, ["update-ref", "refs/remotes/origin/main", base]);
+  await recreate().reserveRecoveryIteration(bare, branch, key, source);
+  await cache.recordRecoveryCapture(bare, branch, key, source, 2, tip);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, 2, aid(3));
+  assert.notEqual(successor.path, orphan.clonePath);
+  assert.ok(journal().retainedSources.some((s: any) => s.clonePath === orphan.clonePath && s.attemptId === aid(2)));
+  assert.equal(fs.readFileSync(path.join(orphan.clonePath, "work.txt"), "utf8"), "retained work\n");
+  assert.equal(journal().recovery.attempts, 2);
+});
+
+test("recovery abort settles the active supervised child before releasing the bare lock", async () => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const before = journal();
+  const stop = new AbortController();
+  let spawned!: () => void, finish!: (value: { code: number }) => void;
+  let cancelled = false, settled = false;
+  const started = new Promise<void>(resolve => { spawned = resolve; });
+  const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
+  const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 1_000,
+    () => cache.withBoundaryProcessSpawner(async () => {
+      spawned();
+      return {
+        stdout: Readable.from([]), stderr: Readable.from([]), stdin: null,
+        completed, cancel: async () => {
+          cancelled = true;
+          await new Promise(resolve => setTimeout(resolve, 20));
+          settled = true;
+          finish({ code: -1 });
+        },
+      };
+    }, new AbortController().signal,
+    () => cache.withBareLock(bare, () => cache.verifyRecoveryClosure(bare, git(source.clonePath, ["rev-parse", "HEAD"])))));
+  await started;
+  stop.abort(new Error("lifecycle stopped"));
+  const observer = cache.withBareLock(bare, async () => { assert.equal(settled, true); });
+  await assert.rejects(operation, /lifecycle stopped/);
+  await observer;
+  assert.equal(cancelled, true);
+  assert.deepEqual(journal(), before);
+});
+
+test("already expired recovery scope admits no local work", async () => {
+  let admitted = false;
+  await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() - 1,
+    async () => { admitted = true; }), /deadline exhausted/);
+  assert.equal(admitted, false);
+});
+
+test("recovery deadline cancels a queued mutation without later changing its charged journal", async () => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const before = journal();
+  let release!: () => void, acquired!: () => void;
+  const held = new Promise<void>(resolve => { acquired = resolve; });
+  const holder = cache.withBareLock(bare, async () => {
+    acquired();
+    await new Promise<void>(resolve => { release = resolve; });
+  });
+  await held;
+  const expired = cache.withRecoveryOperation(new AbortController().signal, Date.now() + 30,
+    () => cache.reserveRecoveryIteration(bare, branch, key, source));
+  await assert.rejects(expired, /abort|deadline/);
+  release();
+  await holder;
+  await cache.withBareLock(bare, async () => {});
+  assert.deepEqual(journal(), before);
+});
+
+test("settled callback aborted during lock wait cannot erase its durable budget", async () => {
+  const { expected } = await ready();
+  const before = journal();
+  const stop = new AbortController();
+  let release!: () => void, acquired!: () => void;
+  const held = new Promise<void>(resolve => { acquired = resolve; });
+  const holder = cache.withBareLock(bare, async () => {
+    acquired();
+    await new Promise<void>(resolve => { release = resolve; });
+  });
+  await held;
+  const completion = cache.completeRecoveryEpisode(bare, branch, key, expected,
+    { settled: true, processedEvents: 1, attemptId: aid(2) }, () => stop.signal.throwIfAborted());
+  stop.abort(new Error("lifecycle stopped"));
+  release();
+  await holder;
+  await assert.rejects(completion, /lifecycle stopped/);
+  assert.deepEqual(journal(), before);
 });
 
 test("effective attempt mode refuses unknown markers, unsafe coordinates and config read errors", async () => {
