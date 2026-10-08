@@ -384,6 +384,14 @@ autostop_claim_setup() {
   echo 'both non-recovery claims followed headroom'
 }
 custody_case "auto-stop manual claims require one slot without adding holds" pass 'both non-recovery claims followed headroom' autostop_claim_setup
+open_holds_db() { if [ "$(cat "$SEQ_DIR/n")" -gt 1 ]; then echo 7; else echo 8; fi; }
+wedge_headroom_setup() {
+  headroom_fixture 8 7
+  eval "$(awk '/^wait_custody_headroom / || /^C0=/' "$ROOT/e2e/phases/72-custody-lifecycle.sh")"
+  [ "$C0" -lt 8 ] || fail 'custody wedge precondition still saturated'
+  echo 'custody wedge can seed its own scoped fixture'
+}
+custody_case "custody wedge waits before reading its seed precondition" pass 'custody wedge can seed' wedge_headroom_setup
 
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
@@ -395,6 +403,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 64 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 65 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 64 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 65 ] && [ "$cases" -eq "$passed" ]

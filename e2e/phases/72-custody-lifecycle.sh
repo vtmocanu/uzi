@@ -80,6 +80,9 @@ ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 [ -n "$ADMIN_ID" ] || fail "could not resolve the admin owner id for '$ADMIN_EMAIL'"
 
 open_holds_db() { db_psql "SELECT count(*) FROM recovery_custody_holds WHERE user_id = '$ADMIN_ID' AND state = 'open'"; }
+# Leave cross-phase source protection intact. With the real agent online, let
+# pending final receipts settle before seeding this phase's own custody fixture.
+wait_custody_headroom 1
 C0="$(open_holds_db)"
 # A suite that arrives already AT/OVER the limit is itself the isolation regression this
 # work guards against (leaked holds from an abrupt kill wedging unrelated later phases).
