@@ -1222,8 +1222,10 @@ WITH claimant AS MATERIALIZED (
       -- NULL my.cap makes the product NULL -> row excluded -> I claim (fail-open);
       -- a 0 active count on me makes the RHS 0 -> no peer qualifies -> I always
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
+      -- Dedicated cross-check claims use affinity instead of spread (PRD #2169);
+      -- legacy run-lane children retain the ordinary spread rules.
       AND (
-          r.kind = 'cross_check'
+          (r.kind = 'cross_check' AND COALESCE(@lane::text, 'run') = 'cross_check')
           OR r.worker_id = @worker_id
           OR r.updated_at < @spread_cutoff
           OR NOT EXISTS (
@@ -1259,6 +1261,11 @@ WITH claimant AS MATERIALIZED (
                             r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
+                -- A legacy child can defer only to a peer eligible on the run lane;
+                -- explicit zero or dedicated cross-check capacity cannot use fallback.
+                -- Keep the protocol, pins and custom-model mirrors below as well.
+                AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(p, r, true,
+                     'run', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
                 -- the peer, or fleet-spread could DEFER an interlocked run to an INCAPABLE peer

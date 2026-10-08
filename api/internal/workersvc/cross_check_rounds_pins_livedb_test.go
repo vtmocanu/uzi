@@ -256,6 +256,8 @@ func TestCrossCheckRoundsPinsFleetPlacementLiveDB(t *testing.T) {
 				env.exec("UPDATE workers SET maintenance_fenced=true WHERE id=$1", w.ID)
 			case "round2 maintenance requested":
 				env.exec("UPDATE workers SET maintenance_phase='requested' WHERE id=$1", w.ID)
+				// Test refusal of new foreign work, rather than draining this worker's pinned child.
+				env.exec("UPDATE runs SET worker_id=NULL WHERE id=$1 AND status='queued'", uuid.UUID(cc.CheckerRunID.Bytes))
 			case "round2 runtime missing":
 				caps = []string{capability.CrossCheckV1, capability.CrossCheckRoundsV1, capability.CrossCheckPinsV1, capability.CodexCustomModelV1, capability.CodexHarnessV1}
 			}
