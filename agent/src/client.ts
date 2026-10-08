@@ -6,6 +6,13 @@ import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  type MemoryBinding,
+  type MemoryPolicy,
+  type MemoryOutcome,
+  type MemoryReservationRequest,
+  type MemoryOutcomeRequest,
+  type MemoryReservation,
+  type MemoryIncarnation,
   type TerminalRejectionsRequest,
   type TerminalRejectionsResponse,
   type TerminalRejectionCustodyResponse,
@@ -939,6 +946,58 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
     sample.inodesTotal > 0 && sample.inodesUsed <= sample.inodesTotal;
 }
 
+function memoryError(): Error { return new Error("memory intervention unavailable or invalid"); }
+function memoryObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw memoryError();
+  return value as Record<string, unknown>;
+}
+function memoryUUID(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    && value !== "00000000-0000-0000-0000-000000000000";
+}
+function memoryNonce(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= 128;
+}
+function memoryNatural(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function memoryBinding(value: unknown): MemoryBinding {
+  const b = memoryObject(value);
+  if (!memoryUUID(b.run_id) || !memoryUUID(b.worker_id) || !memoryUUID(b.intervention_id)
+    || !memoryNonce(b.register_nonce) || !memoryNatural(b.claim_generation) || b.claim_generation === 0
+    || !memoryNatural(b.memory_episode)) throw memoryError();
+  return { run_id: b.run_id, worker_id: b.worker_id, intervention_id: b.intervention_id,
+    register_nonce: b.register_nonce, claim_generation: b.claim_generation, memory_episode: b.memory_episode };
+}
+function memoryPolicy(value: unknown): MemoryPolicy {
+  const p = memoryObject(value);
+  if (p.version !== 1 || !memoryNatural(p.max_interventions) || p.max_interventions < 1 || p.max_interventions > 9999) throw memoryError();
+  return { version: 1, max_interventions: p.max_interventions };
+}
+function memoryOutcome(value: unknown): value is MemoryOutcome {
+  return value === "no_signal" || value === "unknown" || value === "confirmed_drained";
+}
+function decodeMemoryReservation(value: unknown, request: MemoryReservationRequest | MemoryOutcomeRequest): MemoryReservation {
+  const obj = memoryObject(value);
+  const binding = memoryBinding(obj);
+  for (const field of ["run_id", "worker_id", "intervention_id", "register_nonce", "claim_generation", "memory_episode"] as const) {
+    if (binding[field] !== request[field]) throw memoryError();
+  }
+  const policy = memoryPolicy(obj.policy);
+  if ("policy" in request && (policy.version !== request.policy.version || policy.max_interventions !== request.policy.max_interventions)) throw memoryError();
+  const allowance = memoryObject(obj.allowance);
+  const { limit, used, remaining } = allowance;
+  if (!memoryNatural(limit) || limit !== policy.max_interventions || !memoryNatural(used) || used > limit
+    || !memoryNatural(remaining) || remaining !== limit - used
+    || typeof obj.admitted !== "boolean" || typeof obj.authorizing !== "boolean"
+    || (obj.outcome !== undefined && !memoryOutcome(obj.outcome))
+    || (obj.admitted && used === 0) || (!obj.admitted && used !== limit)
+    || (obj.authorizing && (!obj.admitted || obj.outcome !== undefined))
+    || ("outcome" in request && (obj.outcome !== request.outcome || obj.authorizing))) throw memoryError();
+  return { ...binding, policy, allowance: { limit, used, remaining }, admitted: obj.admitted,
+    authorizing: obj.authorizing, ...(obj.outcome === undefined ? {} : { outcome: obj.outcome }) };
+}
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private readonly inventoryGuardedClaims = new Set<string>();
@@ -971,6 +1030,48 @@ export class WorkerClient {
    * register, so a client that has not registered sends today's byte-identical wire.
    */
   private serverFeatures = new Set<string>();
+  private memoryRegistrationRevision = 0;
+  private memoryIncarnationValue: MemoryIncarnation | undefined;
+  private memoryInvalidationListener: (() => void) | undefined;
+
+  get memoryIncarnation(): MemoryIncarnation | undefined { return this.memoryIncarnationValue; }
+
+  /** One worker guard owns this subscription; unsubscribe on guard disposal. */
+  subscribeMemoryInvalidation(listener: () => void): () => void {
+    if (this.memoryInvalidationListener) throw new Error("memory listener already installed");
+    this.memoryInvalidationListener = listener;
+    return () => {
+      if (this.memoryInvalidationListener === listener) this.memoryInvalidationListener = undefined;
+    };
+  }
+
+  private invalidateMemoryIncarnation(): void {
+    this.memoryIncarnationValue = undefined;
+    this.memoryInvalidationListener?.();
+  }
+
+  async reserveMemoryIntervention(request: MemoryReservationRequest, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<MemoryReservation> {
+    const binding = memoryBinding(request);
+    const policy = memoryPolicy(request.policy);
+    return this.memoryRequest("reserve", { ...binding, policy }, signal, timeoutMs);
+  }
+
+  async reportMemoryInterventionOutcome(request: MemoryOutcomeRequest, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<MemoryReservation> {
+    const binding = memoryBinding(request);
+    if (!memoryOutcome(request.outcome)) throw memoryError();
+    return this.memoryRequest("outcome", { ...binding, outcome: request.outcome }, signal, timeoutMs);
+  }
+
+  private async memoryRequest(kind: "reserve" | "outcome", body: MemoryReservationRequest | MemoryOutcomeRequest, signal: AbortSignal | undefined, timeoutMs: number): Promise<MemoryReservation> {
+    if (!this.hasFeature("worker_memory_pressure_v1") || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) throw memoryError();
+    try {
+      const raw = await this.postJSON(`${WORKER_API_PREFIX}/runs/${body.run_id}/memory/${kind}`, body, timeoutMs, signal, 64 * 1024);
+      return decodeMemoryReservation(raw, body);
+    } catch {
+      // Neither server error bodies nor malformed response text escape this seam.
+      throw memoryError();
+    }
+  }
 
   /**
    * Whether this image advertised the `credential_switch_v1` protocol capability at
@@ -1068,6 +1169,8 @@ export class WorkerClient {
     protocolCapabilities?: string[],
     initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
+    const memoryRevision = ++this.memoryRegistrationRevision;
+    this.invalidateMemoryIncarnation();
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -1099,6 +1202,13 @@ export class WorkerClient {
     // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
     if (initialSnapshot !== undefined) body.active_snapshot = initialSnapshot;
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
+    if (memoryRevision !== this.memoryRegistrationRevision) return res;
+    if (Array.isArray(res.protocol_features) && res.protocol_features.includes("worker_memory_pressure_v1")
+      && memoryUUID(res.worker_id) && memoryNonce(res.register_nonce)) {
+      this.memoryIncarnationValue = Object.freeze({
+        worker_id: res.worker_id, register_nonce: res.register_nonce, revision: memoryRevision,
+      });
+    }
     // Capture the negotiated protocol features (PRD #1392 D7 / #1391 D8): REPLACE the set
     // from this register's advertisement so a re-register after a rollout reflects the
     // server's current features. Filter to strings (defensive), and treat an absent field
@@ -1139,6 +1249,7 @@ export class WorkerClient {
    *  restarts (a re-register would re-populate it). */
   clearFeatures(): void {
     this.serverFeatures.clear();
+    this.invalidateMemoryIncarnation();
     this.latestDindMaintenanceValue = undefined;
   }
 

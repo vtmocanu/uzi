@@ -353,6 +353,42 @@ export interface RegisterRequest {
   active_snapshot?: ActiveSnapshot;
 }
 
+export interface MemoryBinding {
+  run_id: string;
+  worker_id: string;
+  register_nonce: string;
+  claim_generation: number;
+  memory_episode: number;
+  intervention_id: string;
+}
+export interface MemoryPolicy { version: 1; max_interventions: number }
+export interface MemoryReservationRequest extends MemoryBinding { policy: MemoryPolicy }
+export interface MemoryOutcomeRequest extends MemoryBinding { outcome: MemoryOutcome }
+export type MemoryOutcome = "no_signal" | "unknown" | "confirmed_drained";
+export interface MemoryReservation extends MemoryBinding {
+  admitted: boolean;
+  authorizing: boolean;
+  allowance: { limit: number; used: number; remaining: number };
+  policy: MemoryPolicy;
+  outcome?: MemoryOutcome;
+}
+export interface WorkerMemoryPressureResult extends Omit<MemoryBinding, "register_nonce"> {
+  attempt_id: string;
+  code: "worker_memory_pressure";
+  command_id: string;
+  tool_id: string;
+  command: string;
+  observed_total_bytes: number;
+  limit_bytes: number;
+  tree_rss_bytes_approx: number;
+  cancellation_confirmed: boolean;
+  outcome: MemoryOutcome;
+  retry_blocked: true;
+  guidance: "Use smaller or serial commands after recovery.";
+}
+
+export type MemoryIncarnation = Readonly<{ worker_id: string; register_nonce: string; revision: number }>;
+
 export interface RegisterResponse {
   // The worker is identified by its Bearer token on every subsequent call
   // (heartbeat/claim carry no worker id in the path), so this is not strictly

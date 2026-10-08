@@ -117,3 +117,42 @@ test("production bounded read seam works on fake proc/cgroup files only", () => 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("invalid UTF-8 is unavailable before scalar parsing", () => {
+  const reader = new WorkerMemoryReader({
+    cgroupRoot: "/fake", procCgroupPath: "/fake/proc",
+    readBytes: () => Uint8Array.from([0xc3, 0x28]),
+  });
+  assert.deepEqual(reader.sample().available, false);
+  const result = reader.sample();
+  if (!result.available) assert.equal(result.reason, "malformed");
+});
+
+test("production reads retry short reads within the aggregate allocation budget", (t) => {
+  const dir = fs.mkdtempSync(path.resolve("../.uzi/scratch/memory-short-"));
+  const original = fs.readSync;
+  const reads: { allocation: number; offset: number; length: number; count: number }[] = [];
+  try {
+    for (const [file, raw] of Object.entries(files())) fs.writeFileSync(path.join(dir, path.basename(file)), raw);
+    t.mock.method(fs, "readSync", (fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
+      const count = original(fd, buffer, offset, Math.min(length, 3), position);
+      reads.push({ allocation: buffer.byteLength, offset, length, count });
+      return count;
+    });
+    const reader = new WorkerMemoryReader({ cgroupRoot: dir, procCgroupPath: path.join(dir, "proc") });
+    assert.equal(reader.sample().available, true);
+    assert.ok(reads.some((read) => read.offset > 0 && read.count > 0));
+    assert.ok(reads.every((read) => read.allocation <= 65537 && read.length === read.allocation - read.offset));
+    reads.length = 0;
+    fs.writeFileSync(path.join(dir, "memory.stat"), "x".repeat(100000));
+    const result = reader.sample();
+    assert.equal(result.available, false);
+    if (!result.available) assert.equal(result.reason, "oversized");
+    assert.equal(reads.reduce((sum, read) => sum + read.count, 0), 65537);
+    const allocations = reads.filter((read) => read.offset === 0).map((read) => read.allocation);
+    assert.deepEqual(allocations, [65537, 65532, 65527, 65522]);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
