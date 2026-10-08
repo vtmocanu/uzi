@@ -16,7 +16,7 @@ An issue fires only with `on-deck` plus eligibility (`uzi` or bot assignment).
    - `security` label, "investigate" or diagnosis-first issues, and anything verified only by a live or cluster check.
 4. **Fresh**: issue-triage Step 4 ran on current `origin/main`: premise verified, anchors refreshed, conditionals resolved.
 5. **Pinned**: every design fork is decided in the body (option and reason); no implementation decision is left for the run or the user.
-6. **Testable**: an acceptance section. A bug fix requires a regression test watched failing on current main and passing with the fix. LiveDB fixes name `./e2e/run-store-it.sh`.
+6. **Testable**: an acceptance section. A bug fix names a regression test that the run must watch failing on current main and passing with the fix; filing does not implement it. LiveDB fixes name `./e2e/run-store-it.sh`.
 7. **Compatible**: a DTO change only as an optional additive field, safe when absent, verified compatible with older producers and consumers, needing no coordinated rollout, and with no change to authorization, validation, persistence or lifecycle semantics.
 8. **Dependencies**: a new one only when the body explains why existing tools or a small in-house implementation are insufficient, pins package, version and lockfile change, and names verification. Promoting an existing indirect dependency at the same version is fine.
 9. **One lane**: no `bug`/`Planned` or other enabled label-sweep selector (custom and refactor sweeps included; read `uzi schedule list --json`), no bot assignment, no enabled one-shot schedule, no active run, no open PR for the issue.
@@ -37,7 +37,17 @@ Rewrite the body before queuing, in the maintainer's words:
 
 ## Review
 
-The buddy reviews the exact final body (pin its hash) and the label set; `reviewed` follows that approval only. A criteria review approves no issue. Queuing also needs the user's authorization: their OK for this batch, or an existing scoped grant. Buddy approval alone does not supply it.
+The buddy reviews the exact final body (pin its hash) and the label set; `reviewed` follows that approval only. A criteria review approves no issue. Queuing also needs the user's authorization: their OK for this batch, or an existing scoped grant such as the filing default below. Buddy approval alone does not supply it.
+
+## Filing default
+
+Standing user grant for issues a session files in this repo. It does not cover backlog triage, schedule changes or merging.
+
+- A new issue meeting every criterion gets `on-deck` + `uzi` + `reviewed` + `area::*`/`priority::*` at filing, once the buddy approved its exact title, body and labels. Post body and labels together; never add `bug` or `Planned`.
+- Before requesting that approval, run the freshness check and settle routine implementation choices yourself. Ask the user only for unavailable evidence or a product/design decision. A body change needs fresh approval.
+- Anything else (PRD, large or multi-outcome work, an excluded risk class, a failed criterion): name the reason and ask the user for its disposition unless already given: hold, gated dispatch (uzi-watcher), local work, or an explicitly authorized sweep. Never fall back to `bug`/`Planned` on your own.
+- A non-maintainer report keeps issue-triage's maintainer-written-body rule; this grant never overrides server permission gating, withheld comments or a plan gate.
+- Queued means eligible for the next capacity-permitted fire. Confirm the `ondeck-sweep` is enabled (`uzi schedule list --json`) before saying it will fire.
 
 ## Drop
 

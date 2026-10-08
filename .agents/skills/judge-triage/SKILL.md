@@ -170,6 +170,5 @@ prints the exact undo command — keep it). After a batch, re-run
   finding to the issue. `uzi findings file ID ID...` posts the unedited server
   text only. Label filed issues per `.agents/skills/issue-triage/references/taxonomy.md`.
   For a low or normal issue, write the body in the shape of
-  `.agents/skills/issue-triage/references/on-deck.md` and propose `on-deck` when it meets
-  every criterion there; apply it only with the buddy's approval of the exact body and
-  label set plus the user's authorization (their OK or an existing scoped grant).
+  `.agents/skills/issue-triage/references/on-deck.md` and apply its *Filing default*
+  (`on-deck` + `uzi` when every criterion holds, else ask the user for the disposition).
