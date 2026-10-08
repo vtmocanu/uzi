@@ -4529,6 +4529,32 @@ export class GitCache {
       // superseded tips and pins created before a failed journal write. Validate the
       // complete snapshot before deleting anything; sibling run namespaces are excluded.
       const prefix = `refs/uzi-recovery-episode/${journal.runId}/`;
+      // Loose enumeration is specific to the files backend. --list also succeeds
+      // for an absent setting, without treating a failed config read as absence.
+      const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+      for (const entry of config.split("\0")) {
+        const separator = entry.indexOf("\n");
+        const name = separator < 0 ? entry : entry.slice(0, separator);
+        if (name.toLowerCase() === "extensions.refstorage" &&
+            (separator < 0 || entry.slice(separator + 1) !== "files")) throw new Error("unsupported recovery ref backend");
+      }
+      // Probe outer-to-inner before Git or readdir traverses the loose namespace.
+      // Missing ancestors allow packed-only pins; unsafe ancestors refuse cleanup.
+      let looseDir: string | undefined = barePath;
+      for (const part of ["refs", "uzi-recovery-episode", journal.runId]) {
+        looseDir = path.join(looseDir, part);
+        let st: Stats;
+        try { st = await fs.lstat(looseDir); }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          looseDir = undefined;
+          break;
+        }
+        if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+            ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
+          throw new Error("unsafe recovery pin namespace");
+        }
+      }
       const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", prefix]);
       const pins = listing.trim().split("\n").filter(Boolean).map(line => {
         const [ref, oid, symref, extra] = line.split("\0");
@@ -4536,6 +4562,22 @@ export class GitCache {
         if (ref === undefined || symref !== "" || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
         return { ref, tip };
       });
+      // Git omits dangling symbolic and broken loose refs. One flat pass, no retries:
+      // every loose ref must appear in the validated direct-pin snapshot before deletion.
+      // Any failed sibling check refuses the entire discard and keeps all attribution.
+      if (looseDir !== undefined) {
+        const directRefs = new Set(pins.map(pin => pin.ref));
+        for (const name of await fs.readdir(looseDir)) {
+          const st = await fs.lstat(path.join(looseDir, name));
+          if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+              ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
+            throw new Error("invalid recovery pin identity");
+          }
+          // Git's regular SHA lock files are not refs; leave deletion to report contention.
+          if (name.endsWith(".lock") && SHA40_RE.test(name.slice(0, -5))) continue;
+          if (!SHA40_RE.test(name) || !directRefs.has(prefix + name)) throw new Error("invalid recovery pin identity");
+        }
+      }
       // One attempt per enumerated pin, no retries. The first failed delete stops
       // cleanup and keeps the journal; a later explicit discard can retry remaining pins.
       for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "--no-deref", "-d", ref, tip]);

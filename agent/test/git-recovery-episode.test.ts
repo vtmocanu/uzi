@@ -488,6 +488,112 @@ test("discard rejects symbolic pins before touching unrelated targets or attribu
   assert.equal(git(bare, ["symbolic-ref", symbolic]), target);
 });
 
+for (const packed of [false, true]) {
+  test("discard rejects dangling symbolic pins with " + (packed ? "packed" : "loose") + " valid pins before any deletion", async () => {
+    const { expected, tip } = await ready();
+    const before = journal();
+    const prefix = "refs/uzi-recovery-episode/" + runId + "/";
+    const parent = git(bare, ["rev-parse", tip + "^"]);
+    const valid = [tip, parent];
+    git(bare, ["update-ref", prefix + parent, parent]);
+    if (packed) {
+      git(bare, ["pack-refs", "--all", "--prune"]);
+      for (const oid of valid) assert.equal(fs.existsSync(path.join(bare, prefix + oid)), false);
+    }
+    const symbolic = prefix + "f".repeat(40);
+    const target = "refs/keep/absent-discard-target";
+    assert.throws(() => git(bare, ["rev-parse", "--verify", target]));
+    git(bare, ["symbolic-ref", symbolic, target]);
+    const symbolicBytes = fs.readFileSync(path.join(bare, symbolic));
+    assert.equal(git(bare, ["for-each-ref", "--format=%(refname)", prefix]).includes(symbolic), false);
+    await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /pin identity/);
+    assert.deepEqual(journal(), before);
+    for (const oid of valid) assert.equal(git(bare, ["rev-parse", prefix + oid]), oid);
+    assert.equal(git(bare, ["symbolic-ref", symbolic]), target);
+    assert.deepEqual(fs.readFileSync(path.join(bare, symbolic)), symbolicBytes);
+    assert.throws(() => git(bare, ["rev-parse", "--verify", target]));
+  });
+}
+
+test("discard refuses malformed ref backend settings before deleting pins or attribution", async () => {
+  const { expected, tip } = await ready();
+  const before = journal();
+  const pin = "refs/uzi-recovery-episode/" + runId + "/" + tip;
+  const configPath = path.join(bare, "config");
+  const originalConfig = fs.readFileSync(configPath);
+  // Change only the declared backend, never convert the fixture's existing refs.
+  fs.appendFileSync(configPath, "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n");
+  try {
+    await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /unsupported recovery ref backend|unsupported.*extension/i);
+  } finally {
+    fs.writeFileSync(configPath, originalConfig);
+  }
+  assert.deepEqual(journal(), before);
+  assert.equal(git(bare, ["rev-parse", pin]), tip);
+});
+
+test("discard refuses malformed loose pin paths and symlink ancestors before any deletion", async () => {
+  const { expected, tip } = await ready();
+  const before = journal();
+  const prefix = "refs/uzi-recovery-episode/" + runId + "/";
+  const good = prefix + tip;
+  const bad = path.join(bare, prefix + "f".repeat(40));
+  for (const shape of ["directory", "symlink", "broken"] as const) {
+    if (shape === "directory") fs.mkdirSync(bad);
+    else if (shape === "symlink") fs.symlinkSync(path.join(bare, good), bad);
+    else fs.writeFileSync(bad, "invalid ref bytes\n");
+    await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /pin identity/);
+    assert.deepEqual(journal(), before);
+    assert.equal(git(bare, ["rev-parse", good]), tip);
+    fs.rmSync(bad, { recursive: true });
+  }
+  for (const relative of ["refs", "refs/uzi-recovery-episode", prefix]) {
+    const dir = path.resolve(bare, relative);
+    const saved = dir + ".saved";
+    fs.renameSync(dir, saved);
+    fs.symlinkSync(saved, dir);
+    try {
+      await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /unsafe recovery pin namespace/);
+      assert.deepEqual(journal(), before);
+      assert.equal(git(bare, ["rev-parse", good]), tip);
+    } finally {
+      fs.unlinkSync(dir);
+      fs.renameSync(saved, dir);
+    }
+  }
+});
+
+test("discard refuses writable loose namespace and pin files before clearing attribution", async () => {
+  const { expected, tip } = await ready();
+  const before = journal();
+  const prefix = "refs/uzi-recovery-episode/" + runId + "/";
+  const pin = path.join(bare, prefix + tip);
+  for (const target of [pin, path.join(bare, "refs"), path.join(bare, "refs/uzi-recovery-episode"), path.join(bare, prefix)]) {
+    const mode = fs.statSync(target).mode;
+    fs.chmodSync(target, mode | 0o002);
+    try {
+      await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /pin identity|pin namespace/);
+      assert.deepEqual(journal(), before);
+      assert.equal(git(bare, ["rev-parse", prefix + tip]), tip);
+    } finally {
+      fs.chmodSync(target, mode);
+    }
+  }
+});
+
+test("discard accepts packed-only pins when the loose run namespace is absent", async () => {
+  const { expected, tip } = await ready();
+  const prefix = "refs/uzi-recovery-episode/" + runId + "/";
+  git(bare, ["config", "core.repositoryFormatVersion", "1"]);
+  git(bare, ["config", "extensions.refStorage", "files"]);
+  git(bare, ["pack-refs", "--all", "--prune"]);
+  assert.equal(fs.existsSync(path.join(bare, prefix + tip)), false);
+  fs.rmSync(path.join(bare, prefix), { recursive: true, force: true });
+  await cache.discardRetainedRecovery(bare, branch, key, expected, true);
+  assert.throws(() => git(bare, ["rev-parse", "--verify", prefix + tip]));
+  assert.equal(git(bare, ["config", "uzi-recovery." + branch + ".clone"]), "");
+});
+
 test("explicit owner discard keeps paths intact and per-key attempt mode outlives cleared journal", async () => {
   assert.equal(await cache.recoveryAttemptMode(fx.originPath, key), false);
   const { expected, tip } = await ready();
