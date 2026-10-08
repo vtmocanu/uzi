@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-user usage follows the selected window ([#2439](https://github.com/vtmocanu/uzi/issues/2439)).**
+  The dashboard's per-user breakdown follows its shared All time / Last 7 days toggle. `uzi admin usage --window lifetime|last_7_days` defaults to lifetime and switches the human factory summary and per-user rows together, including usage-bearing runs, tokens, outcomes, recoverable failures, failed-run rate over finished runs, and metered cost with subscription/unreported exclusions. Failure recency stays lifetime. JSON retains the complete response with both windows and additive per-user seven-day fields; invalid window values are rejected before a request even with JSON. An older API missing per-user `last_7_days` requires an API upgrade for the seven-day human report and prints no partial report; lifetime and JSON remain usable.
+
 ### Fixed
 
 - **Completed guarded recovery can settle after attributed clone parents disappear ([#2433](https://github.com/vtmocanu/uzi/issues/2433)).**
@@ -44,11 +49,6 @@ through `[0.52.0]`.)
 
 - **Codex MR rework receives its captured review findings ([#2393](https://github.com/vtmocanu/uzi/issues/2393)).**
   Planning and ordinary implementation prompts, including cold starts and resumes, carry the shared untrusted review-comment block with the exact reply and resolve identifiers; approved plans retain precedence, and runs without review comments keep their existing prompts.
-
-### Changed
-
-- **Per-user usage follows the selected window ([#2439](https://github.com/vtmocanu/uzi/issues/2439)).**
-  The dashboard's per-user breakdown follows its shared All time / Last 7 days toggle. `uzi admin usage --window lifetime|last_7_days` defaults to lifetime and switches the human factory summary and per-user rows together, including usage-bearing runs, tokens, outcomes, recoverable failures, failed-run rate over finished runs, and metered cost with subscription/unreported exclusions. Failure recency stays lifetime. JSON retains the complete response with both windows and additive per-user seven-day fields; invalid window values are rejected before a request even with JSON. An older API missing per-user `last_7_days` requires an API upgrade for the seven-day human report and prints no partial report; lifetime and JSON remain usable.
 
 ### Added
 
