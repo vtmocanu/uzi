@@ -81,7 +81,8 @@ func (s *Service) Reconcile(ctx context.Context, wkr store.Worker, runID, captur
 		res.Reason = "hold_not_original_worker"
 		return res, nil
 	}
-	if !(gen > req.Generation || (gen == req.Generation && (released.Valid || custodyRunTerminalStatuses[status]))) {
+	ended := gen > req.Generation || (gen == req.Generation && (released.Valid || custodyRunTerminalStatuses[status]))
+	if !ended {
 		res.Reason = "generation_not_ended"
 		return res, nil
 	}

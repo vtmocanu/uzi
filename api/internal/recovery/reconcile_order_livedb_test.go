@@ -122,11 +122,11 @@ func TestRecoveryReconcileReleaseFirstOrderLiveDB(t *testing.T) {
 	}
 	ack := awaitReconcileOperation(t, release)
 	if ack.err != nil || !ack.value.Released {
-		t.Fatalf("release: %+v", ack)
+		t.Fatalf("release: %+v err=%v", ack.value, ack.err)
 	}
 	got := awaitReconcileOperation(t, reconcile)
 	if got.err != nil || got.value.Outcome != "accepted" || !reflect.DeepEqual(got.value.FinalReceipt, releaseReq.FinalDisposition) {
-		t.Fatalf("reconcile: %+v", got)
+		t.Fatalf("reconcile: %+v err=%v", got.value, got.err)
 	}
 	e.bytes(id, body)
 }
@@ -155,13 +155,13 @@ func TestRecoveryReconcileFenceFirstOrderLiveDB(t *testing.T) {
 	}
 	got := awaitReconcileOperation(t, reconcile)
 	if got.err != nil || got.value.Outcome != "replaceable" {
-		t.Fatalf("fence: %+v", got)
+		t.Fatalf("fence: %+v err=%v", got.value, got.err)
 	}
 	if got := awaitReconcileOperation(t, release); !errors.Is(got.err, ErrManifestConflict) {
-		t.Fatalf("late FINAL: %+v", got)
+		t.Fatalf("late FINAL: %+v err=%v", got.value, got.err)
 	}
 	if got := awaitReconcileOperation(t, upload); !errors.Is(got.err, ErrNotAvailable) {
-		t.Fatalf("late upload: %+v", got)
+		t.Fatalf("late upload: %+v err=%v", got.value, got.err)
 	}
 	c, err := e.q.GetCaptureForOwner(e.ctx, store.GetCaptureForOwnerParams{ID: id, RunID: e.run, UserID: e.w.UserID})
 	chunks, chunkErr := e.q.ListCaptureChunks(e.ctx, id)
@@ -190,6 +190,86 @@ func (r *reconcilePausedReader) Read(p []byte) (int, error) {
 	return r.body.Read(p)
 }
 
+func TestRecoveryFinalUploadFirstOrderLiveDB(t *testing.T) {
+	e := newInventoryEnv(t)
+	id := e.reserve("upload-first-final")
+	e.exec("UPDATE runs SET status='completed' WHERE id=$1", e.run)
+	body := []byte("healthy in-flight FINAL inventory bytes")
+	manifest := manifestOf(body)
+	entered, resume := make(chan struct{}), make(chan struct{}, 1)
+	defer close(resume)
+	upload := startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryCaptureStatusResponse, error) {
+		reader := &reconcilePausedReader{ctx: ctx, entered: entered, resume: resume, body: bytes.NewReader(body)}
+		return e.svc.Upload(ctx, e.w, e.run, id, manifest, reader)
+	})
+	select {
+	case <-entered: // stream owns capture before FINAL locks worker/run/hold.
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload never entered stream")
+	}
+	req := e.request(id)
+	final := startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryReleaseResponse, error) {
+		return e.svc.Release(ctx, e.w, e.run, req)
+	})
+	waitReconcileLock(t, e, 0, "GetFinalInventoryCapture")
+	resume <- struct{}{}
+	up := awaitReconcileOperation(t, upload)
+	if up.err != nil || up.value.State != "available" || !up.value.ManifestBound ||
+		up.value.CaptureID != id.String() || up.value.ByteSize == nil ||
+		*up.value.ByteSize != manifest.ByteSize || up.value.Checksum != manifest.Checksum {
+		t.Fatalf("upload: %+v err=%v", up.value, up.err)
+	}
+	ack := awaitReconcileOperation(t, final)
+	wantACK := apitypes.RecoveryReleaseResponse{RunID: e.run.String(), Released: true, HoldsReleased: 1, Generation: &e.gen}
+	if ack.err != nil || !reflect.DeepEqual(ack.value, wantACK) {
+		t.Fatalf("FINAL: %+v err=%v want=%+v", ack.value, ack.err, wantACK)
+	}
+	hold, err := e.q.GetFinalInventoryHold(e.ctx, store.GetFinalInventoryHoldParams{
+		RunID: e.run, UserID: e.w.UserID, WorkerID: e.w.ID, Generation: e.gen,
+	})
+	if err != nil || hold.ID != e.hold || hold.State != "released" ||
+		!hold.FinalCaptureID.Valid || uuid.UUID(hold.FinalCaptureID.Bytes) != id ||
+		hold.FinalDisposition.String != req.FinalDisposition.Kind ||
+		hold.FinalSourceSha.String != req.FinalDisposition.SourceSha ||
+		hold.FinalCoverageDigest.String != req.FinalDisposition.CoverageDigest ||
+		hold.ReleaseEvidence.String != "archive" || hold.LiveWorkerID.Valid || hold.LiveRunID.Valid {
+		t.Fatalf("FINAL hold: %+v err=%v", hold, err)
+	}
+	capture, err := e.q.GetCaptureForOwner(e.ctx, store.GetCaptureForOwnerParams{ID: id, RunID: e.run, UserID: e.w.UserID})
+	if err != nil || capture.State != "available" || !capture.ManifestBound ||
+		capture.HoldID != e.hold || capture.SourceSha != req.FinalDisposition.SourceSha ||
+		capture.CoverageDigest.String != req.FinalDisposition.CoverageDigest ||
+		!capture.ByteSize.Valid || capture.ByteSize.Int64 != manifest.ByteSize ||
+		!capture.Checksum.Valid || capture.Checksum.String != manifest.Checksum ||
+		!capture.ChunkCount.Valid || capture.ChunkCount.Int32 != 1 ||
+		!capture.LocalReplicaWorkerID.Valid || uuid.UUID(capture.LocalReplicaWorkerID.Bytes) != e.w.ID ||
+		!capture.ReadyRetentionSeconds.Valid || capture.ReadyRetentionSeconds.Int64 != 3600 {
+		t.Fatalf("FINAL capture: %+v err=%v", capture, err)
+	}
+	chunks, err := e.q.ListCaptureChunks(e.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exact FINAL retry and reconcile must echo the receipt without changing evidence.
+	retry, err := e.svc.Release(e.ctx, e.w, e.run, req)
+	if err != nil || !reflect.DeepEqual(retry, wantACK) {
+		t.Fatalf("FINAL retry: %+v err=%v", retry, err)
+	}
+	reconciled, err := e.svc.Reconcile(e.ctx, e.w, e.run, id, reconcileRequest(body))
+	if err != nil || reconciled.Outcome != "accepted" || !reflect.DeepEqual(reconciled.FinalReceipt, req.FinalDisposition) {
+		t.Fatalf("accepted reconcile: %+v err=%v", reconciled, err)
+	}
+	after, err := e.q.GetCaptureForOwner(e.ctx, store.GetCaptureForOwnerParams{ID: id, RunID: e.run, UserID: e.w.UserID})
+	if err != nil || !reflect.DeepEqual(after, capture) {
+		t.Fatalf("immutable capture: %+v err=%v before=%+v", after, err, capture)
+	}
+	afterChunks, err := e.q.ListCaptureChunks(e.ctx, id)
+	if err != nil || !reflect.DeepEqual(afterChunks, chunks) {
+		t.Fatalf("immutable chunks: %+v err=%v", afterChunks, err)
+	}
+	e.bytes(id, body)
+}
+
 func TestRecoveryReconcileUploadFirstOrderLiveDB(t *testing.T) {
 	e := newInventoryEnv(t)
 	id := e.reserve("upload-first")
@@ -213,11 +293,11 @@ func TestRecoveryReconcileUploadFirstOrderLiveDB(t *testing.T) {
 	resume <- struct{}{}
 	up := awaitReconcileOperation(t, upload)
 	if up.err != nil || up.value.State != "available" || !up.value.ManifestBound {
-		t.Fatalf("upload: %+v", up)
+		t.Fatalf("upload: %+v err=%v", up.value, up.err)
 	}
 	got := awaitReconcileOperation(t, reconcile)
 	if got.err != nil || got.value.Outcome != "retained" || got.value.Reason != "capture_available" {
-		t.Fatalf("post-upload reconcile: %+v", got)
+		t.Fatalf("post-upload reconcile: %+v err=%v", got.value, got.err)
 	}
 	e.bytes(id, body)
 }
