@@ -5,7 +5,10 @@ package forge
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 
 	gh "github.com/google/go-github/v92/github"
@@ -91,44 +94,41 @@ func (g *github) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	if err != nil {
 		return g.wrapErr("update issue labels", err)
 	}
-	// GitHub's set-replace is PUT /issues/{n}/labels (ReplaceLabelsForIssue). Read
-	// the current set, compute the target client-side (current − remove + add), and
-	// PUT once. An unrelated label the caller neither adds nor removes SURVIVES
-	// because it stays in target. The read/write is not transactional, so the same
-	// lost-update window the Forgejo/GitLab drivers accept (D3) applies.
-	cur, _, err := g.client.Issues.Get(ctx, slug.owner, slug.repo, num)
-	if err != nil {
-		return g.wrapErr("update issue labels: read current issue", err)
-	}
-	current := map[string]struct{}{}
-	for _, l := range cur.Labels {
-		if l != nil {
-			current[l.Name] = struct{}{}
+	// Apply the delta without replacing a stale snapshot of unrelated labels.
+	// This is non-atomic: a failed removal or addition leaves earlier removals
+	// applied, with no compensation. Additions run last, so overlap adds win.
+	// Each supplied removal gets one DELETE and at most one verification Get;
+	// the first failure aborts the remaining delta. Requests use the client timeout
+	// and caller context. The Forge interface is unchanged.
+	for _, name := range remove {
+		_, err := g.client.Issues.RemoveLabelForIssue(ctx, slug.owner, slug.repo, num, url.PathEscape(name))
+		if err == nil {
+			continue
 		}
-	}
-	removeSet := make(map[string]struct{}, len(remove))
-	for _, r := range remove {
-		removeSet[r] = struct{}{}
-	}
-	target := map[string]struct{}{}
-	for name := range current {
-		if _, drop := removeSet[name]; !drop {
-			target[name] = struct{}{}
+		// Inspect the raw status before wrapErr redacts the error chain. A 404
+		// alone cannot distinguish an absent label from an unreadable issue.
+		var responseErr *gh.ErrorResponse
+		if errors.As(err, &responseErr) && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound {
+			issue, _, readErr := g.client.Issues.Get(ctx, slug.owner, slug.repo, num)
+			if readErr == nil && issue != nil && issue.GetNumber() == num {
+				present := false
+				for _, label := range issue.Labels {
+					if label != nil && label.Name == name {
+						present = true
+						break
+					}
+				}
+				if !present {
+					continue
+				}
+			}
 		}
+		return g.wrapErr(fmt.Sprintf("update issue labels: remove %q", name), err)
 	}
-	for _, a := range add {
-		target[a] = struct{}{}
-	}
-	// No-op: a card move that changes nothing must issue ZERO PUTs (D3).
-	if sameNameSet(current, target) {
-		return nil
-	}
-	names := make([]string, 0, len(target))
-	for name := range target {
-		names = append(names, name)
-	}
-	if _, _, err := g.client.Issues.ReplaceLabelsForIssue(ctx, slug.owner, slug.repo, num, names); err != nil {
-		return g.wrapErr("update issue labels", err)
+	if len(add) > 0 {
+		if _, _, err := g.client.Issues.AddLabelsToIssue(ctx, slug.owner, slug.repo, num, add); err != nil {
+			return g.wrapErr("update issue labels: add", err)
+		}
 	}
 	return nil
 }

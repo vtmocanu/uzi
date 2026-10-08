@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Completed guarded recovery can settle after attributed clone parents disappear ([#2433](https://github.com/vtmocanu/uzi/issues/2433)).**
+  After loss of the runner tree, verified absence of an attributed clone's parent directories no longer blocks archive-backed FINAL for a completed run with a valid durable capture; once FINAL is acknowledged, replay can retire its pending terminal journal. Discarded holds (#2417) and unresolved initial clone survival remain outside this fix.
+
 - **Empty pre-clone terminal claims settle guarded custody ([#2469](https://github.com/vtmocanu/uzi/issues/2469)).**
   A confirmed forge-park cap failure or cancellation releases its exact-generation hold after positive evidence that no source was adopted. Lost acknowledgements require a matching terminal ownership generation; stale or unknown claims and retained source keep their custody protection.
 
@@ -54,6 +57,11 @@ through `[0.52.0]`.)
 
 - **Exhausted worker recovery waits for the owner instead of discarding recorded recovery evidence ([#2394](https://github.com/vtmocanu/uzi/issues/2394)).**
   At the automatic worker-death cap, recorded checkpoint/capture evidence, pending publication/capture, unresolved source custody or unknown server evidence holds the run for owner Resume or Cancel; no recorded recovery evidence or unresolved custody keeps `worker_lost`, without proving absence of unrecorded worker work. Resume queues one explicit attempt and starts a recovery episode with the current `RUN_MAX_REQUEUES` automatic allowance; 0 grants none. Lifetime charged counts and generation-proven readoption refunds survive, the existing wall budget is preserved, and the #1742 once-per-run extra allowance remains initial-episode only. CLI and the full run page show per-episode counts and historical evidence with honest availability/latest-edit caveats; default CLI wait stops for this decision, while explicit `--until` keeps its status set. Shared board cards direct readers to open the run for the cause. Timer, credential, vault and ordinary input events do not release or renew the hold, and capture expiry does not fail or promote it. Question caps and deadlines reset on fresh executor execution. The `N+1` worker-death attempt contribution (`N = RUN_MAX_REQUEUES`, initial `N+2` with the positive-cap #1742 extra) and corresponding question-budget multipliers apply only with no other fresh executor execution. Ordinary transient/limit/credential redispatch can reset worker-memory question budgets within the same episode without changing its number or charged `requeue_count`; the allowance bounds charged worker-death retries, not total attempts or questions per episode or lifetime. This clarification introduces no runtime budget. Multi-run workers use the existing generic chart route `api.config.RUN_MAX_REQUEUES` (default 3; sizing example 5), with no new knob. Neither a hold nor its historical evidence guarantees an export or recovery of the latest local edits. **Downgrade note:** deliberately rolling migration 00309 back fails exhaustion holds as `worker_lost`, preserving recovery sources and custody under the prior recovery lifecycle. Owner exhaustion Resume and removed episode history are unavailable after downgrade; reapplying Up does not undo those failures. Stop or replace the newer application before Down, whose table alterations and constraint validation can lock and scan runs. See [the downgrade procedure](docs/run-recovery-wait.md#deliberate-schema-downgrade).
+
+### Fixed
+
+- **Removed dispatch labels stay removed ([#2441](https://github.com/vtmocanu/uzi/issues/2441)).**
+  GitHub sweep dispatches no longer restore a removed selector label during another label write. Stale board moves and label additions keep removed labels absent while preserving unrelated current labels in the issues cache.
 
 ## [0.86.0] - 2026-10-06
 
