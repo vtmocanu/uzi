@@ -957,6 +957,11 @@ describe("#2493 initial credential release", () => {
           return release(...args);
         };
         const log = recordingLog();
+        const launch = rig.deps.launchProviderRoot!;
+        rig.deps = { ...rig.deps, launchProviderRoot: async (spec, mode) => {
+          assert.ok(log.added.includes(FRESH_TOKEN), "released token registered before provider launch/login");
+          return launch(spec, mode);
+        } };
         await makeExecutor(rig, binding(), log.log).run(makeCtx().ctx);
         assert.equal(calls, 2, "retry classifier permits temporary release faults");
         assert.equal(rig.providerLaunches(), 1);
@@ -1237,7 +1242,7 @@ describe("#2493 initial credential release", () => {
     }
   }
 
-  for (const stop of ["shutdown", "cancel"] as const) {
+  for (const stop of ["shutdown", "cancel", "owed-limit"] as const) {
   it(`declined runner pause then ${stop} aborts real HTTP release backoff`, async () => {
     const api = new FakeApi("shutdown-release-worker");
     const url = await api.listen();
@@ -1261,7 +1266,13 @@ describe("#2493 initial credential release", () => {
     const original = executor.run.bind(executor);
     let releaseError: unknown;
     let terminal: AbortSignal | undefined;
+    let checkpoint: RunContext["checkpoint"];
+    let worktree = "";
+    let pauseSignal: AbortSignal | undefined;
     executor.run = async ctx => {
+      checkpoint = ctx.checkpoint;
+      worktree = ctx.worktreePath;
+      pauseSignal = ctx.signal;
       api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
       await waitFor(() => ctx.signal!.aborted, "runner owner pause");
       assert.ok(ctx.signal!.reason instanceof PauseNowSignal);
@@ -1272,7 +1283,8 @@ describe("#2493 initial credential release", () => {
       await waitFor(() => ctx.pauseModeRequested!() === null, "runner clears declined pause");
       try { return await original(ctx); } catch (e) { releaseError = e; throw e; }
     };
-    const runner = new RunRunner(client, new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions()),
+    const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    const runner = new RunRunner(client, git,
       () => ({ executor, homeDir }), noopLog, 20, undefined, {
         pollMs: 5, recoveryRetryMs: 5,
         quiesceRun: async () => ({
@@ -1285,16 +1297,28 @@ describe("#2493 initial credential release", () => {
       await waitFor(() => api.codexRequests.length === 1, "real HTTP release entered", 10000);
       await tick(); await tick();
       assert.equal(terminal?.aborted, false, "release backoff is still live before terminal stop");
+      assert.equal(pauseSignal?.aborted, true, "declined pause already spent the attempt signal");
+      assert.ok(pauseSignal?.reason instanceof PauseNowSignal);
       if (stop === "shutdown") runner.shutdown();
-      else api.appendInputs(claim.run_id, [{ id: 3, kind: "cancel" }]);
+      else if (stop === "owed-limit") {
+        commitInTree(worktree, "OWED.txt", "owed-limit checkpoint work\n");
+        git.fetchAgentBranch = async () => ({ kind: "not_updated", reason: "owed_limit" });
+        await checkpoint!({ reap: false });
+        assert.equal(terminal?.aborted, true, "owed-limit checkpoint aborts the stable lifecycle");
+      } else api.appendInputs(claim.run_id, [{ id: 3, kind: "cancel" }]);
       await withTimeout(execution, 10000, `runner ${stop}`);
-      assert.ok(releaseError instanceof CodexRequestFailure, "shutdown cancels initial release");
+      assert.ok(releaseError instanceof CodexRequestFailure, "terminal stop cancels initial release");
       assert.equal(releaseError.kind, "parent_abort", "runner terminal wiring bypasses spent pause signal");
       assert.equal(terminal?.aborted, true);
       assert.equal(api.codexRequests.length, 1);
       assert.equal(rig.providerLaunches(), 0);
       if (stop === "shutdown") assert.ok(!api.states.some(s => s.body.status === "failed"));
-      else assert.ok(api.inputReceiptCalls.some(r => r.kind === "ack" && r.ids.includes(3)),
+      else if (stop === "owed-limit") {
+        const failed = api.states.filter(s => s.body.status === "failed");
+        assert.equal(failed.length, 1);
+        assert.match(failed[0]?.body.failure_reason ?? "", /owed-head limit/);
+        assert.ok(!api.states.some(s => s.body.status === "recovery_wait"), "terminal refusal is not release exhaustion");
+      } else assert.ok(api.inputReceiptCalls.some(r => r.kind === "ack" && r.ids.includes(3)),
         "production steering received the owner cancel");
     } finally {
       runner.shutdown();

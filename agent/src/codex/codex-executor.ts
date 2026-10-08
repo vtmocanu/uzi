@@ -839,7 +839,7 @@ export class CodexCredentialDeferredError extends Error {
 }
 
 /** Epoch-start release retries exhausted; the runner retains custody and parks credential-free. */
-export class CodexInitialCredentialUnavailableError extends Error {
+class CodexInitialCredentialUnavailableError extends Error {
   readonly deferral = "credential_release_unavailable" as const;
   constructor() {
     super("Codex initial credential release is temporarily unavailable");
