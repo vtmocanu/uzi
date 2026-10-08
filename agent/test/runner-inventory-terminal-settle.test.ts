@@ -108,7 +108,9 @@ it("completed guarded run settles its persisted terminal after loss of attribute
       outcome: open ? "retained" : "settled",
     });
   });
-  workerId = (await client.register("test")).worker_id;
+  const registration = await client.register("test");
+  assert.ok(registration.worker_id, "registration returns a worker identity");
+  workerId = registration.worker_id;
   assert.equal(client.hasFeature("terminal_rejection_report"), true);
   const bare = await git.ensureClone(fx.originPath);
   const attemptId = mintAttemptId(generation);
