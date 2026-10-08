@@ -457,6 +457,37 @@ test("discard refuses malformed or changed run pin identity before deleting any 
   }
 });
 
+test("capture replaces only its own symbolic pin without updating the unrelated target", async () => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  const parent = git(bare, ["rev-parse", tip + "^"]);
+  const target = "refs/keep/capture-target";
+  const pin = "refs/uzi-recovery-episode/" + runId + "/" + tip;
+  git(bare, ["update-ref", target, parent]);
+  git(bare, ["symbolic-ref", pin, target]);
+  await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+  assert.equal(git(bare, ["rev-parse", target]), parent);
+  assert.equal(git(bare, ["rev-parse", pin]), tip);
+  assert.throws(() => git(bare, ["symbolic-ref", pin]));
+  assert.equal(journal().recovery.stage, "captured");
+});
+
+test("discard rejects symbolic pins before touching unrelated targets or attribution", async () => {
+  const { expected, tip } = await ready();
+  const before = journal();
+  const good = "refs/uzi-recovery-episode/" + runId + "/" + tip;
+  const parent = git(bare, ["rev-parse", tip + "^"]);
+  const target = "refs/keep/discard-target";
+  const symbolic = "refs/uzi-recovery-episode/" + runId + "/" + parent;
+  git(bare, ["update-ref", target, parent]);
+  git(bare, ["symbolic-ref", symbolic, target]);
+  await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /pin identity/);
+  assert.deepEqual(journal(), before);
+  assert.equal(git(bare, ["rev-parse", good]), tip);
+  assert.equal(git(bare, ["rev-parse", target]), parent);
+  assert.equal(git(bare, ["symbolic-ref", symbolic]), target);
+});
+
 test("explicit owner discard keeps paths intact and per-key attempt mode outlives cleared journal", async () => {
   assert.equal(await cache.recoveryAttemptMode(fx.originPath, key), false);
   const { expected, tip } = await ready();

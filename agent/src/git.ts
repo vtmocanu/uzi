@@ -4413,7 +4413,7 @@ export class GitCache {
       await this.runGit(barePath, ["rev-list", "--objects", "--missing=error", tip]);
       const sourceHead = (await this.runGitAsRunner(expected.clonePath, ["rev-parse", "HEAD"])).trim();
       if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
-      await this.runGit(barePath, ["update-ref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
+      await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
       if (!await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
       await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,
         recovery: { ...recovery, restoreTip: tip, stage: "captured" } });
@@ -4529,16 +4529,16 @@ export class GitCache {
       // superseded tips and pins created before a failed journal write. Validate the
       // complete snapshot before deleting anything; sibling run namespaces are excluded.
       const prefix = `refs/uzi-recovery-episode/${journal.runId}/`;
-      const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", prefix]);
+      const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", prefix]);
       const pins = listing.trim().split("\n").filter(Boolean).map(line => {
-        const [ref, oid, extra] = line.split(" ");
+        const [ref, oid, symref, extra] = line.split("\0");
         const tip = ref?.startsWith(prefix) ? ref.slice(prefix.length) : "";
-        if (ref === undefined || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
+        if (ref === undefined || symref !== "" || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
         return { ref, tip };
       });
       // One attempt per enumerated pin, no retries. The first failed delete stops
       // cleanup and keeps the journal; a later explicit discard can retry remaining pins.
-      for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "-d", ref, tip]);
+      for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "--no-deref", "-d", ref, tip]);
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
     });
   }
