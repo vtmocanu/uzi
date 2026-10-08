@@ -273,9 +273,16 @@ func TestRecoveryReconcileRouteLiveDB(t *testing.T) {
 	if rec := call(string(b), foreignToken); rec.Code != http.StatusForbidden {
 		t.Fatalf("foreign original ownership = %d: %s", rec.Code, rec.Body.String())
 	}
-	cliMustExec(t, e.pool, "UPDATE recovery_custody_holds SET live_worker_id=$2 WHERE id=$1", e.holdID, foreign)
-	checkRetained("hold_not_original_worker")
-	cliMustExec(t, e.pool, "UPDATE recovery_custody_holds SET live_worker_id=$2 WHERE id=$1", e.holdID, e.worker.ID)
+	// Guarded inventory cannot be adopted: assert the trigger rejected the
+	// reassignment rather than treating an unchanged hold as foreign custody.
+	adoption, err := e.pool.Exec(e.ctx, "UPDATE recovery_custody_holds SET live_worker_id=$2 WHERE id=$1", e.holdID, foreign)
+	if err != nil || adoption.RowsAffected() != 0 {
+		t.Fatalf("guarded adoption: rows=%d err=%v", adoption.RowsAffected(), err)
+	}
+	var liveWorker uuid.UUID
+	if err := e.pool.QueryRow(e.ctx, "SELECT live_worker_id FROM recovery_custody_holds WHERE id=$1", e.holdID).Scan(&liveWorker); err != nil || liveWorker != e.worker.ID {
+		t.Fatalf("guarded adoption changed custody: worker=%s err=%v", liveWorker, err)
+	}
 	for i := 0; i < 2; i++ {
 		rec := call(string(b), token)
 		var out apitypes.RecoveryReconcileResponse

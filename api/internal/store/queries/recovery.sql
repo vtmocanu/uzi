@@ -841,10 +841,12 @@ WHERE h.run_id = @run_id AND h.generation = @generation AND h.live_worker_id = @
   AND NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id);
 
 -- name: GetFinalInventoryHold :one
+-- Serialize custody writers while permitting the upload's hold_id FK KEY SHARE
+-- recheck after BindCaptureManifest and MarkCaptureReady in the stream transaction.
 SELECT * FROM recovery_custody_holds
 WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_id::uuid
   AND generation = @generation
-ORDER BY id LIMIT 1 FOR UPDATE;
+ORDER BY id LIMIT 1 FOR NO KEY UPDATE;
 
 -- name: GetFinalInventoryCapture :one
 SELECT * FROM recovery_captures
