@@ -161,7 +161,11 @@ apipost() { fail "unexpected custody write"; }
 apidelete() { fail "unexpected custody discard"; }
 db_psql() {
   [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail "unexpected custody SQL mutation"
-  apiget /api/recovery/holds
+  if [[ "$1" == *json_agg* ]]; then
+    apiget /api/recovery/holds | jq -sc '[.[] | if type=="array" then .[] else . end]'
+  else
+    apiget /api/recovery/holds | jq -c 'if type=="array" then .[] else . end'
+  fi
 }
 custody_case() {
   cases=$((cases + 1))
@@ -211,6 +215,7 @@ park_fixture() {
         elif $step=="promoted" then .run_status="queued"
         elif $step=="legacy" then .+{inventory_guarded:false,state:"released",release_evidence:"no_adopted_source"}
         elif $step=="legacy-open" then .inventory_guarded=false
+        elif $step=="duplicate" then [., .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_park:true}]
         else . end' >> "$SEQ_DIR/seq"
   done
 }
@@ -232,6 +237,8 @@ park_fixture legacy-open
 custody_case "legacy open hold cannot wait to pass" fail "did not atomically release" wait_forge_park_release R 1 2
 printf '\n' > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
 custody_case "missing exact hold fails closed" fail "missing receipt" wait_forge_park_release R 1 2
+park_fixture duplicate
+custody_case "two matching holds cannot mask the open first row" fail "expected exactly one hold" wait_forge_park_release R 1 2
 
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
@@ -243,6 +250,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 40 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 41 cases green; a zero-case or
 # partially-red run must exit nonzero.
 [ "$cases" -ge 40 ] && [ "$cases" -eq "$passed" ]

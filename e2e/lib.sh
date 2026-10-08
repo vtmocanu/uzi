@@ -437,12 +437,14 @@ wait_custody_headroom() {
 wait_forge_park_release() {
   local run="$1" generation="$2" timeout="${3:-10}" start=$SECONDS snapshot
   while :; do
-    snapshot="$(db_psql "SELECT json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
+    snapshot="$(db_psql "SELECT COALESCE(json_agg(json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
       'generation',h.generation,'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
-      'after_park',h.released_at >= r.claim_released_at,'run_status',r.status,'claim_generation',r.claim_generation)::text
+      'after_park',h.released_at >= r.claim_released_at,'run_status',r.status,'claim_generation',r.claim_generation)), '[]'::json)::text
       FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
       WHERE h.run_id='$run' AND h.generation=$generation")"
-    [ -n "$snapshot" ] || fail "forge park changed run/generation or lost hold: missing receipt"
+    printf '%s' "$snapshot" | jq -e 'type=="array" and length==1' >/dev/null \
+      || fail "forge park expected exactly one hold (missing receipt or duplicate): $snapshot"
+    snapshot="$(printf '%s' "$snapshot" | jq -c '.[0]')"
     printf '%s' "$snapshot" | jq -e --argjson gen "$generation" \
       '.generation==$gen and .claim_generation==$gen and .run_status=="recovery_wait"' >/dev/null \
       || fail "forge park changed run/generation or lost hold: $snapshot"
