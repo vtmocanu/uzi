@@ -3,15 +3,18 @@ package apitypes
 // CrossCheckPinDTO keeps stored pins separate from resolved family defaults.
 // ResolvedModel is null when the inactive Claude cell inherits the SDK model.
 type CrossCheckPinDTO struct {
-	Stage          string  `json:"stage"`
-	Harness        string  `json:"harness"`
-	Model          *string `json:"model"`
-	Effort         *string `json:"effort"`
-	ResolvedModel  *string `json:"resolved_model"`
-	ResolvedEffort string  `json:"resolved_effort"`
-	ModelSource    string  `json:"model_source"`
-	EffortSource   string  `json:"effort_source"`
-	Active         bool    `json:"active"`
+	Stage   string  `json:"stage"`
+	Harness string  `json:"harness"`
+	Model   *string `json:"model"`
+	Effort  *string `json:"effort"`
+	// WorkerDefaultModel resolves this cell without checker pins from the same read snapshot.
+	// Null delegates model selection to the Claude SDK/account.
+	WorkerDefaultModel *string `json:"worker_default_model"`
+	ResolvedModel      *string `json:"resolved_model"`
+	ResolvedEffort     string  `json:"resolved_effort"`
+	ModelSource        string  `json:"model_source"`
+	EffortSource       string  `json:"effort_source"`
+	Active             bool    `json:"active"`
 }
 
 // UserSettingsDTO mirrors the handler's own (unexported) userSettingsDTO for the

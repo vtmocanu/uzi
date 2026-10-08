@@ -5,6 +5,7 @@
       "harness": "x",
       "model": "x",
       "effort": "x",
+      "worker_default_model": "x",
       "resolved_model": "x",
       "resolved_effort": "x",
       "model_source": "x",

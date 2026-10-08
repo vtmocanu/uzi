@@ -103,13 +103,13 @@ const SEED_USER_SETTINGS: UserSettings = {
 if (mockScenario() === "cross-check-mixed") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "codex", model: "gpt-6-sol", effort: null,
-      resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
   ];
 }
 if (mockScenario() === "cross-check-dormant-claude") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "claude", model: "sonnet", effort: "max",
-      resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: false },
+      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: false },
   ];
 }
 const SEED_APP_SETTINGS: AppSettings = {
@@ -491,7 +491,7 @@ function mySettingsResponse(): { settings: UserSettings } {
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
       : userSettings.default_codex_model ?? "gpt-6.1-sol";
     const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
-    return { stage: "plan", harness, model, effort, resolved_model: model ?? workerModel,
+    return { stage: "plan", harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
       resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
       effort_source: effort === null ? "worker default" : "pin", active: harness === "codex" };
   });
@@ -1156,8 +1156,7 @@ export const settingsApi = {
         if (seen.has(harness)) throw new ApiError(400, `${name}: duplicate cell`);
         seen.add(harness);
         const previous = pins.find(p => p.harness === harness);
-        const pin: CrossCheckPinDTO = previous ?? { stage: "plan", harness, model: null, effort: null,
-          resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex" };
+        const pin: CrossCheckPinDTO = previous ?? { stage: "plan", harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex" };
         for (const field of ["model", "effort"] as const) {
           if (!(field in cell)) continue;
           const value = cell[field];

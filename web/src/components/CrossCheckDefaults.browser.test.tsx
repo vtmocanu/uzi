@@ -13,15 +13,15 @@ const settings: UserSettings = {
   theme: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null,
   cross_check_pins: [
     { stage: "plan", harness: "claude", model: "custom-claude-checker", effort: "max",
-      resolved_model: "custom-claude-checker", resolved_effort: "max", model_source: "pin", effort_source: "pin", active: false },
+      worker_default_model: "allocated-custom-model", resolved_model: "custom-claude-checker", resolved_effort: "max", model_source: "pin", effort_source: "pin", active: false },
     { stage: "plan", harness: "codex", model: "custom-codex-checker", effort: null,
-      resolved_model: "custom-codex-checker", resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+      worker_default_model: "gpt-6.1-sol", resolved_model: "custom-codex-checker", resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
   ],
 };
 
 it.each([390, 1100])("keeps one accessible Plan row in aligned checker columns at %ipx", async width => {
   await page.viewport(width, 900);
-  render(<div className="p-4"><CrossCheckDefaults settings={settings} userId="me" onSaved={() => {}} /></div>);
+  render(<div className="p-4"><CrossCheckDefaults settings={settings} onSaved={() => {}} /></div>);
   const table = screen.getByRole("table", { name: "Cross-check defaults" });
   expect(within(table).getAllByRole("row")).toHaveLength(2);
   const claude = screen.getByLabelText("Claude checker model");

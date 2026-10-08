@@ -135,6 +135,7 @@ export interface CrossCheckPinDTO {
   harness: Harness;
   model: string | null;
   effort: string | null;
+  worker_default_model: string | null;
   resolved_model: string | null;
   resolved_effort: string;
   model_source: "pin" | "worker default";

@@ -1159,7 +1159,7 @@ func TestUserSettingsDTOTags(t *testing.T) {
 func TestCrossCheckPinDTOTags(t *testing.T) {
 	assertTags(t, "CrossCheckPinDTO", CrossCheckPinDTO{},
 		"stage", "harness", "model", "effort", "resolved_model", "resolved_effort",
-		"model_source", "effort_source", "active")
+		"model_source", "effort_source", "active", "worker_default_model")
 }
 
 func TestPlanCrossCheckSummaryDTOTags(t *testing.T) {

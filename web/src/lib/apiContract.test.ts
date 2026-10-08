@@ -24,6 +24,7 @@ import type {
   AdminUsage,
   SelfUsage,
   UserSettings,
+  CrossCheckPinDTO,
   CatalogEntry,
   AdminCliToken,
   Board,
@@ -133,6 +134,7 @@ import brandingZero from "../../../fixtures/api-contract/branding.zero.json";
 import brandingFull from "../../../fixtures/api-contract/branding.full.json";
 import chatZero from "../../../fixtures/api-contract/chat.zero.json";
 import chatFull from "../../../fixtures/api-contract/chat.full.json";
+import metadataCorpus from "../../../fixtures/api-contract/cross_check_metadata.behavior.json";
 import agentTemplateZero from "../../../fixtures/api-contract/agent_template.zero.json";
 import agentTemplateFull from "../../../fixtures/api-contract/agent_template.full.json";
 import schedulePauseZero from "../../../fixtures/api-contract/schedule_pause.zero.json";
@@ -745,6 +747,27 @@ void _buildInfoFull;
   void _userSettingsZero;
   void _userSettingsFull;
 }
+
+// Nested members must match the Go recorder, including required nullable metadata.
+{
+  type RecordedCell = typeof userSettingsFull.cross_check_pins[number];
+  const missing: never = null as unknown as Exclude<keyof CrossCheckPinDTO, keyof RecordedCell>;
+  const extra: never = null as unknown as Exclude<keyof RecordedCell, keyof CrossCheckPinDTO>;
+  const nullable: CrossCheckPinDTO["worker_default_model"] = null;
+  // @ts-expect-error metadata is required even when its value is null
+  const absent: CrossCheckPinDTO = { stage: "plan", harness: "claude", model: null, effort: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false };
+  void missing; void extra; void nullable; void absent;
+}
+it("recorded nested checker metadata always has the nullable member", () => {
+  expect(metadataCorpus.some(c => c.get_cross_check_pins.some(p => p.worker_default_model === null))).toBe(true);
+  for (const fixture of [userSettingsFull, settingsUserSettingsFull, ...metadataCorpus.map(c => ({ cross_check_pins: c.get_cross_check_pins }))]) {
+    expect(fixture.cross_check_pins.length).toBeGreaterThan(0);
+    for (const cell of fixture.cross_check_pins) {
+      expect(Object.prototype.hasOwnProperty.call(cell, "worker_default_model")).toBe(true);
+      expect(cell.worker_default_model === null || typeof cell.worker_default_model === "string").toBe(true);
+    }
+  }
+});
 
 // ── Codex account rate limits (PRD #1209) ───────────────────────────────────
 // The per-account meter and its admin row. ZeroOf exemptions: aliases + buckets on the

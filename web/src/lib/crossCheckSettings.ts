@@ -1,4 +1,4 @@
-import type { AgentTemplate, Harness, TemplateAllocation } from "./apiTypes";
+import type { Harness } from "./apiTypes";
 import { modelFieldWarning } from "./agentTemplates";
 
 export function normalizeCheckerValue(value: string): string {
@@ -17,15 +17,4 @@ export function checkerModelWarning(model: string, harness: Harness): string {
     ? ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"]
     : ["opus", "sonnet", "haiku", "fable"];
   return otherFamily.includes(value) ? "Choose a model from the checker's model family." : "";
-}
-
-// Match ListClaimAgentTemplates: shared-name precedence applies even when the
-// shared row is unallocated. The first delivered lead stops resolution, including null.
-export function inheritedClaudeModel(templates: AgentTemplate[], allocations: TemplateAllocation[], userId: string): string | null {
-  const sharedNames = new Set(templates.filter(t => t.scope !== "user").map(t => t.name));
-  const delivered = new Set(allocations.filter(t => t.effective).map(t => t.id));
-  return templates.filter(t => delivered.has(t.id) &&
-    (t.scope !== "user" || (t.user_id === userId && !sharedNames.has(t.name))))
-    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
-    .find(t => /^(lead|orchestrator)$/i.test(t.name))?.model ?? null;
 }

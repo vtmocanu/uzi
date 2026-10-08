@@ -182,6 +182,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 			t.Fatal(err)
 		}
+		metadataCells(t, rec)
 		if len(response.Settings.Pins) != 2 {
 			t.Fatalf("cells: %+v", response)
 		}
@@ -220,6 +221,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 		t.Fatal("Default did not follow updated lane")
 	}
 	for _, body := range []string{
+		`{"cross_check_pins":[{"stage":"plan","harness":"claude","worker_default_model":null}]}`,
 		`{"cross_check_pins":null}`, `{"cross_check_pins":{}}`,
 		`{"cross_check_pins":[{"stage":"code","harness":"codex"}]}`,
 		`{"cross_check_pins":[{"stage":"plan","harness":"other"}]}`,

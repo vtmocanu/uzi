@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import corpus from "../../../fixtures/api-contract/cross_check_metadata.behavior.json";
 import type { UserSettingsPatch } from "../lib/apiTypes";
 
 async function fresh() {
@@ -13,6 +14,33 @@ beforeEach(() => {
   window.history.replaceState({}, "", "/");
 });
 afterEach(() => { vi.resetModules(); vi.doUnmock("./data"); });
+
+describe("Go-recorded metadata corpus through public mock GET/PUT", () => {
+  const tested = new Set<string>();
+  it.each(corpus)("matches both complete cells for $name", async entry => {
+    vi.doMock("./data", async importActual => {
+      const actual = await importActual<typeof import("./data")>();
+      const owner = actual.mockUsers.find(u => u.email === "vlad@uzi.local")!.id;
+      return { ...actual, mockTemplates: (entry.templates ?? []).map((t, i) => ({
+        ...actual.mockTemplates[0], id: `corpus-${i}`, name: t.name, scope: t.scope,
+        model: t.model, user_id: t.scope === "user" ? (t.foreign ? "foreign-owner" : owner) : null,
+      })) };
+    });
+    const api = await fresh();
+    await api.setTemplateAllocations({ global_default_ids: [], my_overrides: (entry.templates ?? []).map((t, i) => ({ template_id: `corpus-${i}`, enabled: t.allocated })) });
+    await api.putMySettings({ default_harness: "claude", default_claude_model: entry.default_claude_model,
+      default_codex_model: entry.default_codex_model, default_effort: null, default_codex_effort: null });
+    const before = (await api.getMySettings()).settings.cross_check_pins!;
+    expect(before).toEqual(entry.get_cross_check_pins);
+    const after = (await api.putMySettings(entry.put as UserSettingsPatch)).settings.cross_check_pins!;
+    expect(after).toEqual(entry.put_cross_check_pins);
+    for (const cells of [before, after]) for (const cell of cells) expect(Object.prototype.hasOwnProperty.call(cell, "worker_default_model")).toBe(true);
+    tested.add(entry.name);
+  });
+  it("exercises every recorded case", () => {
+    expect([...tested].sort()).toEqual(corpus.map(c => c.name).sort());
+  });
+});
 
 describe("mock checker pins", () => {
   it("resolves two independent cells afresh, resets one field, and persists only stored overrides", async () => {
@@ -28,15 +56,31 @@ describe("mock checker pins", () => {
     ] });
     await api.putMySettings({ default_claude_model: "haiku", default_codex_model: "worker-codex", default_codex_effort: "xhigh" });
     cells = (await api.getMySettings()).settings.cross_check_pins!;
-    expect(cells.find(p => p.harness === "claude")).toMatchObject({ model: "custom-claude", effort: "max", resolved_model: "custom-claude", active: false });
-    expect(cells.find(p => p.harness === "codex")).toMatchObject({ resolved_model: "custom-codex", resolved_effort: "xhigh", effort_source: "worker default" });
+    expect(cells.find(p => p.harness === "claude")).toMatchObject({ model: "custom-claude", effort: "max", worker_default_model: "haiku", resolved_model: "custom-claude", active: false });
+    expect(cells.find(p => p.harness === "codex")).toMatchObject({ worker_default_model: "worker-codex", resolved_model: "custom-codex", resolved_effort: "xhigh", effort_source: "worker default" });
     cells[0].model = "mutated-return";
     expect((await api.getMySettings()).settings.cross_check_pins![0].model).toBe("custom-claude");
     await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "codex", model: null, effort: "high" }] });
     api = await fresh();
-    expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({ model: null, effort: "high", resolved_model: "worker-codex", model_source: "worker default" });
+    expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({ model: null, effort: "high", worker_default_model: "worker-codex", resolved_model: "worker-codex", model_source: "worker default" });
     await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "codex", effort: "  " }] });
     expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({ model: null, effort: null, resolved_effort: "xhigh" });
+  });
+
+  it("recomputes metadata on GET and PUT despite poisoned persisted metadata", async () => {
+    let api = await fresh();
+    await api.putMySettings({ default_claude_model: "haiku", default_codex_model: "worker-codex",
+      cross_check_pins: [{ stage: "plan", harness: "claude", model: "sonnet" }, { stage: "plan", harness: "codex", model: "custom-codex" }] });
+    const blob = JSON.parse(localStorage.getItem("uzi.mock.v4")!);
+    for (const cell of blob.userSettings.cross_check_pins) cell.worker_default_model = "persisted-lie";
+    localStorage.setItem("uzi.mock.v4", JSON.stringify(blob));
+    api = await fresh();
+    for (const response of [await api.getMySettings(), await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "claude", effort: "max" }] })]) {
+      expect(response.settings.cross_check_pins).toEqual([
+        expect.objectContaining({ harness: "claude", worker_default_model: "haiku", resolved_model: "sonnet" }),
+        expect.objectContaining({ harness: "codex", worker_default_model: "worker-codex", resolved_model: "custom-codex" }),
+      ]);
+    }
   });
 
   it("preserves simultaneous model-only and effort-only patches and Go whitespace normalization", async () => {
@@ -59,6 +103,8 @@ describe("mock checker pins", () => {
   it.each([
     null, {}, [null], [{ stage: "code", harness: "codex" }], [{ stage: "plan", harness: "other" }],
     [{ stage: "plan", harness: "codex", resolved_model: "bad" }],
+    [{ stage: "plan", harness: "claude", worker_default_model: null }],
+    [{ stage: "plan", harness: "codex", worker_default_model: "bad" }],
     [{ stage: "plan", harness: "codex" }, { stage: "plan", harness: "codex" }],
     Array.from({ length: 3 }, () => ({ stage: "plan", harness: "claude" })),
   ])("rejects malformed list %j without changing worker fields", async list => {
