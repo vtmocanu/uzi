@@ -628,6 +628,60 @@ for mode in archive-lost archive-changed; do
   custody_case "fixture decision detects $mode evidence" fail 'changed an available archive' fixture_owner_decision "$mode"
 done
 
+fixture_archive_receipt() {
+  local mode="$1" fixture_id=b4dec5cf-e6d4-413b-b3a8-0005a2835770
+  local ADMIN_EMAIL=fixture@example.com n=0
+  # shellcheck disable=SC2034  # read by the extracted real helper on timeout
+  local COMPOSE=(fixture_agent_log)
+  fixture_agent_log() { echo 'recreated agent log tail'; }
+  echo 0 > "$SEQ_DIR/receipt-polls"
+  apiget() {
+    case "$1" in
+      /api/recovery/holds) jq -nc --arg run "$UUID" --arg id "$fixture_id" --arg mode "$mode" \
+        '{holds:[{id:$id,run_id:$run,generation:1,state:"open",inventory_guarded:true,attention:"source_only",
+          has_available_capture:true,capture_state:(if $mode=="preparing" then "preparing" else "available" end)}]}' ;;
+      "/api/runs/$UUID/archives") echo '{"archives":[{"id":"kept","state":"available","checksum":"stable","byte_size":12}]}' ;;
+      "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
+      *) fail 'unexpected fixture receipt route' ;;
+    esac
+  }
+  uzi_cli() { fail 'captured hold must never be discarded'; }
+  db_psql() {
+    [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unexpected receipt SQL mutation'
+    n="$(cat "$SEQ_DIR/receipt-polls")"
+    echo $((n + 1)) > "$SEQ_DIR/receipt-polls"
+    jq -nc --arg run "$UUID" --arg id "$fixture_id" --arg mode "$mode" --argjson n "$n" '
+      {run_id:$run,run_status:"cancelled",holds:[{id:$id,run_id:$run,generation:1,inventory_guarded:true,
+        state:"open",final_disposition:null,release_evidence:null,captures:[{state:"available"}],
+        worker:{last_heartbeat_at:"fixture-heartbeat",updated_at:"fixture-register"}}]}
+      | if $n>0 and $mode!="timeout" then .holds[0] += {state:"released",final_disposition:"archive",release_evidence:"archive",archive_matches:true} else . end
+      | if $n>0 and $mode=="discarded" then .holds[0].state="discarded"
+        elif $n>0 and $mode=="no-proof" then .holds[0].archive_matches=false
+        elif $n>0 and $mode=="wrong-id" then .holds[0].id="changed"
+        else . end'
+  }
+  if [ "$mode" = timeout ]; then
+    local output
+    if output="$(resolve_fixture_source_hold "$UUID" 1 2 '2026-10-08T09:08:20Z' 2>&1)"; then
+      fail 'captured fixture unexpectedly settled'
+    fi
+    [[ "$output" == *'restore_at=2026-10-08T09:08:20Z'* && "$output" == *'fixture-heartbeat'* \
+      && "$output" == *'fixture-register'* && "$output" == *'"captures"'* \
+      && "$output" == *'recreated agent log tail'* && "$output" == *'receipt timeout'* ]] \
+      || fail "timeout diagnostic omitted evidence: $output"
+    printf '%s\n' "$output"
+    return 1
+  fi
+  resolve_fixture_source_hold "$UUID" 1 2 '2026-10-08T09:08:20Z'
+  [ "$(cat "$SEQ_DIR/receipt-polls")" -ge 2 ] || fail 'receipt returned before archive release'
+}
+custody_case "captured fixture waits for exact archive FINAL without discard" pass 'fixture archive custody receipt:' fixture_archive_receipt released
+custody_case "captured fixture refuses mid-wait discard" fail 'unexpected disposition' fixture_archive_receipt discarded
+custody_case "captured fixture requires matching archive proof" fail 'lacks archive proof' fixture_archive_receipt no-proof
+custody_case "captured fixture preserves exact hold identity" fail 'changed identity' fixture_archive_receipt wrong-id
+custody_case "captured fixture timeout retains row worker and recreation log" fail 'recreated agent log tail' fixture_archive_receipt timeout
+custody_case "preparing fixture fails immediately" fail 'not a capture-less owner decision' fixture_archive_receipt preparing
+
 # Execute the actual owning phase boundaries against the real owner helper. The
 # nine-hold fixture includes the completed outage case, which must remain open.
 fixture_phase_boundary() {
@@ -637,6 +691,8 @@ fixture_phase_boundary() {
   local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
   # shellcheck disable=SC2034  # read by the extracted owning phase statements
   local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3
+  # shellcheck disable=SC2034  # read by the extracted phase-42 boundary
+  local RA_RESTORE_AT=2026-10-08T09:08:20Z
   echo '{"holds":[]}' > "$SEQ_DIR/boundary-holds"
   for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1"; do
     run="${entry%:*}"; gen="${entry##*:}"; n=$((n + 1))
@@ -684,6 +740,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 115 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 121 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 115 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 121 ] && [ "$cases" -eq "$passed" ]

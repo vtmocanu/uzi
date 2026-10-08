@@ -368,6 +368,7 @@ unset UZI_ACTIVE_SNAPSHOT_DISABLED UZI_E2E_MAX_CONCURRENT_RUNS UZI_E2E_DROP_ON_S
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login
+RA_RESTORE_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
 pass "api + agent recreated back to their defaults"
@@ -387,7 +388,7 @@ settle_runs_terminal 45 "${E:-}" "${G:-}" "${EA:-}" "${GA:-}" "${X:-}" "${ED:-}"
 wait_status "$X" cancelled
 wait_status "$ED" cancelled
 resolve_fixture_source_hold "$X" "$GEN_X0"
-resolve_fixture_source_hold "$X" "$GEN_X1"
+resolve_fixture_source_hold "$X" "$GEN_X1" 120 "$RA_RESTORE_AT"
 resolve_fixture_source_hold "$ED" "$GEN_ED_ORIGINAL"
 
 fi
