@@ -74,8 +74,9 @@ directory (`agent/src/outbox.ts`):
 - **Boot.** `Outbox.init()` loads authenticated finalize records next to the terminal journals; an
   unauthenticated record is ignored (left on disk). `listPendingFinalizes()` excludes any run that
   also has a pending terminal journal on this worker, so the journal and its lease win. A boot
-  that resolves a terminal journal also retires that run's finalize records at generations up to
-  the journal's, once the journal is settled.
+  that resolves a terminal journal considers the original finalize records at generations up to
+  the journal's. Settlement or stale supersession of the terminal alone is not finalize authority:
+  each exact generation must pass the worker retirement rule below.
 
 ### D2: carry it on the register snapshot, retire after an accepted Register
 
@@ -92,10 +93,30 @@ list is dropped with a warning and never fails the register or discards the rest
 The wire shape is pinned by the shared fixture `fixtures/worker-register-snapshot/finalize-resume.json`,
 read by tests on both sides.
 
-After a register the api accepts (2xx), the worker retires exactly the offered set (and any
-lower-generation record of the same offered runs). It does not re-list the directory, so a record
-a live G+1 flight writes later is never touched. A failed register retires nothing. There is no
-acknowledgment protocol.
+Before requesting registration, the worker freezes the offered record identities and existing
+lower-generation records. After a register the api accepts (2xx), only the exact original offered
+records gain handoff authority. The process retains at most 256 accepted identities for its
+lifetime, including while a terminal journal hides a record; a replacement with the same key and
+timestamp does not inherit handoff. During the accepted registration cleanup only, captured lower
+originals have temporary batch authority after their own exact custody check; it is not saved as
+handoff. Newly created lower records retain. Registration attempts the frozen set in waves of at
+most 16 within the five-second pass deadline, rather than stopping after the first 16.
+
+Worker-driven retirement requires exact-generation `recoveryInventoryPending === false` and
+either that accepted original identity, temporary lower-original registration authority, or fresh
+runtime-validated ownership with status
+`completed`, `failed` or `cancelled` and a nonnegative safe-integer generation at least the record's.
+If present, `inventory_guarded` must be boolean. Failed requests, omitted records, new entries and
+same-key replacements retain without fresh terminal proof. Missing, malformed, active, pending,
+404 or unavailable ownership is not proof. Boot and live terminal resolution use this same
+predicate, with identities frozen before resolving the terminal.
+
+Retry shares the existing process-wide quarantine of 16 unresolved exact keys, one-second
+candidate deadline and five-second pass deadline. Least recently attempted keys rotate; a failed
+or stalled candidate does not block siblings with available slots. Timed-out calls occupy their
+slots until settlement and late results cannot delete. Identity, cancellation, liveness and
+pending terminals are checked inside the deletion lock. Normal runner retirement after an
+accepted durable outcome remains unchanged. There is no new acknowledgment protocol.
 
 ### D3: the attested register pass and the one-shot resume allowance
 

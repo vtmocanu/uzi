@@ -72,7 +72,19 @@ for closed or discarded holds.
 ### Terminal and finalize report retirement has separate authority
 
 `Runner.recoveryInventoryPending` in `agent/src/runner.ts` protects report
-retirement. A covering authenticated ACK permits retirement. Otherwise
+retirement. A covering authenticated ACK clears the exact custody check. Worker-driven finalize
+retirement additionally requires either acceptance of the exact original record offered during
+registration, temporary authority for captured lower originals during accepted registration cleanup,
+or fresh runtime-validated terminal ownership (`completed`, `failed` or `cancelled`,
+nonnegative safe-integer generation at least the record's, boolean `inventory_guarded` when present).
+Original offered identities and existing lower records are frozen before the request; lower
+generations gain no saved handoff and same-key replacements gain no authority. Registration
+attempts the frozen set in waves of at most 16 within the five-second pass deadline. At most 256 accepted identities
+remain for the process lifetime, even while terminal journals hide them. Boot and live terminal
+resolution apply the same predicate. Ownership and custody share the existing 16 unresolved-key
+quarantine, one-second candidate and five-second pass bounds; late results cannot delete.
+Deletion rechecks the original identity, cancellation, liveness and pending terminals under the
+run lock. The runner's normal durable-outcome retirement remains unchanged. Otherwise
 `WorkerClient.hasRecoveryRetirementAuthority` in `agent/src/client.ts` requires
 fresh evidence; it authorizes retiring the report, not deleting recovery sources.
 

@@ -43,6 +43,7 @@ const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 // Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
 // and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
 const finalizeAuthorities = new Map<string, Promise<boolean>>();
+type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
 const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
 
 /** Bound a wait without granting authority to a late result. Always remove the abort listener. */
@@ -171,17 +172,25 @@ export class Worker {
   /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
   private sweepingTerminals = false;
   private sweepingFinalizes = false;
+  // Only the exact 256-or-fewer wire offers accepted in this worker lifetime gain handoff.
+  // Keep identities even while a terminal hides the record; replacements never inherit them.
+  private readonly acceptedFinalizes = new Map<string, Readonly<object>>();
+  private finalizeRegistrationAccepted = false;
   private finalizeAttemptSequence = 0;
   private readonly finalizeAttempts = new Map<string, number>();
 
   /** Independent heartbeat retry: at most 16 checks/deletions, five seconds per pass and one
-   * second per authority wait. A failed candidate never blocks its siblings. Enumeration is
-   * uncapped; least recently attempted exact keys rotate past held old generations. */
-  private async sweepPendingFinalizes(signal?: AbortSignal): Promise<void> {
+   * second per candidate (authority and queued deletion). A failed candidate never blocks its siblings. Enumeration is
+   * uncapped; least recently attempted exact keys rotate past held old generations. Accepted
+   * registration alone attempts its frozen count in waves of 16 within the same pass deadline;
+   * its lower-original authority expires on return and is never added to acceptedFinalizes. */
+  private async sweepPendingFinalizes(signal?: AbortSignal, frozen?: readonly FinalizeCandidate[],
+    registrationLower?: ReadonlySet<Readonly<object>>): Promise<void> {
     const outbox = this.outbox;
     if (this.sweepingFinalizes || signal?.aborted || !outbox ||
         typeof outbox.listPendingFinalizeGenerations !== "function" ||
         typeof outbox.retireFinalizeIfEligible !== "function" ||
+        typeof outbox.finalizeRecordIdentity !== "function" ||
         typeof this.runner.recoveryInventoryPending !== "function") return;
     this.sweepingFinalizes = true;
     const pass = new AbortController();
@@ -190,7 +199,9 @@ export class Worker {
     signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), 5_000);
     try {
-      const entries = outbox.listPendingFinalizeGenerations();
+      const candidates = frozen ?? this.captureFinalizes();
+      const entries = candidates.map(candidate => candidate.entry);
+      const identities = new Map(candidates.map(candidate => [finalizeKey(candidate.entry), candidate.identity]));
       const present = new Set(entries.map(finalizeKey));
       for (const key of this.finalizeAttempts.keys()) {
         if (!present.has(key)) this.finalizeAttempts.delete(key);
@@ -201,14 +212,20 @@ export class Worker {
         a.claim_generation - b.claim_generation);
       const tasks: Promise<void>[] = [];
       for (const entry of entries) {
-        if (tasks.length >= 16 || finalizeAuthorities.size >= 16 || pass.signal.aborted ||
+        if (tasks.length >= 16) {
+          if (!registrationLower) break;
+          await Promise.all(tasks);
+          tasks.length = 0;
+        }
+        if (finalizeAuthorities.size >= 16 || pass.signal.aborted ||
             Date.now() >= deadline) break;
         const key = finalizeKey(entry);
         if (finalizeAuthorities.has(key)) continue;
         try {
           if (this.isFinalizeRunLive(entry.run_id)) continue;
           this.finalizeAttempts.set(key, ++this.finalizeAttemptSequence);
-          tasks.push(this.retryPendingFinalize(outbox, entry, key, pass.signal, deadline));
+          tasks.push(this.retryPendingFinalize(outbox, entry, key, identities.get(key)!, pass.signal, deadline,
+            registrationLower?.has(identities.get(key)!) ?? false));
         } catch (err) {
           this.log.warn("outbox: finalize candidate retained after live fence error", {
             run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
@@ -228,8 +245,32 @@ export class Worker {
       (typeof this.runner.isExecuting === "function" && this.runner.isExecuting(runId));
   }
 
+  private captureFinalizes(runId?: string, through?: number): FinalizeCandidate[] {
+    const outbox = this.outbox;
+    if (!outbox || typeof outbox.finalizeRecordIdentity !== "function") return [];
+    return outbox.listPendingFinalizeGenerations(runId !== undefined)
+      .filter(entry => runId === undefined || (entry.run_id === runId && entry.claim_generation <= through!))
+      .flatMap(entry => {
+        const identity = outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation);
+        return identity ? [{ entry, identity }] : [];
+      });
+  }
+
+  private async hasFinalizeAuthority(entry: PendingFinalize, identity: Readonly<object>, registrationLower: boolean): Promise<boolean> {
+    if (await this.runner.recoveryInventoryPending(entry.run_id, entry.claim_generation) !== false) return false;
+    if (registrationLower || this.acceptedFinalizes.get(finalizeKey(entry)) === identity) return true;
+    const ownership: unknown = await this.client.getRunOwnership(entry.run_id);
+    if (!ownership || typeof ownership !== "object") return false;
+    const proof = ownership as { status?: unknown; claim_generation?: unknown; inventory_guarded?: unknown };
+    return (proof.status === "completed" || proof.status === "failed" || proof.status === "cancelled") &&
+      typeof proof.claim_generation === "number" && Number.isSafeInteger(proof.claim_generation) &&
+      proof.claim_generation >= 0 && proof.claim_generation >= entry.claim_generation &&
+      (proof.inventory_guarded === undefined || typeof proof.inventory_guarded === "boolean");
+  }
+
   private async retryPendingFinalize(
-    outbox: Outbox, entry: PendingFinalize, key: string, signal: AbortSignal, deadline: number,
+    outbox: Outbox, entry: PendingFinalize, key: string, identity: Readonly<object>, signal: AbortSignal, deadline: number,
+    registrationLower = false,
   ): Promise<void> {
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
@@ -237,20 +278,19 @@ export class Worker {
     const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
     try {
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
-      const authority = Promise.resolve().then(() =>
-        this.runner.recoveryInventoryPending(entry.run_id, entry.claim_generation));
+      const authority = Promise.resolve().then(() => this.hasFinalizeAuthority(entry, identity, registrationLower));
       finalizeAuthorities.set(key, authority);
       const settled = () => {
         if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
       };
       void authority.then(settled, settled);
-      const pending = await waitForFinalize(authority, authorityWait.signal);
-      if (pending !== false) return;
-      const eligible = () => !signal.aborted && Date.now() < deadline &&
+      const authorized = await waitForFinalize(authority, authorityWait.signal);
+      if (authorized !== true) return;
+      const eligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
         !this.isFinalizeRunLive(entry.run_id);
       if (!eligible()) return;
       await waitForFinalize(outbox.retireFinalizeIfEligible(
-        entry.run_id, entry.claim_generation, eligible, signal), signal);
+        entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity), authorityWait.signal);
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
@@ -386,6 +426,7 @@ export class Worker {
     for (const entry of outbox.listPendingTerminals()) {
       if (signal.aborted) return;
       const gen = entry.claim_generation;
+      const finalizes = this.captureFinalizes(entry.run_id, gen);
       try {
         await resolvePendingTerminal(deps, {
           runId: entry.run_id,
@@ -402,8 +443,7 @@ export class Worker {
         const stillPending = outbox
           .listPendingTerminals()
           .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
-        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen,
-          async (runId, generation) => !(await this.runner.recoveryInventoryPending?.(runId, generation)));
+        if (!stillPending) await this.sweepPendingFinalizes(signal, finalizes);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -535,6 +575,7 @@ export class Worker {
       return;
     }
     if (this.isRunLiveHere(runId)) return;
+    const finalizes = this.captureFinalizes(runId, gen);
     try {
       await resolvePendingTerminal(deps, {
         runId,
@@ -548,8 +589,7 @@ export class Worker {
       const stillPending = outbox
         .listPendingTerminals()
         .some((p) => p.run_id === runId && p.claim_generation === gen);
-      if (!stillPending) await outbox.retireFinalizesThrough(runId, gen,
-        async (id, generation) => !(await this.runner.recoveryInventoryPending?.(id, generation)));
+      if (!stillPending) await this.sweepPendingFinalizes(signal, finalizes);
     } catch (err) {
       this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
         run_id: runId,
@@ -579,12 +619,16 @@ export class Worker {
     // wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
-    // snapshot. After an accepted register the offered records (and any lower-generation records of
-    // the same offered runs) are retired, never a re-listing, so a record a live flight writes later
-    // survives.
+    // snapshot. Freeze each original identity before the request, including existing lower records.
+    // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
+    const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
+      sentFinalizes.some(offered => offered.run_id === entry.run_id &&
+        entry.claim_generation <= offered.claim_generation));
+    const offeredIdentities = frozenFinalizes.filter(({ entry }) =>
+      sentFinalizes.some(offered => finalizeKey(offered) === finalizeKey(entry)));
     if (sentFinalizes.length > 0) {
       this.log.info("register finalize snapshot", {
         count: sentFinalizes.length,
@@ -726,15 +770,23 @@ export class Worker {
         });
         this.dindPrune?.setWorkerId(res.worker_id);
         this.dindMaintenance?.register(res.register_nonce, this.client.hasFeature("dind_maintenance_v1"));
+        if (!this.finalizeRegistrationAccepted) {
+          this.finalizeRegistrationAccepted = true;
+          for (const { entry, identity } of offeredIdentities.slice(0, 256)) {
+            this.acceptedFinalizes.set(finalizeKey(entry), identity);
+          }
+        }
         onRegistered(res.worker_id);
         // Issue #1742: the api accepted this register, so retire the offered finalize records
-        // (`sentFinalizes`, what the snapshot carried) and lower-generation records only after each
-        // exact generation passes its custody check. A failed register never reaches here. A
+        // (`sentFinalizes`, what the snapshot carried) and captured lower originals after their own
+        // exact custody checks. Batch authority expires with this bounded pass. A failed register never reaches here. A
         // retire failure must not turn an accepted register into a retry loop.
         if (sentFinalizes.length > 0) {
           try {
-            await this.outbox?.retireFinalizes(sentFinalizes,
-              async (runId, generation) => !(await this.runner.recoveryInventoryPending?.(runId, generation)));
+            const lowerOriginals = new Set(frozenFinalizes.filter(({ entry }) =>
+              sentFinalizes.some(offered => offered.run_id === entry.run_id &&
+                entry.claim_generation < offered.claim_generation)).map(candidate => candidate.identity));
+            await this.sweepPendingFinalizes(signal, frozenFinalizes, lowerOriginals);
           } catch (err) {
             this.log.warn("register finalize snapshot: retiring the offered records failed", {
               error: errMessage(err),

@@ -28,7 +28,7 @@ const RUN2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
 const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
 const noReview = { execute: async () => {} } as unknown as ReviewRunner;
-const idleRunner = { resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
+const idleRunner = { recoveryInventoryPending: async () => false, resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
 const idleChat = { execute: async () => {} } as unknown as ChatRunner;
 const okPreflight = (): { ok: boolean; missing: string[] } => ({ ok: true, missing: [] });
 
@@ -80,6 +80,7 @@ interface FakeClientHooks {
 function fakeClient(hooks: FakeClientHooks = {}): WorkerClient {
   return {
     register: async () => ({}),
+    getRunOwnership: async () => ({ status: "completed", claim_generation: Number.MAX_SAFE_INTEGER }),
     heartbeat: hooks.heartbeat ?? (async () => {}),
     reportState: hooks.reportState ?? (async () => ({ applied: true, status: "completed" }) as StateAck),
     claimRun: hooks.claimRun ?? (async (): Promise<ClaimResponse | null> => null),
@@ -197,7 +198,8 @@ describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
     const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
     const controller = new AbortController();
     const worker = new Worker(
-      fakeConfig(), fakeClient(), idleRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight,
+      fakeConfig(), Object.assign(fakeClient(), { getRunOwnership: async () => ({ status: "completed", claim_generation: 4 }) }),
+      idleRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight,
       outbox, new Map(), registry,
     );
     const done = worker.run(controller.signal);

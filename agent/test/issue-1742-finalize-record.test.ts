@@ -17,7 +17,8 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import { isFinalizeBoundResult, type RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
+import { RecoveryCoordinator } from "../src/recovery.js";
+import { api, client, git, TOKEN, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
 
 // Issue #1742 M2: the worker-local finalize-pending record (outbox), its register hand-off, and the
 // runner write and retirement sites.
@@ -64,10 +65,11 @@ async function registerWith(
   outbox: Outbox,
   register: (snapshot: ActiveSnapshot | undefined) => Promise<unknown>,
   withRegistry = true,
-  recoveryInventoryPending?: (runId: string, generation: number) => Promise<boolean>,
+  recoveryInventoryPending: (runId: string, generation: number) => Promise<boolean> = async () => false,
 ): Promise<void> {
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
   const client = {
+    getRunOwnership: async () => ({ status: "completed", claim_generation: Number.MAX_SAFE_INTEGER }),
     register: async (_n: string, _t?: string, _m?: number, _c?: string[], _p?: string[], snapshot?: ActiveSnapshot) =>
       register(snapshot),
   } as unknown as WorkerClient;
@@ -87,6 +89,33 @@ async function registerWith(
   await (worker as unknown as { registerWithRetry(signal: AbortSignal): Promise<void> })
     .registerWithRetry(new AbortController().signal);
 }
+
+it("rework-2464: authenticated legacy actual runner custody false still retains unoffered running finalize", async () => {
+  const root = tmpRoot();
+  const outbox = makeOutbox(root);
+  await outbox.init();
+  const recovery = new RecoveryCoordinator({ recoveryRoot: root + "-recovery",
+    workerToken: TOKEN, client, git, log: nullLogger() });
+  roots.push(root + "-recovery");
+  const pinned = await recovery.pin({ runId: RUN_A, sourceSha: "1".repeat(40),
+    kind: "issue", branch: "agent/legacy" });
+  assert.ok(pinned);
+  assert.equal(await recovery.inventoryCleanupState(RUN_A, 1), "legacy");
+  const { gitlab } = fakeGitlab();
+  const actual = runner(new StubExecutor(nullLogger()), gitlab, TOKEN, { recovery });
+  assert.equal(await actual.recoveryInventoryPending(RUN_A, 1), false, "actual legacy custody predicate");
+  await outbox.journalFinalize(RUN_A, 1);
+  let status = "running";
+  const probe = { getRunOwnership: async () => ({ status, claim_generation: 1 }) } as unknown as WorkerClient;
+  const worker = new Worker({} as Config, probe, actual, {} as ChatRunner, {} as JudgeRunner,
+    {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }), outbox);
+  const seam = worker as unknown as { sweepPendingFinalizes(): Promise<void> };
+  await seam.sweepPendingFinalizes();
+  assert.deepEqual(await finalizeFiles(root, RUN_A), ["finalize-1.json"], "legacy running record retains");
+  status = "completed";
+  await seam.sweepPendingFinalizes();
+  assert.deepEqual(await finalizeFiles(root, RUN_A), [], "fresh terminal proof permits");
+});
 
 describe("issue #1742 finalize record: Outbox", () => {
   it("logs `finalize record durable` only after the record is linked and the directory is fsynced", async () => {
