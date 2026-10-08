@@ -436,6 +436,7 @@ wait_custody_headroom() {
 # same generation; legacy claims retain their atomic no_adopted_source assertion.
 wait_forge_park_release() {
   local run="$1" generation="$2" timeout="${3:-10}" start=$SECONDS snapshot
+  [[ "$generation" =~ ^[1-9][0-9]*$ ]] || fail "forge park invalid generation: $generation"
   while :; do
     snapshot="$(db_psql "SELECT COALESCE(json_agg(json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
       'generation',h.generation,'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,

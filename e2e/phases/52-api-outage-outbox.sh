@@ -725,8 +725,14 @@ f42_assert_capture_park() {
     [$events | to_entries[] | select(.value.msg == "run claimed") | .key] as $claims |
     [$events | to_entries[] | select(.value.msg == "run parked for transient recovery"
       and .value.detail == "recovering retained work before reseeding") | .key] as $parks |
-    [$events | to_entries[] | select(.value.msg == "recovery: park/early-terminal disposition outcome"
-      and .value.claim_generation == $gen and .value.state == "uploaded") | .key] as $captures |
+    # runner.ts emits legacy claim_generation at park/early-terminal disposition,
+    # and guarded generation at inventory disposition. Retries can log the same
+    # uploaded capture again; require one distinct capture, not one log emission.
+    [$events | to_entries[] | select(
+      ((.value.msg == "recovery: park/early-terminal disposition outcome" and .value.claim_generation == $gen)
+       or (.value.msg == "recovery: guarded inventory disposition" and .value.generation == $gen))
+      and .value.state == "uploaded" and (.value.capture_id | type == "string" and length > 0))]
+      | unique_by(.value.capture_id) | map(.key) as $captures |
     ($claims | length) == 3 and ($parks | length) == 1 and ($captures | length) == 1
     and $claims[1] < $parks[0] and $parks[0] < $captures[0] and $captures[0] < $claims[2]
   ' "$log_file" >/dev/null \

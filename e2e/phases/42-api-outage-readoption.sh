@@ -110,6 +110,8 @@ pass "agent recreated at max_concurrent_runs=2"
 # Two fresh claims need admission headroom. Preserve earlier phases' recovery evidence
 # and let acknowledged final inventories settle, rather than deleting their custody.
 wait_custody_headroom "$CAP"
+RA_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
+[ -n "$RA_ADMIN_ID" ] || fail "readopt: could not resolve the admin owner id for '$ADMIN_EMAIL'"
 
 # =============================================================================
 # CASE (b) — LIVE stale requeue + heartbeat re-adoption (proves M2a/M2b/M2c).

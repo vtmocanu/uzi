@@ -175,7 +175,8 @@ pass "run $RUN_A parked: recovery_wait, cause=forge_unreachable, forge_park_coun
 
 # Guarded workers provide empty-inventory evidence after the park acknowledgement;
 # legacy holds release inside the park transaction. Require the exact generation receipt.
-wait_forge_park_release "$RUN_A" "$(echo "$FA" | jq -er '.run.claim_generation')"
+PARK_GENERATION="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_A'")"
+wait_forge_park_release "$RUN_A" "$PARK_GENERATION"
 pass "parked generation custody released with the required evidence"
 
 # Exactly one feed event on the run feed (D4/D10).

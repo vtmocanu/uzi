@@ -239,6 +239,8 @@ printf '\n' > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
 custody_case "missing exact hold fails closed" fail "missing receipt" wait_forge_park_release R 1 2
 park_fixture duplicate
 custody_case "two matching holds cannot mask the open first row" fail "expected exactly one hold" wait_forge_park_release R 1 2
+park_fixture released
+custody_case "null generation cannot reach SQL" fail "invalid generation" wait_forge_park_release R null 2
 
 # Drive the real sequential outbox creation seam, not just the admission helper.
 # Each fresh claim must observe a saturated-then-free owner before create_run.
@@ -265,6 +267,62 @@ outbox_sequence() {
 }
 custody_case "each sequential outbox claim waits for one slot" pass 'two fresh claims after their admission waits' outbox_sequence
 
+# Exercise actual phase statements with the real run DTO shape (no generation).
+db_psql() {
+  case "$1" in
+    'SELECT id FROM users'*) echo owner;;
+    'SELECT claim_generation FROM runs'*) echo 1;;
+    *"user_id = 'owner'"*) echo 1;;
+    *) fail "unexpected owner/generation query: $1";;
+  esac
+}
+readoption_owner_queries() {
+  unset RA_ADMIN_ID
+  local -x X=R ADMIN_EMAIL=admin@example.invalid
+  eval "$(awk '/^RA_ADMIN_ID=/' "$ROOT/e2e/phases/42-api-outage-readoption.sh")"
+  eval "$(awk '/^CLAIMABLE_[NX]=/' "$ROOT/e2e/phases/42-api-outage-readoption.sh")"
+  [ "$CLAIMABLE_N" = 1 ] && [ "$CLAIMABLE_X" = 1 ] || fail "owner-scoped queries failed"
+  echo 'owner resolved for the later sibling precondition'
+}
+custody_case "readoption keeps its later owner-scoped precondition" pass 'owner resolved' readoption_owner_queries
+wait_forge_park_release() { [ "$2" = 1 ] || fail 'phase did not use authoritative DB generation'; }
+park_phase_call() {
+  local -x RUN_A=R FA='{"run":{"status":"recovery_wait"}}'
+  eval "$(awk '/^PARK_GENERATION=/ || /^wait_forge_park_release /' "$ROOT/e2e/phases/73-forge-unreachable-park.sh")"
+  echo 'phase used authoritative DB generation'
+}
+custody_case "park phase gets generation absent from run DTO" pass 'phase used authoritative DB generation' park_phase_call
+
+# The actual capture decoder must recognize guarded and legacy typed logs while
+# preserving generation, ordering and unique-capture requirements.
+eval "$(awk '/^f42_assert_capture_park\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+fake_compose() { cat "$SEQ_DIR/events"; }
+# shellcheck disable=SC2034  # read by the extracted production capture decoder
+COMPOSE=(fake_compose)
+export RUNROOT="$SEQ_DIR"
+uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"available"}]}]'; }
+capture_fixture() {
+  jq -nc --arg variant "$1" '
+    {run_id:"R",msg:"run claimed"} as $claim |
+    {run_id:"R",msg:"run parked for transient recovery",detail:"recovering retained work before reseeding"} as $park |
+    {run_id:"R",msg:"recovery: guarded inventory disposition",generation:2,capture_id:"capture",state:"uploaded"} as $capture |
+    (if $variant=="legacy" then [$claim,$claim,$park,($capture+{msg:"recovery: park/early-terminal disposition outcome",claim_generation:2}),$claim]
+     else [$claim,$claim,$park,$capture,$capture,$claim] end) |
+    if $variant=="wrong-generation" then .[3].generation=3 | .[4].generation=3
+    elif $variant=="wrong-order" then [.[0],.[1],.[3],.[2],.[4],.[5]]
+    elif $variant=="two-captures" then .[4].capture_id="other"
+    elif $variant=="missing-id" then .[3].capture_id=null | .[4].capture_id=null
+    else . end | .[]' > "$SEQ_DIR/events"
+}
+capture_fixture guarded
+custody_case "guarded G+1 capture retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_park R 2
+capture_fixture legacy
+custody_case "legacy G+1 capture contract still accepted" pass 'exact generation 2 captured' f42_assert_capture_park R 2
+for variant in wrong-generation wrong-order two-captures missing-id; do
+  capture_fixture "$variant"
+  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_park R 2
+done
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -275,6 +333,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 42 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 51 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 42 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 51 ] && [ "$cases" -eq "$passed" ]
