@@ -1677,6 +1677,36 @@ export class Outbox {
       .map((e) => ({ run_id: e.run_id, claim_generation: e.claim_generation }));
   }
 
+  /** All authenticated exact generations for live retry; register's capped view stays separate. */
+  listPendingFinalizeGenerations(): PendingFinalize[] {
+    const entries: PendingFinalize[] = [];
+    for (const rs of this.runs.values()) {
+      if (rs.terminals.size > 0) continue;
+      for (const generation of rs.finalizes.keys()) {
+        entries.push({ run_id: rs.runId, claim_generation: generation });
+      }
+    }
+    return entries;
+  }
+
+  /** Retry only the authorized exact generation. Recheck custody and synchronous eligibility
+   * under the run lock; cancellation also prevents an expired queued waiter from deleting. */
+  async retireFinalizeIfEligible(
+    runId: string,
+    claimGeneration: number,
+    eligible: () => boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.disabled) return;
+    await this.withRunLock(runId, async () => {
+      const rs = this.runs.get(runId);
+      if (!this.validRunId(runId) || !rs?.finalizes.has(claimGeneration) ||
+          rs.terminals.size > 0 || signal.aborted || !eligible()) return;
+      await fs.rm(path.join(this.runDir(runId), finalizeFileName(claimGeneration)), { force: true });
+      rs.finalizes.delete(claimGeneration);
+    }, signal);
+  }
+
   /** Issue #1742: retire one finalize record (unlink the file, drop it from the pending set). */
   async retireFinalize(runId: string, claimGeneration: number): Promise<void> {
     if (this.disabled) return;

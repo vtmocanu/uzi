@@ -40,6 +40,26 @@ export const ISOLATED_JOB_CAPABILITY = "isolated_job_v1";
 /** issue #1582 M2: default re-sweep interval of the ancestry-settlement journal. */
 const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
+// Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
+// and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
+const finalizeAuthorities = new Map<string, Promise<boolean>>();
+const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
+
+/** Bound a wait without granting authority to a late result. Always remove the abort listener. */
+async function waitForFinalize<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  let aborted!: () => void;
+  const cancellation = new Promise<never>((_, reject) => {
+    aborted = () => reject(signal.reason);
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+  try {
+    return await Promise.race([promise, cancellation]);
+  } finally {
+    signal.removeEventListener("abort", aborted);
+  }
+}
+
 /**
  * Outbound-only worker loop (a daemon model): register once, heartbeat on
  * an interval, and poll for claims. No inbound ports.
@@ -150,6 +170,96 @@ export class Worker {
 
   /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
   private sweepingTerminals = false;
+  private sweepingFinalizes = false;
+  private finalizeAttemptSequence = 0;
+  private readonly finalizeAttempts = new Map<string, number>();
+
+  /** Independent heartbeat retry: at most 16 checks/deletions, five seconds per pass and one
+   * second per authority wait. A failed candidate never blocks its siblings. Enumeration is
+   * uncapped; least recently attempted exact keys rotate past held old generations. */
+  private async sweepPendingFinalizes(signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (this.sweepingFinalizes || signal?.aborted || !outbox ||
+        typeof outbox.listPendingFinalizeGenerations !== "function" ||
+        typeof outbox.retireFinalizeIfEligible !== "function" ||
+        typeof this.runner.recoveryInventoryPending !== "function") return;
+    this.sweepingFinalizes = true;
+    const pass = new AbortController();
+    const deadline = Date.now() + 5_000;
+    const abort = () => pass.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), 5_000);
+    try {
+      const entries = outbox.listPendingFinalizeGenerations();
+      const present = new Set(entries.map(finalizeKey));
+      for (const key of this.finalizeAttempts.keys()) {
+        if (!present.has(key)) this.finalizeAttempts.delete(key);
+      }
+      entries.sort((a, b) =>
+        (this.finalizeAttempts.get(finalizeKey(a)) ?? 0) - (this.finalizeAttempts.get(finalizeKey(b)) ?? 0) ||
+        (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0) ||
+        a.claim_generation - b.claim_generation);
+      const tasks: Promise<void>[] = [];
+      for (const entry of entries) {
+        if (tasks.length >= 16 || finalizeAuthorities.size >= 16 || pass.signal.aborted ||
+            Date.now() >= deadline) break;
+        const key = finalizeKey(entry);
+        if (finalizeAuthorities.has(key)) continue;
+        try {
+          if (this.isFinalizeRunLive(entry.run_id)) continue;
+          this.finalizeAttempts.set(key, ++this.finalizeAttemptSequence);
+          tasks.push(this.retryPendingFinalize(outbox, entry, key, pass.signal, deadline));
+        } catch (err) {
+          this.log.warn("outbox: finalize candidate retained after live fence error", {
+            run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
+          });
+        }
+      }
+      await Promise.all(tasks);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      this.sweepingFinalizes = false;
+    }
+  }
+
+  private isFinalizeRunLive(runId: string): boolean {
+    return this.admittedRunIds.has(runId) || (this.activeRuns?.has(runId) ?? false) ||
+      (typeof this.runner.isExecuting === "function" && this.runner.isExecuting(runId));
+  }
+
+  private async retryPendingFinalize(
+    outbox: Outbox, entry: PendingFinalize, key: string, signal: AbortSignal, deadline: number,
+  ): Promise<void> {
+    const authorityWait = new AbortController();
+    const abort = () => authorityWait.abort(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
+    try {
+      // Install quarantine before invoking the predicate, including synchronously throwing doubles.
+      const authority = Promise.resolve().then(() =>
+        this.runner.recoveryInventoryPending(entry.run_id, entry.claim_generation));
+      finalizeAuthorities.set(key, authority);
+      const settled = () => {
+        if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
+      };
+      void authority.then(settled, settled);
+      const pending = await waitForFinalize(authority, authorityWait.signal);
+      if (pending !== false) return;
+      const eligible = () => !signal.aborted && Date.now() < deadline &&
+        !this.isFinalizeRunLive(entry.run_id);
+      if (!eligible()) return;
+      await waitForFinalize(outbox.retireFinalizeIfEligible(
+        entry.run_id, entry.claim_generation, eligible, signal), signal);
+    } catch (err) {
+      this.log.warn("outbox: finalize retry retained a generation", {
+        run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
+      });
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    }
+  }
 
   async run(signal: AbortSignal): Promise<void> {
     // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
@@ -724,6 +834,9 @@ export class Worker {
         // drainer never visits those). Fire-and-forget for the same reason as the drain above.
         void this.sweepPendingTerminals(signal).catch((err) => {
           this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
+        });
+        void this.sweepPendingFinalizes(signal).catch((err) => {
+          this.log.warn("outbox finalize sweep failed", { error: errMessage(err) });
         });
         // Issue #1995: re-drive a journaled recovery bundle whose upload failed while this worker
         // stayed alive (it was retried only at the next boot before). Fire-and-forget like the
