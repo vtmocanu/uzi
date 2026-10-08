@@ -66,12 +66,12 @@ WITH candidates AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
 ), locked_checks AS MATERIALIZED (
-    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc
+    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited FROM cross_checks cc
     JOIN locked_parents lead ON lead.id = cc.lead_run_id
     CROSS JOIN parent_lock_set locks
     WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
       AND cc.lead_run_id = ANY(locks.ids)
-      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
       AND cc.deadline_at > now()
       AND lead.status IN ('claimed', 'running')
       AND lead.claim_released_at IS NULL
@@ -142,7 +142,7 @@ WHERE a.worker_id = $1 AND a.run_id = r.id AND a.terminal_pending = false
       WHERE cc.checker_run_id = r.id AND r.id = ANY(checks.ids)
         AND cc.lead_run_id = r.target_run_id
         AND lead.user_id = r.user_id
-        AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+        AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
         AND cc.deadline_at > now()
         AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
@@ -194,7 +194,7 @@ type FrozenReadoptRunsFromSnapshotRow struct {
 // outputs of LockWorkerRecoveryParents. Parent reads stay inside the held set.
 // Exact association drift is deferred, including replacement by an already held
 // parent. Only terminal failure admits an unchanged orphan; checker admission
-// still requires the live pending plan round-one check and active lead.
+// still requires the latest eligible pending plan round and active lead.
 // PRD #1390 M2b (D5, D2): restore a `queued` run-lane run the worker still lists as a LIVE entry
 // (terminal_pending = false) at the SAME generation to its listed phase. This is a DIRECT status
 // write (not SetRunRunning), correct because the held-state content columns (open_question_id,
@@ -284,12 +284,12 @@ WITH candidates AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
 ), locked_checks AS MATERIALIZED (
-    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc
+    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited FROM cross_checks cc
     JOIN locked_parents lead ON lead.id = cc.lead_run_id
     CROSS JOIN parent_lock_set locks
     WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
       AND cc.lead_run_id = ANY(locks.ids)
-      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
       AND cc.deadline_at > now()
       AND lead.status IN ('claimed', 'running')
       AND lead.claim_released_at IS NULL
@@ -337,7 +337,7 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN candidates exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = mapping.run_id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND EXISTS (
                 SELECT 1 FROM locked_parents runs
                 WHERE runs.id = exiting.id
@@ -386,7 +386,7 @@ WHERE runs.worker_id = $2
       CROSS JOIN checker_lock_set checks
       WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
-        AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+        AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
         AND cc.deadline_at > now()
         AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
@@ -470,24 +470,24 @@ func (q *Queries) FrozenRequeueAttestedFinalizeRuns(ctx context.Context, arg Fro
 const frozenRequeueRunsMissingFromSnapshot = `-- name: FrozenRequeueRunsMissingFromSnapshot :many
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.worker_id = $1
+    WHERE runs.worker_id = $2
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
-  AND runs.status_since < $2
-  AND (runs.requeue_count - runs.requeue_episode_baseline) < $3
+  AND runs.status_since < $3
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < $4
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($4::timestamptz
+    AND runs.started_at < ($1::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -539,12 +539,12 @@ WITH candidates AS MATERIALIZED (
     -- Consume every selected parent lock before taking a checker lock.
     SELECT array_agg(id) AS ids FROM locked_parents
 ), locked_checks AS MATERIALIZED (
-    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc
+    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited FROM cross_checks cc
     JOIN locked_parents lead ON lead.id = cc.lead_run_id
     CROSS JOIN parent_lock_set locks
     WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
       AND cc.lead_run_id = ANY(locks.ids)
-      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
       AND cc.deadline_at > now()
       AND lead.status IN ('claimed', 'running')
       AND lead.claim_released_at IS NULL
@@ -592,30 +592,30 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN candidates exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = mapping.run_id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND EXISTS (
                 SELECT 1 FROM locked_parents runs
                 WHERE runs.id = exiting.id
                   AND runs.status IN ('claimed', 'running')
                   AND runs.claim_released_at IS NULL
-                  AND (runs.worker_id = $1
+                  AND (runs.worker_id = $2
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
-  AND runs.status_since < $2
-  AND (runs.requeue_count - runs.requeue_episode_baseline) < $3
+  AND runs.status_since < $3
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < $4
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($4::timestamptz
+    AND runs.started_at < ($1::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -626,7 +626,7 @@ WITH candidates AS MATERIALIZED (
             )
       )
 )
-UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.requeue_count + 1,
+UPDATE runs SET status = 'queued', status_since = $1::timestamptz, requeue_count = runs.requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     budget_paused_seconds = runs.budget_paused_seconds
         + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
@@ -634,24 +634,24 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
                ELSE 0 END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE runs.worker_id = $1
+WHERE runs.worker_id = $2
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL                        -- #1247 fence
-  AND runs.status_since < $2                   -- fence: stale window + one heartbeat interval, D4
-  AND (runs.requeue_count - runs.requeue_episode_baseline) < $3
+  AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
+  AND (runs.requeue_count - runs.requeue_episode_baseline) < $4
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($4::timestamptz
+    AND runs.started_at < ($1::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
-                  WHERE a.worker_id = $1 AND a.run_id = runs.id
+                  WHERE a.worker_id = $2 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -666,7 +666,7 @@ WHERE runs.worker_id = $1
       CROSS JOIN checker_lock_set checks
       WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
-        AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+        AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
         AND cc.deadline_at > now()
         AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
@@ -702,10 +702,10 @@ RETURNING runs.id, runs.user_id, runs.status
 `
 
 type FrozenRequeueRunsMissingFromSnapshotParams struct {
+	Now                  pgtype.Timestamptz `json:"now"`
 	WorkerID             pgtype.UUID        `json:"worker_id"`
 	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
 	MaxRequeues          int32              `json:"max_requeues"`
-	Now                  pgtype.Timestamptz `json:"now"`
 	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
 	FrozenTargets        []byte             `json:"frozen_targets"`
 	LockedParentIds      []uuid.UUID        `json:"locked_parent_ids"`
@@ -725,10 +725,10 @@ type FrozenRequeueRunsMissingFromSnapshotRow struct {
 // never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
 func (q *Queries) FrozenRequeueRunsMissingFromSnapshot(ctx context.Context, arg FrozenRequeueRunsMissingFromSnapshotParams) ([]FrozenRequeueRunsMissingFromSnapshotRow, error) {
 	rows, err := q.db.Query(ctx, frozenRequeueRunsMissingFromSnapshot,
+		arg.Now,
 		arg.WorkerID,
 		arg.MissingCutoff,
 		arg.MaxRequeues,
-		arg.Now,
 		arg.GlobalTimeoutSeconds,
 		arg.FrozenTargets,
 		arg.LockedParentIds,
@@ -808,12 +808,12 @@ WITH candidates AS MATERIALIZED (
     -- Collect the actual locked IDs completely before any checker can be mutated.
     SELECT array_agg(id) AS ids FROM locked_parents
 ), locked_checks AS MATERIALIZED (
-    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at FROM cross_checks cc
+    SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited FROM cross_checks cc
     JOIN locked_parents lead ON lead.id = cc.lead_run_id
     CROSS JOIN parent_lock_set locks
     WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
       AND cc.lead_run_id = ANY(locks.ids)
-      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
       AND cc.deadline_at > now()
       AND lead.status IN ('claimed', 'running')
       AND lead.claim_released_at IS NULL
@@ -912,7 +912,7 @@ WHERE runs.id = candidate.run_id
       CROSS JOIN checker_lock_set checks
       WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
-        AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+        AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
         AND cc.deadline_at > now()
         AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
@@ -1138,8 +1138,8 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00302 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
+    -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
@@ -1149,7 +1149,7 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND exiting.status IN ('claimed', 'running')
             AND exiting.claim_released_at IS NULL
       )
@@ -1389,8 +1389,8 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00302 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
+    -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
@@ -1400,7 +1400,7 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND exiting.status IN ('claimed', 'running')
             AND exiting.claim_released_at IS NULL
       )
@@ -1602,8 +1602,8 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00302 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
+    -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
@@ -1613,7 +1613,7 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND exiting.status IN ('claimed', 'running')
             AND exiting.claim_released_at IS NULL
       )
@@ -1978,8 +1978,8 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00302 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
+    -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
@@ -1989,7 +1989,7 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND exiting.status IN ('claimed', 'running')
             AND exiting.claim_released_at IS NULL
       )
@@ -2118,24 +2118,24 @@ func (q *Queries) frozenFailAttestedFinalizeRunsOverCapLocked(ctx context.Contex
 const frozenFailRunsMissingFromSnapshotLocked = `-- name: frozenFailRunsMissingFromSnapshotLocked :many
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.worker_id = $3
+    WHERE runs.worker_id = $4
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
-  AND runs.status_since < $4
-  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $5
+  AND runs.status_since < $5
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($6::timestamptz
+    AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($6::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $3 AND a.run_id = runs.id
+                  WHERE a.worker_id = $4 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -2192,24 +2192,24 @@ WITH candidates AS MATERIALIZED (
     CROSS JOIN parent_lock_set locks
     WHERE runs.id IN (SELECT id FROM candidates)
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
-      AND runs.worker_id = $3
+      AND runs.worker_id = $4
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
-  AND runs.status_since < $4
-  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $5
+  AND runs.status_since < $5
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($6::timestamptz
+    AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($6::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $3 AND a.run_id = runs.id
+                  WHERE a.worker_id = $4 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -2253,24 +2253,24 @@ WITH candidates AS MATERIALIZED (
     -- Recheck the refreshed locked rows, not initial candidate membership.
     SELECT runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason, runs.issue_raw_digest, runs.issue_saved_body, runs.issue_input_reason, runs.auto_approve_blocked_reasons, runs.plan_cross_check_diff_refusal, runs.worker_recovery_episode, runs.requeue_episode_baseline, runs.worker_recovery_evidence FROM locked_targets runs CROSS JOIN target_lock_set locks
     WHERE runs.id = ANY(locks.ids)
-      AND runs.worker_id = $3
+      AND runs.worker_id = $4
   AND runs.kind <> 'chat'
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL
-  AND runs.status_since < $4
-  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $5
+  AND runs.status_since < $5
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($6::timestamptz
+    AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($6::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
-                  WHERE a.worker_id = $3 AND a.run_id = runs.id
+                  WHERE a.worker_id = $4 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -2307,8 +2307,8 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00302 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
+    -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
@@ -2318,13 +2318,13 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND exiting.status IN ('claimed', 'running')
             AND exiting.claim_released_at IS NULL
       )
 )
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
-    status = CASE WHEN COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN 'recovery_wait' ELSE 'failed' END, status_since = now(), failure_reason = CASE WHEN COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $2 END END,
+    status = CASE WHEN COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN 'recovery_wait' ELSE 'failed' END, status_since = $2::timestamptz, failure_reason = CASE WHEN COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.original_worker_id = runs.worker_id AND h.generation = runs.claim_generation AND h.terminal_record_rejection = 'mac_failure') THEN 'terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody' ELSE $3 END END,
     fail_origin = CASE WHEN COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN NULL ELSE 'worker_lost' END,
     move_pending_since = CASE WHEN NOT COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) AND runs.issue_iid IS NOT NULL THEN now() END, finished_at = CASE WHEN NOT COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN now() END,
     milestones_in_progress = NULL,
@@ -2346,24 +2346,24 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     released_worker_nonce = CASE WHEN COALESCE(($1::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
-WHERE runs.worker_id = $3
+WHERE runs.worker_id = $4
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
   AND runs.status = 'running'
   AND runs.claim_released_at IS NULL                        -- #1247 fence
-  AND runs.status_since < $4                   -- fence: stale window + one heartbeat interval, D4
-  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $5
+  AND runs.status_since < $5                   -- fence: stale window + one heartbeat interval, D4
+  AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
   AND NOT (runs.kind NOT IN ('chat', 'judge', 'job', 'cross_check') AND runs.interactive = false
     AND runs.completion_attempts = 0
-    AND runs.started_at < ($6::timestamptz
+    AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM
-                                (LEAST($6::timestamptz, cc.deadline_at) - cc.created_at)))::int)
+                                (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int)
                                 FROM cross_checks cc WHERE cc.lead_run_id = runs.id
-                                  AND cc.stage = 'plan' AND cc.verdict = 'pending'), 0))))
+                                  AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
-                  WHERE a.worker_id = $3 AND a.run_id = runs.id
+                  WHERE a.worker_id = $4 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -2404,11 +2404,11 @@ RETURNING runs.id, runs.user_id, runs.status
 
 type frozenFailRunsMissingFromSnapshotLockedParams struct {
 	ExhaustionEvidence   []byte             `json:"exhaustion_evidence"`
+	Now                  pgtype.Timestamptz `json:"now"`
 	FailureReason        pgtype.Text        `json:"failure_reason"`
 	WorkerID             pgtype.UUID        `json:"worker_id"`
 	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
 	MaxRequeues          int32              `json:"max_requeues"`
-	Now                  pgtype.Timestamptz `json:"now"`
 	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
 	FrozenTargets        []byte             `json:"frozen_targets"`
 	LockedParentIds      []uuid.UUID        `json:"locked_parent_ids"`
@@ -2432,11 +2432,11 @@ type frozenFailRunsMissingFromSnapshotLockedRow struct {
 func (q *Queries) frozenFailRunsMissingFromSnapshotLocked(ctx context.Context, arg frozenFailRunsMissingFromSnapshotLockedParams) ([]frozenFailRunsMissingFromSnapshotLockedRow, error) {
 	rows, err := q.db.Query(ctx, frozenFailRunsMissingFromSnapshotLocked,
 		arg.ExhaustionEvidence,
+		arg.Now,
 		arg.FailureReason,
 		arg.WorkerID,
 		arg.MissingCutoff,
 		arg.MaxRequeues,
-		arg.Now,
 		arg.GlobalTimeoutSeconds,
 		arg.FrozenTargets,
 		arg.LockedParentIds,
@@ -2606,8 +2606,8 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00302 owns cancellation only
-    -- for an unreleased active lead with a pending plan round-one check.
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
+    -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
@@ -2617,7 +2617,7 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+            AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
             AND exiting.status IN ('claimed', 'running')
             AND exiting.claim_released_at IS NULL
       )

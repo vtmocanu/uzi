@@ -9,6 +9,7 @@ import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Outbox } from "./outbox.js";
 import { CodexCrossCheck, CrossCheckMalformedError } from "./codex/cross-check.js";
 import { selectCodexBinding } from "./codex/select.js";
+import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, isStaleClaimRefusal } from "./terminal-resolve.js";
 import { errMessage } from "./util.js";
@@ -76,7 +77,7 @@ export class CrossCheckRunner {
       if (ack?.staleClaim) return;
       const candidate = claim.cross_check;
       if (claim.kind !== "cross_check" || selectCodexBinding(claim.secrets).kind !== "codex"
-        || !candidate || candidate.stage !== "plan" || candidate.round !== 1
+        || !candidate || candidate.stage !== "plan" || !Number.isInteger(candidate.round) || candidate.round < 1 || candidate.round > 5
         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)) throw new Error("invalid plan checker claim");
       const deadline = Date.parse(candidate.deadline_at);
       const timeout = Math.min(this.opts.modelTimeoutMs ?? 15 * 60_000, deadline - Date.now());
@@ -124,6 +125,7 @@ export class CrossCheckRunner {
       if (isStaleClaimRefusal(err) || steering?.claimLost()) return;
       if (checkerClaimRefused(err) && await custodyLost()) return;
       if (timedOut) reason = "model_timeout";
+      else if (!cancel.signal.aborted && err instanceof CrossCheckCheckerUnavailableError) reason = "checker_unavailable";
       else if (err instanceof CrossCheckMalformedError) reason = "malformed";
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
       try {
@@ -134,10 +136,12 @@ export class CrossCheckRunner {
         if (isStaleClaimRefusal(delivery) || (checkerClaimRefused(delivery) && await custodyLost())) return;
         this.log.warn("cross-check failed verdict delivery failed", { run_id: runId, error: errMessage(delivery) });
       }
+      const failureReason = reason === "checker_unavailable" && err instanceof CrossCheckCheckerUnavailableError
+        ? "plan cross-check: checker unavailable" : "The cross-check did not complete.";
       try {
         await postTerminalState(this.terminalDeps, this.client, {
           runId, claimGeneration: generation, phase: "running", messagesThroughSeq: seq,
-          body: { status: "failed", failure_reason: "The cross-check did not complete.", claim_generation: claim.claim_generation },
+          body: { status: "failed", failure_reason: failureReason, claim_generation: claim.claim_generation },
         });
       } catch (terminal) {
         this.log.warn("cross-check failed-state delivery pending", { run_id: runId, error: errMessage(terminal) });

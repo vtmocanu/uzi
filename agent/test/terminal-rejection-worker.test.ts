@@ -77,9 +77,9 @@ test("heartbeat runs immediately after Register while offered finalize retiremen
   const r = await rig();
   await r.outbox.journalFinalize(run, 2);
   const retire = deferred<void>();
-  const realRetire = r.outbox.retireFinalizes.bind(r.outbox);
+  const realRetire = r.outbox.retireFinalizeIfEligible.bind(r.outbox);
   let retiring = false;
-  r.outbox.retireFinalizes = async (entries) => { retiring = true; await retire.promise; await realRetire(entries); };
+  r.outbox.retireFinalizeIfEligible = async (...args) => { retiring = true; await retire.promise; await realRetire(...args); };
   let heartbeats = 0;
   let claims = 0;
   const client = {
@@ -89,7 +89,7 @@ test("heartbeat runs immediately after Register while offered finalize retiremen
     claimRun: async () => { claims++; return null; },
     claimChat: async () => null,
   } as unknown as WorkerClient;
-  const running = makeWorker(r, client).run(r.controller.signal);
+  const running = makeWorker(r, client, { recoveryInventoryPending: async () => false }).run(r.controller.signal);
   try {
     await until(() => retiring && heartbeats >= 3);
     assert.equal(claims, 0, "post-registration await remains stalled");

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { LimitReachedError } from "../src/limit.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { ScratchPublicationError } from "../src/git.js";
@@ -354,7 +355,7 @@ for (const accepted of [true, false]) {
       assert.ok(feed.includes(guard.serverId), "delivered feed names the SERVER capture UUID");
       assert.ok(feed.includes(h.slice(0, 12)));
       assert.match(feed, /uzi run export/);
-      assert.match(feed, /custody final ACK pending/);
+      assert.match(feed, /local sources retained/);
       assert.equal(guard.finals(), 0, "the still-registered flight cannot finalize inventory");
     } else {
       assert.equal(frozen, 0);
@@ -362,6 +363,55 @@ for (const accepted of [true, false]) {
     }
   });
 }
+
+it("uploaded guarded thin archive preserves the source at retirement while custody is pending", async () => {
+  const claim = gitlabClaim(1962, { claim_generation: 29, inventory_guarded: true });
+  // Published history exceeds the capture cap but its current tree is small.
+  fs.writeFileSync(path.join(fx.originPath, "public-large"), randomBytes(256 * 1024));
+  command(fx.originPath, ["add", "public-large"]);
+  command(fx.originPath, ["-c", "commit.gpgsign=false", "commit", "-m", "public large history"]);
+  fs.unlinkSync(path.join(fx.originPath, "public-large"));
+  command(fx.originPath, ["add", "-u"]);
+  command(fx.originPath, ["-c", "commit.gpgsign=false", "commit", "-m", "public deletion"]);
+  const publicTip = command(fx.originPath, ["rev-parse", "HEAD"]);
+  const { gitlab } = fakeGitlab();
+  const guard = guardedApi(claim, () =>
+    api.states.some(s => s.body.status === "failed") ? "failed" : "running");
+  const produce = git.produceRecoveryBundle.bind(git);
+  git.produceRecoveryBundle = (bare, opts) => produce(bare, { ...opts, maxBytes: 32 * 1024 });
+  let clone = "", head = "";
+  const r = runner({ run: async ctx => {
+    clone = ctx.worktreePath;
+    head = commit(clone, "thin-private.txt");
+    throw new Error("terminal failure with unpublished output");
+  } }, gitlab, "journal-key");
+  // Observe the real disposition's flight flag before executeClaim's retirement logic.
+  const internals = r as unknown as {
+    settleGuardedInventory(...args: [typeof claim, { preserveRecoveryClone: boolean }, ...unknown[]]): Promise<void>;
+  };
+  const settle = internals.settleGuardedInventory.bind(r);
+  const retirementFlags: boolean[] = [];
+  internals.settleGuardedInventory = async (...args) => {
+    await settle(...args);
+    if (args[5] === true) retirementFlags.push(args[1].preserveRecoveryClone);
+  };
+  await r.execute(claim);
+  const records = await r.snapshotBootRecoveries();
+  const uploaded = records.find(record => record.state === "uploaded" && record.coverageDigest);
+  assert.ok(uploaded, "real upload persists an available guarded capture");
+  assert.equal(uploaded.serverCaptureId, guard.serverId);
+  assert.equal(uploaded.selfContained, false);
+  assert.deepEqual(uploaded.prerequisiteShas, [publicTip]);
+  assert.notEqual(uploaded.finalAcknowledged, true);
+  assert.ok(retirementFlags.length > 0, "terminal retirement disposition was observed");
+  assert.ok(retirementFlags.every(flag => flag), "pending uploaded custody sets preserveRecoveryClone before retirement");
+  assert.equal(fs.existsSync(clone), true, "actual source clone survives retirement");
+  assert.equal(command(clone, ["rev-parse", "HEAD"]), head);
+  assert.equal(command(clone, ["show", "HEAD:thin-private.txt"]), "thin-private.txt");
+  const roots = await git.enumerateOwedCandidates(git.barePathFor(fx.originPath), claim.run_id);
+  assert.ok(roots.some(root => root.sha === head && root.contexts.some(c => c.generation === 29)));
+  assert.equal(guard.finals(), 0, "thin capture cannot send FINAL");
+});
 
 it("guarded credential-switch give-up keeps inventory open until normal completion", async () => {
   const claim = gitlabClaim(1948, { claim_generation: 13, inventory_guarded: true });

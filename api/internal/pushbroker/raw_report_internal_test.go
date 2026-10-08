@@ -129,7 +129,7 @@ func TestForwardRawAttachmentFailsBeforeInvocation(t *testing.T) {
 
 func TestForwardRawSuccessCloseCause(t *testing.T) {
 	const ref = "refs/uzi-checkpoints/main"
-	cause := errors.New("original close cause")
+	cause := &typedReportFailure{text: "https://credential@remote.invalid/" + ref + "\n\r\x00\u202e" + "glpat-" + strings.Repeat("E", 20)}
 	for _, wording := range []string{"ordinary close failure", "missing workflow scope", "non-fast-forward"} {
 		t.Run(wording, func(t *testing.T) {
 			closeErr := fmt.Errorf("%s: %w", wording, cause)
@@ -137,6 +137,20 @@ func TestForwardRawSuccessCloseCause(t *testing.T) {
 			result, err := rawFixtureForward(t, context.Background(), sess)
 			if !result.invoked || !result.success || result.rejected || !errors.Is(err, cause) {
 				t.Fatalf("result=%+v error=%v", result, err)
+			}
+			var got *typedReportFailure
+			if !errors.As(err, &got) || got != cause {
+				t.Fatal("lost typed session error")
+			}
+			for _, rendered := range []string{err.Error(), fmt.Sprintf("%v", err), fmt.Sprintf("%+v", err), fmt.Sprintf("%#v", err)} {
+				if !strings.Contains(rendered, "case=session_failure") || !strings.Contains(rendered, "marker=true") || !strings.Contains(rendered, "flush=true") {
+					t.Fatalf("missing parser diagnostics: %q", rendered)
+				}
+				for _, secret := range []string{"credential", "remote.invalid", ref, "glpat-", "\n", "\r", "\x00", "\u202e", wording} {
+					if strings.Contains(rendered, secret) {
+						t.Fatalf("unsafe rendered error: %q", rendered)
+					}
+				}
 			}
 		})
 	}
@@ -271,10 +285,6 @@ func (t rawFixtureRoundTripper) RoundTrip(*http.Request) (*http.Response, error)
 }
 
 func TestRawHTTPObservesOnlyReceivePackBody(t *testing.T) {
-	ep, err := transport.NewEndpoint("https://example.invalid/origin.git")
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, tc := range []struct {
 		method, path string
 		want         bool
@@ -288,17 +298,20 @@ func TestRawHTTPObservesOnlyReceivePackBody(t *testing.T) {
 			report := &rawReport{ref: "refs/uzi-checkpoints/main"}
 			cause := errors.New("close cause")
 			body := &chunkErrorReader{data: rawFixtureWire(t, "unpack ok", "ok "+report.ref), chunk: 1, terminal: io.EOF}
-			rt := &rawReportRoundTripper{original: rawFixtureRoundTripper{body}, endpoint: ep, report: report}
+			rt := &rawReportRoundTripper{original: rawFixtureRoundTripper{body}, report: report}
 			req, err := http.NewRequest(tc.method, "https://example.invalid"+tc.path, nil)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if tc.want {
+				req = req.WithContext(context.WithValue(req.Context(), reportInvocationKey{}, report))
 			}
 			res, err := rt.RoundTrip(req)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if body.reads != 0 {
-				t.Fatal("RoundTrip read response independently")
+			if (body.reads > 0) != tc.want {
+				t.Fatal("incorrect eager attachment")
 			}
 			if _, err := io.Copy(io.Discard, res.Body); err != nil {
 				t.Fatal(err)
@@ -307,7 +320,8 @@ func TestRawHTTPObservesOnlyReceivePackBody(t *testing.T) {
 				t.Fatalf("observed wrong response: complete=%v", report.complete())
 			}
 			body.terminal = cause
-			if res.Body.Close() != cause || body.closes != 1 {
+			closeErr := res.Body.Close()
+			if (tc.want && closeErr != nil) || (!tc.want && closeErr != cause) || body.closes != 1 {
 				t.Fatal("body Close did not delegate")
 			}
 		})

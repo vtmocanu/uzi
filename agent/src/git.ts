@@ -692,6 +692,40 @@ export const RECOVERY_CHUNK_BYTES = 1024 * 1024;
 // branch or a stale bare mirror ref (it is created and deleted under the bare lock).
 export const RECOVERY_BUNDLE_REF = "refs/heads/recovered-source";
 
+/** Inspect at most 16 KiB of retained bytes; never load the pack to parse its header. */
+export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: string): Promise<{
+  prerequisiteShas: string[]; selfContained: boolean;
+}> {
+  const file = await fs.open(bundlePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    const st = await file.stat();
+    if (!st.isFile()) throw new Error("recovery bundle is not a regular file");
+    const bytes = Buffer.alloc(16 * 1024);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    const end = bytes.subarray(0, bytesRead).indexOf("\n\n");
+    if (end < 0 || end + 6 > bytesRead || !bytes.subarray(end + 2, end + 6).equals(Buffer.from("PACK"))) {
+      throw new Error("invalid or excessive recovery bundle header");
+    }
+    const header = bytes.subarray(0, end);
+    // Latin-1 preserves opaque prerequisite comment bytes without masking structural bytes.
+    const lines = header.toString("latin1").split("\n");
+    const version = lines.shift();
+    if (version !== "# v2 git bundle" && version !== "# v3 git bundle") throw new Error("invalid recovery bundle version");
+    if (version === "# v3 git bundle" && lines[0] === "@object-format=sha1") lines.shift();
+    const prerequisites: string[] = [];
+    while (lines[0]?.startsWith("-")) {
+      const line = lines.shift()!;
+      const match = /^-([0-9a-f]{40}) /.exec(line);
+      if (!match || prerequisites.length >= 64 || prerequisites.includes(match[1]!)) throw new Error("invalid recovery prerequisites");
+      prerequisites.push(match[1]!);
+    }
+    if (lines.length !== 1 || lines[0] !== `${sourceSha} ${RECOVERY_BUNDLE_REF}` || !/^[0-9a-f]{40}$/.test(sourceSha)) {
+      throw new Error("recovery bundle source/ref mismatch");
+    }
+    return { prerequisiteShas: prerequisites.sort(), selfContained: prerequisites.length === 0 };
+  } finally { await file.close(); }
+}
+
 /** The verified-bundle facts the recovery uploader binds into the upload manifest and
  *  journals BEFORE upload (PRD #1296 D5). Produced from trusted bare-object operations
  *  only — no source checkout, no repo-controlled hooks/filters. */
@@ -704,13 +738,13 @@ export interface RecoveryBundleResult {
   checksum: string;
   /** Expected ordered-chunk inventory = ceil(byteSize / RECOVERY_CHUNK_BYTES). */
   chunkCount: number;
-  /** The verified public prerequisite closure the bundle imports against — the
-   *  merge-base(H, fresh forge tip) SHA(s), or [] for a self-contained bundle (D5). */
+  /** Actual sorted bundle-header dependencies. Guarded cached dependencies retain
+   *  local custody; legacy dependencies derive from the fresh forge tip. */
   prerequisiteShas: string[];
   /** The resolved original committed head H (40-hex). */
   sourceSha: string;
-  /** True when no forge-reachable prerequisite existed and the bundle carries H's full
-   *  reachable history self-contained within the size limit (D5). */
+  /** True when the verified bundle header declares no external prerequisites and the
+   *  bundle carries H's full reachable history within the size limit (D5). */
   selfContained: boolean;
   /** True when H is ALREADY reachable from the fresh forge tip (merge-base(H, forgeTip) ==
    *  H) — i.e. the committed head is already published, so there is NOTHING to archive.
@@ -1408,6 +1442,10 @@ class OwedCandidateLimitError extends Error {
     this.name = "OwedCandidateLimitError";
   }
 }
+
+export type InventoryReadCause =
+  | "attribution_unreadable" | "clone_ancestor_invalid" | "clone_path_invalid"
+  | "clone_head_unreadable" | "git_or_filesystem_error" | "other";
 
 export class GitCache {
   private readonly reposRoot: string;
@@ -4166,15 +4204,24 @@ export class GitCache {
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
   async readInventoryCloneHeads(barePath: string, runId: string): Promise<
-    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown" }
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
+    let cause: InventoryReadCause = "other";
+    function refuse(failure: InventoryReadCause, message: string): never {
+      cause = failure;
+      throw new Error(message);
+    }
+    // Classification is scoped to the failing operation, never a phase left by a sibling.
+    const atFailure = async <T>(failure: InventoryReadCause, operation: () => Promise<T>): Promise<T> => {
+      try { return await operation(); } catch (err) { cause = failure; throw err; }
+    };
     try {
       if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
-          await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return { kind: "unknown" };
+          await atFailure("git_or_filesystem_error", () => this.resolveRecoveryBareDir(path.basename(barePath))) !== barePath) return { kind: "unknown", cause };
       return await this.withLock(barePath, async () => {
         const paths = new Map<string, { branch: string; runId: string }>();
         const foreignOwners = new Set<string>();
-        const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+        const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
         const entries = config.split("\0");
         const journals = new Map<string, string>();
         for (const item of entries) {
@@ -4187,20 +4234,20 @@ export class GitCache {
           // Retirement clears this key to empty. Like readRecoveryCapture, the
           // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
           if (value === "") continue;
-          const journal = await this.readRecoveryCapture(barePath, branch, entries);
-          if (!journal) throw new Error("unreadable recovery attribution");
+          const journal = await atFailure("attribution_unreadable", () => this.readRecoveryCapture(barePath, branch, entries));
+          if (!journal) refuse("attribution_unreadable", "unreadable recovery attribution");
           if (journal.attemptId !== undefined &&
               (parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot))?.attemptId ?? "") !== journal.attemptId) {
-            throw new Error("recovery attempt identity disagrees with clone path");
+            refuse("clone_path_invalid", "recovery attempt identity disagrees with clone path");
           }
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
           paths.set(journal.clonePath, { branch, runId });
         }
         // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
-        for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
-          if (!parseAttemptLedgerEntry(raw)) throw new Error("unreadable attempt attribution");
+        for (const [, raw] of await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgerRaw(barePath))) {
+          if (!parseAttemptLedgerEntry(raw)) refuse("attribution_unreadable", "unreadable attempt attribution");
         }
-        for (const entry of (await this.readAllAttemptLedgers(barePath)).values()) {
+        for (const entry of (await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgers(barePath))).values()) {
           if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
@@ -4209,64 +4256,67 @@ export class GitCache {
         clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
-          if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("unknown canonical clone key");
-          if (!await this.classifyOwnerClonePath(barePath, owner.branch, key, runId, clone)) {
-            throw new Error("unknown retained clone path");
+          if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) refuse("clone_path_invalid", "unknown canonical clone key");
+          if (!await atFailure("git_or_filesystem_error", () => this.classifyOwnerClonePath(barePath, owner.branch, key, runId, clone))) {
+            refuse("clone_path_invalid", "unknown retained clone path");
           }
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
-              path.dirname(path.dirname(clone)) !== root) throw new Error("unsafe clone path");
+              path.dirname(path.dirname(clone)) !== root) refuse("clone_path_invalid", "unsafe clone path");
           // After attribution validation, probe outer-to-inner: ENOENT skips this clone
           // without reading descendants; every existing ancestor must be a non-symlink directory.
           for (const dir of [root, path.dirname(clone)]) {
             let st: Stats;
             try { st = await fs.lstat(dir); }
-            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; throw err; }
-            if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone parent");
+            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; cause = "clone_ancestor_invalid"; throw err; }
+            if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_ancestor_invalid", "unsafe clone parent");
           }
           let st: Stats;
           try { st = await fs.lstat(clone); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; throw err; }
-          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone");
-          const gitdir = path.join(clone, ".git");
-          const gs = await fs.lstat(gitdir);
-          if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
-          const readRef = async (relative: string): Promise<string> => {
-            const parts = relative.split("/");
-            for (let i = 1; i < parts.length; i++) {
-              const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
-              if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; cause = "git_or_filesystem_error"; throw err; }
+          if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
+          const head = await atFailure("clone_head_unreadable", async () => {
+            const gitdir = path.join(clone, ".git");
+            const gs = await fs.lstat(gitdir);
+            if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
+            const readRef = async (relative: string): Promise<string> => {
+              const parts = relative.split("/");
+              for (let i = 1; i < parts.length; i++) {
+                const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
+                if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+              }
+              const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+              try {
+                const stat = await file.stat();
+                if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
+                const bytes = Buffer.alloc(1024 * 1024 + 1);
+                const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+                if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
+                return bytes.subarray(0, bytesRead).toString("utf8").trim();
+              } finally { await file.close(); }
+            };
+            let head = await readRef("HEAD");
+            if (head.startsWith("ref: ")) {
+              const ref = head.slice(5);
+              if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
+                  ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
+              try { head = await readRef(ref); }
+              catch (err) {
+                if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+                const packed = await readRef("packed-refs");
+                head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+              }
             }
-            const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-            try {
-              const stat = await file.stat();
-              if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
-              const bytes = Buffer.alloc(1024 * 1024 + 1);
-              const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-              if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
-              return bytes.subarray(0, bytesRead).toString("utf8").trim();
-            } finally { await file.close(); }
-          };
-          let head = await readRef("HEAD");
-          if (head.startsWith("ref: ")) {
-            const ref = head.slice(5);
-            if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
-                ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
-            try { head = await readRef(ref); }
-            catch (err) {
-              if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-              const packed = await readRef("packed-refs");
-              head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
-            }
-          }
-          if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+            if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+            return head;
+          });
           heads.add(head);
           clones.push({ clonePath: clone, ...owner });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
       });
     } catch {
-      return { kind: "unknown" };
+      return { kind: "unknown", cause };
     }
   }
 
@@ -6477,8 +6527,11 @@ export class GitCache {
    * a real merge-base with H, that merge-base is the bundle's prerequisite — so a user's
    * CLEAN forge clone (which already has the merge-base) can import it. The runner clone's
    * private `origin/main`, a prior checkpoint wrapper, or an unpublished private base are
-   * NEVER used: the caller passes only a freshly forge-fetched tip, and this method reads
-   * nothing else. When no forge-reachable prerequisite exists (unrelated histories, or H is
+   * NEVER used by the legacy `forgeTip` path. The guarded path first attempts a full
+   * bundle; only on oversize may it use the direct worker bare's cached default ref.
+   * Those cached prerequisites are header-derived and require retained local custody,
+   * since they do not prove current forge reachability. When no forge-reachable prerequisite
+   * exists (unrelated histories, or H is
    * already fully on the forge), it falls back to a SELF-CONTAINED bundle within the size
    * limit; if that exceeds RECOVERY_MAX_BUNDLE_BYTES it throws RecoveryBundleTooLargeError
    * so the caller retains custody and surfaces needs_action rather than truncating. The size
@@ -6491,15 +6544,20 @@ export class GitCache {
    */
   async produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult> {
+    if (opts.guardedDefaultBranch !== undefined && opts.forgeTip !== undefined) {
+      throw new Error("guardedDefaultBranch and forgeTip are mutually exclusive");
+    }
     const maxBytes = opts.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES;
     return this.withLock(barePath, async () => {
+      if (opts.guardedDefaultBranch !== undefined) await this.assertOwedBare(barePath);
+      const graphGit = (args: string[]): Promise<string> => this.runGit(barePath, ["--no-replace-objects", ...args]);
       // Resolve + verify H is a real commit present in the trusted bare. Never trust a
       // caller-supplied SHA blindly; a missing object here means the source is not
       // reproducible and the caller must surface needs_action.
       const h = (
-        await this.runGit(barePath, ["rev-parse", "--verify", `${opts.sourceSha}^{commit}`]).catch(
+        await graphGit(["rev-parse", "--verify", `${opts.sourceSha}^{commit}`]).catch(
           () => "",
         )
       ).trim();
@@ -6514,7 +6572,7 @@ export class GitCache {
       let prereqs: string[] = [];
       if (opts.forgeTip && /^[0-9a-f]{40}$/.test(opts.forgeTip)) {
         const mb = (
-          await this.runGit(barePath, ["merge-base", h, opts.forgeTip]).catch(() => "")
+          await graphGit(["merge-base", h, opts.forgeTip]).catch(() => "")
         ).trim();
         if (/^[0-9a-f]{40}$/.test(mb)) {
           if (mb === h) {
@@ -6537,12 +6595,47 @@ export class GitCache {
       await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
       try {
         // `-` writes the bundle to stdout so the bytes actually written are counted and capped.
-        const args = ["bundle", "create", "-", RECOVERY_BUNDLE_REF];
-        for (const p of prereqs) args.push(`^${p}`);
-        await this.streamBundleWithCap(barePath, args, opts.outPath, maxBytes);
-        // Producer self-check: the bundle's prerequisites resolve against the bare. The
-        // authoritative proof is the clean-clone import in the conformance tests.
-        await this.runGit(barePath, ["bundle", "verify", opts.outPath]);
+        const produce = async (): Promise<void> => {
+          const args = ["--no-replace-objects", "bundle", "create", "-", RECOVERY_BUNDLE_REF];
+          for (const p of prereqs) args.push(`^${p}`);
+          await this.streamBundleWithCap(barePath, args, opts.outPath, maxBytes);
+        };
+        try {
+          await produce();
+        } catch (original) {
+          if (!(original instanceof RecoveryBundleTooLargeError) || opts.guardedDefaultBranch === undefined) throw original;
+          // Only the direct worker cache is admissible. No network or private runner ref is
+          // consulted. Invalid, absent or unrelated cache leaves the original oversized outcome.
+          try {
+            const branch = opts.guardedDefaultBranch;
+            if (!await this.isPlainBranchName(barePath, branch)) throw original;
+            const ref = `refs/remotes/origin/${branch}`;
+            await graphGit(["check-ref-format", ref]);
+            const tip = (await graphGit(["show-ref", "--verify", "--hash", ref])).trim();
+            const direct = (await graphGit(["for-each-ref", "--format=%(refname)|%(objectname)|%(objecttype)|%(symref)|END", ref])).trim();
+            if (direct !== `${ref}|${tip}|commit||END`) throw original;
+            if (!/^[0-9a-f]{40}$/.test(tip) || (await graphGit(["cat-file", "-t", tip])).trim() !== "commit") throw original;
+            const bases = (await graphGit(["merge-base", "--all", h, tip])).trim().split("\n");
+            if (!bases.length || bases.some(sha => !/^[0-9a-f]{40}$/.test(sha))) throw original;
+            prereqs = [...new Set(bases)].sort();
+            if (prereqs.includes(h)) {
+              const parents = (await graphGit(["rev-list", "--parents", "-n", "1", h])).trim().split(" ");
+              if (parents.shift() !== h) throw original;
+              prereqs = [...new Set(parents)].sort();
+              for (const sha of prereqs) {
+                if (!/^[0-9a-f]{40}$/.test(sha) || (await graphGit(["cat-file", "-t", sha])).trim() !== "commit") throw original;
+              }
+            }
+            if (!prereqs.length) throw original;
+          } catch { throw original; }
+          await produce();
+        }
+        await graphGit(["bundle", "verify", opts.outPath]);
+        // Git may advertise boundary commits other than the selected exclusions.
+        prereqs = (await readRecoveryBundleHeader(opts.outPath, h)).prerequisiteShas;
+      } catch (err) {
+        await fs.rm(opts.outPath, { force: true });
+        throw err;
       } finally {
         await this.tryGit(barePath, ["update-ref", "-d", RECOVERY_BUNDLE_REF]);
       }
@@ -7220,7 +7313,7 @@ export class GitCache {
     if (!OID.test(floor) || !OID.test(tip)) return "unknown";
     // tryGitExit (NOT tryGit) so a non-completion — a spawn failure, timeout, or signal kill —
     // surfaces as null rather than tryGit's coerce-to-1, which would misreport it as "divergent".
-    const code = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", floor, tip]);
+    const code = await this.tryGitExit(barePath, ["--no-replace-objects", "merge-base", "--is-ancestor", floor, tip]);
     if (code === 0) return "ancestor";
     if (code === 1) return "divergent";
     // 128 / any other exit = a git error or a missing/unresolvable ref, and null = a spawn error,
@@ -8206,7 +8299,7 @@ export class GitCache {
 
   private async requireOwedCommit(barePath: string, sha: string): Promise<void> {
     if (typeof sha !== "string" || !OWED_OID.test(sha) ||
-        (await this.runGit(barePath, ["cat-file", "-t", sha])).trim() !== "commit") {
+        (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha])).trim() !== "commit") {
       throw new Error("owed candidate is not an actual lowercase commit OID");
     }
   }
@@ -8285,9 +8378,13 @@ export class GitCache {
     } finally { await fs.rm(temp, { force: true }); }
   }
 
-  private async removeOwedFile(barePath: string, name: string): Promise<void> {
+  private async removeOwedFile(barePath: string, name: string, allowMissing = false): Promise<void> {
     const dir = this.owedDirectory(barePath);
-    await fs.unlink(path.join(dir, name));
+    try { await fs.unlink(path.join(dir, name)); }
+    catch (err) {
+      if (allowMissing && (err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
+    }
     const handle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
     try { await handle.sync(); } finally { await handle.close(); }
   }
@@ -8726,6 +8823,115 @@ export class GitCache {
     });
   }
 
+  /** Local archive cleanup is separate from remote publication reconciliation. The caller
+   * supplies authenticated FINAL roots and journal pins. One finite pass under the bare lock;
+   * unknown recovery-source attribution retains custody; tracking consumers retain contexts.
+   * IO failure throws for a later coordinator pass. */
+  async cleanupRecoveryGeneration(barePath: string, context: PositiveOwedCandidateContext,
+    roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
+    coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
+    coveringSha: string, canDelete: () => boolean = () => true): Promise<"removed" | "retained"> {
+    await this.validateOwedContext(barePath, context.branch, context);
+    if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const metadata = await this.readOwedMetadataUnderLock(barePath);
+      if (metadata.names.some(name => name.startsWith(".tmp-"))) return "retained";
+      // Enumerate all physical pins, not just the target run. An orphan candidate after a
+      // ref-first crash is valid metadata and remains selectable on the next cleanup pass.
+      const allRefs = (await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)"]))
+        .trim().split("\n").filter(Boolean).map(line => {
+          const parts = line.split(" ");
+          if (parts.length !== 2 || !OWED_OID.test(parts[1]!)) throw new Error("invalid cleanup ref inventory");
+          return { ref: parts[0]!, sha: parts[1]! };
+        });
+      const runs = new Set([...metadata.contexts.values()].map(c => c.runId));
+      for (const pin of allRefs.filter(p => p.ref.startsWith("refs/uzi-owed/"))) {
+        const match = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40})$/.exec(pin.ref);
+        if (!match || match[2] !== pin.sha || !runs.has(match[1]!)) return "retained";
+      }
+      for (const run of runs) await this.enumerateOwedUnderLock(barePath, run, metadata);
+      // Authenticate receipt/marker consumers even when pending or their tracking ref is gone.
+      // Their identity must survive archive cleanup: archive coverage is not publication proof.
+      for (const name of metadata.names.filter(n => n.startsWith("receipt-") || n.startsWith("governed-"))) {
+        const value = await this.readOwedFile(barePath, name) as TrackingReceipt;
+        if (!value || typeof value.branch !== "string" ||
+            name !== `${name.startsWith("receipt-") ? "receipt" : "governed"}-${this.receiptName(value.branch)}.json`) return "retained";
+        if (name.startsWith("governed-")) {
+          if (JSON.stringify(value) !== JSON.stringify({ version: 1, branch: value.branch })) return "retained";
+        } else {
+          if (Object.keys(value).sort().join(",") !== "branch,context,generation,phase,runId,trackingSha,version" ||
+              value.version !== 1 || !OWED_OID.test(value.trackingSha) ||
+              !["pending", "committed"].includes(value.phase)) return "retained";
+          const consumer = metadata.contexts.get(value.context);
+          if (!consumer || consumer.branch !== value.branch || consumer.runId !== value.runId ||
+              consumer.generation !== value.generation) return "retained";
+        }
+      }
+      // Config and physical tracking refs are consumers too. An indeterminate tracking owner
+      // cannot be treated as publication or as proof that a context is unconsumed.
+      const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+      const exact = metadata.records.filter(r => r.runId === context.runId && r.c.generation === context.generation);
+      for (const record of exact) {
+        if ("origin" in record.c || !roots.some(root => root.sha === record.sha &&
+            root.contexts.some(c => !("origin" in c) && this.contextName(c) === record.contextName))) return "retained";
+        if (await this.ancestry(barePath, record.sha, coveringSha) !== "ancestor") return "retained";
+      }
+      const ownedPins = allRefs.filter(p => p.ref.startsWith(`refs/uzi-coverage/${context.runId}/${context.generation}/`) ||
+        p.ref === recoveryPinRef(context.runId, context.generation));
+      for (const pin of ownedPins) {
+        const known = pin.ref === recoveryPinRef(context.runId, context.generation)
+          ? recoverySources.includes(pin.sha)
+          : coveragePins.some(p => /^[0-9a-f]{64}$/.test(p.fingerprint) &&
+            pin.ref === `refs/uzi-coverage/${context.runId}/${context.generation}/${p.fingerprint}` && pin.sha === p.sha);
+        if (!known) return "retained";
+        // Synthetic archives need not parent earlier synthetic commits. The authenticated
+        // journal supplies their frozen original roots and tree/disposition sources instead.
+        const heads = coveragePins.find(p => p.sha === pin.sha)?.coveredHeads ?? [pin.sha];
+        if (!heads.length) return "retained";
+        for (const head of heads) {
+          if (!OWED_OID.test(head) || await this.ancestry(barePath, head, coveringSha) !== "ancestor") return "retained";
+        }
+      }
+      const open = (): void => {
+        assertResidueQuarantineOpen("git");
+        if (!canDelete()) throw new Error("recovery cleanup source protection changed");
+      };
+      const deleteRef = async (ref: string, sha: string): Promise<void> => {
+        open();
+        await this.runGit(barePath, ["update-ref", "-d", ref, sha]);
+        if (await this.checkedRefSha(barePath, ref) !== undefined) throw new Error("recovery cleanup ref deletion mismatch");
+      };
+      for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
+      for (const sha of new Set(exact.map(r => r.sha))) {
+        const ref = `refs/uzi-owed/${context.runId}/${sha}`;
+        const shared = metadata.records.some(r => r.runId === context.runId && r.sha === sha && !exact.includes(r));
+        if (!shared && allRefs.some(p => p.ref === ref)) await deleteRef(ref, sha);
+      }
+      for (const record of exact) {
+        open();
+        const name = `candidate-${record.runId}-${record.sha}-${record.contextName.slice(8, -5)}.json`;
+        await this.removeOwedFile(barePath, name, true);
+      }
+      // Only positively unconsumed exact-generation contexts can be garbage-collected.
+      // Preserve receipt/marker identity, owner stamps, governed refs and sibling candidates.
+      // Unknown config naming conservatively keeps contexts rather than retiring proof.
+      for (const [name, c] of metadata.contexts) {
+        if (c.runId !== context.runId || c.generation !== context.generation || "origin" in c) continue;
+        const hash = this.receiptName(c.branch);
+        const consumed = metadata.records.some(r => r.contextName === name && !exact.includes(r)) ||
+          metadata.names.some(n => n === `receipt-${hash}.json` || n === `governed-${hash}.json`) ||
+          allRefs.some(p => p.ref === runnerTrackingRef(c.branch)) ||
+          config.split("\0").some(item => item.startsWith(`uzi-trackowner.${c.branch}.`) ||
+            item.startsWith(legacyFlatTrackingOwnerKey(c.branch) + "\n"));
+        if (consumed) continue;
+        open();
+        await this.removeOwedFile(barePath, name, true);
+      }
+      return "removed";
+    });
+  }
+
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
   async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string):
     Promise<{ removedShas: string[]; retainedShas: string[] }> {
@@ -8767,8 +8973,8 @@ export class GitCache {
       if (!roots.length) throw new Error("recovery coverage needs original roots");
       await this.requireOwedCommit(barePath, currentSha);
       for (const root of roots) await this.requireOwedCommit(barePath, root);
-      const tree = (await this.runGit(barePath, ["rev-parse", `${currentSha}^{tree}`])).trim();
-      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["cat-file", "-t", tree])).trim() !== "tree") {
+      const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
+      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", tree])).trim() !== "tree") {
         throw new Error("recovery current tree unavailable");
       }
       const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
@@ -8777,7 +8983,7 @@ export class GitCache {
       do {
         const next: string[] = [];
         for (let start = 0; start < parents.length; start += 32) {
-          const args = ["-c", "commit.gpgsign=false", "commit-tree", tree];
+          const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
           for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
           args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
           const sha = (await this.runGitWithEnv(barePath, args, {
@@ -8795,7 +9001,7 @@ export class GitCache {
       for (const root of [...roots, currentSha]) {
         if (await this.ancestry(barePath, root, sha) !== "ancestor") throw new Error("recovery coverage proof failed");
       }
-      if ((await this.runGit(barePath, ["rev-parse", `${sha}^{tree}`])).trim() !== tree) {
+      if ((await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${sha}^{tree}`])).trim() !== tree) {
         throw new Error("recovery coverage tree mismatch");
       }
       await this.persistOwedContext(context);

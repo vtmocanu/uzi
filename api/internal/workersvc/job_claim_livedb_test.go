@@ -388,7 +388,7 @@ func TestJobEndToEndEphemeralProvisionRegisterClaimLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	inGap := func() bool {
-		rows, err := e.q.ListUnplaceableQueuedRunsForEphemeral(e.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{MaxRows: 1000, MaxPerUser: 1000})
+		rows, err := e.q.ListUnplaceableQueuedRunsForEphemeral(e.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true}, MaxRows: 1000, MaxPerUser: 1000})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -517,7 +517,7 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		if c, err := e.q.CountEphemeralHostedWorkersForUser(e.ctx, u); err != nil || c != 0 {
 			t.Fatalf("ephemeral slot count = %d, %v; want 0 (slot freed)", c, err)
 		}
-		rows, err := e.q.ListUnplaceableQueuedRunsForEphemeral(e.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{MaxRows: 1000, MaxPerUser: 1000})
+		rows, err := e.q.ListUnplaceableQueuedRunsForEphemeral(e.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true}, MaxRows: 1000, MaxPerUser: 1000})
 		if err != nil {
 			t.Fatal(err)
 		}

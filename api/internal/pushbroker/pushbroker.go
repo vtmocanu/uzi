@@ -1082,9 +1082,11 @@ func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMet
 // receiveObservedPack observes the capabilities selected by the caller and uses
 // the complete raw report to classify the same ReceivePack invocation.
 func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession, req *packp.ReferenceUpdateRequest, raw *rawReport) (forwardPackResult, error) {
-	raw.sideband = req.Capabilities.Supports(capability.Sideband64k) || req.Capabilities.Supports(capability.Sideband)
+	raw.sideband64k = req.Capabilities.Supports(capability.Sideband64k)
+	raw.sideband = raw.sideband64k || req.Capabilities.Supports(capability.Sideband)
 	outcome := forwardPackResult{invoked: true}
-	_, err := sess.ReceivePack(ctx, req)
+	_, err := sess.ReceivePack(context.WithValue(ctx, reportInvocationKey{}, raw), req)
+	err = errors.Join(err, raw.finalErr)
 	if raw.exhausted {
 		// ReportStatus.Decode can replace a reader error with "missing flush".
 		// Preserve that returned cause while retaining the bounded reader cause.
@@ -1092,7 +1094,7 @@ func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession,
 	}
 	// ReportStatus discards the command marker. Only the observed, complete raw
 	// report can distinguish "ng <ref> ok" from a successful command.
-	if raw.complete() {
+	if raw.complete() && (!raw.http || (raw.attached && raw.eligible && raw.finalized)) {
 		switch {
 		case raw.unpack != "ok":
 			outcome.rejected, outcome.reason = true, raw.unpack
@@ -1105,6 +1107,11 @@ func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession,
 	if outcome.rejected && err == nil {
 		// The synthesized error omits the raw reason; classification uses reason only.
 		err = errors.New("pushbroker: receive-pack rejected update")
+	}
+	if !outcome.rejected && (!outcome.success || err != nil) {
+		err = raw.unknownError(err)
+	} else if err != nil {
+		err = &safeReportError{text: "pushbroker: receive-pack failed", cause: err}
 	}
 	return outcome, err
 }

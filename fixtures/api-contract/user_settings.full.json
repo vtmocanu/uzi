@@ -1,4 +1,18 @@
 {
+  "cross_check_pins": [
+    {
+      "stage": "x",
+      "harness": "x",
+      "model": "x",
+      "effort": "x",
+      "worker_default_model": "x",
+      "resolved_model": "x",
+      "resolved_effort": "x",
+      "model_source": "x",
+      "effort_source": "x",
+      "active": true
+    }
+  ],
   "default_model": "x",
   "default_effort": "x",
   "default_codex_effort": "x",

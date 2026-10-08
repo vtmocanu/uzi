@@ -55,6 +55,8 @@ type EphemeralSettings interface {
 // EphemeralConfig carries the tuning knobs the provisioner needs (PRD #529 M2), lifted
 // out of config.Config so hostedsvc does not depend on the config package.
 type EphemeralConfig struct {
+	// BackgroundGrace restores background runs to normal priority after this age.
+	BackgroundGrace time.Duration
 	// DockerEnabled is the effective deployment Docker tier (config.WorkerDockerEnabled).
 	DockerEnabled bool
 	// IsolatedLaneEnabled reports whether the deployment enabled the isolated research lane
@@ -167,10 +169,12 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	// query LIMITs are ephemeralProvisionBatch, but the UNION could hold up to 2× that, so
 	// we dedup by run id and re-apply the per-tick LIMIT to the combined set — a run cannot
 	// legitimately be in both sets, but the guard keeps one run from consuming two slots.
+	backgroundGraceCutoff := pgconv.Time(p.now().Add(-p.cfg.BackgroundGrace))
 	gapRuns, err := p.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
-		MaxRows:        ephemeralProvisionBatch,
-		MaxPerUser:     int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
+		BackgroundGraceCutoff: backgroundGraceCutoff,
+		MaxRows:               ephemeralProvisionBatch,
+		MaxPerUser:            int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+		EphemeralLease:        workersvc.LeaseInterval(p.cfg.Lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
 		CodexCuratedModels:  workersvc.CodexCuratedModels(),
 		WorkerDockerEnabled: p.cfg.DockerEnabled,
@@ -180,10 +184,11 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
 	}
 	satRuns, err := p.q.ListSaturationQueuedRunsForEphemeral(ctx, store.ListSaturationQueuedRunsForEphemeralParams{
-		SaturationDelay: durationToInterval(p.cfg.SaturationDelay),
-		MaxRows:         ephemeralProvisionBatch,
-		MaxPerUser:      int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-		EphemeralLease:  workersvc.LeaseInterval(p.cfg.Lease),
+		BackgroundGraceCutoff: backgroundGraceCutoff,
+		SaturationDelay:       durationToInterval(p.cfg.SaturationDelay),
+		MaxRows:               ephemeralProvisionBatch,
+		MaxPerUser:            int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+		EphemeralLease:        workersvc.LeaseInterval(p.cfg.Lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
 		CodexCuratedModels:  workersvc.CodexCuratedModels(),
 		WorkerDockerEnabled: p.cfg.DockerEnabled,
@@ -200,8 +205,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	var laneRuns []store.ListIsolatedQueuedRunsForEphemeralRow
 	if p.cfg.IsolatedLaneEnabled {
 		laneRuns, err = p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
-			MaxRows:    ephemeralProvisionBatch,
-			MaxPerUser: int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+			BackgroundGraceCutoff: backgroundGraceCutoff,
+			MaxRows:               ephemeralProvisionBatch,
+			MaxPerUser:            int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		})
 		if err != nil {
 			return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)

@@ -28,13 +28,14 @@ type healthFakeStore struct {
 	eligibilityCalls []store.CountOnlineWorkersClaimableForRunParams
 
 	Store
-	liveCrossCheck      map[uuid.UUID]bool
-	liveCrossCheckErr   error
-	liveCrossCheckCalls []uuid.UUID
-	active              []store.ListActiveRunsForHealthRow
-	crossCheckRun       store.Run
-	crossCheckWorkers   []store.ListWorkersByUserRow
-	window              map[uuid.UUID][]store.ListRunToolWindowRow
+	liveCrossCheck        map[uuid.UUID]bool
+	liveCrossCheckErr     error
+	liveCrossCheckCalls   []uuid.UUID
+	active                []store.ListActiveRunsForHealthRow
+	crossCheckRun         store.Run
+	crossCheckWorkers     []store.ListWorkersByUserRow
+	crossCheckWorkerCalls []uuid.UUID
+	window                map[uuid.UUID][]store.ListRunToolWindowRow
 	// messages is an optional per-run run_messages log (seq ascending or not; the
 	// fake orders it). When a run has one, BOTH tool-window reads derive from it with
 	// the real queries' filter + ORDER BY seq DESC + LIMIT semantics, so a test can
@@ -140,7 +141,12 @@ func (f *healthFakeStore) HasLivePlanCrossCheck(_ context.Context, id uuid.UUID)
 func (f *healthFakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
 	return f.crossCheckRun, nil
 }
-func (f *healthFakeStore) ListWorkersByUser(context.Context, uuid.UUID) ([]store.ListWorkersByUserRow, error) {
+func (f *healthFakeStore) GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error) {
+	return 1, nil
+}
+
+func (f *healthFakeStore) ListWorkersByUser(_ context.Context, userID uuid.UUID) ([]store.ListWorkersByUserRow, error) {
+	f.crossCheckWorkerCalls = append(f.crossCheckWorkerCalls, userID)
 	return f.crossCheckWorkers, nil
 }
 

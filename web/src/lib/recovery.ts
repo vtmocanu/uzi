@@ -381,7 +381,7 @@ function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkp
         stateLabel: "Decision required",
         summary: (hasArchive
           ? hold.inventory_guarded
-            ? "An earlier recovery archive is available, but final inventory coverage is pending. The worker retains committed work that may be absent from that archive."
+            ? "A recovery archive is available, but custody remains unresolved. Coverage may be incomplete, or recovery may require external commits even when all retained roots are covered. The worker retains the local source."
             : "A recovery archive is available to download, but it may not cover the latest worker-local work. Custody remains open for your decision."
           : hold.capture_state === "preparing" || hold.capture_state === "uploading"
             ? "No server archive is available to download yet. The worker-local source may be the only copy; custody remains open for your decision."

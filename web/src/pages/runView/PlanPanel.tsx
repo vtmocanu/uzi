@@ -26,12 +26,12 @@ const MAX_REVISION_ROUNDS = 3;
 export interface PlanRevision {
   // versions = number of `plan` messages so far (v1, v2, …).
   versions: number;
-  // rounds = number of `plan_feedback` rounds — the "revision N of MAX" counter.
+  // rounds = number of human `plan_feedback` rounds — the "revision N of MAX" counter.
   rounds: number;
   // revising = the LATEST of {`plan`, `plan_revising`} by seq is a `plan_revising`
   // frame, i.e. the planner is reworking and the gate is parked (not open).
   revising: boolean;
-  // latestFeedback = the newest `plan_feedback` steering text (the user's bubble).
+  // latestFeedback = the newest human `plan_feedback` text (the user's bubble).
   latestFeedback: string | null;
   // priorPlans = the plan_md of every SUPERSEDED plan version (all but the latest),
   // oldest-first — the collapsed history accordion once a v2+ is re-gated.
@@ -42,7 +42,9 @@ export interface PlanRevision {
 // direct unit test of the derivation (the component test drives the UI on top of it).
 export function derivePlanRevision(messages: RunMessage[]): PlanRevision {
   const plans = messages.filter((m) => m.kind === "plan");
-  const feedbacks = messages.filter((m) => m.kind === "plan_feedback");
+  const feedbacks = messages.filter(
+    (m) => m.kind === "plan_feedback" && (m.payload as { automatic?: unknown } | null)?.automatic !== true,
+  );
 
   // The gate's live state is the latest of {plan, plan_revising} BY SEQ — a newer
   // `plan` (re-gated) beats an earlier `plan_revising`, and vice-versa.

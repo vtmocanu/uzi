@@ -1157,6 +1157,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Post("/runs/{id}/cross-checks", h.WorkerSubmitPlanCrossCheck)
+		r.Get("/runs/{id}/cross-checks/plan/latest", h.WorkerLatestPlanCrossCheck)
 		r.Get("/runs/{id}/cross-checks/plan/{round}", h.WorkerPlanCrossCheckStatus)
 		r.Post("/runs/{id}/cross-check-verdict", h.WorkerCrossCheckVerdict)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
@@ -1358,6 +1359,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/terminal-rejection-custody", h.WorkerTerminalRejectionCustody)
 		r.Post("/runs/{id}/archives/reserve", h.WorkerRecoveryReserve)
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
+		r.Post("/runs/{id}/archives/{captureID}/reconcile", h.WorkerRecoveryReconcile)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
 		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.

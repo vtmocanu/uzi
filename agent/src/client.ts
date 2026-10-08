@@ -76,6 +76,8 @@ import {
   type CodexReleaseResponse,
   type CodexRefreshRequest,
   type CodexRefreshResponse,
+  type RecoveryReconcileRequest,
+  type RecoveryReconcileResponse,
   type RecoveryReserveRequest,
   type RecoveryReserveResponse,
   type RecoveryUploadManifest,
@@ -92,7 +94,8 @@ import {
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
-  | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed";
+  | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
+  | "approved_not_stored" | "revisions_exhausted";
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -114,17 +117,17 @@ export interface PlanCrossCheckFindings {
 export type PlanCrossCheckResponse = ({ reconciliation?: PlanCrossCheckReconciliation } & (
   | { result: "parked"; verdict: string; reason_class: string; lead_last_seq: number; reconciliation: PlanCrossCheckReconciliation }
   | { result: "no_row"; reason_class: "no_candidate"; lead_last_seq: number }
-  | { result: "candidate"; round: number; checker_run_id: string | null; candidate_digest: string;
+  | { result: "candidate"; round: number; automatic_revision_limit: number; automatic_rounds_enabled: boolean; checker_run_id: string | null; candidate_digest: string;
       candidate_generation: number; candidate: PlanCrossCheckCandidate;
       verdict: "pending" | "approve" | "revise" | "block" | "failed";
       reason_class: "" | "approve" | PlanCrossCheckGateReason;
       findings: PlanCrossCheckFindings | null; deadline_at: string; lead_last_seq: number }));
 const CROSS_CHECK_FAILURE_REASONS = new Set([
   "malformed", "model_error", "model_timeout", "checker_unavailable", "confinement_failed",
-  "timed_out", "superseded", "interrupted",
+  "timed_out", "superseded", "interrupted", "approved_not_stored",
 ]);
 const CROSS_CHECK_GATE_REASONS = new Set([...CROSS_CHECK_FAILURE_REASONS,
-  "revise", "block", "codex_lead_unsupported", "planning_diff_refused", "candidate_refused", "checker_failed"]);
+  "revise", "block", "codex_lead_unsupported", "planning_diff_refused", "candidate_refused", "checker_failed", "revisions_exhausted"]);
 function crossCheckRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -145,7 +148,56 @@ function crossCheckPair(verdict: unknown, reason: unknown): boolean {
     verdict === "failed" ? typeof reason === "string" && CROSS_CHECK_FAILURE_REASONS.has(reason) :
       ["approve", "revise", "block"].includes(verdict as string) && reason === verdict;
 }
-function decodePlanCrossCheckResponse(value: unknown, generation: number): PlanCrossCheckResponse {
+function crossCheckRound(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 5;
+}
+function crossCheckSnapshot(wire: Record<string, unknown>, legacy = false): { automatic_revision_limit: number; automatic_rounds_enabled: boolean } | undefined {
+  if (legacy && wire.round === 1 && !("automatic_revision_limit" in wire) && !("automatic_rounds_enabled" in wire))
+    return { automatic_revision_limit: 0, automatic_rounds_enabled: false };
+  const limit = wire.automatic_revision_limit, enabled = wire.automatic_rounds_enabled;
+  if (!Number.isInteger(limit) || (limit as number) < 0 || (limit as number) > 4 || typeof enabled !== "boolean" ||
+      (!enabled && limit !== 0) || (wire.round as number) > (limit as number) + 1) return undefined;
+  return { automatic_revision_limit: limit as number, automatic_rounds_enabled: enabled };
+}
+
+/** Recovery recommendations only; never an approval proof or candidate. */
+export interface PlanCrossCheckLatestMetadata {
+  result: "no_row" | "latest";
+  round: number;
+  candidate_generation: number;
+  automatic_revision_limit: number;
+  automatic_rounds_enabled: boolean;
+  next_round: number | null;
+  next_round_eligible: boolean;
+  fallback_reason: "" | "approve" | PlanCrossCheckGateReason;
+}
+function decodePlanCrossCheckLatestMetadata(value: unknown): PlanCrossCheckLatestMetadata {
+  const invalid = (): never => { throw new Error("invalid cross-check latest metadata"); };
+  if (!crossCheckRecord(value)) return invalid();
+  const snapshot = crossCheckSnapshot(value);
+  if (!snapshot || typeof value.next_round_eligible !== "boolean" ||
+      (value.next_round !== null && !crossCheckRound(value.next_round)) ||
+      value.next_round_eligible !== (value.next_round !== null) ||
+      typeof value.fallback_reason !== "string" ||
+      !(value.fallback_reason === "" || value.fallback_reason === "approve" || CROSS_CHECK_GATE_REASONS.has(value.fallback_reason)) ||
+      (value.next_round_eligible && value.fallback_reason !== "")) return invalid();
+  if (value.result === "no_row") {
+    if (value.round !== 0 || value.candidate_generation !== 0 || snapshot.automatic_rounds_enabled ||
+        snapshot.automatic_revision_limit !== 0 || value.fallback_reason !== "" ||
+        (value.next_round !== null && value.next_round !== 1)) return invalid();
+  } else if (value.result === "latest") {
+    if (!crossCheckRound(value.round) || !Number.isSafeInteger(value.candidate_generation) ||
+        (value.candidate_generation as number) <= 0 ||
+        (value.next_round !== null && (!snapshot.automatic_rounds_enabled ||
+          value.next_round !== value.round + 1 || value.next_round > snapshot.automatic_revision_limit + 1)) ||
+        (value.fallback_reason === "revisions_exhausted" && (!snapshot.automatic_rounds_enabled ||
+          value.round !== snapshot.automatic_revision_limit + 1))) return invalid();
+  } else return invalid();
+  return { result: value.result, round: value.round as number, candidate_generation: value.candidate_generation as number,
+    ...snapshot, next_round: value.next_round as number | null, next_round_eligible: value.next_round_eligible,
+    fallback_reason: value.fallback_reason as PlanCrossCheckLatestMetadata["fallback_reason"] };
+}
+function decodePlanCrossCheckResponse(value: unknown, generation: number, round: number): PlanCrossCheckResponse {
   const invalid = (): never => { throw new Error("invalid " +
     (crossCheckRecord(value) && value.result === "parked" ? "parked " : "") + "cross-check response"); };
   if (!crossCheckRecord(value)) return invalid();
@@ -172,7 +224,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number): PlanC
     return { result: "parked", verdict: verdict as string, reason_class: reason as string,
       lead_last_seq: reconciliation.leadLastSeq, reconciliation };
   }
-  if (wire.result !== "candidate" || wire.round !== 1 ||
+  const snapshot = crossCheckSnapshot(wire, true);
+  if (wire.result !== "candidate" || !crossCheckRound(wire.round) || wire.round !== round || !snapshot ||
       !Number.isSafeInteger(wire.candidate_generation) || (wire.candidate_generation as number) <= 0 ||
       (wire.checker_run_id !== null && (typeof wire.checker_run_id !== "string" ||
         !/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(wire.checker_run_id))) ||
@@ -213,6 +266,7 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number): PlanC
         Buffer.byteLength(JSON.stringify(f), "utf8") > 32 * 1024) return invalid();
     decoded.findings = { ...f, items: f.items ?? [] };
   }
+  Object.assign(decoded, snapshot);
   decoded.candidate = { ...c, required_capabilities: caps, required_tools: tools };
   return decoded as PlanCrossCheckResponse;
 }
@@ -941,6 +995,7 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
+  private registeredWorkerId: string | undefined;
   private readonly inventoryGuardedClaims = new Set<string>();
   private readonly settledInventoryGuardedClaims = new Set<string>();
 
@@ -1068,6 +1123,7 @@ export class WorkerClient {
     protocolCapabilities?: string[],
     initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
+    this.registeredWorkerId = undefined;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -1125,6 +1181,7 @@ export class WorkerClient {
       res.worker_outbox_max_pending >= 0
         ? Math.floor(res.worker_outbox_max_pending)
         : undefined;
+    this.registeredWorkerId = terminalUUID(res.worker_id) ? res.worker_id.toLowerCase() : undefined;
     return res;
   }
 
@@ -1466,15 +1523,22 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
+  async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal, round = 1): Promise<PlanCrossCheckResponse> {
+    if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
-      { stage: "plan", claim_generation: claimGeneration, ...candidate },
-      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES), claimGeneration);
+      { ...candidate, stage: "plan", claim_generation: claimGeneration, round },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES), claimGeneration, round);
   }
 
   async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
+    if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
-      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal), claimGeneration);
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal), claimGeneration, round);
+  }
+
+  async planCrossCheckLatest(runId: string, generation: number, signal?: AbortSignal): Promise<PlanCrossCheckLatestMetadata> {
+    return decodePlanCrossCheckLatestMetadata(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/latest?claim_generation=${generation}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal));
   }
 
   async reportCrossCheckVerdict(runId: string, claimGeneration: number, result:
@@ -1706,8 +1770,23 @@ export class WorkerClient {
     )) as RecoveryReserveResponse;
   }
 
+  /** Atomically reconcile an exact inventory capture and fence it before granting
+   * replacement authority. JSON POST. Throws RequestError on 4xx/5xx. */
+  async reconcileRecoveryCapture(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse> {
+    if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; capture retained");
+    return await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/reconcile`,
+      req,
+      this.httpTimeoutMs,
+      undefined,
+      // The immutable receipt carries IDs, generation, outcome and optional disposition/evidence;
+      // 16 KiB leaves ample protocol headroom while bounding actual response bytes.
+      16 * 1024,
+    ) as RecoveryReconcileResponse;
+  }
+
   /** By-id status poll of a capture (handles lost ACKs; on restart tells whether the byte
-   *  manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
+   * manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
   async getRecoveryCaptureStatus(
     runId: string,
     captureId: string,
@@ -1936,7 +2015,8 @@ export class WorkerClient {
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
-    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
+    // Bound actual streamed bytes before ownership can authorize recovery retirement.
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024)) as RunOwnershipResponse;
   }
 
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
@@ -2726,6 +2806,7 @@ export class WorkerClient {
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex/release`,
       req,
       signal,
+      "release",
     );
     return validateCodexReleaseResponse(raw, expected);
   }
@@ -2790,7 +2871,7 @@ export class WorkerClient {
     return text ? JSON.parse(text) : undefined;
   }
 
-  private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+  private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal, errorPolicy?: "release"): Promise<unknown> {
     let serialized: string | undefined;
     try { serialized = JSON.stringify(body); } catch { throw new CodexRequestFailure("local"); }
     const timeout = AbortSignal.timeout(this.codexHTTPTimeoutMs);
@@ -2814,8 +2895,8 @@ export class WorkerClient {
       try {
         text = (await readBoundedText(res, ERROR_BODY_MAX_BYTES)).trim();
       } catch {
-        // A received authorization refusal is definite even if its body is lost.
-        if ([400, 401, 403, 404].includes(res.status)) throw new RequestError("POST", path, res.status, "");
+        // Release refusals remain definite when their body is lost; refresh keeps its ambiguity contract.
+        if ((errorPolicy === "release" && !isTransientStatus(res.status)) || [400, 401, 403, 404].includes(res.status)) throw new RequestError("POST", path, res.status, "");
         throw failure();
       }
       throw new RequestError("POST", path, res.status, text);
@@ -2854,6 +2935,33 @@ export class WorkerClient {
           (d.disposition !== "recorded" && d.disposition !== "skipped")) throw terminalResponseError();
     }
     return response as TerminalRejectionsResponse;
+  }
+
+  /** Fresh observation permits report retirement only, never recovery source deletion. */
+  async hasRecoveryRetirementAuthority(runId: string, generation: number, state: "absent" | "pending"): Promise<boolean> {
+    if (!terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0) return false;
+    if (state === "pending" && (!this.registeredWorkerId || !this.hasFeature("terminal_rejection_report"))) return false;
+    const ownership = await this.getRunOwnership(runId);
+    if (!ownership || typeof ownership !== "object" ||
+        !["completed", "failed", "cancelled"].includes(ownership.status) ||
+        !terminalGeneration(ownership.claim_generation) || ownership.claim_generation <= 0) return false;
+    if (ownership.inventory_guarded !== undefined && typeof ownership.inventory_guarded !== "boolean") return false;
+    if (state === "absent" && typeof ownership.inventory_guarded !== "boolean") return false;
+    // Absence is not legacy evidence. An exact explicit server classification is, unless
+    // this process has already observed a guarded claim (including one since settled).
+    if (state === "absent" && ownership.claim_generation === generation && ownership.inventory_guarded === false &&
+        !this.inventoryGuardedClaims.has(`${runId}:${generation}`)) return true;
+    if (!["completed", "failed", "cancelled"].includes(ownership.status) || ownership.claim_generation! < generation) return false;
+    const workerId = this.registeredWorkerId;
+    if (!workerId) return false;
+    const custody = await this.getTerminalRejectionCustody(runId, generation, workerId);
+    if (workerId !== this.registeredWorkerId || !this.hasFeature("terminal_rejection_report") ||
+        !custody || custody.outcome !== "settled" || !custody.complete || !custody.exact_complete ||
+        !custody.sibling_complete || custody.exact_count < 1 || custody.sibling_count !== 0 ||
+        custody.exact_holds.length !== custody.exact_count || custody.sibling_holds.length !== 0 ||
+        !custody.exact_holds.every(h => state === "pending" ? h.state === "discarded" : h.state === "released" || h.state === "discarded")) return false;
+    this.markInventoryGuardedClaimSettled(runId, generation);
+    return true;
   }
 
   async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {

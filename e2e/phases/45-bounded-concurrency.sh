@@ -184,6 +184,8 @@ else
   wait_status "$RUN_KA" awaiting_approval
   wait_status "$RUN_KB" awaiting_approval
   pass "two fresh runs in-flight (both parked at the gate, each holding a slot)"
+  GEN_KA_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_KA'")"
+  GEN_KB_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_KB'")"
 
   # Hard-kill the agent: no graceful drain, no re-register — only the server-side
   # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
@@ -239,5 +241,8 @@ else
   { [ "$MRKA" != null ] && [ "$MRKA" -gt 0 ] && [ "$MRKB" != null ] && [ "$MRKB" -gt 0 ]; } \
     || fail "re-queued runs must still land their MRs after the restart (got A=$MRKA B=$MRKB)"
   pass "both re-queued runs completed after restart (requeue_count>=1), MRs !$MRKA + !$MRKB"
+  # The phase created and killed these exact originals. Their preservation was
+  # asserted above; now record the fixture owner's decision, keeping ready archives.
+  resolve_fixture_source_hold "$RUN_KA" "$GEN_KA_ORIGINAL"
+  resolve_fixture_source_hold "$RUN_KB" "$GEN_KB_ORIGINAL"
 fi
-

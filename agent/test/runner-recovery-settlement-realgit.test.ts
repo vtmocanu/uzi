@@ -582,33 +582,37 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
         ];
       },
     );
-    await runGen2(s, gen2Claim, crashingClient, outbox1);
-    assert.equal(crashingClient.calls.length, 1, "the live settle was attempted after the ACK");
-    assert.equal(pendingAtSettle, false, "the settle ran after the outbox terminal journal was retired, not inside the send");
-    for (const r of restore) r();
-    const settleDir = path.join(git.recoverySettlementRoot, gen2Claim.run_id);
-    for (const f of fs.readdirSync(settleDir)) {
-      const bytes = fs.readFileSync(path.join(settleDir, f), "utf8");
-      assert.ok(!bytes.includes(PAT), "no forge PAT in the settlement journal");
-      assert.doesNotMatch(bytes, /forge_pat|token/i);
-    }
-    const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
-    assert.equal(atCrash!.state, "pending_settle", "the ACK was observed before the crash");
-    // No forge is reachable after the restart: the settle needs none (server-side proof).
-    fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
     try {
-      const { events, calls, s2 } = await bootAndSettle(gen2Claim.run_id, outboxRoot);
-      assert.deepEqual(events, [`settle:${HOLD_G1}`], "nothing to replay; the sweep settles");
-      assert.deepEqual(calls[0]!.req, {
-        predecessor_generation: 1,
-        successor_generation: 2,
-        pushed_sha: gitOut(`${fx.originPath}.gone`, "rev-parse", branchOf(iid)),
-        source_sha: gen1Head,
-        adopted_sha: gen1Head,
-      });
-      assert.deepEqual(await s2.coord.inspect(gen2Claim.run_id), [], "gen1's journal removed after the release");
+      api.setOwnershipStatus(gen2Claim.run_id, "completed", 2, false);
+      await runGen2(s, gen2Claim, crashingClient, outbox1);
+      assert.equal(crashingClient.calls.length, 1, "the live settle was attempted after the ACK");
+      assert.equal(pendingAtSettle, false, "the settle ran after the outbox terminal journal was retired, not inside the send");
+      for (const r of restore) r();
+      const settleDir = path.join(git.recoverySettlementRoot, gen2Claim.run_id);
+      for (const f of fs.readdirSync(settleDir)) {
+        const bytes = fs.readFileSync(path.join(settleDir, f), "utf8");
+        assert.ok(!bytes.includes(PAT), "no forge PAT in the settlement journal");
+        assert.doesNotMatch(bytes, /forge_pat|token/i);
+      }
+      const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
+      assert.equal(atCrash!.state, "pending_settle", "the ACK was observed before the crash");
+      // No forge is reachable after the restart: the settle needs none (server-side proof).
+      fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
+      try {
+        const { events, calls, s2 } = await bootAndSettle(gen2Claim.run_id, outboxRoot);
+        assert.deepEqual(events, [`settle:${HOLD_G1}`], "nothing to replay; the sweep settles");
+        assert.deepEqual(calls[0]!.req, {
+          predecessor_generation: 1,
+          successor_generation: 2,
+          pushed_sha: gitOut(`${fx.originPath}.gone`, "rev-parse", branchOf(iid)),
+          source_sha: gen1Head,
+          adopted_sha: gen1Head,
+        });
+        assert.deepEqual(await s2.coord.inspect(gen2Claim.run_id), [], "gen1's journal removed after the release");
+      } finally {
+        fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
+      }
     } finally {
-      fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
       fs.rmSync(snapRoot, { recursive: true, force: true });
     }
   });

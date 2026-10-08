@@ -44,7 +44,7 @@
 // unbound approve (sent while no gate was visible) is disposed of; an unbound reject or revise and
 // every legacy row keep the epoch rules above; a malformed binding fails closed.
 
-import { RequestError, type InputReceipt, type WorkerClient } from "./client.js";
+import { RequestError, type InputReceipt, type PlanCrossCheckFindings, type WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
 import { InclusionReporter } from "./inclusion-reporter.js";
 import type { Logger } from "./log.js";
@@ -54,8 +54,9 @@ import { errMessage, sleep } from "./util.js";
 /** The outcome of the plan-approval gate. On approve, `selection` is the parsed
  *  `approve_plan` body (PRD #37): the executor resolves it against the run's
  *  detected roster (absent → run default; malformed → own, never repo). A `revise`
- *  (PRD #41) carries the user's feedback: the executor runs a fresh plan turn with it
- *  and re-enters the gate (approve/reject/cancel are terminal; revise is not). */
+ *  (PRD #41) carries revision feedback and re-enters the gate. External steering
+ *  constructs only the human variant; automatic provenance is worker-only and has
+ *  no input receipt to settle (approve/reject/cancel are terminal; revise is not). */
 export type PlanVerdict =
   | { kind: "approve"; approval?: "human"; selection: AgentSelectionParse }
   | {
@@ -73,7 +74,9 @@ export type PlanVerdict =
     }
   | { kind: "reject"; reason: string }
   | { kind: "cancel" }
-  | { kind: "revise"; feedback: string; inputId?: number };
+  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number }
+  | { kind: "revise"; automatic: true; feedback: string; round: number;
+      items?: PlanCrossCheckFindings["items"]; inputId?: never };
 
 /** The resolution of an ask_user park (PRD #88 M1). `cancel` is the same abort the
  *  plan gate sees; it is question-identity-exempt and always wins. */
@@ -1346,13 +1349,19 @@ export class SteeringChannel {
   /** The tick's abort generation. Unlike the executor's shared cancel signal, a declined park
    *  can replace this controller so a later tick may run. */
   private lifecycle = new AbortController();
+  private readonly terminalLifecycle = new AbortController();
   private lifecycleEnded = false;
 
   lifecycleSignal(): AbortSignal {
     return this.lifecycle.signal;
   }
 
+  terminalLifecycleSignal(): AbortSignal {
+    return this.terminalLifecycle.signal;
+  }
+
   abortLifecycle(reason?: unknown, terminal = true): void {
+    if (terminal && !(reason instanceof PauseNowSignal)) this.terminalLifecycle.abort(reason);
     if (terminal) this.lifecycleEnded = true;
     if (!this.lifecycle.signal.aborted) this.lifecycle.abort(reason);
   }

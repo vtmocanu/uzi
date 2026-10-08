@@ -98,8 +98,8 @@ type RecoveryReserveResponse struct {
 // RecoveryUploadManifest is the byte-manifest the worker binds ONCE (compare-and-set, D2)
 // before/at the streaming upload of the verified bundle. ByteSize and Checksum are the
 // complete-bundle facts the server verifies; ChunkCount is the expected ordered-chunk
-// inventory; PrerequisiteShas is the verified public prerequisite closure the bundle
-// imports against (D5). The bundle bytes themselves stream as the request body — they are
+// inventory; PrerequisiteShas records the actual bundle-header dependencies, including
+// cached dependencies for guarded captures (D5), not a fresh public-availability guarantee. The bundle bytes themselves stream as the request body — they are
 // never carried in JSON.
 type RecoveryUploadManifest struct {
 	ByteSize         int64    `json:"byte_size"`
@@ -341,6 +341,27 @@ type RecoveryCustodyAggregateDTO struct {
 type RecoveryCustodyHoldsDTO struct {
 	Aggregate RecoveryCustodyAggregateDTO `json:"aggregate"`
 	Holds     []RecoveryCustodyHoldDTO    `json:"holds"`
+}
+
+// RecoveryReconcileRequest names the saved archive identity for one ended generation.
+type RecoveryReconcileRequest struct {
+	Generation     int64  `json:"generation"`
+	SourceSha      string `json:"source_sha"`
+	CoverageDigest string `json:"coverage_digest"`
+	Checksum       string `json:"checksum"`
+	ByteSize       int64  `json:"byte_size"`
+}
+
+// RecoveryReconcileResponse echoes immutable FINAL receipts; callers must compare
+// the receipt with their saved identity before disposing of local source.
+type RecoveryReconcileResponse struct {
+	RunID           string                    `json:"run_id"`
+	Generation      int64                     `json:"generation"`
+	CaptureID       string                    `json:"capture_id"`
+	Outcome         string                    `json:"outcome"`
+	FinalReceipt    *RecoveryFinalDisposition `json:"final_receipt,omitempty"`
+	ReleaseEvidence string                    `json:"release_evidence,omitempty"`
+	Reason          string                    `json:"reason,omitempty"`
 }
 
 // RecoveryFinalDisposition binds a final archive or empty settled inventory to an exact hold.

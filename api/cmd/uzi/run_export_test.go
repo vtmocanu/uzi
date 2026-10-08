@@ -68,6 +68,14 @@ func TestRunExportHappyPath(t *testing.T) {
 	if !strings.Contains(stdout, "cap-1") || !strings.Contains(stdout, dest) {
 		t.Errorf("confirmation missing capture id / path:\n%s", stdout)
 	}
+	if !strings.Contains(stdout, "bytes verified only") {
+		t.Errorf("export confirmation overstates verification:\n%s", stdout)
+	}
+	for _, want := range []string{"bytes only", "fresh destination clone", "git bundle verify <bundle-path>", "before import or discarding retained source"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("export guidance missing %q:\n%s", want, stderr)
+		}
+	}
 	// The secret-review warning is on STDERR (D6/D7), on every download surface.
 	if !strings.Contains(strings.ToLower(stderr), "secret") {
 		t.Errorf("expected a secret-review warning on stderr:\n%s", stderr)
@@ -97,6 +105,16 @@ func TestRunExportJSONMetadataOnly(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("--json stdout missing %q:\n%s", want, stdout)
 		}
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 7 || result["verified"] != true {
+		t.Fatalf("JSON byte-verification contract changed: %s", stdout)
+	}
+	if !strings.Contains(stderr, "bytes only") || !strings.Contains(stderr, "git bundle verify <bundle-path>") {
+		t.Errorf("JSON export missing dependency guidance on stderr: %s", stderr)
 	}
 	if strings.Contains(stdout, "SECRETLY-BINARY-BUNDLE-BYTES") {
 		t.Errorf("--json stdout leaked raw bundle bytes:\n%s", stdout)

@@ -19,13 +19,13 @@ The child uses ordinary run slots, with expedite priority 2. The lead retains it
 
 ### Exact-plan authority stays on the server
 
-`api/internal/workersvc/cross_check.go` normalizes and stores the candidate and computes its digest over plan, milestones, capabilities, tools, size class, base commit and planning diff. Same-generation retries recover the immutable attempt, including a decided attempt; a mismatched candidate or generation cannot create a second round.
+`api/internal/workersvc/cross_check.go` normalizes and stores the candidate and computes its digest over plan, milestones, capabilities, tools, size class, base commit and planning diff. In the original #2149 round-1 scope, same-generation retries recovered the immutable attempt, including a decided attempt; a mismatched candidate or generation could not create a second round. The dated #2150 extension below replaces that round-1 restriction while preserving exact-identity retry checks.
 
 `SetRunAutopilotPlan` in `api/internal/store/queries/runtime.sql` binds the latest plan-stage APPROVE to an opposite-harness `cross_check` child, current lead claim generation, server digest and matching approval-bearing fields. It freezes those fields in the guarded write. `SetRunRunning`, completion and progress guards prevent bypass through adjacent state reports. These are server storage/lifecycle guarantees; they cannot prevent arbitrary execution by a worker that ignores a refusal. Capability claim gates exclude unaware workers, and the worker treats a refused handoff as fatal.
 
 ### Bounded fallback, terminal delivery exceptions
 
-REVISE, BLOCK, verdict deadline, checker model timeout, malformed result, model/confinement error, unavailable checker, interrupted attempt, candidate/diff refusal and submit failure normally force the human plan gate. A checker pass is not a substitute for an acknowledged exact-plan handoff.
+In the original #2149 scope, REVISE, BLOCK, verdict deadline, checker model timeout, malformed result, model/confinement error, unavailable checker, interrupted attempt, candidate/diff refusal and submit failure normally forced the human plan gate. #2150 adds bounded automatic REVISE and narrowly eligible recovery as described below; the remaining dispositions stay in force. A checker pass is not a substitute for an acknowledged exact-plan handoff.
 
 `agent/src/plan-cross-check-gate.ts` and `agent/src/runner.ts` fail closed on delivery losses:
 
@@ -59,7 +59,7 @@ The three packaged proofs cover different boundaries: fileop Read/write/traversa
 
 Maintainer-provided provenance reports PR2358 reviewer/tester/auditor validation at `631b28a1`, 2262 LiveDB tests and capable-host confinement PASS run by the lander. Those results were not observed or rerun here. Web M1 is committed at `e45d6cb` (implementation `bb0efb31`); the dispatch records `gate:web` PASS (5641 unit tests / 299 files, 8 Chromium tests / 2 files; docs checker PASS) and `npm run build` PASS. The initial web-gate lint failure was fixed and the gate rerun. The build ran before the test-only lint fix, which changed no production source.
 
-The lander retains the capable-host confinement merge gate against the PR head. Hosted acceptance remains maintainer-owned in acceptance issue 2152. Automatic checker revision, the Codex-lead direction, dedicated checker slots, checker model/effort pins and code cross-check remain outside this implementation. Observed at documentation commit `ba73044a`: `task docs:sync` completed; `task gate:web` PASS (5641 unit tests and 8 Chromium tests, including `check-docs:web`), `npm --prefix web run build` PASS, `task gate:repo` PASS and `task gate:api` PASS, including the embedded-docs package. Secrets scanning reported zero tracked-file findings and detected both canaries; SAST reported zero findings and detected its canary. The read-only docs reviewer reported no mandatory or optional findings. These are component-gate results from this run, not a replay of prior LiveDB or capable-host confinement proof. No runtime source or confinement harness changed.
+The lander retains the capable-host confinement merge gate against the PR head. Hosted acceptance remains maintainer-owned in acceptance issue 2152. Automatic checker revision, the Codex-lead direction, dedicated checker slots, checker model/effort pins and code cross-check were outside the original #2149 implementation; #2150 extends automatic revisions below. The other exclusions remain. Observed at documentation commit `ba73044a`: `task docs:sync` completed; `task gate:web` PASS (5641 unit tests and 8 Chromium tests, including `check-docs:web`), `npm --prefix web run build` PASS, `task gate:repo` PASS and `task gate:api` PASS, including the embedded-docs package. Secrets scanning reported zero tracked-file findings and detected both canaries; SAST reported zero findings and detected its canary. The read-only docs reviewer reported no mandatory or optional findings. These are component-gate results from that #2149 documentation pass, not a replay of prior LiveDB or capable-host confinement proof. No runtime source or confinement harness changed.
 
 ## Planning-diff capture: symlinks, gitlinks and budgets (2026-10-07, #2410)
 
@@ -68,3 +68,27 @@ Capture budgets are split: the object-store snapshot copy has its own 128 MiB bu
 Symlink posture: an unchanged tracked symlink is accepted by hashing its raw target against the base blob through a pinned parent descriptor; targets are never opened or followed. Added, removed, retargeted, file/link-swapped and untracked non-ignored symlinks refuse with `unsupported_entry`, and a symlinked `.gitignore` is treated as absent, as Git does.
 
 Gitlinks (mode 160000 at base or index, changed or not) also refuse with `unsupported_entry`. Support is deferred: equal base and index gitlink ids do not prove `git add -A` publishes nothing, since a moved submodule HEAD or a removed directory is staged. It needs a proof that the worktree preserves the base gitlink under publication. Refusal sub-codes are persisted and shown with the gate reason (see `docs/cross-check.md`).
+
+## Automatic rounds extension (2026-10-07, #2150)
+
+[PRD #2150](../prds/done/2150-plan-cross-check-auto-revise.md) extends Claude-lead/Codex-checker plans with bounded automatic REVISE. It leaves #2149's ordinary slots, credentials, confinement, terminal D7 and established-human-gate D16 contracts intact. Codex leads remain unsupported; stage-specific pins, dedicated slots and Code cross-check remain outside this extension. This is not a recertification of #2149's confinement or hosted acceptance.
+
+### Round protocol and immutable budget
+
+Submit holds the current owning lead/generation lock. An omitted requested round means legacy round 1. Same lead/generation/round and canonical candidate digest replay the immutable attempt even if decided; a conflicting candidate or generation at that round refuses. Identical text in a new round still needs an explicit requested round. The exact-plan storage guard binds the latest eligible APPROVE, current generation, digest and canonical approval-bearing fields; stale child verdicts and stale approved-plan writes refuse.
+
+The first candidate snapshots `automatic_rounds_enabled` and `automatic_revision_limit` from claiming-worker capability and `PLAN_CROSS_CHECK_MAX_REVISIONS` (default 2, integer 0–4). Subsequent candidates copy them; configuration changes affect new checks only. The global server-counted budget is limit + 1 candidates across generations, including superseded attempts, with a fresh deadline per candidate. No automatic round spends human `runs.revise_count` or `PLAN_MAX_REVISIONS`. Older workers snapshot false/0 and park REVISE as changes requested; capable workers with limit 0 park REVISE as `plan cross-check: revisions exhausted`.
+
+`cross_check_rounds_v1` is a durable protocol capability for automatic leads and round > 1 child claimability/provisioning, independently of the runtime kill switch. The current-worker-authorized latest GET returns metadata and next-round recommendation only: no candidate, findings, approval proof/grant or writes. Admission and settlement remain server-side write checks, not authority conveyed by this read.
+
+### Preserve decided fallback
+
+The maintainer's **2026-10-07** decision allows fresh-round recovery before an established human gate or durably approved plan for pending interruption strictly before deadline (including lifecycle-settled failed/superseded with proven pre-deadline origin), decided REVISE, and APPROVE never durably stored, marked `approved_not_stored`. They consume the existing budget. Otherwise eligible exhaustion parks as exhausted. Decided BLOCK, timeout and other check failures create no fresh row/child and retain their own reason even when budget is spent; D7 delivery losses stay terminal. D16 human context cannot be adopted from evidence or turned into a fresh check; durable approved plans use existing resume behavior.
+
+The first custody-invalidating transition supplies the authoritative interruption time: direct DB writers use transaction `now()`; frozen writers use the server-provided `now` of that same transition. Persisted `interrupted_at`/decision evidence controls eligibility after lifecycle settlement. A later sweep clock cannot grant recovery; equality and ambiguous legacy evidence fail closed to timeout. See [the requirements matrix](../specs/human.md) for dispositions.
+
+### Settle before automatic advice
+
+Validated usage/preparation/reconciliation must successfully release the actual `reservation.release` before the checked-state barrier is released and awaited successfully. Only then may the lead revise. The automatic path returns `{kind: "revise", feedback, automatic: true}` with no `inputId`; it does not send `awaiting_approval`, use `releaseAppliedGate` or establish a human presentation. SDK/stub executors count human revisions separately and record automatic checker-round identity in the feed. Human input cannot forge automatic provenance.
+
+`buildAutomaticRevisionPrompt` is separate from the human builder and stage-neutral. Checker advice and optional prior-plan context receive separate nonce fences; trusted framing calls the advice potentially wrong or hostile and requires verification against code, issue and uzi rules, declining conflicts. This shared builder does not imply Code cross-check is implemented. Summary evidence describes the latest checked candidate; earlier rounds remain feed history.

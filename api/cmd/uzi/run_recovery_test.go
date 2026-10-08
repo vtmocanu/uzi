@@ -734,18 +734,23 @@ func TestRecoveryHelpSeparatesExportFromAttention(t *testing.T) {
 	}
 }
 
-func TestGuardedSourceOnlyLineDistinguishesEarlierArchive(t *testing.T) {
+func TestGuardedSourceOnlyLineDistinguishesAvailableArchive(t *testing.T) {
 	h := apitypes.RecoveryCustodyHoldDTO{
-		ID: "guarded", Attention: "source_only", InventoryGuarded: true,
+		ID: "guarded", State: "open", Attention: "source_only", InventoryGuarded: true,
 		HasAvailableCapture: true, WorkerName: "worker",
 	}
-	line := sourceOnlyLine(h)
-	if !strings.Contains(line, "earlier recovery archive available") ||
-		!strings.Contains(line, "final inventory disposition is pending") {
-		t.Fatalf("incomplete inventory guidance: %q", line)
+	line, stderr, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{
+		Holds: []apitypes.RecoveryCustodyHoldDTO{h},
+	}}), "run", "recovery")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(line, "recovery archive available") ||
+		!strings.Contains(line, "remains unresolved and its local source is retained") {
+		t.Fatalf("unresolved custody guidance: %q", line)
 	}
 	if strings.Contains(line, "no recovery archive") || strings.Contains(line, "export unavailable") {
-		t.Fatalf("earlier archive incorrectly hidden: %q", line)
+		t.Fatalf("available archive incorrectly hidden: %q", line)
 	}
 }
 

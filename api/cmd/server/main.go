@@ -302,20 +302,22 @@ func run() error {
 	// approval-gate handler needs its SubmitInput and the socket manager captures
 	// its inbound handler at construction.
 	wsvc := workersvc.New(q, box, workersvc.Params{
-		RunTimeout:                  cfg.RunTimeout,
-		RunWallCeiling:              cfg.RunWallCeiling,
-		PlanCrossCheckTimeout:       cfg.PlanCrossCheckTimeout,
-		RunIdleTimeout:              cfg.RunIdleTimeout,
-		WorkerTaskIdleTimeout:       cfg.WorkerTaskIdleTimeout,
-		RunMaxIterations:            cfg.RunMaxIterations,
-		HandoffRunTimeout:           cfg.HandoffRunTimeout,
-		HandoffRunMaxIterations:     cfg.HandoffRunMaxIterations,
-		PlanMaxRevisions:            cfg.PlanMaxRevisions,
-		QuestionMax:                 cfg.QuestionMax,
-		QuestionTimeoutSeconds:      cfg.QuestionTimeoutSeconds,
-		CompletionHoldWindowSeconds: cfg.CompletionHoldWindowSeconds,
-		RunMaxRequeues:              cfg.RunMaxRequeues,
-		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
+		RunTimeout:                    cfg.RunTimeout,
+		RunWallCeiling:                cfg.RunWallCeiling,
+		PlanCrossCheckTimeout:         cfg.PlanCrossCheckTimeout,
+		PlanCrossCheckMaxRevisions:    cfg.PlanCrossCheckMaxRevisions,
+		PlanCrossCheckMaxRevisionsSet: true,
+		RunIdleTimeout:                cfg.RunIdleTimeout,
+		WorkerTaskIdleTimeout:         cfg.WorkerTaskIdleTimeout,
+		RunMaxIterations:              cfg.RunMaxIterations,
+		HandoffRunTimeout:             cfg.HandoffRunTimeout,
+		HandoffRunMaxIterations:       cfg.HandoffRunMaxIterations,
+		PlanMaxRevisions:              cfg.PlanMaxRevisions,
+		QuestionMax:                   cfg.QuestionMax,
+		QuestionTimeoutSeconds:        cfg.QuestionTimeoutSeconds,
+		CompletionHoldWindowSeconds:   cfg.CompletionHoldWindowSeconds,
+		RunMaxRequeues:                cfg.RunMaxRequeues,
+		WorkerHeartbeatStale:          cfg.WorkerHeartbeatStale,
 		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval.
 		WorkerHeartbeatInterval: cfg.WorkerHeartbeatInterval,
 		// PRD #1390 M1 (D1): the boot-grace window that suppresses the stale-worker passes
@@ -766,6 +768,7 @@ func run() error {
 		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
 		SaturationDelay:     cfg.EphemeralSaturationDelay,
+		BackgroundGrace:     cfg.WorkerBackgroundGrace,
 		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
 		// live lease and provisioning evicts the oldest releasable one at the cap.
 		Lease: cfg.EphemeralLease,

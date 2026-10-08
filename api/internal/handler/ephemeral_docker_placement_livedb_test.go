@@ -62,7 +62,7 @@ func (fx *ephemeralFixture) dockerPlacementSnapshot(pref, tier bool, list string
 		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
 		{Key: settings.KeyDockerRepoAllowlist, Value: value},
 	}}, time.Minute)
-	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{
+	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
 		DockerEnabled: tier, MaxPerUser: max, DefaultSize: "m", Lease: 2 * time.Hour, SaturationDelay: time.Hour,
 	})
 	return p, probe, ids
@@ -200,7 +200,7 @@ func TestEphemeralDockerNoWorkersGapBaselineLiveDB(t *testing.T) {
 			if tc.fail {
 				ids = []uuid.UUID{}
 			}
-			gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+			gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 				MaxRows: 10000, MaxPerUser: 2, EphemeralLease: workersvc.LeaseInterval(2 * time.Hour),
 				WorkerDockerEnabled: true, DockerRepoAllowlist: ids, CodexCuratedModels: workersvc.CodexCuratedModels(),
 			})
@@ -247,7 +247,7 @@ func TestEphemeralDockerSaturationLeaseMirrorsLiveDB(t *testing.T) {
 			_, _, ids := fx.dockerPlacementSnapshot(true, true, "target", false, 2)
 			for _, pref := range []bool{true, false} {
 				cliMustExec(t, fx.pool, "UPDATE users SET ephemeral_docker_enabled=$2 WHERE id=$1", fx.userID, pref)
-				rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+				rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 					MaxRows: 10000, MaxPerUser: 2, SaturationDelay: workersvc.LeaseInterval(time.Hour),
 					EphemeralLease: workersvc.LeaseInterval(2 * time.Hour), WorkerDockerEnabled: true,
 					DockerRepoAllowlist: ids, CodexCuratedModels: workersvc.CodexCuratedModels(),
@@ -276,7 +276,7 @@ func TestEphemeralDockerPersistentSaturationDebounceLiveDB(t *testing.T) {
 	fx.activeRunOn(busy)
 	run := fx.queuedRun([]string{})
 	p, _, ids := fx.dockerPlacementSnapshot(true, true, "target", false, 2)
-	gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+	gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 		MaxRows: 10000, MaxPerUser: 2, EphemeralLease: workersvc.LeaseInterval(2 * time.Hour),
 		WorkerDockerEnabled: true, DockerRepoAllowlist: ids, CodexCuratedModels: workersvc.CodexCuratedModels(),
 	})
@@ -292,7 +292,7 @@ func TestEphemeralDockerPersistentSaturationDebounceLiveDB(t *testing.T) {
 		if old {
 			cliMustExec(t, fx.pool, "UPDATE runs SET status_since=now()-interval '2 hours' WHERE id=$1", run)
 		}
-		rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+		rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 			MaxRows: 10000, MaxPerUser: 2, SaturationDelay: workersvc.LeaseInterval(time.Hour),
 			EphemeralLease: workersvc.LeaseInterval(2 * time.Hour), WorkerDockerEnabled: true,
 			DockerRepoAllowlist: ids, CodexCuratedModels: workersvc.CodexCuratedModels(),

@@ -26,6 +26,23 @@ func boundedCheckerFixture(t *testing.T) *ClaimPayload {
 			PlanCrossCheckCandidate: c}}
 }
 
+func TestPlanCrossCheckRoundAwareWireBounds(t *testing.T) {
+	for _, round := range []int32{1, 2, 3, 4, 5} {
+		p := boundedCheckerFixture(t)
+		p.CrossCheck.Round = round
+		if _, err := MarshalCrossCheckClaim(p); err != nil {
+			t.Fatalf("bounded round %d refused on wire: %v", round, err)
+		}
+	}
+	for _, round := range []int32{0, 6} {
+		p := boundedCheckerFixture(t)
+		p.CrossCheck.Round = round
+		if _, err := MarshalCrossCheckClaim(p); !errors.Is(err, ErrCrossCheckRefused) {
+			t.Fatalf("invalid round %d accepted: %v", round, err)
+		}
+	}
+}
+
 func TestCheckerContextPayloadBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

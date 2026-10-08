@@ -1838,16 +1838,17 @@ func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist,
 // testParams are sane fixed knobs for the tests.
 func testParams() Params {
 	return Params{
-		RunTimeout:             2 * time.Hour,
-		RunWallCeiling:         8 * time.Hour,
-		RunIdleTimeout:         10 * time.Minute,
-		WorkerTaskIdleTimeout:  30 * time.Minute, // PRD #517 M5 interactive-task park idle cap
-		RunMaxIterations:       5,
-		PlanMaxRevisions:       3,
-		QuestionMax:            5,     // PRD #88 clarification-question cap
-		QuestionTimeoutSeconds: 86400, // PRD #88 answer deadline (24h)
-		RunMaxRequeues:         1,
-		WorkerHeartbeatStale:   45 * time.Second,
+		RunTimeout:                 2 * time.Hour,
+		RunWallCeiling:             8 * time.Hour,
+		RunIdleTimeout:             10 * time.Minute,
+		WorkerTaskIdleTimeout:      30 * time.Minute, // PRD #517 M5 interactive-task park idle cap
+		RunMaxIterations:           5,
+		PlanMaxRevisions:           3,
+		PlanCrossCheckMaxRevisions: 2,
+		QuestionMax:                5,     // PRD #88 clarification-question cap
+		QuestionTimeoutSeconds:     86400, // PRD #88 answer deadline (24h)
+		RunMaxRequeues:             1,
+		WorkerHeartbeatStale:       45 * time.Second,
 		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
 		// (45s + 15s = 60s), so a Service from testParams() computes the same fence as production.
 		WorkerHeartbeatInterval: 15 * time.Second,

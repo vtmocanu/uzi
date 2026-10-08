@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { handleInput } from "./engine";
-import { listMessages, patchRun, state } from "./store";
+import { appendMessage, listMessages, patchRun, state } from "./store";
 import {
   deriveOpenQuestion,
   encodeAnswerBody,
@@ -188,6 +188,17 @@ describe("mock engine: revise_plan no longer falls through (PRD #41, fixed with 
     drain();
     expect(state.runs.get(RUN_ID)!.status).toBe("awaiting_approval");
     expect(messagesOfKind("plan").length).toBeGreaterThan(0);
+  });
+
+  it("does not consume human rounds for automatic feedback in a mixed feed", () => {
+    appendMessage(RUN_ID, "plan_feedback", "lead", { feedback: "auto first", automatic: true, cross_check_round: 1 });
+    appendMessage(RUN_ID, "plan_feedback", "lead", { feedback: "auto second", automatic: true, cross_check_round: 2 });
+    handleInput(RUN_ID, "revise_plan", "human request");
+    expect(last("plan_revising")!.payload).toEqual({ round: 1 });
+    drain();
+    appendMessage(RUN_ID, "plan_feedback", "lead", { feedback: "legacy human request", automatic: "true" });
+    handleInput(RUN_ID, "revise_plan", "second request");
+    expect(last("plan_revising")!.payload).toEqual({ round: 3 });
   });
 
   it("counts rounds from the feed rather than a parallel counter", () => {

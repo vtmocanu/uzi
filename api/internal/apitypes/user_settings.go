@@ -1,10 +1,28 @@
 package apitypes
 
+// CrossCheckPinDTO keeps stored pins separate from resolved family defaults.
+// ResolvedModel is null when the inactive Claude cell inherits the SDK model.
+type CrossCheckPinDTO struct {
+	Stage   string  `json:"stage"`
+	Harness string  `json:"harness"`
+	Model   *string `json:"model"`
+	Effort  *string `json:"effort"`
+	// WorkerDefaultModel resolves this cell without checker pins from the same read snapshot.
+	// Null delegates model selection to the Claude SDK/account.
+	WorkerDefaultModel *string `json:"worker_default_model"`
+	ResolvedModel      *string `json:"resolved_model"`
+	ResolvedEffort     string  `json:"resolved_effort"`
+	ModelSource        string  `json:"model_source"`
+	EffortSource       string  `json:"effort_source"`
+	Active             bool    `json:"active"`
+}
+
 // UserSettingsDTO mirrors the handler's own (unexported) userSettingsDTO for the
 // CLI to decode GET /api/me/settings (envelope: {"settings": {...}}). It is a
 // decoding-tolerant mirror — the handler owning its own type is intentional; the
 // TUI only reads SidebarTokenIds today, the rest are carried for fidelity.
 type UserSettingsDTO struct {
+	CrossCheckPins []CrossCheckPinDTO `json:"cross_check_pins"`
 	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): a legacy compatibility projection of the
 	// effective harness's lane, kept one release. New clients read the two lanes below.
 	DefaultModel *string `json:"default_model"`

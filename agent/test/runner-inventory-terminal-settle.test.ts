@@ -11,7 +11,7 @@ import { RunRunner } from "../src/runner.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal } from "../src/terminal-resolve.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
 installHarness();
 function command(dir: string, args: string[]): string {
@@ -79,11 +79,39 @@ it(`guarded completed run whose inventory was released retires its clone`, async
 
 // Construct the post-completion stores directly: execute() may retire an uploaded clone.
 // The callback-free coordinator uploads but retains FINAL while an attributed clone exists.
-it("completed guarded run settles its persisted terminal after loss of attributed clone parents", async () => {
+it("completed guarded run settles its persisted terminal after loss of attributed clone parents", async t => {
   const claim = gitlabClaim(2433, { claim_generation: 29, inventory_guarded: true });
   const generation = claim.claim_generation!;
   const branch = "agent/issue-2433", token = "inventory-restart-journal-key";
   const server = guardedServer(claim, () => "completed");
+  api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report"]);
+  const originalFetch = globalThis.fetch;
+  const custodyReads: { runId: string; generation: number; workerId: string; open: boolean }[] = [];
+  let workerId: string;
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.origin !== new URL(baseUrl).origin ||
+        url.pathname !== `/api/worker/runs/${claim.run_id}/terminal-rejection-custody`) {
+      return originalFetch(input, init);
+    }
+    assert.equal(init?.method ?? (input instanceof Request ? input.method : "GET"), "GET");
+    const requestedGeneration = Number(url.searchParams.get("generation"));
+    assert.equal(requestedGeneration, generation);
+    assert.ok(workerId, "custody is read only after real registration");
+    const open = server.isOpen();
+    custodyReads.push({ runId: claim.run_id, generation: requestedGeneration, workerId, open });
+    return Response.json({
+      run_id: claim.run_id, worker_id: workerId, generation: requestedGeneration,
+      exact_holds: [{ id: "33333333-3333-4333-8333-333333333333", state: open ? "open" : "released" }],
+      sibling_holds: [], exact_count: 1, sibling_count: 0,
+      complete: true, exact_complete: true, sibling_complete: true,
+      outcome: open ? "retained" : "settled",
+    });
+  });
+  const registration = await client.register("test");
+  assert.ok(registration.worker_id, "registration returns a worker identity");
+  workerId = registration.worker_id;
+  assert.equal(client.hasFeature("terminal_rejection_report"), true);
   const bare = await git.ensureClone(fx.originPath);
   const attemptId = mintAttemptId(generation);
   const clone = await git.runnerCloneForBranch(bare, branch, "issue-2433", {
@@ -188,6 +216,11 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   await replay();
   assert.ok(await freshOutbox.readTerminalJournal(claim.run_id, generation), "pre-FINAL replay retains the journal");
   assert.equal(server.finals(), 0);
+  assert.ok(custodyReads.length > 0, "pre-FINAL replay reads custody authority");
+  assert.ok(custodyReads.every(read =>
+    read.runId === claim.run_id && read.generation === generation &&
+    read.workerId === workerId && read.open), "open exact-generation custody retains the journal");
+  const preFinalCustodyReads = custodyReads.length;
   const release = client.releaseRecoveryCustody.bind(client);
   client.releaseRecoveryCustody = async (runId, gen, evidence, disposition) => {
     assert.equal(runId, claim.run_id);
@@ -204,13 +237,21 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   const persisted = await new RecoveryCoordinator({
     client, git: freshGit, log: nullLogger(), recoveryRoot: freshGit.recoveryRoot, workerToken: token,
   }).inspect(claim.run_id);
-  assert.equal(persisted.find(record => record.captureId === uploaded.captureId)?.finalAcknowledged, true);
+  // Successful FINAL removes the generation's ACK after local cleanup.
+  assert.deepEqual(persisted, []);
   assert.equal(server.finals(), 1, "exactly one successful custody release");
   assert.equal(server.isOpen(), false);
   assert.deepEqual((await client.listRecoveryHolds(claim.run_id)).holds, []);
   assert.equal(await freshRunner.recoveryInventoryPending(claim.run_id, generation), false);
+  assert.ok(custodyReads.length > preFinalCustodyReads, "local cleanup requires a fresh custody read");
+  assert.ok(custodyReads.slice(preFinalCustodyReads).every(read =>
+    read.runId === claim.run_id && read.generation === generation &&
+    read.workerId === workerId && !read.open), "released exact-generation custody authorizes retirement");
+  const postReleaseCustodyReads = custodyReads.length;
   assert.ok(await freshOutbox.readTerminalJournal(claim.run_id, generation), "FINAL alone does not retire the outbox");
   await replay();
+  assert.ok(custodyReads.length > postReleaseCustodyReads, "terminal retirement rechecks released custody");
+  assert.ok(custodyReads.slice(postReleaseCustodyReads).every(read => !read.open));
   assert.equal(await freshOutbox.readTerminalJournal(claim.run_id, generation), undefined);
   assert.deepEqual(freshOutbox.listPendingTerminals(), []);
   assert.equal(freshOutbox.depthFor(claim.run_id)?.pendingTerminal ?? 0, 0);

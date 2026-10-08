@@ -29,6 +29,50 @@ async function rig() {
 const applied = (status = "completed"): StateAck => ({ applied: true, status });
 
 describe("Worker heartbeat terminal sweep (issue #1512)", () => {
+  it("live G2 terminal retirement preserves guarded pending G1 finalize", async () => {
+    const outbox = await rig();
+    let beats = 0;
+    let registrations = 0;
+    let g1Pending = true;
+    const checked: number[] = [];
+    const client = sweepClient({ heartbeat: async () => { beats++; }, reportState: async () => applied() });
+    const register = client.register.bind(client);
+    client.register = async (...args) => {
+      registrations++;
+      return register(...args);
+    };
+    const w = startSweepWorker({
+      outbox, client,
+      runner: { recoveryInventoryPending: async (_runId, generation) => {
+        checked.push(generation);
+        return generation === 1 && g1Pending;
+      } },
+    });
+    try {
+      await pollUntil(() => beats >= 3, 3000, "boot completed");
+      await outbox.journalFinalize(RUN, 1);
+      await outbox.journalFinalize(RUN, 2);
+      await outbox.journalTerminal(RUN, 2, "running", 0, { status: "completed" });
+      await pollUntil(() => checked.includes(1) && !outbox.hasPendingTerminal(RUN, 2) &&
+        !outbox.listPendingFinalizes().some(e => e.claim_generation === 2), 3000, "G2 retired");
+      const seen = beats;
+      await pollUntil(() => {
+        assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN, claim_generation: 1 }],
+          "guarded G1 finalize remains pending during live heartbeats");
+        assert.equal(outbox.hasPendingTerminal(RUN, 2), false, "G2 terminal stays retired");
+        assert.equal(registrations, 1, "the worker has not re-registered");
+        return beats >= seen + 5;
+      }, 3000, "several heartbeats preserve guarded G1");
+      g1Pending = false;
+      await pollUntil(() => outbox.listPendingFinalizes().length === 0, 3000,
+        "a live heartbeat retires G1 after its recovery inventory clears");
+    } finally { await w.stop(); }
+    assert.ok(checked.includes(1), "G1 recovery inventory was checked");
+    assert.equal(outbox.hasPendingTerminal(RUN, 2), false, "G2 terminal remains retired");
+    assert.deepEqual(outbox.listPendingFinalizes(), []);
+    assert.equal(registrations, 1, "G1 retirement requires no restart or re-registration");
+  });
+
   it("2. a no-spill `completed` journal whose boot send failed is delivered by a later heartbeat", async () => {
     const outbox = await rig();
     await outbox.journalTerminal(RUN, 3, "running", 0, { status: "completed", branch: "agent/issue-1" });

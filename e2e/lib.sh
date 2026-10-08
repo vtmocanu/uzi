@@ -426,33 +426,123 @@ wait_run_mr_state()   { wait_eq "$2" "${3:-30}" "run $1 mr_state" run_mr_state "
 # (a stall needs ~75s of quiet plus a sweep tick).
 wait_health()         { wait_eq "$2" "${3:-120}" "run $1 health" run_health "$1"; }
 
-# wait_custody_headroom NEEDED [TIMEOUT]: fresh claims each add a hold. Read the owner
-# aggregate used by the recovery UI (GetCustodyAggregateForOwner), which counts the
-# same state='open' owner holds as ClaimRun's custody admission predicate. Never delete
-# or discard cross-phase evidence to make room, including source-only owner decisions.
+# wait_custody_headroom NEEDED [TIMEOUT]: reserve the case's requested admission
+# headroom using the canonical admission_counted_holds aggregate (ADR-2445).
+# Total open custody is diagnostic only. Preserve cross-phase source protection.
 wait_custody_headroom() {
-  local needed="$1" timeout="${2:-180}" start=$SECONDS snapshot count limit
+  local needed="$1" timeout="${2:-180}" start=$SECONDS snapshot count open_count limit
   [[ "$needed" =~ ^[1-9][0-9]*$ ]] || fail "custody headroom: invalid needed=$needed"
   while :; do
     snapshot="$(apiget /api/recovery/holds)"
-    count="$(printf '%s' "$snapshot" | jq -er '.aggregate.open_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid open count"
+    count="$(printf '%s' "$snapshot" | jq -er '.aggregate.admission_counted_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid admission count"
+    open_count="$(printf '%s' "$snapshot" | jq -er '.aggregate.open_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid open count"
     limit="$(printf '%s' "$snapshot" | jq -er '.aggregate.custody_hold_limit | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid admission limit"
     if [ "$limit" = 0 ] || [ $((count + needed)) -le "$limit" ]; then
-      pass "custody headroom: open=$count limit=$limit needed=$needed; evidence preserved"
+      pass "custody headroom: counted=$count open=$open_count limit=$limit needed=$needed; evidence preserved"
       printf '%s' "$snapshot" | jq -c '.holds[] | select(.state=="open" and .attention=="source_only") | {id,run_id,generation,attention}'
       return 0
     fi
     if [ $((SECONDS - start)) -ge "$timeout" ]; then
-      printf 'custody headroom exhausted: open=%s limit=%s needed=%s\n' "$count" "$limit" "$needed"
+      printf 'custody headroom exhausted: counted=%s open=%s limit=%s needed=%s\n' "$count" "$open_count" "$limit" "$needed"
       printf '%s' "$snapshot" | jq -c '.holds[] | select(.state=="open") | {id,run_id,generation,attention,capture_state}'
       local run
       while IFS= read -r run; do
         apiget "/api/runs/$run" | jq -c '.run | {id,status,claim_generation}'
       done < <(printf '%s' "$snapshot" | jq -r '[.holds[] | select(.state=="open") | .run_id] | unique[]')
-      fail "custody headroom timeout: open=$count limit=$limit needed=$needed after ${timeout}s; evidence preserved"
+      fail "custody headroom timeout: counted=$count open=$open_count limit=$limit needed=$needed after ${timeout}s; evidence preserved"
     fi
     sleep 2
   done
+}
+
+# End-of-fixture owner choice, ONLY for an explicit run/generation whose phase
+# already proved preservation. Captured holds wait for the worker's exact archive
+# FINAL; only capture-less holds use owner discard. Available archives are preserved.
+resolve_fixture_source_hold() {
+  local run="$1" generation="$2" view hold id state before after reply
+  local timeout="${3:-120}" restored_at="${4:-}" start=$SECONDS snapshot
+  [[ "$run" =~ ^[0-9a-fA-F-]{36}$ && "$generation" =~ ^[1-9][0-9]*$ ]] \
+    || fail "invalid fixture hold identity: run=$run generation=$generation"
+  apiget "/api/runs/$run" | jq -e --arg run "$run" '.run.id==$run and (.run.status|IN("completed","failed","cancelled"))' >/dev/null \
+    || fail "fixture hold run is not terminal: $run"
+  view="$(apiget /api/recovery/holds)"
+  hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
+    '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
+  [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
+  id="$(printf '%s' "$hold" | jq -r '.[0].id')"
+  [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid fixture hold id: $hold"
+  state="$(printf '%s' "$hold" | jq -r '.[0].state')"
+  case "$state" in
+    released|discarded) pass "fixture hold already resolved: run=$run generation=$generation hold=$id"; return ;;
+    open) ;;
+    *) fail "unexpected fixture hold state: $hold" ;;
+  esac
+  if printf '%s' "$hold" | jq -e '.[0] | .has_available_capture==true and .capture_state=="available"' >/dev/null; then
+    before="$(apiget "/api/runs/$run/archives" | jq -ce '.archives|select(type=="array")|[.[]|select(.state=="available")|{id,checksum,byte_size}]')" \
+      || fail "fixture archive listing malformed: run=$run hold=$id"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture receipt timeout: $timeout"
+    while :; do
+      snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'run_status',r.status,
+        'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'run_id',h.run_id,'generation',h.generation,
+          'state',h.state,'inventory_guarded',h.inventory_guarded,'created_at',h.created_at,'updated_at',h.updated_at,
+          'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
+          'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,'final_coverage_digest',h.final_coverage_digest,
+          'archive_matches',EXISTS(SELECT 1 FROM recovery_captures c WHERE c.id=h.final_capture_id
+            AND c.hold_id=h.id AND c.run_id=h.run_id AND c.user_id=h.user_id AND c.original_worker_id=h.original_worker_id
+            AND c.manifest_bound AND c.state='available' AND c.expires_at>clock_timestamp()
+            AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest),
+          'captures',COALESCE((SELECT json_agg(json_build_object('id',c.id,'state',c.state,'manifest_bound',c.manifest_bound,
+            'source_sha',c.source_sha,'coverage_digest',c.coverage_digest,'expires_at',c.expires_at))
+            FROM recovery_captures c WHERE c.hold_id=h.id),'[]'::json),
+          'worker',(SELECT json_build_object('id',w.id,'status',w.status,'last_heartbeat_at',w.last_heartbeat_at,
+            'updated_at',w.updated_at,'online_since',w.online_since)
+            FROM workers w WHERE w.id=h.original_worker_id))) FROM recovery_custody_holds h
+          WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=$generation),'[]'::json))::text
+        FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")"
+      printf '%s' "$snapshot" | jq -e --arg run "$run" --arg id "$id" --argjson gen "$generation" '
+        .run_id==$run and (.run_status|IN("completed","failed","cancelled")) and
+        (.holds|type=="array" and length==1) and (.holds[0] | .id==$id and .run_id==$run and .generation==$gen and .inventory_guarded==true)' >/dev/null \
+        || fail "fixture receipt changed identity or outcome: $snapshot"
+      if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
+        printf '%s' "$snapshot" | jq -e '.holds[0] | .final_disposition=="archive" and .release_evidence=="archive" and .archive_matches==true' >/dev/null \
+          || fail "fixture receipt lacks archive proof: $snapshot"
+        after="$(apiget "/api/runs/$run/archives")"
+        printf '%s' "$after" | jq -e --argjson before "$before" \
+          '[.archives[]|select(.state=="available")|{id,checksum,byte_size}] as $after | all($before[]; . as $archive | any($after[]; .==$archive))' >/dev/null \
+          || fail "fixture receipt changed an available archive: run=$run hold=$id"
+        pass "fixture archive custody receipt: run=$run generation=$generation hold=$id; archives preserved"
+        return
+      fi
+      printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null
+        and (.captures|type=="array" and any(.[]; .state=="available"))' >/dev/null \
+        || fail "fixture receipt has unexpected disposition or capture state: $snapshot"
+      if [ $((SECONDS - start)) -ge "$timeout" ]; then
+        printf 'fixture receipt timeout evidence: restore_at=%s snapshot=%s\n' "${restored_at:-unknown}" "$snapshot"
+        if [ -n "$restored_at" ]; then
+          "${COMPOSE[@]}" logs --no-color --since "$restored_at" --tail 80 agent || true
+        fi
+        fail "fixture archive custody receipt timeout after ${timeout}s; evidence preserved"
+      fi
+      sleep 1
+    done
+  fi
+  printf '%s' "$hold" | jq -e '.[0] | .attention=="source_only" and .has_available_capture==false and (.capture_state // "")==""' >/dev/null \
+    || fail "fixture hold is not a capture-less owner decision: $hold"
+  before="$(apiget "/api/runs/$run/archives")"
+  printf '%s' "$before" | jq -e --arg id "$id" '.archives|type=="array" and all(.[]; .hold_id!=$id)' >/dev/null \
+    || fail "fixture hold has capture evidence: $id"
+  before="$(printf '%s' "$before" | jq -c '[.archives[]|select(.state=="available")|{id,checksum,byte_size}]')"
+  reply="$(uzi_cli run discard "$run" --hold "$id" --yes --json)" || fail "fixture owner disposition failed: run=$run hold=$id"
+  printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "fixture owner disposition not acknowledged: $reply"
+  view="$(apiget /api/recovery/holds)"
+  printf '%s' "$view" | jq -e --arg run "$run" --arg id "$id" --argjson generation "$generation" \
+    '[.holds[] | select(.id==$id and .run_id==$run and .generation==$generation)] | length==1 and .[0].state=="discarded"' >/dev/null \
+    || fail "fixture owner disposition has no exact discarded row: run=$run hold=$id"
+  after="$(apiget "/api/runs/$run/archives")"
+  printf '%s' "$after" | jq -e --argjson before "$before" \
+    '[.archives[]|select(.state=="available")|{id,checksum,byte_size}] as $after | all($before[]; . as $archive | any($after[]; .==$archive))' >/dev/null \
+    || fail "fixture owner disposition changed an available archive: run=$run hold=$id"
+  pass "fixture owner decision recorded: run=$run generation=$generation hold=$id; archives preserved"
 }
 
 # A completed status precedes the worker's final custody ACK. Wait only for this

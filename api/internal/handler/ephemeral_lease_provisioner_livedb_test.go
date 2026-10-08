@@ -30,7 +30,7 @@ func (fx *ephemeralFixture) leaseProvisioner(maxPerUser int, lease time.Duration
 	sc := settings.New(&settingsStore{rows: []store.AppSetting{
 		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
 	}}, time.Minute)
-	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
+	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
 		MaxPerUser:  maxPerUser,
 		DefaultSize: "m",
 		Lease:       lease,
@@ -286,7 +286,7 @@ func TestEphemeralLeaseReapPassLiveDB(t *testing.T) {
 	reap := func(lease time.Duration) {
 		t.Helper()
 		sc := settings.New(&settingsStore{}, time.Minute)
-		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
+		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
 			MaxPerUser: 2, DefaultSize: "m", ProvisionDeadline: deadline, Lease: lease,
 		})
 		if _, err := p.ReapPass(fx.ctx); err != nil {

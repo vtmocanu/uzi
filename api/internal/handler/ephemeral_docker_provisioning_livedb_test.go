@@ -50,7 +50,7 @@ func (fx *ephemeralFixture) dockerProvisioner(preference, tier, member bool, max
 		values = append(values, fx.repoID)
 	}
 	probe := &dockerAllowlistProbe{Cache: sc, values: values, fail: fail}
-	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{
+	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
 		DockerEnabled: tier, MaxPerUser: max, DefaultSize: "m",
 	}), probe
 }
@@ -258,7 +258,7 @@ func TestEphemeralDockerExcludedCandidatesLiveDB(t *testing.T) {
 			{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
 			{Key: settings.KeyDockerRepoAllowlist, Value: fx.repoID.String()},
 		}}, time.Minute)
-		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
+		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
 			DockerEnabled: true, IsolatedLaneEnabled: true, MaxPerUser: 2, DefaultSize: "m",
 		})
 		if _, err := p.ProvisionPass(fx.ctx); err != nil {
@@ -301,7 +301,7 @@ func TestEphemeralDockerFinalPlacementLiveDB(t *testing.T) {
 			run := fx.followUp(warm)
 			_, probe := fx.dockerProvisioner(tc.pref, tc.tier, tc.member, 2, tc.fail)
 			// Use the same settings snapshot with a live lease.
-			p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: tc.tier, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+			p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: tc.tier, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
 			if _, err := p.ProvisionPass(fx.ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -336,7 +336,7 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
 	run := fx.followUp(warm)
 	_, probe := fx.dockerProvisioner(true, true, true, 2, false)
-	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
 	svc := workersvc.New(fx.q, fx.box, workersvc.Params{WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
 	svc.SetTxBeginner(fx.pool)
 	svc.SetEphemeralLease(2 * time.Hour)
@@ -358,7 +358,7 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	if payload != nil {
 		t.Fatal("plain warm worker claims when it should refuse")
 	}
-	gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{MaxRows: 10, MaxPerUser: 2, EphemeralLease: workersvc.LeaseInterval(2 * time.Hour), WorkerDockerEnabled: true, DockerRepoAllowlist: []uuid.UUID{fx.repoID}, CodexCuratedModels: workersvc.CodexCuratedModels()})
+	gaps, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true}, MaxRows: 10, MaxPerUser: 2, EphemeralLease: workersvc.LeaseInterval(2 * time.Hour), WorkerDockerEnabled: true, DockerRepoAllowlist: []uuid.UUID{fx.repoID}, CodexCuratedModels: workersvc.CodexCuratedModels()})
 	if err != nil || len(gaps) != 1 || gaps[0].ID != run {
 		t.Fatalf("gap=%+v err=%v, want same follow-up", gaps, err)
 	}

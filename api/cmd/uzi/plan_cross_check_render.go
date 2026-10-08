@@ -16,6 +16,18 @@ func crossCheckPlain(s string) string {
 	return (&tuiRenderer{}).Plain(s, 200)
 }
 
+// crossCheckSource renders only the closed provenance vocabulary. Older
+// records and unfamiliar server values cannot assert a known source.
+func crossCheckSource(source *string) string {
+	if source != nil {
+		switch *source {
+		case "pin", "worker default":
+			return crossCheckPlain(*source)
+		}
+	}
+	return "unknown"
+}
+
 func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	var rows [][]string
 	if r.Status == "awaiting_approval" && r.PlanCrossCheckRequired && r.PlanCrossCheckGateReason != nil {
@@ -51,6 +63,9 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	if s.CheckerEffort != nil {
 		rows = append(rows, []string{label + "_EFFORT", crossCheckPlain(*s.CheckerEffort)})
 	}
+	rows = append(rows,
+		[]string{label + "_MODEL_SOURCE", crossCheckSource(s.CheckerModelSource)},
+		[]string{label + "_EFFORT_SOURCE", crossCheckSource(s.CheckerEffortSource)})
 	cost := "cost unavailable"
 	if s.Usage != nil {
 		cost = costDetailCell(*s.Usage)

@@ -47,6 +47,7 @@ export interface SweepClientHooks {
 export function sweepClient(hooks: SweepClientHooks = {}): WorkerClient {
   return {
     register: async () => ({}),
+    getRunOwnership: async () => ({ status: "completed", claim_generation: Number.MAX_SAFE_INTEGER }),
     heartbeat: async (_sample: unknown, entries?: OutboxHeartbeatEntry[]) => hooks.heartbeat?.(entries),
     reportState:
       hooks.reportState ?? (async () => ({ applied: true, status: "completed" }) as StateAck),

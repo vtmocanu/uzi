@@ -53,6 +53,31 @@ an owner is holding too much unresolved recovery — be reserved cheaply and imm
 without waiting on the worker to actually produce bytes, while the capture itself stays
 free to fail, retry, or need action without ever un-reserving that admission slot.
 
+### D5: independent import and the guarded cached-dependency exception
+
+The original D5 contract uses a fresh verified forge default tip and its merge
+base with H, falling back to self-contained capture when no suitable public
+prerequisite exists. Import verification uses an isolated no-alternates repository
+supplied only with the verified public prerequisite closure; byte verification
+alone does not establish dependency availability.
+
+For inventory-guarded capture (#2476), try self-contained first. Only a size-cap
+refusal permits a capped thin fallback using the exact cached worker-bare
+default-branch tip and all its merge bases with the captured source, without a
+forge PAT. If a merge base equals the captured source H, exclude H's verified
+parents instead so H remains advertised; a root H has no useful boundary and
+keeps the self-contained/oversized outcome. Record actual bundle-header
+dependencies. Production verifies the bundle in the trusted worker bare;
+conformance tests verify and import it in isolated no-alternates destination
+clones. These checks do not guarantee fresh public availability. A thin archive remains
+owner-downloadable but never authorizes archive-backed FINAL or source cleanup,
+even with complete root coverage. Holds, pins and clones stay retained until
+independently verified empty-inventory settlement or explicit owner discard.
+Non-final capture TTL remains normal; custody does not expire and pod/PVC/hold
+costs continue. Deploy the API release guard before the worker producer. Legacy
+fresh-forge capture is unchanged. Historical oversized captures are not
+automatically reproduced.
+
 ### The two-lifetime foreign-key model
 
 `recovery_custody_holds` carries two *different* kinds of pointer to the same worker and
@@ -393,7 +418,11 @@ now carries MAC-covered `bareDir`, `defaultBranch` and `finalizationPin` facts, 
 head is verified present in the local bare and is **not reachable from the bare's default ref**, is
 bundled **self-contained without a forge PAT**: no forge tip is fetched, so there is no forge
 prerequisite to satisfy. The bundle is journaled and uploaded at the record's exact generation, and
-the hold becomes `archive_ready`. Three limits carry over from the rest of D5:
+the legacy hold becomes `archive_ready`. Restart and quarantine capture without
+an explicit guarded cached-dependency fallback option remains self-contained.
+The guarded D5 exception above can produce a downloadable thin archive, but
+never closes custody through archive-backed FINAL or retires the source or pod.
+Three limits carry over from the rest of D5:
 
 - The size cap (`RECOVERY_MAX_BUNDLE_BYTES`, 64 MiB) is enforced on the bytes written while
   streaming, so an oversized bundle stops early and the hold stays `needs_action` (`oversized`).

@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -434,6 +435,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
 	// Workers.
 	CreateWorker(ctx context.Context, arg store.CreateWorkerParams) (store.Worker, error)
@@ -1352,10 +1354,13 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	PlanCrossCheckTimeout time.Duration
-	RunTimeout            time.Duration
-	RunWallCeiling        time.Duration
-	RunIdleTimeout        time.Duration
+	PlanCrossCheckMaxRevisions int32
+	// Presence distinguishes an explicitly disabled budget from an unwired service.
+	PlanCrossCheckMaxRevisionsSet bool
+	PlanCrossCheckTimeout         time.Duration
+	RunTimeout                    time.Duration
+	RunWallCeiling                time.Duration
+	RunIdleTimeout                time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
 	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
@@ -2185,6 +2190,9 @@ const defaultDispatchGrace = 15 * time.Minute
 
 // New constructs a Service. box may be nil only in tests that never call Claim.
 func New(q Store, box *secretbox.Box, p Params) *Service {
+	if !p.PlanCrossCheckMaxRevisionsSet && p.PlanCrossCheckMaxRevisions == 0 {
+		p.PlanCrossCheckMaxRevisions = config.DefaultPlanCrossCheckMaxRevisions
+	}
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
 	}
@@ -4555,9 +4563,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
-			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
-			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
-			ReportOnly:          reportOnly,
+			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
+			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
+			// Checker report-only is a server-owned kind invariant. Checker
+			// findings remain in cross_checks; report_md stays issue-gated.
+			ReportOnly:          reportOnly || owned.Kind == "cross_check",
 			ReportMd:            clampWireReportMd(owned, req.ReportMd, reportOnly),
 			MilestonesCompleted: completedIDs,
 			StopKind:            scopeStopKind,

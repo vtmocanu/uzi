@@ -45,15 +45,15 @@ function diagnosticLogger() {
 }
 const timing = { preparationMs: 100, backoffMs: [1, 2] as const, requestMs: 100, pollMs: 5 };
 
-function claim() { return freshClaim(1, { kind: "issue", auto_approve: true, plan_cross_check_required: true }); }
+function claim(generation = 1) { return freshClaim(generation, { kind: "issue", auto_approve: true, plan_cross_check_required: true }); }
 function proof(runId: string, generation = 1) {
   return { lead_last_seq: Math.max(0, ...api.messages(runId).map((m) => m.seq)),
     claim_generation: generation, plan_cross_check_settled: true, gate_revision: 0,
     current_plan_sha256: createHash("sha256").update("").digest("hex") };
 }
 function answer(runId: string, body: Record<string, unknown>, verdict = "approve", reason = verdict, overrides = {}) {
-  const { stage: _stage, claim_generation: _generation, ...candidate } = body;
-  return { result: "candidate", round: 1, checker_run_id: child, candidate_digest: digest,
+  const { stage: _stage, claim_generation: _generation, round = 1, ...candidate } = body;
+  return { result: "candidate", round, checker_run_id: child, candidate_digest: digest,
     candidate_generation: 1, candidate, verdict, reason_class: reason, findings: null,
     deadline_at: new Date(Date.now() + 60_000).toISOString(), ...proof(runId), ...overrides };
 }
@@ -86,6 +86,263 @@ function terminal(runId: string, condition: string) {
 // Runner paths that reach native planning capture walk Linux /proc; Linux CI runs them.
 const LINUX_CAPTURE = process.platform !== "linux" && "Linux /proc capture required";
 describe("U2 real runner checked gate", () => {
+  it("two automatic revisions select explicit rounds and store only round-three canonical approval", { skip: LINUX_CAPTURE }, async () => {
+    const c = claim();
+    const seen: PlanVerdict[] = [];
+    const events: string[] = [];
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    const capture = git.capturePlanningDiff.bind(git);
+    let captures = 0;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      const reservation = reserve.call(this);
+      return { ...reservation,
+        release: (response) => {
+          const released = reservation.release(response);
+          assert.equal(released, true);
+          events.push(`release:${response.result === "candidate" ? response.round : 0}`);
+          return released;
+        },
+        releaseAppliedGate: () => { throw new Error("automatic path must never release a human gate"); },
+      };
+    };
+    git.capturePlanningDiff = async (...args) => {
+      captures++;
+      await capture(...args);
+      return Buffer.from(`diff candidate ${captures}`);
+    };
+    api.crossCheckHandler = ({ runId, body }) => {
+      const round = Number(body.round);
+      assert.equal(gates(runId).length, 0);
+      assert.equal(api.states.filter((s) => s.runId === runId && s.body.plan_md).length, 0);
+      return { status: 200, body: answer(runId, body, round < 3 ? "revise" : "approve", round < 3 ? "revise" : "approve", {
+        automatic_revision_limit: 2, automatic_rounds_enabled: true,
+        findings: round < 3 ? { summary: `fix round ${round}`, items: [] } : null,
+        candidate: { plan_md: NORMALIZED, milestones: [{ title: "canonical", done: false }],
+          required_capabilities: [], required_tools: [], size_class: "s",
+          base_commit: body.base_commit, planning_diff: body.planning_diff },
+      }) };
+    };
+    const exec: Executor = { run: async (ctx) => {
+      // Three bounded candidates; any wrong verdict fails immediately.
+      for (let round = 1; round <= 3; round++) {
+        const verdict = await ctx.gatePlan!(`${PLAN} ${round}`);
+        events.push(`return:${round}`);
+        seen.push(verdict);
+        assert.equal(gates(c.run_id).length, 0);
+        if (round < 3) {
+          assert.deepEqual(verdict, { kind: "revise", automatic: true, round,
+            feedback: `fix round ${round}`, items: [] });
+          assert.ok(!("inputId" in verdict));
+          assert.equal(ctx.cancelRequested!(), false);
+        } else {
+          assert.equal(verdict.kind, "approve");
+          assert.ok(verdict.kind === "approve" && verdict.approval === "cross_check");
+          assert.equal(verdict.canonical.plan, NORMALIZED);
+          assert.deepEqual(verdict.canonical.milestones, [{ title: "canonical", done: false }]);
+        }
+      }
+      return { branch: ctx.branch };
+    } };
+    try {
+      await start(exec, c);
+      assert.equal(captures, 3);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2, 3]);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.planning_diff),
+        ["diff candidate 1", "diff candidate 2", "diff candidate 3"]);
+      assert.equal(api.crossCheckLatestRequests.length, 0);
+      assert.deepEqual(events, ["release:1", "return:1", "release:2", "return:2", "release:3", "return:3"]);
+      const stored = api.states.filter((s) => s.runId === c.run_id && s.body.plan_md);
+      assert.equal(stored.length, 1);
+      assert.equal(stored[0]!.body.plan_md, NORMALIZED);
+      assert.equal(stored[0]!.body.candidate_digest, digest);
+      assert.deepEqual(stored[0]!.body.milestones, [{ title: "canonical", done: false }]);
+      assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "approve"]);
+    } finally {
+      MessageBatcher.prototype.reserveCandidateTransport = reserve;
+      git.capturePlanningDiff = capture;
+    }
+  });
+
+  for (const failure of ["release", "cancel"] as const) {
+    it(`automatic ${failure} failure never returns a revision turn`, { skip: LINUX_CAPTURE }, async () => {
+      const c = claim();
+      const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+      let context: RunContext;
+      let releases = 0;
+      MessageBatcher.prototype.reserveCandidateTransport = function () {
+        const reservation = reserve.call(this);
+        return { ...reservation, release: (response) => {
+          releases++;
+          if (failure === "release") return false;
+          const released = reservation.release(response);
+          send(c.run_id, row("cancel"));
+          return released;
+        } };
+      };
+      api.crossCheckHandler = async ({ runId, body }) => {
+        if (failure === "cancel") {
+          send(c.run_id, row("cancel"));
+          assert.ok(await until(() => context.cancelRequested!()));
+        }
+        return { status: 200, body: answer(runId, body, "revise", "revise", {
+          automatic_revision_limit: 2, automatic_rounds_enabled: true,
+        }) };
+      };
+      const { exec, verdicts } = checkedExec(async (ctx) => { context = ctx; });
+      try {
+        await start(exec, c);
+        assert.equal(verdicts.length, 0);
+        assert.equal(gates(c.run_id).length, 0);
+        if (failure === "release") {
+          assert.equal(releases, 1);
+          terminal(c.run_id, "revision settlement receipts unavailable");
+        }
+      } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
+    });
+  }
+
+  it("shutdown after decided reservation release prevents automatic return at the state barrier", { skip: LINUX_CAPTURE }, async () => {
+    const c = claim();
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    let done: ReturnType<typeof start>;
+    let released = false;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      const reservation = reserve.call(this);
+      return { ...reservation, release: (response) => {
+        released = reservation.release(response);
+        // Runs after checkPlan's synchronous cancellation check, before the runner
+        // resumes from its decision promise and awaits the actual state barrier.
+        queueMicrotask(() => done.shutdown());
+        return released;
+      } };
+    };
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise", {
+      automatic_revision_limit: 2, automatic_rounds_enabled: true,
+    }) });
+    const { exec, verdicts } = checkedExec();
+    try {
+      done = start(exec, c);
+      await done;
+      assert.equal(released, true, "real decided-proof release completed");
+      assert.equal(verdicts.length, 0, "no executor revision after lifecycle cancellation");
+      assert.equal(gates(c.run_id).length, 0);
+      assert.equal(api.crossCheckRequests.length, 1);
+    } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
+  });
+
+  it("reclaimed generation discovers eligible round two once and then uses its explicit counter", { skip: LINUX_CAPTURE }, async () => {
+    const c = claim(2);
+    api.crossCheckLatestHandler = () => ({ status: 200, body: {
+      result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
+      automatic_rounds_enabled: true, next_round: 2, next_round_eligible: true, fallback_reason: "",
+    } });
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body,
+      body.round === 2 ? "revise" : "approve", body.round === 2 ? "revise" : "approve", {
+        ...proof(runId, 2), candidate_generation: 2,
+        automatic_revision_limit: 2, automatic_rounds_enabled: true,
+      }) });
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      seen.push(await ctx.gatePlan!(PLAN));
+      assert.ok(seen[0]!.kind === "revise" && seen[0]!.automatic);
+      seen.push(await ctx.gatePlan!(NORMALIZED));
+      assert.equal(seen[1]!.kind, "approve");
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [2, 3]);
+    assert.deepEqual(api.crossCheckLatestRequests, [{ runId: c.run_id, generation: 2 }]);
+    assert.equal(gates(c.run_id).length, 0);
+  });
+
+  for (const reason of ["", "approve"] as const) {
+    it(`current-generation metadata ${reason || "pending"} retries its exact round and never grants approval`, { skip: LINUX_CAPTURE }, async () => {
+      const c = claim(2);
+      api.crossCheckLatestHandler = () => ({ status: 200, body: {
+        result: "latest", round: 2, candidate_generation: 2, automatic_revision_limit: 2,
+        automatic_rounds_enabled: true, next_round: null, next_round_eligible: false, fallback_reason: reason,
+      } });
+      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+        ...proof(runId, 2), candidate_generation: 2, automatic_revision_limit: 2, automatic_rounds_enabled: true,
+      }) });
+      const { exec, verdicts } = checkedExec();
+      await start(exec, c);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [2]);
+      assert.equal(verdicts[0]!.kind, "approve");
+      assert.equal(gates(c.run_id).length, 0);
+    });
+  }
+
+  for (const metadata of [
+    { candidate_generation: 3 },
+    { next_round: 4, next_round_eligible: true },
+    { fallback_reason: "unknown" },
+  ]) {
+    it(`invalid or future metadata is terminal without submit or approval: ${JSON.stringify(metadata)}`, { skip: LINUX_CAPTURE }, async () => {
+      const c = claim(2);
+      api.crossCheckLatestHandler = () => ({ status: 200, body: {
+        result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
+        automatic_rounds_enabled: true, next_round: 2, next_round_eligible: true, fallback_reason: "",
+        ...metadata,
+      } });
+      const { exec, verdicts } = checkedExec();
+      await start(exec, c);
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(verdicts.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      terminal(c.run_id, "plan cross-check:");
+    });
+  }
+
+  it("automatic revision can fall back to a local human revision without fresh discovery or checks", { skip: LINUX_CAPTURE }, async () => {
+    const c = claim(2);
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body,
+      body.round === 1 ? "revise" : "block", body.round === 1 ? "revise" : "block", {
+        ...proof(runId, 2), candidate_generation: 2, automatic_revision_limit: 2, automatic_rounds_enabled: true,
+      }) });
+    api.onState(c.run_id, (body) => {
+      if (body.status === "awaiting_approval")
+        send(c.run_id, row(body.plan_md === "human revision" ? "reject_plan" : "revise_plan", "human feedback"));
+    });
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      seen.push(await ctx.gatePlan!(PLAN));
+      assert.ok(seen[0]!.kind === "revise" && seen[0]!.automatic);
+      const human = await ctx.gatePlan!(NORMALIZED);
+      seen.push(human);
+      assert.ok(human.kind === "revise" && !human.automatic);
+      seen.push(await ctx.gatePlan!("human revision", undefined, undefined, human.inputId));
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "reject"]);
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
+    assert.equal(api.crossCheckLatestRequests.length, 1);
+    assert.equal(gates(c.run_id).length, 2);
+  });
+
+  for (const reason of ["block", "timed_out", "model_error", "checker_failed", "revisions_exhausted"] as const) {
+    it(`reclaimed ${reason} metadata preserves fallback without submitting a child`, { skip: LINUX_CAPTURE }, async () => {
+      const c = claim(2);
+      api.crossCheckLatestHandler = () => ({ status: 200, body: {
+        result: "latest", round: reason === "revisions_exhausted" ? 3 : 1, candidate_generation: 1,
+        automatic_revision_limit: 2, automatic_rounds_enabled: true,
+        next_round: null, next_round_eligible: false, fallback_reason: reason,
+      } });
+      api.crossCheckHandler = () => { throw new Error("must never submit"); };
+      api.onState(c.run_id, (body) => {
+        if (body.status === "awaiting_approval") send(c.run_id, row("reject_plan", "human rejection"));
+      });
+      const { exec, verdicts } = checkedExec();
+      await start(exec, c);
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(api.crossCheckLatestRequests.length, 1);
+      assert.equal(gates(c.run_id).length, 1);
+      assert.equal((gates(c.run_id)[0]! as PlanCrossCheckStateRequest).plan_cross_check_gate_reason, reason);
+      assert.equal(verdicts[0]!.kind, "reject");
+    });
+  }
+
   for (const action of ["approve_plan", "revise_plan", "reject_plan"] as const) {
     it(`retryable preparation publishes once before replay and restores human ${action}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
@@ -1350,6 +1607,145 @@ describe("U2 real runner checked gate", () => {
     assert.equal(canonical.candidate_digest, digest);
     assert.ok(verdicts[0]?.kind === "approve" && verdicts[0].approval === "cross_check");
     assert.equal(gates(c.run_id).length, 0);
+  });
+
+  it("automatic REVISE releases concurrent feed producers and the session barrier before the next planning turn", { skip: LINUX_CAPTURE }, async () => {
+    const c = claim();
+    let context!: RunContext;
+    let releasePost!: () => void;
+    const post = new Promise<void>((resolve) => { releasePost = resolve; });
+    let entered = false;
+    const events: string[] = [];
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    const capture = git.capturePlanningDiff.bind(git);
+    const reportState = client.reportState.bind(client);
+    let captures = 0;
+    let sessionSends = 0;
+    const session = "automatic-concurrent-session";
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      const reservation = reserve.call(this);
+      return { ...reservation,
+        release: (response) => {
+          if (response.result === "candidate" && response.round === 1)
+            assert.equal(sessionSends, 0, "session sender is still behind the checked-state barrier at transport release");
+          const released = reservation.release(response);
+          assert.equal(released, true, "decided proof releases the real transport reservation");
+          events.push(`release:${response.result === "candidate" ? response.round : 0}`);
+          return released;
+        },
+        releaseAppliedGate: () => { throw new Error("automatic revision must not settle a human gate"); },
+      };
+    };
+    git.capturePlanningDiff = async (...args) => {
+      captures++;
+      await capture(...args);
+      return Buffer.from(`fresh concurrent candidate ${captures}`);
+    };
+    client.reportState = async (runId, body, ...args) => {
+      if (runId === c.run_id && body.status === "running" && body.session_id === session) {
+        assert.ok(events.includes("release:1"), "session HTTP cannot cross the held checked-state barrier");
+        sessionSends++;
+        events.push("session-send");
+      }
+      return reportState(runId, body, ...args);
+    };
+    api.crossCheckHandler = async ({ runId, body }) => {
+      const round = Number(body.round);
+      assert.equal(gates(runId).length, 0);
+      assert.equal(api.states.filter((s) => s.runId === runId && s.body.plan_md).length, 0);
+      if (round === 1) {
+        assert.equal(api.usageRequests.length, 1, "usage ACK precedes candidate POST");
+        assert.ok(api.messages(runId).some((m) => (m.payload as { text?: string }).text === "before automatic reservation"));
+        entered = true;
+        await post;
+      } else {
+        assert.equal(round, 2, "next candidate uses the explicit fresh round");
+        assert.ok(sessionSends > 0, "independent session sender drains before the next candidate");
+      }
+      return { status: 200, body: answer(runId, body, round === 1 ? "revise" : "approve", round === 1 ? "revise" : "approve", {
+        automatic_revision_limit: 2, automatic_rounds_enabled: true,
+        findings: round === 1 ? { summary: "fresh candidate required", items: [] } : null,
+        candidate: { plan_md: NORMALIZED, milestones: [{ title: "canonical concurrent", done: false }],
+          required_capabilities: [], required_tools: [], size_class: "s",
+          base_commit: body.base_commit, planning_diff: body.planning_diff },
+      }) };
+    };
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      context = ctx;
+      ctx.emit({ kind: "status", payload: { text: "before automatic reservation" } });
+      const leg = ctx.usage!.startLeg();
+      leg.observeAssistant({ message: { id: "automatic-concurrent-usage", model: "claude", usage: { input_tokens: 3 } } });
+      leg.close();
+      const revised = await ctx.gatePlan!(PLAN);
+      events.push("revision-return");
+      seen.push(revised);
+      assert.deepEqual(revised, { kind: "revise", automatic: true, round: 1,
+        feedback: "fresh candidate required", items: [] });
+      assert.ok(!("inputId" in revised));
+      assert.ok(events.indexOf("release:1") < events.indexOf("session-send"));
+      assert.ok(events.indexOf("session-send") < events.indexOf("revision-return"),
+        "independent sender passed the released checked-state barrier before the next planning turn");
+      assert.equal(gates(c.run_id).length, 0);
+      assert.ok(!statuses(c.run_id).includes("awaiting_approval"));
+      events.push("next-planning-turn");
+      const approved = await ctx.gatePlan!(`${PLAN} fresh round two`);
+      seen.push(approved);
+      assert.ok(approved.kind === "approve" && approved.approval === "cross_check");
+      assert.equal(approved.canonical.plan, NORMALIZED);
+      assert.deepEqual(approved.canonical.milestones, [{ title: "canonical concurrent", done: false }]);
+      return { branch: ctx.branch };
+    } };
+    const forge = fakeGitlab();
+    const run = runner(exec, forge.gitlab, undefined, {
+      planCrossCheckTiming: { ...timing, requestMs: 4000 }, planApprovalTimeoutMs: 4000,
+    });
+    const done = run.execute(c);
+    try {
+      assert.ok(await until(() => entered));
+      await Promise.all(Array.from({ length: 4 }, async (_, i) => {
+        context.emit({ kind: "status", payload: { text: `automatic producer ${i}` } });
+      }));
+      context.onSessionId!(session);
+      const feed = api.messages(c.run_id);
+      feed.push({ seq: feed.at(-1)!.seq + 1, kind: "status", payload: { text: "automatic server checker event" } });
+      // Let the already queued sender run to its barrier while the POST remains held.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(sessionSends, 0);
+      assert.ok(!api.states.some((s) => s.runId === c.run_id && s.body.session_id === session));
+      assert.ok(!feed.some((m) => String((m.payload as { text?: string }).text).startsWith("automatic producer ")));
+      assert.deepEqual(events, []);
+      releasePost();
+      await done;
+      assert.deepEqual(seen.map((v) => v.kind), ["revise", "approve"], "no deadlock after automatic release");
+      assert.ok(api.states.some((s) => s.runId === c.run_id && s.body.session_id === session),
+        "independent sender's state was persisted");
+      assert.equal(captures, 2);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.plan_md), [PLAN, `${PLAN} fresh round two`]);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.planning_diff),
+        ["fresh concurrent candidate 1", "fresh concurrent candidate 2"]);
+      assert.equal(api.crossCheckLatestRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      assert.ok(!statuses(c.run_id).includes("awaiting_approval"));
+      const stored = api.states.filter((s) => s.runId === c.run_id && s.body.plan_md);
+      assert.equal(stored.length, 1, "only approved canonical bundle is stored");
+      assert.equal(stored[0]!.body.plan_md, NORMALIZED);
+      assert.equal(stored[0]!.body.candidate_digest, digest);
+      assert.deepEqual(stored[0]!.body.milestones, [{ title: "canonical concurrent", done: false }]);
+      const messages = api.messages(c.run_id);
+      for (let i = 0; i < 4; i++)
+        assert.equal(messages.filter((m) => (m.payload as { text?: string }).text === `automatic producer ${i}`).length, 1);
+      assert.equal(messages.filter((m) => (m.payload as { text?: string }).text === "automatic server checker event").length, 1);
+      assert.deepEqual(messages.map((m) => m.seq), Array.from({ length: messages.length }, (_, i) => i + 1));
+    } finally {
+      releasePost();
+      run.shutdown();
+      await done;
+      MessageBatcher.prototype.reserveCandidateTransport = reserve;
+      git.capturePlanningDiff = capture;
+      client.reportState = reportState;
+    }
   });
 
   for (const decision of ["approve", "revise"] as const) {

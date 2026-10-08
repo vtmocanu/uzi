@@ -207,7 +207,7 @@ func TestPlanCrossCheckExitRacesLiveDB(t *testing.T) {
 					if !exitFirst && actor == "verdict" {
 						wantVerdict, wantReason = "approve", "approve"
 					}
-					if !exitFirst && actor == "expiry" {
+					if actor == "expiry" {
 						wantReason = "timed_out"
 					}
 					if verdict != wantVerdict || reason != wantReason || credit < 17 {
