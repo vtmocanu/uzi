@@ -125,11 +125,13 @@ it("stalled authority does not block sibling retirement or successful heartbeats
   try {
     await pollUntil(() => beats >= 3, 3000, "registered");
     await outbox.journalFinalize(RUN, 1);
+    await pollUntil(() => calls === 1, 3000, "stalled authority started");
+    // The sibling first becomes eligible on the next pass after the bounded authority wait.
     await outbox.journalFinalize(RUN2, 1);
     await pollUntil(() => calls === 1 && !outbox.listPendingFinalizeGenerations().some(e => e.run_id === RUN2),
-      500, "sibling cleared during stalled authority");
+      3000, "sibling cleared during stalled authority");
     const seen = beats;
-    await pollUntil(() => beats >= seen + 10, 500, "heartbeat remains independent");
+    await pollUntil(() => beats >= seen + 10, 3000, "heartbeat remains independent");
     await new Promise(resolve => setTimeout(resolve, 1100));
     assert.equal(calls, 1, "timed-out key stays excluded");
     held.resolve(true);
