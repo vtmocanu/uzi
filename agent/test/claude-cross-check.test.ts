@@ -229,6 +229,8 @@ describe("buildClaudeCrossCheckOptions: the checker's confinement", () => {
       for (const bad of ["/etc/*", "../*", "a/../../b", "~/.ssh/*", "{a,/etc/*}", "{x,../y}", "..", "\\etc\\*", "{a/,}../etc/*", ".{.,}/*", "{.,}./*", "src/{.,}./x", "{a,.}./*", ".{x,}./*", "{.,x}{y,.}/*", "{a,.}{.,b}/etc/*", "{x,{.,}.}/*", "{a,b", "a}b", "{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}{o,p}{q,r}", "{.,x\\{}{.,y\\}}/*", "a\\b", "{x}".repeat(33), "a".repeat(1025), `{${Array.from({ length: 257 }, (_, i) => i).join(",")}}`]) {
         assert.match(await glob(bad), /relative to the checkout/, bad);
       }
+      for (const bad of ["*.ts /etc/**", "*.ts ../x", "*.ts\t~/.ssh/*", "*.ts\n/etc/**", "*.ts,../x"]) assert.match(await grepGlob(bad), /relative to the checkout/, JSON.stringify(bad));
+      assert.equal(await grepGlob("*.ts *.md"), "allow");
       assert.equal(await grepGlob("*.ts"), "allow");
       assert.match(await grepGlob("/etc/**"), /relative to the checkout/);
       assert.match(await grepGlob("../**"), /relative to the checkout/);

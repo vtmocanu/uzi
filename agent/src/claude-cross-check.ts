@@ -116,7 +116,8 @@ function buildCheckerPatternGuard(log: Logger): (input: HookInput) => Promise<Ho
     if (input.hook_event_name !== "PreToolUse") return {};
     const toolInput = input.tool_input && typeof input.tool_input === "object" ? input.tool_input as Record<string, unknown> : {};
     const field = input.tool_name === "Glob" ? toolInput["pattern"] : input.tool_name === "Grep" ? toolInput["glob"] : undefined;
-    if (typeof field !== "string" || !escapesCheckout(field)) return {};
+    // The CLI splits a Grep glob on whitespace after this hook runs, so each token is screened too.
+    if (typeof field !== "string" || !(escapesCheckout(field) || field.split(/\s+/).some(t => t !== "" && escapesCheckout(t)))) return {};
     log.warn("cross-check pattern guard denied a pattern", { tool: input.tool_name });
     return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: REASON_PATTERN } };
   };
