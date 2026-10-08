@@ -146,6 +146,8 @@ uzi logout
 uzi auth token [--with-token]
 uzi auth status [--all]
 uzi whoami
+uzi settings
+uzi settings get
 uzi context list
 uzi context current
 uzi context use <name>
@@ -293,6 +295,18 @@ uzi version
 - `uzi logout` — remove **the active context's** local credential. Its stored
   URL is left intact (a later re-login needs no re-typed URL). It does **not**
   revoke the token server-side; do that in the web UI (Settings → Access).
+
+### Account settings
+
+- `uzi settings` — show settings command help.
+- `uzi settings get` — read your own non-secret account settings; no setters.
+  The default table shows the Claude and Codex plan cross-check cells, including
+  active/inactive status, stored model/effort pins, worker default model,
+  resolved model/effort, and their sources (`pin` or `worker default`, with
+  unrecognized sources shown as `unknown`). An inactive Claude cell is still shown; its stored pin
+  remains visible. Table rendering inspects at most twenty response cells and
+  displays each harness once. `uzi settings get --json` returns the settings
+  object at the top level, including `cross_check_pins` and source fields.
 
 ### Named contexts
 

@@ -1509,9 +1509,9 @@ describe("B1 independent settings responses", () => {
       const modelDone = () => finish(replies[0], modelResponse(model.response), model.button);
       const effortDone = () => finish(replies[1], { ...initial, ...effort.response }, effort.button);
       if (modelFirst) { await modelDone(); await waitFor(() => label(model.checker, model.expected)); await effortDone(); }
-      else { await effortDone(); label(effort.checker, effort.expected); await modelDone(); }
+      else { await effortDone(); await waitFor(() => label(effort.checker, effort.expected)); await modelDone(); }
       await waitFor(() => label(model.checker, model.expected));
-      label(effort.checker, effort.expected);
+      await waitFor(() => label(effort.checker, effort.expected));
       expectHints(model.response);
       expect(currentSettings().default_effort).toBe("default_effort" in effort.response ? effort.response.default_effort : initial.default_effort);
       expect(currentSettings().default_codex_effort).toBe("default_codex_effort" in effort.response ? effort.response.default_codex_effort : initial.default_codex_effort);
