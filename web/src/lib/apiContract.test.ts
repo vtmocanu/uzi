@@ -113,6 +113,8 @@ import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.js
 import runOutcomesFull from "../../../fixtures/api-contract/run_outcomes.full.json";
 import userSettingsZero from "../../../fixtures/api-contract/user_settings.zero.json";
 import userSettingsFull from "../../../fixtures/api-contract/user_settings.full.json";
+import settingsUserSettingsFull from "../../../fixtures/api-contract/settings_user_settings.full.json";
+import settingsUserSettingsZero from "../../../fixtures/api-contract/settings_user_settings.zero.json";
 import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.json";
 import catalogEntryFull from "../../../fixtures/api-contract/catalog_entry.full.json";
 import cliTokenZero from "../../../fixtures/api-contract/cli_token.zero.json";
@@ -728,12 +730,16 @@ void _buildInfoFull;
 // ZeroOf exemption: sidebar_token_ids and sidebar_codex_account_ids — the handler mapper
 // runs uuidStrings on both, which returns a non-nil [] (handler/user_settings.go), so the
 // wire is [] though the nil-slice zero marshals null. Every other field is typed X|null in
-// TS.
+// TS. cross_check_pins also exempts the Go nil-slice zero; GET always emits two cells.
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
+  const _settingsUserFull: Widen<UserSettings> = settingsUserSettingsFull;
+  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins"> = settingsUserSettingsZero;
+  void _settingsUserFull;
+  void _settingsUserZero;
   void _userSettingsMissing;
   void _userSettingsExtra;
   void _userSettingsZero;
@@ -1555,7 +1561,7 @@ it("plan-check findings permit a null item array", () => {
     findings: { summary: "ok", items: null },
     checker_run_id: null,
     checker_model: null,
-    checker_effort: null,
+    checker_effort: null, checker_model_source: null, checker_effort_source: null,
     usage: null,
     historical: false,
   };

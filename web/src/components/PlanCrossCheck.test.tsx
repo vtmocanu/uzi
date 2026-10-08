@@ -16,7 +16,7 @@ afterEach(cleanup);
 const child = "11111111-1111-4111-8111-111111111111";
 function summary(over: Partial<PlanCrossCheckSummary> = {}): PlanCrossCheckSummary {
   return { round: 1, verdict: "approve", reason_class: "approve", findings: null,
-    checker_run_id: null, checker_model: null, checker_effort: null, usage: null, historical: false, ...over };
+    checker_run_id: null, checker_model: null, checker_effort: null, checker_model_source: null, checker_effort_source: null, usage: null, historical: false, ...over };
 }
 function run(over: Partial<Run> = {}): Run { return { ...mockRuns[0], ...over }; }
 const cases: [unknown, unknown, string][] = [
@@ -148,5 +148,22 @@ describe("planning-diff refusal sub-code", () => {
     cleanup();
     const bare = render(<PlanCrossCheck run={run({ plan_cross_check_gate_reason: "planning_diff_refused", plan_cross_check_diff_refusal: null })} />);
     expect(bare.container.textContent).not.toContain("Refusal:");
+  });
+});
+
+describe("recorded checker sources", () => {
+  it.each([
+    ["pin", "worker default", "pin", "worker default"],
+    [null, null, "unknown", "unknown"],
+    ["provider-attribute\u202e", "worker_default", "unknown", "unknown"],
+  ])("renders only closed recorded labels %s/%s", (modelSource, effortSource, modelLabel, effortLabel) => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({
+      checker_model: "historical-model", checker_effort: "high", historical: true,
+      checker_model_source: modelSource as PlanCrossCheckSummary["checker_model_source"],
+      checker_effort_source: effortSource as PlanCrossCheckSummary["checker_effort_source"],
+    }) })} />);
+    expect(r.getByText(`Model: historical-model (${modelLabel}) · Effort: high (${effortLabel})`)).toBeTruthy();
+    expect(r.container.textContent).not.toContain("provider-attribute");
+    expect(r.getByText("These findings concern an earlier plan; they do not certify the current plan.")).toBeTruthy();
   });
 });

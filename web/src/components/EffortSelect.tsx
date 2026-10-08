@@ -15,14 +15,16 @@ export function EffortSelect({
   value,
   onChange,
   id,
+  defaultLabel,
 }: {
   value: string;
   onChange: (effort: string) => void;
   id?: string;
+  defaultLabel?: string;
 }) {
   return (
     <Select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
-      <option value="">Inherit (uzi default: medium)</option>
+      <option value="">{defaultLabel ?? "Inherit (uzi default: medium)"}</option>
       {EFFORT_LEVELS.map((lvl) => (
         <option key={lvl} value={lvl}>
           {lvl === "medium" ? "medium (uzi default)" : lvl}

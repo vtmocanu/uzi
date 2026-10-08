@@ -1373,3 +1373,34 @@ it("usage-limit provider regression #2360: shared default has neutral copy", () 
   // The saved opt-out stays off even though newly-created users default on.
   expect((screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement).checked).toBe(false);
 });
+
+describe("checker defaults follow committed worker settings", () => {
+  it("refreshes the worker model and effort Defaults while retaining checker drafts", async () => {
+    const initial = { default_harness: null, default_model: null, default_claude_model: "opus",
+      default_effort: null, judge_model: null, summary_model: null, appearance_mode: null,
+      light_theme: null, dark_theme: null, typeface: null, theme: null };
+    mockApi.getMySettings.mockResolvedValue({ settings: initial });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const checker = await screen.findByLabelText("Claude checker model") as HTMLSelectElement;
+    fireEvent.change(checker, { target: { value: "sonnet" } });
+    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "haiku" } });
+    expect(within(checker).getByRole("option", { name: "Default · opus (worker default)" })).toBeTruthy();
+    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
+    await waitFor(() => expect(within(checker).getByRole("option", { name: "Default · haiku (worker default)" })).toBeTruthy());
+    expect(checker.value).toBe("sonnet");
+    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
+    const checkerEffort = screen.getByLabelText("Claude checker effort");
+    expect(within(checkerEffort).getByRole("option", { name: "Default · medium (worker default)" })).toBeTruthy();
+    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", default_effort: "max" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Claude effort" }));
+    await waitFor(() => expect(within(checkerEffort).getByRole("option", { name: "Default · max (worker default)" })).toBeTruthy());
+    expect(checker.value).toBe("sonnet");
+    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, cross_check_pins: [
+      { stage: "plan", harness: "claude", model: "sonnet", effort: null, resolved_model: "sonnet",
+        resolved_effort: "max", model_source: "pin", effort_source: "worker default", active: false },
+    ] } });
+    fireEvent.click(screen.getByRole("button", { name: "Save cross-check defaults" }));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ cross_check_pins: [{ stage: "plan", harness: "claude", model: "sonnet" }] }));
+  });
+});

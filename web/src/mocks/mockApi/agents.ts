@@ -11,6 +11,7 @@ import type {
   TemplateAllocationsInput,
   User,
 } from "../../lib/api";
+import { inheritedClaudeModel } from "../../lib/crossCheckSettings";
 import { ApiError } from "../../lib/apiError";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../../lib/skills";
 import { mockAllocations, mockShippedBuiltins, mockSkills, mockTemplates } from "../data";
@@ -106,6 +107,11 @@ function templateAllocationView(me: User): TemplateAllocation[] {
       effective: myOverride ?? globalDefault,
     };
   });
+}
+
+export function mockDefaultClaudeModel(): string | null {
+  const me = requireSession();
+  return inheritedClaudeModel(templates, templateAllocationView(me), me.id);
 }
 
 function toAllocated(id: string): AllocatedSkill | null {

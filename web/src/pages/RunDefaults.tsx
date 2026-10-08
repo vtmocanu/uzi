@@ -8,7 +8,8 @@
 import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
-import type { BindMode } from "../lib/apiTypes";
+import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
+import type { UserSettings, BindMode } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
@@ -36,6 +37,7 @@ export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
   // Kept local: the save handlers below still set this on failure, so it is merged
   // with the hook's load error at the one page-level Alert.
+  const [committedSettings, setCommittedSettings] = useState<UserSettings | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [autopilotBusy, setAutopilotBusy] = useState(false);
@@ -206,6 +208,7 @@ export function RunDefaults() {
     setMrReworkBusy(true);
     try {
       const { settings } = await api.putMySettings({ mr_rework_enabled: next });
+      setCommittedSettings(settings);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setMrReworkError(
@@ -279,6 +282,7 @@ export function RunDefaults() {
         api.listSecrets(),
         api.getMySettings(),
       ]);
+      setCommittedSettings(settings);
       // PRD #1551: seed each lane from its own explicit field, never from the
       // legacy default_model projection — the two lanes are the source of truth now.
       const claude = settings.default_claude_model ?? "";
@@ -332,6 +336,7 @@ export function RunDefaults() {
     setJudgeModelBusy(true);
     try {
       const { settings } = await api.putMySettings({ judge_model: judgeModel.trim() || null });
+      setCommittedSettings(settings);
       const model = settings.judge_model ?? "";
       setJudgeModel(model);
       setSavedJudgeModel(model);
@@ -359,6 +364,7 @@ export function RunDefaults() {
     setSummaryModelBusy(true);
     try {
       const { settings } = await api.putMySettings({ summary_model: summaryModel.trim() || null });
+      setCommittedSettings(settings);
       const model = settings.summary_model ?? "";
       setSummaryModel(model);
       setSavedSummaryModel(model);
@@ -385,6 +391,7 @@ export function RunDefaults() {
     setEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_effort: defaultEffort || null });
+      setCommittedSettings(settings);
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
@@ -407,6 +414,7 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
+      setCommittedSettings(settings);
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
@@ -483,6 +491,7 @@ export function RunDefaults() {
         default_codex_model: codexModel.trim() || null,
       };
       const { settings } = await api.putMySettings(patch);
+      setCommittedSettings(settings);
       const dh = selectionFromHarness(settings.default_harness);
       setDefaultHarness(dh);
       setSavedHarness(dh);
@@ -565,6 +574,7 @@ export function RunDefaults() {
           />
           <span className="text-fg">Plan cross-check · Required before implementation</span>
         </label>
+        {committedSettings && <CrossCheckDefaults settings={committedSettings} userId={user?.id ?? ""} onSaved={setCommittedSettings} />}
       </Card>
 
       {/* PRD #35. Placed after Autopilot on purpose: the two compose, and this is the
