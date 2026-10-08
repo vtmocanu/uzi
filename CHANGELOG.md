@@ -24,8 +24,8 @@ through `[0.52.0]`.)
 
 ### Added
 
-- **Plan cross-check model and effort pins (#2151)**
-  Account settings store separate Claude and Codex checker pins; plan checker claims honor hard pins and record their sources.
+- **Plan cross-checks honor independent model and effort pins ([#2151](https://github.com/vtmocanu/uzi/issues/2151)).**
+  Settings → Run defaults offers per-family hard pins or Default, with delivered values and independent sources frozen at claim time and retained with findings; no substitution, effort clamp or default retry occurs. The Claude cell stays editable but inactive until Codex-lead cross-checks ship; today only a Codex checker checks a Claude lead. Pin-aware placement and preflight check syntax, family, effort and worker capabilities before credential delivery, requeuing capability races within the verdict deadline including queue time. Account model availability is discovered at authenticated startup: recognized pinned-model rejection fails the child with `plan cross-check: checker unavailable` and forces a human gate; other startup failures retain existing handling. `uzi settings get` shows stored pins, worker defaults, resolved values, sources and inactive status, with the decoded settings DTO in JSON; run evidence shows independent sources and keeps missing legacy provenance unknown. Code cross-check, dedicated slots, Claude-checker execution, Models/CLI setters and admin/per-run overrides remain outside this change.
 
 ### Changed
 

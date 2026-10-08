@@ -2266,6 +2266,31 @@ presented at the gate, `0` for a run that has never gated under this
 feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
 `--expected-gate-revision` above.
 
+### Plan cross-check settings
+
+```sh
+uzi settings get
+uzi settings get --json
+```
+
+The human table shows the two Plan cross-check cells: stage, harness,
+active/inactive status, stored model and effort, worker default model,
+resolved model and effort, and each resolved field's source. Stored null
+fields show `Default`; explicit choices show `Pin · value`. The Claude
+cell is inactive and editable in **Settings → Run defaults → Cross-check**;
+only Codex checkers for Claude leads execute today. CLI set/reset is deferred
+to #1703.
+
+JSON returns the decoded account settings DTO, including
+`cross_check_pins`. Each cell has nullable stored
+`model`/`effort`, read-only nullable `worker_default_model`, separate
+`resolved_model`/`resolved_effort`, `model_source`/`effort_source` and
+`active`. Null Claude model metadata means SDK/account default. Sources
+display as `pin` or `worker default`; missing or unfamiliar values show
+`unknown` in the human view. See
+[Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
+for resolution, validation and capability requirements.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
@@ -2274,7 +2299,12 @@ this cookie-only consent setting.
 
 `uzi run get <id>` shows `PLAN_CROSS_CHECK` for a current cross-check human
 gate reason. Its `PLAN_CHECK_*` rows show the stored candidate's result,
-reason, checker id, recorded model/effort, tokens/cost and findings. A human
+reason, checker id, recorded model/effort, independent model/effort sources,
+tokens/cost and findings. `PLAN_CHECK_MODEL_SOURCE` and
+`PLAN_CHECK_EFFORT_SOURCE` show `pin` or `worker default`; missing legacy or
+unrecognized sources show `unknown`. JSON summary fields
+`checker_model_source` and `checker_effort_source` remain nullable for legacy
+records. Settings changes do not rewrite this recorded evidence. A human
 revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
 warning that the check does not certify the current plan. Missing cost stays
 unavailable; subscription usage is distinguished from metered spend.
