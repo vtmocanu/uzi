@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"reflect"
 	"syscall"
 	"testing"
@@ -161,6 +162,99 @@ func TestDrainIdempotentOnEmptyTree(t *testing.T) {
 	if len(*killed) != 0 {
 		t.Errorf("kill calls = %v, want none", *killed)
 	}
+}
+
+func TestDrainContinuousReapsDeadline(t *testing.T) {
+	now := time.Unix(0, 0)
+	deadline := now.Add(time.Second)
+	waits := 0
+	got := drain(deadline, func() time.Time { return now }, func() {},
+		seqChildren(nil), func(processIdentity) error { return nil },
+		func() (int, error) {
+			waits++
+			if waits > 10000 {
+				return 0, syscall.ECHILD
+			}
+			now = now.Add(250 * time.Millisecond)
+			return waits, nil
+		})
+	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || waits != 4 {
+		t.Fatalf("waits=%d result=%+v", waits, got)
+	}
+	t.Logf("continuous reaps: waits=%d retained=%d state=%s reason=%s", waits, len(got.Reaped), got.State, got.Reason)
+}
+
+func TestDrainCumulativeChurnBound(t *testing.T) {
+	deadline, clock, sleep := farClock()
+	passes, kills, waits := 0, 0, 0
+	got := drain(deadline, clock, sleep,
+		func() ([]observationRow, error) { passes++; return testChildRows([]int{passes}), nil },
+		func(processIdentity) error { kills++; return nil },
+		func() (int, error) {
+			waits++
+			if waits%2 == 0 {
+				return 0, nil
+			}
+			return (waits + 1) / 2, nil
+		})
+	if got.State != stateUnconfirmed || got.Reason != "oversize" || kills != 256 || len(got.Killed) != 256 || len(got.Reaped) != 256 {
+		t.Fatalf("passes=%d kills=%d waits=%d result=%+v", passes, kills, waits, got)
+	}
+	var output bytes.Buffer
+	if err := (&evidence{w: &output}).writeJSON(disposeEvidence(1, got)); err != nil {
+		t.Fatal(err)
+	}
+	if output.Len() >= maxEvidenceBytes {
+		t.Fatalf("output bytes=%d", output.Len())
+	}
+	t.Logf("cumulative churn: passes=%d kills=%d waits=%d killed=%d reaped=%d serialized=%d", passes, kills, waits, len(got.Killed), len(got.Reaped), output.Len())
+}
+
+func TestDrainKillLoopDeadline(t *testing.T) {
+	now := time.Unix(0, 0)
+	kills, waits := 0, 0
+	got := drain(now.Add(time.Second), func() time.Time { return now }, func() {},
+		seqChildren([]int{1, 2, 3}),
+		func(processIdentity) error { kills++; now = now.Add(time.Second); return nil },
+		func() (int, error) { waits++; return 0, syscall.ECHILD })
+	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || kills != 1 || waits != 0 {
+		t.Fatalf("kills=%d waits=%d result=%+v", kills, waits, got)
+	}
+}
+
+func TestDrainDeadlineAfterEmptyVerification(t *testing.T) {
+	now := time.Unix(0, 0)
+	lists := 0
+	got := drain(now.Add(time.Second), func() time.Time { return now }, func() {},
+		func() ([]observationRow, error) {
+			lists++
+			if lists == 2 {
+				now = now.Add(time.Second)
+			}
+			return nil, nil
+		}, func(processIdentity) error { t.Fatal("unexpected kill"); return nil }, seqReaper())
+	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || got.Authority != "" {
+		t.Fatalf("result=%+v", got)
+	}
+}
+
+func TestDrainExpiredAuditorProbe(t *testing.T) {
+	now := time.Unix(0, 0)
+	waits, kills := 0, 0
+	got := drain(now.Add(-time.Second), func() time.Time { return now }, func() {},
+		seqChildren([]int{10001}),
+		func(processIdentity) error { kills++; return nil },
+		func() (int, error) {
+			waits++
+			if waits <= 10000 {
+				return waits, nil
+			}
+			return 0, syscall.ECHILD
+		})
+	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || waits != 0 || kills != 0 {
+		t.Fatalf("waits=%d kills=%d result=%+v", waits, kills, got)
+	}
+	t.Logf("auditor expired deadline: waits=%d kills=%d retained=%d state=%s", waits, kills, len(got.Reaped), got.State)
 }
 
 // testChildRows adapts scripted PID lists to the identity-carrying seam.

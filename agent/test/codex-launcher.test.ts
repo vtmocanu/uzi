@@ -1328,8 +1328,9 @@ describe("launcher observation contract", () => {
     const timeout = await first;
     assert.equal(timeout.state, "unavailable");
     if (timeout.state === "unavailable") assert.equal(timeout.reason, "timeout");
+    assert.equal((await handle.observe(10)).state, "unavailable");
+    fake.writeEvidence({ ...complete(fake.observeRequests[0]!), root: { pid: 4243, startTime: "7" } });
     const second = handle.observe(1000);
-    fake.writeEvidence(complete(fake.observeRequests[0]!));
     // A late oversized reply is discarded too; it cannot settle the new request.
     fake.evidence.write(`{"event":"observe","id":${fake.observeRequests[0]!},"payload":"${"x".repeat(100000)}"}\n`);
     const id = fake.observeRequests[1]!;
@@ -1361,7 +1362,6 @@ describe("launcher observation contract", () => {
       (v: ReturnType<typeof complete>) => ({ ...v, processes: [{ ...v.processes[0]!, ppid: 8888 }] }),
       (v: ReturnType<typeof complete>) => ({ ...v, processes: [...v.processes, ...v.processes] }),
       (v: ReturnType<typeof complete>) => ({ ...v, supervisor: { ...v.supervisor, startTime: "5" } }),
-      (v: ReturnType<typeof complete>) => ({ ...v, processes: Array(257).fill(v.processes[0]) }),
       (v: ReturnType<typeof complete>) => ({ ...v, tmpCleanup: { state: "removed", reason: "" } }),
     ]) {
       const outcome = await request(mutate);
@@ -1390,6 +1390,97 @@ describe("launcher observation contract", () => {
     assert.equal(fake.control.writableEnded, false);
     assert.equal((await handle.dispose()).clean, true);
   });
+  it("preflights 16000 rows, escaped keys, nesting and malformed structure before parsing rows", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const parse = JSON.parse;
+    let materialized = 0;
+    JSON.parse = ((text: string, ...args: unknown[]) => {
+      if (text.startsWith("{") && text.includes("process")) materialized++;
+      return Reflect.apply(parse, JSON, [text, ...args]);
+    }) as typeof JSON.parse;
+    try {
+      for (const rows of [
+        Array(16000).fill("{}").join(","),
+        Array(257).fill('"braces [ ] and \\"quotes\\""').join(","),
+        "[".repeat(40) + "0" + "]".repeat(40),
+        Array(129).fill("[0]").join(","),
+      ]) {
+        const promise = handle.observe();
+        const id = fake.observeRequests.at(-1)!;
+        const text = '{"proce\\u0073ses":[' + rows + '],"id":' + id + ',"ev\\u0065nt":"observe"}';
+        assert.ok(Buffer.byteLength(text) < 65536);
+        fake.writeRawEvidence(text);
+        const outcome = await promise;
+        assert.equal(outcome.state, "unavailable");
+        if (outcome.state === "unavailable") assert.equal(outcome.reason, "oversize");
+      }
+      assert.equal(materialized, 0);
+      const malformed = handle.observe();
+      fake.writeRawEvidence('{"event":"observe","id":' + fake.observeRequests.at(-1)! + ',"processes":[{},]}');
+      assert.equal((await malformed).state, "unavailable");
+      assert.equal(materialized, 0);
+    } finally { JSON.parse = parse; }
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
+  it("fences 300 timed-out attempts and ignores invalid and oversized late IDs", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const first = await handle.observe(0);
+    assert.equal(first.state, "unavailable");
+    const old = fake.observeRequests[0]!;
+    for (let i = 0; i < 300; i++) {
+      const result = await handle.observe(0);
+      if (result.state === "unavailable") assert.equal(result.reason, "busy");
+    }
+    assert.equal(fake.observeRequests.length, 1);
+    fake.writeRawEvidence('{"id":-1,"event":"observe","payload":"' + "x".repeat(100000) + '"}');
+    assert.equal((await handle.observe(0)).state, "unavailable");
+    assert.equal(fake.observeRequests.length, 1);
+    fake.writeRawEvidence('{"id":' + old + ',"event":"observe","payload":"' + "x".repeat(100000) + '"}');
+    const next = handle.observe(1000);
+    let settled = false;
+    void next.then(() => { settled = true; });
+    fake.writeEvidence(complete(old));
+    fake.writeRawEvidence('{"event":"observe","id":' + old + ',"payload":"' + "x".repeat(100000) + '"}');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(fake.observeRequests.length, 2);
+    fake.writeEvidence(complete(fake.observeRequests[1]!));
+    assert.equal((await next).state, "complete");
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
+  it("respects real writable backpressure without queueing further observations", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.control.cork();
+    // Force the next tiny control frame to hit the actual Writable high-water mark.
+    const state = fake.control as unknown as { _writableState: { highWaterMark: number } };
+    state._writableState.highWaterMark = 1;
+    const first = await handle.observe(0);
+    assert.equal(first.state, "unavailable");
+    assert.equal(fake.control.writableNeedDrain, true);
+    const queued = fake.control.writableLength;
+    for (let i = 0; i < 300; i++) await handle.observe(0);
+    assert.equal(fake.control.writableLength, queued);
+    assert.equal(fake.observeRequests.length, 0);
+    fake.control.uncork();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(fake.observeRequests.length, 1);
+    fake.writeEvidence(complete(fake.observeRequests[0]!));
+    const next = handle.observe(1000);
+    fake.writeEvidence(complete(fake.observeRequests[1]!));
+    assert.equal((await next).state, "complete");
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
   it("retains transport death as unavailable observation and unconfirmed disposal", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
