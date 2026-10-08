@@ -9705,7 +9705,7 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < @max_per_user::int
-ORDER BY r.created_at ASC
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
 -- name: ListSaturationQueuedRunsForEphemeral :many
@@ -9765,10 +9765,8 @@ LIMIT @max_rows;
 --     the lock. It can also transiently exclude a run whose owner has just dropped below the
 --     cap; the next tick surfaces it, so no run is lost.
 --
--- ORDER BY r.status_since ASC so the longest-waiting run is provisioned first; note the
--- sibling orders by created_at, but THIS path's clock is status_since (the same column the
--- debounce gates on), so we order by it for consistency. LIMIT @max_rows bounds the work
--- per tick.
+-- Effective run priority comes first, then status_since (the debounce clock) breaks
+-- equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -9893,7 +9891,7 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < @max_per_user::int
-ORDER BY r.status_since ASC
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.status_since ASC
 LIMIT @max_rows;
 
 -- name: ListIsolatedQueuedRunsForEphemeral :many
@@ -9943,7 +9941,7 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < @max_per_user::int
-ORDER BY r.created_at ASC
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
 -- name: RunHasVerdictSinceGateOpened :one

@@ -8536,13 +8536,14 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < $1::int
-ORDER BY r.created_at ASC
-LIMIT $2
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $2) DESC, r.created_at ASC
+LIMIT $3
 `
 
 type ListIsolatedQueuedRunsForEphemeralParams struct {
-	MaxPerUser int32 `json:"max_per_user"`
-	MaxRows    int32 `json:"max_rows"`
+	MaxPerUser            int32              `json:"max_per_user"`
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
+	MaxRows               int32              `json:"max_rows"`
 }
 
 type ListIsolatedQueuedRunsForEphemeralRow struct {
@@ -8573,7 +8574,7 @@ type ListIsolatedQueuedRunsForEphemeralRow struct {
 //   - (SELECT count(...)) < @max_per_user — the same cross-user FAIRNESS filter (never the cap)
 //     as the two sibling triggers, counted the same way as CountEphemeralHostedWorkersForUser.
 func (q *Queries) ListIsolatedQueuedRunsForEphemeral(ctx context.Context, arg ListIsolatedQueuedRunsForEphemeralParams) ([]ListIsolatedQueuedRunsForEphemeralRow, error) {
-	rows, err := q.db.Query(ctx, listIsolatedQueuedRunsForEphemeral, arg.MaxPerUser, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listIsolatedQueuedRunsForEphemeral, arg.MaxPerUser, arg.BackgroundGraceCutoff, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -10095,18 +10096,19 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < $6::int
-ORDER BY r.status_since ASC
-LIMIT $7
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $7) DESC, r.status_since ASC
+LIMIT $8
 `
 
 type ListSaturationQueuedRunsForEphemeralParams struct {
-	SaturationDelay     pgtype.Interval `json:"saturation_delay"`
-	EphemeralLease      pgtype.Interval `json:"ephemeral_lease"`
-	WorkerDockerEnabled bool            `json:"worker_docker_enabled"`
-	DockerRepoAllowlist []uuid.UUID     `json:"docker_repo_allowlist"`
-	CodexCuratedModels  []string        `json:"codex_curated_models"`
-	MaxPerUser          int32           `json:"max_per_user"`
-	MaxRows             int32           `json:"max_rows"`
+	SaturationDelay       pgtype.Interval    `json:"saturation_delay"`
+	EphemeralLease        pgtype.Interval    `json:"ephemeral_lease"`
+	WorkerDockerEnabled   bool               `json:"worker_docker_enabled"`
+	DockerRepoAllowlist   []uuid.UUID        `json:"docker_repo_allowlist"`
+	CodexCuratedModels    []string           `json:"codex_curated_models"`
+	MaxPerUser            int32              `json:"max_per_user"`
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
+	MaxRows               int32              `json:"max_rows"`
 }
 
 type ListSaturationQueuedRunsForEphemeralRow struct {
@@ -10182,10 +10184,8 @@ type ListSaturationQueuedRunsForEphemeralRow struct {
 //     the lock. It can also transiently exclude a run whose owner has just dropped below the
 //     cap; the next tick surfaces it, so no run is lost.
 //
-// ORDER BY r.status_since ASC so the longest-waiting run is provisioned first; note the
-// sibling orders by created_at, but THIS path's clock is status_since (the same column the
-// debounce gates on), so we order by it for consistency. LIMIT @max_rows bounds the work
-// per tick.
+// Effective run priority comes first, then status_since (the debounce clock) breaks
+// equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
 func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg ListSaturationQueuedRunsForEphemeralParams) ([]ListSaturationQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral,
 		arg.SaturationDelay,
@@ -10194,6 +10194,7 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 		arg.DockerRepoAllowlist,
 		arg.CodexCuratedModels,
 		arg.MaxPerUser,
+		arg.BackgroundGraceCutoff,
 		arg.MaxRows,
 	)
 	if err != nil {
@@ -10317,17 +10318,18 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < $5::int
-ORDER BY r.created_at ASC
-LIMIT $6
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $6) DESC, r.created_at ASC
+LIMIT $7
 `
 
 type ListUnplaceableQueuedRunsForEphemeralParams struct {
-	WorkerDockerEnabled bool            `json:"worker_docker_enabled"`
-	DockerRepoAllowlist []uuid.UUID     `json:"docker_repo_allowlist"`
-	EphemeralLease      pgtype.Interval `json:"ephemeral_lease"`
-	CodexCuratedModels  []string        `json:"codex_curated_models"`
-	MaxPerUser          int32           `json:"max_per_user"`
-	MaxRows             int32           `json:"max_rows"`
+	WorkerDockerEnabled   bool               `json:"worker_docker_enabled"`
+	DockerRepoAllowlist   []uuid.UUID        `json:"docker_repo_allowlist"`
+	EphemeralLease        pgtype.Interval    `json:"ephemeral_lease"`
+	CodexCuratedModels    []string           `json:"codex_curated_models"`
+	MaxPerUser            int32              `json:"max_per_user"`
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
+	MaxRows               int32              `json:"max_rows"`
 }
 
 type ListUnplaceableQueuedRunsForEphemeralRow struct {
@@ -10395,6 +10397,7 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 		arg.EphemeralLease,
 		arg.CodexCuratedModels,
 		arg.MaxPerUser,
+		arg.BackgroundGraceCutoff,
 		arg.MaxRows,
 	)
 	if err != nil {

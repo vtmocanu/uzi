@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -49,7 +50,7 @@ func unplaceableRunIDs(fx *fleetFixture) map[uuid.UUID]bool {
 
 func unplaceableRunIDsCap(fx *fleetFixture, maxPerUser int32) map[uuid.UUID]bool {
 	fx.t.Helper()
-	rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+	rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 		MaxRows:    50,
 		MaxPerUser: maxPerUser,
 	})

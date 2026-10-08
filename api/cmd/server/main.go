@@ -766,6 +766,7 @@ func run() error {
 		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
 		SaturationDelay:     cfg.EphemeralSaturationDelay,
+		BackgroundGrace:     cfg.WorkerBackgroundGrace,
 		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
 		// live lease and provisioning evicts the oldest releasable one at the cap.
 		Lease: cfg.EphemeralLease,

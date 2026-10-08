@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -80,7 +81,7 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 	listed := func(fx *fleetFixture) (gap, sat map[uuid.UUID]bool) {
 		fx.t.Helper()
 		gap, sat = map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
-		g, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+		g, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 			EphemeralLease: iv, MaxPerUser: 1000, MaxRows: 50, CodexCuratedModels: curated})
 		if err != nil {
 			fx.t.Fatalf("ListUnplaceableQueuedRunsForEphemeral: %v", err)
@@ -88,7 +89,7 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		for _, r := range g {
 			gap[r.ID] = true
 		}
-		sr, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+		sr, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 			SaturationDelay: pgtype.Interval{Valid: true}, EphemeralLease: iv, MaxPerUser: 1000, MaxRows: 50, CodexCuratedModels: curated})
 		if err != nil {
 			fx.t.Fatalf("ListSaturationQueuedRunsForEphemeral: %v", err)

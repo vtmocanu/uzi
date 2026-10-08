@@ -154,7 +154,7 @@ func TestOrdinaryTriggersSkipProfileBoundRunsLiveDB(t *testing.T) {
 	fx.onlineWorker("base-only", false)
 	gapBound := fx.boundQueuedRun(prof, []string{"docker"})
 	gapUnbound := fx.queuedRun([]string{"docker"})
-	gap, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{MaxRows: 1000, MaxPerUser: 100})
+	gap, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true}, MaxRows: 1000, MaxPerUser: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestOrdinaryTriggersSkipProfileBoundRunsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	fx.activeRunOn(baseOnly)
-	sat, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+	sat, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 		SaturationDelay: pgtype.Interval{Microseconds: 0, Valid: true}, MaxRows: 1000, MaxPerUser: 100,
 	})
 	if err != nil {
@@ -200,7 +200,7 @@ func TestOrdinaryTriggersSkipProfileBoundRunsLiveDB(t *testing.T) {
 	// And the lane trigger lists the bound run it can serve, and neither unbound run. gapBound
 	// requires docker, which the lane never has, so the lane trigger excludes it too (see
 	// TestLaneTriggerSkipsDockerRunsLiveDB).
-	lane, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{MaxRows: 1000, MaxPerUser: 100})
+	lane, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true}, MaxRows: 1000, MaxPerUser: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestReapLaneMismatchLiveDB(t *testing.T) {
 	plainOnUnbound := seed(unbound2, false)
 
 	// A long deadline, so only the mismatch arm can fire on these just-created workers.
-	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{ProvisionDeadline: time.Hour})
+	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, ProvisionDeadline: time.Hour})
 	if _, err := prov.ReapPass(fx.ctx); err != nil {
 		t.Fatalf("ReapPass: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestLaneTriggerSkipsDockerRunsLiveDB(t *testing.T) {
 	}
 	servable := fx.boundQueuedRun(prof, nil)
 
-	rows, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{MaxRows: 1, MaxPerUser: 100})
+	rows, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true}, MaxRows: 1, MaxPerUser: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +402,7 @@ func TestReapLaneWorkerWithoutFetchProtocolLiveDB(t *testing.T) {
 	}
 
 	// A long deadline, so only the no-protocol arm can fire on these just-created workers.
-	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{ProvisionDeadline: time.Hour})
+	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, ProvisionDeadline: time.Hour})
 	if _, err := prov.ReapPass(fx.ctx); err != nil {
 		t.Fatalf("ReapPass: %v", err)
 	}

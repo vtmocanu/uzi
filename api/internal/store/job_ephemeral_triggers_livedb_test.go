@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -43,7 +44,7 @@ func (fx *fleetFixture) queuedJob() uuid.UUID {
 
 func saturationRunIDs(fx *fleetFixture) map[uuid.UUID]bool {
 	fx.t.Helper()
-	rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+	rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 		SaturationDelay: pgtype.Interval{Valid: true},
 		MaxRows:         1000,
 		MaxPerUser:      1000,

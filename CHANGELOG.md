@@ -33,6 +33,9 @@ through `[0.52.0]`.)
   The fixed owner limit remains 8, but admission excludes at most one non-decision hold per run with exact current-generation, unreleased live ownership and a fresh worker heartbeat. Total open custody remains visible and protected; decision holds, older generations and unknown or stale claims still count. CLI, queued-run health, owner health and Slack capacity facts use the admission count separately from total holds; older API responses fall back to total when the new field is absent, preserving explicit zero. Continuations retain their 1–7 own-open-hold exemption. This is a statement-snapshot gate, so concurrent claims and later staleness can exceed the limit. No-action UX copy and tone stay with #2444.
   Exhaustion custody remains a source-only owner decision (needs action after failed capture) even with an available archive or a latest capture preparing/uploading. Web and CLI keep export access separate from latest-work coverage warnings; capacity-only alerts warn, while reported blocked runs use danger.
 
+- **Ephemeral provisioning respects run priority ([#2477](https://github.com/vtmocanu/uzi/issues/2477)).**
+  Within each provisioning trigger, expedited runs precede normal runs and fresh background runs wait behind interactive work until the configured background grace expires. Equal priorities retain queue age ordering, and isolated-lane, capability-gap and saturation trigger precedence stays unchanged.
+
 - **Terminal protection recognizes case-only run directory aliases on case-insensitive filesystems ([#2309](https://github.com/vtmocanu/uzi/issues/2309)).**
   On a case-insensitive filesystem such as default macOS APFS, a valid UUID run directory whose stored name differs from its id only by letter case is no longer read as unsafe, so a run with no terminal files is not kept under physical terminal protection indefinitely. Symlinked run directories and any other path difference stay unsafe; Linux workers are unaffected.
 
@@ -57,15 +60,13 @@ through `[0.52.0]`.)
 - **Codex MR rework receives its captured review findings ([#2393](https://github.com/vtmocanu/uzi/issues/2393)).**
   Planning and ordinary implementation prompts, including cold starts and resumes, carry the shared untrusted review-comment block with the exact reply and resolve identifiers; approved plans retain precedence, and runs without review comments keep their existing prompts.
 
+- **Removed dispatch labels stay removed ([#2441](https://github.com/vtmocanu/uzi/issues/2441)).**
+  GitHub sweep dispatches no longer restore a removed selector label during another label write. Stale board moves and label additions keep removed labels absent while preserving unrelated current labels in the issues cache.
+
 ### Added
 
 - **Exhausted worker recovery waits for the owner instead of discarding recorded recovery evidence ([#2394](https://github.com/vtmocanu/uzi/issues/2394)).**
   At the automatic worker-death cap, recorded checkpoint/capture evidence, pending publication/capture, unresolved source custody or unknown server evidence holds the run for owner Resume or Cancel; no recorded recovery evidence or unresolved custody keeps `worker_lost`, without proving absence of unrecorded worker work. Resume queues one explicit attempt and starts a recovery episode with the current `RUN_MAX_REQUEUES` automatic allowance; 0 grants none. Lifetime charged counts and generation-proven readoption refunds survive, the existing wall budget is preserved, and the #1742 once-per-run extra allowance remains initial-episode only. CLI and the full run page show per-episode counts and historical evidence with honest availability/latest-edit caveats; default CLI wait stops for this decision, while explicit `--until` keeps its status set. Shared board cards direct readers to open the run for the cause. Timer, credential, vault and ordinary input events do not release or renew the hold, and capture expiry does not fail or promote it. Question caps and deadlines reset on fresh executor execution. The `N+1` worker-death attempt contribution (`N = RUN_MAX_REQUEUES`, initial `N+2` with the positive-cap #1742 extra) and corresponding question-budget multipliers apply only with no other fresh executor execution. Ordinary transient/limit/credential redispatch can reset worker-memory question budgets within the same episode without changing its number or charged `requeue_count`; the allowance bounds charged worker-death retries, not total attempts or questions per episode or lifetime. This clarification introduces no runtime budget. Multi-run workers use the existing generic chart route `api.config.RUN_MAX_REQUEUES` (default 3; sizing example 5), with no new knob. Neither a hold nor its historical evidence guarantees an export or recovery of the latest local edits. **Downgrade note:** deliberately rolling migration 00309 back fails exhaustion holds as `worker_lost`, preserving recovery sources and custody under the prior recovery lifecycle. Owner exhaustion Resume and removed episode history are unavailable after downgrade; reapplying Up does not undo those failures. Stop or replace the newer application before Down, whose table alterations and constraint validation can lock and scan runs. See [the downgrade procedure](docs/run-recovery-wait.md#deliberate-schema-downgrade).
-
-### Fixed
-
-- **Removed dispatch labels stay removed ([#2441](https://github.com/vtmocanu/uzi/issues/2441)).**
-  GitHub sweep dispatches no longer restore a removed selector label during another label write. Stale board moves and label additions keep removed labels absent while preserving unrelated current labels in the issues cache.
 
 ## [0.86.0] - 2026-10-06
 
