@@ -87,7 +87,10 @@ const (
 // Like ClaimPayload it is returned only over the claim response and must never be
 // logged.
 type ChatClaimPayload struct {
-	RunID string `json:"run_id"`
+	MemoryEpisode           int64         `json:"memory_episode"`
+	MemoryInterventionCount int32         `json:"memory_intervention_count"`
+	MemoryPolicy            *MemoryPolicy `json:"memory_policy"`
+	RunID                   string        `json:"run_id"`
 	// Kind is always "chat" — the worker's chat lane asserts it, and it keeps the
 	// two lanes' payloads self-describing.
 	Kind string `json:"kind"`
@@ -385,16 +388,23 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		sessionID = resumeSession
 	}
 
+	frozenMemoryPolicy, err := optionalMemoryPolicy(run.MemoryPolicy)
+	if err != nil {
+		return nil, err
+	}
 	return &ChatClaimPayload{
-		RunID:           run.ID.String(),
-		Kind:            run.Kind,
-		Title:           run.Title.String,
-		Status:          run.Status,
-		SessionID:       textPtr(sessionID),
-		ResumeOfRunID:   uuidPtr(run.ResumeOfRunID),
-		LastSeq:         run.LastSeq,
-		RequeueCount:    run.RequeueCount,
-		ClaimGeneration: run.ClaimGeneration,
+		RunID:                   run.ID.String(),
+		Kind:                    run.Kind,
+		Title:                   run.Title.String,
+		Status:                  run.Status,
+		SessionID:               textPtr(sessionID),
+		ResumeOfRunID:           uuidPtr(run.ResumeOfRunID),
+		LastSeq:                 run.LastSeq,
+		RequeueCount:            run.RequeueCount,
+		ClaimGeneration:         run.ClaimGeneration,
+		MemoryEpisode:           run.MemoryEpisode,
+		MemoryInterventionCount: run.MemoryInterventionCount,
+		MemoryPolicy:            frozenMemoryPolicy,
 		Secrets: ChatClaimSecrets{
 			AnthropicOAuthToken: string(anthropic),
 		},

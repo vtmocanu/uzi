@@ -3590,7 +3590,9 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	RegisterNonce string `json:"register_nonce,omitempty"`
+	MemoryEpisode *int64 `json:"memory_episode,omitempty"`
+	State         string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -3971,6 +3973,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseWorkerMemoryPressure {
+		return s.parkWorkerMemoryPressure(ctx, wkr, runID, req)
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
 		return store.Run{}, false, err

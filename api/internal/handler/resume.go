@@ -42,18 +42,26 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 
 	switch run.Status {
 	case "recovery_wait":
-		if !run.RecoveryWaitCause.Valid || run.RecoveryWaitCause.String != "worker_requeue_exhausted" {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}
-		if _, err := h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
-			ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+		var resumeErr error
+		if run.RecoveryWaitCause.String == "worker_memory_pressure" {
+			_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
+				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+			})
+		} else {
+			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
+				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+			})
+		}
+		if resumeErr != nil {
+			if errors.Is(resumeErr, pgx.ErrNoRows) {
 				httpx.Error(w, http.StatusConflict, "run cannot resume: hold changed or no remaining budget")
 				return
 			}
-			slog.Error("resume worker recovery episode", "error", err)
+			slog.Error("resume recovery episode", "error", resumeErr)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

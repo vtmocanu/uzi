@@ -1155,6 +1155,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
+		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		r.Post("/runs/{id}/cross-checks", h.WorkerSubmitPlanCrossCheck)
 		r.Get("/runs/{id}/cross-checks/plan/{round}", h.WorkerPlanCrossCheckStatus)
 		r.Post("/runs/{id}/cross-check-verdict", h.WorkerCrossCheckVerdict)

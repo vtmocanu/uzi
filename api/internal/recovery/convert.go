@@ -157,7 +157,7 @@ func deriveHoldAttention(row holdAttentionInput) string {
 		return attentionCapturing
 	case row.CaptureState == "needs_action":
 		return attentionNeedsAction
-	case row.RunStatus == "recovery_wait" && row.RecoveryWaitCause == custodyRecoveryCauseWorkerRequeueExhausted:
+	case row.RunStatus == "recovery_wait" && (row.RecoveryWaitCause == custodyRecoveryCauseWorkerRequeueExhausted || row.RecoveryWaitCause == "worker_memory_pressure"):
 		return attentionSourceOnly
 	case row.RunStatus != "" && !custodyRunTerminalStatuses[row.RunStatus]:
 		return attentionActive

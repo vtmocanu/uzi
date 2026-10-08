@@ -395,6 +395,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 func protocolFeatures(activeSnapshotEnabled bool) []string {
 	groups := [][]string{
 		{"dind_maintenance_v1"},
+		{"worker_memory_pressure_v1"},
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1"}, // PRD #1392 M1
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
 		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
