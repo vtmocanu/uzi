@@ -19,12 +19,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-const acceptanceGenericOrphan = "worker restarted; run orphaned and out of re-queue budget"
 const acceptanceMACCopy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
 
-func acceptanceRunState(t *testing.T, e *settleEnv, reason string) {
+func acceptanceRunState(t *testing.T, e *settleEnv) {
 	t.Helper()
-	var status, origin, got string
+	rejectionAssertPark(t, e)
+	var status string
+	var origin, got *string
 	var generation int64
 	var requeues int
 	var allowanceUnused, noLease bool
@@ -36,9 +37,9 @@ func acceptanceRunState(t *testing.T, e *settleEnv, reason string) {
 		Scan(&status, &origin, &got, &generation, &requeues, &allowanceUnused, &noLease); err != nil {
 		t.Fatal(err)
 	}
-	if status != "failed" || origin != "worker_lost" || got != reason ||
+	if status != "recovery_wait" || origin != nil || got != nil ||
 		generation != 3 || requeues != 0 || !allowanceUnused || !noLease {
-		t.Fatalf("orphan state = %s/%s %q G%d requeues=%d unused=%t noLease=%t",
+		t.Fatalf("exhaustion hold = %s/%v %v G%d requeues=%d unused=%t noLease=%t",
 			status, origin, got, generation, requeues, allowanceUnused, noLease)
 	}
 }
@@ -62,7 +63,7 @@ func acceptanceRegister(t *testing.T, e *settleEnv) {
 	if !found {
 		t.Fatal("registration did not advertise terminal_rejection_report")
 	}
-	acceptanceRunState(t, e, acceptanceGenericOrphan)
+	acceptanceRunState(t, e)
 }
 
 func acceptanceCustody(t *testing.T, e *settleEnv, id uuid.UUID, outcome, state string) {
@@ -155,7 +156,7 @@ func TestTerminalRejectionAcceptanceLiveDB(t *testing.T) {
 		assertRejectionDisposition(t, rejectionHTTP(e, http.MethodPost,
 			"/api/worker/terminal-rejections", e.tokenA, string(body)), e.run, 3, "recorded")
 	}
-	acceptanceRunState(t, e, acceptanceMACCopy)
+	acceptanceRunState(t, e)
 	e.assertOpen(exact, sibling)
 	h := acceptanceOwnerHold(t, e, ownerToken, exact)
 	if h.RunID != e.run.String() || h.Generation != 3 || h.State != "open" ||
@@ -173,7 +174,10 @@ func TestTerminalRejectionAcceptanceLiveDB(t *testing.T) {
 		t.Fatalf("archives = %d %s", rec.Code, rec.Body.String())
 	}
 
-	scratch, err := os.MkdirTemp("", "terminal-acceptance.")
+	if err := os.MkdirAll("../../../.uzi/scratch", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	scratch, err := os.MkdirTemp("../../../.uzi/scratch", "terminal-acceptance.")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,5 +296,5 @@ func TestTerminalRejectionOldWorkerNewAPILiveDB(t *testing.T) {
 		t.Fatalf("old worker custody changed by feature advertisement: %+v", h)
 	}
 	e.assertOpen(exact, e.pred, e.sibGen, e.sibWork)
-	acceptanceRunState(t, e, acceptanceGenericOrphan)
+	acceptanceRunState(t, e)
 }

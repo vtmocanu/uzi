@@ -68,7 +68,7 @@ async function registerAfterRestart(outbox: Outbox, withRegistry = true): Promis
   const worker = new Worker(
     { workerName: "restart-probe", workerTemplate: "base", maxConcurrentRuns: 1, pollIntervalMs: 1 } as Config,
     client,
-    {} as RunRunner,
+    { recoveryInventoryPending: async () => false } as unknown as RunRunner,
     {} as ChatRunner,
     {} as JudgeRunner,
     {} as ReviewRunner,

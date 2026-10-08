@@ -205,7 +205,7 @@ func credentialSwitchState(r store.Run) *string {
 // RUN_FORGE_UNREACHABLE_MAX_PARKS; 0 = unlimited), passed in the same way as
 // extensionCapSeconds so this mapper stays pure — no config reaches into it. It surfaces on
 // the DTO as ForgeParkMax so the forge-park pill can render "N of MAX".
-func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, forgeParkMax int, now time.Time) apitypes.RunDTO {
+func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, forgeParkMax int, now time.Time, automaticRequeueLimit int) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
@@ -223,6 +223,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		Title:          textPtrValue(r.Title.Valid, r.Title.String),
 		Status:         r.Status,
 		RequeueCount:   r.RequeueCount,
+		WorkerRecovery: workerRecoveryDTO(r, automaticRequeueLimit),
 		IterationCount: r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
@@ -732,4 +733,27 @@ func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
 		out.Result = res
 	}
 	return out
+}
+
+// workerRecoveryDTO maps lifetime counts to the current configured episode allowance.
+// Evidence is historical; it never asserts latest work or current forge availability.
+func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
+	if r.WorkerRecoveryEpisode == 0 && len(r.WorkerRecoveryEvidence) == 0 &&
+		(!r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "worker_requeue_exhausted") {
+		return nil
+	}
+	used := r.RequeueCount - r.RequeueEpisodeBaseline
+	remaining := max(0, limit-int(used))
+	dto := &apitypes.WorkerRecoveryDTO{Episode: r.WorkerRecoveryEpisode,
+		AutomaticRequeueLimit: limit, EpisodeUsed: used, EpisodeRemaining: remaining}
+	if len(r.WorkerRecoveryEvidence) > 0 {
+		var evidence apitypes.WorkerRecoveryEvidenceDTO
+		if err := json.Unmarshal(r.WorkerRecoveryEvidence, &evidence); err != nil || strings.TrimSpace(string(r.WorkerRecoveryEvidence)) == "null" {
+			// A corrupt historic snapshot cannot establish recovery availability.
+			evidence = apitypes.WorkerRecoveryEvidenceDTO{Unknown: true,
+				PublicationUncertain: true, CaptureUncertain: true, CustodyUncertain: true}
+		}
+		dto.Evidence = &evidence
+	}
+	return dto
 }

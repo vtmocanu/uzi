@@ -24,9 +24,12 @@ import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { state } from "../store";
-import { delay, oidcDemo, requireSession, users } from "./shared";
+import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
+import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
+import type { CrossCheckPinDTO, Harness } from "../../lib/apiTypes";
+import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
 
 // PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
@@ -69,6 +72,7 @@ const FETCH_CAP_BOUNDS: Record<string, [number, number]> = {
   fetch_max_run_attempts: [1, 100000],
 };
 const SEED_USER_SETTINGS: UserSettings = {
+  cross_check_pins: [],
   default_model: null,
   // PRD #1551 M1/D2: the two explicit per-harness worker-model lanes; null = inherit.
   // The legacy default_model above stays as a server-projected compatibility field.
@@ -95,6 +99,19 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
 };
+// Persisted pins override these fresh-demo seeds on reload.
+if (mockScenario() === "cross-check-mixed") {
+  SEED_USER_SETTINGS.cross_check_pins = [
+    { stage: "plan", harness: "codex", model: "gpt-6-sol", effort: null,
+      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+  ];
+}
+if (mockScenario() === "cross-check-dormant-claude") {
+  SEED_USER_SETTINGS.cross_check_pins = [
+    { stage: "plan", harness: "claude", model: "sonnet", effort: "max",
+      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: false },
+  ];
+}
 const SEED_APP_SETTINGS: AppSettings = {
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
@@ -207,7 +224,17 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   if (typeof us !== "object" || us === null || typeof as !== "object" || as === null) return false;
   const u = us as Record<string, unknown>;
   const a = as as Record<string, unknown>;
-  const okUser =
+  const validPins = u.cross_check_pins === undefined ||
+    (Array.isArray(u.cross_check_pins) && u.cross_check_pins.length <= 2 &&
+      new Set(u.cross_check_pins.map((p: unknown) => p && typeof p === "object" ? (p as Record<string, unknown>).harness : null)).size === u.cross_check_pins.length &&
+      u.cross_check_pins.every((p: unknown) => {
+        if (!p || typeof p !== "object") return false;
+        const pin = p as Record<string, unknown>;
+        if (pin.stage !== "plan" || (pin.harness !== "claude" && pin.harness !== "codex")) return false;
+        return (pin.model === null || (typeof pin.model === "string" && !checkerModelWarning(pin.model, pin.harness))) &&
+          (pin.effort === null || (typeof pin.effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(pin.effort)));
+      }));
+  const okUser = validPins &&
     (u.default_model === null || typeof u.default_model === "string") &&
     // PRD #1551 M1: optional so a pre-split blob stays valid; absent/null reads as
     // inherit (treated as null), and the SEED fills them going forward — the same
@@ -458,7 +485,17 @@ function mySettingsResponse(): { settings: UserSettings } {
   const lane = effectiveLegacyLane(userSettings.default_harness);
   const projected =
     lane === "codex" ? userSettings.default_codex_model : userSettings.default_claude_model;
-  return { settings: { ...userSettings, default_model: projected ?? null } };
+  const cross_check_pins: CrossCheckPinDTO[] = (["claude", "codex"] as const).map(harness => {
+    const pin = userSettings.cross_check_pins?.find(p => p.stage === "plan" && p.harness === harness);
+    const model = pin?.model ?? null, effort = pin?.effort ?? null;
+    const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
+      : userSettings.default_codex_model ?? "gpt-6.1-sol";
+    const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+    return { stage: "plan", harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
+      resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
+      effort_source: effort === null ? "worker default" : "pin", active: harness === "codex" };
+  });
+  return { settings: { ...userSettings, cross_check_pins, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1102,6 +1139,38 @@ export const settingsApi = {
     // + light_theme:"ember") returns 400 without half-applying — matching the real
     // handler's validate-all-then-write ordering.
     let next = { ...userSettings };
+    if ("cross_check_pins" in patch) {
+      const list: unknown = patch.cross_check_pins;
+      if (!Array.isArray(list) || list.length > 2) throw new ApiError(400, "cross_check_pins: expected at most two cells");
+      const pins = (userSettings.cross_check_pins ?? []).map(p => ({ ...p }));
+      const seen = new Set<string>();
+      for (const raw of list) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ApiError(400, "cross_check_pins: invalid cell");
+        const cell = raw as Record<string, unknown>;
+        const name = `cross_check_pins[plan/${cell.harness}]`;
+        if (cell.stage !== "plan" || (cell.harness !== "claude" && cell.harness !== "codex"))
+          throw new ApiError(400, `${name}: invalid stage/harness`);
+        if (Object.keys(cell).some(k => !["stage", "harness", "model", "effort"].includes(k)))
+          throw new ApiError(400, `${name}: unknown field`);
+        const harness: Harness = cell.harness;
+        if (seen.has(harness)) throw new ApiError(400, `${name}: duplicate cell`);
+        seen.add(harness);
+        const previous = pins.find(p => p.harness === harness);
+        const pin: CrossCheckPinDTO = previous ?? { stage: "plan", harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex" };
+        for (const field of ["model", "effort"] as const) {
+          if (!(field in cell)) continue;
+          const value = cell[field];
+          if (value !== null && typeof value !== "string") throw new ApiError(400, `${name}.${field}: expected string or null`);
+          const normalized = typeof value === "string" ? normalizeCheckerValue(value) : "";
+          const warning = field === "model" ? checkerModelWarning(normalized, harness)
+            : normalized && !["low", "medium", "high", "xhigh", "max"].includes(normalized) ? "invalid effort" : "";
+          if (warning) throw new ApiError(400, `${name}.${field}: ${warning}`);
+          pin[field] = normalized || null;
+        }
+        if (!previous && ("model" in cell || "effort" in cell)) pins.push(pin);
+      }
+      next.cross_check_pins = pins;
+    }
     if (patch.default_model !== undefined) {
       // PRD #1551 D3: the deprecated legacy field is bridged to the effective-harness
       // lane, never stored on its own. The effective harness is the pin supplied in

@@ -106,7 +106,7 @@ func TestPlanCrossCheckExitSweepLiveDB(t *testing.T) {
 	}
 	// Requeue is already a custody exit: settlement must precede this read,
 	// without requiring a periodic sweep.
-	firstCredit := assertPlanCrossCheckSettled(ctx, t, f, childID, 110)
+	firstCredit := assertPlanCrossCheckSettled(ctx, t, f, childID, 110, "timed_out")
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'running', status_since = now(),
         requeue_count = 0 WHERE id = $1`, f.runID)
 	if _, err := f.q.SetRunWallPark(ctx, store.SetRunWallParkParams{
@@ -152,7 +152,7 @@ func TestPlanCrossCheckExitSweepLiveDB(t *testing.T) {
 	}
 	sweep(0) // the earlier requeue already settled this check
 	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'queued' WHERE id = $1`, f.runID)
-	assertPlanCrossCheckSettled(ctx, t, f, childID, 110)
+	assertPlanCrossCheckSettled(ctx, t, f, childID, 110, "timed_out")
 	sweep(0) // synchronous settlement leaves no work for the fallback
 	var verdict, reason, childStatus string
 	var credit int32
@@ -163,7 +163,7 @@ func TestPlanCrossCheckExitSweepLiveDB(t *testing.T) {
 		Scan(&verdict, &reason, &childStatus, &credit); err != nil {
 		t.Fatal(err)
 	}
-	if verdict != "failed" || reason != "superseded" || childStatus != "cancelled" || credit < 110 {
+	if verdict != "failed" || reason != "timed_out" || childStatus != "cancelled" || credit < 110 {
 		t.Fatalf("exit: verdict=%s reason=%s child=%s credit=%d", verdict, reason, childStatus, credit)
 	}
 	if credit != firstCredit {

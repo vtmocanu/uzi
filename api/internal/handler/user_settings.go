@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -30,6 +31,7 @@ import (
 // tokens whose rate meters the user surfaced on the sidebar rail — the default
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
+	CrossCheckPins []crossCheckPinDTO `json:"cross_check_pins"`
 	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): the retained model defaults now live
 	// in the two per-harness lanes below. On GET/PUT this legacy field is a PROJECTION of
 	// the lane for the effective harness (ResolveSettingsHarness), kept one release as a
@@ -90,6 +92,12 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	pins, err := h.crossCheckPinSettings(r.Context(), userID)
+	if err != nil {
+		slog.Error("get cross-check pins", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	sidebarCodexIDs := s.SidebarCodexAccountIds
 	if sidebarCodexOverride != nil {
 		sidebarCodexIDs = *sidebarCodexOverride
@@ -115,6 +123,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
+			CrossCheckPins:         pins,
 			DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
 			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
 			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
@@ -189,7 +198,8 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// RawMessage distinguishes an absent field (nil) from a present null (the
 	// bytes `null`); a plain *string cannot, and absent must mean "unchanged".
 	var req struct {
-		DefaultModel json.RawMessage `json:"default_model"`
+		CrossCheckPins json.RawMessage `json:"cross_check_pins"`
+		DefaultModel   json.RawMessage `json:"default_model"`
 		// The two per-harness lanes (PRD #1551 M1 / D2), same absent/null/value tri-state
 		// as default_model: absent ⇒ lane unchanged, null ⇒ clear to inherit, a validated
 		// value ⇒ set. Cross-vocabulary rejection uses closed lists only (D3).
@@ -513,11 +523,23 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pinPatches, err := decodeCrossCheckPins(req.CrossCheckPins, user.ID)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// ---- Phase 2: writes. Every present field has validated, so nothing below
 	// leaves the row half-updated on a bad input. Each SetUser* is its own
 	// single-column statement (PATCH semantics); the four appearance columns go in
 	// ONE atomic conditional UPDATE (no read-merge-write, so two concurrent saves
 	// of different fields cannot clobber each other).
+
+	if err := h.saveCrossCheckPins(r.Context(), pinPatches); err != nil {
+		slog.Error("save cross-check pins", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 
 	if ok {
 		if _, err := h.q.SetUserHarnessModels(r.Context(), groupParams); err != nil {
@@ -879,24 +901,14 @@ func validateHarness(raw *string) (pgtype.Text, error) {
 // mirror of workersvc.codexModels and the web CLAUDE_MODEL_ALIASES sibling. Used ONLY by
 // the closed-list cross-vocabulary guard: a value in this set is rejected from the Claude
 // lane. Deliberately NOT a prefix check — no `gpt-` guessing.
-var curatedCodexModels = map[string]bool{
-	"gpt-6-astra": true,
-	"gpt-5.6-sol": true,
-	"gpt-6-sol":   true,
-	"gpt-6.1-sol": true,
-}
+var curatedCodexModels = agenttmpl.CuratedCodexModels
 
 // knownClaudeAliases is the closed Claude alias set the web ModelSelect curates
 // (CLAUDE_MODEL_ALIASES: opus, sonnet, haiku, fable). Used ONLY by the cross-vocabulary
 // guard: one of these is rejected from the Codex lane. A full custom Claude id (e.g.
 // claude-opus-4-8) is NOT in this set and passes — the guard is a closed list, not a
 // `claude-` prefix check (D3).
-var knownClaudeAliases = map[string]bool{
-	"opus":   true,
-	"sonnet": true,
-	"haiku":  true,
-	"fable":  true,
-}
+var knownClaudeAliases = agenttmpl.KnownClaudeAliases
 
 // rejectCodexIDInClaudeLane fails when a validated model value is a curated Codex id sitting
 // in a Claude-vocabulary field (PRD #1551 D3). A NULL/blank (clear) value never trips it.

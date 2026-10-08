@@ -157,6 +157,8 @@ func TestPlanCrossCheckGateReasonNoRowDeclarationsLiveDB(t *testing.T) {
 		{name: "explicit empty reason", harness: "claude", reason: "", invalid: true},
 		{name: "false no-row revise", harness: "claude", reason: "revise", invalid: true},
 		{name: "false no-row block", harness: "claude", reason: "block", invalid: true},
+		{name: "false no-row exhaustion", harness: "claude", reason: "revisions_exhausted", invalid: true},
+		{name: "false recovered no-row exhaustion", harness: "claude", reason: "revisions_exhausted", recovered: true, invalid: true},
 		{name: "false unsupported Claude lead", harness: "claude", reason: "codex_lead_unsupported", invalid: true},
 		{name: "unbounded diff refusal", harness: "claude", reason: "planning_diff_refused", refusal: "anything", invalid: true},
 		{name: "missing diff refusal", harness: "claude", reason: "planning_diff_refused", invalid: true},

@@ -80,7 +80,8 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
                   : "Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle."}
             </p>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
-              {/* Each count line renders only when its value > 0 (matching recoveryWaitCount),
+              <Count value={holds.aggregate.open_holds} singular="open custody hold" plural="open custody holds" />
+              {/* Each decision/blocked count renders only when its value > 0 (matching recoveryWaitCount),
                   so the alert never shows "0 holds need a decision" or "0 runs blocked". The
                   self-hide/escalation decision still lives in custodyAlertView. */}
               {view.decisionNeeded > 0 && (

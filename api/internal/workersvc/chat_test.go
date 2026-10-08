@@ -27,7 +27,7 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 	uid := uuid.New()
 	fs := &fakeStore{
 		chatClaimRun: store.Run{
-			ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed",
+			ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", ClaimGeneration: 3,
 			Title:            pgtype.Text{String: "How does the plan gate work?", Valid: true},
 			IssueDescription: "how does the plan-approval gate work?",
 		},
@@ -44,6 +44,9 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 	}
 	if payload.Kind != runkind.Chat {
 		t.Errorf("Kind = %q, want chat", payload.Kind)
+	}
+	if payload.ClaimGeneration != 3 {
+		t.Errorf("ClaimGeneration = %d, want 3", payload.ClaimGeneration)
 	}
 	if payload.Secrets.AnthropicOAuthToken != "anthropic-chat-token-abcdef1234567890" {
 		t.Errorf("chat claim must carry the decrypted Anthropic token")

@@ -1022,7 +1022,7 @@ func openPRScene(dark bool, detail apitypes.PullDetailDTO) string {
 	m = key(m, keyViewPulls)
 	m = step(m, pullsMsg{reqID: m.pulls.waitID, pulls: []apitypes.PullDTO{detail.PullDTO}})
 	m = key(m, keyEnter) // open the PR drill-in
-	m = step(m, prMsg{reqID: m.pr.waitID, detail: detail})
+	m = step(m, prMsg{reqID: m.pr.waitID, gen: m.pr.gen, detail: detail})
 	return m.View().Content
 }
 

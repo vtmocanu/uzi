@@ -1634,11 +1634,70 @@ function codexHoldCopy(
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
-export function RecoveryWaitPanel({ run }: { run: Run }) {
+function WorkerExhaustionPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run;
+  ownerProof: boolean;
+  busy: boolean;
+  onResume: () => void;
+  onCancel: () => void;
+}) {
+  const recovery = run.worker_recovery;
+  const evidence = recovery?.evidence;
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
+      <p className="text-sm font-semibold text-warn">Worker recovery needs your decision</p>
+      <p className="mt-0.5 text-xs text-muted">
+        Automatic worker recovery has stopped. Only the run owner can resume or cancel this run.
+        Resume requests one explicit attempt, even when the automatic recovery limit is zero.
+        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.
+      </p>
+      <p className="mt-1.5 text-xs text-muted">
+        {recovery
+          ? `Automatic recovery limit: ${recovery.automatic_requeue_limit}. Used: ${recovery.episode_used}. Remaining: ${recovery.episode_remaining}.`
+          : "Automatic recovery limit, used and remaining: unknown."}
+      </p>
+      {recovery && <p className="mt-1.5 text-xs text-muted">Recovery episode: {recovery.episode}.</p>}
+      <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p>
+      {evidence ? (
+        <>
+          {evidence.checkpoint_tip && <p className="mt-1.5 text-xs text-muted">
+            The server recorded checkpoint {evidence.checkpoint_tip} before this hold. Current availability and the latest local edits are not verified.
+          </p>}
+          {evidence.available_capture && <p className="mt-1.5 text-xs text-muted">
+            A recovery capture was recorded as available at {evidence.recorded_at}. It may later expire or be discarded; it may not contain the latest local edits.
+          </p>}
+          {evidence.publication_uncertain && <p className="mt-1.5 text-xs text-muted">Publication is pending or uncertain.</p>}
+          {evidence.capture_uncertain && <p className="mt-1.5 text-xs text-muted">Capture is pending or uncertain.</p>}
+          {evidence.custody_uncertain && <p className="mt-1.5 text-xs text-muted">Retained source custody is uncertain.</p>}
+          {(evidence.unknown || (!evidence.checkpoint_tip && !evidence.available_capture &&
+            !evidence.publication_uncertain && !evidence.capture_uncertain && !evidence.custody_uncertain)) &&
+            <p className="mt-1.5 text-xs text-muted">Server recovery evidence is incomplete.</p>}
+        </>
+      ) : <p className="mt-1.5 text-xs text-muted">Server recovery evidence is unavailable.</p>}
+      {ownerProof ? (
+        <div className="mt-3 flex gap-2">
+          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
+        </div>
+      ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
+    </div>
+  );
+}
+
+export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {} }: {
+  run: Run;
+  ownerProof?: boolean;
+  busy?: boolean;
+  onResume?: () => void;
+  onCancel?: () => void;
+}) {
   // Only for a run actually recovering. Every other status (including terminal and the
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
+  if (run.recovery_wait_cause === "worker_requeue_exhausted") {
+    return <WorkerExhaustionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
+  }
 
   // PRD #1392 M5: a forge-unreachable park gets forge-specific copy, and (PRD #1590 D6) a
   // codex_account_unavailable hold gets the Codex copy below. Every other cause (including
@@ -1875,7 +1934,11 @@ export function RunView() {
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
-  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
+  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner } = useRunStream(id);
+  const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
+  // All page control surfaces share this gate, including the existing top Stop.
+  // Other holds retain their optimistic canSteer semantics.
+  const canSteer = optimisticCanSteer && (!workerExhausted || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
   useEffect(() => {
@@ -1946,6 +2009,35 @@ export function RunView() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const exhaustionResumeAction = useRef<{ runId: string } | null>(null);
+  useEffect(() => () => {
+    // Retire this navigation's Resume, including a return to the same run ID.
+    if (exhaustionResumeAction.current) {
+      exhaustionResumeAction.current = null;
+      setBusy(false);
+      setActionErr("");
+    }
+  }, [id]);
+  const resumeExhaustedRun = async () => {
+    if (!canSteer || !workerExhausted || run?.id !== id) return;
+    const action = { runId: id };
+    exhaustionResumeAction.current = action;
+    const isCurrent = () => currentRunIdRef.current === action.runId &&
+      exhaustionResumeAction.current === action;
+    setActionErr("");
+    setBusy(true);
+    try {
+      await api.resumeRun(action.runId);
+      if (isCurrent()) await refreshRun();
+    } catch (e) {
+      if (isCurrent()) setActionErr(errorMessage(e, "Action failed"));
+    } finally {
+      if (isCurrent()) {
+        exhaustionResumeAction.current = null;
+        setBusy(false);
+      }
+    }
+  };
   // PRD #841: the owner's global MR-rework default, for the per-run checkbox's effective
   // display when this run inherits (mr_rework_enabled null). Lives on UserSettings, not
   // the session User, so it is fetched here. Best-effort — a failed read leaves null,
@@ -2089,6 +2181,7 @@ export function RunView() {
     setDiscardOutcomeErr("");
   };
   const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
+    if (workerExhausted && !canSteer) return false;
     const requestRunId = id;
     setActionErr("");
     // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
@@ -2196,7 +2289,7 @@ export function RunView() {
   // always-mounted region is its only reliable announcement. RecoveryWaitPanel mounts
   // in the same tick as its content, and a region created with its first content is
   // typically silent to assistive tech, so the panel's own role="status" cannot be
-  // relied on. One stable key ("recovery_wait"), like pool_wait.
+  // relied on. The recovery cause keys distinct holds, including exhaustion.
   // PRD #1190: a `paused` run announces too — a deliberate owner hold a screen-reader user
   // must be told about, just like the follow-up and pool_wait parks. One stable key
   // ("paused") since a pause has no per-instance identity to re-announce on. The persistent
@@ -2224,7 +2317,9 @@ export function RunView() {
                   // transient interruption, so it gets its own stable key and sentence.
                   run.recovery_wait_cause === "data_volume_full"
                   ? "data_volume_full"
-                  : "recovery_wait"
+                  : run.recovery_wait_cause === "worker_requeue_exhausted"
+                    ? "worker_requeue_exhausted"
+                    : "recovery_wait"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
             : run?.status === "paused"
@@ -2241,6 +2336,8 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
+          : parkKey === "worker_requeue_exhausted"
+            ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
@@ -2540,8 +2637,8 @@ export function RunView() {
                   the same false all-clear.
 
                   Issue #1197 and PRD #1190: recovery_wait and paused are excluded too.
-                  No work runs during either hold: recovery_wait retries automatically
-                  after backoff, while paused waits for an explicit Resume. The needs-you
+                  No work runs during either hold. Transient recovery retries after backoff;
+                  exhaustion and paused wait for an owner decision. The needs-you
                   gates retain the connection chip. */}
               {!terminal &&
                 run.status !== "limit_wait" &&
@@ -2688,9 +2785,15 @@ export function RunView() {
           toggle, and two recovery controls stacked let a user misread that
           usage-limit checkbox as the way to un-wait the recovery hold, which it is not.
           RecoveryWaitPanel self-hides on every status but recovery_wait, so it does not
-          disturb the limit_wait/pool_wait layouts. It carries no control of its own — the
-          backoff is automatic and cancel is the separate Stop control. */}
-      <RecoveryWaitPanel run={run} />
+          disturb the limit_wait/pool_wait layouts. Transient recovery uses automatic
+          backoff; worker exhaustion offers owner-proven Resume and Cancel controls. */}
+      <RecoveryWaitPanel
+        run={run}
+        ownerProof={canSteer && confirmedOwner === true}
+        busy={busy}
+        onResume={() => { void resumeExhaustedRun(); }}
+        onCancel={() => { void cancelRun(); }}
+      />
 
       {/* PRD #1190: the paused-run panel. Self-hides on every status but `paused`. Resume
           hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
@@ -2967,7 +3070,7 @@ export function RunView() {
           nothing for every other kind. */}
       <JobResultPanel run={run} />
 
-      <RecoveryArchivesPanel run={run} />
+      {(!workerExhausted || canSteer) && <RecoveryArchivesPanel run={run} />}
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run
@@ -3162,7 +3265,7 @@ export function RunView() {
               <Button
                 variant="dangerSolid"
                 size="sm"
-                disabled={busy}
+                disabled={busy || (workerExhausted && !canSteer)}
                 onClick={() => cancelRun(true)}
               >
                 {busy ? "Discarding…" : "Discard and cancel"}

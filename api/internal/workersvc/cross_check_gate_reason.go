@@ -23,7 +23,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 	switch reason {
 	case "", "revise", "block", "malformed", "model_error", "model_timeout",
 		"checker_unavailable", "confinement_failed", "timed_out", "superseded",
-		"codex_lead_unsupported", "planning_diff_refused", "interrupted", "candidate_refused", "checker_failed":
+		"codex_lead_unsupported", "planning_diff_refused", "interrupted", "candidate_refused", "checker_failed", "revisions_exhausted":
 	default:
 		return ErrInvalidState
 	}

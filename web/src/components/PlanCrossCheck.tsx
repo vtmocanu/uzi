@@ -12,6 +12,7 @@ const reasons: Record<string, string> = {
   malformed: "Malformed checker response", model_error: "Checker model error",
   confinement_failed: "Checker confinement failed", superseded: "Superseded",
   checker_failed: "Checker failed",
+  approved_not_stored: "Approved plan not stored", revisions_exhausted: "Revisions exhausted",
   codex_lead_unsupported: "Not yet supported for a Codex lead",
   planning_diff_refused: "Planning diff refused", candidate_refused: "Candidate refused",
 };
@@ -48,12 +49,19 @@ function childId(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
+function safeRound(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 5 ? value : undefined;
+}
+
 export function planCheckEventText(payload: unknown, detail?: PlanCrossCheckSummary): string {
   const p = record(payload);
-  // A run has one plan checker, so a historical summary makes every plan event earlier-plan
-  // evidence, even when the deleted checker's id no longer appears in the summary.
-  const earlier = detail?.historical === true;
-  return `Plan cross-check of ${earlier ? "earlier-plan" : "checked"} candidate: ${planCheckOutcome(p.verdict, p.reason_class)}`;
+  const explicitRound = safeRound(p.round);
+  const eventRound = p.round === undefined ? 1 : explicitRound;
+  const latestRound = safeRound(detail?.round);
+  const earlier = eventRound !== undefined && latestRound !== undefined
+    && (eventRound < latestRound || (eventRound === latestRound && detail?.historical === true));
+  const identity = explicitRound === undefined ? "" : ` (round ${explicitRound})`;
+  return `Plan cross-check${identity} of ${earlier ? "earlier-plan" : "checked"} candidate: ${planCheckOutcome(p.verdict, p.reason_class)}`;
 }
 
 // Parsing is capped at 16,384 source characters across at most 20 items.
@@ -92,6 +100,10 @@ export function PlanCrossCheckEvent({ payload, detail }: { payload: unknown; det
   </section>;
 }
 
+function sourceLabel(source: unknown): string {
+  return source === "pin" || source === "worker default" ? source : "unknown";
+}
+
 export function PlanCrossCheck({ run }: { run: Run }) {
   const s = run.plan_cross_check_summary;
   const gate = run.plan_cross_check_gate_reason;
@@ -108,7 +120,7 @@ export function PlanCrossCheck({ run }: { run: Run }) {
     {s?.historical && <p>These findings concern an earlier plan; they do not certify the current plan.</p>}
     {s && <>
       <Findings value={s.findings} />
-      <p>Model: {plain(s.checker_model) || "Unreported"} · Effort: {plain(s.checker_effort) || "Unreported"}</p>
+      <p>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)}) · Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</p>
       {usage && <p>Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</p>}
       <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : cost === "Unavailable" ? " · cost unavailable" : ""}</p>
       {childId(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}

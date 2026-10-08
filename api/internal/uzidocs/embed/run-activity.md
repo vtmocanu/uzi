@@ -69,8 +69,10 @@ nothing shows no such list. The same list is available from the terminal
 via `uzi run get` (see [the CLI docs](./cli.md#commands)).
 
 Autopilot normally skips the human gate. With [Plan cross-check](./cross-check.md),
-a Claude lead proceeds after an exact-plan pass; a non-pass normally forces
-this gate, and Codex leads park as unsupported. See [Autopilot](./autopilot.md).
+a Claude lead proceeds after the latest exact-plan pass. Eligible changes
+requested receive bounded automatic revisions; exhaustion, blockers and
+check failures normally force this gate. Codex leads park as unsupported.
+See [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
 
@@ -79,7 +81,10 @@ A full revision round also works end to end from
 The plan panel and run detail show **Plan cross-check** evidence separately
 from the current human gate: checked-candidate outcome, findings, checker-run
 link, recorded model/effort and reported tokens/cost. The activity feed
-includes plan cross-check events even when there is no agent lane. Pending,
+includes distinct plan cross-check rounds even when there is no agent lane.
+Automatic revision events carry their checker-round identity separately from
+human revision counters. The summary describes the latest checked candidate;
+earlier rounds remain feed history. Pending,
 passed, changes requested, blocked, verdict deadline, checker model timeout,
 malformed/model/confinement failures, interruption and refusal have distinct
 labels; unknown or inconsistent verdict/reason pairs show unavailable.
@@ -151,14 +156,18 @@ A few things worth knowing:
 - **Nobody answers ⇒ the run fails**, "clarification timed out", once the
   answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
   is no configurable default action. The timer is held by the worker, so if
-  it dies and the run is picked up again the clock restarts: the honest
-  worst case is the timeout **times one more than the requeue limit**
-  (`RUN_MAX_REQUEUES`, default 3), 96h on the defaults. The
-  question cap (`QUESTION_MAX`, default 5 per attempt) resets the same way,
-  for the same reason, so its honest lifetime bound is likewise **× (requeue
-  limit + 1)**, 20 questions on the defaults. A run that a restarted worker resumed
-  through the one-shot finalize-resume allowance (issue #1742) gets one more
-  attempt, so both bounds become **× (requeue limit + 2)** for that run.
+  it dies and the run is picked up again the clock restarts. With no other
+  fresh executor execution, worker-death retries contribute
+  `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 96h on defaults.
+  The question cap (`QUESTION_MAX`, default 5 per attempt) resets the same
+  way: `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` — 20 questions on defaults
+  under that condition. Only the initial episode can use the once-per-run
+  finalize-resume allowance (#1742) with a positive cap, making these
+  multipliers `RUN_MAX_REQUEUES + 2`. Ordinary transient/limit/credential
+  redispatch can create fresh `execute()` within the same episode, resetting
+  worker-memory question budgets without changing its number or charged
+  `requeue_count`. `RUN_MAX_REQUEUES` bounds charged worker-death retries,
+  not total attempts or questions per episode or lifetime.
 - **Autopilot runs never park on a question.** With nobody in the loop, the
   agent auto-resolves with "proceed on your best judgment," notes the
   assumption it made in the run feed, and keeps going — see

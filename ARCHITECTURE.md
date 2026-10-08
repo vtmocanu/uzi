@@ -591,23 +591,60 @@ snapshot the requirement inside their INSERT. Seeded plans and gateless kinds
 are excluded. Required leads and `cross_check` children need a worker with
 `cross_check_v1`; the queued health reason exposes a missing capability.
 
-A Claude lead submits one bounded, normalized candidate with its immutable
-base commit and scanned planning diff. The API stores `cross_checks` and a
-report-only Codex child atomically through existing credential resolution.
+A Claude lead submits bounded, normalized candidates in explicit rounds with
+an immutable base commit and scanned planning diff. The first candidate
+snapshots automatic-round enablement and `PLAN_CROSS_CHECK_MAX_REVISIONS`
+(default 2, range 0–4); later rounds copy that snapshot. The server counts at
+most limit + 1 candidates globally across generations, including supersession.
+Automatic leads and later-round children require `cross_check_rounds_v1`;
+claimability/provisioning enforce the durable protocol capability independently
+of the runtime kill switch. Older workers snapshot disabled/0 and park REVISE;
+capable zero-budget workers park with `revisions exhausted`. The API stores
+`cross_checks` and a report-only Codex child atomically through existing credential resolution.
 The lead retains its Claude credential, the child its Codex credential and
 usage attribution. The child has its own checkout, dedicated cross-check slot
 (or a legacy plan-stage run slot during a mixed-image roll) and expedite
 priority; it publishes no branch/MR. The lead retains its slot while
 waiting, with pending wait excluded from its wall budget and banked on
-settlement. The server verdict deadline includes queue time.
+settlement. Each candidate's fresh server verdict deadline includes queue time.
+
+Submit locks the current owning lead and claim generation. An omitted round
+means legacy round 1; an exact identity/digest retry recovers the immutable
+attempt even after decision. A different candidate at that identity refuses;
+identical text for a new round still requires an explicit new round. The
+latest GET is narrowly worker-authorized, side-effect-free metadata and a
+next-round recommendation: no candidate, findings, approval grant or writes.
 
 `SetRunAutopilotPlan` binds the latest opposite-harness APPROVE to the current
 claim generation, server-computed digest and matching approval-bearing
 fields. Adjacent running/progress/completion guards prevent an unchecked
 plan from being stored or completed through those paths. The worker must obey
 a refusal; server guards cannot prevent arbitrary execution by a worker that
-ignores them. Non-pass and refusal normally force a human gate; Codex leads
-park as unsupported.
+ignores them. Stale child verdicts and plan writes cannot use an earlier
+round or generation. Eligible REVISE returns to the Claude lead automatically:
+validated usage/preparation/reconciliation releases the actual reservation,
+then the checked-state barrier is released and awaited before revision. The
+worker returns `{kind: "revise", feedback, automatic: true}` without `inputId`,
+not an `awaiting_approval` report or `releaseAppliedGate` human presentation.
+The SDK and stub executors keep automatic-round feed identity separate from
+human counters; human input cannot forge automatic provenance. A stage-neutral
+prompt builder nonce-fences checker advice and prior-plan context separately,
+requires verification against code/issue/uzi rules and declining conflicts,
+and preserves the separate human-revision builder. Exhaustion, BLOCK, timeout
+and other failures keep their fallbacks; Codex leads park as unsupported.
+
+Recovery follows the 2026-10-07 preserve-decided-fallback decision in
+[PRD #2150 D8](prds/done/2150-plan-cross-check-auto-revise.md#decision-log).
+Without an established human gate or durably approved plan, fresh rounds are
+limited to pending attempts interrupted strictly before deadline (including
+lifecycle-settled failed/superseded with that proven origin), decided REVISE,
+and `approved_not_stored`, within the same candidate budget. The first
+custody-invalidating transition supplies the authoritative clock: database
+transaction time for direct writers, that transition's server-provided `now`
+for frozen writers. Persisted `interrupted_at`/decision evidence prevents a
+later sweep from granting permission. Equality/ambiguous legacy evidence
+fails closed to timeout. Non-revisable decided outcomes keep their own reason
+even at budget exhaustion; otherwise eligible exhaustion parks as exhausted.
 
 Irrecoverable preparation receipts fail with
 `plan cross-check: preparation receipts irrecoverably lost`; unrecoverable
@@ -630,8 +667,45 @@ with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
 confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
 rationale, validation provenance and pending hosted acceptance. Automatic
-checker revision, Codex-lead checking (#2460), stage-specific pins and Code
-cross-check remain outside this implementation.
+rounds extend the original #2149
+scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
+[ADR-2149's dated extension](adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150);
+local round/recovery proofs do not establish hosted authenticated model acceptance.
+
+Plan checker pins live in `user_cross_check_pins`, keyed by owner, stage and
+family. Model and effort resolve independently from a claim-time statement
+snapshot; delivery and recording reuse that snapshot, including independent
+`pin` / `worker default` provenance. Legacy sources stay nullable/unknown
+and historical records are not recomputed after settings edits. Each new
+round resolves pins from its own claim-time settings. The settings
+DTO also exposes read-only `worker_default_model` counterfactual metadata
+using the existing allocated lead/orchestrator selection in native SQL name
+order when the Claude worker model is unset; a null first-template model
+then means SDK/account default. Codex without a saved worker model falls
+back to `gpt-6.1-sol`.
+
+A non-null model or effort pin in the Codex cell requires
+`cross_check_pins_v1`; unpinned checks still accept older
+`cross_check_v1` workers for round 1; later rounds additionally require
+`cross_check_rounds_v1`. A custom resolved model separately requires
+`codex_custom_model_v1`, including a custom worker default. Placement
+mirrors enforce these requirements; both checks repeat in claim preflight
+before credential delivery, requeuing a capability race. Local syntax/family
+and effort validation also precedes delivery. Pins are hard: no model
+substitution, effort clamp or default retry.
+
+The API does not determine account model availability. Recognized
+authenticated pinned-model rejection at checker startup settles
+`checker_unavailable`, fails the child with
+`plan cross-check: checker unavailable` and forces the lead's human gate.
+Other startup failures retain #2149 handling, including model errors with
+worker defaults or effort-only pins. The Claude pin cell is stored and
+editable but inactive; only a Codex checker checks a Claude lead today.
+See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
+decision and validation limits, and
+[configuration](docs/configuration.md#plan-cross-check-model-and-effort-pins)
+for the settings contract. Codex-lead checking (#2460) and Code cross-check
+(#2170) remain outside this implementation.
 
 PRD #2169 adds a third worker claim pool beside run and chat:
 `POST /api/worker/runs/claim?lane=cross_check`, bounded by
@@ -765,7 +839,7 @@ is a linear state machine:
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
                                                                                                                    → failed
-   ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
+   ↳ (worker dies) → re-queued within episode allowance → failed (worker_lost) or owner-only recovery_wait, by recorded state
    ↳ (provider usage window, waiting enabled by default) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
@@ -1124,8 +1198,15 @@ chain in the diagram above, with no intervening `running`.
   requeue re-parks on the same question id, so an answer submitted just before a
   crash still resumes and an answer to a superseded question is rejected. Bounds
   are an absolute answer deadline (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a
-  per-run cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue resets
-  both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)** for a run that used the one-shot finalize-resume allowance, issue #1742). **Only the
+  per-attempt cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue
+  resets both). With no other fresh executor execution, worker-death retries
+  contribute **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)**
+  in the initial episode if the one-shot finalize-resume allowance is used with
+  a positive cap (issue #1742). Ordinary transient, limit and credential
+  redispatch can create a fresh `execute()` within the same episode, resetting
+  both budgets without changing the episode or charged `requeue_count`.
+  `RUN_MAX_REQUEUES` bounds charged worker-death retries, not total attempts or
+  questions per episode or lifetime. **Only the
   deadline fails the run closed**; exhausting the cap emits a feed notice and the
   lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
   looping on questions without ever reaching a plan). **Autopilot ordinary
@@ -1193,9 +1274,11 @@ chain in the diagram above, with no intervening `running`.
   still-running turn from a local checkpoint, while this one preserves a
   run's original commits across a `failed` finalization and the worker's
   eventual teardown. A **claim-scoped custody hold** (`recovery_custody_holds`,
-  H-free, opened in the same `ClaimRun` transaction) reserves owner-scoped
-  admission capacity and blocks the worker's teardown while the work is
-  unpublished; the **archive capture** (`recovery_captures`) is the later,
+  H-free, opened in the same `ClaimRun` transaction) protects unpublished work
+  and blocks the worker's teardown. Admission counts open holds except at most
+  one per run backing a healthy current claim without an owner decision;
+  total custody remains protected. See [ADR-2445](adr/2445-custody-admission-accounting.md).
+  The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
   (a v2 worker advertises `recovery_archive_v2`; an ambiguous/older case
@@ -1273,12 +1356,21 @@ chain in the diagram above, with no intervening `running`.
   its owner to extend or stop it, never failed for the clock alone (PRD #1497,
   see the **running → paused (wall park)** entry above); a worker whose
   heartbeat is stale past `WORKER_HEARTBEAT_STALE`
-  (default 45s) is marked offline and its non-terminal runs re-queued,
-  incrementing `requeue_count` — only after a *second* consecutive stale
-  window is the run failed instead of re-queued again, giving a worker that
-  briefly lost the api time to return (issue #1390). An orphan sweep also
+  (default 45s) is marked offline and its eligible runs re-queued within the
+  owner recovery episode's `RUN_MAX_REQUEUES` allowance, incrementing lifetime
+  history `requeue_count`; episode spend is `requeue_count - requeue_episode_baseline`.
+  Over-cap disposition waits for a second consecutive stale window, preserving
+  the returning worker's readoption opportunity (issue #1390).
+  Exhausted runs fail with `worker_lost` only when recorded state has no checkpoint,
+  available capture, unresolved publication/capture/custody, or unknown evidence;
+  otherwise they hold in owner-only `recovery_wait` with cause
+  `worker_requeue_exhausted`. An explicit owner resume opens a new episode without
+  resetting lifetime history or the #1742 marker; `0` disables automatic requeues
+  but permits that explicit attempt. The #1742 one-shot finalize-resume allowance
+  applies only in initial episode 0 with a positive cap. See
+  [docs/run-recovery-wait.md](docs/run-recovery-wait.md). An orphan sweep also
   runs once at API boot, but its three stale-worker passes (offline-marking,
-  over-cap fail, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
+  over-cap disposition, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
   after the api's listeners are ready — every other boot pass runs as usual —
   so a worker that only lost the api — not its own health — is not wrongly
   declared dead; on its next

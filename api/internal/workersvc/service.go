@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -434,6 +435,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
 	// Workers.
 	CreateWorker(ctx context.Context, arg store.CreateWorkerParams) (store.Worker, error)
@@ -607,6 +609,7 @@ type Store interface {
 	// call (checkpoint_publish_attempts, 00267), and the sweeper's attempts arm that reconciles a
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
+	RecordLiveCheckpointPublishAttempt(ctx context.Context, arg store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error)
 	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
@@ -1028,13 +1031,13 @@ type Store interface {
 	StampCompletionBudgetExhausted(ctx context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
-	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
+	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error)
 	// RequeueWorkerRuns returns the re-queued run ids (PRD #1390 M2a) so Register can publish
 	// each transition post-commit, mirroring the sweeper's RequeueRunsOfStaleWorkers twin.
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
 	// The attested finalize-resume pair (issue #1742), run by Register before the ordinary orphan
 	// pass for the (run, exact generation) pairs a restarting worker attests.
-	FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error)
+	FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error)
 	RequeueAttestedFinalizeRuns(ctx context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
@@ -1351,10 +1354,13 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	PlanCrossCheckTimeout time.Duration
-	RunTimeout            time.Duration
-	RunWallCeiling        time.Duration
-	RunIdleTimeout        time.Duration
+	PlanCrossCheckMaxRevisions int32
+	// Presence distinguishes an explicitly disabled budget from an unwired service.
+	PlanCrossCheckMaxRevisionsSet bool
+	PlanCrossCheckTimeout         time.Duration
+	RunTimeout                    time.Duration
+	RunWallCeiling                time.Duration
+	RunIdleTimeout                time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
 	// RunIdleTimeout) so the worker's own park idle timer matches what the server configured
@@ -2184,6 +2190,9 @@ const defaultDispatchGrace = 15 * time.Minute
 
 // New constructs a Service. box may be nil only in tests that never call Claim.
 func New(q Store, box *secretbox.Box, p Params) *Service {
+	if !p.PlanCrossCheckMaxRevisionsSet && p.PlanCrossCheckMaxRevisions == 0 {
+		p.PlanCrossCheckMaxRevisions = config.DefaultPlanCrossCheckMaxRevisions
+	}
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
 	}
@@ -2322,23 +2331,25 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if snapshot != nil {
 		finalizeOffered = len(snapshot.FinalizeResume)
 	}
-	var finalizeFailed, finalizeRequeued []uuid.UUID
+	var finalizeFailed []store.WorkerRecoveryDisposition
+	var finalizeRequeued []uuid.UUID
 	finalizeAllowance := 0
 	// runAttested runs the attested pass on q (the tx-bound or the plain queries). No-op without a
 	// valid list.
 	runAttested := func(q interface {
-		FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error)
+		FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error)
 		RequeueAttestedFinalizeRuns(ctx context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error)
 	}) error {
 		if !finalizeOK {
 			return nil
 		}
 		failed, err := q.FailAttestedFinalizeRunsOverCap(ctx, store.FailAttestedFinalizeRunsOverCapParams{
-			FailureReason:    failParams.FailureReason,
-			WorkerID:         pgconv.UUID(wkr.ID),
-			MaxRequeues:      max,
-			RunIds:           finalize.ids,
-			ClaimGenerations: finalize.generations,
+			ReleasedWorkerNonceOverride: failParams.ReleasedWorkerNonceOverride,
+			FailureReason:               failParams.FailureReason,
+			WorkerID:                    pgconv.UUID(wkr.ID),
+			MaxRequeues:                 max,
+			RunIds:                      finalize.ids,
+			ClaimGenerations:            finalize.generations,
 		})
 		if err != nil {
 			return err
@@ -2365,6 +2376,11 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// Tx-less degraded path: no pool wired (fake-store unit tests). No worker-row lock and no
 	// snapshot persist; still rotates the nonce and resets the epoch via RegisterWorker.
 	if s.txBeginner == nil {
+		prior, err := s.q.GetWorkerByID(ctx, wkr.ID)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		failParams.ReleasedWorkerNonceOverride = &prior.SnapshotRegisterNonce
 		row, err := s.q.RegisterWorker(ctx, regParams)
 		if err != nil {
 			return store.Worker{}, "", err
@@ -2398,9 +2414,11 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	qtx := store.New(tx)
 	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
 	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
-	if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+	prior, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
 		return store.Worker{}, "", err
 	}
+	failParams.ReleasedWorkerNonceOverride = &prior.SnapshotRegisterNonce
 	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
@@ -2432,12 +2450,13 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		}
 	}
 	finalizeFailed, finalizeRequeued, finalizeAllowance, err = s.runFrozenAttested(ctx, qtx, row.ID, max,
-		store.FrozenFailWorkerRunsOverCapParams{FailureReason: failParams.FailureReason}, finalize, finalizeOK, locks)
+		store.FrozenFailWorkerRunsOverCapParams{FailureReason: failParams.FailureReason, ReleasedWorkerNonceOverride: failParams.ReleasedWorkerNonceOverride}, finalize, finalizeOK, locks)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
 	orphanFailed, err := qtx.FrozenFailWorkerRunsOverCap(ctx, store.FrozenFailWorkerRunsOverCapParams{
-		FailureReason: failParams.FailureReason, WorkerID: failParams.WorkerID, MaxRequeues: max,
+		ReleasedWorkerNonceOverride: failParams.ReleasedWorkerNonceOverride,
+		FailureReason:               failParams.FailureReason, WorkerID: failParams.WorkerID, MaxRequeues: max,
 		FrozenTargets: frozen, LockedParentIds: parents,
 	})
 	if err != nil {
@@ -2465,13 +2484,13 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 			"worker_id", wkr.ID.String(), "offered_entries", len(snapshot.Active),
 			"offered_pending_entries", pendingCount, "offered_pending_overflow", snapshot.PendingOverflow,
 			"applied", snapshotApplied, "overflow_lease_applied", snapshotApplied && snapshot.PendingOverflow,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued),
+			"orphan_failed", recoveryDispositionCount(orphanFailed, "failed"), "orphan_parked", recoveryDispositionCount(orphanFailed, "recovery_wait"), "orphan_requeued", len(requeued),
 			"finalize_resume_offered", finalizeOffered, "finalize_requeued", len(finalizeRequeued),
-			"finalize_allowance_used", finalizeAllowance, "finalize_failed", len(finalizeFailed))
+			"finalize_allowance_used", finalizeAllowance, "finalize_failed", recoveryDispositionCount(finalizeFailed, "failed"), "finalize_parked", recoveryDispositionCount(finalizeFailed, "recovery_wait"))
 	} else {
 		slog.Info("worker register orphan recovery committed",
 			"worker_id", wkr.ID.String(), "snapshot_offered", false,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+			"orphan_failed", recoveryDispositionCount(orphanFailed, "failed"), "orphan_parked", recoveryDispositionCount(orphanFailed, "recovery_wait"), "orphan_requeued", len(requeued))
 	}
 	s.publishRegisterOutcome(ctx, finalizeFailed, orphanFailed, finalizeRequeued, requeued)
 	return store.Worker(row), nonce, nil
@@ -2480,8 +2499,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 // publishRegisterOutcome merges the attested finalize-resume transitions with the ordinary orphan
 // pass (failed and requeued separately) and publishes them post-commit; both Register branches
 // (tx and tx-less) call it so the merge is one code path.
-func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, orphanFailed, finalizeRequeued, requeued []uuid.UUID) {
-	failed := append(append([]uuid.UUID{}, finalizeFailed...), orphanFailed...)
+func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, orphanFailed []store.WorkerRecoveryDisposition, finalizeRequeued, requeued []uuid.UUID) {
+	failed := append(append([]store.WorkerRecoveryDisposition{}, finalizeFailed...), orphanFailed...)
 	queued := append(append([]uuid.UUID{}, finalizeRequeued...), requeued...)
 	s.publishRegisterSweeps(ctx, failed, queued)
 }
@@ -2491,10 +2510,12 @@ func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, or
 // register-time requeue/fail reached no live channel — before, only the judge saw the fails)
 // and maybeEnqueueJudgeByID for the committed-terminal fails (PRD #46 Decision 2, the same
 // worker-lost runs the sweeper funnels). Both are best-effort and never fail the register.
-func (s *Service) publishRegisterSweeps(ctx context.Context, failed, requeued []uuid.UUID) {
-	for _, id := range failed {
-		s.publishSwept(id, "failed")
-		s.maybeEnqueueJudgeByID(ctx, id)
+func (s *Service) publishRegisterSweeps(ctx context.Context, failed []store.WorkerRecoveryDisposition, requeued []uuid.UUID) {
+	for _, row := range failed {
+		s.publishSwept(row.ID, row.Status)
+		if row.Status == "failed" {
+			s.maybeEnqueueJudgeByID(ctx, row.ID)
+		}
 	}
 	for _, id := range requeued {
 		s.publishSwept(id, "queued")
@@ -2713,7 +2734,9 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	}
 	for _, r := range missingFailed {
 		s.publishSwept(r.ID, r.Status)
-		s.maybeEnqueueJudgeByID(ctx, r.ID)
+		if r.Status == "failed" {
+			s.maybeEnqueueJudgeByID(ctx, r.ID)
+		}
 	}
 	for _, r := range missingRequeued {
 		s.publishSwept(r.ID, r.Status)
@@ -3050,13 +3073,14 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// A transaction-less adapter cannot select children: queued affinity is not a claim.
 		lane = "ordinary"
 	}
+	claimNow := s.now()
 	params := store.ClaimRunParams{
 		Lane:                     lane,
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
-		AffinityCutoff:           pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
-		CrossCheckEvaluatedAt:    pgconv.Time(s.now()),
-		CrossCheckAffinityCutoff: pgconv.Time(s.now().Add(-s.p.WorkerAffinityGrace)),
+		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
+		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:           isDocker,
 		WorkerDockerEnabled:      s.effectiveDockerTier,
 		DockerRepoAllowlist:      allowlist,
@@ -3076,20 +3100,20 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
 		IsEphemeral:    wkr.Ephemeral,
 		EphemeralRunID: wkr.EphemeralRunID,
-		SpreadCutoff:   pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		SpreadCutoff:   pgconv.Time(claimNow.Add(-s.p.WorkerSpreadGrace)),
 		// PRD #2006: the configured lease for EVERY claimant, read by ClaimRun's spread-peer mirror so a
 		// leased ephemeral peer is a deferral target. A claimant's own lease identity (LeaseSince,
 		// LeaseRepoID, LeaseBranch, LeaseAt) stays confined to claimRunInTx. Lease 0 yields a NULL interval.
 		EphemeralLease:        LeaseInterval(s.ephemeralLease),
-		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
-		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
+		BackgroundGraceCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerBackgroundGrace)),
+		HeartbeatCutoff:       pgconv.Time(claimNow.Add(-s.p.WorkerHeartbeatStale)),
 		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
 		// drain gate above and the `NOT @claimant_draining OR r.worker_id = @worker_id`
 		// clause in ClaimRun). A non-draining worker passes false — a no-op.
 		ClaimantDraining: wkr.DrainingSince.Valid,
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
-		//     >= this many unresolved (open) custody holds (owner-scoped, never global).
+		//     >= this many admission-counted open holds (ADR-2445; owner-scoped, never global).
 		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
 		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
 		//     versioned contract; any one of the three suffices): the custody hold is
@@ -3105,7 +3129,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs
 		// (empty in the no-snapshot path). All three are always passed so an old worker still gets
 		// the persisted-snapshot exclusions + the overflow closure.
-		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
+		SnapshotFreshCutoff: pgconv.Time(claimNow.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
 		RequestActiveIds:    reqIDs,
 		RequestActiveGens:   reqGens,
 		// PRD #1551 M4 (D6): the curated Codex model vocabulary, feeding ClaimRun's non-bypassable
@@ -4064,6 +4088,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// excluded here (stateUsesGenerationFence is false for it) and enforces the identical check
 	// inside completeRunWithPermitLease's permit transaction, where the rest of that arm's fence lives.
 	if req.ClaimGeneration == nil &&
+		owned.Kind != runkind.Chat &&
 		stateUsesGenerationFence(req.State, owned) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return owned, false, ErrMissingClaimGeneration
@@ -4207,7 +4232,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run;
 	// the limit_wait rate-limit opt-out settles inline in limitwait.go instead.
 	// Issue #1399: those arm decisions read `owned`, which for any report that skips the FOR
-	// UPDATE fence (a legacy nil-generation report, a chat run, an interlocked completion; see
+	// UPDATE fence (a legacy nil-generation report, a generation-zero chat, an interlocked completion; see
 	// stateUsesGenerationFence / stateUsesForUpdateFence) is the UNLOCKED pre-switch snapshot, so
 	// a scope directive can commit after it and before the terminal write. The applied-transition
 	// block therefore also settles when it is still empty and the post-transition re-read is
@@ -4563,9 +4588,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
-			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
-			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
-			ReportOnly:          reportOnly,
+			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
+			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
+			// Checker report-only is a server-owned kind invariant. Checker
+			// findings remain in cross_checks; report_md stays issue-gated.
+			ReportOnly:          reportOnly || owned.Kind == "cross_check",
 			ReportMd:            clampWireReportMd(owned, req.ReportMd, reportOnly),
 			MilestonesCompleted: completedIDs,
 			StopKind:            scopeStopKind,
@@ -4742,11 +4769,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
-				// capability report was already generation-checked under the outer FOR UPDATE fence
-				// upstream, so the per-query fence is redundant here; a legacy or chat report carries no
-				// generation (chat is deliberately fence-exempt), so nil is correct there too. Behavior
-				// preserved.
+				// The stamped report was already generation-checked under the outer FOR UPDATE
+				// fence, so the per-query generation guard is redundant. An unstamped report or
+				// generation-zero chat skips that lock and retains the legacy nil guard.
 				ClaimGeneration: pgtype.Int8{},
 			})
 		case req.BranchMoved != nil && *req.BranchMoved && (owned.Kind == runkind.MRRework || owned.Kind == runkind.CIFix):
@@ -4787,11 +4812,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
-				// capability report was already generation-checked under the outer FOR UPDATE fence
-				// upstream, so the per-query fence is redundant here; a legacy or chat report skips the
-				// lock and carries no generation (chat is deliberately fence-exempt), so nil is correct
-				// there too. Behavior preserved.
+				// The stamped report was already generation-checked under the outer FOR UPDATE
+				// fence, so the per-query generation guard is redundant. An unstamped report or
+				// generation-zero chat skips that lock and retains the legacy nil guard.
 				ClaimGeneration: pgtype.Int8{},
 			})
 		}
@@ -4875,7 +4898,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// and skips it.
 		//
 		// Issue #1399: an arm's decision reads `owned`, which is unlocked for any report that
-		// skips the FOR UPDATE fence (legacy nil-generation, chat, interlocked completion; see
+		// skips the FOR UPDATE fence (legacy nil-generation, generation-zero chat, interlocked completion; see
 		// stateUsesGenerationFence), and the forge park arm decides nothing. A scope directive
 		// that committed after that read but before the terminal write shows up only in this
 		// post-transition re-read, so a terminal (completed/failed/cancelled) scope-directed run
@@ -5935,6 +5958,10 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
 	push.live = true
+	defer push.clearPreparedAttempt(ctx)
+	if err := push.prepareLiveAttempt(ctx); err != nil {
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	}
 
 	// PRD #1810 D2: another run's retained record may hold this branch's slot even when this
 	// publish would fast-forward over it (the new run's work descends from the old tip). The slot
@@ -6041,9 +6068,15 @@ func (s *Service) publishTerminalLocked(ctx context.Context, push *checkpointPus
 // forge call, once the pre-push budget has elapsed (the retry comes after a supersession that can
 // take a while), and every push is recorded in checkpoint_publish_attempts before it is sent.
 func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) error {
+	defer push.clearPreparedAttempt(ctx)
 	err := push.pushOnce(ctx)
-	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, push.run, push.branch) {
-		err = push.pushOnce(ctx)
+	if errors.Is(err, pushbroker.ErrNotDescendant) {
+		if admissionErr := push.prepareLiveAttempt(ctx); admissionErr != nil {
+			return admissionErr
+		}
+		if s.freeCheckpointSlot(ctx, push.run, push.branch) {
+			err = push.pushOnce(ctx)
+		}
 	}
 	return err
 }

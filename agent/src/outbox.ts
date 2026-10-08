@@ -319,6 +319,8 @@ export interface OutboxOptions {
   /** Bound terminal reads before JSON; defaults to the config's 1.25 MiB cap. */
   terminalMaxBytes?: number;
   now?: () => number;
+  /** Optional canonical-path seam for terminal directory safety checks (tests). */
+  realpath?: (filePath: string) => Promise<string>;
   /** Optional raw-write seam to simulate `ENOSPC` (tests). */
   rawWrite?: RawWriteSeam;
   /**
@@ -412,6 +414,7 @@ export class Outbox {
   private terminalScanTail: Promise<unknown> = Promise.resolve();
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
+  private readonly realpath: (filePath: string) => Promise<string>;
   private readonly classifyWriteFailure: OutboxOptions["classifyWriteFailure"];
 
   private readonly runs = new Map<string, RunState>();
@@ -445,6 +448,7 @@ export class Outbox {
         : OUTBOX_RANGE_RESERVE_BYTES;
     this.now = opts.now ?? (() => Date.now());
     this.rawWrite = opts.rawWrite ?? ((write) => write());
+    this.realpath = opts.realpath ?? ((filePath) => fs.realpath(filePath));
     this.classifyWriteFailure = opts.classifyWriteFailure;
   }
 
@@ -1677,6 +1681,43 @@ export class Outbox {
       .map((e) => ({ run_id: e.run_id, claim_generation: e.claim_generation }));
   }
 
+  /** All authenticated exact generations for live retry; register's capped view stays separate. */
+  listPendingFinalizeGenerations(includeTerminal = false): PendingFinalize[] {
+    const entries: PendingFinalize[] = [];
+    for (const rs of this.runs.values()) {
+      if (!includeTerminal && rs.terminals.size > 0) continue;
+      for (const generation of rs.finalizes.keys()) {
+        entries.push({ run_id: rs.runId, claim_generation: generation });
+      }
+    }
+    return entries;
+  }
+
+  /** Opaque stable identity of the authenticated in-memory record; timestamps are not identity. */
+  finalizeRecordIdentity(runId: string, generation: number): Readonly<object> | undefined {
+    return this.runs.get(runId)?.finalizes.get(generation);
+  }
+
+  /** Retry only the authorized exact generation. Recheck custody and synchronous eligibility
+   * under the run lock; cancellation also prevents an expired queued waiter from deleting. */
+  async retireFinalizeIfEligible(
+    runId: string,
+    claimGeneration: number,
+    eligible: () => boolean,
+    signal: AbortSignal,
+    expectedIdentity: Readonly<object>,
+  ): Promise<void> {
+    if (this.disabled) return;
+    await this.withRunLock(runId, async () => {
+      const rs = this.runs.get(runId);
+      if (!expectedIdentity || rs?.finalizes.get(claimGeneration) !== expectedIdentity ||
+          !this.validRunId(runId) || !rs?.finalizes.has(claimGeneration) ||
+          rs.terminals.size > 0 || signal.aborted || !eligible()) return;
+      await fs.rm(path.join(this.runDir(runId), finalizeFileName(claimGeneration)), { force: true });
+      rs.finalizes.delete(claimGeneration);
+    }, signal);
+  }
+
   /** Issue #1742: retire one finalize record (unlink the file, drop it from the pending set). */
   async retireFinalize(runId: string, claimGeneration: number): Promise<void> {
     if (this.disabled) return;
@@ -1689,20 +1730,18 @@ export class Outbox {
     });
   }
 
-  /** Issue #1742: retire the given records AND every lower-generation record of the same run (a
-   *  register offers only a run's highest generation, and a lower one is superseded by it). One
-   *  failure never blocks the rest (retireFinalize swallows its own unlink errors). */
-  async retireFinalizes(entries: readonly PendingFinalize[]): Promise<void> {
-    for (const e of entries) await this.retireFinalizesThrough(e.run_id, e.claim_generation);
-  }
-
-  /** Issue #1742: retire the run's finalize records at generation <= `claimGeneration`. Records at a
-   *  higher generation (a live flight's) are untouched. */
-  async retireFinalizesThrough(runId: string, claimGeneration: number): Promise<void> {
-    if (this.disabled) return;
-    const gens = new Set<number>([claimGeneration]);
-    for (const g of this.runs.get(runId)?.finalizes.keys() ?? []) if (g <= claimGeneration) gens.add(g);
-    for (const g of gens) await this.retireFinalize(runId, g);
+  /** Compatibility batch API: freeze original identities before any asynchronous check.
+   * Attempts are bounded by the stored generation count; a rejected check stops this batch. */
+  async retireFinalizes(entries: readonly PendingFinalize[], mayRetire: (runId: string, generation: number) => Promise<boolean>): Promise<void> {
+    const candidates = this.listPendingFinalizeGenerations(true).filter(record =>
+      entries.some(entry => entry.run_id === record.run_id && record.claim_generation <= entry.claim_generation))
+      .map(entry => ({ entry, identity: this.finalizeRecordIdentity(entry.run_id, entry.claim_generation) }));
+    const signal = new AbortController().signal;
+    for (const { entry, identity } of candidates) {
+      if (identity && await mayRetire(entry.run_id, entry.claim_generation)) {
+        await this.retireFinalizeIfEligible(entry.run_id, entry.claim_generation, () => true, signal, identity);
+      }
+    }
   }
 
   /** Get an existing in-memory run entry, or create one WITHOUT writing a manifest to disk — a run
@@ -1947,8 +1986,13 @@ export class Outbox {
     if (!this.validRunId(runId)) return false;
     const root = await fs.lstat(this.root);
     const dir = await fs.lstat(this.runDir(runId));
-    return root.isDirectory() && !root.isSymbolicLink() && dir.isDirectory() && !dir.isSymbolicLink() &&
-      await fs.realpath(this.runDir(runId)) === path.join(await fs.realpath(this.root), runId);
+    if (!root.isDirectory() || root.isSymbolicLink() || !dir.isDirectory() || dir.isSymbolicLink()) return false;
+    const realRoot = await this.realpath(this.root);
+    const realRun = await this.realpath(this.runDir(runId));
+    const expected = path.join(realRoot, runId);
+    return realRun === expected || (terminalRunUUID(runId) &&
+      path.dirname(realRun) === realRoot &&
+      path.basename(realRun).toLowerCase() === path.basename(expected).toLowerCase());
   }
 
   private async inspectTerminal(runId: string, generation: number | undefined, fileName: string): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {

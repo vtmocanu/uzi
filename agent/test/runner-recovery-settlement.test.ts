@@ -613,7 +613,7 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
         if (rec.state === "pending_settle") pendingAtPromotion.push(outbox.hasPendingTerminal(claim.run_id, 2));
         return put(rec);
       };
-      api.setOwnershipStatus(claim.run_id, "completed", 2);
+      api.setOwnershipStatus(claim.run_id, "completed", 2, false);
       r.settleClient.answer = (h) => released(claim.run_id, h);
       const runner = runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, nullLogger(), {
         recovery: r.coord,

@@ -1142,7 +1142,7 @@ func TestCodexAdminRateLimitRowDTOTags(t *testing.T) {
 // set fails here rather than silently dropping a field on decode.
 func TestUserSettingsDTOTags(t *testing.T) {
 	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
-		"default_model", "default_effort", "default_codex_effort", "judge_model", "summary_model", "theme", "sidebar_token_ids",
+		"cross_check_pins", "default_model", "default_effort", "default_codex_effort", "judge_model", "summary_model", "theme", "sidebar_token_ids",
 		// PRD #700 M5: the per-user MR-review-watcher opt-in (default ON; null clears to default).
 		"mr_rework_enabled",
 		// PRD #1167: the four raw per-field appearance overrides (each null ⇒ inherit).
@@ -1154,6 +1154,18 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"sidebar_codex_account_ids",
 		// PRD #1551 M1 (D2): the retained per-harness worker-model lanes (each null ⇒ inherit).
 		"default_claude_model", "default_codex_model")
+}
+
+func TestCrossCheckPinDTOTags(t *testing.T) {
+	assertTags(t, "CrossCheckPinDTO", CrossCheckPinDTO{},
+		"stage", "harness", "model", "effort", "resolved_model", "resolved_effort",
+		"model_source", "effort_source", "active", "worker_default_model")
+}
+
+func TestPlanCrossCheckSummaryDTOTags(t *testing.T) {
+	assertTags(t, "PlanCrossCheckSummaryDTO", PlanCrossCheckSummaryDTO{},
+		"round", "verdict", "reason_class", "findings", "checker_run_id", "checker_model",
+		"checker_effort", "checker_model_source", "checker_effort_source", "usage", "historical")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

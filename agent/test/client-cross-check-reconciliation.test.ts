@@ -107,7 +107,7 @@ it("lost forced ACK can be recovered by parked status/submit with identity, curr
   }
 });
 
-it("legacy active/no-row and ordinary ACK shapes remain unchanged; incomplete proof is not invented", async (t) => {
+it("legacy candidates default to disabled snapshots; no-row and ordinary ACK shapes stay unchanged without invented proof", async (t) => {
   for (const call of calls) {
     for (const value of [
       { result: "no_row", reason_class: "no_candidate", lead_last_seq: 7 },
@@ -115,7 +115,8 @@ it("legacy active/no-row and ordinary ACK shapes remain unchanged; incomplete pr
         verdict: "pending", reason_class: "", checker_run_id: null, findings: null, deadline_at: "2030-01-01T00:00:00Z" },
     ]) {
       t.mock.method(globalThis, "fetch", async () => Response.json(value));
-      assert.deepEqual(await call(client()), value);
+      assert.deepEqual(await call(client()), value.result === "candidate"
+        ? { ...value, automatic_revision_limit: 0, automatic_rounds_enabled: false } : value);
       t.mock.method(globalThis, "fetch", async () => Response.json({ ...value, plan_cross_check_settled: true }));
       assert.equal((await call(client())).reconciliation, undefined);
       t.mock.method(globalThis, "fetch", async () => Response.json({ ...value, ...running }));

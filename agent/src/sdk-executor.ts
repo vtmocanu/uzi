@@ -70,6 +70,7 @@ import {
   buildPlanPrompt,
   buildRepoInstructionsContext,
   buildRevisePlanPrompt,
+  buildAutomaticRevisionPrompt,
   buildSelfImprovePlanPrompt,
   dockerScratchResumeNote,
   isNotCodePlan,
@@ -1746,7 +1747,7 @@ export class SdkExecutor implements Executor {
        *  for the server to count, unlike a revise_plan.
        *
        *  Declared ABOVE the preApproved branch, not inside it, and that placement is
-       *  load-bearing twice over. The cap is per RUN: M4 lets the lead ask before it
+       *  load-bearing twice over. The cap is per execute() attempt: M4 lets the lead ask before it
        *  plans, so a budget scoped to the planning branch would reset between the
        *  planning and implement phases and silently be worth 2 x QUESTION_MAX. And a
        *  PRE-APPROVED resume (PRD #35) skips the planning branch entirely while its
@@ -1754,12 +1755,18 @@ export class SdkExecutor implements Executor {
        *  merely mis-scoped there — it does not exist on that path at all.
        *
        *  NOT DURABLE, and the honest bound is worth stating because the other #88
-       *  bound already states its own: this is worker memory, so a worker death
-       *  re-queues the run, execute() runs fresh, and the count restarts at 0. The
-       *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 20 on
-       *  defaults, not 5 (a run that used the issue #1742 one-shot finalize-resume
-       *  allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2)) — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
-       *  identical reason. Documenting one and not the other would be worse than
+       *  bound already states its own: this is worker memory, so if worker-death
+       *  recovery re-queues the run, execute() runs fresh and the count restarts at 0.
+       *  With no other fresh executor execution, worker-death retries contribute
+       *  QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 20 on defaults. Initial episode 0
+       *  can get one extra via #1742 with a positive cap, so x (RUN_MAX_REQUEUES + 2).
+       *  Ordinary transient/limit/credential redispatch can also run execute() fresh
+       *  within the same episode, resetting worker-memory question budgets without
+       *  changing the episode or charged requeue_count. RUN_MAX_REQUEUES bounds
+       *  charged worker-death retries, not all executions; there is no unconditional
+       *  per-episode or lifetime question/attempt ceiling from it.
+       *  QUESTION_TIMEOUT_SECONDS has the same conditional multipliers.
+       *  Documenting one and not the other would be worse than
        *  documenting neither: a reader who finds the timeout's caveat reasonably
        *  infers the cap has none. */
       const budget = { asked: 0 };
@@ -2077,26 +2084,33 @@ export class SdkExecutor implements Executor {
             });
         }
         let revisions = 0;
+        let automaticRound = 0;
         while (verdict.kind === "revise") {
+          const automatic = verdict.automatic === true;
+          if (verdict.automatic === true) {
+            if (!Number.isInteger(verdict.round) || verdict.round <= automaticRound || verdict.round > 4)
+              throw new TrustedExecutionRefusal("invalid automatic plan revision round");
+            automaticRound = verdict.round;
+          }
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
           const feedback = verdict.feedback;
           // Issue #1604 (D2): the re-gate of the revised plan settles THIS revise, once the revised
           // plan is confirmed persisted; until then an interruption replays it.
-          const settles = verdict.inputId;
+          const settles = automatic ? undefined : verdict.inputId;
           // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
           // (and thus before the next gatePlan flushes the new plan), so the feed never
           // lags the awaiting_approval re-report.
           ctx.emit({
             kind: "plan_feedback",
             agent: "worker",
-            payload: { feedback },
+            payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback },
           });
           // Belt-and-suspenders (PRD #41 Decision 3c): the SERVER enforces the same cap at
           // submit time and won't enqueue a revise past it, so this should never trip. If it
           // does, DO NOT run another planning turn — record it and re-gate the current plan so
           // the run stays fail-closed rather than revising unbounded.
-          if (revisions >= maxRevisions) {
+          if (!automatic && revisions >= maxRevisions) {
             this.log.warn(
               "plan revision budget exhausted; re-gating without a turn",
               { run_id: ctx.runId, max_revisions: maxRevisions },
@@ -2116,11 +2130,11 @@ export class SdkExecutor implements Executor {
             verdict = gExhausted.value;
             continue;
           }
-          revisions++;
+          if (!automatic) revisions++;
           ctx.emit({
             kind: "plan_revising",
             agent: "worker",
-            payload: { round: revisions },
+            payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions },
           });
           // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
           // subagents (baseConfig), exactly like the first plan turn — the roster
@@ -2138,10 +2152,10 @@ export class SdkExecutor implements Executor {
           // signal then reaches the outer catch, byte-identical to the pre-rework behaviour).
           // Issue #1604 (D4): with no session to resume, the turn has never seen the plan it is
           // revising, so it gets the full planning prompt plus the submitted plan and the feedback.
-          const revisePrompt =
-            resumeId === undefined
-              ? `${planPrompt}\n\n${buildRevisePlanPrompt(feedback, approvedPlan)}`
-              : buildRevisePlanPrompt(feedback);
+          const revisionAdvice = verdict.automatic === true
+            ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, resumeId === undefined ? approvedPlan : undefined)
+            : buildRevisePlanPrompt(feedback, resumeId === undefined ? approvedPlan : undefined);
+          const revisePrompt = resumeId === undefined ? `${planPrompt}\n\n${revisionAdvice}` : revisionAdvice;
           // Issue #2083: a session-less revise re-sends the full planPrompt, which carries the
           // memo block on the plain issue/rework path: announce where it is actually placed.
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))

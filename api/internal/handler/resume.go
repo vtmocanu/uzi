@@ -15,12 +15,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// ResumeRunNow manually resumes ONE run the owner holds: a pool_wait hold (PRD #754 M5) or a
-// paused run (PRD #1190 M1, Decision 14 — the ONE resume mechanism, the existing endpoint
-// widened). It READS the run first, then dispatches on its status: pool_wait → PromotePoolWaitRun,
-// paused → ResumePausedRun, anything else → 409 naming the status. Ownership is the SQL predicate
-// on both writes AND on the initial read (GetRunByIDForUser), so a foreign/absent run is 404 before
-// any write. Both success branches write a kind='resume' audit row.
+// ResumeRunNow resumes an owner-held pool_wait or paused run, or starts a new
+// worker-recovery episode for recovery_wait/worker_requeue_exhausted. The owner-scoped
+// read returns 404 for foreign/absent runs. Each status-scoped write refuses races
+// and ineligible holds with 409; successful transitions write a resume audit row.
 //
 // A POST verb with no payload: there is nothing to configure (unlike expedite's expedite/clear),
 // so it deliberately reads NO request body.
@@ -43,6 +41,22 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch run.Status {
+	case "recovery_wait":
+		if !run.RecoveryWaitCause.Valid || run.RecoveryWaitCause.String != "worker_requeue_exhausted" {
+			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
+			return
+		}
+		if _, err := h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
+			ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusConflict, "run cannot resume: hold changed or no remaining budget")
+				return
+			}
+			slog.Error("resume worker recovery episode", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	case "pool_wait":
 		// PRD #754 M5: promote a pooled-token hold. Owner+status-scoped; a race that moved the
 		// run out of pool_wait between the read and this write yields 0 rows → 409 below.
@@ -100,7 +114,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Both success branches write the kind='resume' audit row (PRD #1190 D14): the single
+	// Successful transitions write the kind='resume' audit row (PRD #1190 D14): the single
 	// resume mechanism, so exactly one writer. Best-effort — the transition already committed,
 	// so a failed audit write must not fail the resume. 'resume' is a server-only kind excluded
 	// from ConsumeRunInputs, so the worker never drains it.
@@ -114,5 +128,5 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 }

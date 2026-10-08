@@ -146,6 +146,8 @@ uzi logout
 uzi auth token [--with-token]
 uzi auth status [--all]
 uzi whoami
+uzi settings
+uzi settings get
 uzi context list
 uzi context current
 uzi context use <name>
@@ -294,6 +296,18 @@ uzi version
   URL is left intact (a later re-login needs no re-typed URL). It does **not**
   revoke the token server-side; do that in the web UI (Settings → Access).
 
+### Account settings
+
+- `uzi settings` — show settings command help.
+- `uzi settings get` — read your own non-secret account settings; no setters.
+  The default table shows the Claude and Codex plan cross-check cells, including
+  active/inactive status, stored model/effort pins, worker default model,
+  resolved model/effort, and their sources (`pin` or `worker default`, with
+  unrecognized sources shown as `unknown`). An inactive Claude cell is still shown; its stored pin
+  remains visible. Table rendering inspects at most twenty response cells and
+  displays each harness once. `uzi settings get --json` returns the settings
+  object at the top level, including `cross_check_pins` and source fields.
+
 ### Named contexts
 
 - `uzi context list` — every stored context (union of `config.toml` and
@@ -353,6 +367,8 @@ uzi version
   promotes it back to `queued` once past its `retry_not_before`),
   `pool_wait` (an `auto` run held because its token pool is empty — add a token
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
+  because automatic worker-death recovery exhausted — cause
+  `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
@@ -389,14 +405,15 @@ uzi version
   task parked awaiting your next follow-up — it does not auto-resume, so a
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
-  `recovery_wait`/`paused`: limit and recovery waits retry on a timer, pool waits
+  `recovery_wait`/`paused`, except a default wait stops on recovery cause
+  `worker_requeue_exhausted`: timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and owner pauses need `uzi run resume`. A
-  `vault_locked` recovery park is no exception: a bare wait keeps waiting through it
+  `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
   scheduled retry provides the fallback.
   So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
-  interactive park, OR the end". It **exits 0** the
+  interactive park, worker recovery exhaustion, OR the end". It **exits 0** the
   moment a target state is reached (including if the run is already in one),
   polls `GET /api/runs/:id` every `--interval` (default 3s) client-side, and
   prints each transition to **stderr**; `--json` prints the final run object (the
@@ -601,6 +618,11 @@ uzi version
   the bump: it removes the manual override and returns the run to its kind default
   priority (it does **not** demote it below normal). Prints the updated run; `--json`
   emits the run object, whose `priority` pill reads `expedited` after a bump.
+  Expedite also orders new ephemeral worker provisioning by priority within
+  each eligible trigger class. Class precedence stays **isolated lane → capability
+  gap → saturation**, regardless of priority. Saturation debounce, placement
+  eligibility and per-user caps still apply; expedite does not guarantee global
+  priority precedence or immediate provisioning.
 - `uzi run resume-now <run-id>` — resume a run held in `pool_wait`, an `auto` run
   parked because its owner's Anthropic token pool was empty when it claimed (PRD
   #754). It flips the hold straight to **queued** instead of waiting up to a sweeper
@@ -675,13 +697,28 @@ uzi version
   you have before export or discard. The human view lists only open custody holds across
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
   `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
-  `open_holds`, `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate, plus
+  `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
+  `blocked_runs` aggregate. Capacity uses admission count against the fixed limit 8;
+  `open_holds` remains total custody. At most one hold per run is excluded when it backs
+  an exact-owner/run/live-run, unreleased current-generation claim on a matching existing
+  same-owner worker with a fresh non-null heartbeat (inclusive configured
+  `WorkerHeartbeatStale` cutoff), in `claimed`, `running`, `awaiting_approval`,
+  `awaiting_input` or `awaiting_followup`, without a `needs_action`/`source_only` decision.
+  Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
+  remain counted; `active` attention alone is not eligibility. Accounting releases nothing
+  and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
+  bypass owner admission with 1–7 own total open holds, losing that exemption at 8;
+  `blocked_runs` excludes exempt continuations. Concurrent claims and late staleness can
+  exceed the limit under the statement-snapshot gate. The current API emits the new field
+  even at zero; the CLI falls back to total only when an older API omits it, preserving
+  explicit zero. The human view also prints
   a recover-or-discard hint when an open hold needs a decision. With no run id, `--json`
   returns the endpoint's `aggregate` and `holds`, including settled holds, without captures.
   Supply a run id to list that run's retained holds (owner-only): each hold's exact id,
   claim generation, server-derived **disposition** and latest capture state.
   A `source_only` or `needs_action` disposition awaits your decision;
-  `archive_ready` self-releases and `active` is healthy protection of a still-running run.
+  `archive_ready` can release after its required evidence is accepted; `active` labels
+  nonterminal protection but does not prove admission eligibility.
   Recover an available archive with `uzi run export`, or discard a held source with
   `uzi run discard`. `--json` emits the run's raw hold DTOs, each with a `captures` array
   (id, state, source_sha, byte_size, created_at); pass a capture id to
@@ -689,14 +726,46 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  Worker-death exhaustion is `recovery_wait` / `worker_requeue_exhausted`:
+  owner `uzi run resume <id>` (or `resume-now`) releases the exact run hold
+  and queues one explicit attempt with the current `RUN_MAX_REQUEUES`
+  automatic worker-death allowance per episode. At 0 there are no automatic
+  worker-death requeues. This bounds charged worker-death retries, not all
+  executions: ordinary transient/limit/credential redispatch can create fresh
+  `execute()` in the same episode, resetting worker-memory question budgets
+  without changing its number or charged `requeue_count`. `N+1` attempts
+  (`N = RUN_MAX_REQUEUES`, initial `N+2` with the positive-cap #1742 extra)
+  and the corresponding question-budget multipliers require no other fresh
+  executor execution; they give no unconditional per-episode or lifetime
+  question/attempt ceiling and introduce no runtime budget.
+  Lifetime charged `requeue_count`, generation-proven readoption refunds and
+  the existing wall budget survive; the #1742 extra allowance is initial-episode
+  only and its lifetime marker is never renewed. Timers, credentials, vault,
+  account and ordinary inputs do not release or renew the hold.
+  `run get` shows `WORKER_RECOVERY` and `RECOVERY_EVIDENCE`; JSON
+  `worker_recovery` has `episode`, `automatic_requeue_limit`, `episode_used`,
+  `episode_remaining`, and historical `evidence` (`checkpoint_tip`,
+  `available_capture`, `publication_uncertain`, `capture_uncertain`,
+  `custody_uncertain`, `unknown`, `recorded_at`). This does not certify current
+  availability, latest local edits or exportability. Recorded evidence or
+  uncertainty holds; no recorded recovery evidence or unresolved custody keeps
+  `worker_lost`, without proving absence of unrecorded work.
+  An explicit `run wait --until` retains its status set; ordinary recovery
+  continues as before. `run logs --follow` reports cause changes within the same
+  status, and the TUI places exhaustion in NEEDS YOU without a retry countdown.
   A `terminal_record_rejection` of `mac_failure` is a separate diagnostic:
   "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody".
   The rejected record is unauthenticated, distinct from a trusted unsent outcome;
   it authorizes no outcome replay, completion, terminal lease renewal, or extra
-  finalize-resume allowance. Ordinary requeue policy still applies; a policy failure
-  keeps `worker_lost` as its origin, with this rejection prose.
-  The originating worker's exact-generation open hold remains in custody. For a terminal
-  run without an available independently verified capture, it reports `source_only`:
+  finalize-resume allowance. Ordinary requeue policy still applies; no recorded recovery evidence or unresolved custody
+  keeps `worker_lost` as its origin, with this rejection prose; it does not prove
+  absence of unrecorded worker work. Recorded evidence or uncertainty at exhaustion
+  instead holds the run at `recovery_wait` / `worker_requeue_exhausted` for owner Resume.
+  The originating worker's exact-generation open hold remains in custody. An exhaustion
+  hold stays an owner decision (`source_only`, or `needs_action` after a failed capture),
+  independently of archive availability or a capture preparing/uploading. An available
+  archive stays exportable but may not cover the latest worker-local work. Without an
+  available archive or a capture in progress, source-only custody reports:
   "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)".
   Export requires an available independent capture; a verified pin must first be archived.
   Hold discard changes database custody; it does not repair the worker journal.

@@ -4172,14 +4172,25 @@ export class GitCache {
         const foreignOwners = new Set<string>();
         const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
         const entries = config.split("\0");
+        const journals = new Map<string, string>();
         for (const item of entries) {
           const nl = item.indexOf("\n");
           const match = /^uzi-recovery\.(.+)\.clone$/.exec(item.slice(0, nl));
           if (!match) continue;
-          const journal = await this.readRecoveryCapture(barePath, match[1]!, entries);
+          journals.set(match[1]!, item.slice(nl + 1));
+        }
+        for (const [branch, value] of journals) {
+          // Retirement clears this key to empty. Like readRecoveryCapture, the
+          // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
+          if (value === "") continue;
+          const journal = await this.readRecoveryCapture(barePath, branch, entries);
           if (!journal) throw new Error("unreadable recovery attribution");
+          if (journal.attemptId !== undefined &&
+              (parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot))?.attemptId ?? "") !== journal.attemptId) {
+            throw new Error("recovery attempt identity disagrees with clone path");
+          }
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
-          paths.set(journal.clonePath, { branch: match[1]!, runId });
+          paths.set(journal.clonePath, { branch, runId });
         }
         // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
         for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
@@ -4191,7 +4202,7 @@ export class GitCache {
         }
         const heads = new Set<string>();
         const clones: Array<{ clonePath: string; branch: string; runId: string }> = [];
-        for (const [clone, owner] of paths) {
+        clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
           if (!parsed && !/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("unknown canonical clone key");
@@ -4201,9 +4212,12 @@ export class GitCache {
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
               path.dirname(path.dirname(clone)) !== root) throw new Error("unsafe clone path");
-          // ENOENT proves no physical clone remains, only after validating all parents.
+          // After attribution validation, probe outer-to-inner: ENOENT skips this clone
+          // without reading descendants; every existing ancestor must be a non-symlink directory.
           for (const dir of [root, path.dirname(clone)]) {
-            const st = await fs.lstat(dir);
+            let st: Stats;
+            try { st = await fs.lstat(dir); }
+            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; throw err; }
             if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe clone parent");
           }
           let st: Stats;
@@ -8250,9 +8264,13 @@ export class GitCache {
     } finally { await fs.rm(temp, { force: true }); }
   }
 
-  private async removeOwedFile(barePath: string, name: string): Promise<void> {
+  private async removeOwedFile(barePath: string, name: string, allowMissing = false): Promise<void> {
     const dir = this.owedDirectory(barePath);
-    await fs.unlink(path.join(dir, name));
+    try { await fs.unlink(path.join(dir, name)); }
+    catch (err) {
+      if (allowMissing && (err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
+    }
     const handle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
     try { await handle.sync(); } finally { await handle.close(); }
   }
@@ -8688,6 +8706,115 @@ export class GitCache {
         if (abort) throw abort;
         return { kind: "not_updated", reason: preservationReason(cause) };
       }
+    });
+  }
+
+  /** Local archive cleanup is separate from remote publication reconciliation. The caller
+   * supplies authenticated FINAL roots and journal pins. One finite pass under the bare lock;
+   * unknown recovery-source attribution retains custody; tracking consumers retain contexts.
+   * IO failure throws for a later coordinator pass. */
+  async cleanupRecoveryGeneration(barePath: string, context: PositiveOwedCandidateContext,
+    roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
+    coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
+    coveringSha: string, canDelete: () => boolean = () => true): Promise<"removed" | "retained"> {
+    await this.validateOwedContext(barePath, context.branch, context);
+    if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const metadata = await this.readOwedMetadataUnderLock(barePath);
+      if (metadata.names.some(name => name.startsWith(".tmp-"))) return "retained";
+      // Enumerate all physical pins, not just the target run. An orphan candidate after a
+      // ref-first crash is valid metadata and remains selectable on the next cleanup pass.
+      const allRefs = (await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)"]))
+        .trim().split("\n").filter(Boolean).map(line => {
+          const parts = line.split(" ");
+          if (parts.length !== 2 || !OWED_OID.test(parts[1]!)) throw new Error("invalid cleanup ref inventory");
+          return { ref: parts[0]!, sha: parts[1]! };
+        });
+      const runs = new Set([...metadata.contexts.values()].map(c => c.runId));
+      for (const pin of allRefs.filter(p => p.ref.startsWith("refs/uzi-owed/"))) {
+        const match = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40})$/.exec(pin.ref);
+        if (!match || match[2] !== pin.sha || !runs.has(match[1]!)) return "retained";
+      }
+      for (const run of runs) await this.enumerateOwedUnderLock(barePath, run, metadata);
+      // Authenticate receipt/marker consumers even when pending or their tracking ref is gone.
+      // Their identity must survive archive cleanup: archive coverage is not publication proof.
+      for (const name of metadata.names.filter(n => n.startsWith("receipt-") || n.startsWith("governed-"))) {
+        const value = await this.readOwedFile(barePath, name) as TrackingReceipt;
+        if (!value || typeof value.branch !== "string" ||
+            name !== `${name.startsWith("receipt-") ? "receipt" : "governed"}-${this.receiptName(value.branch)}.json`) return "retained";
+        if (name.startsWith("governed-")) {
+          if (JSON.stringify(value) !== JSON.stringify({ version: 1, branch: value.branch })) return "retained";
+        } else {
+          if (Object.keys(value).sort().join(",") !== "branch,context,generation,phase,runId,trackingSha,version" ||
+              value.version !== 1 || !OWED_OID.test(value.trackingSha) ||
+              !["pending", "committed"].includes(value.phase)) return "retained";
+          const consumer = metadata.contexts.get(value.context);
+          if (!consumer || consumer.branch !== value.branch || consumer.runId !== value.runId ||
+              consumer.generation !== value.generation) return "retained";
+        }
+      }
+      // Config and physical tracking refs are consumers too. An indeterminate tracking owner
+      // cannot be treated as publication or as proof that a context is unconsumed.
+      const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+      const exact = metadata.records.filter(r => r.runId === context.runId && r.c.generation === context.generation);
+      for (const record of exact) {
+        if ("origin" in record.c || !roots.some(root => root.sha === record.sha &&
+            root.contexts.some(c => !("origin" in c) && this.contextName(c) === record.contextName))) return "retained";
+        if (await this.ancestry(barePath, record.sha, coveringSha) !== "ancestor") return "retained";
+      }
+      const ownedPins = allRefs.filter(p => p.ref.startsWith(`refs/uzi-coverage/${context.runId}/${context.generation}/`) ||
+        p.ref === recoveryPinRef(context.runId, context.generation));
+      for (const pin of ownedPins) {
+        const known = pin.ref === recoveryPinRef(context.runId, context.generation)
+          ? recoverySources.includes(pin.sha)
+          : coveragePins.some(p => /^[0-9a-f]{64}$/.test(p.fingerprint) &&
+            pin.ref === `refs/uzi-coverage/${context.runId}/${context.generation}/${p.fingerprint}` && pin.sha === p.sha);
+        if (!known) return "retained";
+        // Synthetic archives need not parent earlier synthetic commits. The authenticated
+        // journal supplies their frozen original roots and tree/disposition sources instead.
+        const heads = coveragePins.find(p => p.sha === pin.sha)?.coveredHeads ?? [pin.sha];
+        if (!heads.length) return "retained";
+        for (const head of heads) {
+          if (!OWED_OID.test(head) || await this.ancestry(barePath, head, coveringSha) !== "ancestor") return "retained";
+        }
+      }
+      const open = (): void => {
+        assertResidueQuarantineOpen("git");
+        if (!canDelete()) throw new Error("recovery cleanup source protection changed");
+      };
+      const deleteRef = async (ref: string, sha: string): Promise<void> => {
+        open();
+        await this.runGit(barePath, ["update-ref", "-d", ref, sha]);
+        if (await this.checkedRefSha(barePath, ref) !== undefined) throw new Error("recovery cleanup ref deletion mismatch");
+      };
+      for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
+      for (const sha of new Set(exact.map(r => r.sha))) {
+        const ref = `refs/uzi-owed/${context.runId}/${sha}`;
+        const shared = metadata.records.some(r => r.runId === context.runId && r.sha === sha && !exact.includes(r));
+        if (!shared && allRefs.some(p => p.ref === ref)) await deleteRef(ref, sha);
+      }
+      for (const record of exact) {
+        open();
+        const name = `candidate-${record.runId}-${record.sha}-${record.contextName.slice(8, -5)}.json`;
+        await this.removeOwedFile(barePath, name, true);
+      }
+      // Only positively unconsumed exact-generation contexts can be garbage-collected.
+      // Preserve receipt/marker identity, owner stamps, governed refs and sibling candidates.
+      // Unknown config naming conservatively keeps contexts rather than retiring proof.
+      for (const [name, c] of metadata.contexts) {
+        if (c.runId !== context.runId || c.generation !== context.generation || "origin" in c) continue;
+        const hash = this.receiptName(c.branch);
+        const consumed = metadata.records.some(r => r.contextName === name && !exact.includes(r)) ||
+          metadata.names.some(n => n === `receipt-${hash}.json` || n === `governed-${hash}.json`) ||
+          allRefs.some(p => p.ref === runnerTrackingRef(c.branch)) ||
+          config.split("\0").some(item => item.startsWith(`uzi-trackowner.${c.branch}.`) ||
+            item.startsWith(legacyFlatTrackingOwnerKey(c.branch) + "\n"));
+        if (consumed) continue;
+        open();
+        await this.removeOwedFile(barePath, name, true);
+      }
+      return "removed";
     });
   }
 

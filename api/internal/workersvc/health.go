@@ -215,8 +215,10 @@ const (
 	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
 	// comes online. PRD #1909 M1: a job stamped with runs.job_protocol additionally needs
 	// 'job_files_v1', so the text names both. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoJobCapableWorker        = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
-	reasonNoCrossCheckCapableWorker = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
+	reasonNoJobCapableWorker              = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
+	reasonNoCrossCheckCapableWorker       = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
+	reasonNoCrossCheckRoundsCapableWorker = "no online worker supports plan cross-check rounds (cross_check_rounds_v1); update or provision a capable worker"
+	reasonNoCrossCheckPinCapableWorker    = "no online worker supports pinned plan cross-check (cross_check_pins_v1); update or provision a pin-aware worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -243,11 +245,11 @@ const (
 	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it.
 	reasonRepoNotDockerAllowed = "this repo isn't on the Docker worker allowlist, so no Docker worker can run it"
 	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
-	// the custody-hold admission limit — they hold >= custodyHoldLimit UNRESOLVED (open)
-	// custody holds, so ClaimRun's owner-scoped custody-admission clause matches no row and
+	// the custody-hold admission limit — they hold >= custodyHoldLimit admission-counted
+	// open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
 	// the run stays queued until the owner resolves or discards some unpublished-work
 	// archives. Resolved against the SAME predicate the claim gates on
-	// (GetCustodyAdmissionForRun's owner open-hold count vs the same custodyHoldLimit
+	// (GetCustodyAdmissionForRun's admission-counted holds vs the same custodyHoldLimit
 	// constant, plus ClaimRun's continuation exemption, issue #1751), so the pill and the
 	// claim can never disagree. Maps to the SAME healthWaitingWorker enum (no
 	// migration — runs.health_reason is free text). A NEW const, never a reuse of the
@@ -958,13 +960,13 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		return reasonVaultLocked
 	}
 	// PRD #1296 M4 (D4): the owner-scoped custody-admission block. When the owner holds
-	// >= custodyHoldLimit UNRESOLVED (open) custody holds, ClaimRun's custody-admission
+	// >= custodyHoldLimit admission-counted open holds (ADR-2445), ClaimRun's custody-admission
 	// clause matches no row and the run stays queued no matter how many idle, capable
 	// workers exist — so this is a FUNDAMENTAL, fleet-independent block, resolved right
 	// after the vault-lock (the only other owner-account-state block) and AHEAD of every
-	// worker-availability reason: bringing a worker online cannot clear it, and naming a
+	// worker-availability reason: adding worker slots cannot clear counted custody, and naming a
 	// worker reason would point at the wrong cause. Read against the SAME predicate the
-	// claim gates on (GetCustodyAdmissionForRun: the owner's open-hold count and the same
+	// claim gates on (GetCustodyAdmissionForRun: the owner's admission-counted holds and the same
 	// custodyHoldLimit constant), so the pill and the claim never disagree. Issue #1751 /
 	// ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold count
 	// at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
@@ -977,10 +979,11 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if custodyHoldLimit > 0 {
 		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
 			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: custodyHoldLimit,
+			HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		})
 		if cerr != nil {
 			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
-		} else if !adm.ContinuationExempt && adm.OpenHolds >= int64(custodyHoldLimit) {
+		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(custodyHoldLimit) {
 			return reasonCustodyLimit
 		}
 	}
@@ -1000,17 +1003,18 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// counts and the claim path can never disagree on whether capabilities are enforced.
 	if r.Kind == "cross_check" {
 		counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
-		if err == nil {
-			if counts.StrictEligible == 0 {
-				return reasonNoCrossCheckWorker
-			}
+		if err != nil {
+			slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
+			return reasonPlanCrossCheckWaiting
+		}
+		if counts.StrictEligible > 0 {
 			if counts.Claimable == 0 {
 				return reasonCrossCheckSlotsBusy
 			}
 			return reasonPlanCrossCheckWaiting
 		}
-		slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
-		return reasonPlanCrossCheckWaiting
+		// Diagnose missing rounds/pins below when no worker meets the combined
+		// child contract. StrictEligible includes bound ephemeral checker workers.
 	}
 	capAware := s.capabilityAwareOn(ctx)
 	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
@@ -1143,23 +1147,53 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// capability ClaimRun requires. A failed read falls through.
 	if run, rerr := s.q.GetRunByID(ctx, r.ID); rerr != nil {
 		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
-	} else if run.PlanCrossCheckRequired {
-		workers, werr := s.q.ListWorkersByUser(ctx, r.UserID)
-		if werr != nil {
-			slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
-		} else {
-			capable := false
-			for _, worker := range workers {
-				if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
-					slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) {
-					capable = true
-					break
-				}
-			}
-			if !capable {
-				return reasonNoCrossCheckCapableWorker
+	} else if run.PlanCrossCheckRequired || run.Kind == "cross_check" {
+		requiredProtocol := capability.CrossCheckV1
+		protocolAvailable := true
+		if run.Kind == "cross_check" {
+			round, err := s.q.GetCrossCheckChildProtocol(ctx, run.ID)
+			if err != nil {
+				slog.Error("health: read cross-check child protocol", "run_id", run.ID, "error", err)
+				protocolAvailable = false
+			} else if round > 1 {
+				requiredProtocol = capability.CrossCheckRoundsV1
 			}
 		}
+		if protocolAvailable {
+			workers, werr := s.q.ListWorkersByUser(ctx, r.UserID)
+			if werr != nil {
+				slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
+			} else {
+				capable := false
+				for _, worker := range workers {
+					if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
+						slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
+						slices.Contains(worker.ProtocolCapabilities, requiredProtocol) &&
+						(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
+						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
+						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) &&
+						!worker.MaintenanceFenced && worker.MaintenancePhase != "requested" && worker.MaintenancePhase != "ready" && worker.MaintenancePhase != "stopping" && worker.MaintenancePhase != "recycling" {
+						capable = true
+						break
+					}
+				}
+				if !capable {
+					if requiredProtocol == capability.CrossCheckRoundsV1 {
+						return reasonNoCrossCheckRoundsCapableWorker
+					}
+					if r.CrossCheckPinRequired {
+						return reasonNoCrossCheckPinCapableWorker
+					}
+					if r.Kind == "cross_check" {
+						return reasonNoCrossCheckWorker
+					}
+					return reasonNoCrossCheckCapableWorker
+				}
+			}
+		}
+	}
+	if r.Kind == "cross_check" {
+		return reasonNoCrossCheckWorker
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is
 	// yielding to interactive work — so its owner gets a reason that says so rather than the

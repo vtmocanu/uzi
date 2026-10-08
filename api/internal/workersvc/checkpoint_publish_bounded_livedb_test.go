@@ -88,6 +88,13 @@ func (q *boundedLiveStore) RecordCheckpointPublishAttempt(ctx context.Context, p
 	}
 	return id, err
 }
+func (q *boundedLiveStore) RecordLiveCheckpointPublishAttempt(ctx context.Context, p store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error) {
+	id, err := q.Store.RecordLiveCheckpointPublishAttempt(ctx, p)
+	if err == nil && q.inserted != nil {
+		q.inserted(id)
+	}
+	return id, err
+}
 func (q *boundedLiveStore) DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error) {
 	if q.beforeDelete != nil {
 		q.beforeDelete(id)

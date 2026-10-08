@@ -18,6 +18,7 @@ import (
 )
 
 type planCrossCheckRequest struct {
+	Round           *int32 `json:"round"`
 	Stage           string `json:"stage"`
 	ClaimGeneration *int64 `json:"claim_generation"`
 	workersvc.PlanCrossCheckCandidate
@@ -42,6 +43,8 @@ func crossCheckError(w http.ResponseWriter, err error) {
 		switch {
 		case errors.Is(err, workersvc.ErrCrossCheckInterrupted):
 			reason = "interrupted"
+		case errors.Is(err, workersvc.ErrCrossCheckRevisionsExhausted):
+			reason = "revisions_exhausted"
 		case errors.Is(err, workersvc.ErrCrossCheckUnavailable):
 			reason = "checker_unavailable"
 		}
@@ -88,7 +91,11 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
 		return
 	}
-	cc, err := h.wsvc.SubmitPlanCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, c)
+	round := int32(1)
+	if req.Round != nil {
+		round = *req.Round
+	}
+	cc, err := h.wsvc.SubmitPlanCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, c, round)
 	if err != nil {
 		crossCheckError(w, err)
 		return
@@ -220,16 +227,18 @@ type planCrossCheckNoRowResponse struct {
 }
 
 type planCrossCheckCandidateResponse struct {
-	Result              string                            `json:"result"`
-	Round               int32                             `json:"round"`
-	CheckerRunID        *string                           `json:"checker_run_id"`
-	CandidateDigest     string                            `json:"candidate_digest"`
-	CandidateGeneration int64                             `json:"candidate_generation"`
-	Candidate           workersvc.PlanCrossCheckCandidate `json:"candidate"`
-	Verdict             string                            `json:"verdict"`
-	ReasonClass         string                            `json:"reason_class"`
-	Findings            json.RawMessage                   `json:"findings"`
-	DeadlineAt          time.Time                         `json:"deadline_at"`
+	Result                 string                            `json:"result"`
+	AutomaticRevisionLimit int32                             `json:"automatic_revision_limit"`
+	AutomaticRoundsEnabled bool                              `json:"automatic_rounds_enabled"`
+	Round                  int32                             `json:"round"`
+	CheckerRunID           *string                           `json:"checker_run_id"`
+	CandidateDigest        string                            `json:"candidate_digest"`
+	CandidateGeneration    int64                             `json:"candidate_generation"`
+	Candidate              workersvc.PlanCrossCheckCandidate `json:"candidate"`
+	Verdict                string                            `json:"verdict"`
+	ReasonClass            string                            `json:"reason_class"`
+	Findings               json.RawMessage                   `json:"findings"`
+	DeadlineAt             time.Time                         `json:"deadline_at"`
 	leadReconciliationResponse
 }
 
@@ -241,7 +250,7 @@ func crossCheckResponse(cc store.CrossCheck, lastSeq int32) planCrossCheckCandid
 		childID = &value
 	}
 	return planCrossCheckCandidateResponse{
-		Result: "candidate", Round: cc.Round, CheckerRunID: childID,
+		Result: "candidate", Round: cc.Round, AutomaticRevisionLimit: cc.AutomaticRevisionLimit, AutomaticRoundsEnabled: cc.AutomaticRoundsEnabled, CheckerRunID: childID,
 		CandidateDigest: hex.EncodeToString(cc.CandidateDigest), CandidateGeneration: cc.LeadClaimGeneration,
 		Candidate: workersvc.PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: json.RawMessage(cc.Milestones),
 			RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String,
@@ -249,4 +258,27 @@ func crossCheckResponse(cc store.CrossCheck, lastSeq int32) planCrossCheckCandid
 		Verdict: cc.Verdict, ReasonClass: cc.ReasonClass.String, Findings: json.RawMessage(cc.Findings),
 		DeadlineAt: cc.DeadlineAt.Time, leadReconciliationResponse: reconciliationResponse(lastSeq, nil),
 	}
+}
+
+func (h *Handler) WorkerLatestPlanCrossCheck(w http.ResponseWriter, r *http.Request) {
+	worker, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	generation, err := strconv.ParseInt(r.URL.Query().Get("claim_generation"), 10, 64)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid cross-check metadata request")
+		return
+	}
+	metadata, err := h.wsvc.LatestPlanCrossCheck(r.Context(), worker, id, generation)
+	if err != nil {
+		crossCheckError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, metadata)
 }

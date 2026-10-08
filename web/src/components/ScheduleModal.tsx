@@ -1212,7 +1212,7 @@ export function ScheduleModal({
                   placeholder="UTC"
                 />
                 <datalist id="sched-tz-list">
-                  {[browserTimezone(), ...COMMON_TIMEZONES].map((tz) => (
+                  {Array.from(new Set([browserTimezone(), ...COMMON_TIMEZONES])).map((tz) => (
                     <option key={tz} value={tz} />
                   ))}
                 </datalist>

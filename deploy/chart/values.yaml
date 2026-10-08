@@ -653,6 +653,9 @@ workers:
   # documented in docs/worker-setup.md (PRD #58 Decision 7) and means a busy worker no
   # longer leaves a user's other runs queued behind it — so size the preset to fit that
   # many concurrent runs. The controller rejects a non-integer or a value < 1 at boot.
+  # With a cap above 1, also raise the API's requeue budget via
+  # api.config.RUN_MAX_REQUEUES (for example "5"): one OOM can requeue every
+  # in-flight run. The API default is 3; "0" disables automatic requeue.
   #
   # This is still a per-worker cap, not a fleet placement policy — since PRD #216
   # the server itself spreads queued runs across idle workers inside the claim, so

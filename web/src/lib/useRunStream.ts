@@ -41,6 +41,9 @@ export function useRunStream(runId: string) {
   // Send that 404s, never a banner. Defaults true so an owner never flashes hidden;
   // a 404 flips it off. A 200-empty owner is unaffected.
   const [canSteer, setCanSteer] = useState(true);
+  // Explicit owner-only actions need positive proof, while existing steer surfaces
+  // retain their optimistic pending-read behaviour. Bind proof to this run's generation.
+  const [ownerProof, setOwnerProof] = useState<{ runId: string; generation: number } | null>(null);
 
   const streamRef = useRef<StreamState>(emptyStream());
   const statusRef = useRef<string>("");
@@ -99,13 +102,17 @@ export function useRunStream(runId: string) {
       setInputs(inputs);
       // A 200 (even empty) proves this viewer owns the run → allow steering.
       setCanSteer(true);
+      setOwnerProof({ runId, generation: gen });
     } catch (e) {
       // A 404 on the owner-only endpoint means this viewer is NOT the owner (the run
       // view itself is owner-or-admin, so it can still be open): hide the steer surface
       // silently (Decision 8/N2). Any other error is transient — leave the queue and the
       // last-known canSteer untouched. Never surface a banner either way.
       if (gen !== genRef.current) return;
-      if (e instanceof ApiError && e.status === 404) setCanSteer(false);
+      if (e instanceof ApiError && e.status === 404) {
+        setCanSteer(false);
+        setOwnerProof(null);
+      }
     }
   }, [runId]);
 
@@ -128,6 +135,7 @@ export function useRunStream(runId: string) {
     setError("");
     setInputs([]);
     setCanSteer(true);
+    setOwnerProof(null);
     // Load the run and its message history on MOUNT, independent of the socket.
     // The persisted log is authoritative and a page load must show existing
     // history (and current status) immediately — even if the WS is slow to
@@ -284,5 +292,6 @@ export function useRunStream(runId: string) {
   // inputs + refreshInputs are the PRD #95 steer queue: M3 wires refreshInputs into the
   // live triggers and the queue card reads `inputs`. canSteer gates the steer surface
   // for a non-owner viewer (Decision 8/N2).
-  return { run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer };
+  const confirmedOwner = ownerProof?.runId === runId && ownerProof.generation === genRef.current;
+  return { run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer, confirmedOwner };
 }

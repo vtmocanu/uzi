@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -27,13 +28,14 @@ type healthFakeStore struct {
 	eligibilityCalls []store.CountOnlineWorkersClaimableForRunParams
 
 	Store
-	liveCrossCheck      map[uuid.UUID]bool
-	liveCrossCheckErr   error
-	liveCrossCheckCalls []uuid.UUID
-	active              []store.ListActiveRunsForHealthRow
-	crossCheckRun       store.Run
-	crossCheckWorkers   []store.ListWorkersByUserRow
-	window              map[uuid.UUID][]store.ListRunToolWindowRow
+	liveCrossCheck        map[uuid.UUID]bool
+	liveCrossCheckErr     error
+	liveCrossCheckCalls   []uuid.UUID
+	active                []store.ListActiveRunsForHealthRow
+	crossCheckRun         store.Run
+	crossCheckWorkers     []store.ListWorkersByUserRow
+	crossCheckWorkerCalls []uuid.UUID
+	window                map[uuid.UUID][]store.ListRunToolWindowRow
 	// messages is an optional per-run run_messages log (seq ascending or not; the
 	// fake orders it). When a run has one, BOTH tool-window reads derive from it with
 	// the real queries' filter + ORDER BY seq DESC + LIMIT semantics, so a test can
@@ -116,9 +118,11 @@ type healthFakeStore struct {
 	// custodyErr forces the read to fail (falls through to the generic queuedReason). The count
 	// predicate itself is pinned against a real Postgres by the store package; this side pins the
 	// ARM (count vs limit → reason mapping).
-	custodyHolds  int64
-	custodyExempt bool
-	custodyErr    error
+	custodyHolds   int64
+	custodyCounted *int64
+	custodyCutoffs []pgtype.Timestamptz
+	custodyExempt  bool
+	custodyErr     error
 	// custodyCalls records every lookup's user id, so a test can prove the rung asks about THIS
 	// run's owner (the SAME predicate the claim gates on) and that vault-lock short-circuits it.
 	custodyCalls []uuid.UUID
@@ -137,7 +141,12 @@ func (f *healthFakeStore) HasLivePlanCrossCheck(_ context.Context, id uuid.UUID)
 func (f *healthFakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
 	return f.crossCheckRun, nil
 }
-func (f *healthFakeStore) ListWorkersByUser(context.Context, uuid.UUID) ([]store.ListWorkersByUserRow, error) {
+func (f *healthFakeStore) GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error) {
+	return 1, nil
+}
+
+func (f *healthFakeStore) ListWorkersByUser(_ context.Context, userID uuid.UUID) ([]store.ListWorkersByUserRow, error) {
+	f.crossCheckWorkerCalls = append(f.crossCheckWorkerCalls, userID)
 	return f.crossCheckWorkers, nil
 }
 
@@ -230,10 +239,15 @@ func (f *healthFakeStore) GetCustodyAdmissionForRun(_ context.Context, arg store
 	f.custodyCalls = append(f.custodyCalls, arg.UserID)
 	f.custodyRunCalls = append(f.custodyRunCalls, arg.RunID)
 	f.custodyLimitCalls = append(f.custodyLimitCalls, arg.CustodyHoldLimit)
+	f.custodyCutoffs = append(f.custodyCutoffs, arg.HeartbeatCutoff)
 	if f.custodyErr != nil {
 		return store.GetCustodyAdmissionForRunRow{}, f.custodyErr
 	}
-	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.custodyHolds, ContinuationExempt: f.custodyExempt}, nil
+	counted := f.custodyHolds
+	if f.custodyCounted != nil {
+		counted = *f.custodyCounted
+	}
+	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.custodyHolds, AdmissionCountedHolds: counted, ContinuationExempt: f.custodyExempt}, nil
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.onlineWorkers, nil
@@ -763,6 +777,25 @@ func TestHealthQueuedHandoffSetup(t *testing.T) {
 // worker-availability reason — so even a zero-worker fleet reports the custody block, because
 // bringing a worker online cannot clear it. Below the limit, or on a read error, it falls
 // through to the generic worker reasons rather than inventing one.
+func TestHealthCustodyCountAndConfiguredCutoff(t *testing.T) {
+	for _, counted := range []int64{0, 7, 8} {
+		t.Run(fmt.Sprint(counted), func(t *testing.T) {
+			r := runRow("queued")
+			fs := &healthFakeStore{custodyHolds: 12, custodyCounted: &counted}
+			svc := healthSvc(fs, defaultHealthSettings())
+			svc.p.WorkerHeartbeatStale = 137 * time.Second
+			reason := svc.queuedReason(context.Background(), t0, r)
+			if (reason == reasonCustodyLimit) != (counted >= custodyHoldLimit) {
+				t.Fatalf("total12/count%d reason=%q", counted, reason)
+			}
+			want := t0.Add(-137 * time.Second)
+			if len(fs.custodyCutoffs) != 1 || !fs.custodyCutoffs[0].Valid || !fs.custodyCutoffs[0].Time.Equal(want) {
+				t.Fatalf("cutoffs=%v want=%s", fs.custodyCutoffs, want)
+			}
+		})
+	}
+}
+
 func TestHealthQueuedCustodyLimit(t *testing.T) {
 	cases := []struct {
 		name    string

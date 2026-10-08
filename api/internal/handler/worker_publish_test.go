@@ -21,15 +21,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// publishStore backs the M8 checkpoint-publish handler tests: it answers the
-// ownership lookup and the run-claim-context lookup the service reaches, and
-// nothing else.
+// publishStore backs the M8 checkpoint-publish handler tests with ownership,
+// claim context and live publish-attempt bookkeeping.
 type publishStore struct {
 	workersvc.Store
-	ownedRun store.Run
-	ownedErr error
-	claim    store.GetRunClaimContextRow
-	claimErr error
+	ownedRun             store.Run
+	ownedErr             error
+	claim                store.GetRunClaimContextRow
+	claimErr             error
+	livePublishAttemptID uuid.UUID
 }
 
 func (p *publishStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
@@ -37,6 +37,37 @@ func (p *publishStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByW
 }
 func (p *publishStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRunClaimContextRow, error) {
 	return p.claim, p.claimErr
+}
+
+func (p *publishStore) RecordLiveCheckpointPublishAttempt(_ context.Context, arg store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error) {
+	// issueRun omits the owned row ID; configured IDs still bind admission to
+	// the ownership snapshot, as do the expected worker and claim generation.
+	if (p.ownedRun.ID != uuid.Nil && arg.RunID != p.ownedRun.ID) ||
+		arg.ExpectedWorkerID != p.ownedRun.WorkerID || arg.ExpectedClaimGeneration != p.ownedRun.ClaimGeneration {
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	if p.livePublishAttemptID == uuid.Nil {
+		p.livePublishAttemptID = uuid.New()
+	}
+	if arg.AttemptID != uuid.Nil && arg.AttemptID != p.livePublishAttemptID {
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	return p.livePublishAttemptID, nil
+}
+
+func (p *publishStore) MarkCheckpointPublishAttemptReady(_ context.Context, id uuid.UUID) (int64, error) {
+	if id == uuid.Nil || id != p.livePublishAttemptID {
+		return 0, pgx.ErrNoRows
+	}
+	return 1, nil
+}
+
+func (p *publishStore) DeleteCheckpointPublishAttempt(_ context.Context, id uuid.UUID) (int64, error) {
+	if id == uuid.Nil || id != p.livePublishAttemptID {
+		return 0, pgx.ErrNoRows
+	}
+	p.livePublishAttemptID = uuid.Nil
+	return 1, nil
 }
 
 // SetRunCheckpointTip is the best-effort tip persist a successful publish makes

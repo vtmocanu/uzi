@@ -56,7 +56,7 @@ beforeEach(() => {
   // pre-#104 tests below see exactly the page they always saw.
   mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret()] });
   mockApi.getRecoveryHolds.mockResolvedValue({
-    aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+    aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
   });
 });

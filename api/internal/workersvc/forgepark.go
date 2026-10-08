@@ -56,6 +56,7 @@ const recoveryCauseCodexAccountUnavailable = "codex_account_unavailable"
 // runs_recovery_wait_cause_check (pinned by TestRecoveryWaitCauseVocabularyMatchesCheck).
 var serverRecoveryWaitCauses = map[string]bool{
 	recoveryCauseCodexAccountUnavailable: true,
+	"worker_requeue_exhausted":           true,
 }
 
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).

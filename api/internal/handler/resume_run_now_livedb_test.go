@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -18,7 +19,8 @@ import (
 
 // TestResumeRunNowDispatchLiveDB pins the widened resume endpoint (PRD #1190 M1, Decision 14):
 // ResumeRunNow READS the run first, then dispatches on status — pool_wait promotes, paused
-// resumes, everything else is a 409 naming the status — and a foreign/absent run is 404. It
+// resumes, worker-requeue exhaustion starts another episode, and other statuses return 409.
+// A foreign/absent run is 404. It
 // exercises the real handler against a live DB (the store queries are the load-bearing half).
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
@@ -110,6 +112,58 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 		}
 		if n != 1 {
 			t.Fatalf("resume audit rows = %d, want 1", n)
+		}
+	})
+
+	t.Run("worker requeue exhaustion with a checkpoint allows owner resume", func(t *testing.T) {
+		id := newRun("running")
+		worker := uuid.New()
+		tip := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		exec("INSERT INTO workers (id,user_id,name,token_hash) VALUES ($1,$2,'exhaustion-resume',$3)", worker, owner.ID, worker[:])
+		exec("UPDATE runs SET worker_id=$2,claim_generation=2,requeue_count=2,budget_wall_seconds=86400,checkpoint_tip=$3,checkpoint_tip_at=now() WHERE id=$1", id, worker, tip)
+		if _, err := h.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+			WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, MaxRequeues: 1,
+			FailureReason: pgtype.Text{String: "worker requeue budget exhausted", Valid: true},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Reach the hold through its real writer. The current cause CHECK must not
+		// be bypassed by inserting a fabricated recovery_wait fixture.
+		var status, cause string
+		var finished bool
+		if err := pool.QueryRow(ctx, "SELECT status,COALESCE(recovery_wait_cause,''),finished_at IS NOT NULL FROM runs WHERE id=$1", id).Scan(&status, &cause, &finished); err != nil {
+			t.Fatal(err)
+		}
+		if status != "recovery_wait" || cause != "worker_requeue_exhausted" || finished {
+			t.Fatalf("exhaustion before owner resume = status=%q cause=%q finished=%v; want recovery_wait/worker_requeue_exhausted/nonterminal", status, cause, finished)
+		}
+		foreign := call(id, store.User{ID: uuid.New()})
+		if foreign.Code != http.StatusNotFound || statusOf(id) != "recovery_wait" {
+			t.Fatalf("foreign resume code=%d status=%s, want 404/recovery_wait", foreign.Code, statusOf(id))
+		}
+		rec := call(id, owner)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("owner exhaustion resume code=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if statusOf(id) != "queued" {
+			t.Fatalf("owner exhaustion resume status=%s, want queued", statusOf(id))
+		}
+		var retainedTip string
+		var inputs int
+		if err := pool.QueryRow(ctx, "SELECT checkpoint_tip,(SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume') FROM runs WHERE id=$1", id).Scan(&retainedTip, &inputs); err != nil {
+			t.Fatal(err)
+		}
+		if retainedTip != tip || inputs != 1 {
+			t.Fatalf("resumed checkpoint=%q audit rows=%d, want %q/1", retainedTip, inputs, tip)
+		}
+	})
+
+	t.Run("ordinary recovery_wait still refuses generic owner resume", func(t *testing.T) {
+		id := newRun("recovery_wait")
+		exec("UPDATE runs SET recovery_wait_cause='forge_unreachable' WHERE id=$1", id)
+		rec := call(id, owner)
+		if rec.Code != http.StatusConflict || errBody(rec) != "run is recovery_wait" || statusOf(id) != "recovery_wait" {
+			t.Fatalf("ordinary recovery hold resume code=%d body=%s status=%s, want 409/unchanged", rec.Code, rec.Body.String(), statusOf(id))
 		}
 	})
 

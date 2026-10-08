@@ -92,12 +92,16 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	resume := &cobra.Command{
 		Use:   "resume <run-id>",
-		Short: "Resume a paused run, moving it back to the queue with its remaining budget preserved",
+		Short: "Resume a paused or worker recovery exhausted run",
 		Long: "Resume ONE run the owner paused (`paused`, PRD #1190): it flips the hold back to `queued`, " +
 			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
 			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
 			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
-			"A run that is NOT paused is a 409 (exit 5); a foreign or unknown run is a 404 (exit 4). It " +
+			"For worker recovery exhausted (recovery_wait), only owner Resume starts a fresh recovery episode " +
+			"with the configured automatic requeue allowance; lifetime charged count is preserved. " +
+			"An allowance of zero still permits this explicit attempt but no automatic requeues. " +
+			"Cancel instead with uzi run cancel <run-id>. Historical evidence does not verify current availability or latest local edits.\n\n" +
+			"A run without a supported hold is a 409 (exit 5); a foreign or unknown run is a 404 (exit 4). It " +
 			"posts to the same endpoint as `uzi run resume-now`, which also resumes a pool-held run.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -115,6 +119,12 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			if !gf.quiet {
 				p.Printf("Resumed %s: queued.\n", args[0])
+				if w := run.WorkerRecovery; w != nil && w.Episode > 0 {
+					p.Printf("Worker recovery episode %d; only owner Resume from exhaustion starts a fresh worker recovery episode; automatic requeue allowance %d; %d used, %d remaining; lifetime charged count %d.\n", w.Episode, w.AutomaticRequeueLimit, w.EpisodeUsed, w.EpisodeRemaining, run.RequeueCount)
+					if w.AutomaticRequeueLimit == 0 {
+						p.Printf("Zero allowance permits this explicit attempt; no automatic requeues.\n")
+					}
+				}
 			}
 			return nil
 		},

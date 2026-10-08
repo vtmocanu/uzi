@@ -127,6 +127,9 @@ RUN_B="$(create_run "$REPO_ID" "$IID_ASB")" || fail "auto-stop phase: could not 
 # a dirty queue (a leftover queued run from an earlier phase) — fail loudly, it should
 # not happen at end-of-file. We already know A vs B from create_run, so no remapping
 # is needed; this only proves both A and B were the runs claimed (and thus owned).
+# This completion-only synthetic worker adds no custody; both claims need the
+# existing owner count below the admission ceiling, not two new custody slots.
+wait_custody_headroom 1
 C1="$(asw_claim)" || fail "auto-stop phase: first claim failed (see stderr)"
 C2="$(asw_claim)" || fail "auto-stop phase: second claim failed (see stderr)"
 for c in "$C1" "$C2"; do

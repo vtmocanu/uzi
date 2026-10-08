@@ -130,7 +130,21 @@ export interface SecretMeta {
 // UserSettings is the current user's own (non-secret) settings. theme is
 // the per-user UI theme override; null means "use the instance default" (PRD
 // #21).
+export interface CrossCheckPinDTO {
+  stage: "plan";
+  harness: Harness;
+  model: string | null;
+  effort: string | null;
+  worker_default_model: string | null;
+  resolved_model: string | null;
+  resolved_effort: string;
+  model_source: "pin" | "worker default";
+  effort_source: "pin" | "worker default";
+  active: boolean;
+}
+
 export interface UserSettings {
+  cross_check_pins?: CrossCheckPinDTO[];
   /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
    *  Kept for one compatibility release as a server-projected legacy field — the
    *  server derives it from the effective-harness lane, so a stale client reading it
@@ -194,6 +208,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
+  cross_check_pins?: { stage: "plan"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
    *  send this. Kept only for the bounded stale-client bridge, where the server routes it
@@ -2759,6 +2774,22 @@ export interface Run {
   title: string | null;
   resume_of_run_id: string | null;
   status: RunStatus;
+  /** Current episode allowance plus historic exhaustion evidence; no current availability promise. */
+  worker_recovery?: {
+    episode: number;
+    automatic_requeue_limit: number;
+    episode_used: number;
+    episode_remaining: number;
+    evidence: {
+      checkpoint_tip: string | null;
+      available_capture: boolean;
+      publication_uncertain: boolean;
+      capture_uncertain: boolean;
+      custody_uncertain: boolean;
+      unknown: boolean;
+      recorded_at: string;
+    } | null;
+  };
   requeue_count: number;
   iteration_count: number;
   /** issue #321: server-computed planning-phase display flag — true only while a run is
@@ -3468,6 +3499,8 @@ export interface PlanCrossCheckSummary {
   checker_run_id: string | null;
   checker_model: string | null;
   checker_effort: string | null;
+  checker_model_source: "pin" | "worker default" | null;
+  checker_effort_source: "pin" | "worker default" | null;
   usage: RunUsage | null;
   historical: boolean;
 }
@@ -4799,9 +4832,11 @@ export interface RecoveryCustodyHold {
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
-// one-per-episode Slack DM read. All four counts are always present (0 is meaningful).
+// one-per-episode Slack DM read. Counts are numeric (0 is meaningful).
+// admission_counted_holds is optional for compatibility with older servers.
 export interface RecoveryCustodyAggregate {
   open_holds: number;
+  admission_counted_holds?: number;
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;

@@ -57,6 +57,8 @@ type EphemeralSettings interface {
 type EphemeralConfig struct {
 	// WorkerAffinityGrace must mirror the worker claim configuration.
 	WorkerAffinityGrace time.Duration
+	// BackgroundGrace restores background runs to normal priority after this age.
+	BackgroundGrace time.Duration
 	// DockerEnabled is the effective deployment Docker tier (config.WorkerDockerEnabled).
 	DockerEnabled bool
 	// IsolatedLaneEnabled reports whether the deployment enabled the isolated research lane
@@ -171,7 +173,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	// legitimately be in both sets, but the guard keeps one run from consuming two slots.
 	evaluatedAt := p.now()
 	affinityCutoff := pgtype.Timestamptz{Time: evaluatedAt.Add(-p.cfg.WorkerAffinityGrace), Valid: true}
+	backgroundGraceCutoff := pgconv.Time(evaluatedAt.Add(-p.cfg.BackgroundGrace))
 	gapRuns, err := p.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+		BackgroundGraceCutoff:    backgroundGraceCutoff,
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: evaluatedAt, Valid: true},
 		CrossCheckAffinityCutoff: affinityCutoff,
 		MaxRows:                  ephemeralProvisionBatch,
@@ -186,6 +190,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
 	}
 	satRuns, err := p.q.ListSaturationQueuedRunsForEphemeral(ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+		BackgroundGraceCutoff:    backgroundGraceCutoff,
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: evaluatedAt, Valid: true},
 		CrossCheckAffinityCutoff: affinityCutoff,
 		SaturationDelay:          durationToInterval(p.cfg.SaturationDelay),
@@ -208,8 +213,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	var laneRuns []store.ListIsolatedQueuedRunsForEphemeralRow
 	if p.cfg.IsolatedLaneEnabled {
 		laneRuns, err = p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
-			MaxRows:    ephemeralProvisionBatch,
-			MaxPerUser: int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+			BackgroundGraceCutoff: backgroundGraceCutoff,
+			MaxRows:               ephemeralProvisionBatch,
+			MaxPerUser:            int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		})
 		if err != nil {
 			return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)

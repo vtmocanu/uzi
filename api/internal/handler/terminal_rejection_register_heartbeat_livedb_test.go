@@ -50,20 +50,17 @@ func TestTerminalRejectionRegisterHeartbeatLiveDB(t *testing.T) {
 				if rec.Code != http.StatusOK {
 					t.Fatalf("%s: %d %s", endpoint, rec.Code, rec.Body.String())
 				}
-				var status, origin, reason string
+				rejectionAssertPark(t, e)
 				var generation int64
-				if err := e.pool.QueryRow(e.ctx, "SELECT status,fail_origin,failure_reason,claim_generation FROM runs WHERE id=$1", e.run).Scan(&status, &origin, &reason, &generation); err != nil {
+				if err := e.pool.QueryRow(e.ctx, "SELECT claim_generation FROM runs WHERE id=$1", e.run).Scan(&generation); err != nil || generation != 1 {
+					t.Fatalf("generation=%d err=%v; want unchanged generation 1", generation, err)
+				}
+				var exactMAC bool
+				if err := e.pool.QueryRow(e.ctx, "SELECT COALESCE(terminal_record_rejection='mac_failure',false) FROM recovery_custody_holds WHERE id=$1", e.pred).Scan(&exactMAC); err != nil {
 					t.Fatal(err)
 				}
-				want := "worker restarted; run orphaned and out of re-queue budget"
-				if path == "heartbeat" {
-					want = "worker lost the execution; exceeded re-queue budget"
-				}
-				if scope == "exact" {
-					want = rejectionExplanation
-				}
-				if status != "failed" || origin != "worker_lost" || reason != want || generation != 1 {
-					t.Fatalf("run status=%s origin=%s reason=%q generation=%d; want failed/worker_lost/%q/1", status, origin, reason, generation, want)
+				if exactMAC != (scope == "exact") {
+					t.Fatalf("exact custody MAC=%t scope=%s", exactMAC, scope)
 				}
 				var state string
 				if err := e.pool.QueryRow(e.ctx, "SELECT state FROM recovery_custody_holds WHERE id=$1", e.pred).Scan(&state); err != nil {

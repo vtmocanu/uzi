@@ -192,13 +192,16 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   - **Nobody answers ⇒ the run fails** once the answer deadline passes (24
     hours by default, `QUESTION_TIMEOUT_SECONDS`). The timer is held by the
     worker, so if that worker dies and the run is picked up again the clock
-    restarts — the honest worst case is the timeout times one more than the
-    requeue limit, not the timeout flat. The per-run question cap
-    (`QUESTION_MAX`, 5 by default) resets the same way for the same reason,
-    so it has the identical caveat: a run may ask up to 20 questions over its
-    life on defaults (`RUN_MAX_REQUEUES` is 3), not 5, if a worker dies and it's requeued in between (one attempt
-    more for a run resumed through the one-shot finalize-resume allowance,
-    issue #1742).
+    restarts. With no other fresh executor execution, worker-death retries
+    contribute `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` and
+    `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` (96h and 20 questions on defaults).
+    Only the initial episode can use the once-per-run finalize-resume
+    allowance (#1742) with a positive cap, giving the multiplier
+    `RUN_MAX_REQUEUES + 2`. Ordinary transient/limit/credential redispatch
+    can create fresh `execute()` within the same episode, resetting
+    worker-memory question budgets without changing its number or charged
+    `requeue_count`. `RUN_MAX_REQUEUES` bounds charged worker-death retries,
+    not total attempts or questions per episode or lifetime.
   - **The ✅ means "recorded", not "delivered".** It is added once uzi has
     stored your answer for the run to collect. In the narrow window of a
     rolling worker upgrade, a run resumed onto a worker from before this

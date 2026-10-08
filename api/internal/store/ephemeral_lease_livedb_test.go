@@ -773,7 +773,8 @@ func TestLeaseClockNowLiveDB(t *testing.T) {
 func listedUnplaceable(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) map[uuid.UUID]bool {
 	fx.t.Helper()
 	rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
-		EphemeralLease: iv, MaxPerUser: maxPerUser, MaxRows: 50,
+		BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
+		EphemeralLease:        iv, MaxPerUser: maxPerUser, MaxRows: 50,
 		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
 		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute))})
 	if err != nil {
@@ -789,7 +790,8 @@ func listedUnplaceable(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) m
 func listedSaturation(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) map[uuid.UUID]bool {
 	fx.t.Helper()
 	rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
-		SaturationDelay: leaseInterval(0), EphemeralLease: iv, MaxPerUser: maxPerUser, MaxRows: 50,
+		BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
+		SaturationDelay:       leaseInterval(0), EphemeralLease: iv, MaxPerUser: maxPerUser, MaxRows: 50,
 		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
 		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute))})
 	if err != nil {
@@ -804,7 +806,7 @@ func listedSaturation(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) ma
 
 func listedIsolated(fx *fleetFixture, maxPerUser int32) map[uuid.UUID]bool {
 	fx.t.Helper()
-	rows, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
+	rows, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
 		MaxPerUser: maxPerUser, MaxRows: 50})
 	if err != nil {
 		fx.t.Fatalf("ListIsolatedQueuedRunsForEphemeral: %v", err)

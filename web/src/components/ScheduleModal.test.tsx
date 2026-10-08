@@ -5,11 +5,12 @@
 // POST /api/schedules/preview endpoint — never a client-side cron guess — so it
 // always matches server truth (Decision 6).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { ScheduleModal } from "./ScheduleModal";
 import { api, ApiError, type Schedule, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { browserTimezone } from "../lib/timezone";
 // The REAL mock (distinct from the vi.mock'd `api` above) — used to exercise the mock's
 // own updateSchedule repoint branch directly. It ships seeded schedules/repos and starts
 // signed in as admin, so no session setup is needed. ApiError survives the api vi.mock
@@ -38,6 +39,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+vi.mock("../lib/timezone", () => ({ browserTimezone: vi.fn() }));
 
 const mockApi = vi.mocked(api);
 
@@ -54,6 +56,7 @@ function renderModal() {
 }
 
 beforeEach(async () => {
+  vi.mocked(browserTimezone).mockReturnValue("UTC");
   vi.mocked(useAuth).mockReturnValue({ uziLabel: "uzi" } as unknown as ReturnType<typeof useAuth>);
   mockApi.listScheduleCatalog.mockResolvedValue(await realMockApi.listScheduleCatalog());
   mockApi.previewSchedule.mockResolvedValue({ fires: [] });
@@ -80,6 +83,46 @@ beforeEach(async () => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("timezone suggestions", () => {
+  it.each([
+    {
+      timezone: "UTC",
+      expected: ["UTC", "Europe/Bucharest", "America/New_York", "Europe/London"],
+    },
+    {
+      timezone: "Europe/Bucharest",
+      expected: ["Europe/Bucharest", "UTC", "America/New_York", "Europe/London"],
+    },
+    {
+      timezone: "Asia/Tokyo",
+      expected: ["Asia/Tokyo", "UTC", "Europe/Bucharest", "America/New_York", "Europe/London"],
+    },
+  ])("keeps $timezone first without duplicate options or keys", async ({ timezone, expected }) => {
+    vi.mocked(browserTimezone).mockReturnValue(timezone);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await act(async () => {
+        renderModal();
+      });
+
+      const values = Array.from(
+        document.querySelectorAll<HTMLOptionElement>("#sched-tz-list option"),
+        (option) => option.value,
+      );
+      expect(new Set(values).size).toBe(values.length);
+      expect(values[0]).toBe(timezone);
+      expect(values).toEqual(expected);
+      expect(
+        consoleError.mock.calls.some((args) =>
+          args.some((arg) => String(arg).includes("Encountered two children with the same key")),
+        ),
+      ).toBe(false);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
 });
 
 describe("target switching swaps the fields", () => {

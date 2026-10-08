@@ -35,6 +35,10 @@ import (
 // the tested paths reach.
 type protocolStore struct {
 	workersvc.Store
+	priorWorker   store.Worker
+	priorReadID   uuid.UUID
+	registerArg   store.RegisterWorkerParams
+	failArg       store.FailWorkerRunsOverCapParams
 	claimErr      error
 	ownedRun      store.Run
 	ownedErr      error
@@ -92,10 +96,22 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 
 // Register path: orphan recovery + the online transition. The counts are
 // irrelevant to the wire-decode test, so they return 0/empty.
-func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+func (p *protocolStore) GetWorkerByID(_ context.Context, id uuid.UUID) (store.Worker, error) {
+	p.priorReadID = id
+	prior := p.priorWorker
+	if prior.ID == uuid.Nil {
+		prior.ID = id
+	} else if prior.ID != id {
+		return store.Worker{}, pgx.ErrNoRows
+	}
+	return prior, nil
+}
+
+func (p *protocolStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
+	p.failArg = arg
 	return nil, nil
 }
-func (p *protocolStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+func (p *protocolStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	return nil, nil
 }
 func (p *protocolStore) RequeueAttestedFinalizeRuns(context.Context, store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
@@ -105,7 +121,8 @@ func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRu
 	return nil, nil
 }
 func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
-	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
+	p.registerArg = arg
+	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns, SnapshotRegisterNonce: arg.SnapshotRegisterNonce}, nil
 }
 
 // HeartbeatWorker echoes the stats params back onto the returned worker, so a
@@ -196,6 +213,30 @@ func TestWorkerClaimDisabledApiRejectsSnapshotBody(t *testing.T) {
 	h.WorkerClaim(bodyless, workerReq(http.MethodPost, "", uuid.Nil))
 	if bodyless.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204 (an old bodyless claim must not 400 on a disabled api)", bodyless.Code)
+	}
+}
+
+func TestWorkerRegisterReadsPriorNonceForRecovery(t *testing.T) {
+	id := uuid.New()
+	priorNonce := pgtype.Text{String: "prior-registration", Valid: true}
+	st := &protocolStore{priorWorker: store.Worker{ID: id, SnapshotRegisterNonce: priorNonce}}
+	h := newProtocolHandler(t, st)
+	req := workerReq(http.MethodPost, "{}", uuid.Nil)
+	req = req.WithContext(mw.ContextWithWorker(req.Context(), store.Worker{ID: id, UserID: uuid.New()}))
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if st.priorReadID != id || st.registerArg.ID != id {
+		t.Fatalf("prior read/register IDs=%s/%s, want %s", st.priorReadID, st.registerArg.ID, id)
+	}
+	if !st.registerArg.SnapshotRegisterNonce.Valid || st.registerArg.SnapshotRegisterNonce.String == "" ||
+		st.registerArg.SnapshotRegisterNonce == priorNonce {
+		t.Fatalf("nonce did not rotate: %+v", st.registerArg.SnapshotRegisterNonce)
+	}
+	if st.failArg.ReleasedWorkerNonceOverride == nil || *st.failArg.ReleasedWorkerNonceOverride != priorNonce {
+		t.Fatalf("recovery lost prior incarnation: %+v", st.failArg.ReleasedWorkerNonceOverride)
 	}
 }
 

@@ -49,10 +49,15 @@ func frozenRecoveryPhase(ctx context.Context, q *store.Queries, phase string, wo
 		}
 		return result, err
 	case "worker fail":
-		return q.FrozenFailWorkerRunsOverCap(ctx, store.FrozenFailWorkerRunsOverCapParams{
+		rows, err := q.FrozenFailWorkerRunsOverCap(ctx, store.FrozenFailWorkerRunsOverCapParams{
 			WorkerID: pgU(worker), MaxRequeues: 5, FailureReason: pgT("lost"),
 			FrozenTargets: frozen, LockedParentIds: parents,
 		})
+		var result []uuid.UUID
+		for _, row := range rows {
+			result = append(result, row.ID)
+		}
+		return result, err
 	case "worker requeue":
 		return q.FrozenRequeueWorkerRuns(ctx, store.FrozenRequeueWorkerRunsParams{
 			WorkerID: pgU(worker), MaxRequeues: 5, FrozenTargets: frozen, LockedParentIds: parents,
@@ -62,10 +67,15 @@ func frozenRecoveryPhase(ctx context.Context, q *store.Queries, phase string, wo
 		for i := range generations {
 			generations[i] = 1
 		}
-		return q.FrozenFailAttestedFinalizeRunsOverCap(ctx, store.FrozenFailAttestedFinalizeRunsOverCapParams{
+		rows, err := q.FrozenFailAttestedFinalizeRunsOverCap(ctx, store.FrozenFailAttestedFinalizeRunsOverCapParams{
 			WorkerID: pgU(worker), MaxRequeues: 5, FailureReason: pgT("lost"),
 			RunIds: ids, ClaimGenerations: generations, FrozenTargets: frozen, LockedParentIds: parents,
 		})
+		var result []uuid.UUID
+		for _, row := range rows {
+			result = append(result, row.ID)
+		}
+		return result, err
 	case "attested requeue":
 		generations := make([]int64, len(ids))
 		for i := range generations {
@@ -325,7 +335,7 @@ func TestRecoveryTerminalParentOwnershipLiveDB(t *testing.T) {
 					wantChild, wantVerdict, wantBank = "cancelled", "failed", 25
 				case "approve", "failed":
 					wantVerdict = state
-				case "parent fence", "frozen parent fence":
+				case "released", "parent fence", "frozen parent fence":
 					wantLeadStatus = "running"
 				}
 				if child != wantChild || verdict != wantVerdict || leadStatus != wantLeadStatus || bank != wantBank {

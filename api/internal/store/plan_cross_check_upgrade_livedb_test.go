@@ -285,11 +285,14 @@ func testCrossCheckRecoveryLockOrder(t *testing.T, pool *pgxpool.Pool, user, rep
 	if err != nil {
 		t.Fatalf("recovery: %v", err)
 	}
-	var status, reason string
-	if err := pool.QueryRow(ctx, "SELECT status,failure_reason FROM runs WHERE id=$1", child).Scan(&status, &reason); err != nil {
-		t.Fatal(err)
-	}
-	if status != "failed" || reason != "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody" {
-		t.Fatalf("fresh custody failure: status=%s reason=%q", status, reason)
+	var parked bool
+	if err := pool.QueryRow(ctx, `SELECT status='recovery_wait'
+		AND recovery_wait_cause='worker_requeue_exhausted' AND fail_origin IS NULL
+		AND failure_reason IS NULL AND finished_at IS NULL AND claim_released_at IS NOT NULL
+		AND (worker_recovery_evidence->>'custody_uncertain')::boolean
+		AND EXISTS (SELECT 1 FROM recovery_custody_holds WHERE id=$2
+			AND state='open' AND terminal_record_rejection='mac_failure')
+		FROM runs WHERE id=$1`, child, hold).Scan(&parked); err != nil || !parked {
+		t.Fatalf("fresh custody must park and retain the committed MAC annotation: parked=%t err=%v", parked, err)
 	}
 }

@@ -837,8 +837,8 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // (PRD #1349 M5, D6/D7/D10). By default it lists ALL the owner's holds (every state) — the CLI's
 // all-states contract via `uzi run recovery`; when openOnly is set (the web hot poll, PRD #1371)
 // it lists only live custody (state='open'), dropping resolved released/discarded history. It
-// stamps each hold with a server-derived Attention, and folds the aggregate: OpenHolds and
-// BlockedRuns come from the aggregate query (the SAME predicate ClaimRun/health gate on),
+// stamps each hold with a server-derived Attention, and folds the aggregate: OpenHolds is
+// total open custody; AdmissionCountedHolds and BlockedRuns use the admission predicate,
 // CustodyHoldLimit from the configured ceiling, and DecisionNeeded is the count of holds whose
 // derived attention awaits an owner decision (needs_action or source_only) — active protection and
 // self-releasing archive_ready rows are excluded (D10). OpenHolds/BlockedRuns come from the
@@ -851,6 +851,7 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // always non-nil so it marshals as [] (never null). No run scope — this is the owner-wide list;
 // the CLI narrows by run.
 func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openOnly bool) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	now := s.now()
 	params := store.ListCustodyHoldsForOwnerParams{UserID: userID}
 	if openOnly {
 		// Bound the list to live custody (PRD #1371): drop resolved (released/discarded)
@@ -873,7 +874,7 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		dto.CheckpointRef = r.CheckpointRef.String
 		dto.CheckpointTip = r.CheckpointTip.String
 		dto.CheckpointState = r.CheckpointState.String
-		if isDecisionAttention(dto.Attention) {
+		if r.DecisionNeeded {
 			decisionNeeded++
 		}
 		holds = append(holds, dto)
@@ -881,16 +882,18 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 	agg, err := s.store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
 		UserID:           userID,
 		CustodyHoldLimit: s.limits.CustodyHoldLimit,
+		HeartbeatCutoff:  pgconv.Time(now.Add(-s.limits.WorkerHeartbeatStale)),
 	})
 	if err != nil {
 		return apitypes.RecoveryCustodyHoldsDTO{}, err
 	}
 	return apitypes.RecoveryCustodyHoldsDTO{
 		Aggregate: apitypes.RecoveryCustodyAggregateDTO{
-			OpenHolds:        int(agg.OpenHolds),
-			CustodyHoldLimit: int(s.limits.CustodyHoldLimit),
-			DecisionNeeded:   decisionNeeded,
-			BlockedRuns:      int(agg.BlockedRuns),
+			OpenHolds:             int(agg.OpenHolds),
+			AdmissionCountedHolds: int(agg.AdmissionCountedHolds),
+			CustodyHoldLimit:      int(s.limits.CustodyHoldLimit),
+			DecisionNeeded:        decisionNeeded,
+			BlockedRuns:           int(agg.BlockedRuns),
 		},
 		Holds: holds,
 	}, nil
@@ -959,7 +962,7 @@ func (s *Service) CustodyDecisionsByWorker(ctx context.Context, ids []uuid.UUID)
 		return nil, err
 	}
 	for _, row := range rows {
-		if _, requested := counts[row.WorkerID]; requested && isDecisionAttention(deriveHoldAttention(batchHoldAttentionInput(row))) {
+		if _, requested := counts[row.WorkerID]; requested && row.DecisionNeeded {
 			counts[row.WorkerID]++
 		}
 	}

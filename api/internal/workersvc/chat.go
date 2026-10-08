@@ -109,7 +109,7 @@ type ChatClaimPayload struct {
 	LastSeq       int32   `json:"last_seq"` // resume: continue message numbering
 	RequeueCount  int32   `json:"requeue_count"`
 	// ClaimGeneration is the run's claim_generation, which the worker sends on its input
-	// receipts (issue #1673). The chat lane does not bump it, so it is usually 0.
+	// receipts (issue #1673). Every successful chat claim opens a fresh generation.
 	ClaimGeneration int64 `json:"claim_generation"`
 
 	Secrets ChatClaimSecrets `json:"secrets"`

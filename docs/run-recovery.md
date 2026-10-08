@@ -30,6 +30,11 @@ guarantee against every possible failure. It does **not** cover uncommitted
 files, the SDK transcript, the worker's HOME directory, or a worker that
 died before it reached this protected boundary.
 
+For operators investigating checkpoint acknowledgement failures, see
+[Checkpoint publish diagnostics](./checkpoint-publish-diagnostics.md) for the
+HTTP evidence boundary and a deployment comparison procedure. An unknown
+acknowledgement does not prove that origin rejected the update.
+
 ## What you'll see
 
 The run page shows a **Recovery archives** section on any run that failed to
@@ -160,7 +165,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
-| Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you until you resolve or discard some. A requeued run that still holds its own unresolved work is still admitted, even past the limit, until that one run alone holds 8. Fixed today, not yet an environment variable. |
+| Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 ### Shared stored-file budget
 
@@ -236,6 +241,42 @@ identity acknowledgment; the worker verifies ancestry locally, not the server.
 Closed custody does not authorize new archive reservations or uploads, and a
 deleted worker's credentials receive 401 from worker authentication.
 
+After an authenticated final acknowledgment covers the inventory, the worker
+can retire that generation's local recovery, coverage and owed-head pins,
+bundles and recovery journals. It checks ref deletion before removing bundles,
+then removes source journals and the covering acknowledgment journal last.
+If an earlier step fails, the acknowledgment stays for bounded retries on
+restart or while the worker is live; completed steps can safely be repeated.
+Removal of the now-empty directory is best-effort and never recursive.
+Unknown, unreadable, malformed, foreign or uncovered inventory keeps local
+custody. Shared owed-head pins, sibling generations and lightweight context
+metadata still referenced by tracking or publication records remain intact.
+Archive coverage is not evidence that the work was published to your forge.
+
+The server keeps the durable disposition receipt and selected archive after
+local cleanup; the worker adds no new local receipt or tombstone. Execution
+or worker quarantine keeps the local evidence. Rejected credentials stop
+network recovery work, but bounded local cleanup of an already acknowledged
+inventory can still retry when execution and quarantine guards permit it.
+Boot discovery does not recreate journals for closed or discarded holds.
+
+Retiring a queued completion or finalization report is a separate decision.
+Without a covering acknowledgment, the worker needs fresh proof of terminal
+ownership and a complete, nonempty custody decision for that exact generation,
+with no open sibling holds on that worker. Pending guarded inventory requires
+every exact hold to be **discarded**; a mixture of released and discarded
+holds is insufficient. With absent recovery journals, released or discarded
+exact holds can authorize report retirement, but absence alone cannot. A
+positively verified legacy generation follows its existing report policy.
+Missing ownership, transferred ownership or unavailable evidence keeps the
+report. A `stale_claim` response supersedes the report; it does not settle or
+delete recovery inventory. Exact discard authorizes report retirement alone:
+physical clone or recovery-source retirement still requires the existing
+quiescence and retention rules, and guarded recovery journals require a
+covering final acknowledgment. See [ADR-2417](../adr/2417-guarded-local-retention.md)
+for the exact checks; the [bad-MAC terminal-record cleanup](#when-a-terminal-record-fails-authentication-after-restart)
+below remains a distinct policy.
+
 A guarded generation that parks (forge unreachable) or fails before its
 repository was ever cloned adopted nothing, yet its hold stays open until a
 final disposition. The worker closes that empty hold itself: after reporting
@@ -255,10 +296,11 @@ pending is not safe terminal release or permission to reclaim the source.
 
 The **selected final archive** is protected from automatic expiry while its
 local worker row exists. Physical worker deletion renews its configured
-normal ready-retention window (7 days by default); protection is not
-perpetual. Earlier non-final and legacy ready captures keep their existing
-TTL. Size limits, quotas, owner-only access and explicit discard behavior
-are unchanged.
+normal ready-retention window (7 days by default) and clears the server's
+local-replica marker; protection is not perpetual. Local acknowledgment
+cleanup leaves that marker and the archive's expiry unchanged. Earlier
+non-final and legacy ready captures keep their existing TTL. Size limits,
+quotas, owner-only access and explicit discard behavior are unchanged.
 
 ### Published checkpoint refs
 
@@ -348,10 +390,10 @@ completed-run check above.
 
 ## Reviewing and resolving held work
 
-At most **8 unresolved holds per owner** (the *Unresolved recovery holds*
-limit above) can accumulate before uzi pauses admitting **new** runs for you.
-A run that was interrupted and requeued while it still has its own unresolved
-hold keeps resuming, until that one run alone holds 8.
+Once **8 admission-counted holds per owner** (the *Admission-counted recovery
+holds* limit above) accumulate, uzi pauses admitting **new** runs for you.
+A run that was interrupted and requeued while it has 1 to 7 of its own open
+holds keeps resuming; once that one run alone holds 8, it loses the exemption.
 When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
@@ -405,13 +447,24 @@ Recovery shows the fixed diagnostic:
 A MAC-rejected terminal record supplies no trustworthy outcome: it cannot
 authorize outcome replay, completion, a terminal lease renewal, or an extra
 finalize-resume allowance. Ordinary requeue policy still applies; if that
-policy fails the run, its failure origin stays `worker_lost`, with the
+policy reaches exhaustion with no recorded recovery evidence or unresolved
+custody, its failure origin stays `worker_lost`, with the
 rejection prose above. This is an unauthenticated record, distinct from a
 trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
-stays in custody. For a terminal run without an available independently
-verified recovery capture, it reports `source_only`:
+stays in custody. An OPEN hold for `recovery_wait` /
+`worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
+capture failed, before archive readiness or capture progress is considered. An
+available archive remains exportable; a latest preparing/uploading capture is not
+yet downloadable, and an earlier archive may omit latest worker-local work. These
+capture facts do not settle the owner decision or implicitly release custody.
+Other terminal holds without a verified available capture report `source_only`,
+rather than `active_protected`. An inventory-guarded hold also reports `source_only` while an
+earlier archive is downloadable: that archive does not cover the full inventory
+and does not settle custody. Recorded evidence or uncertainty at exhaustion holds the
+run for owner Resume; the MAC rejection grants no extra allowance. Absence of
+recorded evidence does not prove absence of unrecorded worker work:
 
 > no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)
 

@@ -43,8 +43,14 @@ SELECT r.kind = 'cross_check'
     AND EXISTS (
         SELECT 1 FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
         WHERE cc.checker_run_id = r.id AND cc.lead_run_id = r.target_run_id
-          AND cc.stage = check_stage AND cc.round = 1 AND cc.verdict = 'pending'
-          AND cc.deadline_at > evaluated_at
+          AND cc.stage = check_stage
+          AND cc.round = (SELECT max(latest.round) FROM cross_checks latest
+                          WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage)
+          AND (cc.round = 1 OR (cc.automatic_rounds_enabled
+               AND cc.round <= cc.automatic_revision_limit + 1
+               AND 'cross_check_rounds_v1' = ANY(w.protocol_capabilities)))
+          AND cc.verdict = 'pending' AND cc.deadline_at > evaluated_at
+          AND lead.user_id = r.user_id AND lead.kind <> 'cross_check'
           AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
           AND lead.claim_generation = cc.lead_claim_generation
     )

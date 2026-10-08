@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import { nullLogger } from "./helpers.js";
-import { WorkerClient } from "../src/client.js";
+import { WorkerClient, RequestError } from "../src/client.js";
 import type { RecoveryReserveRequest, RecoveryUploadManifest } from "../src/protocol.js";
 
 // PRD #1296 M3 — the worker→API archive RPC WIRE, pinned against M2's committed handler
@@ -87,6 +87,88 @@ describe("recovery archive client wire (PRD #1296 M3 ↔ M2 handler)", () => {
     assert.match(String(recorded[0]!.headers.authorization), /^Bearer /);
     assert.deepEqual(JSON.parse(recorded[0]!.body.toString("utf8")), req);
   });
+
+  it("reconcile uses worker bearer, exact archive route and contract body", async () => {
+    const client = newClient();
+    client.protocolFeatures = ["recovery_inventory_v1"];
+    const req = { generation: 7, source_sha: "a".repeat(40), coverage_digest: "b".repeat(64),
+      checksum: "c".repeat(64), byte_size: 14 };
+    const response = { run_id: RUN_ID, generation: 7, capture_id: CAPTURE_ID, outcome: "replaceable" };
+    respond = () => ({ status: 200, body: JSON.stringify(response) });
+    assert.deepEqual(await client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), response);
+    assert.equal(recorded[0]!.method, "POST");
+    assert.equal(recorded[0]!.url, `/api/worker/runs/${RUN_ID}/archives/${CAPTURE_ID}/reconcile`);
+    assert.match(String(recorded[0]!.headers.authorization), /^Bearer /);
+    assert.deepEqual(JSON.parse(recorded[0]!.body.toString("utf8")), req);
+    client.protocolFeatures = [];
+    await assert.rejects(client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), /feature unavailable/);
+    assert.equal(recorded.length, 1);
+    client.protocolFeatures = ["recovery_inventory_v1"];
+    for (const status of [401, 404, 500]) {
+      respond = () => ({ status, body: '{"error":"unavailable"}' });
+      await assert.rejects(client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), RequestError);
+    }
+  });
+
+  for (const contentLength of [undefined, "1"]) {
+    it(`reconcile bounds streamed bytes with ${contentLength === undefined ? "absent" : "lying"} Content-Length`, async (t) => {
+      const client = newClient();
+      client.protocolFeatures = ["recovery_inventory_v1"];
+      const req = { generation: 7, source_sha: "a".repeat(40), coverage_digest: "b".repeat(64),
+        checksum: "c".repeat(64), byte_size: 14 };
+      const receipt = { run_id: RUN_ID, generation: 7, capture_id: CAPTURE_ID, outcome: "replaceable" };
+      // Valid JSON below 16 KiB in characters but above it in UTF-8 bytes.
+      const text = JSON.stringify({ ...receipt, reason: "界".repeat(10_000) });
+      assert.ok(text.length < 16 * 1024);
+      const bytes = Buffer.from(text);
+      assert.ok(bytes.length > 16 * 1024);
+      let delivered = 0;
+      let cancelled = false;
+      let ended = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (delivered === bytes.length) {
+            ended = true;
+            controller.close();
+            return;
+          }
+          const chunk = bytes.subarray(delivered, delivered + 4096);
+          delivered += chunk.length;
+          controller.enqueue(chunk);
+        },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 });
+      const headers = contentLength === undefined ? {} : { "Content-Length": contentLength };
+      let response = new Response(body, { headers });
+      const fetch = t.mock.method(globalThis, "fetch", async () => response);
+      await assert.rejects(client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), {
+        name: "ResponseBodyOverflowError",
+        message: "response body exceeds 16384 bytes",
+      });
+      assert.equal(cancelled, true);
+      assert.equal(ended, false);
+      assert.ok(delivered < bytes.length, "overflow must stop before draining the response");
+      assert.equal(fetch.mock.callCount(), 1);
+
+      // An exact-cap healthy receipt must still reach EOF and parse successfully.
+      const healthy = Buffer.from(JSON.stringify(receipt).padEnd(16 * 1024, " "));
+      let offset = 0;
+      response = new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset === healthy.length) {
+            controller.close();
+            return;
+          }
+          const chunk = healthy.subarray(offset, offset + 4096);
+          offset += chunk.length;
+          controller.enqueue(chunk);
+        },
+      }, { highWaterMark: 0 }), { headers });
+      assert.deepEqual(await client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), receipt);
+      assert.equal(offset, healthy.length);
+      assert.equal(fetch.mock.callCount(), 2);
+    });
+  }
 
   it("status → GET /api/worker/runs/{id}/archives/{captureID}", async () => {
     respond = () => ({

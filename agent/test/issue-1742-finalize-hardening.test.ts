@@ -140,7 +140,7 @@ async function registerWith(
   const worker = new Worker(
     { workerName: "finalize-probe", workerTemplate: "base", maxConcurrentRuns: 1, pollIntervalMs: 1 } as Config,
     wc,
-    {} as RunRunner,
+    { recoveryInventoryPending: async () => false } as unknown as RunRunner,
     {} as ChatRunner,
     {} as JudgeRunner,
     {} as ReviewRunner,
@@ -337,7 +337,7 @@ describe("issue #1742 finalize hardening: runner retirement and crash cuts", () 
     return { root, outbox };
   }
 
-  it("retires the record when a finalize-time report reveals a SERVER wall park", async () => {
+  it("retains the record after a SERVER wall park without absent-journal authority", async () => {
     const root = tmpRoot();
     // No terminal journal can be installed, so the terminal send is the first thing that can end
     // the flight and the journal-install retirement site is never reached.
@@ -362,11 +362,11 @@ describe("issue #1742 finalize hardening: runner retirement and crash cuts", () 
       !api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"),
       "a server wall park reports no failure",
     );
-    assert.deepEqual(await finalizeFiles(root, claim.run_id), [], "retired: the api parked this generation");
-    assert.deepEqual(outbox.listPendingFinalizes(), []);
+    assert.deepEqual(await finalizeFiles(root, claim.run_id), ["finalize-4.json"], "parking alone is not classification");
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: claim.run_id, claim_generation: 4 }]);
   });
 
-  it("retires the record when the completion hold parks the run during finalize", async () => {
+  it("retains the record after a completion hold without absent-journal authority", async () => {
     const { root, outbox } = await outboxWithRoot();
     const claim = gitlabClaim(1751, { claim_generation: 2, config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setCompletionPermitResponse(false, { denyReason: "missing_milestones" });
@@ -374,11 +374,11 @@ describe("issue #1742 finalize hardening: runner retirement and crash cuts", () 
     await runner(new StubExecutor(nullLogger()), gitlab, undefined, { outbox, ...RUNNER_OPTS, recoveryRetryMs: 1 }).execute(claim);
     assert.equal(api.completionHoldRequests.length, 1, "the run entered the completion hold");
     assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
-    assert.deepEqual(await finalizeFiles(root, claim.run_id), [], "retired: the api accepted the hold");
-    assert.deepEqual(outbox.listPendingFinalizes(), []);
+    assert.deepEqual(await finalizeFiles(root, claim.run_id), ["finalize-2.json"], "hold ACK alone is not classification");
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: claim.run_id, claim_generation: 2 }]);
   });
 
-  it("retires the record when a vault_locked deferral at finalize parks the run", async () => {
+  it("retains the record after a vault_locked park without absent-journal authority", async () => {
     const { root, outbox } = await outboxWithRoot();
     client.protocolFeatures = ["recovery_cause_vault_locked"];
     const claim = gitlabClaim(1752, { claim_generation: 2 });
@@ -397,8 +397,8 @@ describe("issue #1742 finalize hardening: runner retirement and crash cuts", () 
     assert.equal(deferred, true, "the deferral fired at the finalize fetch-back");
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
     assert.ok(statuses.includes("recovery_wait"), `the run parked: ${statuses.join(",")}`);
-    assert.deepEqual(await finalizeFiles(root, claim.run_id), [], "retired: the api accepted the vault park");
-    assert.deepEqual(outbox.listPendingFinalizes(), []);
+    assert.deepEqual(await finalizeFiles(root, claim.run_id), ["finalize-2.json"], "park ACK alone is not classification");
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: claim.run_id, claim_generation: 2 }]);
   });
 
   it("a cut at finalize quiescence carries the record: a restart loads it and the register offers it", async () => {

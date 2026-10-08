@@ -3,7 +3,7 @@
 -- or approval authority. Bound legacy text before transfer. Child metadata is
 -- optional after deletion, and usage is joined only through the same-owner child.
 SELECT cc.round, cc.verdict, cc.reason_class,
-    cc.findings, cc.checker_run_id, cc.checker_model, cc.checker_effort,
+    cc.findings, cc.checker_run_id, cc.checker_model, cc.checker_effort, cc.checker_model_source, cc.checker_effort_source,
     (checker.id IS NOT NULL)::boolean AS has_child,
     (usage.run_id IS NOT NULL)::boolean AS has_usage,
     COALESCE(usage.input_tokens, 0)::bigint AS input_tokens,
@@ -34,7 +34,7 @@ LEFT JOIN runs checker ON checker.id = cc.checker_run_id
     AND checker.target_run_id = lead.id AND checker.harness = cc.checker_harness
 LEFT JOIN run_usage_totals usage ON usage.run_id = checker.id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
-    AND lead.kind <> 'cross_check' AND cc.stage = 'plan' AND cc.round = 1
+    AND lead.kind <> 'cross_check' AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage)
     AND (cc.findings IS NULL OR octet_length(cc.findings::text) <= 65536)
     AND (cc.checker_model IS NULL OR octet_length(cc.checker_model) <= 512)
     AND (cc.checker_effort IS NULL OR octet_length(cc.checker_effort) <= 512)

@@ -38,7 +38,7 @@ func ownerRecoveryFixture() apitypes.RecoveryCustodyHoldsDTO {
 	old := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
 	newer := old.Add(time.Hour)
 	return apitypes.RecoveryCustodyHoldsDTO{
-		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 3, CustodyHoldLimit: 8, DecisionNeeded: 2, BlockedRuns: 1},
+		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 3, AdmissionCountedHolds: 2, CustodyHoldLimit: 8, DecisionNeeded: 2, BlockedRuns: 1},
 		Holds: []apitypes.RecoveryCustodyHoldDTO{
 			{ID: "hold-z", RunID: "run-z", Generation: 3, State: "open", Attention: "active",
 				WorkerID: "worker-z", CreatedAt: newer},
@@ -157,7 +157,7 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 		strings.Contains(out, "run-r") || strings.Contains(out, "run-d") {
 		t.Errorf("settled hold in human view: %q", out)
 	}
-	if !strings.Contains(out, "open_holds: 3  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
+	if !strings.Contains(out, "open_holds: 3  admission_counted_holds: 2  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
 		t.Errorf("aggregate absent: %q", out)
 	}
 	if !strings.Contains(out, "2 hold(s) await a decision") || !strings.Contains(out, "run discard <run-id> --hold <hold-id> --yes") {
@@ -181,6 +181,9 @@ func TestOwnerRecoveryJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(out, `"open_holds": 3`) || !strings.Contains(out, `"admission_counted_holds": 2`) {
+		t.Errorf("JSON missing distinct counts: %s", out)
+	}
 	if !reflect.DeepEqual(got, dto) {
 		t.Errorf("JSON changed owner DTO: got %+v, want %+v", got, dto)
 	}
@@ -196,7 +199,7 @@ func TestOwnerRecoveryEmptyAndNoHint(t *testing.T) {
 		}}
 		out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery")
 		if code != uzicli.ExitOK || !strings.Contains(out, "no open custody holds") ||
-			!strings.Contains(out, "open_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
+			!strings.Contains(out, "open_holds: 0  admission_counted_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
 			strings.Contains(out, "await a decision") || strings.Contains(out, "settled") {
 			t.Errorf("empty human view: code=%d output=%q", code, out)
 		}
@@ -249,7 +252,7 @@ func TestOwnerRecoverySanitizesCells(t *testing.T) {
 
 func recoveryHoldsFixture() apitypes.RecoveryCustodyHoldsDTO {
 	return apitypes.RecoveryCustodyHoldsDTO{
-		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 2, CustodyHoldLimit: 8, DecisionNeeded: 1, BlockedRuns: 0},
+		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 2, AdmissionCountedHolds: 1, CustodyHoldLimit: 8, DecisionNeeded: 1, BlockedRuns: 0},
 		Holds: []apitypes.RecoveryCustodyHoldDTO{
 			{ID: "hold-run1-gen1", RunID: "run1", Generation: 1, State: "open", Attention: "source_only",
 				WorkerID: "w1", WorkerName: "alpha", CaptureState: ""},
@@ -647,8 +650,8 @@ func TestRunDiscardConfirmEOFDeclines(t *testing.T) {
 }
 
 // TestOwnerRecoveryHintsSplitByArchive proves the owner listing offers `run export` only for
-// the archive_ready hold, discard for the source_only and needs_action holds (neither has an
-// archive, as the server never pairs those dispositions with one), and explains the
+// the archive-bearing fixture hold, discard for the source_only and needs_action fixtures
+// (neither has an archive in this listing), and explains the
 // source_only hold's missing archive with a custody line.
 func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 	dto := ownerRecoveryFixture()
@@ -673,9 +676,8 @@ func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 	}
 }
 
-// TestOwnerRecoveryHintsDefensiveDoubleCount deliberately pins a state the server never
-// emits (needs_action WITH an available archive): the CLI counts such a hold in both hints
-// rather than hiding either, so a server change surfaces instead of silently dropping one.
+// TestOwnerRecoveryHintsDefensiveDoubleCount pins independent decision and availability
+// facts: the CLI counts a needs_action hold with an available archive in both hints.
 func TestOwnerRecoveryHintsDefensiveDoubleCount(t *testing.T) {
 	dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
 		{ID: "hold-x", RunID: "run-x", Generation: 1, State: "open", Attention: "needs_action",
@@ -709,9 +711,8 @@ func TestOwnerRecoveryFoldsRunIDInCustodyPrefix(t *testing.T) {
 	}
 }
 
-// TestRecoveryHelpTiesExportToArchiveReady pins the help text's disposition guidance: export
-// belongs to archive_ready holds; source_only and needs_action holds await a discard decision.
-func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
+// TestRecoveryHelpSeparatesExportFromAttention pins availability-based export guidance.
+func TestRecoveryHelpSeparatesExportFromAttention(t *testing.T) {
 	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "recovery", "--help")
 	if code != uzicli.ExitOK {
 		t.Fatalf("help exit = %d", code)
@@ -719,6 +720,7 @@ func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
 	flat := strings.Join(strings.Fields(out), " ")
 	for _, want := range []string{
 		"An `archive_ready` hold has a recovery archive: recover it with `run export`",
+		"Archive availability is independent of attention: export an available archive even for a decision hold; it may not cover the latest work.",
 		"A `source_only` or `needs_action` hold retains local inventory and awaits your decision to discard it",
 		"`source_only` means the worker's local inventory remains in custody until a final disposition",
 		"For `source_only` and `needs_action` holds the retained source may be the only copy, so discarding one can destroy the work",
@@ -860,5 +862,39 @@ func TestSourceOnlyLineSanitizes(t *testing.T) {
 	}
 	if strings.ContainsAny(out, "\x1b\r\x07") || strings.Contains(out, "\nforged") {
 		t.Errorf("run view leaked hostile bytes: %q", out)
+	}
+}
+
+func TestSourceOnlyArchiveAndCaptureIndependent(t *testing.T) {
+	for _, state := range []string{"available", "preparing", "uploading"} {
+		t.Run(state, func(t *testing.T) {
+			h := apitypes.RecoveryCustodyHoldDTO{ID: "hold-exhausted", RunID: "run-exhausted", State: "open", Attention: "source_only", WorkerName: "worker", HasAvailableCapture: true, CaptureState: state}
+			out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "recovery", "--help")
+			if code != uzicli.ExitOK {
+				t.Fatalf("help exit = %d", code)
+			}
+			if !strings.Contains(out, "Archive availability is independent of attention") {
+				t.Fatalf("missing independent export help: %s", out)
+			}
+			dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{h}}
+			output, _, outputCode := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery")
+			if outputCode != uzicli.ExitOK || !strings.Contains(output, "1 hold(s) have a recovery archive") || !strings.Contains(output, "1 hold(s) await a decision") {
+				t.Fatalf("archive and decision hints must coexist: exit=%d output=%s", outputCode, output)
+			}
+			line := sourceOnlyLine(h)
+			if !strings.Contains(line, "recovery archive available to export") || !strings.Contains(line, "may not cover the latest") || !strings.Contains(line, "retained for your decision") || strings.Contains(line, "export unavailable") {
+				t.Fatalf("incorrect archive guidance: %s", line)
+			}
+			if state != "available" && !strings.Contains(line, "latest capture is "+state) {
+				t.Fatalf("missing capture progress: %s", line)
+			}
+			h.HasAvailableCapture = false
+			if state != "available" {
+				line = sourceOnlyLine(h)
+				if !strings.Contains(line, "no recovery archive available to export yet") || !strings.Contains(line, "latest capture is "+state) {
+					t.Fatalf("incorrect pending capture guidance: %s", line)
+				}
+			}
+		})
 	}
 }

@@ -46,14 +46,16 @@ function hold(over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
   };
 }
 
-function listing(holds: RecoveryCustodyHold[]): RecoveryCustodyHolds {
+function listing(holds: RecoveryCustodyHold[], over: Partial<RecoveryCustodyHolds["aggregate"]> = {}): RecoveryCustodyHolds {
   const open = holds.filter((h) => h.state === "open");
   return {
     aggregate: {
       open_holds: open.length,
+      admission_counted_holds: 0,
       custody_hold_limit: 8,
       decision_needed: open.filter((h) => h.attention === "source_only" || h.attention === "needs_action").length,
       blocked_runs: 0,
+      ...over,
     },
     holds,
   };
@@ -74,6 +76,88 @@ async function renderSurface(resp: RecoveryCustodyHolds) {
 }
 
 describe("RecoveryHoldsSurface", () => {
+  it.each(["available", "preparing", "uploading"])("links source-only export to the run archive section with latest capture %s", async (capture_state) => {
+    await renderSurface(listing([hold({ attention: "source_only", run_id: "run-exhausted", has_available_capture: true, capture_state })]));
+    const row = screen.getByText("Decision required").closest("li")!;
+    expect(within(row).getByRole("link", { name: /Export archive/ }).getAttribute("href")).toBe("/runs/run-exhausted#recovery-archives");
+    expect(within(row).getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+    expect(within(row).getByText(/may not cover the latest worker-local work/)).toBeTruthy();
+    if (capture_state !== "available") expect(within(row).getByText(new RegExp(`latest capture is ${capture_state}`))).toBeTruthy();
+    expect(within(row).queryByText(/releasing automatically/)).toBeNull();
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
+  it.each(["preparing", "uploading"])("shows source-only capture %s without export when no archive exists", async (capture_state) => {
+    await renderSurface(listing([hold({ attention: "source_only", capture_state })]));
+    expect(screen.getByText(/No server archive is available to download yet/)).toBeTruthy();
+    expect(screen.getByText("Decision required")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Export archive/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+  });
+
+  it.each(["available", "preparing", "uploading"])("qualifies source-only discard confirmation when an archive exists and latest capture is %s", async (capture_state) => {
+    await renderSurface(listing([hold({
+      id: "h-src", run_id: "run-xyz", worker_name: "jvm-worker", generation: 4,
+      attention: "source_only", has_available_capture: true, capture_state,
+    })]));
+    fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
+    const group = screen.getByRole("group", { name: "Discard held work for run run-xyz on jvm-worker, generation 4" });
+    const warning = document.getElementById(group.getAttribute("aria-describedby")!)!;
+    expect(warning.textContent).toContain("An earlier available archive can restore older work but may not cover the latest worker-local work.");
+    expect(warning.textContent).toContain("The latest worker-local source may be the only copy.");
+    expect(warning.textContent).not.toContain("no server archive can restore it");
+    expect(warning.textContent).toContain("hold h-src");
+    expect(warning.textContent).toContain("torn down, which can destroy this work permanently");
+    expect(warning.textContent).toContain("This cannot be undone.");
+    expect(document.activeElement).toBe(group);
+    expect((within(group).getByRole("button", { name: /Discard held work/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "preparing", "uploading"])("keeps the strong no-archive discard warning with latest capture %s", async (capture_state) => {
+    await renderSurface(listing([hold({ attention: "source_only", capture_state })]));
+    expect(screen.queryByRole("link", { name: /Export archive/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
+    const group = screen.getByRole("group", { name: /Discard held work/ });
+    const warning = document.getElementById(group.getAttribute("aria-describedby")!)!;
+    expect(warning.textContent).toMatch(/worker-local source may be the\s+only copy — no server archive can restore it/);
+    expect(warning.textContent).not.toContain("An earlier available archive");
+    expect(warning.textContent).toContain("torn down, which can destroy this work permanently");
+    expect(warning.textContent).toMatch(/This cannot be\s+undone\./);
+    expect((within(group).getByRole("button", { name: /Discard held work/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [8, undefined, 8, 8],
+    [8, 0, 8, 0],
+    [12, 3, 8, 3],
+    [12, 8, 8, 8],
+    [12, 8, 0, 8],
+    [12, 8, -1, 8],
+  ])("renders total %s and capacity %s with limit %s independently", async (open_holds, admission_counted_holds, custody_hold_limit, used) => {
+    const resp = listing([hold({ attention: "source_only" })], {
+      open_holds, admission_counted_holds, custody_hold_limit,
+    });
+    if (admission_counted_holds === undefined) delete resp.aggregate.admission_counted_holds;
+    await renderSurface(resp);
+    expect(screen.getByText(`${used} / ${custody_hold_limit}`)).toBeTruthy();
+    expect(screen.getByText(/open custody holds/).textContent).toContain(`${open_holds} open custody holds`);
+    expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+  });
+
+  it("uses aggregate capacity for an older counted hold whose attention is still active", async () => {
+    await renderSurface(listing([
+      hold({ id: "older", attention: "active", terminal_record_rejection: "mac_failure" }),
+      hold({ id: "newer", attention: "active" }),
+    ], { admission_counted_holds: 1 }));
+    expect(screen.getByText("1 / 8")).toBeTruthy();
+    expect(screen.getByText(/open custody holds/).textContent).toContain("2 open custody holds");
+    expect(screen.getByText("Active protection")).toBeTruthy();
+    expect(screen.queryByText(/need a decision|to resolve/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Discard held work/ })).toBeNull();
+  });
+
   it("shows fixed rejection separately on the exact source-only generation without export", async () => {
     await renderSurface(listing([
       hold({ id: "hold-gen7", run_id: "run-one", generation: 7, attention: "source_only", terminal_record_rejection: "mac_failure" }),
@@ -117,7 +201,7 @@ describe("RecoveryHoldsSurface", () => {
     expect(within(row).queryByRole("button", { name: /Discard held work/ })).toBeNull();
     expect(screen.queryByText("gen 8")).toBeNull();
     expect(document.body.textContent).not.toContain("unknown MAC failure");
-    expect(screen.getByText("2 / 8")).toBeTruthy();
+    expect(screen.getByText("0 / 8")).toBeTruthy();
     expect(screen.queryByText(/need a decision|to resolve/)).toBeNull();
     expect(mockApi.discardHold).not.toHaveBeenCalled();
   });

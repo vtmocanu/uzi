@@ -33,10 +33,12 @@ func (f *supersedeFix) reconcileAttempts(t *testing.T, svc *Service) {
 	}
 }
 
-// recordAttempt writes an outstanding attempt of the old run at tip, as pushOnce does.
+// recordAttempt intentionally seeds unconditional historical attempt evidence.
 func (f *supersedeFix) recordAttempt(t *testing.T, tip string) uuid.UUID {
 	t.Helper()
-	id, err := f.svc1.recordPublishAttempt(f.e.ctx, f.oldRun, f.branch, f.branchRef, tip)
+	id, err := f.e.q.RecordCheckpointPublishAttempt(f.e.ctx, store.RecordCheckpointPublishAttemptParams{
+		RunID: f.oldRun, Branch: f.branch, Ref: f.branchRef, Tip: tip,
+	})
 	if err != nil || id == uuid.Nil {
 		t.Fatalf("recordPublishAttempt: id %v err %v", id, err)
 	}
@@ -250,6 +252,16 @@ func (s failingStore) RecordCheckpointPublishAttempt(ctx context.Context, arg st
 		time.Sleep(s.recordDelay)
 	}
 	return s.Store.RecordCheckpointPublishAttempt(ctx, arg)
+}
+
+func (s failingStore) RecordLiveCheckpointPublishAttempt(ctx context.Context, arg store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error) {
+	if s.recordAttempt {
+		return uuid.Nil, errInjected
+	}
+	if s.recordDelay > 0 {
+		time.Sleep(s.recordDelay)
+	}
+	return s.Store.RecordLiveCheckpointPublishAttempt(ctx, arg)
 }
 
 func (s failingStore) CheckpointTipClaimedByOtherRun(ctx context.Context, arg store.CheckpointTipClaimedByOtherRunParams) (bool, error) {

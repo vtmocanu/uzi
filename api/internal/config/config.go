@@ -398,12 +398,13 @@ type Config struct {
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
-	PlanCrossCheckTimeout time.Duration // bounded checker wall-clock budget
-	RunTimeout            time.Duration // base wall clock before a running run parks at budget_exhausted
-	RunWallCeiling        time.Duration // server-enforced ceiling on scaled and handoff wall budgets
-	RunIdleTimeout        time.Duration // worker-side no-message idle cap
-	WorkerTaskIdleTimeout time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
-	RunMaxIterations      int           // implement⇄review loop cap (worker-side)
+	PlanCrossCheckMaxRevisions int32
+	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget
+	RunTimeout                 time.Duration // base wall clock before a running run parks at budget_exhausted
+	RunWallCeiling             time.Duration // server-enforced ceiling on scaled and handoff wall budgets
+	RunIdleTimeout             time.Duration // worker-side no-message idle cap
+	WorkerTaskIdleTimeout      time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
+	RunMaxIterations           int           // implement⇄review loop cap (worker-side)
 	// HandoffRunTimeout / HandoffRunMaxIterations (issue #785) are the dedicated default
 	// wall-clock budget and iteration cap for a NON-interactive `uzi handoff` task run.
 	// Decoupled from RunTimeout / RunMaxIterations so raising one does not move the other.
@@ -411,16 +412,16 @@ type Config struct {
 	HandoffRunTimeout       time.Duration // non-interactive handoff wall-clock budget
 	HandoffRunMaxIterations int           // non-interactive handoff implement⇄review loop cap
 	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
-	QuestionMax             int           // PRD #88 clarification-question cap per run (worker-enforced)
+	QuestionMax             int           // PRD #88 clarification-question cap per execute() attempt (worker-enforced)
 	QuestionTimeoutSeconds  int           // PRD #88 answer deadline before a parked run fails (worker-enforced)
 	// CompletionHoldWindowSeconds (PRD #1226 M5, D6) is the live owner-continue window a
 	// completion-blocked run waits before it parks: the worker's completion-question timer uses
 	// it INSTEAD of QuestionTimeoutSeconds for the completion hold. Shipped in the claim like the
 	// other worker-enforced timers. Default 900s.
 	CompletionHoldWindowSeconds int
-	RunMaxRequeues              int           // worker-death re-queues allowed before a run is failed
+	RunMaxRequeues              int           // automatic worker-death requeues allowed per owner recovery episode (zero disables automatic requeues)
 	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
-	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + eligible runs re-queued within episode allowance, else held or failed by recorded state
 	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
 	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	// SweeperBootGrace (PRD #1390 M1, D1): the three stale-worker passes
@@ -1058,6 +1059,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("RUN_WALL_CEILING must be at least 1s, at least RUN_TIMEOUT, and at most 72h")
 		}
 	}
+	cfg.PlanCrossCheckMaxRevisions = DefaultPlanCrossCheckMaxRevisions
+	if raw, present := os.LookupEnv("PLAN_CROSS_CHECK_MAX_REVISIONS"); present {
+		value, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || value < 0 || value > int64(MaxPlanCrossCheckMaxRevisions) {
+			return Config{}, fmt.Errorf("PLAN_CROSS_CHECK_MAX_REVISIONS must be an integer from 0 to %d", MaxPlanCrossCheckMaxRevisions)
+		}
+		cfg.PlanCrossCheckMaxRevisions = int32(value)
+	}
 	cfg.PlanCrossCheckTimeout = 30 * time.Minute
 	if cfg.RunTimeout > 0 && cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
 		// An install with a short RUN_TIMEOUT and no explicit checker timeout must
@@ -1079,7 +1088,8 @@ func Load() (Config, error) {
 	// the claim (like RunIdleTimeout). Shorter than chat's 60m because a parked task pins
 	// a git clone/HOME + worker slot; on idle the worker gracefully finalizes (push, MR
 	// iff open_mr) → completed. There is deliberately NO server-side park-age sweep: a
-	// dead-worker park is recovered by the existing stale-worker requeue (M2), not a new
+	// dead-worker park follows stale-worker recovery (episode requeue or recorded-state
+	// owner hold/worker_lost failure), not a new
 	// TASK_IDLE_TIMEOUT completing a run the server cannot push.
 	cfg.WorkerTaskIdleTimeout = parseDuration("WORKER_TASK_IDLE_TIMEOUT", 30*time.Minute)
 	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
@@ -1088,6 +1098,10 @@ func Load() (Config, error) {
 	cfg.HandoffRunTimeout = parseDuration("HANDOFF_RUN_TIMEOUT", 4*time.Hour)
 	cfg.HandoffRunMaxIterations = parseInt("HANDOFF_RUN_MAX_ITERATIONS", 10)
 	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
+	// Fresh execute() resets worker-memory question budgets, including ordinary
+	// transient/limit/credential redispatch within the same recovery episode.
+	// RUN_MAX_REQUEUES bounds charged worker-death retries, not total attempts
+	// or questions per episode or lifetime; this introduces no runtime budget.
 	cfg.QuestionMax = parseInt("QUESTION_MAX", 5)
 	cfg.QuestionTimeoutSeconds = parseInt("QUESTION_TIMEOUT_SECONDS", 86400)
 	// PRD #1226 M5 (D6): the completion-hold owner-continue window, default 900s.
@@ -1168,8 +1182,8 @@ func Load() (Config, error) {
 
 	// PRD #35. parseNonNegInt, so RUN_LIMIT_MAX_WAITS=0 is legal and means "never
 	// park" — the deliberate off switch for an operator who wants today's
-	// fail-immediately behaviour, matching how RUN_MAX_REQUEUES=0 means "never
-	// re-queue".
+	// fail-immediately behaviour. RUN_MAX_REQUEUES=0 similarly disables automatic
+	// requeues, but still permits an explicit owner resume attempt from exhaustion.
 	cfg.RunLimitMaxWaits = parseNonNegInt("RUN_LIMIT_MAX_WAITS", 5)
 	cfg.RunLimitMaxPark = parseDuration("RUN_LIMIT_MAX_PARK", 8*24*time.Hour)
 
@@ -2256,7 +2270,8 @@ func parseNonNegDuration(key string, def time.Duration) time.Duration {
 }
 
 // parseNonNegInt is parseInt but accepts 0 (a legitimate value for e.g.
-// RUN_MAX_REQUEUES, meaning "never re-queue"). A negative or malformed value
+// RUN_MAX_REQUEUES, meaning "no automatic requeues"; an explicit owner resume
+// attempt remains allowed from exhaustion). A negative or malformed value
 // falls back to def.
 func parseNonNegInt(key string, def int) int {
 	raw := strings.TrimSpace(os.Getenv(key))

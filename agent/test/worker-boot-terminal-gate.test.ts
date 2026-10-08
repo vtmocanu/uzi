@@ -28,7 +28,7 @@ const RUN2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
 const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
 const noReview = { execute: async () => {} } as unknown as ReviewRunner;
-const idleRunner = { resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
+const idleRunner = { recoveryInventoryPending: async () => false, resumePendingRecoveries: async () => {}, execute: async () => {} } as unknown as RunRunner;
 const idleChat = { execute: async () => {} } as unknown as ChatRunner;
 const okPreflight = (): { ok: boolean; missing: string[] } => ({ ok: true, missing: [] });
 
@@ -80,6 +80,7 @@ interface FakeClientHooks {
 function fakeClient(hooks: FakeClientHooks = {}): WorkerClient {
   return {
     register: async () => ({}),
+    getRunOwnership: async () => ({ status: "completed", claim_generation: Number.MAX_SAFE_INTEGER }),
     heartbeat: hooks.heartbeat ?? (async () => {}),
     reportState: hooks.reportState ?? (async () => ({ applied: true, status: "completed" }) as StateAck),
     claimRun: hooks.claimRun ?? (async (): Promise<ClaimResponse | null> => null),
@@ -100,6 +101,25 @@ async function pollUntil(pred: () => boolean, ms: number, label: string): Promis
 }
 
 describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
+  it("boot terminal G2 settlement checks G1 custody separately before exact finalize retirement", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalTerminal(RUN, 2, "running", 0, { status: "completed" });
+    await outbox.journalFinalize(RUN, 1);
+    await outbox.journalFinalize(RUN, 2);
+    const checked: number[] = [];
+    const worker = new Worker(fakeConfig(), fakeClient(), {
+      recoveryInventoryPending: async (_runId: string, generation: number) => {
+        checked.push(generation);
+        return generation === 1;
+      },
+    } as unknown as RunRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight, outbox);
+    await (worker as unknown as { resolveBootTerminals(signal: AbortSignal): Promise<void> })
+      .resolveBootTerminals(new AbortController().signal);
+    assert.equal(outbox.hasPendingTerminal(RUN, 2), false);
+    assert.deepEqual(checked.sort(), [1, 2]);
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN, claim_generation: 1 }]);
+  });
+
   it("heartbeat starts FIRST; the claim loop does not start until the pending terminal is resolved", async () => {
     const outbox = await mkOutbox();
     await outbox.journalTerminal(RUN, 4, "running", 0, { status: "completed" });
@@ -178,7 +198,8 @@ describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
     const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
     const controller = new AbortController();
     const worker = new Worker(
-      fakeConfig(), fakeClient(), idleRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight,
+      fakeConfig(), Object.assign(fakeClient(), { getRunOwnership: async () => ({ status: "completed", claim_generation: 4 }) }),
+      idleRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight,
       outbox, new Map(), registry,
     );
     const done = worker.run(controller.signal);

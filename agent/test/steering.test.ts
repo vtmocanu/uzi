@@ -51,6 +51,39 @@ function makeChannel(batches: UserInput[][], cancel = new AbortController()): { 
   return { ch, cancel };
 }
 
+describe("#2493 terminal lifecycle", () => {
+  it("identity survives pause rearm and recoverable switch; terminal abort keeps first reason", () => {
+    const { ch } = makeChannel([[]]);
+    const signal = ch.terminalLifecycleSignal();
+    ch.abortLifecycle(new PauseNowSignal(), false);
+    ch.rearmLifecycle();
+    assert.equal(ch.terminalLifecycleSignal(), signal);
+    assert.equal(signal.aborted, false, "owner/wall pause must not poison terminal signal");
+    ch.abortLifecycle(new CredentialSwitchSignal(), false);
+    ch.rearmLifecycle();
+    assert.equal(ch.terminalLifecycleSignal(), signal);
+    assert.equal(signal.aborted, false, "recoverable switch must not poison terminal signal");
+    ch.requestDiskStop();
+    assert.equal(signal.aborted, false, "disk pause must not poison terminal signal");
+    const reason = new Error("terminal fixture");
+    ch.abortLifecycle(reason);
+    ch.abortLifecycle(new Error("later reason"));
+    ch.rearmLifecycle();
+    assert.equal(ch.terminalLifecycleSignal(), signal);
+    assert.equal(signal.reason, reason, "terminal abort preserves first reason");
+  });
+
+  it("production owner cancel aborts stable terminal signal after pause", async () => {
+    const { ch } = makeChannel([[inp("pause", "now")], [inp("pause_cancel")], [inp("cancel")]]);
+    const terminal = ch.terminalLifecycleSignal();
+    ch.start();
+    for (let n = 0; n < 300 && !ch.isCancelled(); n++) await tick();
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(terminal.aborted, true, "cancel writer aborts terminal signal");
+    await ch.stop();
+  });
+});
+
 describe("SteeringChannel", () => {
   it("resolves the gate verdict on approve_plan", async () => {
     const { ch } = makeChannel([[inp("approve_plan")]]);
@@ -1496,7 +1529,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("ends the flight on a released or stale claim, from a 200 or a 409 receipt", async () => {
+  it("#2493 ends the flight on a released or stale claim, from a 200 or a 409 receipt", async () => {
     for (const reason of ["released", "stale"]) {
       for (const via of ["200", "409"]) {
         const row: UserInput = { id: 7, kind: "approve_plan", body: null };
@@ -1511,10 +1544,17 @@ describe("input receipts", () => {
           applyInputs: async () => { throw Error("a fenced batch must not apply"); },
         } as unknown as WorkerClient;
         const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+        ch.abortLifecycle(new PauseNowSignal(), false);
+        ch.rearmLifecycle();
+        const terminal = ch.terminalLifecycleSignal();
         const gate = ch.awaitVerdict();
         ch.start();
         try {
           await assert.rejects(gate, (err: Error) => err.name === "ClaimFencedSignal", `${reason} via ${via}`);
+          assert.equal(terminal.aborted, true);
+          assert.equal((terminal.reason as Error).name, "ClaimFencedSignal");
+          ch.rearmLifecycle();
+          assert.equal(ch.terminalLifecycleSignal(), terminal);
           assert.strictEqual((cancel.signal.reason as Error).name, "ClaimFencedSignal");
           assert.strictEqual(ch.isCancelled(), false, "the fenced batch's inputs were not routed");
           await assert.rejects(ch.awaitFollowUp(100_000), (err: Error) => err.name === "ClaimFencedSignal", "a later park fails at once");
@@ -1553,7 +1593,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("fails a waiting state report and later parks when APPLIED keeps failing on the active claim", async () => {
+  it("#2493 fails a waiting state report and later parks when APPLIED keeps failing on the active claim", async () => {
     for (const kind of ["approve_plan", "follow_up"] as const) {
       const row: UserInput = { id: 7, kind, body: kind === "follow_up" ? "seven" : null };
       let applies = 0;
@@ -1563,6 +1603,9 @@ describe("input receipts", () => {
         applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
       } as unknown as WorkerClient;
       const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+      ch.abortLifecycle(new PauseNowSignal(), false);
+      ch.rearmLifecycle();
+      const terminal = ch.terminalLifecycleSignal();
       ch.start();
       try {
         // The routed input reaches the executor, which then reports the resume.
@@ -1571,6 +1614,12 @@ describe("input receipts", () => {
         await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError",
           "the guarded report never goes out as if the input were applied");
         assert.strictEqual(applies, 30, "bounded on the active claim");
+        assert.equal(terminal.aborted, true);
+        assert.equal((terminal.reason as Error).name, "InputReceiptError");
+        const reason = terminal.reason;
+        ch.rearmLifecycle();
+        assert.equal(ch.terminalLifecycleSignal(), terminal);
+        assert.equal(terminal.reason, reason);
         await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError");
         await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "InputReceiptError");
       } finally {

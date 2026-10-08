@@ -1636,13 +1636,30 @@ const server = https.createServer(
         return send(res, 200, state.labelEvents[Number(labelEvents[1])] || []);
       }
 
-      // Issue notes (comments). POST records the autopilot pre-run / terminal
-      // comment; the harness reads them back via /_e2e/state to assert exactly-once.
+      // Issue notes: GET supplies the input-assessment thread; POST records the
+      // bot's pre-run / terminal comments (also inspected via /_e2e/state).
       const notesRoute = rest.match(/^\/issues\/(\d+)\/notes$/);
+      if (method === "GET" && notesRoute) {
+        const iid = Number(notesRoute[1]);
+        const notes = state.notes.filter((n) => n.project_id === project.id && n.issue_iid === iid)
+          .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id - b.id);
+        if (url.searchParams.get("sort") !== "asc") notes.reverse();
+        const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
+        const perPage = Math.max(1, Number(url.searchParams.get("per_page")) || 20);
+        const totalPages = Math.max(1, Math.ceil(notes.length / perPage));
+        res.setHeader("X-Page", String(page));
+        res.setHeader("X-Per-Page", String(perPage));
+        res.setHeader("X-Total", String(notes.length));
+        res.setHeader("X-Total-Pages", String(totalPages));
+        res.setHeader("X-Next-Page", page < totalPages ? String(page + 1) : "");
+        return send(res, 200, notes.slice((page - 1) * perPage, page * perPage));
+      }
       if (method === "POST" && notesRoute) {
         const body = await readBody(req);
         const iid = Number(notesRoute[1]);
-        const note = { id: state.nextNoteId++, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString() };
+        const note = { id: state.nextNoteId++, project_id: project.id, issue_iid: iid,
+          body: body.body || "", created_at: new Date().toISOString(),
+          system: false, author: { id: 1, username: "uzi-bot" } };
         state.notes.push(note);
         persist();
         log("note on issue", iid, JSON.stringify((body.body || "").slice(0, 72)));

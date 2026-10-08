@@ -116,6 +116,19 @@ func TestPlanCrossCheckClaimBounds(t *testing.T) {
 	if _, err := crossCheckClaimInput(row); err != nil {
 		t.Fatal(err)
 	}
+	roundTwo := row
+	roundTwo.Round, roundTwo.AutomaticRoundsEnabled, roundTwo.AutomaticRevisionLimit = 2, true, 2
+	if _, err := crossCheckClaimInput(roundTwo); err != nil {
+		t.Fatalf("admitted round 2 refused: %v", err)
+	}
+	roundTwo.AutomaticRoundsEnabled = false
+	if _, err := crossCheckClaimInput(roundTwo); !errors.Is(err, ErrCrossCheckRefused) {
+		t.Fatalf("round 2 without snapshot accepted: %v", err)
+	}
+	roundTwo.AutomaticRoundsEnabled, roundTwo.AutomaticRevisionLimit = true, 0
+	if _, err := crossCheckClaimInput(roundTwo); !errors.Is(err, ErrCrossCheckRefused) {
+		t.Fatalf("round 2 beyond snapshot accepted: %v", err)
+	}
 	for _, tc := range []struct {
 		name   string
 		mutate func(*store.CrossCheck)

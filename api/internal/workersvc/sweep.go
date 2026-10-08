@@ -187,12 +187,17 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		if err != nil {
 			return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
 		}
-		res.StaleFailed = int64(len(failed))
+		res.StaleFailed = 0
 		for _, r := range failed {
+			if r.Status == "failed" {
+				res.StaleFailed++
+			}
 			s.publishSwept(r.ID, r.Status)
 			// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
 			// is committed-terminal and worth judging. Best-effort, gated inside.
-			s.maybeEnqueueJudgeByID(ctx, r.ID)
+			if r.Status == "failed" {
+				s.maybeEnqueueJudgeByID(ctx, r.ID)
+			}
 		}
 
 		requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{

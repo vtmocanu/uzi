@@ -37,6 +37,7 @@
 # `schedule get --json | .last_fire == null` as a POSITIVE control of Decision 3, so a
 # future refactor that routes RunNow through advance() reddens here, not silently.
 say "PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip)"
+trap 'if [ "$?" -ne 0 ]; then inventory_diagnostic_snapshot || true; fi' EXIT
 
 # --- catalog enable is idempotent -------------------------------------------
 # --create-missing-labels POSTs the selector label to the forge. On the gitlab lane the
@@ -84,6 +85,14 @@ pass "1st fire: matched=1, ineligible_matched=1, started=1 on A #$IID_A, B #$IID
 
 RUN_A="$(echo "$RN1" | jq -r '.started[0].run_id')"
 { [ -n "$RUN_A" ] && [ "$RUN_A" != null ]; } || fail "1st fire: no run_id for the started run: $RN1"
+assert_sweep_auto_approval() {
+  local run_json
+  run_json="$(apiget "/api/runs/$1")"
+  echo "$run_json" | jq -e '.run.auto_approve == true and ((.run.auto_approve_blocked_reasons // []) | length) == 0' >/dev/null \
+    || fail "sweep run $1 lost auto-approval: $(echo "$run_json" | jq -c '.run | {auto_approve, auto_approve_blocked_reasons}'); inspect forge-fake.log for unhandled assessment routes"
+}
+assert_sweep_auto_approval "$RUN_A"
+pass "A's swept run retained auto-approval with no blocked reasons"
 wait_status "$RUN_A" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 RUN_A_JSON="$(apiget "/api/runs/$RUN_A")"
 BR_A="$(echo "$RUN_A_JSON" | jq -r '.run.branch // empty')"
@@ -153,6 +162,7 @@ pass "2nd fire: B #$IID_B now started; A #$IID_A skipped (open_mr_exists/already
 
 RUN_B="$(echo "$RN2" | jq -r '.started[0].run_id')"
 { [ -n "$RUN_B" ] && [ "$RUN_B" != null ]; } || fail "2nd fire: no run_id for the started run: $RN2"
+assert_sweep_auto_approval "$RUN_B"
 wait_status "$RUN_B" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "B's swept run $RUN_B completed through the stub"
 

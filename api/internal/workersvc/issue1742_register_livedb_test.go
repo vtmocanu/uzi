@@ -27,8 +27,8 @@ func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 		preseedLeaseGen int64
 	}{
 		{
-			name:       "absent register snapshot fails as worker lost",
-			wantStatus: "failed", wantOrigin: "worker_lost",
+			name:       "absent register snapshot parks unresolved custody",
+			wantStatus: "recovery_wait",
 		},
 		{
 			name: "valid worker register overflow snapshot preserves run",
@@ -45,15 +45,15 @@ func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 		{
 			name:            "wrong-generation terminal lease cannot protect run without register snapshot",
 			preseedLeaseGen: 2,
-			wantStatus:      "failed", wantOrigin: "worker_lost", wantLease: true,
+			wantStatus:      "recovery_wait", wantLease: true,
 		},
 		{
-			name: "invalid register snapshot is ignored and orphan pass fails worker lost",
+			name: "invalid register snapshot is ignored and unresolved custody parks",
 			snapshot: func(run uuid.UUID) *ActiveSnapshot {
 				return &ActiveSnapshot{SnapshotEpoch: 0, PendingOverflow: true,
 					Active: []ActiveRunEntry{entry(run, 1, "invalid_phase", true)}}
 			},
-			wantStatus: "failed", wantOrigin: "worker_lost",
+			wantStatus: "recovery_wait",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,6 +90,15 @@ func TestRegisterPendingOutcomeClassificationLiveDB(t *testing.T) {
 			}
 			if origin := failOriginOf(t, env, runID); origin != tc.wantOrigin {
 				t.Fatalf("fail origin = %q, want %q", origin, tc.wantOrigin)
+			}
+			if status == "recovery_wait" {
+				var parked bool
+				if err := env.pool.QueryRow(env.ctx, `SELECT recovery_wait_cause='worker_requeue_exhausted'
+					AND fail_origin IS NULL AND failure_reason IS NULL AND finished_at IS NULL
+					AND claim_released_at IS NOT NULL AND (worker_recovery_evidence->>'custody_uncertain')::boolean
+					FROM runs WHERE id=$1`, runID).Scan(&parked); err != nil || !parked {
+					t.Fatalf("invalid exhaustion hold: parked=%t err=%v", parked, err)
+				}
 			}
 			lease, ok := readActiveRun(t, env, workerID, runID)
 			if ok != tc.wantLease {

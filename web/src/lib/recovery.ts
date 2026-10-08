@@ -184,15 +184,21 @@ export interface CustodyAlertView {
 //
 // SELF-HIDES unless there is an open hold AND a decision, a blocked run, or capacity
 // reached against a positive limit. Healthy protection below capacity stays hidden.
-// Capacity currently uses open_holds; custodyAlertView does not reclassify admission holds.
+// Admission counts come from the server; total open custody remains separate.
 // Danger requires blocked_runs > 0, even below capacity. All other visible states warn.
 // Headlines prioritize blocked runs, then decisions, then capacity alone.
+// Older servers omit admission_counted_holds; explicit zero is meaningful.
+export function recoveryCapacityUsed(agg: RecoveryCustodyAggregate): number {
+  return agg.admission_counted_holds ?? agg.open_holds;
+}
+
 export function custodyAlertView(
   agg: RecoveryCustodyAggregate,
   recoveryWaitCount: number,
 ): CustodyAlertView | null {
+  const capacityUsed = recoveryCapacityUsed(agg);
   const atLimit =
-    agg.custody_hold_limit > 0 && agg.open_holds >= agg.custody_hold_limit;
+    agg.custody_hold_limit > 0 && capacityUsed >= agg.custody_hold_limit;
   const show =
     agg.open_holds > 0 &&
     (agg.decision_needed > 0 || agg.blocked_runs > 0 || atLimit);
@@ -200,8 +206,8 @@ export function custodyAlertView(
   return {
     tone: agg.blocked_runs > 0 ? "danger" : "warning",
     atLimit,
-    slotsLabel: `${agg.open_holds} / ${agg.custody_hold_limit} custody slots used`,
-    slotsUsed: agg.open_holds,
+    slotsLabel: `${capacityUsed} / ${agg.custody_hold_limit} custody slots used`,
+    slotsUsed: capacityUsed,
     slotsLimit: agg.custody_hold_limit,
     decisionNeeded: agg.decision_needed,
     blockedRuns: agg.blocked_runs,
@@ -253,7 +259,7 @@ export interface CustodyHoldView {
   // active protection or archive-ready/release-pending.
   needsDecision: boolean;
   // Ordered action set for this hold. The strongest verb (discard) only appears where the
-  // worker-local source may be the only copy (no available archive).
+  // worker-local source may contain work absent from any available archive.
   actions: CustodyHoldAction[];
   // Where the run's retained published checkpoint currently lives on the forge (PRD #1810),
   // or null when nothing is retained (checkpoint_ref absent/empty).
@@ -373,12 +379,19 @@ function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkp
         group: "attention",
         tone: "warning",
         stateLabel: "Decision required",
-        summary: hold.inventory_guarded && hasArchive
-          ? "An earlier recovery archive is available, but final inventory coverage is pending. The worker retains committed work that may be absent from that archive."
-          : "No server archive exists. The worker-local source may be the only copy — export is not possible, so choose whether to discard it.",
+        summary: (hasArchive
+          ? hold.inventory_guarded
+            ? "An earlier recovery archive is available, but final inventory coverage is pending. The worker retains committed work that may be absent from that archive."
+            : "A recovery archive is available to download, but it may not cover the latest worker-local work. Custody remains open for your decision."
+          : hold.capture_state === "preparing" || hold.capture_state === "uploading"
+            ? "No server archive is available to download yet. The worker-local source may be the only copy; custody remains open for your decision."
+            : "No server archive exists. The worker-local source may be the only copy — export is not possible, so choose whether to discard it.") +
+          (hold.capture_state === "preparing" || hold.capture_state === "uploading"
+            ? ` The latest capture is ${hold.capture_state}; its coverage is not yet verified.`
+            : ""),
         autoReleasing: false,
         needsDecision: true,
-        actions: ["discard"],
+        actions: hasArchive && !hold.inventory_guarded ? ["export", "discard"] : ["discard"],
       };
     case "released":
     case "discarded":

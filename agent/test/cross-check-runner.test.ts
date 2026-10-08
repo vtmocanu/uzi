@@ -126,12 +126,22 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 
-for (const mode of ["approve", "invalidfinding"] as const) {
-it("outer checker uses real Read broker, actual HTTP verdict delivery and journaled child completion: " + mode, async () => {
- const expectedVerdict = mode === "approve" ? "approve" : "failed";
- const expectedReason = mode === "approve" ? "approve" : "malformed";
- const expectedStatus = mode === "approve" ? "completed" : "failed";
- const assistantText = mode === "approve" ? verdict : JSON.stringify({
+for (const round of [1, 2]) for (const mode of ["approve", "approve-round2", "approve-pinned", "invalidfinding", "rejection", "terminal-rejection", "legacy-rejection", "default-rejection", "unrelated-rejection", "activity-rejection", "cleanup-rejection", "invalid-effort"] as const) {
+ if (round === 2 && mode === "approve-round2") continue;
+it("outer checker uses real Read broker, actual HTTP verdict delivery and journaled child completion: " + mode + " round " + (mode === "approve-round2" ? 2 : round), async () => {
+ const approves = mode === "approve" || mode === "approve-round2" || mode === "approve-pinned";
+ const expectedVerdict = approves ? "approve" : "failed";
+ const expectedReason = approves ? "approve" : mode === "invalidfinding" ? "malformed"
+  : ["legacy-rejection", "default-rejection", "unrelated-rejection", "activity-rejection"].includes(mode) ? "model_error"
+  : mode === "cleanup-rejection" ? "confinement_failed" : "checker_unavailable";
+ const modelRejection = {
+  message: JSON.stringify({ error: { message: "SYNTHETIC model rejection marker B",
+   type: "invalid_request_error", param: "model", code: "model_not_found" } }),
+  codexErrorInfo: "other", additionalDetails: null, misalignment: null,
+ };
+ const rejected = !approves && mode !== "invalidfinding";
+ const expectedStatus = approves ? "completed" : "failed";
+ const assistantText = approves ? verdict : JSON.stringify({
   verdict: "approve", summary: "Anchors checked",
   items: [{ file: "anchor.ts", severity: "invalid", summary: "Finding", rationale: "Read anchor" }],
  });
@@ -142,8 +152,19 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
  const registry = new ActiveRunRegistry();
  const posts: { url: string; body: any }[] = [];
  const r = rig({
-  notes: (emit) => emit({ id: 90, method: "item/tool/call", params: {
-   threadId: "thread", turnId: "turn", callId: "read", tool: "Read", arguments: { path: "anchor.ts" } } }),
+  failDispose: mode === "cleanup-rejection",
+  notes: (emit) => {
+   if (rejected) {
+    if (mode === "activity-rejection") emit({ method: "item/reasoning/textDelta", params: {
+     threadId: "thread", turnId: "turn", itemId: "reasoning", delta: "Checking anchors" } });
+    const error = mode === "unrelated-rejection" ? { ...modelRejection, codexErrorInfo: "unauthorized" } : modelRejection;
+    if (mode === "terminal-rejection") emit({ method: "turn/completed", params: {
+     threadId: "thread", turn: { id: "turn", items: [], status: "failed", error: modelRejection } } });
+    else emit({ method: "error", params: { threadId: "thread", turnId: "turn", willRetry: false, error } });
+    return;
+   }
+   emit({ id: 90, method: "item/tool/call", params: {
+   threadId: "thread", turnId: "turn", callId: "read", tool: "Read", arguments: { path: "anchor.ts" } } }); },
   onToolReply: (frame, emit) => {
    assert.equal(frame.result.success, true);
    const excerpt = /^<(repository_excerpt_[a-f0-9]{32})>\n([\s\S]*)\n<\/\1>$/.exec(frame.result.contentItems[0].text);
@@ -156,6 +177,14 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   },
  });
  const c = { ...claim(), claim_generation: 7 };
+ c.cross_check!.round = mode === "approve-round2" ? 2 : round;
+ assert.equal("automatic_revision_limit" in c.cross_check!, false);
+ assert.equal("automatic_rounds_enabled" in c.cross_check!, false);
+ if (rejected || mode === "approve-pinned") {
+  c.config = { default_model: "gpt-6-astra", default_effort: (mode === "invalid-effort" ? "xhigh " : "xhigh") as NonNullable<ClaimResponse["config"]>["default_effort"] };
+  if (mode !== "legacy-rejection") c.cross_check!.model_source = mode === "default-rejection" ? "worker default" : "pin";
+  c.cross_check!.effort_source = "pin";
+ }
  const server = http.createServer(async (req, res) => {
   let raw = "";
   for await (const chunk of req) raw += chunk;
@@ -165,6 +194,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   if (req.url?.endsWith("/codex/release")) res.end(JSON.stringify({ auth_mode: "api_key", access_token: "released-token" }));
   else if (req.url?.endsWith("/inputs")) res.end(JSON.stringify({ inputs: [] }));
   else if (req.url?.endsWith("/cross-check-verdict")) {
+   assert.equal(req.url, "/api/worker/runs/check/cross-check-verdict");
    assert.equal(body.claim_generation, 7);
    assert.equal(body.verdict, expectedVerdict);
    assert.equal(body.reason_class, expectedReason);
@@ -176,7 +206,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
     const journal = await outbox.readTerminalJournal(c.run_id, 7);
     assert.equal(journal?.body.status, expectedStatus);
     assert.equal(journal?.body.claim_generation, 7);
-    assert.equal(journal?.messagesThroughSeq, 2);
+    assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 0 : 2);
    }
    res.end(JSON.stringify({ applied: true, status: body.status }));
   } else res.end("{}");
@@ -198,19 +228,41 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1,
    activeRuns: registry, outbox, model: new CodexCrossCheck(client, r.log, r.deps) }).execute(c);
   assert.deepEqual(clones, [["/bare", c.cross_check!.base_commit, c.run_id]]);
-  assert.deepEqual(r.ops, ["stat", "read"]);
-  assert.deepEqual(r.disposed, ["provider", "fileop"]);
+  assert.deepEqual(r.ops, mode === "invalid-effort" ? [] : rejected ? ["stat"] : ["stat", "read"]);
+  assert.deepEqual(r.disposed, mode === "invalid-effort" ? [] : ["provider", "fileop"]);
   const delivered = posts.filter((p) => p.url.endsWith("/messages"));
-  assert.deepEqual(delivered.map((p) => p.body.messages[0].seq), [1, 2]);
-  assert.deepEqual(delivered.map((p) => p.body.messages[0].payload.event), ["init", "result"]);
-  assert.equal(delivered[1]!.body.messages[0].payload.is_error, mode !== "approve");
+  assert.deepEqual(delivered.map((p) => p.body.messages[0].seq), mode === "invalid-effort" ? [] : [1, 2]);
+  assert.deepEqual(delivered.map((p) => p.body.messages[0].payload.event), mode === "invalid-effort" ? [] : ["init", "result"]);
+  if (mode !== "invalid-effort") assert.equal(delivered[1]!.body.messages[0].payload.is_error, !approves);
+  if (mode !== "invalid-effort") {
+   const start = r.requests.find((f) => f.method === "turn/start")!;
+   const candidate = JSON.parse(/<candidate_[a-f0-9]{32}>\n([\s\S]*?)\n<\/candidate_[a-f0-9]{32}>/.exec(start.params!.input[0].text)![1]!);
+   assert.equal(candidate.round, c.cross_check!.round);
+   assert.equal(candidate.model_source, c.cross_check!.model_source);
+   assert.equal(candidate.effort_source, c.cross_check!.effort_source);
+  }
+  if (rejected || mode === "approve-pinned") {
+   const starts = r.requests.filter((f) => f.method === "turn/start");
+   assert.equal(starts.length, mode === "invalid-effort" ? 0 : 1);
+   assert.equal(r.specs.filter((s) => "kind" in s && s.kind === "provider").length, mode === "invalid-effort" ? 0 : 1);
+   if (starts.length) {
+    assert.equal(starts[0]!.params!.model, "gpt-6-astra");
+    assert.equal(starts[0]!.params!.effort, "xhigh");
+   }
+   assert.equal(JSON.stringify(posts).includes("SYNTHETIC"), false);
+  }
   assert.equal(r.secrets.size, 0);
   assert.ok(posts.every((p) => p.url.includes("/runs/check/")));
   const verdictIndex = posts.findIndex((p) => p.url.endsWith("/cross-check-verdict"));
   assert.ok(verdictIndex > 0);
+  assert.equal(posts.filter((p) => p.url.endsWith("/cross-check-verdict")).length, 1);
+  assert.equal(posts.some((p) => p.url.includes("/cross-checks/plan")), false, "the child never submits an automatic revision");
   assert.equal(posts[verdictIndex]!.body.verdict, expectedVerdict);
   assert.equal(posts[verdictIndex]!.body.reason_class, expectedReason);
   assert.equal(posts[verdictIndex + 1]!.body.status, expectedStatus);
+  if (expectedStatus === "failed") assert.equal(posts[verdictIndex + 1]!.body.failure_reason,
+   expectedReason === "checker_unavailable"
+    ? "plan cross-check: checker unavailable" : "The cross-check did not complete.");
   assert.equal(outbox.hasPendingTerminal(c.run_id, 7), false);
   assert.equal(registry.size, 0);
   assert.deepEqual(removed, ["/checkout"]);

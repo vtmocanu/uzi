@@ -222,7 +222,7 @@ export class FakeApi {
   // 404 not-owned, or a transient 5xx.
   private readonly ownershipByRun = new Map<
     string,
-    { httpStatus: number; status?: string; generation?: number }
+    { httpStatus: number; status?: string; generation?: number; inventoryGuarded?: boolean }
   >();
   // issue #1319: the owner-scoped orphan-classification read. Keyed by OWNER run id (the
   // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
@@ -237,6 +237,9 @@ export class FakeApi {
   /** Hold a pending status response until the owning client's HTTP request aborts. */
   holdCrossCheckStatusUntilAbort?: (runId: string) => boolean;
   abortedHeldCrossCheckStatuses = 0;
+  crossCheckLatestHandler?: (request: { runId: string; generation: number }) =>
+    Promise<{ status: number; body: unknown }> | { status: number; body: unknown };
+  readonly crossCheckLatestRequests: { runId: string; generation: number }[] = [];
   readonly crossCheckRequests: { runId: string; method: string; body: Record<string, unknown> }[] = [];
   readonly crossCheckReplies: { runId: string; method: string; status: number; acceptedCandidate: boolean; dropped: boolean }[] = [];
   usageHandler?: () => { status: number; body: unknown };
@@ -309,6 +312,10 @@ export class FakeApi {
     runId: string;
     body: Record<string, unknown>;
   }> = [];
+  readonly codexReleaseSequences = new Map<string, Array<{ status: number; body?: unknown; drop?: boolean }>>();
+  /** Refresh faults are separate from release faults so an epoch can authorize before losing a refresh reply. */
+  readonly codexRefreshSequences = new Map<string, Array<{ status: number; body?: unknown; drop?: boolean }>>();
+  readonly codexAuthModes = new Map<string, "subscription" | "api_key">();
   readonly codexRequests: Array<{
     runId: string;
     operation: "release" | "refresh";
@@ -803,8 +810,8 @@ export class FakeApi {
    *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw.
    *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
    *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
-  setOwnershipStatus(runId: string, status: string, generation?: number): void {
-    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation });
+  setOwnershipStatus(runId: string, status: string, generation?: number, inventoryGuarded?: boolean): void {
+    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation, ...(inventoryGuarded !== undefined ? { inventoryGuarded } : {}) });
   }
 
   /** issue #559 M3: answer the ownership probe with 404 — the DEFINITIVE not-owned
@@ -994,7 +1001,18 @@ export class FakeApi {
         this.codexResponseOverride = undefined;
         return send(res, 200, override);
       }
-      if (operation === "release" && runId === "api-key") {
+      const releaseReply = (operation === "release" ? this.codexReleaseSequences : this.codexRefreshSequences).get(runId)?.shift();
+      if (releaseReply) {
+        if (releaseReply.drop) {
+          res.writeHead(releaseReply.status, { "Content-Type": "application/json", "Content-Length": "1000" });
+          res.flushHeaders();
+          res.write("{");
+          setImmediate(() => res.destroy());
+          return;
+        }
+        return send(res, releaseReply.status, releaseReply.body ?? {});
+      }
+      if (operation === "release" && (runId === "api-key" || this.codexAuthModes.get(runId) === "api_key")) {
         return send(res, 200, { auth_mode: "api_key", access_token: "api-key-access" });
       }
       const observed = json.observed_generation;
@@ -1186,7 +1204,17 @@ export class FakeApi {
       return send(res, answer.status, answer.body);
     }
 
-    const crossCheckMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks(?:\/plan\/1)?$/.exec(p);
+    const latestMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks\/plan\/latest$/.exec(p);
+    if (req.method === "GET" && latestMatch) {
+      const request = { runId: latestMatch[1]!, generation: Number(url.searchParams.get("claim_generation")) };
+      this.crossCheckLatestRequests.push(request);
+      const answer = this.crossCheckLatestHandler ? await this.crossCheckLatestHandler(request) :
+        { status: 200, body: { result: "no_row", round: 0, candidate_generation: 0,
+          automatic_revision_limit: 0, automatic_rounds_enabled: false, next_round: 1,
+          next_round_eligible: true, fallback_reason: "" } };
+      return send(res, answer.status, answer.body);
+    }
+    const crossCheckMatch = /^\/api\/worker\/runs\/([^/]+)\/cross-checks(?:\/plan\/[1-5])?$/.exec(p);
     if (crossCheckMatch && this.crossCheckHandler) {
       const request = { runId: crossCheckMatch[1]!, method: req.method ?? "", body: json };
       this.crossCheckRequests.push(request);
@@ -1313,6 +1341,7 @@ export class FakeApi {
       // test set one, so the default (issue #559) shape stays {status} for unrelated tests.
       const body: Record<string, unknown> = { status: o.status ?? "running" };
       if (o.generation !== undefined) body.claim_generation = o.generation;
+      if (o.inventoryGuarded !== undefined) body.inventory_guarded = o.inventoryGuarded;
       return send(res, 200, body);
     }
 
