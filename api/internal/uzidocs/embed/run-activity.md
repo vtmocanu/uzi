@@ -69,8 +69,10 @@ nothing shows no such list. The same list is available from the terminal
 via `uzi run get` (see [the CLI docs](./cli.md#commands)).
 
 Autopilot normally skips the human gate. With [Plan cross-check](./cross-check.md),
-a Claude lead proceeds after an exact-plan pass; a non-pass normally forces
-this gate, and Codex leads park as unsupported. See [Autopilot](./autopilot.md).
+a Claude lead proceeds after the latest exact-plan pass. Eligible changes
+requested receive bounded automatic revisions; exhaustion, blockers and
+check failures normally force this gate. Codex leads park as unsupported.
+See [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
 
@@ -79,7 +81,10 @@ A full revision round also works end to end from
 The plan panel and run detail show **Plan cross-check** evidence separately
 from the current human gate: checked-candidate outcome, findings, checker-run
 link, recorded model/effort and reported tokens/cost. The activity feed
-includes plan cross-check events even when there is no agent lane. Pending,
+includes distinct plan cross-check rounds even when there is no agent lane.
+Automatic revision events carry their checker-round identity separately from
+human revision counters. The summary describes the latest checked candidate;
+earlier rounds remain feed history. Pending,
 passed, changes requested, blocked, verdict deadline, checker model timeout,
 malformed/model/confinement failures, interruption and refusal have distinct
 labels; unknown or inconsistent verdict/reason pairs show unavailable.

@@ -14,8 +14,9 @@ spending your own Anthropic token. The plan is still recorded in run
 history as an audit trail, and the merge request stays your human review
 gate. Off by default, and opt-in per user — see below. If you also opt in to
 [Plan cross-check](./cross-check.md), a Claude lead's plan must pass a Codex
-check before implementation. A non-pass normally requires a human decision;
-irrecoverable delivery losses fail the run.
+check before implementation. Eligible changes requested go back to the lead
+for bounded automatic revisions. Exhaustion, blockers and check failures
+normally require a human decision; irrecoverable delivery losses fail the run.
 
 ## 1. Set your forge identity
 
@@ -69,7 +70,9 @@ candidates once the autopilot label lands.
 - **Eligible**: the issue moves to In Progress, a run starts, the plan is
   recorded, and on success a comment lands on the issue with the merge
   request link. With Plan cross-check enabled, a Claude lead proceeds after
-  an exact-plan pass; a non-pass normally parks for your plan decision.
+  the latest exact-plan pass, with bounded automatic revisions on eligible
+  changes requested. Exhaustion, blockers and check failures normally park
+  for your plan decision.
   Codex leads park as unsupported. See [Cross-check](./cross-check.md) for
   terminal delivery exceptions.
 - **The agent never stops to ask you something, either** — with one

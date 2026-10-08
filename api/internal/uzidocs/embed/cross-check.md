@@ -25,11 +25,22 @@ future runs only.
 
 Required runs wait for a worker advertising `cross_check_v1`. A **Claude
 lead's plan is checked on Codex** in a separate, read-only checker run.
-An APPROVE of the exact candidate permits implementation after the server
-acknowledges the matching plan. Changes requested, blocked, timeout or a
-failed check normally force a human plan gate. An unavailable checker,
-interrupted attempt, refused candidate/planning diff or submit failure also
-requires a human decision. An opted-in **Codex lead** parks with
+On a worker advertising `cross_check_rounds_v1`, changes requested (REVISE)
+go back to the lead automatically within the revision budget. Each revised
+candidate gets a fresh check and deadline; an APPROVE of the latest exact
+candidate permits implementation after the server acknowledges the matching
+plan. Checker findings arrive as fenced, potentially wrong or hostile
+advice. The revision prompt tells the lead to verify them against the code,
+issue and uzi rules, and to decline conflicting advice.
+
+The default budget allows two automatic revisions (three checked candidates).
+Superseded attempts count too, including recovery after worker loss; they do
+not spend your human revision allowance. Exhaustion parks with
+`plan cross-check: revisions exhausted`. A round-capable worker with a zero
+budget exhausts on REVISE; an older worker keeps the changes-requested human
+gate. BLOCK, timeout, failed or unavailable checker, refused candidate/diff
+and submit failure retain their human fallback or terminal delivery exception.
+An opted-in **Codex lead** still parks with
 `plan cross-check: not yet supported for a Codex lead`.
 
 Checker runs use ordinary worker slots; the lead holds its slot while
@@ -39,8 +50,9 @@ for timeout defaults and bounds.
 
 ## 3. Read the evidence and decide
 
-Open the run to see the current gate reason, checked-candidate outcome,
-findings, checker-run link, recorded model/effort and reported tokens/cost.
+Open the run to see distinct rounds in the feed, the current gate reason,
+checked-candidate outcome, findings, checker-run link, recorded model/effort
+and reported tokens/cost.
 Unknown or inconsistent outcomes show **Outcome unavailable**. Findings use
 hardened Markdown with a display cap of 16,384 source characters and 20 items;
 omitted text is disclosed. Missing cost shows unavailable; subscription usage
@@ -51,6 +63,24 @@ as history, without an automatic new checker round.
 
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
+
+## Recovery before a human gate
+
+A reclaimed Claude lead can start a fresh round within the same budget when
+there is no established human gate or durably approved plan, and the latest
+attempt was interrupted while pending strictly before its deadline, decided
+REVISE, or APPROVE whose plan was never durably stored (`approved_not_stored`).
+Lifecycle-settled failed/superseded attempts need proof of that pre-deadline
+interruption. The first custody-invalidating transition supplies the clock;
+a later sweep cannot grant recovery. Equality or ambiguous legacy evidence
+fails closed to timeout. BLOCK, timeout and other check failures retain their
+fallback even if budget is spent. An eligible recovery without budget parks
+as exhausted. An established human gate keeps its presentation and revision
+context, without adopting checker evidence or starting a fresh check; a
+durably approved plan follows the existing resume path.
+
+See the [recovery decision](../adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150)
+for the server authority and delivery boundaries.
 
 ## Planning-diff refusals
 
