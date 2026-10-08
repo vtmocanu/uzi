@@ -64,6 +64,7 @@
 #   No scenario in the matrix is uncovered; this phase is the integrated proof M7 asks for.
 # =============================================================================
 say "PRD #1349 M7: custody-limit wedge repro + owner-disposition unblock"
+trap 'if [ "$?" -ne 0 ]; then cat "$RUNROOT/custody-window.jsonl" 2>/dev/null || true; inventory_diagnostic_snapshot || true; fi' EXIT
 
 # The admission ceiling (workersvc.custodyHoldLimit / apitypes CustodyHoldLimit). The
 # production claim path always passes this positive default, so the live stack enforces it.
@@ -131,6 +132,15 @@ pass "created code run $WEDGE_RUN for issue #$IID (owner at the custody limit)"
 NEG_WINDOW=12
 start=$SECONDS
 while [ $((SECONDS - start)) -lt "$NEG_WINDOW" ]; do
+  # Record the actual admission baseline, including receipt transitions. Print
+  # only on failure; the retained rundir also carries the rows for post-mortem.
+  db_psql_rows "SELECT json_build_object('kind','custody_window','observed_at',clock_timestamp(),
+    'hold_id',h.id,'run_id',h.run_id,'generation',h.generation,'state',h.state,
+    'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
+    'released_at',h.released_at,'updated_at',h.updated_at,
+    'open_count',(SELECT count(*) FROM recovery_custody_holds WHERE user_id='$ADMIN_ID' AND state='open'),
+    'wedge_run','$WEDGE_RUN','wedge_status',(SELECT status FROM runs WHERE id='$WEDGE_RUN'))::text
+    FROM recovery_custody_holds h WHERE h.user_id='$ADMIN_ID' ORDER BY h.id" >> "$RUNROOT/custody-window.jsonl"
   s="$(apiget "/api/runs/$WEDGE_RUN" | jq -r '.run.status')"
   [ "$s" = queued ] || fail "wedge run left 'queued' (got '$s') while the owner is at the custody limit — the admission gate did not block the claim"
   sleep 0.5
