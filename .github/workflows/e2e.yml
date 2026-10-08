@@ -55,7 +55,9 @@ jobs:
       matrix:
         include:
           - forge: gitlab
-            timeout: 45
+            # The full lane includes outage/restart and final-custody waits; leave
+            # room for those bounded phases plus builds and artifact collection.
+            timeout: 60
           - forge: forgejo
             timeout: 25
           - forge: github

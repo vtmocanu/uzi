@@ -1879,7 +1879,7 @@ describe("#1604 round 3 — a disposed approve is never applied, so no later cla
         const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
         const second = s.start(s.resumeClaim("none"));
         assert.ok(await until(() => s.gates(second).length >= 1 || second.finished), s.statuses(second).join(","));
-        await tick(200);
+        await until(() => s.texts(second).includes(STALE_APPROVE_NOTICE), 3_000);
         assert.ok(s.texts(second).includes(STALE_APPROVE_NOTICE), s.texts(second).join(" | "));
         if (route === "discarded") await assertDisposedApprove(s, row.id);
         await s.shutdown(second); // the second interruption, at the fresh plan's gate

@@ -3,6 +3,7 @@ package pushbroker
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,18 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 				rejected   bool
 				wantError  bool
 			}{
+				{"valid progress tail", "ok " + ref, 1, true, true, true, false, false},
+				{"oversized progress tail", "ok " + ref, 1, true, false, false, false, true},
+				{"fatal tail", "ok " + ref, 1, true, false, false, false, true},
+				{"data tail", "ok " + ref, 1, true, false, false, false, true},
 				{"progress byte budget", "ok " + ref, 1, true, false, false, false, true},
+				{"duplicate outer terminator", "ok " + ref, 1, true, false, false, false, true},
+				{"progress after outer terminator", "ok " + ref, 1, true, false, false, false, true},
+				{"report after inner completion", "ok " + ref, 1, true, false, false, false, true},
+				{"partial outer header", "ok " + ref, 1, true, false, false, false, true},
+				{"partial outer payload", "ok " + ref, 1, true, false, false, false, true},
+				{"unknown channel", "ok " + ref, 1, true, false, false, false, true},
+				{"missing outer terminator", "ok " + ref, 1, true, false, false, false, true},
 				{"split headers", "ok " + ref, 1, true, true, true, false, false},
 				{"ng reason exactly ok", "ng " + ref + " ok", 1, true, true, false, true, true},
 				{"outer flush only", "ok " + ref, 1, false, false, false, false, true},
@@ -62,8 +74,54 @@ func TestNegotiatedSidebandHTTP(t *testing.T) {
 					if err := enc.Flush(); err != nil {
 						t.Fatal(err)
 					}
+					switch tc.name {
+					case "valid progress tail", "oversized progress tail", "fatal tail", "data tail":
+						b := append([]byte(nil), wire.Bytes()[:wire.Len()-4]...)
+						wire.Reset()
+						wire.Write(b)
+						size := 1000 // Includes the channel byte, as in go-git Demuxer.
+						if selected == capability.Sideband64k {
+							size = 65516 // Maximum payload under canonical pkt-line framing.
+						}
+						channel := byte(2)
+						if tc.name == "oversized progress tail" {
+							size++
+						}
+						if tc.name == "fatal tail" {
+							channel = 3
+						}
+						if tc.name == "data tail" {
+							channel = 1
+						}
+						fmt.Fprintf(&wire, "%04x", size+4)
+						wire.WriteByte(channel)
+						wire.WriteString(strings.Repeat("x", size-1))
+						wire.WriteString("0000")
+					case "duplicate outer terminator":
+						wire.WriteString("0000")
+					case "progress after outer terminator":
+						wire.WriteString("0006\x02x")
+					case "report after inner completion":
+						b := append([]byte(nil), wire.Bytes()[:wire.Len()-4]...)
+						wire.Reset()
+						wire.Write(b)
+						wire.WriteString("0006\x01x0000")
+					case "partial outer header":
+						wire.WriteString("00")
+					case "partial outer payload":
+						wire.WriteString("0006\x02")
+					case "unknown channel":
+						b := append([]byte(nil), wire.Bytes()[:wire.Len()-4]...)
+						wire.Reset()
+						wire.Write(b)
+						wire.WriteString("0006\x04x0000")
+					case "missing outer terminator":
+						b := append([]byte(nil), wire.Bytes()[:wire.Len()-4]...)
+						wire.Reset()
+						wire.Write(b)
+					}
 					t.Run("observer bytes", func(t *testing.T) {
-						raw := &rawReport{ref: ref, sideband: true}
+						raw := &rawReport{ref: ref, sideband: true, sideband64k: selected == capability.Sideband64k}
 						for _, b := range wire.Bytes() {
 							raw.feed([]byte{b})
 						}

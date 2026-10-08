@@ -39,9 +39,45 @@ CREATE TABLE memory_interventions (
     CHECK (admitted OR outcome IS NULL)
 );
 CREATE INDEX memory_interventions_run_episode ON memory_interventions(run_id, memory_episode);
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION fn_custody_attention(hold_state text, available boolean, guarded boolean,
+                                    capture_state text, run_status text, recovery_wait_cause text)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+ SELECT CASE
+  WHEN hold_state = 'discarded' THEN 'discarded'
+  WHEN hold_state = 'released' THEN 'released'
+  WHEN hold_state = 'open' AND run_status = 'recovery_wait'
+       AND recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure') THEN
+       CASE WHEN capture_state = 'needs_action' THEN 'needs_action' ELSE 'source_only' END
+  WHEN available AND NOT guarded THEN 'archive_ready'
+  WHEN capture_state IN ('preparing', 'uploading') THEN 'capturing'
+  WHEN capture_state = 'needs_action' THEN 'needs_action'
+  WHEN COALESCE(run_status, '') <> '' AND run_status NOT IN ('completed', 'failed', 'cancelled') THEN 'active'
+  ELSE 'source_only' END
+$$;
+-- +goose StatementEnd
+
 -- +goose Down
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION fn_custody_attention(hold_state text, available boolean, guarded boolean,
+                                    capture_state text, run_status text, recovery_wait_cause text)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+ SELECT CASE
+  WHEN hold_state = 'discarded' THEN 'discarded'
+  WHEN hold_state = 'released' THEN 'released'
+  WHEN hold_state = 'open' AND run_status = 'recovery_wait'
+       AND recovery_wait_cause = 'worker_requeue_exhausted' THEN
+       CASE WHEN capture_state = 'needs_action' THEN 'needs_action' ELSE 'source_only' END
+  WHEN available AND NOT guarded THEN 'archive_ready'
+  WHEN capture_state IN ('preparing', 'uploading') THEN 'capturing'
+  WHEN capture_state = 'needs_action' THEN 'needs_action'
+  WHEN COALESCE(run_status, '') <> '' AND run_status NOT IN ('completed', 'failed', 'cancelled') THEN 'active'
+  ELSE 'source_only' END
+$$;
+-- +goose StatementEnd
+
 UPDATE runs SET status='failed', fail_origin='worker_lost',
-    failure_reason='memory pressure hold ended by schema rollback (00310)',
+    failure_reason='memory pressure hold ended by schema rollback (00313)',
     finished_at=now(), status_since=now(), updated_at=now(),
     recovery_wait_cause=NULL, recovery_retry_not_before=NULL
 WHERE status='recovery_wait' AND recovery_wait_cause='worker_memory_pressure';

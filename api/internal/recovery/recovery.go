@@ -97,7 +97,7 @@ type Limits struct {
 	MaxConcurrentDownloads int           // concurrent downloads per API process.
 	RequestDeadline        time.Duration // per upload/download request+transaction deadline.
 	// CustodyHoldLimit is the owner-admission ceiling (PRD #1349 M5, D6/D10) — the maximum
-	// UNRESOLVED (state='open') custody holds one owner may accumulate before code-run
+	// admission-counted custody holds one owner may accumulate before code-run
 	// admission pauses. The handler sets it from workersvc.CustodyHoldLimit so the owner
 	// hold aggregate (ListHoldsForOwner) reports the SAME limit ClaimRun/health gate on, and
 	// passes it to GetCustodyAggregateForOwner's blocked-runs CASE. A non-positive value
@@ -105,6 +105,8 @@ type Limits struct {
 	// onto the store param (GetCustodyAggregateForOwnerParams.CustodyHoldLimit) with no lossy
 	// conversion; the owner DTO widens it to int.
 	CustodyHoldLimit int32
+	// WorkerHeartbeatStale is the configured freshness window used by admission counts.
+	WorkerHeartbeatStale time.Duration
 	// StoredFilesBudgetBytes is the shared stored-file budget (UZI_STORED_FILES_BUDGET_BYTES, PRD
 	// #1909 D2): job-file bytes plus recovery-archive bytes, reservations included. Upload admission
 	// counts job files against it (reclaiming them when that alone frees enough) and refuses the

@@ -652,6 +652,11 @@ A few worth knowing:
   to its kind default priority (it does **not** demote it below normal). It
   prints the updated run; `--json` emits the run object, whose `priority` reads
   `expedited` after a bump.
+  Expedite also orders new ephemeral worker provisioning by priority within
+  each eligible trigger class. Class precedence stays **isolated lane → capability
+  gap → saturation**, regardless of priority. Saturation debounce, placement
+  eligibility and per-user caps still apply; expedite does not guarantee global
+  priority precedence or immediate provisioning.
 - **`run rework <id>`** starts ONE on-demand MR-rework cycle on a **completed**
   run whose MR is open, past the automatic cap — the way to rework an MR after the
   automatic watcher has stopped. It skips the cap, the quiet-period debounce, the
@@ -974,10 +979,22 @@ available when it is not.
 
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
-A run's custody hold reserves owner capacity while its committed-but-unpublished work is
-recovered. Holds are per claim generation and capped per owner, so unresolved holds can
-eventually block new code runs. To find what held work you have, start here before choosing
-a run to export or an exact hold to discard:
+A run's custody hold protects its committed-but-unpublished work per claim generation.
+The fixed owner admission limit is 8 counted holds. `open_holds` is total open custody;
+`admission_counted_holds` excludes at most one hold per run backing a healthy, valid live
+current-generation claim without an owner decision. That requires exact owner/run/live-run
+and worker identity, an unreleased claim, a fresh non-null heartbeat (inclusive cutoff
+from the configured `WorkerHeartbeatStale`), and status `claimed`, `running`,
+`awaiting_approval`, `awaiting_input` or `awaiting_followup`. Missing, mismatched, stale,
+released, terminal and old/future-generation claims remain counted, as do decision holds;
+`active` attention alone does not establish eligibility. The discount releases nothing
+and does not permit pruning or teardown of held source.
+
+New code runs wait at the admission limit. A previously claimed queued run with 1–7
+of its own total open holds can still resume; at 8 it loses that exemption. Concurrent
+claims and later heartbeat staleness can exceed the limit: it is a statement-snapshot
+admission gate, not a strict ceiling. To find what held work you have, start here before
+choosing a run to export or an exact hold to discard:
 
 ```
 uzi run recovery [--json]
@@ -986,16 +1003,24 @@ uzi run recovery [--json]
 - The human view shows only open holds across your runs, oldest first by `created_at`.
   Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ARCHIVE` (whether an
   available capture exists), `WORKER`, and `AGE`. Run and hold ids are shown in full.
-  Below the table it prints the owner-wide `open_holds`, `custody_hold_limit`,
-  `decision_needed`, and `blocked_runs` aggregate. For each `source_only` hold it prints
+  Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
+  `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
+  `admission_counted_holds` against the limit for capacity, and `open_holds` for total
+  custody. `blocked_runs` excludes continuations eligible for the exemption. For each
+  `source_only` hold it reports retained source and archive availability independently.
+  An available archive can be exported but may omit latest worker-local work; a latest
+  preparing/uploading capture is reported as progress, without promising download or
+  coverage. With no archive or in-flight capture it prints
   `run <run-id> hold <hold-id>: no recovery archive; custody of worker <name>'s local source
   is retained (export unavailable; it may be the only copy)`. Then it prints hints: a
-  `uzi run export` hint only when an open hold has an available archive (an `archive_ready`
-  hold), and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
-  `needs_action`, which have no archive to export). With no open holds it says so and
+  `uzi run export` hint when an open hold has an available archive, regardless of attention,
+  and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
+  `needs_action`). With no open holds it says so and
   still prints the aggregate.
 - Without a run id, `--json` returns the endpoint's `aggregate` and `holds` object,
-  including settled holds. These hold rows have no `captures` array. Use the run id
+  including settled holds. The current server emits `admission_counted_holds` even
+  when zero; when an older API omits it, the CLI falls back to `open_holds`, preserving
+  an explicitly supplied zero. These hold rows have no `captures` array. Use the run id
   from this list for the detailed view and capture ids:
 
 ```
@@ -1005,11 +1030,13 @@ uzi run recovery <run-id> [--json]
 - The per-run view shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
-  The status also distinguishes a capture-less source that needs a decision and shows
-  the latest capture state. A `source_only`
-  hold prints `hold <hold-id>: no recovery archive; custody of worker <name>'s local source is
-  retained (export unavailable; it may be the only copy)`, and the same export and discard
-  hints as above follow. `--json` prints
+  The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
+  `worker_requeue_exhausted`: it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Owner Resume/Cancel
+  remains required; archive readiness does not implicitly release this custody.
+  The latest capture state and available archive are independent: an older download may
+  omit latest work while a newer capture prepares/uploads. The same source, coverage,
+  export and discard guidance as above follows. `--json` prints
   the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
@@ -2239,6 +2266,31 @@ presented at the gate, `0` for a run that has never gated under this
 feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
 `--expected-gate-revision` above.
 
+### Plan cross-check settings
+
+```sh
+uzi settings get
+uzi settings get --json
+```
+
+The human table shows the two Plan cross-check cells: stage, harness,
+active/inactive status, stored model and effort, worker default model,
+resolved model and effort, and each resolved field's source. Stored null
+fields show `Default`; explicit choices show `Pin · value`. The Claude
+cell is inactive and editable in **Settings → Run defaults → Cross-check**;
+only Codex checkers for Claude leads execute today. CLI set/reset is deferred
+to #1703.
+
+JSON returns the decoded account settings DTO, including
+`cross_check_pins`. Each cell has nullable stored
+`model`/`effort`, read-only nullable `worker_default_model`, separate
+`resolved_model`/`resolved_effort`, `model_source`/`effort_source` and
+`active`. Null Claude model metadata means SDK/account default. Sources
+display as `pin` or `worker default`; missing or unfamiliar values show
+`unknown` in the human view. See
+[Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
+for resolution, validation and capability requirements.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
@@ -2247,7 +2299,12 @@ this cookie-only consent setting.
 
 `uzi run get <id>` shows `PLAN_CROSS_CHECK` for a current cross-check human
 gate reason. Its `PLAN_CHECK_*` rows show the stored candidate's result,
-reason, checker id, recorded model/effort, tokens/cost and findings. A human
+reason, checker id, recorded model/effort, independent model/effort sources,
+tokens/cost and findings. `PLAN_CHECK_MODEL_SOURCE` and
+`PLAN_CHECK_EFFORT_SOURCE` show `pin` or `worker default`; missing legacy or
+unrecognized sources show `unknown`. JSON summary fields
+`checker_model_source` and `checker_effort_source` remain nullable for legacy
+records. Settings changes do not rewrite this recorded evidence. A human
 revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
 warning that the check does not certify the current plan. Missing cost stays
 unavailable; subscription usage is distinguished from metered spend.

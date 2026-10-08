@@ -128,11 +128,14 @@ export type MessageKind =
    *  human files or dismisses it later from the backlog. All fields are model-authored
    *  from attacker-influenceable repo content: escaped sinks only (web M7). */
   | "finding"
-  /** PRD #41: the user's revision feedback at the approval gate (payload
-   *  `{ feedback: string }`), echoed to the feed so the revision is auditable. */
+  /** Revision feedback at the approval gate: human payload `{ feedback: string }`;
+   *  automatic advice adds `{ automatic: true, cross_check_round: number }` and
+   *  carries no human input receipt. Echoed so the revision is auditable. */
   | "plan_feedback"
-  /** PRD #41: the lead is revising the plan for round N (payload `{ round: number }`);
-   *  the UI derives its "revising" gate state from this. */
+  /** The lead is revising the plan: human payload `{ round: number }`;
+   *  automatic payload `{ automatic: true, cross_check_round: number }` uses the
+   *  checked round independently of the human counter. The UI derives its
+   *  "revising" gate state from this. */
   | "plan_revising"
   /** PRD #88: the lead is asking the human a question and the run is parking.
    *  Payload is a QuestionPayload. Emitted BEFORE the awaiting_input state report,
@@ -1214,6 +1217,9 @@ export interface ClaimJob {
  */
 /** Server-stored, bounded plan candidate for one live read-only child claim. */
 export interface ClaimPlanCrossCheck {
+  /** Independent provenance from the captured server snapshot; absent on legacy claims. */
+  model_source?: "pin" | "worker default";
+  effort_source?: "pin" | "worker default";
   stage: "plan";
   lead_run_id: string;
   round: number;
@@ -2856,8 +2862,8 @@ export interface RecoveryReserveResponse {
 /** RecoveryUploadManifest is the byte-manifest the worker binds ONCE (compare-and-set)
  *  before/at the streaming upload of the verified bundle. byte_size/checksum are the
  *  complete-bundle facts the server verifies; chunk_count is the expected ordered-chunk
- *  inventory; prerequisite_shas is the verified public prerequisite closure the bundle
- *  imports against. The bundle bytes stream as the request body, never in this JSON. */
+ *  inventory; prerequisite_shas lists actual bundle-header dependencies. Guarded
+ *  cached dependencies require retained local custody; they are not fresh forge proof. The bundle bytes stream as the request body, never in this JSON. */
 export interface RecoveryUploadManifest {
   byte_size: number;
   checksum: string;
@@ -2879,9 +2885,26 @@ export interface RecoveryCaptureStatusResponse {
   expires_at?: string;
 }
 
-/** RecoveryReleaseResponse is the release ACK for a run's custody: released is true when
- *  the call transitioned any open hold to released, and holds_released is how many open
- *  holds it settled (0 on an idempotent repeat once none remain open). */
+/** Atomic capture reconciliation never reserves or releases custody. */
+export interface RecoveryReconcileRequest {
+  generation: number;
+  source_sha: string;
+  coverage_digest: string;
+  checksum: string;
+  byte_size: number;
+}
+
+export interface RecoveryReconcileResponse {
+  run_id: string;
+  generation: number;
+  capture_id: string;
+  outcome: "accepted" | "replaceable" | "retained";
+  final_receipt?: RecoveryFinalDisposition;
+  release_evidence?: string;
+  reason?: string;
+}
+
+/** RecoveryReleaseResponse is the custody release ACK; holds_released counts settled holds. */
 export interface RecoveryReleaseResponse {
   run_id: string;
   released: boolean;

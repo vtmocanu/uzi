@@ -554,7 +554,7 @@ export const mockRuns: Run[] = [
       findings: { summary: "## Checker findings\n\nKeep notification delivery idempotent.", items: [
         { file: "api/internal/notifier", severity: "warning", summary: "Avoid duplicate emails.", rationale: "A parked run may replay its approval transition." },
       ] },
-      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "high",
+      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "high", checker_model_source: null, checker_effort_source: null,
       usage: { input_tokens: 1200, output_tokens: 250, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0, cost_status: "subscription" },
       historical: false,
     },
@@ -915,7 +915,7 @@ export const mockRuns: Run[] = [
     plan_cross_check_summary: {
       round: 1, verdict: "approve", reason_class: "approve",
       findings: { summary: "## Earlier-plan checker findings\n\nThe earlier candidate covered the happy path.", items: null },
-      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "medium", usage: null, historical: true,
+      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "medium", checker_model_source: null, checker_effort_source: null, usage: null, historical: true,
     },
     worker_id: "w-laptop",
     branch: "agent/issue-18",

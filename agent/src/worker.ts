@@ -43,6 +43,27 @@ export const ISOLATED_JOB_CAPABILITY = "isolated_job_v1";
 /** issue #1582 M2: default re-sweep interval of the ancestry-settlement journal. */
 const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
+// Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
+// and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
+const finalizeAuthorities = new Map<string, Promise<boolean>>();
+type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
+const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
+
+/** Bound a wait without granting authority to a late result. Always remove the abort listener. */
+async function waitForFinalize<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  let aborted!: () => void;
+  const cancellation = new Promise<never>((_, reject) => {
+    aborted = () => reject(signal.reason);
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+  try {
+    return await Promise.race([promise, cancellation]);
+  } finally {
+    signal.removeEventListener("abort", aborted);
+  }
+}
+
 /**
  * Outbound-only worker loop (a daemon model): register once, heartbeat on
  * an interval, and poll for claims. No inbound ports.
@@ -154,6 +175,135 @@ export class Worker {
 
   /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
   private sweepingTerminals = false;
+  private sweepingFinalizes = false;
+  // Only the exact 256-or-fewer wire offers accepted in this worker lifetime gain handoff.
+  // Keep identities even while a terminal hides the record; replacements never inherit them.
+  private readonly acceptedFinalizes = new Map<string, Readonly<object>>();
+  private finalizeRegistrationAccepted = false;
+  private finalizeAttemptSequence = 0;
+  private readonly finalizeAttempts = new Map<string, number>();
+
+  /** Independent heartbeat retry: at most 16 checks/deletions, five seconds per pass and one
+   * second per candidate (authority and queued deletion). A failed candidate never blocks its siblings. Enumeration is
+   * uncapped; least recently attempted exact keys rotate past held old generations. Accepted
+   * registration alone attempts its frozen count in waves of 16 within the same pass deadline;
+   * its lower-original authority expires on return and is never added to acceptedFinalizes. */
+  private async sweepPendingFinalizes(signal?: AbortSignal, frozen?: readonly FinalizeCandidate[],
+    registrationLower?: ReadonlySet<Readonly<object>>): Promise<void> {
+    const outbox = this.outbox;
+    if (this.sweepingFinalizes || signal?.aborted || !outbox ||
+        typeof outbox.listPendingFinalizeGenerations !== "function" ||
+        typeof outbox.retireFinalizeIfEligible !== "function" ||
+        typeof outbox.finalizeRecordIdentity !== "function" ||
+        typeof this.runner.recoveryInventoryPending !== "function") return;
+    this.sweepingFinalizes = true;
+    const pass = new AbortController();
+    const deadline = Date.now() + 5_000;
+    const abort = () => pass.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), 5_000);
+    try {
+      const candidates = frozen ?? this.captureFinalizes();
+      const entries = candidates.map(candidate => candidate.entry);
+      const identities = new Map(candidates.map(candidate => [finalizeKey(candidate.entry), candidate.identity]));
+      const present = new Set(entries.map(finalizeKey));
+      for (const key of this.finalizeAttempts.keys()) {
+        if (!present.has(key)) this.finalizeAttempts.delete(key);
+      }
+      entries.sort((a, b) =>
+        (this.finalizeAttempts.get(finalizeKey(a)) ?? 0) - (this.finalizeAttempts.get(finalizeKey(b)) ?? 0) ||
+        (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0) ||
+        a.claim_generation - b.claim_generation);
+      const tasks: Promise<void>[] = [];
+      for (const entry of entries) {
+        if (tasks.length >= 16) {
+          if (!registrationLower) break;
+          await Promise.all(tasks);
+          tasks.length = 0;
+        }
+        if (finalizeAuthorities.size >= 16 || pass.signal.aborted ||
+            Date.now() >= deadline) break;
+        const key = finalizeKey(entry);
+        if (finalizeAuthorities.has(key)) continue;
+        try {
+          if (this.isFinalizeRunLive(entry.run_id)) continue;
+          this.finalizeAttempts.set(key, ++this.finalizeAttemptSequence);
+          tasks.push(this.retryPendingFinalize(outbox, entry, key, identities.get(key)!, pass.signal, deadline,
+            registrationLower?.has(identities.get(key)!) ?? false));
+        } catch (err) {
+          this.log.warn("outbox: finalize candidate retained after live fence error", {
+            run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
+          });
+        }
+      }
+      await Promise.all(tasks);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      this.sweepingFinalizes = false;
+    }
+  }
+
+  private isFinalizeRunLive(runId: string): boolean {
+    return this.admittedRunIds.has(runId) || (this.activeRuns?.has(runId) ?? false) ||
+      (typeof this.runner.isExecuting === "function" && this.runner.isExecuting(runId));
+  }
+
+  private captureFinalizes(runId?: string, through?: number): FinalizeCandidate[] {
+    const outbox = this.outbox;
+    if (!outbox || typeof outbox.finalizeRecordIdentity !== "function") return [];
+    return outbox.listPendingFinalizeGenerations(runId !== undefined)
+      .filter(entry => runId === undefined || (entry.run_id === runId && entry.claim_generation <= through!))
+      .flatMap(entry => {
+        const identity = outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation);
+        return identity ? [{ entry, identity }] : [];
+      });
+  }
+
+  private async hasFinalizeAuthority(entry: PendingFinalize, identity: Readonly<object>, registrationLower: boolean): Promise<boolean> {
+    if (await this.runner.recoveryInventoryPending(entry.run_id, entry.claim_generation) !== false) return false;
+    if (registrationLower || this.acceptedFinalizes.get(finalizeKey(entry)) === identity) return true;
+    const ownership: unknown = await this.client.getRunOwnership(entry.run_id);
+    if (!ownership || typeof ownership !== "object") return false;
+    const proof = ownership as { status?: unknown; claim_generation?: unknown; inventory_guarded?: unknown };
+    return (proof.status === "completed" || proof.status === "failed" || proof.status === "cancelled") &&
+      typeof proof.claim_generation === "number" && Number.isSafeInteger(proof.claim_generation) &&
+      proof.claim_generation >= 0 && proof.claim_generation >= entry.claim_generation &&
+      (proof.inventory_guarded === undefined || typeof proof.inventory_guarded === "boolean");
+  }
+
+  private async retryPendingFinalize(
+    outbox: Outbox, entry: PendingFinalize, key: string, identity: Readonly<object>, signal: AbortSignal, deadline: number,
+    registrationLower = false,
+  ): Promise<void> {
+    const authorityWait = new AbortController();
+    const abort = () => authorityWait.abort(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
+    try {
+      // Install quarantine before invoking the predicate, including synchronously throwing doubles.
+      const authority = Promise.resolve().then(() => this.hasFinalizeAuthority(entry, identity, registrationLower));
+      finalizeAuthorities.set(key, authority);
+      const settled = () => {
+        if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
+      };
+      void authority.then(settled, settled);
+      const authorized = await waitForFinalize(authority, authorityWait.signal);
+      if (authorized !== true) return;
+      const eligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
+        !this.isFinalizeRunLive(entry.run_id);
+      if (!eligible()) return;
+      await waitForFinalize(outbox.retireFinalizeIfEligible(
+        entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity), authorityWait.signal);
+    } catch (err) {
+      this.log.warn("outbox: finalize retry retained a generation", {
+        run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
+      });
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    }
+  }
 
   private running: Promise<void> | undefined;
   private stopping: Promise<void> | undefined;
@@ -333,6 +483,7 @@ export class Worker {
     for (const entry of outbox.listPendingTerminals()) {
       if (signal.aborted) return;
       const gen = entry.claim_generation;
+      const finalizes = this.captureFinalizes(entry.run_id, gen);
       try {
         await resolvePendingTerminal(deps, {
           runId: entry.run_id,
@@ -344,12 +495,12 @@ export class Worker {
         });
         // Issue #1742: a crash between installing G's terminal journal and retiring G's finalize
         // record leaves both files. Once the journal is settled (no longer pending), the finalize
-        // record for the run at generation <= G is obsolete, so retire it or it blocks the retention
-        // sweep. A journal left listed (blocked, transient blip) keeps its finalize record.
+        // records at generation <= G can retire only after each generation passes its own custody
+        // check. A journal left listed (blocked, transient blip) keeps its finalize record.
         const stillPending = outbox
           .listPendingTerminals()
           .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
-        if (!stillPending && !(await this.runner.recoveryInventoryPending?.(entry.run_id, gen))) await outbox.retireFinalizesThrough(entry.run_id, gen);
+        if (!stillPending) await this.sweepPendingFinalizes(signal, finalizes);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -481,6 +632,7 @@ export class Worker {
       return;
     }
     if (this.isRunLiveHere(runId)) return;
+    const finalizes = this.captureFinalizes(runId, gen);
     try {
       await resolvePendingTerminal(deps, {
         runId,
@@ -494,7 +646,7 @@ export class Worker {
       const stillPending = outbox
         .listPendingTerminals()
         .some((p) => p.run_id === runId && p.claim_generation === gen);
-      if (!stillPending && !(await this.runner.recoveryInventoryPending?.(runId, gen))) await outbox.retireFinalizesThrough(runId, gen);
+      if (!stillPending) await this.sweepPendingFinalizes(signal, finalizes);
     } catch (err) {
       this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
         run_id: runId,
@@ -524,12 +676,16 @@ export class Worker {
     // wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
-    // snapshot. After an accepted register the offered records (and any lower-generation records of
-    // the same offered runs) are retired, never a re-listing, so a record a live flight writes later
-    // survives.
+    // snapshot. Freeze each original identity before the request, including existing lower records.
+    // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
+    const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
+      sentFinalizes.some(offered => offered.run_id === entry.run_id &&
+        entry.claim_generation <= offered.claim_generation));
+    const offeredIdentities = frozenFinalizes.filter(({ entry }) =>
+      sentFinalizes.some(offered => finalizeKey(offered) === finalizeKey(entry)));
     if (sentFinalizes.length > 0) {
       this.log.info("register finalize snapshot", {
         count: sentFinalizes.length,
@@ -617,6 +773,8 @@ export class Worker {
           // until the checker arrives in M2. The server only offers them to workers
           // that advertise this fail-closed gate.
           "cross_check_v1",
+          "cross_check_rounds_v1",
+          "cross_check_pins_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
@@ -678,18 +836,23 @@ export class Worker {
         });
         this.dindPrune?.setWorkerId(res.worker_id);
         this.dindMaintenance?.register(res.register_nonce, this.client.hasFeature("dind_maintenance_v1"));
+        if (!this.finalizeRegistrationAccepted) {
+          this.finalizeRegistrationAccepted = true;
+          for (const { entry, identity } of offeredIdentities.slice(0, 256)) {
+            this.acceptedFinalizes.set(finalizeKey(entry), identity);
+          }
+        }
         onRegistered(res.worker_id);
         // Issue #1742: the api accepted this register, so retire the offered finalize records
-        // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
-        // offered runs. A failed register never reaches here. A
+        // (`sentFinalizes`, what the snapshot carried) and captured lower originals after their own
+        // exact custody checks. Batch authority expires with this bounded pass. A failed register never reaches here. A
         // retire failure must not turn an accepted register into a retry loop.
         if (sentFinalizes.length > 0) {
           try {
-            const releasable = [];
-            for (const entry of sentFinalizes) {
-              if (!(await this.runner.recoveryInventoryPending?.(entry.run_id, entry.claim_generation))) releasable.push(entry);
-            }
-            await this.outbox?.retireFinalizes(releasable);
+            const lowerOriginals = new Set(frozenFinalizes.filter(({ entry }) =>
+              sentFinalizes.some(offered => offered.run_id === entry.run_id &&
+                entry.claim_generation < offered.claim_generation)).map(candidate => candidate.identity));
+            await this.sweepPendingFinalizes(signal, frozenFinalizes, lowerOriginals);
           } catch (err) {
             this.log.warn("register finalize snapshot: retiring the offered records failed", {
               error: errMessage(err),
@@ -791,6 +954,9 @@ export class Worker {
         // drainer never visits those). Fire-and-forget for the same reason as the drain above.
         void this.sweepPendingTerminals(signal).catch((err) => {
           this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
+        });
+        void this.sweepPendingFinalizes(signal).catch((err) => {
+          this.log.warn("outbox finalize sweep failed", { error: errMessage(err) });
         });
         // Issue #1995: re-drive a journaled recovery bundle whose upload failed while this worker
         // stayed alive (it was retried only at the next boot before). Fire-and-forget like the

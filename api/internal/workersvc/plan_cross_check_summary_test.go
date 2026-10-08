@@ -38,7 +38,7 @@ func TestPlanCrossCheckSummaryResults(t *testing.T) {
 		{"approve", "approve"}, {"revise", "revise"}, {"block", "block"},
 		{"failed", "malformed"}, {"failed", "model_error"}, {"failed", "model_timeout"},
 		{"failed", "checker_unavailable"}, {"failed", "confinement_failed"},
-		{"pending", ""}, {"failed", "timed_out"}, {"failed", "superseded"},
+		{"pending", ""}, {"failed", "timed_out"}, {"failed", "superseded"}, {"failed", "approved_not_stored"},
 	} {
 		t.Run(pair[0]+"/"+pair[1], func(t *testing.T) {
 			q := &summaryTestStore{row: store.GetLatestPlanCrossCheckSummaryRow{

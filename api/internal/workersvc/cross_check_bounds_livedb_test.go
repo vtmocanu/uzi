@@ -93,15 +93,19 @@ func TestCheckerAssemblyRefusalFinishesExactClaimLiveDB(t *testing.T) {
 			worker := checkerBoundsWorker(f)
 			svc := New(env.q, env.box, testParams())
 			svc.SetTxBeginner(env.pool)
-			// Exercise actual pre-mint and post-mint assembly refusals.
+			// Missing candidates and oversized stored context are refused before
+			// minting; encoded-envelope bounds still exercise post-mint recovery.
 			run := mustRun(t, env, f.runID)
 			payload, assemblyErr := svc.assembleClaim(env.ctx, worker, run)
 			if payload != nil || !errors.Is(assemblyErr, ErrCrossCheckRefused) {
 				t.Fatalf("assembly refusal missing: %v", assemblyErr)
 			}
 			var minted *codexMintedClaimError
-			if gotMint := errors.As(assemblyErr, &minted); gotMint != (scenario != "stored context") {
+			if gotMint := errors.As(assemblyErr, &minted); gotMint != (scenario == "encoded envelope") {
 				t.Fatal("assembly refusal carried the wrong mint identity")
+			}
+			if scenario != "encoded envelope" && mustRun(t, env, run.ID).CodexClaimEpoch != run.CodexClaimEpoch {
+				t.Fatal("preflight refusal reached credential mint")
 			}
 			out, err := svc.finishRunClaim(env.ctx, run, payload, assemblyErr, claimRecoveryIdentity{workerID: worker.ID})
 			if err != nil || out != nil {

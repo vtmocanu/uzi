@@ -56,23 +56,9 @@ done
 [ "$H47_CAP" = 3 ] || fail "worker did not advertise max_concurrent_runs=3 after recreate (got ${H47_CAP:-none})"
 pass "worker back online advertising cap 3 (room for three concurrent health legs)"
 
-# The restart/recreate phases before this one (15/16/27/28/34/35/39/45, plus the agent
-# recreate just above) leave the admin owner holding open recovery custody holds. ClaimRun's
-# custody-admission gate (workersvc/budget.go: custodyHoldLimit=8) refuses a claim once the
-# owner's open holds reach 8, which would wedge the THIRD health run in 'queued' and time out
-# hrun's `wait_status awaiting_approval` — a timeout SWALLOWED by hrun's command substitution,
-# surfacing only as an unattributed non-zero exit. run-health exercises health detection, not
-# recovery, so clear the owner's accumulated cross-phase holds so the gate does not wedge its
-# own claims. The underlying cross-phase accumulation is tracked with the custody-recovery work.
-H47_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
-[ -n "$H47_ADMIN_ID" ] || fail "run-health: could not resolve the admin owner id for '$ADMIN_EMAIL'"
-# CTE so the TOP-LEVEL statement is a SELECT, returning a bare count. db_psql now also strips any
-# DML command tag at the chokepoint (#1351), so this is belt-and-braces rather than required.
-H47_CLEARED="$(db_psql "WITH del AS (DELETE FROM recovery_custody_holds
-                                       WHERE user_id = '$H47_ADMIN_ID' AND state = 'open'
-                                       RETURNING 1)
-                        SELECT count(*) FROM del")"
-pass "cleared ${H47_CLEARED:-0} accumulated cross-phase custody hold(s) so the admission gate does not wedge the health claims"
+# All three simultaneous legs must fit under the owner custody admission limit.
+# Wait for final settlement without discarding cross-phase archives or source-only holds.
+wait_custody_headroom "$H47_CAP"
 
 # hrun SENTINEL — create a PRD issue carrying the sentinel, start a run, approve the
 # plan gate, and echo the run id (stdout is only the id: the helpers it calls are
@@ -195,4 +181,3 @@ apiput /api/admin/settings '{"settings":{"health_stall_seconds":"300"}}' >/dev/n
 # cap 3 when it expects cap 2.
 unset UZI_E2E_MAX_CONCURRENT_RUNS
 fi
-

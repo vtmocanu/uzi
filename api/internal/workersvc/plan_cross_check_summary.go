@@ -38,7 +38,9 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 		return nil, err
 	}
 	dto := &apitypes.PlanCrossCheckSummaryDTO{
-		Round: row.Round, Verdict: scrubThenBound(row.Verdict, 512),
+		CheckerModelSource:  textPtr(row.CheckerModelSource),
+		CheckerEffortSource: textPtr(row.CheckerEffortSource),
+		Round:               row.Round, Verdict: scrubThenBound(row.Verdict, 512),
 		ReasonClass:   planCrossCheckSummaryLabel(row.ReasonClass),
 		CheckerModel:  planCrossCheckSummaryLabel(row.CheckerModel),
 		CheckerEffort: planCrossCheckSummaryLabel(row.CheckerEffort),
@@ -49,7 +51,14 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 	if len(row.Findings) <= 64*1024 {
 		var compact bytes.Buffer
 		if json.Compact(&compact, row.Findings) == nil {
-			if clean, err := NormalizeCrossCheckFindings(row.Verdict, row.ReasonClass.String, compact.Bytes()); err == nil {
+			// An unstored approval retains its original bounded findings as history.
+			// Normalize the prose using its original outcome, without allowing the
+			// checker verdict route to submit this server-only reason.
+			verdict, reason := row.Verdict, row.ReasonClass.String
+			if verdict == "failed" && reason == "approved_not_stored" {
+				verdict, reason = "approve", "approve"
+			}
+			if clean, err := NormalizeCrossCheckFindings(verdict, reason, compact.Bytes()); err == nil {
 				var findings apitypes.PlanCrossCheckFindingsDTO
 				if json.Unmarshal(clean, &findings) == nil {
 					dto.Findings = &findings

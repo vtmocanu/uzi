@@ -53,7 +53,7 @@ three repo-wide checks that belong to no component, described below.)*
 
 Individual slots exist too (`task test:api`, `task typecheck:web`,
 `task check-docs:web`, …), and `.github/workflows/ci.yml` calls those fine-grained targets
-rather than the component wrappers, because `validate:*` and `test:*` are separate
+rather than the component wrappers, because its `validate-*` and `test-*` jobs are separate
 jobs and a wrapper would run the tests twice.
 
 Four things about it that are decisions rather than accidents:
@@ -270,7 +270,7 @@ the duplication is self-checking, so bumping only one makes the other's assert
 exit 2 naming both numbers — then re-derive the finding count under the new
 version and say so in the commit. yamllint and ruby carry no such pin in the
 wrapper scripts (their two candidate versions were measured to agree on this
-tree), though `lint:repo`'s CI job does assert its own apt-installed versions
+tree), though the `lint-repo` CI job does assert its own apt-installed versions
 of both, symmetrically with shellcheck's, so a Debian point release that moves
 either is something the pipeline states rather than something a reader has to
 infer.

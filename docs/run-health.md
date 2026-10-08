@@ -137,6 +137,12 @@ Runs list, the run page, or [`uzi run expedite <run-id>`](./cli.md)
 (`--clear` to undo). It only matters while `queued`; a claimed run's
 ordering is fixed.
 
+Expedite also orders new ephemeral worker provisioning by priority within
+each eligible trigger class. Class precedence stays **isolated lane → capability
+gap → saturation**, regardless of priority. Saturation debounce, placement
+eligibility and per-user caps still apply; expedite does not guarantee global
+priority precedence or immediate provisioning.
+
 **A run parked at `limit_wait` on a Claude or Codex usage window is excluded
 from these running-state flags, even after hours.** It isn't stuck — see
 [Paused on a usage limit](run-limit-wait.md) for that state.

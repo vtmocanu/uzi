@@ -8,7 +8,8 @@
 import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
-import type { BindMode } from "../lib/apiTypes";
+import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
+import type { UserSettings, BindMode } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
@@ -36,6 +37,7 @@ export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
   // Kept local: the save handlers below still set this on failure, so it is merged
   // with the hook's load error at the one page-level Alert.
+  const [committedSettings, setCommittedSettings] = useState<UserSettings | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [autopilotBusy, setAutopilotBusy] = useState(false);
@@ -206,6 +208,7 @@ export function RunDefaults() {
     setMrReworkBusy(true);
     try {
       const { settings } = await api.putMySettings({ mr_rework_enabled: next });
+      setCommittedSettings(current => current && ({ ...current, mr_rework_enabled: settings.mr_rework_enabled }));
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setMrReworkError(
@@ -279,6 +282,7 @@ export function RunDefaults() {
         api.listSecrets(),
         api.getMySettings(),
       ]);
+      setCommittedSettings(settings);
       // PRD #1551: seed each lane from its own explicit field, never from the
       // legacy default_model projection — the two lanes are the source of truth now.
       const claude = settings.default_claude_model ?? "";
@@ -332,6 +336,7 @@ export function RunDefaults() {
     setJudgeModelBusy(true);
     try {
       const { settings } = await api.putMySettings({ judge_model: judgeModel.trim() || null });
+      setCommittedSettings(current => current && ({ ...current, judge_model: settings.judge_model }));
       const model = settings.judge_model ?? "";
       setJudgeModel(model);
       setSavedJudgeModel(model);
@@ -359,6 +364,7 @@ export function RunDefaults() {
     setSummaryModelBusy(true);
     try {
       const { settings } = await api.putMySettings({ summary_model: summaryModel.trim() || null });
+      setCommittedSettings(current => current && ({ ...current, summary_model: settings.summary_model }));
       const model = settings.summary_model ?? "";
       setSummaryModel(model);
       setSavedSummaryModel(model);
@@ -385,6 +391,7 @@ export function RunDefaults() {
     setEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_effort: defaultEffort || null });
+      setCommittedSettings(current => current && ({ ...current, default_effort: settings.default_effort }));
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
@@ -407,6 +414,7 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
+      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
@@ -483,6 +491,17 @@ export function RunDefaults() {
         default_codex_model: codexModel.trim() || null,
       };
       const { settings } = await api.putMySettings(patch);
+      // Model saves refresh counterfactual metadata; retain current pins and all other hints.
+      setCommittedSettings(current => current && ({
+        ...current,
+        default_harness: settings.default_harness,
+        default_claude_model: settings.default_claude_model,
+        default_codex_model: settings.default_codex_model,
+        cross_check_pins: current.cross_check_pins?.map(cell => {
+          const delivered = settings.cross_check_pins?.find(p => p.stage === cell.stage && p.harness === cell.harness);
+          return delivered ? { ...cell, worker_default_model: delivered.worker_default_model } : cell;
+        }),
+      }));
       const dh = selectionFromHarness(settings.default_harness);
       setDefaultHarness(dh);
       setSavedHarness(dh);
@@ -565,6 +584,7 @@ export function RunDefaults() {
           />
           <span className="text-fg">Plan cross-check · Required before implementation</span>
         </label>
+        {committedSettings && <CrossCheckDefaults settings={committedSettings} />}
       </Card>
 
       {/* PRD #35. Placed after Autopilot on purpose: the two compose, and this is the

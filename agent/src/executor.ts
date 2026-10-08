@@ -342,6 +342,8 @@ export interface RunContext {
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
   signal?: AbortSignal;
+  /** Stable terminal cancellation, independent of rearmed pause lifecycles. */
+  terminalLifecycleSignal?: AbortSignal;
   /**
    * M4 plan gate. Called by the executor after the lead submits a plan: the
    * runner posts /state awaiting_approval with the plan and returns the user's
@@ -1486,24 +1488,35 @@ export class StubExecutor implements Executor {
         let revisedPlan = planMd;
         let verdict = await ctx.gatePlan(revisedPlan);
         let round = 0;
+        let automaticRound = 0;
         while (verdict.kind === "revise") {
+          const automatic = verdict.automatic === true;
+          if (verdict.automatic === true) {
+            if (!Number.isInteger(verdict.round) || verdict.round <= automaticRound || verdict.round > 4)
+              throw new TrustedExecutionRefusal("invalid automatic plan revision round");
+            automaticRound = verdict.round;
+          }
           // Record the reviewer's feedback on the feed BEFORE the next gatePlan flushes
           // the revised plan, so the feed never lags the awaiting_approval re-report —
           // same ordering as the real executor.
           ctx.emit({
             kind: "plan_feedback",
             agent: "worker",
-            payload: { feedback: verdict.feedback },
+            payload: automatic
+              ? { feedback: verdict.feedback, automatic: true, cross_check_round: automaticRound }
+              : { feedback: verdict.feedback },
           });
-          round++;
+          if (!automatic) round++;
           ctx.emit({
             kind: "plan_revising",
             agent: "worker",
-            payload: { round },
+            payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round },
           });
-          revisedPlan = `${revisedPlan}\n\n(revision ${round}: applied feedback)`;
+          revisedPlan = automatic
+            ? `${revisedPlan}\n\n(automatic revision ${automaticRound}: applied feedback)`
+            : `${revisedPlan}\n\n(revision ${round}: applied feedback)`;
           // Issue #1604: the re-gate settles the revise once the revised plan is persisted.
-          verdict = await ctx.gatePlan(revisedPlan, undefined, undefined, verdict.inputId);
+          verdict = await ctx.gatePlan(revisedPlan, undefined, undefined, automatic ? undefined : verdict.inputId);
         }
         // Fail closed: only an approve may proceed to implement. revise exits the loop
         // above; reject/cancel throw here. `verdict` is now narrowed to `approve` — if a

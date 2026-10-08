@@ -70,6 +70,7 @@ import {
   buildPlanPrompt,
   buildRepoInstructionsContext,
   buildRevisePlanPrompt,
+  buildAutomaticRevisionPrompt,
   buildSelfImprovePlanPrompt,
   dockerScratchResumeNote,
   isNotCodePlan,
@@ -2083,26 +2084,33 @@ export class SdkExecutor implements Executor {
             });
         }
         let revisions = 0;
+        let automaticRound = 0;
         while (verdict.kind === "revise") {
+          const automatic = verdict.automatic === true;
+          if (verdict.automatic === true) {
+            if (!Number.isInteger(verdict.round) || verdict.round <= automaticRound || verdict.round > 4)
+              throw new TrustedExecutionRefusal("invalid automatic plan revision round");
+            automaticRound = verdict.round;
+          }
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
           const feedback = verdict.feedback;
           // Issue #1604 (D2): the re-gate of the revised plan settles THIS revise, once the revised
           // plan is confirmed persisted; until then an interruption replays it.
-          const settles = verdict.inputId;
+          const settles = automatic ? undefined : verdict.inputId;
           // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
           // (and thus before the next gatePlan flushes the new plan), so the feed never
           // lags the awaiting_approval re-report.
           ctx.emit({
             kind: "plan_feedback",
             agent: "worker",
-            payload: { feedback },
+            payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback },
           });
           // Belt-and-suspenders (PRD #41 Decision 3c): the SERVER enforces the same cap at
           // submit time and won't enqueue a revise past it, so this should never trip. If it
           // does, DO NOT run another planning turn — record it and re-gate the current plan so
           // the run stays fail-closed rather than revising unbounded.
-          if (revisions >= maxRevisions) {
+          if (!automatic && revisions >= maxRevisions) {
             this.log.warn(
               "plan revision budget exhausted; re-gating without a turn",
               { run_id: ctx.runId, max_revisions: maxRevisions },
@@ -2122,11 +2130,11 @@ export class SdkExecutor implements Executor {
             verdict = gExhausted.value;
             continue;
           }
-          revisions++;
+          if (!automatic) revisions++;
           ctx.emit({
             kind: "plan_revising",
             agent: "worker",
-            payload: { round: revisions },
+            payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions },
           });
           // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
           // subagents (baseConfig), exactly like the first plan turn — the roster
@@ -2144,10 +2152,10 @@ export class SdkExecutor implements Executor {
           // signal then reaches the outer catch, byte-identical to the pre-rework behaviour).
           // Issue #1604 (D4): with no session to resume, the turn has never seen the plan it is
           // revising, so it gets the full planning prompt plus the submitted plan and the feedback.
-          const revisePrompt =
-            resumeId === undefined
-              ? `${planPrompt}\n\n${buildRevisePlanPrompt(feedback, approvedPlan)}`
-              : buildRevisePlanPrompt(feedback);
+          const revisionAdvice = verdict.automatic === true
+            ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, resumeId === undefined ? approvedPlan : undefined)
+            : buildRevisePlanPrompt(feedback, resumeId === undefined ? approvedPlan : undefined);
+          const revisePrompt = resumeId === undefined ? `${planPrompt}\n\n${revisionAdvice}` : revisionAdvice;
           // Issue #2083: a session-less revise re-sends the full planPrompt, which carries the
           // memo block on the plain issue/rework path: announce where it is actually placed.
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))

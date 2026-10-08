@@ -2560,7 +2560,7 @@ func TestTickEmptySweepPersistsLastFire(t *testing.T) {
 }
 
 // TestTickTransientDoesNotPersistLastFire pins Decision 5: a transient fire error does NOT
-// advance, so AdvanceSchedule (the only last_fire write site) is never called and the prior
+// advance, so AdvanceSchedule is never called and the prior
 // last_fire is untouched.
 func TestTickTransientDoesNotPersistLastFire(t *testing.T) {
 	h := newHarness()

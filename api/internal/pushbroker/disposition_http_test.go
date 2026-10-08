@@ -4,18 +4,45 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 )
+
+type closeFailureBody struct {
+	io.ReadCloser
+	cause  error
+	closes *atomic.Int32
+}
+
+func (b *closeFailureBody) Close() error {
+	b.closes.Add(1)
+	return errors.Join(b.ReadCloser.Close(), b.cause)
+}
+
+type closeFailureTransport struct {
+	http.RoundTripper
+	cause  error
+	closes *atomic.Int32
+}
+
+func (c closeFailureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := c.RoundTripper.RoundTrip(req)
+	if err == nil && req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/git-receive-pack") {
+		res.Body = &closeFailureBody{ReadCloser: res.Body, cause: c.cause, closes: c.closes}
+	}
+	return res, err
+}
 
 // This loopback server exercises the broker's real HTTP transport and go-git's
 // report decoder. Sideband responses are unnegotiated protocol errors: Publish
@@ -35,8 +62,19 @@ func TestPublishHTTPDisposition(t *testing.T) {
 		progressOnly bool
 		fatal        bool
 		raw          string
+		status       int
+		stall        bool
+		unfinished   bool
+		closeFailure bool
 	}{
+		{name: "stalled acknowledgement", lines: []string{"unpack ok", "ok " + ref}, flush: true, stall: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "unfinished HTTP ok", lines: []string{"unpack ok", "ok " + ref}, flush: true, unfinished: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "unfinished HTTP ng", lines: []string{"unpack ok", "ng " + ref + " non-fast-forward"}, flush: true, unfinished: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "close failure ng", lines: []string{"unpack ok", "ng " + ref + " non-fast-forward"}, flush: true, closeFailure: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "malicious decoder", lines: []string{"unpack ok", "ok " + ref, "ng " + ref + " https://user:credential@remote.invalid/\u202e" + "glpat-" + strings.Repeat("B", 20)}, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
 		{name: "response byte budget", lines: flood, flush: true, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "non200 ok", lines: []string{"unpack ok", "ok " + ref}, flush: true, status: 201, want: pushbroker.PublishOutcomeUnknown, wantError: true},
+		{name: "non200 ng", lines: []string{"unpack ok", "ng " + ref + " non-fast-forward"}, flush: true, status: 500, want: pushbroker.PublishOutcomeUnknown, wantError: true},
 		{name: "acknowledged", lines: []string{"unpack ok", "ok " + ref}, flush: true, want: pushbroker.PublishAdvanced},
 		{name: "rejection reason exactly ok", lines: []string{"unpack ok", "ng " + ref + " ok"}, flush: true, wantError: true},
 		{name: "unfamiliar rejection", lines: []string{"unpack ok", "ng " + ref + " novel policy"}, flush: true, wantError: true},
@@ -110,6 +148,7 @@ func TestPublishHTTPDisposition(t *testing.T) {
 				}
 			}
 			var invocations atomic.Int32
+			stopped := make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") {
 					service := r.URL.Query().Get("service")
@@ -154,8 +193,19 @@ func TestPublishHTTPDisposition(t *testing.T) {
 						return
 					}
 					w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+					if tc.unfinished {
+						w.Header().Set("Content-Length", fmt.Sprint(response.Len()+1))
+					}
+					if tc.status != 0 {
+						w.WriteHeader(tc.status)
+					}
 					if _, err := w.Write(response.Bytes()); err != nil && tc.name != "response byte budget" {
 						t.Error(err)
+					}
+					if tc.stall {
+						w.(http.Flusher).Flush()
+						<-r.Context().Done()
+						close(stopped)
 					}
 					return
 				}
@@ -163,9 +213,45 @@ func TestPublishHTTPDisposition(t *testing.T) {
 				http.Error(w, "unexpected request", http.StatusNotFound)
 			}))
 			defer server.Close()
-			res, err := pushbroker.Publish(context.Background(), pushbroker.Options{
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if tc.stall {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
+				defer cancel()
+			}
+			var closes atomic.Int32
+			closeCause := errors.New("https://user:credential@remote.invalid/\u202e" + "glpat-" + strings.Repeat("C", 20))
+			if tc.closeFailure {
+				original := pushbroker.BrokerHTTPClient.Transport
+				pushbroker.BrokerHTTPClient.Transport = closeFailureTransport{RoundTripper: original, cause: closeCause, closes: &closes}
+				defer func() { pushbroker.BrokerHTTPClient.Transport = original }()
+			}
+			res, err := pushbroker.Publish(ctx, pushbroker.Options{
 				CloneURL: server.URL + "/origin.git", Branch: "main", DeclaredTip: tip, Pack: pack,
 			})
+			if tc.stall {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("deadline identity lost: %v", err)
+				}
+				select {
+				case <-stopped:
+				case <-time.After(2 * time.Second):
+					t.Error("stalled public handler did not terminate")
+				}
+			}
+			if tc.closeFailure && (!errors.Is(err, closeCause) || closes.Load() != 1) {
+				t.Errorf("close identity/count: error=%v closes=%d", err, closes.Load())
+			}
+			if tc.want == pushbroker.PublishOutcomeUnknown && err != nil {
+				for _, rendered := range []string{err.Error(), fmt.Sprintf("%+v", err), fmt.Sprintf("%#v", err)} {
+					for _, secret := range []string{"credential", "remote.invalid", ref, "glpat-", "\u202e"} {
+						if strings.Contains(rendered, secret) {
+							t.Errorf("unsafe full public error: %q", rendered)
+						}
+					}
+				}
+			}
 			if (err != nil) != tc.wantError {
 				t.Errorf("error = %v, wantError %v", err, tc.wantError)
 			}

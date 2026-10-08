@@ -168,6 +168,7 @@ type lockedCapture struct {
 	expiresAt     pgtype.Timestamptz
 	reason        pgtype.Text
 	reservedBytes pgtype.Int8
+	prerequisites []string
 }
 
 // Upload streams one octet-stream bundle into AAD-sealed ~1 MiB chunks and commits them
@@ -238,11 +239,11 @@ func (s *Service) upload(ctx context.Context, wkr store.Worker, runID, captureID
 func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest) (lockedCapture, error) {
 	var lc lockedCapture
 	err := tx.QueryRow(ctx, `SELECT c.run_id, c.user_id, c.original_worker_id, c.state, c.manifest_bound,
-			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes
+			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes, c.prerequisite_shas
 		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id = c.hold_id
 		WHERE c.id = $1 FOR UPDATE OF c`, captureID).Scan(
 		&lc.runID, &lc.userID, &lc.origWorker, &lc.state, &lc.bound,
-		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes)
+		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes, &lc.prerequisites)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return lockedCapture{}, ErrCaptureNotFound
@@ -258,6 +259,12 @@ func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captur
 	if lc.holdState != "open" {
 		return lockedCapture{}, ErrNotAuthorized
 	}
+	// The trusted worker declaration is immutable, including on receipt-only retries.
+	// slices.Equal preserves order and treats omitted and empty lists alike.
+	if lc.bound && !slices.Equal(lc.prerequisites, manifest.PrerequisiteShas) {
+		return lockedCapture{}, ErrManifestConflict
+	}
+	// Available receipts retain their existing byte/checksum authority.
 	if lc.state != "available" && lc.bound &&
 		(lc.byteSize.Int64 != manifest.ByteSize || !strings.EqualFold(lc.checksum.String, manifest.Checksum)) {
 		return lockedCapture{}, ErrManifestConflict
@@ -689,6 +696,15 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// ReleaseCustodyHoldExact locks the run before updating custody. Take that
+	// lock before resolution too, so v1 cannot invert the lifecycle's run/hold order.
+	var lockedRun uuid.UUID
+	if err := tx.QueryRow(ctx, "SELECT id FROM runs WHERE id=$1 FOR UPDATE", runID).Scan(&lockedRun); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return apitypes.RecoveryReleaseResponse{RunID: runID.String()}, nil
+		}
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
 	_, generation, err := s.resolveSoleOpenHold(ctx, tx, runID, wkr.ID)
 	switch {
 	case errors.Is(err, ErrNotAuthorized):
@@ -837,8 +853,8 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // (PRD #1349 M5, D6/D7/D10). By default it lists ALL the owner's holds (every state) — the CLI's
 // all-states contract via `uzi run recovery`; when openOnly is set (the web hot poll, PRD #1371)
 // it lists only live custody (state='open'), dropping resolved released/discarded history. It
-// stamps each hold with a server-derived Attention, and folds the aggregate: OpenHolds and
-// BlockedRuns come from the aggregate query (the SAME predicate ClaimRun/health gate on),
+// stamps each hold with a server-derived Attention, and folds the aggregate: OpenHolds is
+// total open custody; AdmissionCountedHolds and BlockedRuns use the admission predicate,
 // CustodyHoldLimit from the configured ceiling, and DecisionNeeded is the count of holds whose
 // derived attention awaits an owner decision (needs_action or source_only) — active protection and
 // self-releasing archive_ready rows are excluded (D10). OpenHolds/BlockedRuns come from the
@@ -851,6 +867,7 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // always non-nil so it marshals as [] (never null). No run scope — this is the owner-wide list;
 // the CLI narrows by run.
 func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openOnly bool) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	now := s.now()
 	params := store.ListCustodyHoldsForOwnerParams{UserID: userID}
 	if openOnly {
 		// Bound the list to live custody (PRD #1371): drop resolved (released/discarded)
@@ -873,7 +890,7 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		dto.CheckpointRef = r.CheckpointRef.String
 		dto.CheckpointTip = r.CheckpointTip.String
 		dto.CheckpointState = r.CheckpointState.String
-		if isDecisionAttention(dto.Attention) {
+		if r.DecisionNeeded {
 			decisionNeeded++
 		}
 		holds = append(holds, dto)
@@ -881,16 +898,18 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 	agg, err := s.store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
 		UserID:           userID,
 		CustodyHoldLimit: s.limits.CustodyHoldLimit,
+		HeartbeatCutoff:  pgconv.Time(now.Add(-s.limits.WorkerHeartbeatStale)),
 	})
 	if err != nil {
 		return apitypes.RecoveryCustodyHoldsDTO{}, err
 	}
 	return apitypes.RecoveryCustodyHoldsDTO{
 		Aggregate: apitypes.RecoveryCustodyAggregateDTO{
-			OpenHolds:        int(agg.OpenHolds),
-			CustodyHoldLimit: int(s.limits.CustodyHoldLimit),
-			DecisionNeeded:   decisionNeeded,
-			BlockedRuns:      int(agg.BlockedRuns),
+			OpenHolds:             int(agg.OpenHolds),
+			AdmissionCountedHolds: int(agg.AdmissionCountedHolds),
+			CustodyHoldLimit:      int(s.limits.CustodyHoldLimit),
+			DecisionNeeded:        decisionNeeded,
+			BlockedRuns:           int(agg.BlockedRuns),
 		},
 		Holds: holds,
 	}, nil
@@ -959,7 +978,7 @@ func (s *Service) CustodyDecisionsByWorker(ctx context.Context, ids []uuid.UUID)
 		return nil, err
 	}
 	for _, row := range rows {
-		if _, requested := counts[row.WorkerID]; requested && isDecisionAttention(deriveHoldAttention(batchHoldAttentionInput(row))) {
+		if _, requested := counts[row.WorkerID]; requested && row.DecisionNeeded {
 			counts[row.WorkerID]++
 		}
 	}

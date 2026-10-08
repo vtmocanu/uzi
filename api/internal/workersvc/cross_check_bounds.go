@@ -45,7 +45,7 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 	if err != nil || len(digest) != 32 {
 		return ErrCrossCheckRefused
 	}
-	_, err = crossCheckClaimInput(store.CrossCheck{
+	_, err = crossCheckCandidateInput(store.CrossCheck{
 		Stage: input.Stage, Round: input.Round, LeadRunID: leadID,
 		PlanMd: pgtype.Text{String: input.PlanMd, Valid: true}, Milestones: input.Milestones,
 		RequiredCapabilities: input.RequiredCapabilities, RequiredTools: input.RequiredTools,

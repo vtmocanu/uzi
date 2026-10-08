@@ -19,8 +19,8 @@ import (
 
 // fakeSidebarDB extends fakeSettingsDB with a canned ListUserSecretsForKind
 // answer, so the sidebar_token_ids PUT arm (validate -> ownership-filter ->
-// store) runs end to end without a real database. Only the secrets listing
-// goes through Query; everything else stays fakeSettingsDB's QueryRow.
+// store) runs end to end without a real database. The secrets listing uses
+// its own rows; the settings reads delegate to fakeSettingsDB.
 type fakeSidebarDB struct {
 	fakeSettingsDB
 	secrets []store.ListUserSecretsForKindRow
@@ -29,7 +29,10 @@ type fakeSidebarDB struct {
 	queryErr error
 }
 
-func (f *fakeSidebarDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+func (f *fakeSidebarDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "-- name: ListUserCrossCheckPins") {
+		return f.fakeSettingsDB.Query(ctx, sql, args...)
+	}
 	if f.queryErr != nil {
 		return nil, f.queryErr
 	}

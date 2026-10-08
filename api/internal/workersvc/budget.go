@@ -47,12 +47,14 @@ const (
 	sizeBudgetFactorL = 5
 
 	// custodyHoldLimit is the PRD #1296 M1 (D2/D4) owner-admission cap: the maximum
-	// UNRESOLVED (state='open') recovery custody holds one owner may accumulate before new
+	// admission-counted open recovery custody holds one owner may accumulate before new
 	// code-run admission PAUSES for that owner. Passed to ClaimRun as @custody_hold_limit;
 	// the claim's custody-admission predicate blocks a claim once the owner is at/above it,
 	// leaving the run queued (a distinct custody-limit reason surfaces through the health
 	// resolver against the SAME predicate in a later milestone). It bounds unpublished work
 	// awaiting recovery disposition PER OWNER (never a global stop-claiming switch, D4).
+	// ADR-2445 excludes at most one valid live current claim's non-decision hold per run;
+	// total custody remains open and still protects cleanup, release and teardown.
 	// Lead-design default 8; operator-configurable in a later milestone.
 	//
 	// Issue #1751 / ADR-1751 continuation exemption: a requeued run that was claimed before

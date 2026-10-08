@@ -62,7 +62,7 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
-import { codexDeferralReason, codexRefreshFailure, isTransientStatus, type WorkerClient } from "../client.js";
+import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
@@ -838,6 +838,15 @@ export class CodexCredentialDeferredError extends Error {
   }
 }
 
+/** Epoch-start release retries exhausted; the runner retains custody and parks credential-free. */
+class CodexInitialCredentialUnavailableError extends Error {
+  readonly deferral = "credential_release_unavailable" as const;
+  constructor() {
+    super("Codex initial credential release is temporarily unavailable");
+    this.name = "CodexInitialCredentialUnavailableError";
+  }
+}
+
 /**
  * PRD #1171 m4 (part 4): the RUN-LANE per-sink auth-mode reconcile closure — the safety facade
  * runs it BEFORE every durability boundary. Mirrors {@link CodexAdviceCredentialBridge}: it
@@ -1547,6 +1556,9 @@ function firstSkillName(args: unknown): string | undefined {
 
 // ─── Injectable seams (production defaults; tests inject fakes) ──────────────────
 export interface CodexExecutorDeps {
+  /** Initial release budget; defaults to six attempts and a 2000ms base (8000ms cap). */
+  readonly initialCredentialAttempts?: number;
+  readonly initialCredentialBaseDelayMs?: number;
   readonly installDeps?: typeof installJsDeps;
   /** Adapts the real M3a launcher for a PROVIDER root; a test injects a fake returning a
    *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND the
@@ -2180,9 +2192,11 @@ export class CodexExecutor implements Executor {
     };
     if (ctx.signal?.aborted) forwardLifecycleAbort();
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
+    const lifecycleSignal = ctx.terminalLifecycleSignal
+      ? AbortSignal.any([lifecycleAbort.signal, ctx.terminalLifecycleSignal]) : lifecycleAbort.signal;
     const installAbort = new AbortController();
     const installState: NonNullable<CodexExecutor["depsInstall"]> = {
-      abort: installAbort, cancellation: lifecycleAbort.signal,
+      abort: installAbort, cancellation: lifecycleSignal,
       reported: false, noted: false,
     };
     this.depsInstall = installState;
@@ -2314,10 +2328,10 @@ export class CodexExecutor implements Executor {
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
-      const credentialReconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched, lifecycleAbort.signal);
+      const credentialReconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched, lifecycleSignal);
       const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
         const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
-        const cancellation = AbortSignal.any([signal, lifecycleAbort.signal]);
+        const cancellation = AbortSignal.any([signal, lifecycleSignal]);
         if (!await this.settleDepsInstall(deadlineAt, cancellation, installState)) {
           return { kind: "blocked", errors: [{ category: "protocol", message: "codex dependency install did not settle before reconcile" }] };
         }
@@ -2390,7 +2404,7 @@ export class CodexExecutor implements Executor {
         // One accountant for this executor claim leg. Internal provider epochs share its cumulative;
         // a later worker claim gets a new accountant and a new explicit init lineage.
         accountant: new CodexUsageAccountant(),
-        lifecycleSignal: lifecycleAbort.signal,
+        lifecycleSignal,
         selection: { current: undefined },
       };
 
@@ -2563,6 +2577,8 @@ export class CodexExecutor implements Executor {
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         let revisions = 0;
         while (verdict.kind === "revise") {
+          if (verdict.automatic === true)
+            throw new TrustedExecutionRefusal("codex cannot consume automatic plan revision");
           const feedback = verdict.feedback;
           // Issue #1604: the re-gate below settles this revise once the revised plan is persisted.
           const settles = verdict.inputId;
@@ -4006,25 +4022,50 @@ export class CodexExecutor implements Executor {
           minimumGeneration: committed.value ?? binding.generation,
         }
       : { authMode: "api_key" as const };
-    let released: Awaited<ReturnType<WorkerClient["releaseCodex"]>>;
-    // issue #2213: no provider credential is fetched for an epoch that cannot start.
-    assertResidueQuarantineOpen("provider_turn");
-    try {
-      released = await this.opts.client.releaseCodex(
-        ctx.runId,
-        { capability: binding.capability },
-        expected,
-        signal,
-      );
-    } catch (err) {
-      // Issue #1766: a locked owner vault is a recoverable deferral, not a capability loss.
-      // Surface it as the typed, secret-free error the runner parks on; anything else keeps
-      // failing closed with the original error.
-      if (codexDeferralReason(err) === "vault_locked") throw new CodexCredentialDeferredError();
-      throw err;
+    const attempts = Math.max(1, Math.floor(this.deps.initialCredentialAttempts ?? 6));
+    const baseDelay = Math.max(0, this.deps.initialCredentialBaseDelayMs ?? 2000);
+    const checkAbort = (): void => {
+      if (signal.aborted) throw new CodexRequestFailure("parent_abort");
+    };
+    // One epoch owns this bounded sequence; a refusal stops it immediately.
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      checkAbort();
+      assertResidueQuarantineOpen("provider_turn");
+      try {
+        const released = await this.opts.client.releaseCodex(
+          ctx.runId, { capability: binding.capability }, expected, signal,
+        );
+        checkAbort();
+        registerToken(released.access_token); // BEFORE any use
+        return released.access_token;
+      } catch (err) {
+        checkAbort(); // Cancellation wins even when the final request fails.
+        if (codexDeferralReason(err) === "vault_locked") throw new CodexCredentialDeferredError();
+        const retryable = err instanceof CodexRequestFailure
+          ? err.kind === "transport" || err.kind === "http_timeout"
+          : err instanceof RequestError && isTransientStatus(err.status);
+        if (!retryable) throw err;
+        this.log.warn("Codex initial credential release unavailable", { attempt, attempts,
+          kind: err instanceof CodexRequestFailure ? err.kind : "http_transient" });
+        if (attempt === attempts) throw new CodexInitialCredentialUnavailableError();
+      }
+      const delay = Math.min(8000, baseDelay * 2 ** (attempt - 1));
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = (): void => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+          reject(new CodexRequestFailure("parent_abort"));
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, delay);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
+      checkAbort();
     }
-    registerToken(released.access_token); // BEFORE any use
-    return released.access_token;
+    throw new CodexInitialCredentialUnavailableError();
   }
 
   /**

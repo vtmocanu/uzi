@@ -74,8 +74,9 @@ directory (`agent/src/outbox.ts`):
 - **Boot.** `Outbox.init()` loads authenticated finalize records next to the terminal journals; an
   unauthenticated record is ignored (left on disk). `listPendingFinalizes()` excludes any run that
   also has a pending terminal journal on this worker, so the journal and its lease win. A boot
-  that resolves a terminal journal also retires that run's finalize records at generations up to
-  the journal's, once the journal is settled.
+  that resolves a terminal journal considers the original finalize records at generations up to
+  the journal's. Settlement or stale supersession of the terminal alone is not finalize authority:
+  each exact generation must pass the worker retirement rule below.
 
 ### D2: carry it on the register snapshot, retire after an accepted Register
 
@@ -92,10 +93,30 @@ list is dropped with a warning and never fails the register or discards the rest
 The wire shape is pinned by the shared fixture `fixtures/worker-register-snapshot/finalize-resume.json`,
 read by tests on both sides.
 
-After a register the api accepts (2xx), the worker retires exactly the offered set (and any
-lower-generation record of the same offered runs). It does not re-list the directory, so a record
-a live G+1 flight writes later is never touched. A failed register retires nothing. There is no
-acknowledgment protocol.
+Before requesting registration, the worker freezes the offered record identities and existing
+lower-generation records. After a register the api accepts (2xx), only the exact original offered
+records gain handoff authority. The process retains at most 256 accepted identities for its
+lifetime, including while a terminal journal hides a record; a replacement with the same key and
+timestamp does not inherit handoff. During the accepted registration cleanup only, captured lower
+originals have temporary batch authority after their own exact custody check; it is not saved as
+handoff. Newly created lower records retain. Registration attempts the frozen set in waves of at
+most 16 within the five-second pass deadline, rather than stopping after the first 16.
+
+Worker-driven retirement requires exact-generation `recoveryInventoryPending === false` and
+either that accepted original identity, temporary lower-original registration authority, or fresh
+runtime-validated ownership with status
+`completed`, `failed` or `cancelled` and a nonnegative safe-integer generation at least the record's.
+If present, `inventory_guarded` must be boolean. Failed requests, omitted records, new entries and
+same-key replacements retain without fresh terminal proof. Missing, malformed, active, pending,
+404 or unavailable ownership is not proof. Boot and live terminal resolution use this same
+predicate, with identities frozen before resolving the terminal.
+
+Retry shares the existing process-wide quarantine of 16 unresolved exact keys, one-second
+candidate deadline and five-second pass deadline. Least recently attempted keys rotate; a failed
+or stalled candidate does not block siblings with available slots. Timed-out calls occupy their
+slots until settlement and late results cannot delete. Identity, cancellation, liveness and
+pending terminals are checked inside the deletion lock. Normal runner retirement after an
+accepted durable outcome remains unchanged. There is no new acknowledgment protocol.
 
 ### D3: the attested register pass and the one-shot resume allowance
 
@@ -171,8 +192,10 @@ snapshotted `pinned` record with `finalizationPin`:
   `no_unpublished_work_after_restart`; this reading is valid only for a finalization pin, never
   for an early pin;
 - otherwise the worker produces a self-contained bundle of H with **no forge fetch and no forge
-  PAT**, journals it, and uploads it at the record's exact generation. The hold becomes
-  `archive_ready` and `uzi run export` works without cluster access. An oversized bundle
+  PAT**, journals it, and uploads it at the record's exact generation. `uzi run export`
+  works without cluster access. Ordinary unguarded holds become `archive_ready`; an OPEN
+  `recovery_wait` / `worker_requeue_exhausted` hold instead remains a `source_only`
+  decision under the #2445 amendment below. An oversized bundle
   (`oversized`), a producer failure (`bundle_failed`) or an upload failure
   (`restart_upload_failed`, the bundle is kept for the next boot) leave the hold needing a
   decision.
@@ -213,9 +236,10 @@ exist. What happens in each case:
   existing path verifies the work and captures it under **G+1** (`recovery_wait` park, then
   settle). This is unchanged behaviour.
 - **The run is held for owner Resume** at exhaustion with unresolved source custody
-  (allowance spent, owner-started episode, or `RUN_MAX_REQUEUES=0`): without an
-  available independently verified capture, G's hold reports retained
-  **`source_only`** custody, not `active_protected`, with no available archive. An
+  (allowance spent, owner-started episode, or `RUN_MAX_REQUEUES=0`): G's OPEN hold
+  reports retained **`source_only`** custody, or `needs_action` after failed latest
+  capture, before archive readiness or capture progress. Export availability is
+  independent of attention; this early-cut case has no archive for G. An
   inventory-guarded hold also reports `source_only` while an EARLIER archive is available:
   that download does not cover the full inventory, so it is neither `archive_ready` nor
   settled custody.
@@ -225,9 +249,10 @@ exist. What happens in each case:
   not survive a pod loss; there the work that existed only in the clone is gone (whatever reached
   the worker's bare tracking ref at a checkpoint remains).
 
-**(c) No archive is stated, not implied.** The server still derives `source_only`; there is no DTO
-or server change and `--json` is unchanged. `uzi run recovery` (both the owner view and the per-run
-view) now prints, for a `source_only` hold, `hold <id>: no recovery archive; custody of worker
+**(c) No archive is stated only when absent.** `--json` is unchanged. Under the #2445
+amendment, attention is independent of archive availability and latest capture progress.
+`uzi run recovery` (both the owner view and the per-run view) prints, for a `source_only`
+hold without an archive or in-flight capture, `hold <id>: no recovery archive; custody of worker
 <name>'s local source is retained (export unavailable; it may be the only copy)`. It offers
 `uzi run export` only for an open hold that has an available archive, and suggests `uzi run
 discard` for holds awaiting a decision. The discard hint itself prints no warning: the only-copy
@@ -615,16 +640,32 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    custody exists; no recorded recovery evidence or unresolved custody keeps
    `failed` / `worker_lost` (not proof that no unrecorded work survives).
    `finalize_resume_generation` stays G (the allowance is not reused);
-   `uzi run recovery <B>` shows either an `archive_ready` hold
-   whose archive `uzi run export` downloads (a finalization-pinned source), or a `source_only` hold
-   printed as "no recovery archive; custody ... retained (export unavailable ...)", or an
-   inventory-guarded `source_only` hold whose earlier archive is still downloadable (custody
-   stays open; that archive does not settle it). It must never show a silent empty hold.
+   `uzi run recovery <B>` shows the OPEN exhaustion hold as `source_only`, or
+   `needs_action` if the latest capture failed, even when an independently verified
+   archive is available or the latest capture is preparing/uploading. `uzi run export`
+   downloads any available archive independently of attention; an earlier archive may
+   omit latest worker-local work. Without an archive, output states export is unavailable
+   and reports any capture progress. Guarded inventory warnings remain. Custody stays
+   open for owner Resume/Cancel; capture readiness never implicitly releases this
+   exhaustion hold. This supersedes only the exhaustion-specific `archive_ready`
+   expectation above; ordinary archive-backed settlement is unchanged. It must never
+   show a silent empty hold.
 9. Optional pod-loss variant (Docker lane): delete the pod instead of killing the process at step
    4. The finalize record on `/data` still drives the allowance. For a cut before fetch-back, G's
    hold reports `source_only` (D4b).
 10. Let the trap run (or run the explicit restore above), verify both restorations, and record the
     observed outcome on issue #1742.
+
+## Amendment 2026-10-08 — #2445 exhaustion attention
+
+OPEN custody for `recovery_wait` / `worker_requeue_exhausted` takes precedence over
+archive readiness and in-flight capture states: failed latest capture yields
+`needs_action`, otherwise `source_only`. Availability remains independent and permits
+export of an existing archive without promising full or latest-work coverage. Owner
+Resume/Cancel remains required; neither a download nor capture progress implicitly
+releases custody. This narrowly qualifies the earlier archive-ready/no-archive
+expectations for exhaustion, including D4 and the procedure above. Inventory-guarded
+warnings and release safeguards are unchanged.
 
 ## Amendment 2026-10-07 — #2394 owner-resumed recovery episodes
 

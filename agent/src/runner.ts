@@ -84,7 +84,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
+import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type RecoveryRecord } from "./recovery.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -264,7 +264,7 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  reports just a count of the in-scope processes that outlived the reap. Any capture outcome that
  *  is NOT a blocked proof resets the count. The wall time before that failure is typically about
  *  30 s at the defaults (5 reap deadlines of 5 s plus 4 recoveryRetryMs backoffs), with no terminal cap for
- *  vault_locked or refresh_unknown credential deferrals: those retain custody and retry with
+ *  credential deferrals: those retain custody and retry with
  *  capped exponential waits until a valid proof or an ownership/cancel/shutdown exit. For other
  *  causes this is not a strict ceiling: it runs faster when
  *  a proof returns early (a `survivors` proof with nothing left to kill returns at once, so the
@@ -423,12 +423,16 @@ class BoundaryStepTracker {
  *  boundary-reconcile block (`CodexBoundaryError`, finalize/checkpoint sinks) or as a failed epoch
  *  credential release or a mid-turn app-server refresh (`CodexCredentialDeferredError`, epoch
  *  recreation / issue #1789). An ambiguous subscription refresh carries refresh_unknown through
- *  the boundary error. Like
+ *  the boundary error. Epoch-start retry exhaustion carries credential_release_unavailable
+ *  through CodexInitialCredentialUnavailableError. Like
  *  {@link isCodexBoundaryError} it reads only the error's `name` and its `deferral` field (never
  *  `instanceof`, never the message text), so the runner never imports agent/src/codex/**. Returns
- *  "vault_locked" or "refresh_unknown" only for those two names carrying an exact deferral. */
-function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | undefined {
+ *  the fixed deferral only for its matching error name and field. */
+function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | "credential_release_unavailable" | undefined {
   if (!(err instanceof Error)) return undefined;
+  if (err.name === "CodexInitialCredentialUnavailableError") {
+    return (err as { deferral?: unknown }).deferral === "credential_release_unavailable" ? "credential_release_unavailable" : undefined;
+  }
   if (err.name !== "CodexBoundaryError" && err.name !== "CodexCredentialDeferredError") return undefined;
   const deferral = (err as { deferral?: unknown }).deferral;
   return deferral === "vault_locked" || deferral === "refresh_unknown" ? deferral : undefined;
@@ -507,7 +511,7 @@ interface ExecutionRejection {
 
 type RecoveryParkCause =
   | { kind: "transient" }
-  | { kind: "vault_locked" | "refresh_unknown" }
+  | { kind: "vault_locked" | "refresh_unknown" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean };
 
 /** What {@link RunRunner.captureRecoveryRestorePoint} reports. `residueBlocked` (issue #1783 M3)
@@ -545,6 +549,16 @@ const VAULT_PARK_FEED = {
     "The run owner's vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
   held:
     "The run owner's vault is locked and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
+} as const;
+
+/** An unavailable initial release carries no inferred vault cause. */
+const RELEASE_UNAVAILABLE_PARK_FEED = {
+  ...CREDENTIAL_PARK_FEED,
+  published: "Paused: credential release is temporarily unavailable. The recovery checkpoint is published; this run can resume at its next retry.",
+  local: "Paused: credential release is temporarily unavailable. The recovery checkpoint is saved only on this worker; this run can resume at its next retry.",
+  confirmUnknown: "Could not confirm this run is still running; keeping its local work and session and retrying before pausing.",
+  reportFailed: "Could not record the recovery pause yet; keeping the local work and session and retrying.",
+  held: "This run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
 
 /** An ambiguous refresh has no inferred vault cause; notices remain neutral and deduplicated. */
@@ -2433,12 +2447,13 @@ export class RunRunner {
   }
 
   private async withInventorySourceBoundary(
-    context: { runId: string; generation: number; barePath: string },
+    context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ): Promise<"passed" | "retained"> {
     const { runId, barePath } = context;
+    const refuse = inventorySourceReporter(context);
     // Never wait on an executing lane: terminal-journal drain can call recovery itself.
-    if (this.executionTails.has(runId)) return "retained";
+    if (this.executionTails.has(runId)) { refuse({ check: "execution_tail_present" }); return "retained"; }
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
@@ -2447,9 +2462,10 @@ export class RunRunner {
       let sourceIdentity: string | undefined;
       const prove = async (): Promise<boolean> => {
         const inventory = await this.git.readInventoryCloneHeads(barePath, runId);
-        if (inventory.kind !== "verified") return false;
+        if (inventory.kind !== "verified")
+          return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
         const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
-        if (sourceIdentity !== undefined && sourceIdentity !== identity) return false;
+        if (sourceIdentity !== undefined && sourceIdentity !== identity) return refuse({ check: "source_identity_changed" });
         sourceIdentity = identity;
         // Each owned physical source is checked once per proof; a failed sibling blocks FINAL.
         for (const clone of inventory.clones) {
@@ -2461,21 +2477,27 @@ export class RunRunner {
             otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
             site: "inventory_source",
           };
-          if (process.platform !== "linux" || this.liveAttempts.isLivePath(clone.clonePath)) return false;
+          if (process.platform !== "linux") return refuse({ check: "non_linux_host" });
+          if (this.liveAttempts.isLivePath(clone.clonePath)) return refuse({ check: "live_attempt_path" });
           const before = await this.quiesceImpl(request);
-          if (before.process?.state !== "quiescent") return false;
+          if (before.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_before_git" });
           const status = await this.git.worktreeStatus(clone.clonePath);
           const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
-          if (status === null || status.length !== 0 || after.process?.state !== "quiescent") return false;
+          if (status === null) return refuse({ check: "worktree_status_unreadable" });
+          if (status.length !== 0) return refuse({ check: "worktree_status_dirty" });
+          if (after.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_after_git" });
         }
         const afterGit = await this.git.readInventoryCloneHeads(barePath, runId);
-        return afterGit.kind === "verified" &&
-          JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) === sourceIdentity;
+        if (afterGit.kind !== "verified")
+          return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(afterGit) });
+        return JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) === sourceIdentity ||
+          refuse({ check: "source_identity_changed" });
       };
       if (!await prove()) return "retained";
       await action(prove);
       return "passed";
     } catch (err) {
+      refuse({ check: "boundary_exception" });
       this.log.warn("recovery: physical source retained", { run_id: runId, error: errMessage(err) });
       return "retained";
     } finally {
@@ -3399,8 +3421,8 @@ export class RunRunner {
         );
         await batcher.close().catch(() => undefined);
       } else if (codexDeferralOf(err) !== undefined) {
-        // Codex credentials were deferred by a confirmed vault lock or an unknown boundary
-        // refresh outcome. Vault locks also arise during epoch release and mid-turn refresh.
+        // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
+        // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
         // That
         // is recoverable, never a failed run: park it for recovery, credential-free. Placed AFTER the
         // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
@@ -3446,7 +3468,7 @@ export class RunRunner {
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
       // a committed publish still propagates to the failed-run report below, unless it carries a
-      // credential deferral (vault_locked or refresh_unknown), which the catch chain parks instead. Once phasePublish
+      // credential deferral, which the catch chain parks instead. Once phasePublish
       // registers the committed terminal callback, however, the pushed branch/open MR is the
       // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
@@ -3880,8 +3902,9 @@ export class RunRunner {
     try {
       const state = await this.recovery.inventoryCleanupState(runId, generation);
       if (state === "acknowledged") return false;
-      if (state !== "legacy") return true;
-      if (this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) return true;
+      if (state === "absent" || state === "pending" || this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) {
+        return !(await this.client.hasRecoveryRetirementAuthority(runId, generation, state === "absent" ? "absent" : "pending"));
+      }
       if (this.client.hasFeature("recovery_inventory_v1")) {
         return (await this.client.listRecoveryHolds(runId)).holds.some(h => h.generation === generation && h.inventory_guarded === true);
       }
@@ -4384,8 +4407,8 @@ export class RunRunner {
     });
 
     if (features.includes("recovery_park_cause")) {
-      // Full #1392 api: the TYPED report. The api's park transaction settles this generation's
-      // hold and parks (or fails at the cap) in one shot, so the worker calls NO release endpoint.
+      // Full #1392 api: the TYPED report parks (or fails at the cap) atomically. Legacy holds
+      // settle in that transaction; guarded holds require worker evidence after the ack below.
       const body: StateRequest = {
         status: "recovery_wait",
         recovery_cause: "forge_unreachable",
@@ -4891,12 +4914,14 @@ export class RunRunner {
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
       // cancelled, or failed when the cap branch committed the terminal state, or any other
       // authoritative terminal status: close the still-open batcher, no park event, no second
-      // report. The finally does the (empty, pre-clone) cleanup.
+      // report. A guarded pre-clone hold still needs positive empty-inventory evidence
+      // after this confirmed terminal outcome; the finally does ordinary cleanup.
       runLog.info(`${copy.log}: ack was authoritative terminal; cleaning up without a park`, {
         run_id: flight.runId,
         status: ack.status,
       });
       await batcher.close().catch(() => undefined);
+      await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
       return "stop";
     }
     // Any other 409 (or an unmodelled non-park, non-terminal status): today's failed path,
@@ -5036,6 +5061,11 @@ export class RunRunner {
           status,
         });
         await batcher.close().catch(() => undefined);
+        // Older ownership responses may omit the generation. A terminal status alone
+        // cannot settle this claim: require the explicit exact-generation proof first.
+        if (probe.claim_generation !== undefined && probe.claim_generation === claim.claim_generation) {
+          await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
+        }
         return "stop";
       }
       if (status === "running") {
@@ -9284,7 +9314,7 @@ export class RunRunner {
         // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
         // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
         // fails the run — the intended fail-closed behavior for a credentialed durability boundary —
-        // EXCEPT a credential deferral (vault_locked or refresh_unknown): that error still propagates, but executeClaim's
+        // EXCEPT a credential deferral: that error still propagates, but executeClaim's
         // catch chain parks the run for recovery credential-free instead of failing it.
         // issue #1783 (auditor M2): the flight rides along, so the milestone proves the clone
         // quiescent first. On survivors/unverified THIS checkpoint's publish (and its overlay PAT
@@ -9409,6 +9439,8 @@ export class RunRunner {
     let checkedHuman: CheckedHumanGate | undefined;
     let continueCheckedStorage: (() => Promise<PlanVerdict>) | undefined;
     let crossCheckSelected = false;
+    let crossCheckRound = 1;
+    let crossCheckDiscoveryDone = false;
     // Each strict operation freezes generation/session and the complete request before first send.
     const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
     const reportCheckedState = (body: StateRequest): Promise<StateAck> => {
@@ -9540,6 +9572,7 @@ export class RunRunner {
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
+      terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       // PRD #1190 rework (N2/N1): expose the steering channel's sticky pause/cancel state to the
       // implement loop, because the single shared abort controller (cancel/ctx.signal) fires
       // 'abort' exactly once and cannot deliver a second steering signal. cancelRequested lets the
@@ -9653,8 +9686,9 @@ export class RunRunner {
         let releaseStateBarrier: (() => void) | undefined;
         let failStateBarrier: ((error: unknown) => void) | undefined;
         if (eligible && !crossCheckSelected && !checkedHuman) {
-          crossCheckSelected = true; // One candidate per execution, including refusal/fallback.
-          checkedHuman = { phase: "publishinginitial" };
+          const discoverRound = !crossCheckDiscoveryDone && flight.claimGeneration > 1;
+          crossCheckDiscoveryDone = true;
+          crossCheckSelected = true;
           const barrier = new Promise<void>((resolve, reject) => {
             releaseStateBarrier = () => { flight.checkedStateBarrier = undefined; resolve(); };
             failStateBarrier = (error) => { flight.checkedStateBarrier = undefined; reject(error); };
@@ -9667,28 +9701,67 @@ export class RunRunner {
             // separately drains usage debounce/in-flight HTTP and outbox delivery receipts.
             await Promise.all(flight.stateSenders ?? []);
             steering.lifecycleSignal().throwIfAborted();
-            if (claim.secrets.codex) {
+            if (discoverRound && !claim.secrets.codex) {
+              // One bounded, owner-cancellable discovery per reclaimed execution. Metadata
+              // selects a submit attempt; it never supplies content or an approval grant.
+              const owner = steering.lifecycleSignal();
+              const latest = await this.client.planCrossCheckLatest(runId, flight.claimGeneration,
+                AbortSignal.any([owner, AbortSignal.timeout(this.planCrossCheckTiming?.requestMs ?? 3000)]));
+              owner.throwIfAborted();
+              if (latest.candidate_generation > flight.claimGeneration)
+                throw new Error("plan cross-check: future candidate generation");
+              if (latest.next_round_eligible && latest.next_round !== null) {
+                crossCheckRound = latest.next_round;
+              } else if (latest.result === "latest" &&
+                  latest.candidate_generation === flight.claimGeneration &&
+                  (latest.fallback_reason === "" || latest.fallback_reason === "approve")) {
+                crossCheckRound = latest.round; // Retry exact current attempt; submit revalidates.
+              } else {
+                if (latest.result !== "latest")
+                  throw new Error("plan cross-check: latest metadata cannot select an attempt");
+                const reason = latest.fallback_reason === "" || latest.fallback_reason === "approve"
+                  ? "interrupted" : latest.fallback_reason;
+                checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: reason };
+                crossCheckReason = `plan cross-check: ${reason.replaceAll("_", " ")}`;
+                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
+              }
+            }
+            if (checkedHuman) {
+              // Discovery selected an existing fallback, without adopting a human presentation.
+            } else if (claim.secrets.codex) {
               crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
-              checkedHuman.onApplied = () => releaseStateBarrier?.();
+              checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
               const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
                   plan_cross_check_diff_refusal: captured.refusal };
-                checkedHuman.onApplied = () => releaseStateBarrier?.();
+                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
                 const decision = await checkPlan({ client: this.client, runId, generation: flight.claimGeneration,
                   candidate: { plan_md: planMd, milestones: milestones ?? [],
                     required_capabilities: toolchainDetection?.required_capabilities ?? [],
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-                    planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming });
+                    planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
+                  round: crossCheckRound, allowAutomaticRevision: true });
                 if (decision.kind === "approve") {
                   checkedApproval = decision.response;
-                  checkedHuman = undefined;
+                } else if (decision.kind === "revise") {
+                  // checkPlan has released the decided proof and settled usage. Release and
+                  // await this exact barrier before allowing another executor planning turn.
+                  releaseStateBarrier?.();
+                  await barrier;
+                  steering.lifecycleSignal().throwIfAborted();
+                  crossCheckRound = decision.response.round + 1;
+                  crossCheckSelected = false;
+                  return { kind: "revise", automatic: true, round: decision.response.round,
+                    feedback: decision.response.findings?.summary ?? "Plan cross-check requested changes.",
+                    ...(decision.response.findings ? { items: decision.response.findings.items } : {}) };
                 } else {
+                  checkedHuman = { phase: "publishinginitial" };
                   checkedFields = decision.fields;
                   const reason = checkedFields.plan_cross_check_gate_reason!;
                   crossCheckReason = reason === "revise" ? "plan cross-check: changes requested" :
@@ -10640,7 +10713,7 @@ export class RunRunner {
       const chunk = fresh.slice(i, i + 8);
       const labels = chunk.map(s => s.slice(0, 12));
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
-        archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; final custody ACK pending. Use uzi run recovery or uzi run export.`
+        archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; local custody retained. Use uzi run recovery or uzi run export.`
           : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
       } });
       for (const s of chunk) seen.add(s);
@@ -10719,16 +10792,27 @@ export class RunRunner {
       const outcome = await this.recovery.captureAndUpload({
         record, barePath, defaultBranch: record.defaultBranch!, signal,
       });
-      if (outcome.state !== "uploaded") flight.preserveRecoveryClone = true;
+      // captureAndUpload persists the bundle facts on a newer journal revision.
+      const uploaded = outcome.state === "uploaded"
+        ? (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId)
+        : undefined;
+      // A self-contained upload may still need the terminal quiescence/FINAL pass.
+      // Thin or unknown captures retain the clone; cleanup keeps its independent ACK guard.
+      if (outcome.state !== "uploaded" ||
+          (await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged" &&
+           (uploaded?.state !== "uploaded" || uploaded.selfContained !== true ||
+            !Array.isArray(uploaded.prerequisiteShas) || uploaded.prerequisiteShas.length !== 0))) {
+        flight.preserveRecoveryClone = true;
+      }
       this.announceOwedHeads(flight, record.originalRoots?.map(r => r.sha) ?? [], outcome.state === "uploaded");
       if (outcome.state === "uploaded") {
-        // captureAndUpload persists the reservation on a newer journal revision.
-        const uploaded = (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId);
         if (uploaded?.serverCaptureId && uploaded.state === "uploaded") {
           const noticeIdentity = JSON.stringify([uploaded.serverCaptureId, uploaded.finalAcknowledged === true]);
           const text = uploaded.finalAcknowledged
             ? `Recovery archive ${uploaded.serverCaptureId} covers the frozen inventory; custody transfer confirmed. Use uzi run recovery or uzi run export.`
-            : `Earlier recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending. Use uzi run recovery or uzi run export.`;
+            : uploaded.selfContained === false
+              ? `Recovery archive ${uploaded.serverCaptureId} requires retained prerequisites; local sources and custody intentionally retained. Use uzi run recovery or uzi run export.`
+              : `Recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending, local sources retained. Use uzi run recovery or uzi run export.`;
           if (!flight.inventoryArchiveNotices.has(noticeIdentity)) {
             flight.inventoryArchiveNotices.add(noticeIdentity);
             if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
@@ -13110,7 +13194,8 @@ export class RunRunner {
    * recovery_wait status, including an idempotent 409 after a lost success ACK.
    *
    * Issue #1766: `cause` selects the park. `transient` (the default) is the path above, unchanged.
-   * `vault_locked` and `refresh_unknown` credential deferrals differ in these ways:
+   * Credential deferrals (vault lock, unknown refresh or unavailable initial release) differ
+   * from ordinary transient recovery in these ways:
    *   - it first confirms the run is `running` at this claim's generation
    *     ({@link confirmRunningForCredentialPark}); a stale claim or another generation stops silently, a
    *     server wall park retains everything, and a 404 keeps the clone and session unless a
@@ -13136,7 +13221,7 @@ export class RunRunner {
    *     settle is observed empty;
    *   - the capture publishes with no overlay and no boundary (credentialFree);
    *   - only a confirmed vault lock is typed `recovery_cause: "vault_locked"` when the api advertises
-   *     `recovery_cause_vault_locked`; refresh_unknown is always untyped and uses neutral notices;
+   *     `recovery_cause_vault_locked`; the other credential deferrals are untyped with neutral notices;
    *   - it never runs the credentialed reap-then-settle (which would retry the deferred credential
    *     operation and could release custody), so the custody hold is kept;
    *   - a cancel captures, then reports `run cancelled` without the credentialed pre-report reap;
@@ -13155,11 +13240,11 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
     opts: { terminalDisk?: boolean } = {},
   ): Promise<boolean> {
-    // Both credential deferrals use the same credential-free proof/custody posture.
+    // Credential deferrals share the credential-free proof/custody posture.
     // Unknown outcomes never imply a locked vault or send an API recovery cause.
-    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown";
+    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown" || cause.kind === "credential_release_unavailable";
     if (credentialDeferred) flight.keepGuardedInventoryOpen = true;
-    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : cause.kind === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
     // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
     // stop's counted one). The transient park's steps, with the typed cause on the park report and
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
@@ -13478,7 +13563,7 @@ export class RunRunner {
               cause = { kind: deferral };
               credentialDeferred = true;
               flight.keepGuardedInventoryOpen = true;
-              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : deferral === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
               settled = false;
             }

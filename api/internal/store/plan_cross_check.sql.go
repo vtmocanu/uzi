@@ -12,12 +12,140 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getCrossCheckChildProtocol = `-- name: GetCrossCheckChildProtocol :one
+SELECT cc.round FROM cross_checks cc JOIN runs child ON child.id = cc.checker_run_id
+JOIN runs lead ON lead.id = cc.lead_run_id
+WHERE child.id = $1 AND child.kind = 'cross_check'
+ AND child.target_run_id = lead.id AND child.user_id = lead.user_id
+ AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = lead.id AND latest.stage = 'plan')
+ AND cc.verdict = 'pending' AND cc.deadline_at > now()
+ AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND cc.lead_claim_generation = lead.claim_generation
+ AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1))
+`
+
+func (q *Queries) GetCrossCheckChildProtocol(ctx context.Context, childID uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, getCrossCheckChildProtocol, childID)
+	var round int32
+	err := row.Scan(&round)
+	return round, err
+}
+
+const getExactPlanCrossCheck = `-- name: GetExactPlanCrossCheck :one
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited FROM cross_checks
+WHERE lead_run_id = $1 AND stage = 'plan' AND round = $2 FOR UPDATE
+`
+
+type GetExactPlanCrossCheckParams struct {
+	LeadRunID uuid.UUID `json:"lead_run_id"`
+	Round     int32     `json:"round"`
+}
+
+func (q *Queries) GetExactPlanCrossCheck(ctx context.Context, arg GetExactPlanCrossCheckParams) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, getExactPlanCrossCheck, arg.LeadRunID, arg.Round)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+		&i.CheckerModelSource,
+		&i.CheckerEffortSource,
+		&i.AutomaticRevisionLimit,
+		&i.AutomaticRoundsEnabled,
+		&i.InterruptedAt,
+		&i.WaitCredited,
+	)
+	return i, err
+}
+
+const getPlanCrossCheckClaimingWorkerCaps = `-- name: GetPlanCrossCheckClaimingWorkerCaps :one
+SELECT worker.protocol_capabilities FROM workers worker JOIN runs lead ON lead.worker_id = worker.id
+WHERE lead.id = $1 AND worker.id = $2 AND worker.user_id = $3
+ AND lead.user_id = worker.user_id AND lead.claim_generation = $4
+ AND lead.claim_released_at IS NULL AND lead.status IN ('claimed','running','awaiting_approval')
+`
+
+type GetPlanCrossCheckClaimingWorkerCapsParams struct {
+	LeadRunID       uuid.UUID `json:"lead_run_id"`
+	WorkerID        uuid.UUID `json:"worker_id"`
+	UserID          uuid.UUID `json:"user_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+func (q *Queries) GetPlanCrossCheckClaimingWorkerCaps(ctx context.Context, arg GetPlanCrossCheckClaimingWorkerCapsParams) ([]string, error) {
+	row := q.db.QueryRow(ctx, getPlanCrossCheckClaimingWorkerCaps,
+		arg.LeadRunID,
+		arg.WorkerID,
+		arg.UserID,
+		arg.ClaimGeneration,
+	)
+	var protocol_capabilities []string
+	err := row.Scan(&protocol_capabilities)
+	return protocol_capabilities, err
+}
+
+const getPlanCrossCheckMetadata = `-- name: GetPlanCrossCheckMetadata :one
+SELECT round, lead_claim_generation, verdict, reason_class, deadline_at, decided_at,
+       automatic_revision_limit, automatic_rounds_enabled, interrupted_at
+FROM cross_checks WHERE lead_run_id = $1 AND stage = 'plan'
+ORDER BY round DESC LIMIT 1
+`
+
+type GetPlanCrossCheckMetadataRow struct {
+	Round                  int32              `json:"round"`
+	LeadClaimGeneration    int64              `json:"lead_claim_generation"`
+	Verdict                string             `json:"verdict"`
+	ReasonClass            pgtype.Text        `json:"reason_class"`
+	DeadlineAt             pgtype.Timestamptz `json:"deadline_at"`
+	DecidedAt              pgtype.Timestamptz `json:"decided_at"`
+	AutomaticRevisionLimit int32              `json:"automatic_revision_limit"`
+	AutomaticRoundsEnabled bool               `json:"automatic_rounds_enabled"`
+	InterruptedAt          pgtype.Timestamptz `json:"interrupted_at"`
+}
+
+func (q *Queries) GetPlanCrossCheckMetadata(ctx context.Context, leadRunID uuid.UUID) (GetPlanCrossCheckMetadataRow, error) {
+	row := q.db.QueryRow(ctx, getPlanCrossCheckMetadata, leadRunID)
+	var i GetPlanCrossCheckMetadataRow
+	err := row.Scan(
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.DeadlineAt,
+		&i.DecidedAt,
+		&i.AutomaticRevisionLimit,
+		&i.AutomaticRoundsEnabled,
+		&i.InterruptedAt,
+	)
+	return i, err
+}
+
 const hasLivePlanCrossCheck = `-- name: HasLivePlanCrossCheck :one
 SELECT EXISTS (
     SELECT 1 FROM cross_checks cc
     JOIN runs lead ON lead.id = cc.lead_run_id
     WHERE lead.id = $1 AND lead.plan_cross_check_required
-      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
       AND cc.lead_claim_generation = lead.claim_generation
       AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
       AND cc.deadline_at > now()
@@ -38,7 +166,7 @@ SELECT EXISTS (
 )::boolean AS has_pending_plan_cross_check
 `
 
-// Strict settlement proof: an expired or stale pending row still requires settlement.
+// Strict settlement proof: even expired, stale or malformed pending rows require settlement.
 func (q *Queries) HasPendingPlanCrossCheck(ctx context.Context, leadRunID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, hasPendingPlanCrossCheck, leadRunID)
 	var has_pending_plan_cross_check bool
@@ -143,4 +271,52 @@ func (q *Queries) LockWorkerRecoveryParents(ctx context.Context, arg LockWorkerR
 		return nil, err
 	}
 	return items, nil
+}
+
+const supersedeUnstoredPlanApproval = `-- name: SupersedeUnstoredPlanApproval :one
+UPDATE cross_checks cc SET verdict = 'failed', reason_class = 'approved_not_stored',
+ interrupted_at = COALESCE(cc.interrupted_at, lead.claim_released_at, lead.status_since)
+FROM runs lead WHERE lead.id = cc.lead_run_id AND lead.id = $1
+ AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = lead.id AND latest.stage = 'plan')
+ AND cc.lead_claim_generation <> lead.claim_generation AND cc.verdict = 'approve'
+ AND cc.automatic_rounds_enabled
+ AND lead.plan_md IS NULL AND lead.auto_approve AND lead.gate_revision = 0
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited
+`
+
+func (q *Queries) SupersedeUnstoredPlanApproval(ctx context.Context, leadRunID uuid.UUID) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, supersedeUnstoredPlanApproval, leadRunID)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+		&i.CheckerModelSource,
+		&i.CheckerEffortSource,
+		&i.AutomaticRevisionLimit,
+		&i.AutomaticRoundsEnabled,
+		&i.InterruptedAt,
+		&i.WaitCredited,
+	)
+	return i, err
 }

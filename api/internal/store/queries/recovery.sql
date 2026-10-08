@@ -6,7 +6,7 @@
 
 -- name: BindCaptureManifest :one
 -- D2/D4: compare-and-set the byte manifest ONCE. The first bind (manifest_bound=false)
--- always wins; a retry with the SAME byte_size+checksum is idempotent (the second
+-- always wins; a retry with the SAME byte_size+checksum+ordered prerequisites is idempotent (the second
 -- disjunct matches and re-stamps updated_at); a DIFFERENT manifest under the same
 -- capture_id matches neither disjunct and returns zero rows (a conflict the caller must
 -- surface, never an overwrite of bound bytes). Manifest size/checksum/prerequisites need
@@ -19,7 +19,8 @@ SET manifest_bound = true,
     prerequisite_shas = @prerequisite_shas,
     updated_at = now()
 WHERE id = @id
-  AND (manifest_bound = false OR (byte_size = @byte_size AND checksum = @checksum))
+  AND (manifest_bound = false OR (byte_size = @byte_size AND checksum = @checksum
+    AND COALESCE(prerequisite_shas, '{}'::text[]) = COALESCE(@prerequisite_shas::text[], '{}'::text[])))
 RETURNING *;
 
 -- name: InsertCaptureChunk :exec
@@ -129,11 +130,27 @@ SELECT EXISTS (
 -- reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
 -- for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
 -- classes (migration 00232).
-UPDATE recovery_custody_holds
+-- Worker retry exhaustion and memory pressure require an owner decision even with an available archive.
+-- Lock the run before updating its hold, matching the lifecycle's run-before-hold order.
+-- Read status from the locked tuple: if exhaustion commits while this statement waits,
+-- locked_run observes it and the delayed reconciler candidate moves zero rows.
+WITH locked_run AS MATERIALIZED (
+    SELECT r.id, r.status, r.recovery_wait_cause
+    FROM runs r
+    JOIN recovery_custody_holds h ON h.run_id = r.id
+    WHERE h.id = @id
+    FOR UPDATE OF r
+)
+UPDATE recovery_custody_holds AS target
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
     released_at = now(), updated_at = now()
-WHERE id = @id AND state = 'open' AND NOT inventory_guarded;
+WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
+  AND NOT EXISTS (
+      SELECT 1 FROM locked_run r
+      WHERE r.status = 'recovery_wait'
+        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure')
+  );
 
 -- name: DiscardCaptureForOwner :one
 -- D7: owner-initiated explicit discard of one capture. Deletes its byte chunks (freeing
@@ -226,9 +243,9 @@ WHERE state IN ('preparing', 'uploading')
 --       covered by THIS hold is durably archived, which releases THIS hold's custody (D3).
 --       This is already a strict per-hold test, so a sibling hold's ready capture never
 --       qualifies it.
--- It NEVER infers success from an arbitrary terminal status: a 'failed'/'cancelled'/future
--- 'partial' run with no ready capture, and a 'running'/'queued' run, are excluded (a failed
--- run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
+-- Source-only failed/cancelled/partial/running/queued holds remain open. A ready capture
+-- qualifies its exact legacy hold via (b), even before run completion.
+-- Returns oldest-first for stable reconcile order;
 -- the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
 -- and release agree per-hold and a sibling hold is never collaterally released.
 --
@@ -250,6 +267,12 @@ SELECT h.*,
     END::text AS reason
 FROM recovery_custody_holds h
 WHERE h.state = 'open' AND NOT h.inventory_guarded
+  -- Archive readiness cannot implicitly resolve an owner retry-exhaustion or memory-pressure decision,
+  -- including an older available capture alongside a newer upload for this hold.
+  AND NOT EXISTS (SELECT 1 FROM runs r
+                    WHERE r.id = h.run_id
+                      AND r.status = 'recovery_wait'
+                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -331,6 +354,12 @@ RETURNING *;
 -- the forge pre-clone park passes 'no_adopted_source' (a generation that never adopted a
 -- source has nothing to prove against the forge). CHECK-constrained to the five classes
 -- (migration 00232).
+-- Recheck owner holds under the run lock before any legacy worker release.
+WITH locked_run AS MATERIALIZED (
+    SELECT r.id, r.status, r.recovery_wait_cause
+    FROM runs r WHERE r.id = @run_id
+    FOR UPDATE OF r
+)
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
@@ -338,7 +367,9 @@ SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
 WHERE run_id = @run_id
   AND generation = @generation
   AND live_worker_id = @worker_id::uuid
-  AND state = 'open' AND NOT inventory_guarded;
+  AND state = 'open' AND NOT inventory_guarded
+  AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'));
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
@@ -614,20 +645,13 @@ SELECT
     h.final_source_sha,
     h.final_coverage_digest,
     COALESCE(w.name, '')::text AS worker_name,
-    (EXISTS (SELECT 1 FROM recovery_captures c
-        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
-    COALESCE((SELECT c.state FROM recovery_captures c
-        WHERE c.hold_id = h.id
-        ORDER BY c.created_at DESC, c.id DESC
-        LIMIT 1), '')::text AS capture_state,
-    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
-    COALESCE(r.status, '')::text AS run_status,
+    f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed,
     cr.ref AS checkpoint_ref,
     cr.tip AS checkpoint_tip,
     cr.state AS checkpoint_state
 FROM recovery_custody_holds h
+JOIN recovery_custody_hold_facts f ON f.id = h.id AND f.user_id = h.user_id
 LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
-LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
 LEFT JOIN checkpoint_retentions cr ON cr.run_id = h.run_id AND cr.user_id = h.user_id
     AND cr.state <> 'deleted' AND cr.state <> 'abandoned'
 WHERE h.user_id = @user_id
@@ -638,11 +662,11 @@ ORDER BY h.created_at ASC;
 
 -- name: GetCustodyAggregateForOwner :one
 -- PRD #1349 M1 (D6/D10): the owner-level custody aggregate the board alert and one-per-episode
--- Slack DM read (M6). open_holds is the owner's UNRESOLVED (state='open') hold count — the SAME
--- admission signal ClaimRun blocks on. blocked_runs is the count of the owner's QUEUED
+-- Slack DM read (M6). open_holds is total open custody; admission_counted_holds is the
+-- shared live-claim-discounted admission signal (ADR-2445). blocked_runs counts the owner's QUEUED
 -- code-publishing runs currently blocked by the custody-admission predicate: it mirrors the
 -- reasonCustodyLimit predicate in workersvc/health.go — a run stays queued for custody ONLY when
--- the owner is AT/OVER the limit — so it is 0 unless open_holds >= @custody_hold_limit (and a
+-- the owner is AT/OVER the limit — so it is 0 unless admission_counted_holds >= @custody_hold_limit (and a
 -- non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
 -- The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
 -- task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
@@ -650,18 +674,21 @@ ORDER BY h.created_at ASC;
 -- bound that stops a never-started sweep loop) is NOT blocked — ClaimRun admits it at/over the
 -- cap — so blocked_runs excludes it with the SAME expression ClaimRun and
 -- GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
--- Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
+-- Count columns are cast ::bigint so sqlc types them as int64, never interface{}.
 -- Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
--- top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
+-- SELECT over a single-row CTE, so sqlc's param-type inference cannot pick a single relation
 -- for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column
 -- (it reports "column reference user_id is ambiguous"). The cast types the param directly.
+WITH admission AS MATERIALIZED (
+    SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS counted
+)
 SELECT
+    admission.counted::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
         WHERE h.user_id = @user_id::uuid AND h.state = 'open')::bigint AS open_holds,
     (CASE
         WHEN @custody_hold_limit::int > 0
-             AND (SELECT count(*) FROM recovery_custody_holds h2
-                    WHERE h2.user_id = @user_id::uuid AND h2.state = 'open') >= @custody_hold_limit::int
+             AND admission.counted >= @custody_hold_limit::int
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = @user_id::uuid
                   AND r.status = 'queued'
@@ -672,7 +699,8 @@ SELECT
                            AND (SELECT count(*) FROM recovery_custody_holds oh2
                                   WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int))
         ELSE 0
-     END)::bigint AS blocked_runs;
+     END)::bigint AS blocked_runs
+FROM admission;
 
 -- name: DiscardCustodyHoldForOwner :execrows
 -- PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold
@@ -743,15 +771,15 @@ DELETE FROM custody_episode_notices WHERE user_id = @user_id;
 -- owner Slack DM (slacksvc.CustodyEpisodeReconciler, D10) coalesces the blocked-custody crossing
 -- by owner, so it needs (a) the owners currently AT/OVER the admission limit to notify and
 -- (b) the already-notified owners who have dropped BELOW it, to re-arm (clear) their episode
--- notice for a later crossing. Both key off the SAME open-hold admission signal ClaimRun and
+-- notice for a later crossing. Both key off the SAME admission-counted signal ClaimRun and
 -- GetCustodyAggregateForOwner gate on. Added strictly ADDITIVELY (M1/M4/M5 queries UNTOUCHED).
 -- ════════════════════════════════════════════════════════════════════════════════════════
 
 -- name: ListOwnersOverCustodyLimit :many
--- PRD #1349 M6 (D10): the owners whose OPEN (unresolved) custody-hold count is AT/OVER the
+-- PRD #1349 M6 (D10): the owners whose admission-counted open holds are AT/OVER the
 -- admission limit — the crossing set the episode reconciler considers for a one-per-episode DM.
--- Grouped over the partial idx_recovery_custody_holds_owner_open index; HAVING count(*) >=
--- @custody_hold_limit is the SAME predicate ClaimRun's custody-admission clause blocks on, so a
+-- Grouped over owners with open holds; fn_custody_admission_count >= @custody_hold_limit
+-- is the SAME predicate ClaimRun's custody-admission clause blocks on (ADR-2445), so a
 -- notified owner is exactly one whose runs are (or can be) blocked. The reconciler then claims
 -- at-most-once and reads GetCustodyAggregateForOwner for the exact DM facts, so this returns only
 -- the user_id. The caller guards a non-positive @custody_hold_limit (the admission gate is then
@@ -760,19 +788,18 @@ SELECT h.user_id
 FROM recovery_custody_holds h
 WHERE h.state = 'open'
 GROUP BY h.user_id
-HAVING count(*) >= @custody_hold_limit::int;
+HAVING fn_custody_admission_count(h.user_id, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit::int;
 
 -- name: ListOwnersWithClearedCustodyEpisode :many
--- PRD #1349 M6 (D10): the already-notified owners whose OPEN custody-hold count has dropped
+-- PRD #1349 M6 (D10): the already-notified owners whose admission-counted holds have dropped
 -- BELOW the admission limit — the episode has closed, so the reconciler clears their notice
 -- (ClearCustodyEpisodeNotice) to re-arm a later re-crossing. A row in custody_episode_notices
--- means "already DM'd for this episode"; the correlated open-hold count mirrors the same
+-- means "already DM'd for this episode"; the shared admission count mirrors the same
 -- admission signal, so this returns exactly the owners whose episode should re-arm. Returns only
 -- the user_id; the reconciler clears each.
 SELECT n.user_id
 FROM custody_episode_notices n
-WHERE (SELECT count(*) FROM recovery_custody_holds h
-       WHERE h.user_id = n.user_id AND h.state = 'open') < @custody_hold_limit::int;
+WHERE fn_custody_admission_count(n.user_id, @heartbeat_cutoff::timestamptz) < @custody_hold_limit::int;
 
 -- name: LockTerminalRejectionHolds :many
 SELECT id FROM recovery_custody_holds
@@ -823,10 +850,12 @@ WHERE h.run_id = @run_id AND h.generation = @generation AND h.live_worker_id = @
   AND NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id);
 
 -- name: GetFinalInventoryHold :one
+-- Serialize custody writers while permitting the upload's hold_id FK KEY SHARE
+-- recheck after BindCaptureManifest and MarkCaptureReady in the stream transaction.
 SELECT * FROM recovery_custody_holds
 WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_id::uuid
   AND generation = @generation
-ORDER BY id LIMIT 1 FOR UPDATE;
+ORDER BY id LIMIT 1 FOR NO KEY UPDATE;
 
 -- name: GetFinalInventoryCapture :one
 SELECT * FROM recovery_captures
@@ -834,12 +863,35 @@ WHERE id = @id AND hold_id = @hold_id AND run_id = @run_id AND user_id = @user_i
   AND original_worker_id = @worker_id::uuid
 FOR UPDATE;
 
+-- name: FenceUnacceptedInventoryCapture :execrows
+-- The caller holds worker/run/hold/capture locks. Delete bytes only for the
+-- guarded update's returned IDs, so a failed ownership/receipt guard deletes none.
+WITH fenced AS (
+    UPDATE recovery_captures c
+    SET state = 'expired', reserved_bytes = NULL,
+        reason = 'unaccepted_capture_replaced', updated_at = now()
+    WHERE c.id = @id AND c.hold_id = @hold_id AND c.run_id = @run_id
+      AND c.user_id = @user_id AND c.original_worker_id = @worker_id::uuid
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+        WHERE h.id = c.hold_id AND h.run_id = c.run_id AND h.user_id = c.user_id
+          AND h.original_worker_id = @worker_id::uuid AND h.generation = @generation
+          AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
+          AND h.final_disposition IS NULL AND h.final_capture_id IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id = c.id)
+    RETURNING c.id
+), deleted AS (
+    DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM fenced)
+    RETURNING capture_id
+)
+SELECT id FROM fenced WHERE (SELECT count(*) FROM deleted) >= 0;
+
 -- name: ProtectFinalInventoryCapture :execrows
 UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
     ready_retention_seconds = @retention_seconds::bigint, updated_at = now()
 WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id::uuid
   AND c.source_sha = @source_sha AND c.coverage_digest = @coverage_digest
   AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+  AND COALESCE(cardinality(c.prerequisite_shas), 0) = 0
   AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.id = c.hold_id
     AND h.inventory_guarded AND h.state = 'open' AND h.live_worker_id = @worker_id::uuid);
 
@@ -865,6 +917,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
         AND c.original_worker_id = h.original_worker_id AND c.source_sha = sqlc.narg('final_source_sha')::text
         AND c.coverage_digest = @final_coverage_digest::text
         AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+        AND COALESCE(cardinality(c.prerequisite_shas), 0) = 0
         AND c.local_replica_worker_id = h.original_worker_id AND c.ready_retention_seconds > 0))
     OR (@final_disposition::text = 'settled' AND sqlc.narg('final_capture_id')::uuid IS NULL
       AND sqlc.narg('final_source_sha')::text IS NULL
@@ -881,18 +934,10 @@ WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_i
   AND generation = @generation AND inventory_guarded)::boolean;
 
 -- name: ListOpenCustodyHoldsForWorkers :many
--- Display-only attention inputs for the authorized workers returned by a list endpoint.
--- Live custody determines which worker holds the source; original custody is provenance.
+-- Canonical facts for only the authorized input workers' open holds.
 SELECT w.id AS worker_id, h.state, h.inventory_guarded,
-    (EXISTS (SELECT 1 FROM recovery_captures c
-        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
-    COALESCE((SELECT c.state FROM recovery_captures c
-        WHERE c.hold_id = h.id
-        ORDER BY c.created_at DESC, c.id DESC
-        LIMIT 1), '')::text AS capture_state,
-    COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
-    COALESCE(r.status, '')::text AS run_status
+       f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed
 FROM workers w
 JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
-LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+JOIN recovery_custody_hold_facts f ON f.id = h.id AND f.user_id = h.user_id
 WHERE w.id = ANY(@worker_ids::uuid[]) AND h.state = 'open';

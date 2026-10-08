@@ -350,22 +350,31 @@ func TestMemoryConcurrentDistinctRunsLiveDB(t *testing.T) {
 	}
 }
 
-func memoryCheckerFixture(t *testing.T) (memoryFixture, uuid.UUID) {
+func memoryCheckerFixture(t *testing.T, automatic ...bool) (memoryFixture, uuid.UUID) {
 	t.Helper()
 	f := newMemoryFixture(t)
 	lead := seedOutageRun(t, f.e, f.w.UserID, f.repo, f.w.ID, "running", "issue", 2, 0)
 	f.e.exec("UPDATE runs SET kind='cross_check',harness='codex',issue_iid=NULL,target_run_id=$2,report_only=true WHERE id=$1", f.b.RunID, lead)
+	// The immutable attempt snapshot must be chosen on INSERT. Plan shape requires
+	// plan/milestones/size/base/digest; checker identity is a report-only Codex run
+	// targeting the same owner's live generation. Automatic rounds fit limit+1.
+	enabled := len(automatic) > 0 && automatic[0]
+	limit := 0
+	if enabled {
+		limit = 2
+	}
 	f.e.exec(`INSERT INTO cross_checks
-		(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,checker_run_id,checker_harness,deadline_at)
-		VALUES($1,'plan',1,2,'plan','[]','s',$2,$3,$4,'codex',now()+interval '30 minutes')`,
-		lead, strings.Repeat("a", 40), []byte("memory-candidate"), f.b.RunID)
+		(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,checker_run_id,checker_harness,deadline_at,automatic_rounds_enabled,automatic_revision_limit)
+		VALUES($1,'plan',1,2,'plan','[]','s',$2,$3,$4,'codex',now()+interval '30 minutes',$5,$6)`,
+		lead, strings.Repeat("a", 40), []byte("memory-candidate"), f.b.RunID, enabled, limit)
 	return f, lead
 }
 
 func TestMemoryCrossCheckParentScopeLiveDB(t *testing.T) {
 	for _, tc := range []struct{ name, sql string }{
 		{"eligible plan round1", ""},
-		{"round2", "UPDATE cross_checks SET round=2 WHERE lead_run_id=$1"},
+		{"disabled automatic round2", "UPDATE cross_checks SET round=2 WHERE lead_run_id=$1"},
+		{"nonlatest", "INSERT INTO cross_checks (lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at,verdict,reason_class,decided_at) SELECT lead_run_id,stage,2,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at,'revise','revise',now() FROM cross_checks WHERE lead_run_id=$1"},
 		{"deadline", "UPDATE cross_checks SET deadline_at=now()-interval '1 second' WHERE lead_run_id=$1"},
 		{"generation", "UPDATE runs SET claim_generation=3 WHERE id=$1"},
 		{"released parent", "UPDATE runs SET claim_released_at=now() WHERE id=$1"},
@@ -439,4 +448,51 @@ func TestMemoryCrossCheckParentScopeLiveDB(t *testing.T) {
 			t.Fatalf("unsupported stage error=%v", err)
 		}
 	})
+}
+
+func TestMemoryAutomaticRoundTwoAdmissionHoldLiveDB(t *testing.T) {
+	f, lead := memoryCheckerFixture(t, true)
+	f.e.exec("UPDATE cross_checks SET round=2 WHERE lead_run_id=$1", lead)
+	got := f.reserve(t, f.b)
+	if !got.Admitted || !got.Authorizing || got.Allowance.Used != 1 {
+		t.Fatalf("automatic round2 admission=%+v", got)
+	}
+	held := f.hold(t)
+	if held.Status != "recovery_wait" || held.RecoveryWaitCause.String != "worker_memory_pressure" || !held.ClaimReleasedAt.Valid {
+		t.Fatalf("automatic round2 hold=%+v", held)
+	}
+}
+
+func TestMemoryAutomaticRoundTwoOwnerResumeLiveDB(t *testing.T) {
+	f, lead := memoryCheckerFixture(t, true)
+	f.reserve(t, f.b)
+	f.hold(t)
+	// Hold at round1 and advance the immutable-budget attempt to round2 so this
+	// regression discriminates ResumeMemoryEpisode independently of admission.
+	f.e.exec("UPDATE cross_checks SET round=2 WHERE lead_run_id=$1", lead)
+	before := f.run(t)
+	if _, err := f.e.q.ResumeMemoryEpisode(f.e.ctx, store.ResumeMemoryEpisodeParams{
+		ID: f.b.RunID, UserID: uuid.New(), GlobalTimeoutSeconds: 86400}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("foreign owner resume=%v", err)
+	}
+	if !reflect.DeepEqual(before, f.run(t)) {
+		t.Fatal("foreign owner changed held episode")
+	}
+	if _, err := f.e.q.ResumeMemoryEpisode(f.e.ctx, store.ResumeMemoryEpisodeParams{
+		ID: f.b.RunID, UserID: f.w.UserID, GlobalTimeoutSeconds: 86400}); err != nil {
+		t.Fatal(err)
+	}
+	got := f.run(t)
+	if got.Status != "queued" || got.MemoryEpisode != before.MemoryEpisode+1 || got.MemoryInterventionCount != 0 || got.MemoryPolicy != nil {
+		t.Fatalf("automatic round2 resume=%+v", got)
+	}
+}
+
+func TestMemoryAutomaticRoundBudgetConstraintLiveDB(t *testing.T) {
+	f, lead := memoryCheckerFixture(t, true)
+	_, err := f.e.pool.Exec(f.e.ctx, "UPDATE cross_checks SET round=4 WHERE lead_run_id=$1", lead)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("over-budget round must be rejected by schema: %v", err)
+	}
 }

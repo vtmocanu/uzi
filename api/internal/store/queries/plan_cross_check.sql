@@ -49,15 +49,54 @@ SELECT EXISTS (
     SELECT 1 FROM cross_checks cc
     JOIN runs lead ON lead.id = cc.lead_run_id
     WHERE lead.id = @lead_run_id AND lead.plan_cross_check_required
-      AND cc.stage = 'plan' AND cc.round = 1 AND cc.verdict = 'pending'
+      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
       AND cc.lead_claim_generation = lead.claim_generation
       AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
       AND cc.deadline_at > now()
 )::boolean AS has_live_plan_cross_check;
 
 -- name: HasPendingPlanCrossCheck :one
--- Strict settlement proof: an expired or stale pending row still requires settlement.
+-- Strict settlement proof: even expired, stale or malformed pending rows require settlement.
 SELECT EXISTS (
     SELECT 1 FROM cross_checks cc
     WHERE cc.lead_run_id = @lead_run_id AND cc.stage = 'plan' AND cc.verdict = 'pending'
 )::boolean AS has_pending_plan_cross_check;
+
+
+-- name: GetExactPlanCrossCheck :one
+SELECT * FROM cross_checks
+WHERE lead_run_id = @lead_run_id AND stage = 'plan' AND round = @round FOR UPDATE;
+
+-- name: GetPlanCrossCheckMetadata :one
+SELECT round, lead_claim_generation, verdict, reason_class, deadline_at, decided_at,
+       automatic_revision_limit, automatic_rounds_enabled, interrupted_at
+FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan'
+ORDER BY round DESC LIMIT 1;
+
+-- name: GetCrossCheckChildProtocol :one
+SELECT cc.round FROM cross_checks cc JOIN runs child ON child.id = cc.checker_run_id
+JOIN runs lead ON lead.id = cc.lead_run_id
+WHERE child.id = @child_id AND child.kind = 'cross_check'
+ AND child.target_run_id = lead.id AND child.user_id = lead.user_id
+ AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = lead.id AND latest.stage = 'plan')
+ AND cc.verdict = 'pending' AND cc.deadline_at > now()
+ AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND cc.lead_claim_generation = lead.claim_generation
+ AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1));
+
+-- name: SupersedeUnstoredPlanApproval :one
+UPDATE cross_checks cc SET verdict = 'failed', reason_class = 'approved_not_stored',
+ interrupted_at = COALESCE(cc.interrupted_at, lead.claim_released_at, lead.status_since)
+FROM runs lead WHERE lead.id = cc.lead_run_id AND lead.id = @lead_run_id
+ AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = lead.id AND latest.stage = 'plan')
+ AND cc.lead_claim_generation <> lead.claim_generation AND cc.verdict = 'approve'
+ AND cc.automatic_rounds_enabled
+ AND lead.plan_md IS NULL AND lead.auto_approve AND lead.gate_revision = 0
+RETURNING cc.*;
+
+
+-- name: GetPlanCrossCheckClaimingWorkerCaps :one
+SELECT worker.protocol_capabilities FROM workers worker JOIN runs lead ON lead.worker_id = worker.id
+WHERE lead.id = @lead_run_id AND worker.id = @worker_id AND worker.user_id = @user_id
+ AND lead.user_id = worker.user_id AND lead.claim_generation = @claim_generation
+ AND lead.claim_released_at IS NULL AND lead.status IN ('claimed','running','awaiting_approval');

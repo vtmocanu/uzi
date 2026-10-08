@@ -8,6 +8,7 @@ package uzicli
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -77,15 +78,41 @@ func (c *HTTPClient) DownloadRecoveryArchive(ctx context.Context, runID, capture
 	return n, nil
 }
 
+// recoveryHoldsWire records field presence while keeping the public DTO numeric.
+type recoveryHoldsWire struct {
+	apitypes.RecoveryCustodyHoldsDTO
+}
+
+func (w *recoveryHoldsWire) UnmarshalJSON(data []byte) error {
+	type plain apitypes.RecoveryCustodyHoldsDTO
+	var out plain
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	var presence struct {
+		Aggregate struct {
+			Count *int `json:"admission_counted_holds"`
+		} `json:"aggregate"`
+	}
+	if err := json.Unmarshal(data, &presence); err != nil {
+		return err
+	}
+	if presence.Aggregate.Count == nil {
+		out.Aggregate.AdmissionCountedHolds = out.Aggregate.OpenHolds
+	}
+	w.RecoveryCustodyHoldsDTO = apitypes.RecoveryCustodyHoldsDTO(out)
+	return nil
+}
+
 // RecoveryHolds fetches the caller's owner-wide custody holds + aggregate (PRD #1349 M5, D7).
 // Owner-scoped server-side; Holds is always a JSON array (never null). `uzi run recovery <run-id>`
 // narrows to one run client-side.
 func (c *HTTPClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
-	var out apitypes.RecoveryCustodyHoldsDTO
+	var out recoveryHoldsWire
 	if err := c.get(ctx, "/api/recovery/holds", &out); err != nil {
 		return apitypes.RecoveryCustodyHoldsDTO{}, err
 	}
-	return out, nil
+	return out.RecoveryCustodyHoldsDTO, nil
 }
 
 // DiscardRecoveryHold discards ONE exact owner-owned open custody hold (PRD #1349 M5, D7/D9).

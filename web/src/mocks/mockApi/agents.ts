@@ -108,6 +108,23 @@ function templateAllocationView(me: User): TemplateAllocation[] {
   });
 }
 
+// Mock deterministic delivered name order is not deployment SQL locale order.
+// Shared-name precedence applies even when the
+// shared row is unallocated. The first delivered lead stops resolution, including null.
+function inheritedClaudeModel(templates: AgentTemplate[], allocations: TemplateAllocation[], userId: string): string | null {
+  const sharedNames = new Set(templates.filter(t => t.scope !== "user").map(t => t.name));
+  const delivered = new Set(allocations.filter(t => t.effective).map(t => t.id));
+  return templates.filter(t => delivered.has(t.id) &&
+    (t.scope !== "user" || (t.user_id === userId && !sharedNames.has(t.name))))
+    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+    .find(t => /^(lead|orchestrator)$/i.test(t.name))?.model ?? null;
+}
+
+export function mockDefaultClaudeModel(): string | null {
+  const me = requireSession();
+  return inheritedClaudeModel(templates, templateAllocationView(me), me.id);
+}
+
 function toAllocated(id: string): AllocatedSkill | null {
   const s = skills.find((x) => x.id === id);
   return s ? { skill_id: s.id, name: s.name, description: s.description, scope: s.scope } : null;

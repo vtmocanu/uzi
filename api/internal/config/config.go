@@ -398,12 +398,13 @@ type Config struct {
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
-	PlanCrossCheckTimeout time.Duration // bounded checker wall-clock budget
-	RunTimeout            time.Duration // base wall clock before a running run parks at budget_exhausted
-	RunWallCeiling        time.Duration // server-enforced ceiling on scaled and handoff wall budgets
-	RunIdleTimeout        time.Duration // worker-side no-message idle cap
-	WorkerTaskIdleTimeout time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
-	RunMaxIterations      int           // implement⇄review loop cap (worker-side)
+	PlanCrossCheckMaxRevisions int32
+	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget
+	RunTimeout                 time.Duration // base wall clock before a running run parks at budget_exhausted
+	RunWallCeiling             time.Duration // server-enforced ceiling on scaled and handoff wall budgets
+	RunIdleTimeout             time.Duration // worker-side no-message idle cap
+	WorkerTaskIdleTimeout      time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
+	RunMaxIterations           int           // implement⇄review loop cap (worker-side)
 	// HandoffRunTimeout / HandoffRunMaxIterations (issue #785) are the dedicated default
 	// wall-clock budget and iteration cap for a NON-interactive `uzi handoff` task run.
 	// Decoupled from RunTimeout / RunMaxIterations so raising one does not move the other.
@@ -1057,6 +1058,14 @@ func Load() (Config, error) {
 		if cfg.RunWallCeiling < time.Second || cfg.RunWallCeiling < cfg.RunTimeout || cfg.RunWallCeiling > 72*time.Hour {
 			return Config{}, fmt.Errorf("RUN_WALL_CEILING must be at least 1s, at least RUN_TIMEOUT, and at most 72h")
 		}
+	}
+	cfg.PlanCrossCheckMaxRevisions = DefaultPlanCrossCheckMaxRevisions
+	if raw, present := os.LookupEnv("PLAN_CROSS_CHECK_MAX_REVISIONS"); present {
+		value, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || value < 0 || value > int64(MaxPlanCrossCheckMaxRevisions) {
+			return Config{}, fmt.Errorf("PLAN_CROSS_CHECK_MAX_REVISIONS must be an integer from 0 to %d", MaxPlanCrossCheckMaxRevisions)
+		}
+		cfg.PlanCrossCheckMaxRevisions = int32(value)
 	}
 	cfg.PlanCrossCheckTimeout = 30 * time.Minute
 	if cfg.RunTimeout > 0 && cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {

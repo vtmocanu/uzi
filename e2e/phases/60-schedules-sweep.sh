@@ -37,6 +37,7 @@
 # `schedule get --json | .last_fire == null` as a POSITIVE control of Decision 3, so a
 # future refactor that routes RunNow through advance() reddens here, not silently.
 say "PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip)"
+trap 'if [ "$?" -ne 0 ]; then inventory_diagnostic_snapshot || true; fi' EXIT
 
 # --- catalog enable is idempotent -------------------------------------------
 # --create-missing-labels POSTs the selector label to the forge. On the gitlab lane the

@@ -591,22 +591,59 @@ snapshot the requirement inside their INSERT. Seeded plans and gateless kinds
 are excluded. Required leads and `cross_check` children need a worker with
 `cross_check_v1`; the queued health reason exposes a missing capability.
 
-A Claude lead submits one bounded, normalized candidate with its immutable
-base commit and scanned planning diff. The API stores `cross_checks` and a
-report-only Codex child atomically through existing credential resolution.
+A Claude lead submits bounded, normalized candidates in explicit rounds with
+an immutable base commit and scanned planning diff. The first candidate
+snapshots automatic-round enablement and `PLAN_CROSS_CHECK_MAX_REVISIONS`
+(default 2, range 0–4); later rounds copy that snapshot. The server counts at
+most limit + 1 candidates globally across generations, including supersession.
+Automatic leads and later-round children require `cross_check_rounds_v1`;
+claimability/provisioning enforce the durable protocol capability independently
+of the runtime kill switch. Older workers snapshot disabled/0 and park REVISE;
+capable zero-budget workers park with `revisions exhausted`. The API stores
+`cross_checks` and a report-only Codex child atomically through existing credential resolution.
 The lead retains its Claude credential, the child its Codex credential and
 usage attribution. The child has its own checkout, ordinary run slot and
 expedite priority; it publishes no branch/MR. The lead retains its slot while
 waiting, with pending wait excluded from its wall budget and banked on
-settlement. The server verdict deadline includes queue time.
+settlement. Each candidate's fresh server verdict deadline includes queue time.
+
+Submit locks the current owning lead and claim generation. An omitted round
+means legacy round 1; an exact identity/digest retry recovers the immutable
+attempt even after decision. A different candidate at that identity refuses;
+identical text for a new round still requires an explicit new round. The
+latest GET is narrowly worker-authorized, side-effect-free metadata and a
+next-round recommendation: no candidate, findings, approval grant or writes.
 
 `SetRunAutopilotPlan` binds the latest opposite-harness APPROVE to the current
 claim generation, server-computed digest and matching approval-bearing
 fields. Adjacent running/progress/completion guards prevent an unchecked
 plan from being stored or completed through those paths. The worker must obey
 a refusal; server guards cannot prevent arbitrary execution by a worker that
-ignores them. Non-pass and refusal normally force a human gate; Codex leads
-park as unsupported.
+ignores them. Stale child verdicts and plan writes cannot use an earlier
+round or generation. Eligible REVISE returns to the Claude lead automatically:
+validated usage/preparation/reconciliation releases the actual reservation,
+then the checked-state barrier is released and awaited before revision. The
+worker returns `{kind: "revise", feedback, automatic: true}` without `inputId`,
+not an `awaiting_approval` report or `releaseAppliedGate` human presentation.
+The SDK and stub executors keep automatic-round feed identity separate from
+human counters; human input cannot forge automatic provenance. A stage-neutral
+prompt builder nonce-fences checker advice and prior-plan context separately,
+requires verification against code/issue/uzi rules and declining conflicts,
+and preserves the separate human-revision builder. Exhaustion, BLOCK, timeout
+and other failures keep their fallbacks; Codex leads park as unsupported.
+
+Recovery follows the 2026-10-07 preserve-decided-fallback decision in
+[PRD #2150 D8](prds/done/2150-plan-cross-check-auto-revise.md#decision-log).
+Without an established human gate or durably approved plan, fresh rounds are
+limited to pending attempts interrupted strictly before deadline (including
+lifecycle-settled failed/superseded with that proven origin), decided REVISE,
+and `approved_not_stored`, within the same candidate budget. The first
+custody-invalidating transition supplies the authoritative clock: database
+transaction time for direct writers, that transition's server-provided `now`
+for frozen writers. Persisted `interrupted_at`/decision evidence prevents a
+later sweep from granting permission. Equality/ambiguous legacy evidence
+fails closed to timeout. Non-revisable decided outcomes keep their own reason
+even at budget exhaustion; otherwise eligible exhaustion parks as exhausted.
 
 Irrecoverable preparation receipts fail with
 `plan cross-check: preparation receipts irrecoverably lost`; unrecoverable
@@ -628,9 +665,46 @@ isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
 confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. Dedicated
-slots, automatic checker revision, Codex-lead checking, stage-specific pins
-and Code cross-check remain outside this implementation.
+rationale, validation provenance and pending hosted acceptance. Automatic rounds extend the original #2149
+scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
+[ADR-2149's dated extension](adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150);
+local round/recovery proofs do not establish hosted authenticated model acceptance.
+
+Plan checker pins live in `user_cross_check_pins`, keyed by owner, stage and
+family. Model and effort resolve independently from a claim-time statement
+snapshot; delivery and recording reuse that snapshot, including independent
+`pin` / `worker default` provenance. Legacy sources stay nullable/unknown
+and historical records are not recomputed after settings edits. Each new
+round resolves pins from its own claim-time settings. The settings
+DTO also exposes read-only `worker_default_model` counterfactual metadata
+using the existing allocated lead/orchestrator selection in native SQL name
+order when the Claude worker model is unset; a null first-template model
+then means SDK/account default. Codex without a saved worker model falls
+back to `gpt-6.1-sol`.
+
+A non-null model or effort pin in the Codex cell requires
+`cross_check_pins_v1`; unpinned checks still accept older
+`cross_check_v1` workers for round 1; later rounds additionally require
+`cross_check_rounds_v1`. A custom resolved model separately requires
+`codex_custom_model_v1`, including a custom worker default. Placement
+mirrors enforce these requirements; both checks repeat in claim preflight
+before credential delivery, requeuing a capability race. Local syntax/family
+and effort validation also precedes delivery. Pins are hard: no model
+substitution, effort clamp or default retry.
+
+The API does not determine account model availability. Recognized
+authenticated pinned-model rejection at checker startup settles
+`checker_unavailable`, fails the child with
+`plan cross-check: checker unavailable` and forces the lead's human gate.
+Other startup failures retain #2149 handling, including model errors with
+worker defaults or effort-only pins. The Claude pin cell is stored and
+editable but inactive; only a Codex checker checks a Claude lead today.
+See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
+decision and validation limits, and
+[configuration](docs/configuration.md#plan-cross-check-model-and-effort-pins)
+for the settings contract. Dedicated slots (#2169), Codex-lead checking
+(#2460) and Code cross-check (#2170) remain
+outside this implementation.
 
 ### Run lifecycle
 
@@ -1148,9 +1222,11 @@ chain in the diagram above, with no intervening `running`.
   still-running turn from a local checkpoint, while this one preserves a
   run's original commits across a `failed` finalization and the worker's
   eventual teardown. A **claim-scoped custody hold** (`recovery_custody_holds`,
-  H-free, opened in the same `ClaimRun` transaction) reserves owner-scoped
-  admission capacity and blocks the worker's teardown while the work is
-  unpublished; the **archive capture** (`recovery_captures`) is the later,
+  H-free, opened in the same `ClaimRun` transaction) protects unpublished work
+  and blocks the worker's teardown. Admission counts open holds except at most
+  one per run backing a healthy current claim without an owner decision;
+  total custody remains protected. See [ADR-2445](adr/2445-custody-admission-accounting.md).
+  The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
   (a v2 worker advertises `recovery_archive_v2`; an ambiguous/older case

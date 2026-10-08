@@ -126,8 +126,9 @@ class ThrowingExecutor implements Executor {
 it("unit 1: deferred hook preserves finalize and latches across held-skip ACK retirement", async () => {
   const { gitlab } = fakeGitlab();
   const outbox = await mkOutbox();
-  const runId = "run-deferred-held-skip";
+  const runId = "11111111-0000-4000-8000-000000000001";
   const gen = 4;
+  api.setOwnershipStatus(runId, "completed", gen, false);
   await outbox.journalFinalize(runId, gen);
   await outbox.journalTerminal(runId, gen, "running", 42, { status: "completed", branch: "agent/original" });
   const root = (outbox as unknown as { root: string }).root;
@@ -212,6 +213,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
     const claim = gitlabClaim(8, { claim_generation: 4 });
+    api.setOwnershipStatus(claim.run_id, "completed", 4, false);
     simulateCommittedWork();
 
     await runner(new StubExecutor(nullLogger()), gitlab, undefined, {
@@ -545,8 +547,9 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
       gapFillMax: 100,
       recovery: coord,
     });
-    const runId = "run-n4-reresolve";
+    const runId = "11111111-0000-4000-8000-000000000004";
     const gen = 4;
+    api.setOwnershipStatus(runId, "failed", gen, false);
     const events: string[] = [];
     let sends = 0;
     const flight = minimalFailFlight({
@@ -701,8 +704,9 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
       gapFillMax: 100,
       recovery: coord,
     });
-    const runId = "run-1512-hold-live";
+    const runId = "11111111-0000-4000-8000-000000000008";
     const gen = 8;
+    api.setOwnershipStatus(runId, "failed", gen, false);
     const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
     registry.add(runId, gen); // the run is live in this process while its hook runs
     let beats = 0;
@@ -777,6 +781,7 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
     const claim = gitlabClaim(12, { claim_generation: 7 });
+    api.setOwnershipStatus(claim.run_id, "failed", 7, false);
     // Every /messages post fails 401 → the batcher trips permanently on its first flush, firing the
     // permanent-failure hook. The /state (failed) report is NOT refused, so it applies 200 and the
     // hook RETIRES the journal — the exact condition the N2 latch guards.

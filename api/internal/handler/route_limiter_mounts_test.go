@@ -861,6 +861,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/release", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
+	{"POST", "/api/worker/runs/{id}/archives/{captureID}/reconcile", noLimiter},
 	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated; a call that
 	// reaches the proof spends the OWNER's forge quota (one branch-head read plus up to three
 	// compares, up to six on Forgejo, which compares both directions per candidate), so it
@@ -893,6 +894,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// Worker-authenticated, generation-fenced plan cross-check protocol.
 	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
+	{"GET", "/api/worker/runs/{id}/cross-checks/plan/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/{round}", noLimiter},
 	{"POST", "/api/worker/runs/{id}/cross-check-verdict", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker

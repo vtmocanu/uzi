@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,12 +88,13 @@ func TestRecoveryInventoryClaimLiveDB(t *testing.T) {
 			if n, err := q.ReleaseClaimCustodyNoAdoptedSource(ctx, noAdopt); err != nil || n != 0 {
 				t.Fatalf("running no-adopt: %d %v", n, err)
 			}
-			cap, err := q.ReserveCaptureExact(ctx, store.ReserveCaptureExactParams{RunID: run, UserID: user, OriginalWorkerID: pgtype.UUID{Bytes: worker, Valid: true}, OriginalWorkerIdentity: worker.String(), Generation: 1, SourceSha: "aaaa1111", IdempotencyKey: "earlier"})
+			cap, err := q.ReserveCaptureExact(ctx, store.ReserveCaptureExactParams{RunID: run, UserID: user, OriginalWorkerID: pgtype.UUID{Bytes: worker, Valid: true}, OriginalWorkerIdentity: worker.String(), Generation: 1, SourceSha: "aaaa1111", IdempotencyKey: "earlier", CoverageDigest: pgtype.Text{String: strings.Repeat("a", 64), Valid: true}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			exec("UPDATE recovery_captures SET state='available',expires_at=now()+interval '1 hour' WHERE id=$1", cap.ID)
 			exec("UPDATE runs SET status='completed',branch='agent/issue-1' WHERE id=$1", run)
+			testPrerequisiteSQLGuards(t, ctx, pool, cap, hold, worker, user, run)
 			exec("UPDATE workers SET ephemeral=true,ephemeral_run_id=$2 WHERE id=$1", worker, run)
 			if n, err := q.EnterEphemeralLease(ctx, store.EnterEphemeralLeaseParams{WorkerID: worker, RunID: run}); err != nil || n != 0 {
 				t.Fatalf("open hold lease: %d %v", n, err)

@@ -519,3 +519,21 @@ func TestRecoveryInventorySettledAndDiscardLiveDB(t *testing.T) {
 		e.bytes(id, body)
 	})
 }
+
+// A requeue-exhausted run keeps claim_released_at set while parked for an owner decision;
+// the guarded archive release must not end its custody hold.
+func TestRecoveryInventoryExhaustionParkKeepsHoldLiveDB(t *testing.T) {
+	e := newInventoryEnv(t)
+	id := e.reserve("exhausted")
+	e.upload(id)
+	req := e.request(id)
+	e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted', claim_released_at=now() WHERE id=$1", e.run)
+	e.reject(e.w, req, ErrNotAuthorized)
+	var state string
+	if err := e.pool.QueryRow(e.ctx, "SELECT state FROM recovery_custody_holds WHERE id=$1", e.hold).Scan(&state); err != nil || state != "open" {
+		t.Fatalf("hold state = %q, %v; want open", state, err)
+	}
+	// Control: the same run with a non-exhaustion cause still releases.
+	e.exec("UPDATE runs SET recovery_wait_cause='forge_unreachable' WHERE id=$1", e.run)
+	e.release(req)
+}

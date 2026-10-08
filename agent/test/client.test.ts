@@ -1302,6 +1302,58 @@ describe("Codex success body byte cap (#2232 M1)", () => {
   }
 });
 
+describe("#2493 interrupted refusal body", () => {
+  it("real HTTP interrupted409 release is definite while refresh is transport ambiguous", async () => {
+    const api = new FakeApi("interrupted-body-worker");
+    const url = await api.listen();
+    const client = new WorkerClient(url, "interrupted-body-worker", "test", nullLogger());
+    api.codexReleaseSequences.set("run", [{ status: 409, drop: true }]);
+    api.codexRefreshSequences.set("run", [{ status: 409, drop: true }]);
+    try {
+      await assert.rejects(client.releaseCodex("run", { capability: "fixture-cap" }, { authMode: "api_key" }), err => {
+        assert.ok(err instanceof RequestError);
+        assert.equal(err.status, 409);
+        assert.equal(err.body, "");
+        assert.equal(codexDeferralReason(err), undefined);
+        return true;
+      });
+      await assert.rejects(client.refreshCodex("run",
+        { capability: "fixture-cap", operation_id: "op", observed_generation: 3 },
+        { authMode: "subscription", chatgptAccountId: "verified-account" }), err => {
+        assert.equal((err as { kind?: string }).kind, "transport");
+        return true;
+      });
+      assert.deepEqual(api.codexRequests.map(r => r.operation), ["release", "refresh"]);
+    } finally { await api.close(); }
+  });
+
+  it("received409 retains definite release refusal, refresh remains ambiguous", async () => {
+    const original = globalThis.fetch;
+    const client = newClient();
+    let calls = 0;
+    try {
+      globalThis.fetch = async () => {
+        calls++;
+        return new Response(new ReadableStream({ start(c) { c.error(new Error("private-canary")); } }), { status: 409 });
+      };
+      await assert.rejects(client.releaseCodex("run", { capability: "fixture-cap" }, { authMode: "api_key" }), err => {
+        assert.ok(err instanceof RequestError, "received409 release must remain RequestError");
+        assert.equal(err.status, 409);
+        assert.equal(err.body, "");
+        assert.equal(codexDeferralReason(err), undefined);
+        return true;
+      });
+      assert.equal(calls, 1, "one release attempt");
+      await assert.rejects(client.refreshCodex("run", { capability: "fixture-cap", operation_id: "op", observed_generation: 3 },
+        { authMode: "subscription", chatgptAccountId: "verified-account" }), err => {
+        assert.ok(err instanceof CodexRequestFailure);
+        assert.equal(err.kind, "transport");
+        return true;
+      });
+    } finally { globalThis.fetch = original; }
+  });
+});
+
 describe("M2 secret-free WorkerClient refresh failure classification", () => {
   it("distinguishes local and received malformed replies from transport and lost body", async () => {
     const original = globalThis.fetch;

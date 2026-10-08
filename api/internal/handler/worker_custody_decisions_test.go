@@ -57,7 +57,7 @@ func TestWorkerListsCustodyDecisions(t *testing.T) {
 						st.ownerRows = []store.ListWorkersByUserRow{{ID: a}, {ID: b}}
 						st.adminRows = []store.ListAllWorkersRow{{Worker: store.Worker{ID: a}}, {Worker: store.Worker{ID: b}}}
 					}
-					batch := &custodyBatchStore{rows: []store.ListOpenCustodyHoldsForWorkersRow{{WorkerID: a, State: "open", RunStatus: "failed"}}}
+					batch := &custodyBatchStore{rows: []store.ListOpenCustodyHoldsForWorkersRow{{WorkerID: a, State: "open", RunStatus: "failed", Attention: "source_only", DecisionNeeded: true}}}
 					if fail {
 						batch.err = errors.New("partial batch unavailable")
 					}

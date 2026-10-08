@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -29,7 +31,12 @@ func inventoryGit(t *testing.T, dir string, args ...string) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: fixed Git binary; args are test-only literal operations and owned fixture paths/SHAs, no shell.
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GIT_") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
@@ -39,6 +46,11 @@ func inventoryGit(t *testing.T, dir string, args ...string) string {
 
 // inventoryBundle anchors both unrelated roots under a synthetic aggregate Q with the H2 tree.
 func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
+	data, q, h, h2, _, _ := inventoryBundleFixture(t, false)
+	return data, q, h, h2
+}
+
+func inventoryBundleFixture(t *testing.T, thin bool) ([]byte, string, string, string, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	inventoryGit(t, dir, "init")
@@ -52,6 +64,14 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 		}
 		inventoryGit(t, dir, "add", "work.txt")
 		inventoryGit(t, dir, "commit", "-m", "inventory fixture")
+	}
+	var forge, prerequisite string
+	if thin {
+		write("published base content\n")
+		prerequisite = inventoryGit(t, dir, "rev-parse", "HEAD")
+		forge = filepath.Join(t.TempDir(), "forge.git")
+		// Publish only the base, before private roots and aggregate exist.
+		inventoryGit(t, dir, "clone", "--bare", "--no-local", dir, forge)
 	}
 	write("original H content\n")
 	h := inventoryGit(t, dir, "rev-parse", "HEAD")
@@ -69,7 +89,11 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 	}
 	inventoryGit(t, dir, "update-ref", "refs/heads/recovered-source", q)
 	path := filepath.Join(dir, "aggregate.bundle")
-	inventoryGit(t, dir, "bundle", "create", path, "refs/heads/recovered-source")
+	if thin {
+		inventoryGit(t, dir, "bundle", "create", path, "refs/heads/recovered-source", "^"+prerequisite)
+	} else {
+		inventoryGit(t, dir, "bundle", "create", path, "refs/heads/recovered-source")
+	}
 	if got := inventoryGit(t, dir, "bundle", "list-heads", path); got != q+" refs/heads/recovered-source" {
 		t.Fatalf("bundle refs = %q, want only recovered-source at Q", got)
 	}
@@ -77,17 +101,22 @@ func inventoryBundle(t *testing.T) ([]byte, string, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return data, q, h, h2
+	return data, q, h, h2, forge, prerequisite
 }
 
 func inventoryImport(t *testing.T, data []byte, h, h2 string) {
 	t.Helper()
 	dir := t.TempDir()
+	inventoryGit(t, dir, "init")
+	inventoryImportInto(t, dir, data, h, h2)
+}
+
+func inventoryImportInto(t *testing.T, dir string, data []byte, h, h2 string) {
+	t.Helper()
 	path := filepath.Join(dir, "download.bundle")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	inventoryGit(t, dir, "init")
 	inventoryGit(t, dir, "bundle", "verify", path)
 	inventoryGit(t, dir, "fetch", path, "refs/heads/recovered-source:refs/heads/recovered-source")
 	for _, tc := range []struct{ sha, content string }{
@@ -192,6 +221,142 @@ func inventoryCLIExport(t *testing.T, binary, url, ownerToken, runID, captureID 
 		t.Fatalf("CLI overwrite changed existing destination: %q, %v", got, err)
 	}
 	return downloaded
+}
+
+// TestRecoveryReconcileRouteLiveDB exercises bearer identity, strict JSON and
+// the committed fence through the real router, without building a CLI.
+func TestRecoveryReconcileRouteLiveDB(t *testing.T) {
+	e := newRecoveryEnvGuarded(t, true)
+	h, router, _ := cliLiveDB(t)
+	jwtSecret := h.cfg.JWTSecret
+	h.cfg = recoveryTestCfg()
+	h.cfg.JWTSecret = jwtSecret
+	h.box = e.box
+	token, hash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliMustExec(t, e.pool, "UPDATE workers SET token_hash=$2,protocol_capabilities=$3 WHERE id=$1", e.worker.ID, hash, []string{capability.RecoveryArchiveV1, capability.RecoveryInventoryV1})
+	cliMustExec(t, e.pool, "UPDATE runs SET worker_id=$2,claim_generation=1,status='completed' WHERE id=$1", e.run, e.worker.ID)
+	gen := int64(1)
+	data := []byte("reconcile route bytes")
+	digest := sha256hex([]byte("inventory"))
+	e.worker.ProtocolCapabilities = []string{capability.RecoveryArchiveV1, capability.RecoveryInventoryV1}
+	h.recoverySvc = e.service(recoveryTestLimits())
+	reserve, err := h.recoverySvc.Reserve(e.ctx, e.worker, e.run, apitypes.RecoveryReserveRequest{Generation: &gen, IdempotencyKey: "route", SourceSha: "aaaa1111", CoverageDigest: digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := reserve.CaptureID
+	cliMustExec(t, e.pool, "UPDATE recovery_captures SET state='uploading',reserved_bytes=37 WHERE id=$1", id)
+	cliMustExec(t, e.pool, "INSERT INTO recovery_capture_chunks(capture_id,chunk_index,length,sealed) VALUES($1,0,1,$2)", id, []byte("partial"))
+	path := "/api/worker/runs/" + e.run.String() + "/archives/" + id + "/reconcile"
+	call := func(body string, credential string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+credential)
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		return rec
+	}
+	m := manifestFor(data)
+	req := apitypes.RecoveryReconcileRequest{Generation: 1, SourceSha: "aaaa1111", CoverageDigest: digest, Checksum: m.Checksum, ByteSize: m.ByteSize}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"{}", "null", string(b) + " {}", string(b[:len(b)-1]), strings.Replace(string(b), m.Checksum, "bad", 1), strings.Replace(string(b), "aaaa1111", "bad", 1), string(b[:len(b)-1]) + ",\"extra\":true}", strings.Replace(string(b), "\"byte_size\":"+strconv.FormatInt(m.ByteSize, 10), "\"byte_size\":null", 1), strings.Replace(string(b), "\"generation\":1", "\"generation\":0", 1)} {
+		if rec := call(body, token); rec.Code != http.StatusBadRequest {
+			t.Fatalf("malformed = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	if rec := call(string(b), "invalid"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated = %d", rec.Code)
+	}
+	checkRetained := func(reason string) {
+		t.Helper()
+		rec := call(string(b), token)
+		var out apitypes.RecoveryReconcileResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &out) != nil || out.Outcome != "retained" || out.Reason != reason {
+			t.Fatalf("protected route = %d %s", rec.Code, rec.Body.String())
+		}
+		var state string
+		var reserved int64
+		var chunks int
+		if err := e.pool.QueryRow(e.ctx, "SELECT state,reserved_bytes,(SELECT count(*) FROM recovery_capture_chunks WHERE capture_id=c.id) FROM recovery_captures c WHERE id=$1", id).Scan(&state, &reserved, &chunks); err != nil || state != "uploading" || reserved != 37 || chunks != 1 {
+			t.Fatalf("protected capture mutated: %s %d %d %v", state, reserved, chunks, err)
+		}
+	}
+	cliMustExec(t, e.pool, "UPDATE runs SET status='running',claim_released_at=NULL WHERE id=$1", e.run)
+	checkRetained("generation_not_ended")
+	cliMustExec(t, e.pool, "UPDATE runs SET status='completed' WHERE id=$1", e.run)
+	foreign := uuid.New()
+	foreignToken, foreignHash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliMustExec(t, e.pool, "INSERT INTO workers(id,user_id,name,token_hash,status,protocol_capabilities) VALUES($1,$2,$3,$4,'online',$5)", foreign, e.user, "foreign-"+foreign.String(), foreignHash, []string{capability.RecoveryArchiveV1, capability.RecoveryInventoryV1})
+	if rec := call(string(b), foreignToken); rec.Code != http.StatusForbidden {
+		t.Fatalf("foreign original ownership = %d: %s", rec.Code, rec.Body.String())
+	}
+	// Guarded inventory cannot be adopted: assert the trigger rejected the
+	// reassignment rather than treating an unchanged hold as foreign custody.
+	adoption, err := e.pool.Exec(e.ctx, "UPDATE recovery_custody_holds SET live_worker_id=$2 WHERE id=$1", e.holdID, foreign)
+	if err != nil || adoption.RowsAffected() != 0 {
+		t.Fatalf("guarded adoption: rows=%d err=%v", adoption.RowsAffected(), err)
+	}
+	var liveWorker uuid.UUID
+	if err := e.pool.QueryRow(e.ctx, "SELECT live_worker_id FROM recovery_custody_holds WHERE id=$1", e.holdID).Scan(&liveWorker); err != nil || liveWorker != e.worker.ID {
+		t.Fatalf("guarded adoption changed custody: worker=%s err=%v", liveWorker, err)
+	}
+	for i := 0; i < 2; i++ {
+		rec := call(string(b), token)
+		var out apitypes.RecoveryReconcileResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &out) != nil || out.Outcome != "replaceable" || out.Generation != 1 || out.CaptureID != id || out.FinalReceipt != nil {
+			t.Fatalf("route = %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	var state, hold string
+	var reserved pgtype.Int8
+	var chunks int
+	if err := e.pool.QueryRow(e.ctx, "SELECT c.state,c.reserved_bytes,h.state,(SELECT count(*) FROM recovery_capture_chunks WHERE capture_id=c.id) FROM recovery_captures c JOIN recovery_custody_holds h ON h.id=c.hold_id WHERE c.id=$1", id).Scan(&state, &reserved, &hold, &chunks); err != nil {
+		t.Fatal(err)
+	}
+	if state != "expired" || reserved.Valid || hold != "open" || chunks != 0 {
+		t.Fatalf("route fence: %s %+v %s %d", state, reserved, hold, chunks)
+	}
+	accepted, err := h.recoverySvc.Reserve(e.ctx, e.worker, e.run, apitypes.RecoveryReserveRequest{Generation: &gen, IdempotencyKey: "accepted-route", SourceSha: "aaaa1111", CoverageDigest: digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	captureID := uuid.MustParse(accepted.CaptureID)
+	if _, err := h.recoverySvc.Upload(e.ctx, e.worker, e.run, captureID, m, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	final := &apitypes.RecoveryFinalDisposition{Kind: "archive", CaptureID: accepted.CaptureID, SourceSha: "aaaa1111", CoverageDigest: digest}
+	ack, err := h.recoverySvc.Release(e.ctx, e.worker, e.run, apitypes.RecoveryReleaseRequest{Generation: &gen, FinalDisposition: final})
+	if err != nil || !ack.Released {
+		t.Fatalf("accepted fixture: %+v %v", ack, err)
+	}
+	cliMustExec(t, e.pool, "UPDATE recovery_captures SET expires_at=now()-interval '1 second' WHERE id=$1", captureID)
+	// Query the fenced candidate with a different identity: the accepted receipt
+	// must still be echoed exactly through the endpoint.
+	req.SourceSha = "bbbb2222"
+	req.ByteSize++
+	b, err = json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := call(string(b), token)
+	var out apitypes.RecoveryReconcileResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &out) != nil || out.Outcome != "accepted" || out.FinalReceipt == nil || *out.FinalReceipt != *final {
+		t.Fatalf("accepted route = %d %s", rec.Code, rec.Body.String())
+	}
+	var acceptedChunks int
+	if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM recovery_capture_chunks WHERE capture_id=$1", captureID).Scan(&acceptedChunks); err != nil || acceptedChunks != 1 {
+		t.Fatalf("accepted bytes changed: chunks=%d %v", acceptedChunks, err)
+	}
 }
 
 // TestRecoveryInventoryClosureLiveDB exercises the real worker and owner router mounts.

@@ -7,8 +7,10 @@ import { Input, Select } from "./ui";
 // Claude keeps today's aliases (this is the single shared source for that set, PRD
 // #17 risk: alias drift — reused by the agent-template editor and the per-user
 // default-model setting) plus a free-text "Other…" custom escape hatch. Codex's
-// picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol`/`gpt-6.1-sol` — no custom option, no catalog
-// discovery — matching D6's "the product-owned Codex picker remains exactly" rule.
+// picker has EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol`/`gpt-6.1-sol` as curated
+// options, with no catalog discovery — matching D6's "the product-owned Codex picker
+// remains exactly" rule. Custom entry defaults off for Codex; worker defaults and
+// dedicated checker pins explicitly opt in.
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 // Mirror agent/src/codex/codex-executor.ts CODEX_PRODUCTION_PROVIDER.model.
 export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
@@ -42,13 +44,14 @@ function deriveMode(value: string, aliases: readonly string[]): Mode {
 //
 // PRD #1551 M3: `allowCustom` is an explicit opt-in that overrides the harness default.
 // Historically custom entry was "Claude yes, Codex no" (PRD #1429 D6). Codex's picker
-// stayed closed for schedule/template callers, but the per-user Codex worker-model lane
-// on Run Defaults now needs an "Other…" escape hatch, so ONLY that caller passes
-// allowCustom. Every other caller omits it and keeps the harness-derived default.
+// stays closed for schedule/template callers. The per-user Codex worker-model lane
+// and dedicated plan cross-check pins on Run Defaults opt into the "Other…" escape
+// hatch. Callers that omit allowCustom keep the harness-derived default.
 export function ModelSelect({
   value,
   onChange,
   id,
+  defaultLabel,
   customAriaLabel = "Custom model ID",
   harness,
   allowCustom,
@@ -56,6 +59,7 @@ export function ModelSelect({
   value: string;
   onChange: (model: string) => void;
   id?: string;
+  defaultLabel?: string;
   customAriaLabel?: string;
   // The harness this selection is validated against (PRD #1429 D6). Omitted ⇒
   // Claude, so every pre-M4a caller (the agent-template editor, the schedule modal
@@ -64,7 +68,8 @@ export function ModelSelect({
   // Whether the "Other… (custom model ID)" menu entry is offered. Omitted ⇒ the
   // historical harness default (Claude allows custom, Codex does not), so
   // ScheduleModal / AgentTemplateEditor render unchanged. Run Defaults' Codex lane
-  // passes `allowCustom` to open the escape hatch there and there only (PRD #1551 D5).
+  // and dedicated plan cross-check pins pass `allowCustom` to open that escape hatch
+  // (PRD #1551 D5 and #2151).
   allowCustom?: boolean;
 }) {
   const aliases = aliasesForHarness(harness);
@@ -131,7 +136,7 @@ export function ModelSelect({
   return (
     <div className="space-y-2">
       <Select id={id} value={mode} onChange={(e) => onSelect(e.target.value as Mode)}>
-        <option value="inherit">Inherit (account default)</option>
+        <option value="inherit">{defaultLabel ?? "Inherit (account default)"}</option>
         {aliases.map((m) => (
           <option key={m} value={m}>
             {m}

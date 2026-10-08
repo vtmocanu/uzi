@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 
 import { api, type RecoveryCustodyHold, type RecoveryCustodyHolds } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { custodyHoldView, groupHoldsByWorker, type CustodyCheckpointView } from "../lib/recovery";
+import { custodyHoldView, groupHoldsByWorker, recoveryCapacityUsed, type CustodyCheckpointView } from "../lib/recovery";
 import { stripUnsafeChars } from "../lib/safeText";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, SectionTitle, cx } from "./ui";
@@ -58,6 +58,7 @@ export function RecoveryHoldsSurface() {
     openHoldsByRun.set(h.run_id, (openHoldsByRun.get(h.run_id) ?? 0) + 1);
   }
   const { open_holds, custody_hold_limit, decision_needed } = holds.aggregate;
+  const capacityUsed = recoveryCapacityUsed(holds.aggregate);
 
   return (
     <Card id="recovery-holds" className="scroll-mt-20 space-y-4">
@@ -68,9 +69,11 @@ export function RecoveryHoldsSurface() {
         </div>
         <p className="text-xs text-faint">
           <span className="tabular-nums text-muted">
-            {open_holds} / {custody_hold_limit}
+            {capacityUsed} / {custody_hold_limit}
           </span>{" "}
           custody slots used
+          {" · "}
+          <span className="tabular-nums text-muted">{open_holds} open custody {open_holds === 1 ? "hold" : "holds"}</span>
           {decision_needed > 0 && (
             <>
               {" · "}
@@ -282,10 +285,19 @@ function HoldRow({
           <p id={warningId} className="text-sm text-danger">
             This discards run <span className="font-mono">{runShort}</span>&rsquo;s held work on{" "}
             <span className="font-medium">{workerName}</span> (generation {hold.generation}, hold{" "}
-            <span className="font-mono">{holdShort}</span>). The worker-local source may be the
-            only copy — no server archive can restore it, and discarding permits the worker or
-            its disk to be torn down, which can destroy this work permanently. This cannot be
-            undone.
+            <span className="font-mono">{holdShort}</span>).{" "}
+            {hold.has_available_capture ? (
+              <>
+                An earlier available archive can restore older work but may not cover the latest
+                worker-local work. The latest worker-local source may be the only copy.
+              </>
+            ) : (
+              <>
+                The worker-local source may be the only copy — no server archive can restore it.
+              </>
+            )}{" "}
+            Discarding permits the worker or its disk to be torn down, which can destroy this work
+            permanently. This cannot be undone.
           </p>
           {refWarning && (
             <p id={refWarningId} className="text-sm text-danger">
