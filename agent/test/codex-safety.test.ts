@@ -346,10 +346,35 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     assert.notEqual(reg.state(), "poisoned");
   });
 
-  it("drains an action admitted while an earlier boundary-action batch is settling", async () => {
+  it("drains an action admitted while an earlier boundary-action batch is settling", async (t) => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const first = defer<ReapOutcome>();
     const second = defer<ReapOutcome>();
+    const firstBatchEntered = defer<void>();
+    const secondBatchEntered = defer<void>();
+    let captured: BoundaryPermit | undefined;
+    let actionBatches = 0;
+    let secondBatchSettled = false;
+    const originalAllSettled = Promise.allSettled;
+    t.mock.method(Promise, "allSettled", function (
+      this: PromiseConstructor,
+      ...args: Parameters<typeof Promise.allSettled>
+    ) {
+      // Forward before signalling: allSettled has already snapshotted the batch.
+      const settlements = originalAllSettled.apply(this, args);
+      // Ignore any pre-action registry work; the permit identifies the drain lane.
+      if (!captured) return settlements;
+      actionBatches += 1;
+      if (actionBatches === 1) firstBatchEntered.resolve();
+      if (actionBatches === 2) {
+        secondBatchEntered.resolve();
+        return settlements.then((outcomes) => {
+          secondBatchSettled = true;
+          return outcomes;
+        });
+      }
+      return settlements;
+    });
     let spawnCalls = 0;
     const seam: SpawnRootSeam = async () => {
       spawnCalls += 1;
@@ -360,19 +385,37 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     let boundarySettled = false;
     const boundary = safety
       .withBoundary(req("finalize"), async (permit) => {
+        captured = permit;
         void safety.spawnBoundaryAction(permit, ["first"], "command");
-        setTimeout(() => {
-          void safety.spawnBoundaryAction(permit, ["admitted-during-drain"], "command");
-        }, 0);
       })
       .then(() => {
+        assert.equal(secondBatchSettled, true, "the boundary awaits the second batch settlement");
         boundarySettled = true;
       });
+    const boundaryCompletion = boundary.then(
+      () => "boundary" as const,
+      () => "boundary" as const,
+    );
+    t.after(async () => {
+      first.resolve({ ok: true });
+      second.resolve({ ok: true });
+      // Observe rejection during failure cleanup without replacing the primary assertion.
+      await boundary.catch(() => {});
+    });
 
-    await tick();
+    await firstBatchEntered.promise;
+    assert.ok(captured, "the boundary callback captured its held permit");
+    void safety.spawnBoundaryAction(captured, ["admitted-during-drain"], "command");
     assert.equal(spawnCalls, 2, "the second action was admitted while the first batch drained");
     first.resolve({ ok: true });
-    await tick();
+    assert.equal(
+      await Promise.race([
+        secondBatchEntered.promise.then(() => "second-batch" as const),
+        boundaryCompletion,
+      ]),
+      "second-batch",
+      "the drain enters the second batch before boundary completion",
+    );
     assert.equal(boundarySettled, false, "the second batch still holds the boundary permit");
     second.resolve({ ok: true });
     await boundary;

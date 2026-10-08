@@ -98,7 +98,9 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   → ask for a replacement or a local buddy. Never downgrade silently.
 - **A local buddy waives only the peer buddy**, never independent review, CI or a user
   review. Spawn one fresh subagent per request, brief it as below, pin it to the head;
-  it shares your model's blind spots, so name it in the trail.
+  it shares your model's blind spots, so name it in the trail. Every review brief asks
+  for applicable cleanup lenses (reuse, simplification, efficiency, fix altitude),
+  reported apart from mandatory findings.
 - **A buddy never reviews a diff it wrote.** When the buddy implemented the change, the
   independent review is a bot or a fresh local reviewer; the buddy only verifies findings.
 - **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
@@ -307,6 +309,9 @@ changes it); trust it over a handover's claim.
      compatibility needs that exact name; otherwise call it an example;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
      is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
+   - **optional cleanup** (a Non-blocking reuse, simplification, efficiency or altitude
+     note with no demonstrated defect): record it in the PR's deferred notes for step 8;
+     never fix locally or trigger rework for it alone, unless the user asks.
    Decide, then report the decisions in one message (finding, label, choice, why) and
    execute; do not wait for answers. Several PRs with findings → assess all, report once,
    execute unattended.
@@ -434,7 +439,11 @@ changes it); trust it over a handover's claim.
      (premise verified, fix scoped, no design decision open, no `.github/workflows/**` change,
      which a uzi push cannot carry): if so add its sweep selector (`bug` for a defect,
      `Planned` for planned work) plus `uzi`; if not, leave both off and
-     say why in the trail. A set over the grouped-filing limit (50) is "needs you"; never
+     say why in the trail. A low or normal issue meeting every criterion in
+     `.agents/skills/issue-triage/references/on-deck.md` takes `on-deck` instead of
+     `bug`/`Planned`; draft its body in that file's shape at filing time. Queue it only
+     with the buddy's approval of the exact body and label set plus the user's
+     authorization (their OK or an existing scoped grant). A set over the grouped-filing limit (50) is "needs you"; never
      split or truncate it silently. Name each issue in the trail.
    - Already-tracked issue not moving (no active run, not sweep-fireable per issue-triage's
      Step 1 selector plus `uzi` or bot assignment, no enabled one-time schedule still to

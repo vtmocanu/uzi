@@ -146,6 +146,7 @@ settle "never-terminal run: returns 0 once the timeout passes" 5 running
 # timeout. Any SQL or write endpoint invoked by the admission helper fails the test.
 eval "$(awk '/^wait_custody_headroom\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_forge_park_release\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^wait_completed_custody_receipt\(\) \{/,/^\}/' "$LIB")"
 pass() { echo "$*"; }
 apiget() {
   case "$1" in
@@ -171,7 +172,8 @@ custody_case() {
   cases=$((cases + 1))
   local name="$1" want="$2" diagnostic="$3" helper="$4" output got; shift 4
   if output="$(unset SECONDS; SECONDS=0; "$helper" "$@" 2>&1)"; then got=pass; else got=fail; fi
-  if [ "$got" = "$want" ] && [[ "$output" == *"$diagnostic"* ]] && ! [[ "$output" == *"unexpected custody"* ]]; then
+  if [ "$got" = "$want" ] && [[ "$output" == *"$diagnostic"* ]] \
+      && ! [[ "$output" == *"unexpected custody"* || "$output" == *"unexpected receipt"* ]]; then
     passed=$((passed + 1)); echo "PASS: $name"
   else echo "FAIL: $name: got $got want $want; output [$output]"; fi
 }
@@ -393,6 +395,109 @@ wedge_headroom_setup() {
 }
 custody_case "custody wedge waits before reading its seed precondition" pass 'custody wedge can seed' wedge_headroom_setup
 
+# A completed rework can still have an open hold while its FINAL is retrying.
+# Run the actual phase boundary: seeding the next phase before both own receipts
+# arrived would make its baseline disappear during the queued negative control.
+rework_receipt_boundary() {
+  RUN_MRR=b4dec5cf-e6d4-413b-b3a8-0005a2835767
+  RUN_MRR2=b4dec5cf-e6d4-413b-b3a8-0005a2835768
+  ADMIN_EMAIL=owner@example.test
+  printf 'open\n' > "$SEQ_DIR/$RUN_MRR"
+  printf 'open\n' > "$SEQ_DIR/$RUN_MRR2"
+  db_psql() {
+    [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unexpected receipt write'
+    local run state
+    for run in "$RUN_MRR" "$RUN_MRR2"; do
+      [[ "$1" == *"r.id='$run'"* ]] || continue
+      state="$(cat "$SEQ_DIR/$run")"
+      printf 'released\n' > "$SEQ_DIR/$run"
+      jq -nc --arg run "$run" --arg state "$state" '{run_id:$run,status:"completed",generation:1,holds:[
+        {id:"own-hold",generation:1,inventory_guarded:true,state:$state,after_outcome:true,
+          final_disposition:(if $state=="released" then "archive" else null end),
+          release_evidence:(if $state=="released" then "archive" else null end),archive_matches:true}]}'
+      return
+    done
+    fail 'receipt query not scoped to either own run'
+  }
+  eval "$(awk '/^wait_completed_custody_receipt /' "$ROOT/e2e/phases/71-mr-rework.sh")"
+  [ "$(cat "$SEQ_DIR/$RUN_MRR")" = released ] && [ "$(cat "$SEQ_DIR/$RUN_MRR2")" = released ] \
+    || fail 'boundary would seed custody with a completed rework receipt still open'
+  echo 'both completed rework receipts arrived before custody seeding'
+}
+custody_case "rework boundary settles both own receipts before custody seeding" pass 'both completed rework receipts arrived' rework_receipt_boundary
+
+completed_receipt_fixture() {
+  : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
+  local step
+  for step in "$@"; do
+    jq -nc --arg run "$UUID" --arg step "$step" '{run_id:$run,status:"completed",generation:1,holds:[
+      {id:"own-hold",generation:1,inventory_guarded:true,state:"released",after_outcome:true,
+        final_disposition:"archive",release_evidence:"archive",archive_matches:true}]}
+      | if $step=="open" then .holds[0] += {state:"open",final_disposition:null,release_evidence:null}
+        elif $step=="missing" then .holds=[]
+        elif $step=="duplicate" then .holds += .holds
+        elif $step=="wrong-generation" then .holds[0].generation=2
+        elif $step=="generation-change" then .generation=2 | .holds[0].generation=2
+        elif $step=="wrong-archive" then .holds[0].archive_matches=false
+        elif $step=="old-receipt" then .holds[0].after_outcome=false
+        elif $step=="discarded" then .holds[0] += {state:"discarded",release_evidence:"owner_discard"}
+        elif $step=="settled" then .holds[0] += {final_disposition:"settled",release_evidence:"publication",
+          final_capture_id:null,final_source_sha:null,final_coverage_digest:"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+        elif $step=="legacy" then .holds[0] += {inventory_guarded:false,final_disposition:null}
+        elif $step=="legacy-before-completion" then .holds[0] += {inventory_guarded:false,final_disposition:null,after_outcome:false}
+        elif $step=="failed" then .status="failed"
+        else . end' >> "$SEQ_DIR/seq"
+  done
+}
+ADMIN_EMAIL=owner@example.test
+db_psql() {
+  [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* \
+    && "$1" == *"r.id='$UUID'"* && "$1" == *"r.user_id=(SELECT id FROM users"* ]] \
+    || fail 'unexpected receipt query or write'
+  local n; n="$(cat "$SEQ_DIR/n")"
+  awk -v n="$n" 'NR==n' "$SEQ_DIR/seq"
+  [ "$n" -ge "$(wc -l < "$SEQ_DIR/seq")" ] || echo $((n + 1)) > "$SEQ_DIR/n"
+}
+completed_receipt_fixture open released
+custody_case "completed run waits for its exact archive FINAL" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 5
+completed_receipt_fixture open
+custody_case "completed run with an open hold times out" fail 'receipt timeout' wait_completed_custody_receipt "$UUID" 2
+for variant in missing duplicate wrong-generation; do
+  completed_receipt_fixture "$variant"
+  custody_case "completed receipt refuses $variant" fail 'missing exact run/generation/hold' wait_completed_custody_receipt "$UUID" 2
+done
+for variant in wrong-archive old-receipt; do
+  completed_receipt_fixture "$variant"
+  custody_case "completed receipt refuses $variant" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
+done
+completed_receipt_fixture open generation-change
+custody_case "completed receipt refuses a moving generation" fail 'generation changed' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture discarded
+custody_case "owner discard cannot replace this final receipt" fail 'unexpected disposition' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture settled
+custody_case "completed publication accepts an empty settled FINAL" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture legacy
+custody_case "completed legacy hold accepts its authoritative release" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture legacy-before-completion
+custody_case "legacy archive receipt may precede completion" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture failed
+custody_case "failed run cannot satisfy completed custody boundary" fail 'missing exact run/generation/hold' wait_completed_custody_receipt "$UUID" 2
+
+diagnostic_trap() {
+  local phase="$1" status="$2"
+  RUNROOT="$SEQ_DIR"
+  inventory_diagnostic_snapshot() { echo 'selected inventory diagnostic'; }
+  eval "$(awk '/^trap .*inventory_diagnostic_snapshot/' "$ROOT/e2e/phases/$phase.sh")"
+  exit "$status"
+}
+for phase in 60-schedules-sweep 72-custody-lifecycle; do
+  custody_case "$phase preserves failure while emitting diagnostics" fail 'selected inventory diagnostic' diagnostic_trap "$phase" 7
+  cases=$((cases + 1))
+  if output="$(diagnostic_trap "$phase" 0)" && [ -z "$output" ]; then
+    passed=$((passed + 1)); echo "PASS: $phase skips the failure snapshot on success"
+  else echo "FAIL: $phase invoked diagnostic snapshot on success"; fi
+done
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -403,6 +508,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 65 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 83 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 65 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 83 ] && [ "$cases" -eq "$passed" ]

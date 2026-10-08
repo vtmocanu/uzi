@@ -169,3 +169,7 @@ prints the exact undo command — keep it). After a batch, re-run
   dialog (select the rows, edit the server text before filing), which links each
   finding to the issue. `uzi findings file ID ID...` posts the unedited server
   text only. Label filed issues per `.agents/skills/issue-triage/references/taxonomy.md`.
+  For a low or normal issue, write the body in the shape of
+  `.agents/skills/issue-triage/references/on-deck.md` and propose `on-deck` when it meets
+  every criterion there; apply it only with the buddy's approval of the exact body and
+  label set plus the user's authorization (their OK or an existing scoped grant).

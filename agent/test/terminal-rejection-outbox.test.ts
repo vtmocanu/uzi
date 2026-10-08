@@ -2,10 +2,12 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { OutboxOptions } from "../src/outbox.js";
 import { Outbox, OUTBOX_RANGE_RESERVE_BYTES } from "../src/outbox.js";
 import type { TerminalRejectionCustodyResponse } from "../src/protocol.js";
 import { recordingLogger } from "./helpers.js";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { realpathSync, type Dirent } from "node:fs";
 
 const scratch = realpathSync(os.tmpdir());
@@ -18,11 +20,11 @@ afterEach(async () => {
   for (const box of outboxes.splice(0)) await box.closeTerminalObservationScan();
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
-async function fixture(terminalMaxBytes = 1024) {
+async function fixture(terminalMaxBytes = 1024, realpath?: OutboxOptions["realpath"]) {
   const root = await fs.mkdtemp(path.join(scratch, "terminal-outbox-"));
   roots.push(root);
   const log = recordingLogger();
-  const box = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1, terminalMaxBytes });
+  const box = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1, terminalMaxBytes, realpath });
   outboxes.push(box);
   await box.init();
   await box.journalTerminal(run, 3, "implement", 0, { status: "failed", error: "private body" });
@@ -68,6 +70,23 @@ for (const kind of ["malformed", "oversized", "symlink"] as const) {
     assert.equal((await fs.lstat(file)).ino, before.ino);
     if (kind !== "symlink") assert.equal(await fs.readFile(file, "utf8"), kind === "malformed" ? "{" : " ".repeat(1024 + OUTBOX_RANGE_RESERVE_BYTES + 1));
   });
+}
+
+async function caseSensitiveRoot(root: string): Promise<boolean> {
+  const name = "caseprobe" + randomUUID().replaceAll("-", "").replace(/[0-9]/g, digit => String.fromCharCode(103 + Number(digit)));
+  const probe = path.join(root, name);
+  await fs.writeFile(probe, "", { flag: "wx" });
+  try {
+    try {
+      await fs.access(path.join(root, name.toUpperCase()));
+      return false;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw err;
+    }
+  } finally {
+    await fs.unlink(probe);
+  }
 }
 
 async function reject(file: string) {
@@ -494,11 +513,109 @@ test("physical protection visits a terminal beyond 256 junk entries and closes h
   });
 });
 
-test("physical protection visits a matching UUID case alias beyond 256 unrelated root entries", async () => {
+test("physical protection releases an empty UUID directory with a case-folded canonical basename", async () => {
+  const lower = "abcdefab-1111-4111-8111-111111111111";
+  const upper = lower.toUpperCase();
+  assert.notEqual(lower, upper, "the canonical basename must actually differ");
+  const { box, root } = await fixture(1024, async filePath => {
+    const real = await fs.realpath(filePath);
+    return path.basename(filePath) === lower ? path.join(path.dirname(real), upper) : real;
+  });
+  await fs.mkdir(path.join(root, lower));
+  assert.equal(await box.hasPhysicalTerminalProtection(lower), false);
+});
+
+test("physical protection releases an exact-match empty directory", async () => {
+  const { box, root } = await fixture();
+  await fs.mkdir(path.join(root, worker));
+  assert.equal(await box.hasPhysicalTerminalProtection(worker), false);
+});
+
+test("physical protection retains terminal presence with a folded UUID basename", async () => {
+  const lower = "abcdefab-1111-4111-8111-111111111111";
+  const { box, root } = await fixture(1024, async filePath => {
+    const real = await fs.realpath(filePath);
+    return path.basename(filePath) === lower ? path.join(path.dirname(real), lower.toUpperCase()) : real;
+  });
+  await fs.mkdir(path.join(root, lower));
+  await fs.writeFile(path.join(root, lower, "terminal-3.json"), "{");
+  assert.equal(await box.hasPhysicalTerminalProtection(lower), true);
+});
+
+for (const mismatch of ["basename", "parent", "parent case", "non-UUID"] as const) {
+  test(`physical protection retains a canonical ${mismatch} mismatch`, async () => {
+    const id = mismatch === "non-UUID" ? "ordinary-run" : "abcdefab-1111-4111-8111-111111111111";
+    const { box, root } = await fixture(1024, async filePath => {
+      const real = await fs.realpath(filePath);
+      if (path.basename(filePath) !== id) return real;
+      const parent = path.dirname(real);
+      if (mismatch === "parent") return path.join(parent + "-other", id.toUpperCase());
+      if (mismatch === "parent case") {
+        assert.notEqual(parent.toUpperCase(), parent);
+        return path.join(parent.toUpperCase(), id.toUpperCase());
+      }
+      return path.join(parent, mismatch === "basename" ? "bbcdefab-1111-4111-8111-111111111111" : id.toUpperCase());
+    });
+    await fs.mkdir(path.join(root, id));
+    assert.equal(await box.hasPhysicalTerminalProtection(id), true);
+  });
+}
+
+test("physical protection retains a real run symlink despite a matching folded canonical injection", async () => {
+  const lower = "abcdefab-1111-4111-8111-111111111111";
+  let calls = 0;
+  const { box, root } = await fixture(1024, async filePath => {
+    calls++;
+    const real = await fs.realpath(filePath);
+    return path.basename(filePath) === lower ? path.join(path.dirname(real), lower.toUpperCase()) : real;
+  });
+  await fs.symlink(path.join(root, run), path.join(root, lower));
+  calls = 0;
+  assert.equal(await box.hasPhysicalTerminalProtection(lower), true);
+  assert.equal(calls, 0, "unsafe directories must short circuit before canonical resolution");
+});
+
+test("physical protection retains an invalid ID while the directory guard rejects it without canonical resolution", async () => {
+  let calls = 0;
+  const { box } = await fixture(1024, async filePath => { calls++; return fs.realpath(filePath); });
+  calls = 0;
+  assert.equal(await box.hasPhysicalTerminalProtection("../escape"), true);
+  const guard = box as unknown as { terminalDirectorySafe(runId: string): Promise<boolean> };
+  assert.equal(await guard.terminalDirectorySafe("../escape"), false);
+  assert.equal(calls, 0);
+});
+
+for (const location of ["root", "run"] as const) {
+  for (const code of ["EIO", "ENOENT"] as const) {
+    test(`physical protection retains existing directories on ${location} canonical failure ${code}`, async () => {
+      let failingPath: string | undefined;
+      let failures = 0;
+      const { box, root } = await fixture(1024, async filePath => {
+        if (filePath === failingPath) {
+          failures++;
+          throw Object.assign(new Error("injected canonical resolution failure"), { code });
+        }
+        return fs.realpath(filePath);
+      });
+      await fs.mkdir(path.join(root, worker));
+      failingPath = location === "root" ? root : path.join(root, worker);
+      assert.equal(await box.hasPhysicalTerminalProtection(worker), true);
+      assert.equal(failures, 1);
+      assert.ok((await fs.lstat(root)).isDirectory());
+      assert.ok((await fs.lstat(path.join(root, worker))).isDirectory());
+    });
+  }
+}
+
+test("physical protection visits a matching UUID case alias beyond 256 unrelated root entries", async t => {
   const { box, file, root } = await fixture();
   await fs.unlink(file);
   const lower = "abcdefab-1111-4111-8111-111111111111";
   const mixed = "ABCDefab-1111-4111-8111-111111111111";
+  if (!await caseSensitiveRoot(root)) {
+    t.skip("filesystem folds case; fixture requires distinct case-variant sibling directories");
+    return;
+  }
   await fs.mkdir(path.join(root, lower));
   await box.journalTerminal(mixed, 3, "implement", 0, { status: "failed" });
   for (let n = 0; n < 257; n++) await fs.mkdir(path.join(root, ordinaryUUID(n)));
@@ -531,11 +648,15 @@ for (const kind of ["symlink", "file"] as const) {
 }
 
 for (const kind of ["symlink", "file"] as const) {
-  test(`physical protection retains an unsafe matching UUID ${kind} directory`, async () => {
+  test(`physical protection retains an unsafe matching UUID ${kind} directory`, async t => {
     const { box, file, root } = await fixture();
     await fs.unlink(file);
     const lower = "abcdefab-1111-4111-8111-111111111111";
     const mixed = "ABCDefab-1111-4111-8111-111111111111";
+    if (!await caseSensitiveRoot(root)) {
+      t.skip("filesystem folds case; fixture requires distinct case-variant sibling directories");
+      return;
+    }
     await fs.mkdir(path.join(root, lower));
     const alias = path.join(root, mixed);
     if (kind === "symlink") await fs.symlink(path.join(root, run), alias);
