@@ -112,20 +112,22 @@ servers. It runs with an isolated environment holding only your Anthropic token
 (a Codex checker holds only Codex credentials), as the worker's runner user.
 Direct reads are limited to its own checkout, plus its own SDK spill files for
 oversized tool output. Glob and Grep patterns that are absolute, home-relative
-or contain `..` (including one assembled through brace syntax) are denied. That
+or have a `..` path segment in any brace expansion are denied, as are patterns
+with unbalanced braces or too many expansions. That
 pattern check is defense in depth; the runner user's operating-system
 permissions are the boundary. See
 [worker setup](./worker-setup.md#run-artifacts-and-the-sandbox) for the
 tool-path policy and the [architecture](../ARCHITECTURE.md#plan-cross-check).
 
-## Rollout
+## Rolling out Codex-lead checks
 
 Deploy the api and its migration before the workers. A new worker on an older
 api has its Codex-lead submit refused, so those runs go to the human gate until
 the api is upgraded. Migration 00313 allows Claude checker runs; its Down
 deletes Claude checker runs but keeps the check history, with the checker run
-link empty. Run the Down only with the new api stopped. The settings toggle
-warns when no online worker advertises `cross_check_codex_lead_v1`.
+link empty. Run the Down only with the new api stopped. With ephemeral workers
+off, the settings toggle warns when no online worker can run the checker,
+including when none advertises `cross_check_codex_lead_v1`.
 
 ## Recovery before a human gate
 

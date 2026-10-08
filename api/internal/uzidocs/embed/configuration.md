@@ -249,7 +249,7 @@ A Claude checker (the Claude cell) always requires `cross_check_codex_lead_v1` o
 
 A claim-time snapshot freezes delivered values and independent provenance for the checker record. Hard pins do not substitute, clamp or retry on defaults. Local model syntax/family and effort checks happen before delivery; an intrinsically invalid stored pin fails visibly. There is no account-aware model-availability check in the API. Only recognized authenticated pinned-model rejection at checker startup maps to `checker_unavailable`, fails the child with `plan cross-check: checker unavailable` and forces a human gate. Other startup failures, including worker-default or effort-only model errors, retain the existing cross-check failure handling.
 
-Recorded sources are nullable for legacy checks and remain unknown when absent; later settings edits do not rewrite history. Each new round resolves pins at its own claim time. See [CLI settings](./cli.md#plan-cross-check-settings) and [the completed pin design](../prds/done/2151-cross-check-model-pins.md). Dedicated checker slots (#2169), and Code cross-check (#2170) remain outside this implementation.
+Recorded sources are nullable for legacy checks and remain unknown when absent; later settings edits do not rewrite history. Each new round resolves pins at its own claim time. See [CLI settings](./cli.md#plan-cross-check-settings) and [the completed pin design](../prds/done/2151-cross-check-model-pins.md). Dedicated checker slots (#2169) and Code cross-check (#2170) remain outside this implementation.
 
 ## Agent runtime (PRD #4)
 
