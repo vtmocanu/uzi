@@ -215,6 +215,8 @@ export interface CodexTransportOptions {
   /** Cumulative lifetime ingress caps, used by the dedicated one-check connection. */
   readonly maxProtocolBytes?: number;
   readonly maxProtocolFrames?: number;
+  /** Synchronous receipt evidence, before buffering; must not retain raw frames. */
+  readonly onNotification?: (note: CodexNotification) => void;
 }
 
 export interface CodexTransport {
@@ -390,7 +392,10 @@ class CodexTransportImpl implements CodexTransport {
   private readonly onInboundError = (): void => this.terminate(fail("transport", "codex transport read stream error"));
   private readonly onOutboundError = (): void => this.terminate(fail("transport", "codex transport write stream error"));
 
+  private readonly onNotification?: (note: CodexNotification) => void;
+
   constructor(opts: CodexTransportOptions) {
+    this.onNotification = opts.onNotification;
     this.inbound = opts.inbound;
     this.outbound = opts.outbound;
     this.maxFrameBytes = opts.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
@@ -799,6 +804,11 @@ class CodexTransportImpl implements CodexTransport {
 
   private pushNotification(note: CodexNotification, bytes: number): void {
     if (this.closed) return;
+    try { this.onNotification?.(note); }
+    catch {
+      this.terminate(fail("protocol", "codex transport notification observer failed"));
+      return;
+    }
     if (this.notesWaiter) {
       // Delivered straight to a waiting consumer — never retained, so no byte accounting.
       const waiter = this.notesWaiter;

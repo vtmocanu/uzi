@@ -172,7 +172,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
  });
  const c = { ...claim(), claim_generation: 7 };
  if (rejected) {
-  c.config = { default_model: "gpt-6-astra", default_effort: mode === "invalid-effort" ? "xhigh " : "xhigh" };
+  c.config = { default_model: "gpt-6-astra", default_effort: (mode === "invalid-effort" ? "xhigh " : "xhigh") as NonNullable<ClaimResponse["config"]>["default_effort"] };
   if (mode !== "legacy-rejection") c.cross_check!.model_source = "pin";
   c.cross_check!.effort_source = "pin";
  }

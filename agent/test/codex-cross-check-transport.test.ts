@@ -69,6 +69,54 @@ it("exact cumulative caps accept split multibyte frame", async () => {
  await transport.close();
 });
 
+it("receipt observer captures phase before queued consumption without changing notes", async () => {
+ const inbound = new PassThrough();
+ let authenticated = false;
+ const eligible = new WeakSet<object>();
+ const transport = createCodexTransport({ inbound, outbound: new PassThrough(),
+  onNotification: (note) => { if (authenticated) eligible.add(note); } });
+ inbound.write(JSON.stringify({ method: "activity", params: { phase: "before" } }) + "\n");
+ authenticated = true;
+ inbound.write(JSON.stringify({ method: "activity", params: { phase: "after" } }) + "\n");
+ const notes = transport.notifications();
+ const before = (await notes.next()).value!;
+ const after = (await notes.next()).value!;
+ assert.equal(eligible.has(before), false);
+ assert.equal(eligible.has(after), true);
+ assert.deepEqual(before.params, { phase: "before" });
+ assert.deepEqual(after.params, { phase: "after" });
+ assert.equal(Object.hasOwn(before, "authenticated"), false);
+ await transport.close();
+});
+
+it("receipt observer failure is a static sticky protocol failure", async () => {
+ const inbound = new PassThrough();
+ const transport = createCodexTransport({ inbound, outbound: new PassThrough(),
+  onNotification: () => { throw new Error("private observer detail"); } });
+ const next = transport.notifications().next();
+ inbound.write(JSON.stringify({ method: "activity" }) + "\n");
+ await assert.rejects(next, (error: CodexTransportError) => {
+  assert.equal(error, transport.protocolFailure);
+  assert.equal(error.failure.category, "protocol");
+  assert.equal(error.message, "codex transport notification observer failed");
+  return true;
+ });
+ await transport.close();
+});
+
+it("receipt observer preserves notification queue bounds", async () => {
+ const inbound = new PassThrough();
+ let received = 0;
+ const transport = createCodexTransport({ inbound, outbound: new PassThrough(), maxInboundNotifications: 1,
+  onNotification: () => { received++; } });
+ inbound.write(JSON.stringify({ method: "activity" }) + "\n" + JSON.stringify({ method: "activity" }) + "\n");
+ assert.equal(received, 2);
+ const notes = transport.notifications();
+ assert.equal((await notes.next()).value!.kind, "activity");
+ await assert.rejects(notes.next(), /inbound notification buffer overflow/);
+ await transport.close();
+});
+
 const capturedMessage = JSON.stringify({ error: { message: "SYNTHETIC model rejection marker B",
  type: "invalid_request_error", param: "model", code: "model_not_found" } });
 const secret = "glpat-" + "0123456789abcdefghij";

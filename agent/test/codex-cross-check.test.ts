@@ -31,6 +31,11 @@ type Emit = (frame: unknown) => void;
 // only its dictionary root. This proves functional wiring, not kernel isolation.
 function rig(options: {
  notes?: (emit: Emit) => void;
+ beforeResponse?: (frame: Frame, emit: Emit) => void;
+ afterResponse?: (frame: Frame, emit: Emit) => void;
+ coalesced?: boolean;
+ queuedResponse?: boolean;
+ failUsage?: boolean;
  claim?: ClaimResponse;
  rpcFailure?: string;
  rpcError?: unknown;
@@ -61,7 +66,13 @@ function rig(options: {
    while ((newline = buffer.indexOf("\n")) >= 0) {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
-    onFrame(JSON.parse(line), emit);
+    if (options.coalesced) {
+     const frames: unknown[] = [];
+     let gathering = true;
+     onFrame(JSON.parse(line), (frame) => { if (gathering) frames.push(frame); else emit(frame); });
+     gathering = false;
+     stdout.write(frames.map((frame) => JSON.stringify(frame) + "\n").join(""));
+    } else onFrame(JSON.parse(line), emit);
    }
    done();
   } });
@@ -82,8 +93,10 @@ function rig(options: {
  };
  const provider = roots("provider", (frame, emit) => {
   requests.push(frame);
+  options.beforeResponse?.(frame, emit);
   if ((options.rpcFailure && frame.method === options.rpcFailure) || (options.authFailure && frame.method === "account/login/start")) {
-   emit({ id: frame.id, error: options.rpcError });
+   const respond = (): void => { emit({ id: frame.id, error: options.rpcError }); };
+   if (options.queuedResponse) queueMicrotask(respond); else respond();
   } else if (frame.method === "initialize") emit({ id: frame.id, result: { userAgent: "fake", codexHome: "/owned", platformFamily: "unix", platformOs: "linux" } });
   else if (frame.method === "account/login/start") emit({ id: frame.id, result: { type: options.subscription ? "chatgptAuthTokens" : "apiKey" } });
   else if (frame.method === "thread/start") emit({ id: frame.id, result: { thread: { id: "thread" } } });
@@ -91,6 +104,7 @@ function rig(options: {
    emit({ id: frame.id, result: { turn: { id: "turn" } } });
    queueMicrotask(() => { if (!options.holdTurn) (options.notes ?? terminal)(emit); });
   } else if (!frame.method && frame.id !== undefined) options.onToolReply?.(frame, emit);
+  options.afterResponse?.(frame, emit);
  });
  const fileop = roots("fileop", (frame, emit) => {
   const op = frame as unknown as { id: number; op: string; path: string };
@@ -121,7 +135,7 @@ function rig(options: {
  const checker = new CodexCrossCheck(client, log, deps);
  return { logs: recorded.lines, get releases() { return releases; }, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
   run: (signal = new AbortController().signal) => checker.run(options.claim ?? claim(options.subscription), "/checkout", "/owned", signal,
-   async (payload) => { usage.push(payload); }) };
+   async (payload) => { usage.push(payload); if (options.failUsage && payload.event === "result") throw new Error("usage failed"); }) };
 }
 
 // Synthetic 0.159.3 local Responses HTTP 400 selected frame (#2151),
@@ -177,13 +191,13 @@ for (const source of [undefined, "worker default", "effort-only"] as const) {
 }
 for (const effort of ["", "minimal", "XHIGH", " xhigh", "xhigh ", "unknown"]) {
  it("refuses pinned effort before release: " + JSON.stringify(effort), async () => {
-  const c = pinnedClaim(); c.config!.default_effort = effort;
+  const c = pinnedClaim(); c.config!.default_effort = effort as NonNullable<ClaimResponse["config"]>["default_effort"];
   const r = rig({ claim: c });
   await assert.rejects(r.run(), CrossCheckCheckerUnavailableError);
   assert.equal(r.releases, 0); assert.equal(r.specs.length, 0); assert.equal(r.requests.length, 0);
  });
 }
-for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
  it("passes pinned effort unchanged: " + effort, async () => {
   const c = pinnedClaim(); c.config!.default_effort = effort;
   const r = rig({ claim: c });
@@ -260,6 +274,76 @@ it("cancellation retains disposition before rejection consumption", async () => 
  const r = rig({ claim: pinnedClaim(), notes: (emit) => { rejection(emit); controller.abort(); } });
  await assert.rejects(r.run(controller.signal), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
  assertOneAttempt(r);
+});
+
+for (const bucket of ["outputTokens", "reasoningOutputTokens"] as const) {
+ for (const mode of ["async", "terminal"] as const) {
+  it("cumulative " + bucket + " closes startup with zero last usage: " + mode, async () => {
+   const r = rig({ claim: pinnedClaim(), notes: (emit) => {
+    const zero = { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    emit({ method: "thread/tokenUsage/updated", params: { threadId: "thread", turnId: "turn",
+     tokenUsage: { total: { ...zero, [bucket]: 1 }, last: zero } } });
+    if (mode === "async") rejection(emit); else failedTerminal(emit);
+   } });
+   await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
+   assertOneAttempt(r);
+  });
+ }
+}
+for (const timing of ["coalesced", "queued"] as const) {
+ for (const binding of ["bound", "foreign-thread", "foreign-turn", "missing-start"] as const) {
+  it("arrival activity before rejected turn RPC: " + timing + "/" + binding, async () => {
+   const r = rig({ claim: pinnedClaim(), coalesced: timing === "coalesced", queuedResponse: timing === "queued",
+    rpcFailure: "turn/start", rpcError: { code: -32000, message: capturedError.message },
+    beforeResponse: (frame, emit) => {
+     if (frame.method !== "turn/start") return;
+     if (binding !== "missing-start") emit({ method: "turn/started", params: {
+      threadId: binding === "foreign-thread" ? "foreign" : "thread", turn: { id: "turn" } } });
+     emit({ method: "item/started", params: { threadId: "thread",
+      turnId: binding === "foreign-turn" ? "foreign" : "turn", item: { type: "reasoning" } } });
+    } });
+   await assert.rejects(r.run(), (e: Error) => binding === "bound"
+    ? !(e instanceof CrossCheckCheckerUnavailableError) : e instanceof CrossCheckCheckerUnavailableError);
+   assertOneAttempt(r);
+  });
+ }
+}
+for (const phase of ["initialize", "account/login/start", "turn/start"] as const) {
+ for (const mode of ["async", "terminal"] as const) {
+  it("rejection arrival provenance: " + phase + "/" + mode, async () => {
+   const r = rig({ claim: pinnedClaim(), coalesced: true, holdTurn: true,
+    beforeResponse: (frame, emit) => {
+     if (frame.method === phase) { if (mode === "async") rejection(emit); else failedTerminal(emit); }
+    } });
+   await assert.rejects(r.run(), (e: Error) => phase === "turn/start"
+    ? e instanceof CrossCheckCheckerUnavailableError : !(e instanceof CrossCheckCheckerUnavailableError));
+   assertOneAttempt(r);
+  });
+ }
+}
+for (const method of ["thread/start", "turn/start"] as const) {
+ it("coalesced malformed frame preserves RPC protocol failure: " + method, async () => {
+  const r = rig({ claim: pinnedClaim(), coalesced: true, rpcFailure: method,
+   rpcError: { code: -32000, message: capturedError.message },
+   afterResponse: (frame, emit) => { if (frame.method === method) emit([]); } });
+  await assert.rejects(r.run(), /received a non-object frame/);
+  assertOneAttempt(r, method !== "thread/start");
+ });
+}
+for (const cleanupFails of [false, true]) {
+ it("original failure survives usage failure with cleanup priority: " + cleanupFails, async () => {
+  const r = rig({ claim: pinnedClaim(), failUsage: true, failDispose: cleanupFails, notes: (emit) => rejection(emit) });
+  await assert.rejects(r.run(), (e: Error) => cleanupFails ? /cleanup unconfirmed/.test(e.message)
+   : e instanceof CrossCheckCheckerUnavailableError);
+  assertOneAttempt(r);
+  assert.equal(r.usage.at(-1)!.is_error, true);
+ });
+}
+it("successful verdict preserves usage settlement failure and removes secrets", async () => {
+ const r = rig({ failUsage: true });
+ await assert.rejects(r.run(), /usage failed/);
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+ assert.equal(r.secrets.size, 0);
 });
 
 it("uses claimed model/effort, required wrappers, real Read broker and strict complete verdict", async () => {
