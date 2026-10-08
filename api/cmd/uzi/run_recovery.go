@@ -199,9 +199,9 @@ type recoveryOwnerHoldJSON struct {
 	TerminalRejection string `json:"terminal_rejection,omitempty"`
 }
 
-// sourceOnlyLine explains retained local inventory, including a guarded hold with an
-// earlier downloadable archive pending final coverage. Attention is the server-authoritative
-// value; id and worker name are server-supplied and pass cellText like the table cells.
+// sourceOnlyLine explains retained local inventory, including a guarded hold with a
+// downloadable archive and unresolved custody (incomplete coverage or external dependencies).
+// Attention is server-authoritative; id and worker name pass cellText like the table cells.
 func sourceOnlyLine(h apitypes.RecoveryCustodyHoldDTO) string {
 	if h.Attention != "source_only" {
 		return ""
@@ -215,7 +215,7 @@ func sourceOnlyLine(h apitypes.RecoveryCustodyHoldDTO) string {
 		return line
 	}
 	if h.InventoryGuarded && h.HasAvailableCapture {
-		line := fmt.Sprintf("hold %s: earlier recovery archive available; final inventory disposition is pending; custody of worker %s is retained",
+		line := fmt.Sprintf("hold %s: recovery archive available; custody of worker %s remains unresolved and its local source is retained",
 			cellText(h.ID), cellText(recoveryWorkerLabel(h)))
 		if h.CaptureState == "preparing" || h.CaptureState == "uploading" {
 			line += fmt.Sprintf("; latest capture is %s (coverage not yet verified)", cellText(h.CaptureState))

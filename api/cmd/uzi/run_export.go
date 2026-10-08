@@ -38,7 +38,9 @@ func newRunExportCmd(env Env, gf *globalFlags) *cobra.Command {
 			"download's byte count and checksum are verified against the server manifest before the " +
 			"file is published, and the destination is never overwritten (an existing file or symlink " +
 			"there is refused). An interrupted, corrupt or expired download exits nonzero and leaves " +
-			"no file at the destination.\n\n" +
+			"no file at the destination. Verification here checks bytes only; it does not prove that " +
+			"required commits are available. In a fresh destination clone of your forge repo, run " +
+			"`git bundle verify <bundle-path>` before import or discarding retained source.\n\n" +
 			"The original history may contain secrets: review it before publishing anywhere, and if you " +
 			"find a real credential, revoke/rotate it and remove it from the affected history.",
 		Args: cobra.ExactArgs(1),
@@ -229,7 +231,9 @@ func renderExportResult(env Env, gf *globalFlags, runID string, a apitypes.Recov
 	}
 	_, _ = fmt.Fprintf(env.Stderr,
 		"warning: this archive is the run's ORIGINAL committed history and may contain secrets — "+
-			"review it before publishing anywhere; a real credential must be revoked/rotated and removed from the history\n")
+			"review it before publishing anywhere; a real credential must be revoked/rotated and removed from the history\n"+
+			"verification checks bytes only, not availability of required commits. In a fresh destination clone of your forge repo, "+
+			"run `git bundle verify <bundle-path>` before import or discarding retained source. An available archive does not resolve guarded custody.\n")
 
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
@@ -240,11 +244,12 @@ func renderExportResult(env Env, gf *globalFlags, runID string, a apitypes.Recov
 			"byte_size":  size,
 			"checksum":   strings.ToLower(a.Checksum),
 			"source_sha": a.SourceSha,
-			"verified":   true,
+			// verified retains its byte-count/checksum contract; it does not verify Git dependencies.
+			"verified": true,
 		})
 	}
 	if !gf.quiet {
-		p.Printf("exported recovery archive %s to %s (%s, verified)\n", a.ID, output, humanBytes(size))
+		p.Printf("exported recovery archive %s to %s (%s, bytes verified only)\n", a.ID, output, humanBytes(size))
 	}
 	return nil
 }

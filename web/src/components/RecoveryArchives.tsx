@@ -333,10 +333,18 @@ function CaptureRow({
         {capture.prerequisite_shas && capture.prerequisite_shas.length > 0 && (
           <div className="sm:col-span-2">
             <dt className="inline text-faint">Prerequisites: </dt>
-            <dd className="inline font-mono text-muted">
-              {capture.prerequisite_shas
-                .map((s) => stripUnsafeChars(shortSha(s)))
-                .join(", ")}
+            <dd className="inline text-muted">
+              <span className="font-mono">
+                {capture.prerequisite_shas
+                  .map((s) => stripUnsafeChars(shortSha(s)))
+                  .join(", ")}
+              </span>
+              <p className="mt-1 text-xs text-muted">
+                These required commits must already exist in your destination clone. In a fresh
+                clone of your forge repo, run git bundle verify &lt;bundle-path&gt; before import
+                or discarding retained source. Byte count and checksum alone cannot prove
+                independent recovery; an available archive does not resolve guarded custody.
+              </p>
             </dd>
           </div>
         )}

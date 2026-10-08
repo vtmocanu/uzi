@@ -98,8 +98,8 @@ type RecoveryReserveResponse struct {
 // RecoveryUploadManifest is the byte-manifest the worker binds ONCE (compare-and-set, D2)
 // before/at the streaming upload of the verified bundle. ByteSize and Checksum are the
 // complete-bundle facts the server verifies; ChunkCount is the expected ordered-chunk
-// inventory; PrerequisiteShas is the verified public prerequisite closure the bundle
-// imports against (D5). The bundle bytes themselves stream as the request body — they are
+// inventory; PrerequisiteShas records the actual bundle-header dependencies, including
+// cached dependencies for guarded captures (D5), not a fresh public-availability guarantee. The bundle bytes themselves stream as the request body — they are
 // never carried in JSON.
 type RecoveryUploadManifest struct {
 	ByteSize         int64    `json:"byte_size"`
