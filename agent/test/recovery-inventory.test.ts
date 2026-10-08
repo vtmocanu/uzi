@@ -543,7 +543,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
-    sourceRefused: false, uploads: 0, pinDeletes: 0,
+    sourceRefused: false, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
     beforeFinalAck: undefined as (() => Promise<void>) | undefined,
@@ -579,6 +579,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
       return { capture_id: capture.id, state: "preparing" };
     },
     getRecoveryCaptureStatus: async (_run: string, id: string) => {
+      state.statusReads++;
       const capture = [...captures.values()].find(c => c.id === id);
       assert.ok(capture);
       return {
@@ -667,14 +668,18 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
       return { sha: fingerprint.slice(0, 40), fingerprint };
     },
     fetchDefaultTip: async () => { throw new Error("guarded capture must be credential free"); },
-    produceRecoveryBundle: async (_bare: string, opts: { outPath: string; forgeTip?: string }) => {
+    produceRecoveryBundle: async (_bare: string, opts: { outPath: string; sourceSha: string; forgeTip?: string; guardedDefaultBranch?: string }) => {
       state.produced++;
       state.onProduce?.();
       await state.produceWait;
       assert.equal(opts.forgeTip, undefined);
       if (state.oversized) throw new RecoveryBundleTooLargeError(100, 10);
       if (state.failProduce) throw new Error("bundle failure");
-      const bytes = Buffer.from("bundle-fixture");
+      assert.equal(opts.guardedDefaultBranch, "main");
+      // Valid empty pack for the fake Git seam; the advertised source is exact.
+      const pack = Buffer.concat([Buffer.from("PACK"), Buffer.from([0, 0, 0, 2, 0, 0, 0, 0])]);
+      const bytes = Buffer.concat([Buffer.from(`# v2 git bundle\n${state.thin ? `-${H} retained dependency\n` : ""}${opts.sourceSha} refs/heads/recovered-source\n\n`),
+        pack, createHash("sha1").update(pack).digest()]);
       await fs.writeFile(opts.outPath, bytes);
       return { bundlePath: opts.outPath, byteSize: bytes.length,
         checksum: createHash("sha256").update(bytes).digest("hex"),
@@ -2206,3 +2211,66 @@ it("issue2213 a quarantine during the FINAL ACK keeps the journal unacknowledged
     await fs.access(kept!.bundlePath!);
   } finally { resetResidueQuarantineForTests(); await f.close(); }
 });
+
+for (const uploadFails of [false, true]) {
+  it(`guarded thin retained bytes retry without FINAL or reproduction uploadFails=${uploadFails}`, async () => {
+    const f = await fixture();
+    try {
+      f.state.thin = true;
+      const record = await f.freeze(); assert.ok(record);
+      if (uploadFails) f.state.reserveError = new Error("network unavailable");
+      await f.capture(record);
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(before.selfContained, false);
+      assert.deepEqual(before.prerequisiteShas, [H]);
+      const bytes = await fs.readFile(before.bundlePath!);
+      const produced = f.state.produced;
+      f.state.reserveError = undefined;
+      await f.make().resumePending(undefined, [before]);
+      const uploaded = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(uploaded.state, "uploaded");
+      assert.equal(uploaded.captureId, before.captureId);
+      assert.equal(uploaded.checksum, before.checksum);
+      assert.deepEqual(uploaded.prerequisiteShas, before.prerequisiteShas);
+      const statusReads = f.state.statusReads;
+      await f.capture(uploaded);
+      await f.make().resumePending(undefined, [uploaded]);
+      assert.equal(f.state.statusReads, statusReads, "thin FINAL never polls status");
+      assert.equal(f.finals.length, 0);
+      assert.equal(f.state.produced, produced);
+      assert.deepEqual(await fs.readFile(uploaded.bundlePath!), bytes);
+      assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "pending");
+      await f.coordinator.forgetGeneration("run-1", 7);
+      assert.equal((await f.coordinator.inspect("run-1")).length, 1);
+      assert.equal(f.state.open, true);
+    } finally { await f.close(); }
+  });
+}
+for (const corruption of ["missing", "source", "ref", "dependencies", "oversized-header", "metadata"] as const) {
+  it(`guarded queued archive FINAL refuses retained evidence ${corruption}`, async () => {
+    const f = await fixture();
+    try {
+      f.state.loseAck = true;
+      const record = await f.freeze(); assert.ok(record);
+      await f.capture(record);
+      const queued = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.ok(queued.finalRequest); assert.equal(f.finals.length, 1);
+      if (corruption === "missing") await fs.rm(queued.bundlePath!);
+      else if (corruption === "metadata") {
+        const inner = f.coordinator as unknown as { writeExistingRecord(r: RecoveryRecord, fn: (r: RecoveryRecord) => RecoveryRecord): Promise<RecoveryRecord> };
+        await inner.writeExistingRecord(queued, cur => ({ ...cur, selfContained: undefined, prerequisiteShas: undefined }));
+      } else {
+        const header = corruption === "source" ? `${H} refs/heads/recovered-source`
+          : corruption === "ref" ? `${queued.sourceSha} refs/heads/other`
+          : corruption === "dependencies" ? `-${H} prerequisite\n${queued.sourceSha} refs/heads/recovered-source`
+          : "x".repeat(20 * 1024);
+        await fs.writeFile(queued.bundlePath!, `# v2 git bundle\n${header}\n\nPACK`);
+      }
+      f.state.loseAck = false;
+      await f.make().resumePending(undefined, [queued]);
+      assert.equal(f.finals.length, 1);
+      assert.notEqual((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+      assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "pending");
+    } finally { await f.close(); }
+  });
+}

@@ -2826,8 +2826,8 @@ export interface RecoveryReserveResponse {
 /** RecoveryUploadManifest is the byte-manifest the worker binds ONCE (compare-and-set)
  *  before/at the streaming upload of the verified bundle. byte_size/checksum are the
  *  complete-bundle facts the server verifies; chunk_count is the expected ordered-chunk
- *  inventory; prerequisite_shas is the verified public prerequisite closure the bundle
- *  imports against. The bundle bytes stream as the request body, never in this JSON. */
+ *  inventory; prerequisite_shas lists actual bundle-header dependencies. Guarded
+ *  cached dependencies require retained local custody; they are not fresh forge proof. The bundle bytes stream as the request body, never in this JSON. */
 export interface RecoveryUploadManifest {
   byte_size: number;
   checksum: string;

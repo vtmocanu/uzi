@@ -354,7 +354,7 @@ for (const accepted of [true, false]) {
       assert.ok(feed.includes(guard.serverId), "delivered feed names the SERVER capture UUID");
       assert.ok(feed.includes(h.slice(0, 12)));
       assert.match(feed, /uzi run export/);
-      assert.match(feed, /custody final ACK pending/);
+      assert.match(feed, /local sources retained/);
       assert.equal(guard.finals(), 0, "the still-registered flight cannot finalize inventory");
     } else {
       assert.equal(frozen, 0);

@@ -10705,7 +10705,7 @@ export class RunRunner {
       const chunk = fresh.slice(i, i + 8);
       const labels = chunk.map(s => s.slice(0, 12));
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
-        archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; final custody ACK pending. Use uzi run recovery or uzi run export.`
+        archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; local custody retained. Use uzi run recovery or uzi run export.`
           : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
       } });
       for (const s of chunk) seen.add(s);
@@ -10784,7 +10784,7 @@ export class RunRunner {
       const outcome = await this.recovery.captureAndUpload({
         record, barePath, defaultBranch: record.defaultBranch!, signal,
       });
-      if (outcome.state !== "uploaded") flight.preserveRecoveryClone = true;
+      if (outcome.state !== "uploaded" || await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged") flight.preserveRecoveryClone = true;
       this.announceOwedHeads(flight, record.originalRoots?.map(r => r.sha) ?? [], outcome.state === "uploaded");
       if (outcome.state === "uploaded") {
         // captureAndUpload persists the reservation on a newer journal revision.
@@ -10793,7 +10793,9 @@ export class RunRunner {
           const noticeIdentity = JSON.stringify([uploaded.serverCaptureId, uploaded.finalAcknowledged === true]);
           const text = uploaded.finalAcknowledged
             ? `Recovery archive ${uploaded.serverCaptureId} covers the frozen inventory; custody transfer confirmed. Use uzi run recovery or uzi run export.`
-            : `Earlier recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending. Use uzi run recovery or uzi run export.`;
+            : uploaded.selfContained === false
+              ? `Recovery archive ${uploaded.serverCaptureId} requires retained prerequisites; local sources and custody intentionally retained. Use uzi run recovery or uzi run export.`
+              : `Recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending, local sources retained. Use uzi run recovery or uzi run export.`;
           if (!flight.inventoryArchiveNotices.has(noticeIdentity)) {
             flight.inventoryArchiveNotices.add(noticeIdentity);
             if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });

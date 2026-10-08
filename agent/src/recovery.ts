@@ -43,7 +43,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
@@ -233,7 +233,7 @@ export interface RecoveryBundleProducer {
   buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string): Promise<RecoveryCoverage>;
   produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult>;
   fetchDefaultTip(
     barePath: string,
@@ -987,6 +987,16 @@ export class RecoveryCoordinator {
     if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
     if (!record.inventoryGuarded || record.finalAcknowledged || record.reason === "inventory_quiescence_breach" || !record.coverageDigest ||
         !(await this.inactiveInventory(record))) return;
+    // Archive FINAL releases local custody only with positive, retained-byte evidence.
+    // Settled FINAL has its own independently verified empty-inventory proof.
+    if (record.finalRequest?.disposition.kind !== "settled") {
+      if (record.selfContained !== true || !Array.isArray(record.prerequisiteShas) ||
+          record.prerequisiteShas.length !== 0 || !record.bundlePath) return;
+      try {
+        const header = await readRecoveryBundleHeader(record.bundlePath, record.sourceSha);
+        if (!header.selfContained || header.prerequisiteShas.length !== 0) return;
+      } catch { return; }
+    }
     // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
     if (!record.coverageContext || !this.git.enumerateOwedCandidates) return;
     const unresolved = await this.git.enumerateOwedCandidates(record.coverageContext.barePath, record.runId);
@@ -1408,7 +1418,7 @@ export class RecoveryCoordinator {
       result = await this.git.produceRecoveryBundle(input.barePath, {
         sourceSha: record.sourceSha,
         outPath: tmpPath,
-        forgeTip,
+        ...(record.inventoryGuarded ? { guardedDefaultBranch: input.defaultBranch } : { forgeTip }),
       });
     } catch (err) {
       await fs.rm(tmpPath, { force: true }).catch(() => undefined);
@@ -1470,6 +1480,7 @@ export class RecoveryCoordinator {
         const cur = await this.requireRecord(snapshot);
         if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
+        const header = cur.inventoryGuarded ? await readRecoveryBundleHeader(tmpPath, cur.sourceSha) : undefined;
         await fs.rename(tmpPath, finalPath);
         const bundled: RecoveryRecord = {
           ...cur,
@@ -1479,8 +1490,8 @@ export class RecoveryCoordinator {
           byteSize: result.byteSize,
           checksum: result.checksum,
           chunkCount: result.chunkCount,
-          prerequisiteShas: result.prerequisiteShas,
-          selfContained: result.selfContained,
+          prerequisiteShas: header?.prerequisiteShas ?? result.prerequisiteShas,
+          selfContained: header?.selfContained ?? result.selfContained,
           reason: undefined,
         };
         try {

@@ -688,6 +688,40 @@ export const RECOVERY_CHUNK_BYTES = 1024 * 1024;
 // branch or a stale bare mirror ref (it is created and deleted under the bare lock).
 export const RECOVERY_BUNDLE_REF = "refs/heads/recovered-source";
 
+/** Inspect at most 16 KiB of retained bytes; never load the pack to parse its header. */
+export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: string): Promise<{
+  prerequisiteShas: string[]; selfContained: boolean;
+}> {
+  const file = await fs.open(bundlePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    const st = await file.stat();
+    if (!st.isFile()) throw new Error("recovery bundle is not a regular file");
+    const bytes = Buffer.alloc(16 * 1024);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    const end = bytes.subarray(0, bytesRead).indexOf("\n\n");
+    if (end < 0 || end + 6 > bytesRead || bytes.toString("ascii", end + 2, end + 6) !== "PACK") {
+      throw new Error("invalid or excessive recovery bundle header");
+    }
+    const header = bytes.subarray(0, end);
+    if (header.some(byte => byte < 32 && byte !== 10 || byte > 126)) throw new Error("invalid recovery header encoding");
+    const lines = header.toString("ascii").split("\n");
+    const version = lines.shift();
+    if (version !== "# v2 git bundle" && version !== "# v3 git bundle") throw new Error("invalid recovery bundle version");
+    if (version === "# v3 git bundle" && lines[0] === "@object-format=sha1") lines.shift();
+    const prerequisites: string[] = [];
+    while (lines[0]?.startsWith("-")) {
+      const line = lines.shift()!;
+      const match = /^-([0-9a-f]{40}) (.*)$/.exec(line);
+      if (!match || prerequisites.length >= 64 || prerequisites.includes(match[1]!)) throw new Error("invalid recovery prerequisites");
+      prerequisites.push(match[1]!);
+    }
+    if (lines.length !== 1 || lines[0] !== `${sourceSha} ${RECOVERY_BUNDLE_REF}` || !/^[0-9a-f]{40}$/.test(sourceSha)) {
+      throw new Error("recovery bundle source/ref mismatch");
+    }
+    return { prerequisiteShas: prerequisites.sort(), selfContained: prerequisites.length === 0 };
+  } finally { await file.close(); }
+}
+
 /** The verified-bundle facts the recovery uploader binds into the upload manifest and
  *  journals BEFORE upload (PRD #1296 D5). Produced from trusted bare-object operations
  *  only — no source checkout, no repo-controlled hooks/filters. */
@@ -700,8 +734,8 @@ export interface RecoveryBundleResult {
   checksum: string;
   /** Expected ordered-chunk inventory = ceil(byteSize / RECOVERY_CHUNK_BYTES). */
   chunkCount: number;
-  /** The verified public prerequisite closure the bundle imports against — the
-   *  merge-base(H, fresh forge tip) SHA(s), or [] for a self-contained bundle (D5). */
+  /** Actual sorted bundle-header dependencies. Guarded cached dependencies retain
+   *  local custody; legacy dependencies derive from the fresh forge tip. */
   prerequisiteShas: string[];
   /** The resolved original committed head H (40-hex). */
   sourceSha: string;
@@ -6473,8 +6507,11 @@ export class GitCache {
    * a real merge-base with H, that merge-base is the bundle's prerequisite — so a user's
    * CLEAN forge clone (which already has the merge-base) can import it. The runner clone's
    * private `origin/main`, a prior checkpoint wrapper, or an unpublished private base are
-   * NEVER used: the caller passes only a freshly forge-fetched tip, and this method reads
-   * nothing else. When no forge-reachable prerequisite exists (unrelated histories, or H is
+   * NEVER used by the legacy `forgeTip` path. The guarded path first attempts a full
+   * bundle; only on oversize may it use the direct worker bare's cached default ref.
+   * Those cached prerequisites are header-derived and require retained local custody,
+   * since they do not prove current forge reachability. When no forge-reachable prerequisite
+   * exists (unrelated histories, or H is
    * already fully on the forge), it falls back to a SELF-CONTAINED bundle within the size
    * limit; if that exceeds RECOVERY_MAX_BUNDLE_BYTES it throws RecoveryBundleTooLargeError
    * so the caller retains custody and surfaces needs_action rather than truncating. The size
@@ -6487,15 +6524,20 @@ export class GitCache {
    */
   async produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult> {
+    if (opts.guardedDefaultBranch !== undefined && opts.forgeTip !== undefined) {
+      throw new Error("guardedDefaultBranch and forgeTip are mutually exclusive");
+    }
     const maxBytes = opts.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES;
     return this.withLock(barePath, async () => {
+      if (opts.guardedDefaultBranch !== undefined) await this.assertOwedBare(barePath);
+      const graphGit = (args: string[]): Promise<string> => this.runGit(barePath, ["--no-replace-objects", ...args]);
       // Resolve + verify H is a real commit present in the trusted bare. Never trust a
       // caller-supplied SHA blindly; a missing object here means the source is not
       // reproducible and the caller must surface needs_action.
       const h = (
-        await this.runGit(barePath, ["rev-parse", "--verify", `${opts.sourceSha}^{commit}`]).catch(
+        await graphGit(["rev-parse", "--verify", `${opts.sourceSha}^{commit}`]).catch(
           () => "",
         )
       ).trim();
@@ -6510,7 +6552,7 @@ export class GitCache {
       let prereqs: string[] = [];
       if (opts.forgeTip && /^[0-9a-f]{40}$/.test(opts.forgeTip)) {
         const mb = (
-          await this.runGit(barePath, ["merge-base", h, opts.forgeTip]).catch(() => "")
+          await graphGit(["merge-base", h, opts.forgeTip]).catch(() => "")
         ).trim();
         if (/^[0-9a-f]{40}$/.test(mb)) {
           if (mb === h) {
@@ -6533,12 +6575,47 @@ export class GitCache {
       await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
       try {
         // `-` writes the bundle to stdout so the bytes actually written are counted and capped.
-        const args = ["bundle", "create", "-", RECOVERY_BUNDLE_REF];
-        for (const p of prereqs) args.push(`^${p}`);
-        await this.streamBundleWithCap(barePath, args, opts.outPath, maxBytes);
-        // Producer self-check: the bundle's prerequisites resolve against the bare. The
-        // authoritative proof is the clean-clone import in the conformance tests.
-        await this.runGit(barePath, ["bundle", "verify", opts.outPath]);
+        const produce = async (): Promise<void> => {
+          const args = ["--no-replace-objects", "bundle", "create", "-", RECOVERY_BUNDLE_REF];
+          for (const p of prereqs) args.push(`^${p}`);
+          await this.streamBundleWithCap(barePath, args, opts.outPath, maxBytes);
+        };
+        try {
+          await produce();
+        } catch (original) {
+          if (!(original instanceof RecoveryBundleTooLargeError) || opts.guardedDefaultBranch === undefined) throw original;
+          // Only the direct worker cache is admissible. No network or private runner ref is
+          // consulted. Invalid, absent or unrelated cache leaves the original oversized outcome.
+          try {
+            const branch = opts.guardedDefaultBranch;
+            if (!await this.isPlainBranchName(barePath, branch)) throw original;
+            const ref = `refs/remotes/origin/${branch}`;
+            await graphGit(["check-ref-format", ref]);
+            const tip = (await graphGit(["show-ref", "--verify", "--hash", ref])).trim();
+            const direct = (await graphGit(["for-each-ref", "--format=%(refname)|%(objectname)|%(objecttype)|%(symref)|END", ref])).trim();
+            if (direct !== `${ref}|${tip}|commit||END`) throw original;
+            if (!/^[0-9a-f]{40}$/.test(tip) || (await graphGit(["cat-file", "-t", tip])).trim() !== "commit") throw original;
+            const bases = (await graphGit(["merge-base", "--all", h, tip])).trim().split("\n");
+            if (!bases.length || bases.some(sha => !/^[0-9a-f]{40}$/.test(sha))) throw original;
+            prereqs = [...new Set(bases)].sort();
+            if (prereqs.includes(h)) {
+              const parents = (await graphGit(["rev-list", "--parents", "-n", "1", h])).trim().split(" ");
+              if (parents.shift() !== h) throw original;
+              prereqs = [...new Set(parents)].sort();
+              for (const sha of prereqs) {
+                if (!/^[0-9a-f]{40}$/.test(sha) || (await graphGit(["cat-file", "-t", sha])).trim() !== "commit") throw original;
+              }
+            }
+            if (!prereqs.length) throw original;
+          } catch { throw original; }
+          await produce();
+        }
+        await graphGit(["bundle", "verify", opts.outPath]);
+        // Git may advertise boundary commits other than the selected exclusions.
+        prereqs = (await readRecoveryBundleHeader(opts.outPath, h)).prerequisiteShas;
+      } catch (err) {
+        await fs.rm(opts.outPath, { force: true });
+        throw err;
       } finally {
         await this.tryGit(barePath, ["update-ref", "-d", RECOVERY_BUNDLE_REF]);
       }
@@ -7216,7 +7293,7 @@ export class GitCache {
     if (!OID.test(floor) || !OID.test(tip)) return "unknown";
     // tryGitExit (NOT tryGit) so a non-completion — a spawn failure, timeout, or signal kill —
     // surfaces as null rather than tryGit's coerce-to-1, which would misreport it as "divergent".
-    const code = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", floor, tip]);
+    const code = await this.tryGitExit(barePath, ["--no-replace-objects", "merge-base", "--is-ancestor", floor, tip]);
     if (code === 0) return "ancestor";
     if (code === 1) return "divergent";
     // 128 / any other exit = a git error or a missing/unresolvable ref, and null = a spawn error,
@@ -8185,7 +8262,7 @@ export class GitCache {
 
   private async requireOwedCommit(barePath: string, sha: string): Promise<void> {
     if (typeof sha !== "string" || !OWED_OID.test(sha) ||
-        (await this.runGit(barePath, ["cat-file", "-t", sha])).trim() !== "commit") {
+        (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha])).trim() !== "commit") {
       throw new Error("owed candidate is not an actual lowercase commit OID");
     }
   }
@@ -8859,8 +8936,8 @@ export class GitCache {
       if (!roots.length) throw new Error("recovery coverage needs original roots");
       await this.requireOwedCommit(barePath, currentSha);
       for (const root of roots) await this.requireOwedCommit(barePath, root);
-      const tree = (await this.runGit(barePath, ["rev-parse", `${currentSha}^{tree}`])).trim();
-      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["cat-file", "-t", tree])).trim() !== "tree") {
+      const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
+      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", tree])).trim() !== "tree") {
         throw new Error("recovery current tree unavailable");
       }
       const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
@@ -8869,7 +8946,7 @@ export class GitCache {
       do {
         const next: string[] = [];
         for (let start = 0; start < parents.length; start += 32) {
-          const args = ["-c", "commit.gpgsign=false", "commit-tree", tree];
+          const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
           for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
           args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
           const sha = (await this.runGitWithEnv(barePath, args, {
@@ -8887,7 +8964,7 @@ export class GitCache {
       for (const root of [...roots, currentSha]) {
         if (await this.ancestry(barePath, root, sha) !== "ancestor") throw new Error("recovery coverage proof failed");
       }
-      if ((await this.runGit(barePath, ["rev-parse", `${sha}^{tree}`])).trim() !== tree) {
+      if ((await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${sha}^{tree}`])).trim() !== tree) {
         throw new Error("recovery coverage tree mismatch");
       }
       await this.persistOwedContext(context);
