@@ -681,9 +681,10 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
         chunkCount: 1, prerequisiteShas: [], selfContained: true, alreadyPublished: false };
     },
   };
+  const log = nullLogger();
   const make = (sourceBoundary = false) => new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
-    log: nullLogger(), client: client as never, git: git as never, now: () => state.now,
+    log, client: client as never, git: git as never, now: () => state.now,
     withInventorySourceBoundary: sourceBoundary ? async (_context, action) => {
       if (state.sourceRefused) return "retained";
       await action(async () => !state.sourceRefused);
@@ -698,7 +699,7 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receipt
     record, barePath: context.barePath, defaultBranch: "main",
   });
   return { root, context, state, aggregates, finals, coordinator, make, freeze, capture, git,
-    captures, reserveKeys, committedReceipts, client,
+    captures, reserveKeys, committedReceipts, client, log,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
 }
 
@@ -1007,10 +1008,8 @@ for (const lostAck of [true, false]) {
       assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
       assert.deepEqual(new Set(f.reserveKeys.slice(1)), new Set([pending.reserveIdempotencyKey]));
       assert.equal(await f.make().inventoryCleanupState("run-1", 7), "acknowledged");
-      // Model the runner cleanup caller: pin deletion is authorized only after checked ACK.
-      await f.git.deleteRecoveryPin();
-      assert.equal(f.state.pinDeletes, 1, "the explicit deletion seam is exercised after ACK");
       await f.make().forgetGeneration("run-1", 7);
+      assert.deepEqual(await f.make().inspect("run-1"), []);
       await assert.rejects(fs.readFile(before.bundlePath!), { code: "ENOENT" });
     } finally { await f.close(); }
   });
@@ -1195,6 +1194,91 @@ it("guarded boot failure does not block a sibling run", async () => {
     assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
   } finally { await f.close(); }
 });
+
+for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "attention"] as const) {
+  it(`issue2416 retained FINAL reconciliation preserves retry classification ${variant}`, async () => {
+    const f = await fixture(false, os.tmpdir(), true);
+    try {
+      const warnings: string[] = [];
+      f.log.warn = message => { warnings.push(message); };
+      const record = await f.freeze();
+      assert.ok(record);
+      f.state.finalError = variant === "5xx"
+        ? new RequestError("POST", "/api/worker/runs/run-1/recovery/release", 503, "service unavailable")
+        : variant === "timeout" ? new DOMException("FINAL timed out", "TimeoutError")
+        : new Error("network unavailable");
+      const reason = variant === "generation_not_ended" ? "generation_not_ended"
+        : variant === "attention" ? "capture_failure_requires_attention" : "capture_available";
+      const reconcile = f.client.reconcileRecoveryCapture!;
+      let reconciliations = 0;
+      f.client.reconcileRecoveryCapture = async (run, id, request) => {
+        reconciliations++;
+        const response = await reconcile(run, id, request);
+        assert.equal(response.outcome, "retained");
+        assert.equal(response.reason, "capture_available");
+        return { ...response, reason };
+      };
+      const outcome = await f.capture(record);
+      assert.equal(reconciliations, 1, "the receipt endpoint is reached after FINAL fails");
+      const expected = variant === "attention" ? reason : "upload_transient";
+      assert.equal(outcome.reason, expected);
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(before.state, "uploaded");
+      assert.ok(before.finalRequest);
+      assert.equal(before.finalAcknowledged, undefined);
+      assert.equal(before.reason, variant === "attention" ? reason : undefined);
+      const capture = [...f.captures.values()][0]!;
+      assert.ok(capture.manifest, "the retained capture has healthy available bytes");
+      assert.ok(Date.parse(capture.expires!) > f.state.now);
+      const bytes = await fs.readFile(before.bundlePath!);
+      const pins = structuredClone(f.state.candidates);
+      const assertPending = async () => {
+        const current = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.deepEqual(current, before, "retries preserve the journal and exact FINAL identity");
+        assert.deepEqual(await fs.readFile(before.bundlePath!), bytes);
+        assert.deepEqual(f.state.candidates, pins);
+        assert.equal(f.state.pinDeletes, 0);
+        assert.equal(await f.coordinator.inventoryCleanupState("run-1", 7), "pending");
+        assert.equal(f.reserves(), 1);
+        assert.equal(f.state.uploads, 1);
+        assert.equal(f.state.produced, 1);
+        assert.ok(f.finals.every(request => canonicalJson(request) === canonicalJson(f.finals[0])));
+        assert.equal(warnings.includes("recovery: inventory requires owner attention"), variant === "attention");
+      };
+      const live = () => f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      await live();
+      assert.equal(f.finals.length, 2, "first transient live pass reaches FINAL");
+      await assertPending();
+      if (variant === "attention") {
+        f.state.now += 30_000;
+        await live();
+        assert.equal(f.finals.length, 3, "attention reasons retain the ordinary live interval");
+        await assertPending();
+      } else {
+        f.state.now += 60_000 - 1;
+        await live();
+        assert.equal(f.finals.length, 2, "first transient delay is 60 seconds");
+        f.state.now++;
+        await live();
+        assert.equal(f.finals.length, 3, "second transient live pass reaches FINAL");
+        await assertPending();
+        f.state.now += 120_000 - 1;
+        await live();
+        assert.equal(f.finals.length, 3, "second transient delay doubles to 120 seconds");
+        f.state.now++;
+        f.state.finalError = undefined;
+        await live();
+        assert.equal(f.finals.length, 4);
+        const after = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(after.finalAcknowledged, true);
+        assert.deepEqual(after.finalRequest, before.finalRequest);
+        assert.deepEqual(await fs.readFile(before.bundlePath!), bytes);
+        assert.deepEqual(f.state.candidates, pins);
+        assert.equal(f.state.pinDeletes, 0);
+      }
+    } finally { await f.close(); }
+  });
+}
 
 for (const phase of ["capture", "FINAL"] as const) {
   for (const credential of [false, true]) {

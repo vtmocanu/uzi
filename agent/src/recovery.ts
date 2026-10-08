@@ -1135,6 +1135,7 @@ export class RecoveryCoordinator {
         if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
             typeof response.reason !== "string" || !reasons.has(response.reason)) return;
         const reason = response.reason;
+        if (reason === "capture_available" || reason === "generation_not_ended") return;
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && !cur.finalAcknowledged &&
           canonicalJson(cur) === canonicalJson(record) ? { ...cur, reason } : undefined);
