@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Guarded recovery records safe inventory-source refusal diagnostics ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
   Worker logs and authenticated local recovery reasons identify the first failed source check and a bounded inventory-read cause without raw errors or paths. Existing custody and release decisions stay unchanged; the observed automatic hold-release failure still needs live evidence.
 
+- **Codex checkpoints can retry a verified startup timeout without failing completed work ([#2475](https://github.com/vtmocanu/uzi/issues/2475)).**
+  A checkpoint can retry when a child misses its startup deadline, provided disposal and full reap are verified before the original hard deadline. Completed work is preserved; hard deadline expiry, unsafe posture and unverified cleanup remain fatal. Worker logs and failure reasons include bounded launch-failure classifications without raw error summaries.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
