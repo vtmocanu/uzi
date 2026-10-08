@@ -69,9 +69,10 @@ nothing shows no such list. The same list is available from the terminal
 via `uzi run get` (see [the CLI docs](./cli.md#commands)).
 
 Autopilot normally skips the human gate. With [Plan cross-check](./cross-check.md),
-a Claude lead proceeds after the latest exact-plan pass. Eligible changes
-requested receive bounded automatic revisions; exhaustion, blockers and
-check failures normally force this gate. Codex leads park as unsupported.
+a Claude or Codex lead proceeds after the latest exact-plan pass by the other
+model family. Eligible changes requested receive bounded automatic revisions;
+exhaustion, blockers and check failures normally force this gate. A Codex lead
+on a worker without `cross_check_codex_lead_v1` parks for a human.
 See [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.

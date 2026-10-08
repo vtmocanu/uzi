@@ -466,6 +466,13 @@ The one exception is on the Claude run lane: `Read` may open a file directly
 inside that run's own SDK tool-result spill directory (the "Output too large ...
 Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
 worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
+The read-only Plan cross-check Claude checker (for a Codex lead) is stricter:
+`Read`, `Grep` and `Glob` only, with one path guard that confines them to its
+own checkout, apart from its own SDK spill files under its home. It also denies
+absolute, home-relative and `..` Glob/Grep patterns as defense in depth; the
+runner uid it runs as is the boundary, not that pattern check. See
+[Cross-check](./cross-check.md#claude-checker-isolation).
+
 This is a tool policy, not a promise that every shell command is filesystem
 confined: Claude's Bash guardrail screens commands but does not jail paths;
 Codex also screens the shell working directory, and uses Landlock only when
