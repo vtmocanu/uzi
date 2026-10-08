@@ -188,18 +188,15 @@ export interface CustodyAlertView {
 // Danger requires blocked_runs > 0, even below capacity. All other visible states warn.
 // Headlines prioritize blocked runs, then decisions, then capacity alone.
 // Older servers omit admission_counted_holds; explicit zero is meaningful.
-export function custodyAdmissionCount(agg: RecoveryCustodyAggregate): number {
+export function recoveryCapacityUsed(agg: RecoveryCustodyAggregate): number {
   return agg.admission_counted_holds ?? agg.open_holds;
 }
-
-// Existing held-work consumers share the same server-authoritative admission count.
-export const recoveryCapacityUsed = custodyAdmissionCount;
 
 export function custodyAlertView(
   agg: RecoveryCustodyAggregate,
   recoveryWaitCount: number,
 ): CustodyAlertView | null {
-  const capacityUsed = custodyAdmissionCount(agg);
+  const capacityUsed = recoveryCapacityUsed(agg);
   const atLimit =
     agg.custody_hold_limit > 0 && capacityUsed >= agg.custody_hold_limit;
   const show =
