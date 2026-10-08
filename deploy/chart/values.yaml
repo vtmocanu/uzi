@@ -660,6 +660,9 @@ workers:
   # it for burst capacity on one worker no longer risks piling two simultaneously
   # queued runs onto whichever worker happens to poll first while a sibling sits idle.
   maxConcurrentRuns: 1
+  # Dedicated cross-check lane slots; 0 disables the lane. Accepted range [0, 16].
+  # Relayed through UZI_WORKER_CROSS_CHECK_SLOTS to WORKER_CROSS_CHECK_SLOTS.
+  crossCheckSlots: 1
   # The WORKER container's requests.ephemeral-storage (issue #224 →
   # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
   # INSTEAD of this, not on top of it.

@@ -204,7 +204,9 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 		}
 		return store.Run{}, false, err
 	}
-	if run.ID != uuid.UUID(reread.EphemeralRunID.Bytes) && (!run.CrossCheckLane || run.TargetRunID != reread.EphemeralRunID) {
+	// An own-parent child serves the existing binding on either the dedicated lane
+	// or the legacy run lane; only a lease follow-up rebinds the worker.
+	if run.ID != uuid.UUID(reread.EphemeralRunID.Bytes) && (run.Kind != "cross_check" || run.TargetRunID != reread.EphemeralRunID) {
 		if s.leaseClaimWindow != nil {
 			s.leaseClaimWindow()
 		}

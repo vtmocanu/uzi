@@ -160,6 +160,9 @@ type Config struct {
 	// (PRD #58 Decision 7). Real concurrency is enforced solely by the worker-side
 	// semaphore, so this pod env is the only thing pinning a hosted worker to 1.
 	WorkerMaxConcurrentRuns int
+	// WorkerCrossCheckSlots defaults to 1 and accepts [0, 16]; zero disables cross-checks.
+	// UZI_WORKER_CROSS_CHECK_SLOTS is relayed as WORKER_CROSS_CHECK_SLOTS.
+	WorkerCrossCheckSlots int
 
 	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
 	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
@@ -443,6 +446,18 @@ func loadWorkerSettings(cfg *Config) error {
 			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%d out of range: accepted [1, %d] (a worker with no run slot can never claim a run; the ceiling matches the api's advertised-cap sanity band)", n, workerMaxConcurrentRunsCeiling)
 		}
 		cfg.WorkerMaxConcurrentRuns = n
+	}
+
+	cfg.WorkerCrossCheckSlots = 1
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_CROSS_CHECK_SLOTS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("UZI_WORKER_CROSS_CHECK_SLOTS=%q is not an integer (accepted range [0, 16])", raw)
+		}
+		if n < 0 || n > 16 {
+			return fmt.Errorf("UZI_WORKER_CROSS_CHECK_SLOTS=%d out of range: accepted [0, 16]", n)
+		}
+		cfg.WorkerCrossCheckSlots = n
 	}
 
 	// The worker container's requests.ephemeral-storage (issue #224 M-b), plain tier.
