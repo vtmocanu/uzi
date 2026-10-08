@@ -129,11 +129,27 @@ SELECT EXISTS (
 -- reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
 -- for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
 -- classes (migration 00232).
+-- Worker retry exhaustion requires an owner decision even with an available archive.
+-- Lock the run before updating its hold, matching the lifecycle's run-before-hold order.
+-- Read status from the locked tuple: if exhaustion commits while this statement waits,
+-- locked_run observes it and the delayed reconciler candidate moves zero rows.
+WITH locked_run AS MATERIALIZED (
+    SELECT r.id, r.status, r.recovery_wait_cause
+    FROM runs r
+    JOIN recovery_custody_holds h ON h.run_id = r.id
+    WHERE h.id = @id
+    FOR UPDATE OF r
+)
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
     released_at = now(), updated_at = now()
-WHERE id = @id AND state = 'open' AND NOT inventory_guarded;
+WHERE id = @id AND state = 'open' AND NOT inventory_guarded
+  AND NOT EXISTS (
+      SELECT 1 FROM locked_run r
+      WHERE r.status = 'recovery_wait'
+        AND r.recovery_wait_cause = 'worker_requeue_exhausted'
+  );
 
 -- name: DiscardCaptureForOwner :one
 -- D7: owner-initiated explicit discard of one capture. Deletes its byte chunks (freeing
@@ -250,6 +266,12 @@ SELECT h.*,
     END::text AS reason
 FROM recovery_custody_holds h
 WHERE h.state = 'open' AND NOT h.inventory_guarded
+  -- Archive readiness cannot implicitly resolve an owner retry-exhaustion decision,
+  -- including an older available capture alongside a newer upload for this hold.
+  AND NOT EXISTS (SELECT 1 FROM runs r
+                    WHERE r.id = h.run_id
+                      AND r.status = 'recovery_wait'
+                      AND r.recovery_wait_cause = 'worker_requeue_exhausted')
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id

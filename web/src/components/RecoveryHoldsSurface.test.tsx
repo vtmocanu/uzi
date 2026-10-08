@@ -95,6 +95,39 @@ describe("RecoveryHoldsSurface", () => {
     expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
   });
 
+  it.each(["available", "preparing", "uploading"])("qualifies source-only discard confirmation when an archive exists and latest capture is %s", async (capture_state) => {
+    await renderSurface(listing([hold({
+      id: "h-src", run_id: "run-xyz", worker_name: "jvm-worker", generation: 4,
+      attention: "source_only", has_available_capture: true, capture_state,
+    })]));
+    fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
+    const group = screen.getByRole("group", { name: "Discard held work for run run-xyz on jvm-worker, generation 4" });
+    const warning = document.getElementById(group.getAttribute("aria-describedby")!)!;
+    expect(warning.textContent).toContain("An earlier available archive can restore older work but may not cover the latest worker-local work.");
+    expect(warning.textContent).toContain("The latest worker-local source may be the only copy.");
+    expect(warning.textContent).not.toContain("no server archive can restore it");
+    expect(warning.textContent).toContain("hold h-src");
+    expect(warning.textContent).toContain("torn down, which can destroy this work permanently");
+    expect(warning.textContent).toContain("This cannot be undone.");
+    expect(document.activeElement).toBe(group);
+    expect((within(group).getByRole("button", { name: /Discard held work/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "preparing", "uploading"])("keeps the strong no-archive discard warning with latest capture %s", async (capture_state) => {
+    await renderSurface(listing([hold({ attention: "source_only", capture_state })]));
+    expect(screen.queryByRole("link", { name: /Export archive/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
+    const group = screen.getByRole("group", { name: /Discard held work/ });
+    const warning = document.getElementById(group.getAttribute("aria-describedby")!)!;
+    expect(warning.textContent).toMatch(/worker-local source may be the\s+only copy — no server archive can restore it/);
+    expect(warning.textContent).not.toContain("An earlier available archive");
+    expect(warning.textContent).toContain("torn down, which can destroy this work permanently");
+    expect(warning.textContent).toMatch(/This cannot be\s+undone\./);
+    expect((within(group).getByRole("button", { name: /Discard held work/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
   it.each([
     [8, undefined, 8, 8],
     [8, 0, 8, 0],
