@@ -181,7 +181,7 @@ headroom_fixture() {
   : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
   local count
   for count in "$@"; do
-    jq -nc --argjson count "$count" '{aggregate:{open_holds:$count,custody_hold_limit:8},holds:[
+    jq -nc --argjson count "$count" '{aggregate:{open_holds:$count,admission_counted_holds:$count,custody_hold_limit:8},holds:[
       {id:"archive",run_id:"R",generation:2,state:"open",attention:"archive_ready",capture_state:"available"},
       {id:"source",run_id:"S",generation:1,state:"open",attention:"source_only"}]}' >> "$SEQ_DIR/seq"
   done
@@ -202,8 +202,26 @@ headroom_fixture 5
 custody_case "exactly sufficient admission headroom" pass "open=5 limit=8 needed=3" wait_custody_headroom 3 2
 headroom_fixture 0
 custody_case "invalid requested headroom fails" fail "invalid needed=0" wait_custody_headroom 0 2
-printf '%s\n' '{"aggregate":{"open_holds":0},"holds":[]}' > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
+printf '%s\n' '{"aggregate":{"open_holds":0,"admission_counted_holds":0},"holds":[]}' > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
 custody_case "missing ceiling cannot read green" fail "invalid admission limit" wait_custody_headroom 1 2
+
+headroom_accounting_fixture() {
+  jq -nc --argjson open "$1" --argjson counted "$2" \
+    '{aggregate:{open_holds:$open,admission_counted_holds:$counted,custody_hold_limit:8},holds:[]}' > "$SEQ_DIR/seq"
+  echo 1 > "$SEQ_DIR/n"
+}
+headroom_accounting_fixture 12 3
+custody_case "healthy live holds do not consume admission headroom" pass 'counted=3 open=12' wait_custody_headroom 2 2
+headroom_accounting_fixture 12 0
+custody_case "zero counted holds leaves headroom despite retained total" pass 'counted=0 open=12' wait_custody_headroom 3 2
+headroom_accounting_fixture 12 7
+custody_case "counted saturation reports both pressure and total" fail 'counted=7 open=12' wait_custody_headroom 2 2
+for invalid in null -1 1.5 '"2"' true; do
+  headroom_accounting_fixture 0 "$invalid"
+  custody_case "admission headroom refuses counted=$invalid" fail 'invalid admission count' wait_custody_headroom 1 2
+done
+printf '%s\n' '{"aggregate":{"open_holds":0,"custody_hold_limit":8},"holds":[]}' > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
+custody_case "missing counted field cannot fall back to total" fail 'invalid admission count' wait_custody_headroom 1 2
 
 park_fixture() {
   : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
@@ -666,6 +684,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 106 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 115 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 106 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 115 ] && [ "$cases" -eq "$passed" ]

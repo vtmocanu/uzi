@@ -426,30 +426,30 @@ wait_run_mr_state()   { wait_eq "$2" "${3:-30}" "run $1 mr_state" run_mr_state "
 # (a stall needs ~75s of quiet plus a sweep tick).
 wait_health()         { wait_eq "$2" "${3:-120}" "run $1 health" run_health "$1"; }
 
-# wait_custody_headroom NEEDED [TIMEOUT]: fresh claims each add a hold. Read the owner
-# aggregate used by the recovery UI (GetCustodyAggregateForOwner), which counts the
-# same state='open' owner holds as ClaimRun's custody admission predicate. Never delete
-# or discard cross-phase evidence to make room, including source-only owner decisions.
+# wait_custody_headroom NEEDED [TIMEOUT]: reserve the case's requested admission
+# headroom using the canonical admission_counted_holds aggregate (ADR-2445).
+# Total open custody is diagnostic only. Preserve cross-phase source protection.
 wait_custody_headroom() {
-  local needed="$1" timeout="${2:-180}" start=$SECONDS snapshot count limit
+  local needed="$1" timeout="${2:-180}" start=$SECONDS snapshot count open_count limit
   [[ "$needed" =~ ^[1-9][0-9]*$ ]] || fail "custody headroom: invalid needed=$needed"
   while :; do
     snapshot="$(apiget /api/recovery/holds)"
-    count="$(printf '%s' "$snapshot" | jq -er '.aggregate.open_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid open count"
+    count="$(printf '%s' "$snapshot" | jq -er '.aggregate.admission_counted_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid admission count"
+    open_count="$(printf '%s' "$snapshot" | jq -er '.aggregate.open_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid open count"
     limit="$(printf '%s' "$snapshot" | jq -er '.aggregate.custody_hold_limit | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid admission limit"
     if [ "$limit" = 0 ] || [ $((count + needed)) -le "$limit" ]; then
-      pass "custody headroom: open=$count limit=$limit needed=$needed; evidence preserved"
+      pass "custody headroom: counted=$count open=$open_count limit=$limit needed=$needed; evidence preserved"
       printf '%s' "$snapshot" | jq -c '.holds[] | select(.state=="open" and .attention=="source_only") | {id,run_id,generation,attention}'
       return 0
     fi
     if [ $((SECONDS - start)) -ge "$timeout" ]; then
-      printf 'custody headroom exhausted: open=%s limit=%s needed=%s\n' "$count" "$limit" "$needed"
+      printf 'custody headroom exhausted: counted=%s open=%s limit=%s needed=%s\n' "$count" "$open_count" "$limit" "$needed"
       printf '%s' "$snapshot" | jq -c '.holds[] | select(.state=="open") | {id,run_id,generation,attention,capture_state}'
       local run
       while IFS= read -r run; do
         apiget "/api/runs/$run" | jq -c '.run | {id,status,claim_generation}'
       done < <(printf '%s' "$snapshot" | jq -r '[.holds[] | select(.state=="open") | .run_id] | unique[]')
-      fail "custody headroom timeout: open=$count limit=$limit needed=$needed after ${timeout}s; evidence preserved"
+      fail "custody headroom timeout: counted=$count open=$open_count limit=$limit needed=$needed after ${timeout}s; evidence preserved"
     fi
     sleep 2
   done
