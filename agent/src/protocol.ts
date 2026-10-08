@@ -2849,9 +2849,26 @@ export interface RecoveryCaptureStatusResponse {
   expires_at?: string;
 }
 
-/** RecoveryReleaseResponse is the release ACK for a run's custody: released is true when
- *  the call transitioned any open hold to released, and holds_released is how many open
- *  holds it settled (0 on an idempotent repeat once none remain open). */
+/** Atomic capture reconciliation never reserves or releases custody. */
+export interface RecoveryReconcileRequest {
+  generation: number;
+  source_sha: string;
+  coverage_digest: string;
+  checksum: string;
+  byte_size: number;
+}
+
+export interface RecoveryReconcileResponse {
+  run_id: string;
+  generation: number;
+  capture_id: string;
+  outcome: "accepted" | "replaceable" | "retained";
+  final_receipt?: RecoveryFinalDisposition;
+  release_evidence?: string;
+  reason?: string;
+}
+
+/** RecoveryReleaseResponse is the custody release ACK; holds_released counts settled holds. */
 export interface RecoveryReleaseResponse {
   run_id: string;
   released: boolean;

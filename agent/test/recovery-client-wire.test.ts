@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import { nullLogger } from "./helpers.js";
-import { WorkerClient } from "../src/client.js";
+import { WorkerClient, RequestError } from "../src/client.js";
 import type { RecoveryReserveRequest, RecoveryUploadManifest } from "../src/protocol.js";
 
 // PRD #1296 M3 — the worker→API archive RPC WIRE, pinned against M2's committed handler
@@ -86,6 +86,28 @@ describe("recovery archive client wire (PRD #1296 M3 ↔ M2 handler)", () => {
     assert.equal(recorded[0]!.url, `/api/worker/runs/${RUN_ID}/archives/reserve`);
     assert.match(String(recorded[0]!.headers.authorization), /^Bearer /);
     assert.deepEqual(JSON.parse(recorded[0]!.body.toString("utf8")), req);
+  });
+
+  it("reconcile uses worker bearer, exact archive route and contract body", async () => {
+    const client = newClient();
+    client.protocolFeatures = ["recovery_inventory_v1"];
+    const req = { generation: 7, source_sha: "a".repeat(40), coverage_digest: "b".repeat(64),
+      checksum: "c".repeat(64), byte_size: 14 };
+    const response = { run_id: RUN_ID, generation: 7, capture_id: CAPTURE_ID, outcome: "replaceable" };
+    respond = () => ({ status: 200, body: JSON.stringify(response) });
+    assert.deepEqual(await client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), response);
+    assert.equal(recorded[0]!.method, "POST");
+    assert.equal(recorded[0]!.url, `/api/worker/runs/${RUN_ID}/archives/${CAPTURE_ID}/reconcile`);
+    assert.match(String(recorded[0]!.headers.authorization), /^Bearer /);
+    assert.deepEqual(JSON.parse(recorded[0]!.body.toString("utf8")), req);
+    client.protocolFeatures = [];
+    await assert.rejects(client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), /feature unavailable/);
+    assert.equal(recorded.length, 1);
+    client.protocolFeatures = ["recovery_inventory_v1"];
+    for (const status of [401, 404, 500]) {
+      respond = () => ({ status, body: '{"error":"unavailable"}' });
+      await assert.rejects(client.reconcileRecoveryCapture(RUN_ID, CAPTURE_ID, req), RequestError);
+    }
   });
 
   it("status → GET /api/worker/runs/{id}/archives/{captureID}", async () => {

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -11,6 +11,7 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, type RecoveryBundleResult } from "../src/git.js";
 import { RUN_KINDS, type RunKind } from "../src/protocol.js";
 import {
+  canonicalJson,
   CODE_PUBLISHING_KINDS,
   isCodePublishingKind,
   RecoveryCoordinator,
@@ -246,6 +247,37 @@ describe("RecoveryCoordinator — authenticated pin & journal (D1)", () => {
     assert.equal(seen.length, 1);
     assert.equal(seen[0]!.sourceSha, H);
     assert.equal(seen[0]!.attemptedHeadSha, H_PRIME);
+  });
+
+  it("optional reservation key round-trips through fresh reader and capture writer; legacy remains unchanged", async () => {
+    const client = new FakeClient();
+    client.uploadShouldThrow = true;
+    const coord = makeCoordinator({ client });
+    const record = await coord.pin({ runId: "run-key", sourceSha: H, kind: "issue", branch: "b" });
+    assert.ok(record);
+    const file = path.join(root, record.runId, record.captureId + ".json");
+    const legacyBytes = fs.readFileSync(file, "utf8");
+    assert.deepEqual(await makeCoordinator().inspect(record.runId), [JSON.parse(JSON.stringify(record))]);
+    assert.equal(fs.readFileSync(file, "utf8"), legacyBytes, "legacy read does not rewrite the envelope");
+    const key = createHmac("sha256", TOKEN).update("uzi-recovery-journal-v1").digest();
+    const sign = (reservationKey: string) => {
+      const payload = { ...record, reserveIdempotencyKey: reservationKey };
+      fs.writeFileSync(file, JSON.stringify({ ...payload,
+        mac: createHmac("sha256", key).update(canonicalJson(payload)).digest("hex") }));
+    };
+    sign("invalid-uuid");
+    assert.deepEqual(await makeCoordinator().inspect(record.runId), []);
+    const reservationKey = "00000000-0000-4000-8000-000000000241";
+    sign(reservationKey);
+    const restarted = makeCoordinator({ client });
+    const [seen] = await restarted.inspect(record.runId);
+    assert.ok(seen);
+    await restarted.captureAndUpload({ record: seen, barePath: "/bare", defaultBranch: "main" });
+    const [written] = await makeCoordinator().inspect(record.runId);
+    assert.equal(written?.reserveIdempotencyKey, reservationKey, "capture writer preserves the authenticated optional field");
+    assert.equal(client.reserveCalls[0]!.req.idempotency_key, reservationKey);
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("000000000241", "000000000242"));
+    assert.deepEqual(await makeCoordinator().inspect(record.runId), [], "key tampering invalidates the MAC");
   });
 
   it("is idempotent for the same (runId, sourceSha): a re-pin reuses the record", async () => {
