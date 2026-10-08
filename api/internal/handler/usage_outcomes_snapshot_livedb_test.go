@@ -172,6 +172,10 @@ func TestUsageOutcomesSingleSnapshotIssue1451LiveDB(t *testing.T) {
 		if u.UserID == userID.String() {
 			found = true
 			assertOriginsMatchFailed(t, "per-user lifetime", u.Outcomes)
+			assertOriginsMatchFailed(t, "per-user last_7_days", u.Last7Outcomes)
+			if u.Last7Outcomes.Failed != 3 || u.Last7Outcomes.FailOrigins["agent_failure"] != 3 {
+				t.Fatalf("per-user snapshot before final transition: %+v", u.Last7Outcomes)
+			}
 		}
 	}
 	if !found {

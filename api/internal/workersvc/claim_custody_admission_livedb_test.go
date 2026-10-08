@@ -53,12 +53,51 @@ func (f *liveCustodyClaimFixture) capture(i int, state string, at time.Time) {
 func TestFreshClaimCustodyAdmissionLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	cases := []struct {
-		name    string
-		guarded bool
-		counted int64
-		mutate  func(*liveCustodyClaimFixture, int)
+		name      string
+		guarded   bool
+		exhausted bool
+		counted   int64
+		mutate    func(*liveCustodyClaimFixture, int)
 	}{
 		{name: "eight healthy", counted: 0},
+		{name: "eight exhaustion no capture guarded=false", guarded: false, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+		}},
+		{name: "eight exhaustion no capture guarded=true", guarded: true, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+		}},
+		{name: "eight exhaustion available guarded=false", guarded: false, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "available", f.now)
+		}},
+		{name: "eight exhaustion available guarded=true", guarded: true, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "available", f.now)
+		}},
+		{name: "eight exhaustion preparing guarded=false", guarded: false, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "preparing", f.now)
+		}},
+		{name: "eight exhaustion preparing guarded=true", guarded: true, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "preparing", f.now)
+		}},
+		{name: "eight exhaustion uploading guarded=false", guarded: false, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "uploading", f.now)
+		}},
+		{name: "eight exhaustion uploading guarded=true", guarded: true, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "uploading", f.now)
+		}},
+		{name: "eight exhaustion needs_action guarded=false", guarded: false, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "needs_action", f.now)
+		}},
+		{name: "eight exhaustion needs_action guarded=true", guarded: true, exhausted: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", f.runs[i])
+			f.capture(i, "needs_action", f.now)
+		}},
 		{name: "needs action", counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) { f.capture(i, "needs_action", f.now) }},
 		{name: "guarded earlier archive and latest needs action", guarded: true, counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
 			f.capture(i, "available", f.now.Add(-time.Second))
@@ -116,6 +155,29 @@ func TestFreshClaimCustodyAdmissionLiveDB(t *testing.T) {
 			for i := range f.runs {
 				if tc.mutate != nil {
 					tc.mutate(f, i)
+				}
+			}
+			if tc.exhausted {
+				owners, err := env.q.ListCustodyHoldsForOwner(env.ctx, store.ListCustodyHoldsForOwnerParams{UserID: f.userID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				workers, err := env.q.ListOpenCustodyHoldsForWorkers(env.ctx, f.workers)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(owners) != 8 || len(workers) != 8 {
+					t.Fatalf("exhaustion listings owners=%d workers=%d", len(owners), len(workers))
+				}
+				for _, row := range owners {
+					if !row.DecisionNeeded || row.RecoveryWaitCause != "worker_requeue_exhausted" {
+						t.Fatalf("owner exhaustion facts=%+v", row)
+					}
+				}
+				for _, row := range workers {
+					if !row.DecisionNeeded || row.RecoveryWaitCause != "worker_requeue_exhausted" {
+						t.Fatalf("worker exhaustion facts=%+v", row)
+					}
 				}
 			}
 			fresh := f.seedRun("queued", 0)

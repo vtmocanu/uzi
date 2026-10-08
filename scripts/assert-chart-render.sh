@@ -1041,6 +1041,76 @@ awk '
   { print }
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
 
+# The existing api.config path carries the requeue budget as a quoted string and
+# injects it into the API through the SAME ConfigMap. Three independent offline
+# renders cover the API default budget, a raised budget and disabled requeue.
+# Render failures stop the loop; it has exactly three attempts, without retries.
+for budget in 3 5 0; do
+  REQUEUE_RENDER="$WORK/requeue-$budget.yaml"
+  if ! helm template uzi "$STRIPPED" \
+       --show-only templates/api-configmap.yaml \
+       --show-only templates/api-deployment.yaml \
+       --set api.tls.enabled=true \
+       --set-string "api.config.RUN_MAX_REQUEUES=$budget" \
+       > "$REQUEUE_RENDER" 2> "$WORK/err"; then
+    echo "BROKEN: helm template of the API with RUN_MAX_REQUEUES=$budget failed:" >&2
+    cat "$WORK/err" >&2
+    exit 2
+  fi
+  awk -v budget="$budget" '
+    /^---$/ { doc++; section = ""; api_container = 0; env_from = 0; ref = 0; next }
+    /^[^[:space:]#]/ { section = $0 }
+    /^apiVersion:/ { versions[doc]++; version[doc] = $0 }
+    /^kind:/ { kinds[doc]++; kind[doc] = $0 }
+    section == "metadata:" && /^  name:/ { names[doc]++; name[doc] = $0 }
+    section == "data:" && /^  RUN_MAX_REQUEUES:/ {
+      budgets[doc]++; value[doc] = $0
+    }
+    /^        - name:/ { api_container = ($0 == "        - name: api"); env_from = 0; ref = 0 }
+    api_container && /^          [^[:space:]]/ {
+      env_from = ($0 == "          envFrom:"); ref = 0
+    }
+    api_container && env_from && /^            - / {
+      ref = ($0 == "            - configMapRef:")
+      if (ref) refs[doc]++
+    }
+    api_container && env_from && ref && /^                name:/ {
+      ref_names[doc]++; ref_name[doc] = $0
+    }
+    END {
+      for (d = 0; d <= doc; d++) {
+        if (!kinds[d]) continue
+        if (kinds[d] != 1 || versions[d] != 1 || names[d] != 1) {
+          print "BROKEN: API render must contain valid, unambiguous object identities"; exit 2
+        }
+        if (kind[d] == "kind: ConfigMap") {
+          maps++
+          if (version[d] != "apiVersion: v1" || name[d] != "  name: uzi-api-config") {
+            print "FAIL: expected the exact API ConfigMap identity uzi-api-config"; exit 1
+          }
+          if (budgets[d] != 1 || value[d] != "  RUN_MAX_REQUEUES: \"" budget "\"") {
+            print "FAIL: API ConfigMap must contain exactly one quoted RUN_MAX_REQUEUES=" budget; exit 1
+          }
+        } else if (kind[d] == "kind: Deployment") {
+          deployments++
+          if (version[d] != "apiVersion: apps/v1" || name[d] != "  name: uzi-api") {
+            print "FAIL: expected the exact API Deployment identity uzi-api"; exit 1
+          }
+          if (refs[d] != 1 || ref_names[d] != 1 || ref_name[d] != "                name: uzi-api-config") {
+            print "FAIL: API container envFrom must reference the SAME ConfigMap uzi-api-config"; exit 1
+          }
+        } else {
+          print "BROKEN: unexpected object in the focused API render"; exit 2
+        }
+      }
+      if (maps != 1 || deployments != 1) {
+        print "BROKEN: expected exactly one API ConfigMap and one API Deployment"; exit 2
+      }
+    }
+  ' "$REQUEUE_RENDER" || exit $?
+done
+echo "OK: RUN_MAX_REQUEUES budgets 3/5/0 are quoted exactly in the API ConfigMap and consumed by the API Deployment envFrom"
+
 DEFAULT_OFF="$WORK/default-off.yaml"
 # Issue #1982: the hosted-worker pin also tells healthsvc to expect a controller.
 # Render only the API Deployment so an unrelated object's env cannot satisfy the

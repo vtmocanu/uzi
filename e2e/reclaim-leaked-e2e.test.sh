@@ -5,6 +5,8 @@
 #   - an EPERM pid (init, pid 1), the current run's own project, the real dev
 #     stack `uzi`, and store-it's `uzi-store-it-*` are all SKIPPED;
 #   - UZI_E2E_NO_RECLAIM=1 reclaims nothing.
+#   - the normal entrypoint preserves that opt-out across env -i while scrubbing
+#     compose configuration; absent the opt-out, reclaim still runs.
 # Exits non-zero on any failed assertion.
 set -euo pipefail
 
@@ -89,6 +91,39 @@ if [ -s "$LOG" ]; then
   fails=$((fails + 1))
 else
   printf 'PASS: UZI_E2E_NO_RECLAIM=1 tore down nothing\n'
+fi
+
+# Drive the real entrypoint's re-exec through its shift, then stop before stack
+# provisioning. Keep the actual reclaim script and fake Docker from this test.
+# This pins the opt-out across env -i without running any real stack operation.
+awk '{ print } /^shift / { found=1; exit } END { if (!found) exit 1 }' \
+  "$HERE/run-e2e.sh" > "$TMP/run-e2e.sh"
+cat >> "$TMP/run-e2e.sh" <<'EOF'
+[ -z "${TRUSTED_PROXIES+x}" ] && [ -z "${JWT_SECRET+x}" ] \
+  || { echo 'FAIL: entrypoint leaked a compose configuration variable'; exit 1; }
+bash "$(dirname "${BASH_SOURCE[0]}")/reclaim-leaked-e2e.sh" "$UZI_E2E_COMPOSE_PROJECT"
+EOF
+cp "$SCRIPT" "$TMP/reclaim-leaked-e2e.sh"
+
+: > "$LOG"
+if UZI_E2E_NO_RECLAIM=1 UZI_E2E_COMPOSE_PROJECT="$CURRENT" \
+  TRUSTED_PROXIES=must-be-scrubbed JWT_SECRET=must-be-scrubbed \
+  bash "$TMP/run-e2e.sh" > "$TMP/sanitized.log" && \
+  [ ! -s "$LOG" ] && grep -qF '[reclaim] skipped (UZI_E2E_NO_RECLAIM set)' "$TMP/sanitized.log"; then
+  printf 'PASS: normal entrypoint preserves no-reclaim and scrubs compose configuration\n'
+else
+  printf 'FAIL: normal entrypoint lost no-reclaim or leaked compose configuration\n'
+  fails=$((fails + 1))
+fi
+
+: > "$LOG"
+if env -u UZI_E2E_NO_RECLAIM UZI_E2E_COMPOSE_PROJECT="$CURRENT" \
+  TRUSTED_PROXIES=must-be-scrubbed JWT_SECRET=must-be-scrubbed \
+  bash "$TMP/run-e2e.sh" >/dev/null && [ "$(cat "$LOG")" = "$DEAD" ]; then
+  printf 'PASS: normal entrypoint still reclaims with no opt-out\n'
+else
+  printf 'FAIL: normal entrypoint changed default reclaim behavior\n'
+  fails=$((fails + 1))
 fi
 
 if [ "$fails" -ne 0 ]; then

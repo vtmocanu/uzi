@@ -405,13 +405,20 @@ Recovery shows the fixed diagnostic:
 A MAC-rejected terminal record supplies no trustworthy outcome: it cannot
 authorize outcome replay, completion, a terminal lease renewal, or an extra
 finalize-resume allowance. Ordinary requeue policy still applies; if that
-policy fails the run, its failure origin stays `worker_lost`, with the
+policy reaches exhaustion with no recorded recovery evidence or unresolved
+custody, its failure origin stays `worker_lost`, with the
 rejection prose above. This is an unauthenticated record, distinct from a
 trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
-stays in custody. For a terminal run without an available independently
-verified recovery capture, it reports `source_only`:
+stays in custody. For a terminal run or a non-terminal worker-exhaustion hold
+without an available
+independently verified recovery capture, it reports `source_only`, rather than
+`active_protected`. An inventory-guarded hold also reports `source_only` while an
+earlier archive is downloadable: that archive does not cover the full inventory
+and does not settle custody. Recorded evidence or uncertainty at exhaustion holds the
+run for owner Resume; the MAC rejection grants no extra allowance. Absence of
+recorded evidence does not prove absence of unrecorded worker work:
 
 > no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)
 

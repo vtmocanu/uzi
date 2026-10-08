@@ -1,6 +1,6 @@
 # PRD #2170: Code cross-check before publication
 
-**Status**: Draft. Child 5 of 5 under umbrella #2148 (Cross-check). Blocked by PRD #2169, PRD #2150 and PRD #2151. Naming follows PRD #2149 (D13, D14).
+**Status**: Draft. Child 6 of 6 under umbrella #2148 (Cross-check). Blocked by PRD #2169, PRD #2150, PRD #2151 and (for M2's Claude-checker direction) PRD #2460. Naming follows PRD #2149 (D13, D14).
 
 Resolved facts below were read at `main` `c1543616`.
 
@@ -55,7 +55,7 @@ Acceptance examples:
 - **Repair turn.** The SDK lead resumes the same session id (the transcript survives the reap, as the interlock rework turn relies on today). The Codex lead's epoch was reaped by that checkpoint, so the gate's follow-up sets the executor's recreate flag and continues, exactly as the interlock's rework path does (`epochNeedsRecreate = true; continue`). The repair turn's own done goes through the same branch again: checkpoint, completion attempt, then the gate's second call.
 - First call:
   1. Snapshot: the committed head the done-branch checkpoint fetched back. Uncommitted changes are normalised exactly as finalisation would treat them (the implementation reads that path first and snapshots after the same normalisation); the gate never checks a tree that would not be the published one. The head is pinned in the worker's own bare under a local-only ref `refs/uzi-cross-check/<lead-run-id>`, which is never pushed.
-  2. Submit `POST /api/worker/runs/{lead}/cross-checks` with `stage = "code"`, `base_commit`, `head_commit`. The server creates the row and the child in one closure, with `runs.worker_id` set to this worker; the child is strictly pinned to it (PRD #2169). The server refuses, and the gate records `incomplete: no local checker`, under the conditions in *Worker versions*.
+  2. Submit `POST /api/worker/runs/{lead}/cross-checks` with `stage = "code"`, `base_commit`, `head_commit`. The server creates the row and the child in one closure, with `runs.worker_id` set to this worker; the child is strictly pinned to it. This PRD owns the code stage's placement rules on PRD #2169's stage-keyed predicate: a code-stage child is claimable only on the cross-check lane by that worker (no grace, never through the run-lane fallback, never by another worker), and never triggers ephemeral provisioning; LiveDB tests cover each (moved from PRD #2169, D8 there). The server refuses, and the gate records `incomplete: no local checker`, under the conditions in *Worker versions*.
   3. Poll every 15 s until the row is decided or `CODE_CROSS_CHECK_TIMEOUT` (default 30 min, max 2 h) passes. The wait is excluded from the wall budget and banked once, as in PRD #2149.
   4. No findings, failure or timeout: return `proceed`.
   5. Findings: return a follow-up prompt built with PRD #2150's stage-neutral automatic-feedback builder (nonce-fenced, labelled as an automated cross-checker that may be wrong or adversarial, never "human" or "authoritative"). It asks the lead to verify each finding against the code, fix what it accepts, re-run the checks its fixes affect, then call a new tool `report_cross_check_dispositions` with one disposition and a reason (at most 1 KiB) per finding id, then finish.
@@ -66,7 +66,7 @@ Acceptance examples:
 
 - `CrossCheckRunner`'s code stage, on the lead's worker: checks out `head_commit` from the local bare ref into a clone keyed by its own run id, refusing if the ref's tip is not `head_commit`. It never fetches from origin for the snapshot.
 - **Snapshot lifetime.** The lead's worker deletes `refs/uzi-cross-check/<lead-run-id>` (exact ref, never a glob) once the child has settled or been cancelled, never while the child can still read it. A worker boot sweeps refs whose lead is terminal or no longer owned by this worker. A new attempt on another worker never sees the ref, which is why an interrupted attempt does not check again.
-- Read-only tools only, per family: the Codex broker grant set of PRD #2149 D3, the Claude path-guarded `Read`/`Grep`/`Glob` set of PRD #2150 D4. Usage frames as in PRD #2149.
+- Read-only tools only, per family: the Codex broker grant set of PRD #2149 D3, the Claude path-guarded `Read`/`Grep`/`Glob` set of PRD #2460 D1. Usage frames as in PRD #2149.
 - Inputs: the issue or prompt text, the approved plan if any, `git diff base_commit...head_commit` read through the hardened `runGit` (`--no-ext-diff --no-textconv`), and a fixed base brief: correctness against the plan and the issue, regression tests that cannot fail, security and data-integrity claims stronger than their evidence, gate commands with inlined environment variables, missing changelog or docs, scope beyond the issue. Untrusted content is nonce-fenced. Output is one JSON object of findings; anything else is `failed`, reason `malformed`.
 
 ### Owner guidance (M3)
@@ -114,7 +114,7 @@ Acceptance examples:
 ## Milestones
 
 - [ ] **M1: A Claude lead's code is cross-checked on Codex before publication, findings recorded and shown.** Toggle, snapshot, stage migration, the gate in both executors (with only the Codex checker direction live; a Codex lead records `incomplete: not yet supported`), local snapshot ref, submit with strict pinning, `CrossCheckRunner` code stage on Codex, run page and CLI. The fix pass is off in this milestone: findings are recorded and shown, and the run proceeds. Docs `docs/cross-check.md`, `docs/configuration.md`, `docs/cli.md` then `task docs:sync`; `specs/human.md`; CHANGELOG. Blocked by: PRD #2169 M1, PRD #2150 M1. Gates: `task gate:api`, `task gate:agent`, `task gate:web`, LiveDB via `./e2e/run-store-it.sh`, `task gate:repo`.
-- [ ] **M2: The lead folds or declines, and the merge request shows it.** The follow-up turn, `report_cross_check_dispositions` and its route, the MR section, both directions (the Claude checker path from PRD #2150 M2), the Code cross-check row of the pin grid. Blocked by: M1, PRD #2150 M2, PRD #2151. Gates: as M1.
+- [ ] **M2: The lead folds or declines, and the merge request shows it.** The follow-up turn, `report_cross_check_dispositions` and its route, the MR section, both directions (the Claude checker path from PRD #2460), the Code cross-check row of the pin grid. Blocked by: M1, PRD #2460, PRD #2151. Gates: as M1.
 - [ ] **M3: Owner guidance and repository instructions.** The two repo fields and route group, the Repos panel, freezing, composition, the base-commit `CLAUDE.md` read, an ADR-246 amendment, docs, CHANGELOG. Blocked by: M2. Gates: as M1.
 
 No `.github/workflows/**` change in implementation or validation.

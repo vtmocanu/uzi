@@ -614,7 +614,7 @@ SELECT
     h.final_source_sha,
     h.final_coverage_digest,
     COALESCE(w.name, '')::text AS worker_name,
-    f.has_available_capture, f.capture_state, f.run_status, f.attention, f.decision_needed,
+    f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed,
     cr.ref AS checkpoint_ref,
     cr.tip AS checkpoint_tip,
     cr.state AS checkpoint_state
@@ -645,16 +645,19 @@ ORDER BY h.created_at ASC;
 -- GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
 -- Count columns are cast ::bigint so sqlc types them as int64, never interface{}.
 -- Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
--- top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
+-- SELECT over a single-row CTE, so sqlc's param-type inference cannot pick a single relation
 -- for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column
 -- (it reports "column reference user_id is ambiguous"). The cast types the param directly.
+WITH admission AS MATERIALIZED (
+    SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS counted
+)
 SELECT
-    fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS admission_counted_holds,
+    admission.counted::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
         WHERE h.user_id = @user_id::uuid AND h.state = 'open')::bigint AS open_holds,
     (CASE
         WHEN @custody_hold_limit::int > 0
-             AND fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit::int
+             AND admission.counted >= @custody_hold_limit::int
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = @user_id::uuid
                   AND r.status = 'queued'
@@ -665,7 +668,8 @@ SELECT
                            AND (SELECT count(*) FROM recovery_custody_holds oh2
                                   WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int))
         ELSE 0
-     END)::bigint AS blocked_runs;
+     END)::bigint AS blocked_runs
+FROM admission;
 
 -- name: DiscardCustodyHoldForOwner :execrows
 -- PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold
@@ -875,7 +879,7 @@ WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_i
 -- name: ListOpenCustodyHoldsForWorkers :many
 -- Canonical facts for only the authorized input workers' open holds.
 SELECT w.id AS worker_id, h.state, h.inventory_guarded,
-       f.has_available_capture, f.capture_state, f.run_status, f.attention, f.decision_needed
+       f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed
 FROM workers w
 JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
 JOIN recovery_custody_hold_facts f ON f.id = h.id AND f.user_id = h.user_id

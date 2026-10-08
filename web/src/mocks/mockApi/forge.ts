@@ -1,5 +1,6 @@
 import type {
   AdminBlockedRepos,
+  AdminDockerAllowlistRepos,
   GuardrailOverrideRequest,
   OverrideRequestState,
   PrivilegeReport,
@@ -20,7 +21,23 @@ import {
   mockRepos,
   mockToolAllowlist,
 } from "../data";
-import { delay, requireSession } from "./shared";
+import { delay, requireAdmin, requireSession } from "./shared";
+// settings → workers → secrets has no runtime edge back to forge. Read settings
+// only inside the method, after module initialization, to use the current value.
+import { settingsApi } from "./settings";
+
+// Match google/uuid.Parse v1.6.0, including arbitrary single-byte wrappers.
+// ASCII wrapper checks account for Go's UTF-8 byte length versus JS's UTF-16 length.
+function uuidIdentity(value: string): string | null {
+  let s = value;
+  if (s.length === 45 && /^urn:uuid:/i.test(s)) s = s.slice(9);
+  else if (s.length === 38 && s.charCodeAt(0) <= 0x7f && s.charCodeAt(37) <= 0x7f) s = s.slice(1, 37);
+  if (/^[0-9a-f]{32}$/i.test(s)) {
+    s = s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
+  }
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) ? s.toLowerCase() : null;
+}
+
 
 // Classify guardrail block messages into coded findings + waivability, mirroring
 // privcheck.AllBlocksWaivable: a "could not read"/"unreadable" message is
@@ -80,6 +97,12 @@ repos = [
     guardrail_override: null,
     guardrail_blocked: false,
   },
+];
+// Cross-user admin-only fixtures leave the existing owner-list demo intact.
+// UUID IDs can round-trip through the settings validator.
+const dockerDemoRepos = [
+  { id: "a1111111-1111-4111-8111-111111111111", path_with_namespace: "vtmocanu/uzi", enabled: true, connection_id: "conn-dana" },
+  { id: "b2222222-2222-4222-8222-222222222222", path_with_namespace: "team-beta/retired", enabled: false, connection_id: "conn-dana" },
 ];
 // PRD #534: in-memory GitHub Projects v2 links, keyed by repo id. Seeded with
 // repo-gh-linked so the "linked" readout is visible; repo-gh-unlinked is left
@@ -219,6 +242,32 @@ export const forgeApi = {
   listProjects: async (_connectionId: string) => delay({ repos: repos.map((r) => ({ ...r })) }, 350),
 
   listRepos: async () => delay({ repos: repos.filter((r) => r.enabled).map((r) => ({ ...r })) }),
+  adminListDockerAllowlistRepos: async (): Promise<AdminDockerAllowlistRepos> => {
+    requireAdmin();
+    const { settings } = await settingsApi.getSettings();
+    const trusted = new Set(settings.docker_repo_allowlist.split(",").map((id) => {
+      const token = id.replace(/^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "");
+      return uuidIdentity(token) ?? token;
+    }));
+    return delay({
+      repos: [...repos, ...dockerDemoRepos]
+        .filter((r) => r.enabled || trusted.has(uuidIdentity(r.id) ?? r.id))
+        .map((r) => {
+          const meta = mockBlockedRepoMeta[r.id];
+          const connection = connections.find((c) => c.id === r.connection_id);
+          const crossUser = dockerDemoRepos.includes(r);
+          return {
+            id: r.id,
+            path_with_namespace: r.path_with_namespace,
+            enabled: r.enabled,
+            owner_email: crossUser ? "dana@example.com" : meta?.owner_email ?? mockAdmin.email,
+            connection_id: r.connection_id,
+            forge_type: crossUser ? "forgejo" : connection?.forge_type ?? mockConnection.forge_type,
+            base_url: crossUser ? "https://forge.dana.example.com" : connection?.base_url ?? mockConnection.base_url,
+          };
+        }),
+    });
+  },
   setRepoEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");

@@ -140,9 +140,30 @@ type CompletionAcceptedDTO struct {
 	Revision    int    `json:"revision"`
 }
 
-// RunDTO is the web view of a run. session_id and last_seq are intentionally
-// omitted — they are worker-internal (resume plumbing), not browser state.
+// WorkerRecoveryEvidenceDTO is the historic exhaustion snapshot. Capture and
+// checkpoint evidence records that observation, not current recovery availability.
+type WorkerRecoveryEvidenceDTO struct {
+	CheckpointTip        *string   `json:"checkpoint_tip"`
+	AvailableCapture     bool      `json:"available_capture"`
+	PublicationUncertain bool      `json:"publication_uncertain"`
+	CaptureUncertain     bool      `json:"capture_uncertain"`
+	CustodyUncertain     bool      `json:"custody_uncertain"`
+	Unknown              bool      `json:"unknown"`
+	RecordedAt           time.Time `json:"recorded_at"`
+}
+
+type WorkerRecoveryDTO struct {
+	Episode               int64                      `json:"episode"`
+	AutomaticRequeueLimit int                        `json:"automatic_requeue_limit"`
+	EpisodeUsed           int32                      `json:"episode_used"`
+	EpisodeRemaining      int                        `json:"episode_remaining"`
+	Evidence              *WorkerRecoveryEvidenceDTO `json:"evidence"`
+}
+
+// RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
+
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
 	// issue/ci_fix runs.

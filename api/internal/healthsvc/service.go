@@ -89,6 +89,7 @@ type Store interface {
 	// custody.holds: owners at/over the custody admission limit.
 	ListOwnersOverCustodyLimit(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error)
 	GetCustodyAggregateForOwner(ctx context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error)
+	ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
 	// controller.report: the fleet-independent controller-report singleton's observed_at
 	// (pgx.ErrNoRows when the controller has never reported).
 	GetControllerReport(ctx context.Context) (pgtype.Timestamptz, error)

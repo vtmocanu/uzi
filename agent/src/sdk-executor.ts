@@ -1746,7 +1746,7 @@ export class SdkExecutor implements Executor {
        *  for the server to count, unlike a revise_plan.
        *
        *  Declared ABOVE the preApproved branch, not inside it, and that placement is
-       *  load-bearing twice over. The cap is per RUN: M4 lets the lead ask before it
+       *  load-bearing twice over. The cap is per execute() attempt: M4 lets the lead ask before it
        *  plans, so a budget scoped to the planning branch would reset between the
        *  planning and implement phases and silently be worth 2 x QUESTION_MAX. And a
        *  PRE-APPROVED resume (PRD #35) skips the planning branch entirely while its
@@ -1754,12 +1754,18 @@ export class SdkExecutor implements Executor {
        *  merely mis-scoped there — it does not exist on that path at all.
        *
        *  NOT DURABLE, and the honest bound is worth stating because the other #88
-       *  bound already states its own: this is worker memory, so a worker death
-       *  re-queues the run, execute() runs fresh, and the count restarts at 0. The
-       *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 20 on
-       *  defaults, not 5 (a run that used the issue #1742 one-shot finalize-resume
-       *  allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2)) — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
-       *  identical reason. Documenting one and not the other would be worse than
+       *  bound already states its own: this is worker memory, so if worker-death
+       *  recovery re-queues the run, execute() runs fresh and the count restarts at 0.
+       *  With no other fresh executor execution, worker-death retries contribute
+       *  QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 20 on defaults. Initial episode 0
+       *  can get one extra via #1742 with a positive cap, so x (RUN_MAX_REQUEUES + 2).
+       *  Ordinary transient/limit/credential redispatch can also run execute() fresh
+       *  within the same episode, resetting worker-memory question budgets without
+       *  changing the episode or charged requeue_count. RUN_MAX_REQUEUES bounds
+       *  charged worker-death retries, not all executions; there is no unconditional
+       *  per-episode or lifetime question/attempt ceiling from it.
+       *  QUESTION_TIMEOUT_SECONDS has the same conditional multipliers.
+       *  Documenting one and not the other would be worse than
        *  documenting neither: a reader who finds the timeout's caveat reasonably
        *  infers the cap has none. */
       const budget = { asked: 0 };

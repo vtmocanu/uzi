@@ -1,0 +1,58 @@
+{
+  "last_7_days": {
+    "input_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "output_tokens": 1,
+    "cost_usd": 1.5,
+    "cost_status": "x"
+  },
+  "last7_run_count": 1,
+  "last7_outcomes": {
+    "last_failed_at": "2020-01-02T03:04:05Z",
+    "last_failed_run_id": "x",
+    "last_failed_origin": "x",
+    "last_failed_user_id": "x",
+    "completed_since_last_failure": 1,
+    "finished": 1,
+    "completed": 1,
+    "cancelled": 1,
+    "plan_rejected": 1,
+    "failed": 1,
+    "needs_landing": 1,
+    "fail_origins": {
+      "x": 1
+    }
+  },
+  "last7_subscription_run_count": 1,
+  "last7_unreported_run_count": 1,
+  "user_id": "x",
+  "email": "x",
+  "usage": {
+    "input_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "output_tokens": 1,
+    "cost_usd": 1.5,
+    "cost_status": "x"
+  },
+  "run_count": 1,
+  "outcomes": {
+    "last_failed_at": "2020-01-02T03:04:05Z",
+    "last_failed_run_id": "x",
+    "last_failed_origin": "x",
+    "last_failed_user_id": "x",
+    "completed_since_last_failure": 1,
+    "finished": 1,
+    "completed": 1,
+    "cancelled": 1,
+    "plan_rejected": 1,
+    "failed": 1,
+    "needs_landing": 1,
+    "fail_origins": {
+      "x": 1
+    }
+  },
+  "subscription_run_count": 1,
+  "unreported_run_count": 1
+}

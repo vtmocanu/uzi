@@ -405,7 +405,7 @@ func (m tuiModel) transcriptViewport() int {
 		}
 		return strings.Count(s, "\n") + 1
 	}
-	chrome := len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
+	chrome := len(workerExhaustionTUILines(m.detail.run)) + len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
 	if limitWaitLine(m.detail.run, time.Now()) != "" || nearTimeoutLine(m.detail.run, time.Now()) != "" ||
 		codexAccountActionLine(m.detail.run) != "" || vaultParkLine(m.detail.run) != "" ||
 		diskParkLine(m.detail.run) != "" {

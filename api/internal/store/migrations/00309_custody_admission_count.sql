@@ -1,11 +1,14 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE FUNCTION fn_custody_attention(hold_state text, available boolean, guarded boolean,
-                                    capture_state text, run_status text)
+                                    capture_state text, run_status text, recovery_wait_cause text)
 RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
  SELECT CASE
   WHEN hold_state = 'discarded' THEN 'discarded'
   WHEN hold_state = 'released' THEN 'released'
+  WHEN hold_state = 'open' AND run_status = 'recovery_wait'
+       AND recovery_wait_cause = 'worker_requeue_exhausted' THEN
+       CASE WHEN capture_state = 'needs_action' THEN 'needs_action' ELSE 'source_only' END
   WHEN available AND NOT guarded THEN 'archive_ready'
   WHEN capture_state IN ('preparing', 'uploading') THEN 'capturing'
   WHEN capture_state = 'needs_action' THEN 'needs_action'
@@ -26,10 +29,11 @@ CREATE VIEW recovery_custody_hold_facts AS
 SELECT h.id, h.user_id, h.run_id, h.state, h.inventory_guarded,
        summary.has_available_capture, summary.capture_state,
        COALESCE(r.status, '')::text AS run_status,
+       COALESCE(r.recovery_wait_cause, '')::text AS recovery_wait_cause,
        fn_custody_attention(h.state, summary.has_available_capture, h.inventory_guarded,
-                           summary.capture_state, r.status)::text AS attention,
+                           summary.capture_state, r.status, r.recovery_wait_cause)::text AS attention,
        fn_is_decision_attention(fn_custody_attention(h.state, summary.has_available_capture,
-                           h.inventory_guarded, summary.capture_state, r.status))::boolean AS decision_needed
+                           h.inventory_guarded, summary.capture_state, r.status, r.recovery_wait_cause))::boolean AS decision_needed
 FROM recovery_custody_holds h
 LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
 CROSS JOIN LATERAL (
@@ -65,7 +69,7 @@ RETURNS bigint LANGUAGE sql STABLE AS $$
    OFFSET 0
   ) summary
   WHERE NOT fn_is_decision_attention(fn_custody_attention(
-          h.state, summary.available, h.inventory_guarded, summary.capture_state, r.status))
+          h.state, summary.available, h.inventory_guarded, summary.capture_state, r.status, r.recovery_wait_cause))
     AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
     AND r.claim_released_at IS NULL
     AND h.generation = r.claim_generation
@@ -83,4 +87,4 @@ $$;
 DROP FUNCTION fn_custody_admission_count(uuid, timestamptz);
 DROP VIEW recovery_custody_hold_facts;
 DROP FUNCTION fn_is_decision_attention(text);
-DROP FUNCTION fn_custody_attention(text, boolean, boolean, text, text);
+DROP FUNCTION fn_custody_attention(text, boolean, boolean, text, text, text);

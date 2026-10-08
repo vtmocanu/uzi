@@ -187,7 +187,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				holdKey := run.Status + "/" + strOr(run.HoldReason, "")
+				holdKey := run.Status + "/" + strOr(run.HoldReason, "") + "/" + strOr(run.RecoveryWaitCause, "")
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
 					isCredentialDisabledHold(run) {
 					if parkedIn != holdKey {
@@ -212,10 +212,15 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								args[0])
 						case statusRecoveryWait:
 							// PRD #1392 M5: a forge-unreachable park names the forge and
-							// prints the retry time + park count against its cap; every other
-							// cause keeps the transient-interruption wording (issue #1197,
-							// widened to a transient provider outage by issue #1088).
-							if line := codexAccountActionLine(run); line != "" {
+							// prints the retry time + park count against its cap. Owner-action
+							// holds get their own guidance below; ordinary transient causes
+							// keep the interruption wording (issues #1197 and #1088).
+							if line := workerExhaustionLine(run); line != "" {
+								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", args[0], line)
+								for _, evidence := range workerExhaustionEvidence(run) {
+									_, _ = fmt.Fprintln(env.Stderr, evidence)
+								}
+							} else if line := codexAccountActionLine(run); line != "" {
 								// PRD #1590: a Codex account hold has no retry clock; it
 								// says what the account needs and does not promise a resume.
 								_, _ = fmt.Fprintf(env.Stderr,

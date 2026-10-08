@@ -52,6 +52,9 @@ function fixture(): { self: SelfUsage; admin: AdminUsage } {
     users: ["owner", "other"].map((id) => ({
       user_id: id, email: `${id}.person@example.com`, usage: self.lifetime,
       run_count: 23, outcomes: self.outcomes.lifetime, subscription_run_count: 4, unreported_run_count: 1,
+      last_7_days: id === "owner" ? self.last_7_days : bundle(200, 400, 100, 24.68),
+      last7_run_count: id === "owner" ? 3 : 7, last7_outcomes: self.outcomes.last_7_days,
+      last7_subscription_run_count: id === "owner" ? 1 : 0, last7_unreported_run_count: 0,
     })),
     earliest_run: "2026-05-12T09:00:00Z",
   };
@@ -65,12 +68,12 @@ const mount = (props: Parameters<typeof Harness>[0]) => render(<MemoryRouter><Ha
 const columns = (view: ReturnType<typeof mount>) => ({
   you: within(view.getByRole("region", { name: "Your usage" })),
   factory: within(view.getByRole("region", { name: "Factory usage" })),
-  users: within(view.getByRole("region", { name: "Per-user usage, all time" })),
+  users: within(view.getByRole("region", { name: /^Per-user usage,/ })),
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); setDemoMode(false); });
 
 describe("UsageCard (#40, #1293, #1429 D7)", () => {
-  it("switches both scopes with one accessible toggle while the embedded table stays all time", () => {
+  it("switches both scopes with one accessible toggle and the embedded table follows the window", () => {
     const view = mount(fixture());
     const { you, factory, users } = columns(view);
     expect(view.getAllByRole("group", { name: "Usage reporting period" })).toHaveLength(1);
@@ -84,7 +87,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(factory.getByText("1.1k")).toBeTruthy();
     expect(you.getByText("0.0 pp vs all-time 10.0%")).toBeTruthy();
     expect(you.queryByText(/runs with token usage/)).toBeNull();
-    expect(view.getByText("Per-user figures are all time.")).toBeTruthy();
+    expect(view.getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
     const tableBefore = users.getByRole("table").textContent;
     fireEvent.click(allTime);
     expect(allTime.getAttribute("aria-pressed")).toBe("true");
@@ -94,8 +97,11 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(you.getByText("23 runs with token usage")).toBeTruthy();
     expect(factory.getByText(/46 runs with token usage by 2 users since/)).toBeTruthy();
     expect(you.queryByText(/pp vs all-time/)).toBeNull();
-    expect(view.queryByText("Per-user figures are all time.")).toBeNull();
+    expect(view.getByRole("heading", { name: "Per user · all time" })).toBeTruthy();
+    expect(users.getByRole("table").textContent).not.toBe(tableBefore);
+    fireEvent.click(last7);
     expect(users.getByRole("table").textContent).toBe(tableBefore);
+    fireEvent.click(allTime);
     expect(users.getAllByText("$1235")).toHaveLength(2);
     allTime.focus(); expect(document.activeElement).toBe(allTime);
     for (const cls of ["font-semibold", "focus-visible:outline-solid", "focus-visible:outline-2", "focus-visible:outline-ring", "min-h-11", "sm:min-h-8"]) {
@@ -106,7 +112,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     const view = mount(fixture());
     expect(view.getByRole("heading", { name: "You", level: 3 })).toBeTruthy();
     expect(view.getByRole("heading", { name: "Factory · all users", level: 3 })).toBeTruthy();
-    expect(view.getByRole("heading", { name: "Per user · all time", level: 3 })).toBeTruthy();
+    expect(view.getByRole("heading", { name: "Per user · last 7 days", level: 3 })).toBeTruthy();
     for (const name of ["Metered cost", "Failed runs rate", "Tokens"]) {
       expect(view.getAllByRole("heading", { name, level: 4 })).toHaveLength(2);
     }
@@ -136,7 +142,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     const view = mount({ self: fixture().self });
     expect(view.getByRole("region", { name: "Your usage" })).toBeTruthy();
     expect(view.queryByRole("region", { name: "Factory usage" })).toBeNull();
-    expect(view.queryByRole("region", { name: "Per-user usage, all time" })).toBeNull();
+    expect(view.queryByRole("region", { name: /^Per-user usage,/ })).toBeNull();
     expect(view.getByRole("link", { name: "Your failed runs →" }).getAttribute("href")).toBe("/runs/history?status=failed");
   });
   it.each(["recent", "lifetime"])("hides the baseline when the %s denominator is zero", (scope) => {
@@ -239,7 +245,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     }
   });
   it("retains all-time table shares, disclosure and failure-denominator attributes", () => {
-    const view = mount(fixture()); const { users } = columns(view);
+    const view = mount({ ...fixture(), initial: "lifetime" }); const { users } = columns(view);
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual(["50 percent of factory tokens", "50 percent of factory tokens"]);
     const row = users.getByText("owner.person@example.com").closest("tr")!;
     expect(row.querySelectorAll("td")[3].getAttribute("title")).toBe("10 of 100 finished runs");
@@ -252,12 +258,95 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
       ...f.admin.users[0], user_id: `share-${i}`, email: `share-${i}@example.com`,
       usage: bundle(tokens, 0, 0, 0),
     }));
-    const view = mount(f);
-    const users = within(view.getByRole("region", { name: "Per-user usage, all time" }));
+    const view = mount({ ...f, initial: "lifetime" });
+    const users = within(view.getByRole("region", { name: /^Per-user usage,/ }));
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
       "91 percent of factory tokens", "8 percent of factory tokens", "1 percent of factory tokens",
     ]);
     expect((users.getAllByRole("img")[0].firstElementChild as HTMLElement).style.width).toBe("91%");
+  });
+
+  it("selects metrics before sorting by cost, output and user ID in both directions", () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-07T12:00:00Z"));
+    const f = fixture();
+    f.admin.users = ["b", "a", "c", "d", "e"].map((id, i) => ({
+      ...f.admin.users[0], user_id: id, email: id + "@example.com",
+      usage: bundle(0, 0, [20, 20, 30, 0, 0][i], [2, 2, 2, 0, 0][i]),
+      run_count: [3, 4, 5, 0, 0][i], outcomes: outcomes(),
+      subscription_run_count: i === 0 ? 2 : 0, unreported_run_count: i === 1 ? 1 : 0,
+      last_7_days: bundle(0, 0, [0, 10, 20, 0, 0][i], [0, 2, 1, 0, 0][i]),
+      last7_run_count: [0, 1, 2, 0, 0][i],
+      last7_outcomes: i === 4 ? outcomes({ finished: 2, failed: 1 }) : emptyOutcomes(),
+      last7_subscription_run_count: i === 2 ? 1 : 0, last7_unreported_run_count: i === 1 ? 1 : 0,
+    }));
+    f.admin.factory.lifetime = bundle(0, 0, 70, 6);
+    f.admin.factory.last_7_days = bundle(0, 0, 30, 3);
+    f.admin.factory.run_count = 12;
+    f.admin.factory.lifetime_subscription_run_count = 2;
+    f.admin.factory.lifetime_unreported_run_count = 1;
+    f.admin.factory.last7_subscription_run_count = 1;
+    f.admin.factory.last7_unreported_run_count = 1;
+    f.admin.factory.outcomes.last_7_days = outcomes({ finished: 2, failed: 1 });
+    const view = mount(f); const users = columns(view).users;
+    const rowCells = () => users.getAllByRole("row").slice(1).map((row) =>
+      Array.from(row.querySelectorAll("td")).map((cell) => cell.textContent));
+    const recent = rowCells();
+    expect(recent.map((r) => r[0])).toEqual(["a@example.com", "c@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
+    expect(recent[1]).toEqual(["c@example.com", "2", "0", "—", "6h", "20", "20", "$1.00Cost excludes 1 Codex subscription run", "67%"]);
+    expect(recent[0][7]).toBe("$2.00Cost excludes 1 unreported run");
+    expect(recent[2].slice(1, 8)).toEqual(["0", "0", "—", "6h", "0", "0", "$0.00"]);
+    expect(recent[4].slice(1, 4)).toEqual(["0", "1", "50.0%"]);
+    expect(recent[5].slice(1, 4)).toEqual(["3", "1", "50.0%"]);
+    expect(recent[5].slice(5, 8)).toEqual(["30", "30", "$3.00Cost excludes 1 Codex subscription run and 1 unreported run"]);
+    expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
+      "33 percent of factory tokens", "67 percent of factory tokens", "0 percent of factory tokens",
+      "0 percent of factory tokens", "0 percent of factory tokens",
+    ]);
+    expect(users.getAllByRole("row")[5].querySelectorAll("td")[3].title).toBe("1 of 2 finished runs");
+    const totalRecency = recent[5][4];
+    fireEvent.click(view.getByRole("button", { name: "All time" }));
+    const lifetime = rowCells();
+    expect(lifetime.map((r) => r[0])).toEqual(["c@example.com", "a@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
+    expect(lifetime[1].slice(1, 4)).toEqual(["4", "10", "10.0%"]);
+    expect(lifetime[2][7]).toBe("$2.00Cost excludes 2 Codex subscription runs");
+    expect(lifetime[5].slice(1, 4)).toEqual(["12", "20", "10.0%"]);
+    expect(lifetime[5].slice(5, 8)).toEqual(["70", "70", "$6.00Cost excludes 2 Codex subscription runs and 1 unreported run"]);
+    expect(lifetime[5][4]).toBe(totalRecency);
+    expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
+      "43 percent of factory tokens", "29 percent of factory tokens", "28 percent of factory tokens",
+      "0 percent of factory tokens", "0 percent of factory tokens",
+    ]);
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(rowCells()).toEqual(recent);
+  });
+
+  it.each(["last_7_days", "last7_run_count", "last7_outcomes", "last7_subscription_run_count", "last7_unreported_run_count"] as const)(
+    "requires %s on every user for seven-day data while lifetime remains usable", (field) => {
+      const f = fixture(); delete f.admin.users[1][field];
+      const view = mount(f); const users = columns(view).users;
+      expect(users.queryByRole("table")).toBeNull();
+      expect(users.getByText("Seven-day per-user usage is unavailable. Upgrade the API to view this period.")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "All time" }));
+      expect(users.getByRole("table")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+      expect(users.queryByRole("table")).toBeNull();
+    },
+  );
+
+  it("accepts empty users in both windows and renders zero shares for a zero factory", () => {
+    const f = fixture(); f.admin.factory.last_7_days = bundle(0, 0, 0, 0);
+    for (const u of f.admin.users) u.last_7_days = bundle(0, 0, 0, 0);
+    const view = mount(f); const users = columns(view).users;
+    expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
+      "0 percent of factory tokens", "0 percent of factory tokens",
+    ]);
+    cleanup(); f.admin.users = []; const empty = mount(f);
+    for (const period of ["Last 7 days", "All time"]) {
+      fireEvent.click(empty.getByRole("button", { name: period }));
+      expect(empty.getByText("No usage across the factory yet.")).toBeTruthy();
+      expect(empty.queryByText(/Upgrade the API/)).toBeNull();
+      expect(empty.queryByRole("table")).toBeNull();
+    }
   });
 
   it("distinguishes no failures, no finished runs and unavailable recency", () => {

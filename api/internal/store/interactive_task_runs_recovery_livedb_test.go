@@ -363,7 +363,7 @@ func TestAwaitingFollowupOverCapFailedLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FailWorkerRunsOverCap: %v", err)
 	}
-	if len(failed) != 1 || failed[0] != parked {
+	if len(failed) != 1 || failed[0].ID != parked || failed[0].Status != "failed" {
 		t.Fatalf("FailWorkerRunsOverCap returned %+v, want exactly the parked run — an over-cap parked "+
 			"interactive task must be FAILED on register (drop awaiting_followup from the IN-list and this "+
 			"is empty, a permanent zombie)", failed)

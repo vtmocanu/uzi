@@ -22,8 +22,8 @@ func TestRunToDTO_TerminalBudgetUsedFrozenAtFinishedAt(t *testing.T) {
 			StartedAt:  tstamp(started),
 			FinishedAt: tstamp(finished),
 		}
-		a := runToDTO(r, "normal", 0, 0, 0, finished.Add(time.Minute))
-		b := runToDTO(r, "normal", 0, 0, 0, finished.Add(48*time.Hour))
+		a := runToDTO(r, "normal", 0, 0, 0, finished.Add(time.Minute), 0)
+		b := runToDTO(r, "normal", 0, 0, 0, finished.Add(48*time.Hour), 0)
 		if a.BudgetUsedSeconds == nil || b.BudgetUsedSeconds == nil {
 			t.Fatalf("%s: budget_used_seconds must be set for a started run", status)
 		}
@@ -40,8 +40,8 @@ func TestRunToDTO_TerminalBudgetUsedFrozenAtFinishedAt(t *testing.T) {
 func TestRunToDTO_RunningBudgetUsedStillAges(t *testing.T) {
 	started := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
 	r := store.Run{ID: uuid.New(), Status: "running", StartedAt: tstamp(started)}
-	a := runToDTO(r, "normal", 0, 0, 0, started.Add(time.Minute))
-	b := runToDTO(r, "normal", 0, 0, 0, started.Add(time.Hour))
+	a := runToDTO(r, "normal", 0, 0, 0, started.Add(time.Minute), 0)
+	b := runToDTO(r, "normal", 0, 0, 0, started.Add(time.Hour), 0)
 	if *b.BudgetUsedSeconds <= *a.BudgetUsedSeconds {
 		t.Fatalf("running budget_used_seconds must age: %d then %d", *a.BudgetUsedSeconds, *b.BudgetUsedSeconds)
 	}
@@ -56,14 +56,14 @@ func TestRunToDTO_MapsFirstStartedAt(t *testing.T) {
 		Status:         "running",
 		FirstStartedAt: tstamp(first),
 		StartedAt:      tstamp(last),
-	}, "normal", 0, 0, 0, last.Add(time.Minute))
+	}, "normal", 0, 0, 0, last.Add(time.Minute), 0)
 	if dto.FirstStartedAt == nil || !dto.FirstStartedAt.Equal(first) {
 		t.Fatalf("first_started_at = %v, want %v", dto.FirstStartedAt, first)
 	}
 	if dto.StartedAt == nil || !dto.StartedAt.Equal(last) {
 		t.Fatalf("started_at = %v, want %v", dto.StartedAt, last)
 	}
-	none := runToDTO(store.Run{ID: uuid.New(), Status: "queued"}, "normal", 0, 0, 0, last)
+	none := runToDTO(store.Run{ID: uuid.New(), Status: "queued"}, "normal", 0, 0, 0, last, 0)
 	if none.FirstStartedAt != nil {
 		t.Fatalf("a never-started run must have a null first_started_at, got %v", none.FirstStartedAt)
 	}

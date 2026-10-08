@@ -292,15 +292,12 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		return appendObservation{}, err
 	}
 	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
-	// PRD #1247 M5 rework (chat fence completeness): a CHAT run has no claim-generation contract,
-	// so NORMALIZE the generation to nil for chat and use effectiveClaimGen for EVERY fenced query
-	// below (the omission check, InsertRunMessage, the generation_live stale check, and
-	// UpdateRunLastSeq). This makes a chat batch legacy even if a worker SUPPLIES a (mismatched)
-	// generation: the server must never fence chat regardless of what any client version sends. The
-	// client also guards generation > 0 on chat, but the server holds the property independently (a
-	// guardrail layer is not weakened on the theory another layer covers it).
+	// Generation-zero chats retain legacy supplied-mismatch compatibility. Fresh chat claims
+	// advance the generation, so honor any supplied generation throughout insertion, stale
+	// detection, high-water updates and usage attribution. Omitted chat generations remain
+	// compatible with the current chat runner, independently of worker capability flags.
 	effectiveClaimGen := claimGen
-	if run.Kind == runkind.Chat {
+	if run.Kind == runkind.Chat && run.ClaimGeneration == 0 {
 		effectiveClaimGen = nil
 	}
 	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
@@ -510,7 +507,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// run_usage.claim_generation -> run_credential_epochs). All frames in ONE appendMessages call
 	// share the ONE fenced generation this batch stamped — uniform per-call assignment is correct
 	// (the fence already guaranteed they belong to this claim, or the batch would have been
-	// rejected above). effectiveClaimGen is nil for a legacy worker or a chat run, folding NULL
+	// rejected above). effectiveClaimGen is nil for an unstamped report or generation-zero chat, folding NULL
 	// provenance exactly as before. The stamp is on the fold input only; InsertRunMessage above
 	// persisted the SAME generation onto each row's own column independently.
 	for i := range msgs {

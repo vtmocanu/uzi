@@ -200,7 +200,7 @@ func runBand(status string, isRevising bool) int {
 // (PRD #1732 D14) resumes only on the owner's Enable or token switch, so it is NEEDS YOU too. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isWorkerRecoveryExhausted(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)

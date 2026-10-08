@@ -316,7 +316,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:   "failed",
 		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
-	}, "normal", 0, 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if stamped.StopKind == nil {
 		t.Fatal("a stamped stop_kind must reach the RunDTO, got nil")
 	}
@@ -325,7 +325,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow)
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if unstamped.StopKind != nil {
 		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
 	}
@@ -338,7 +338,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:     "cancelled",
 		StopReason: pgtype.Text{String: "wrong approach, restarting", Valid: true},
-	}, "normal", 0, 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if stamped.StopReason == nil {
 		t.Fatal("a stamped stop_reason must reach the RunDTO, got nil")
 	}
@@ -347,7 +347,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow)
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if unstamped.StopReason != nil {
 		t.Errorf("an unstamped stop_reason must map to nil, got %q", *unstamped.StopReason)
 	}
@@ -367,7 +367,7 @@ func TestRunToDTODeadlineAt(t *testing.T) {
 		Status:            "running",
 		StartedAt:         pgtype.Timestamptz{Time: start, Valid: true},
 		BudgetWallSeconds: pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
-	}, "normal", globalTimeout, 0, 0, dtoTestNow)
+	}, "normal", globalTimeout, 0, 0, dtoTestNow, 0)
 	if issue.DeadlineAt == nil {
 		t.Fatal("a running issue run must carry a deadline_at, got nil")
 	}
@@ -381,7 +381,7 @@ func TestRunToDTODeadlineAt(t *testing.T) {
 		Kind:      "chat",
 		Status:    "running",
 		StartedAt: pgtype.Timestamptz{Time: start, Valid: true},
-	}, "normal", globalTimeout, 0, 0, dtoTestNow)
+	}, "normal", globalTimeout, 0, 0, dtoTestNow, 0)
 	if chat.DeadlineAt != nil {
 		t.Errorf("a running chat run must carry deadline_at null, got %v", *chat.DeadlineAt)
 	}
@@ -398,7 +398,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 		RequiredCapabilities: []string{"docker"},
 		RequiredTools:        []string{"go", "node"},
 		SizeClass:            "m",
-	}, "normal", 0, 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if len(populated.RequiredCapabilities) != 1 || populated.RequiredCapabilities[0] != "docker" {
 		t.Errorf("required_capabilities = %v, want [docker]", populated.RequiredCapabilities)
 	}
@@ -410,7 +410,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 
 	// Empty columns ⇒ non-nil empty slices ([] over null) and "" for size_class.
-	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0, 0, 0, dtoTestNow)
+	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if empty.RequiredCapabilities == nil || len(empty.RequiredCapabilities) != 0 {
 		t.Errorf("required_capabilities = %v, want non-nil empty", empty.RequiredCapabilities)
 	}
@@ -438,7 +438,7 @@ func TestRunToDTOForgeParkFields(t *testing.T) {
 		RecoveryWaitCause:      pgtype.Text{String: "forge_unreachable", Valid: true},
 		RecoveryRetryNotBefore: pgtype.Timestamptz{Time: retry, Valid: true},
 		ForgeParkCount:         3,
-	}, "normal", 0, 0, cap, dtoTestNow)
+	}, "normal", 0, 0, cap, dtoTestNow, 0)
 	if parked.RecoveryWaitCause == nil || *parked.RecoveryWaitCause != "forge_unreachable" {
 		t.Errorf("recovery_wait_cause = %v, want forge_unreachable", parked.RecoveryWaitCause)
 	}
@@ -456,7 +456,7 @@ func TestRunToDTOForgeParkFields(t *testing.T) {
 	}
 
 	// An unparked/legacy run: NULL cause + NULL retry + zero count → null/null/0.
-	legacy := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, cap, dtoTestNow)
+	legacy := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, cap, dtoTestNow, 0)
 	if legacy.RecoveryWaitCause != nil {
 		t.Errorf("legacy recovery_wait_cause = %q, want nil", *legacy.RecoveryWaitCause)
 	}

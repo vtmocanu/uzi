@@ -4384,8 +4384,8 @@ export class RunRunner {
     });
 
     if (features.includes("recovery_park_cause")) {
-      // Full #1392 api: the TYPED report. The api's park transaction settles this generation's
-      // hold and parks (or fails at the cap) in one shot, so the worker calls NO release endpoint.
+      // Full #1392 api: the TYPED report parks (or fails at the cap) atomically. Legacy holds
+      // settle in that transaction; guarded holds require worker evidence after the ack below.
       const body: StateRequest = {
         status: "recovery_wait",
         recovery_cause: "forge_unreachable",
@@ -4891,12 +4891,14 @@ export class RunRunner {
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
       // cancelled, or failed when the cap branch committed the terminal state, or any other
       // authoritative terminal status: close the still-open batcher, no park event, no second
-      // report. The finally does the (empty, pre-clone) cleanup.
+      // report. A guarded pre-clone hold still needs positive empty-inventory evidence
+      // after this confirmed terminal outcome; the finally does ordinary cleanup.
       runLog.info(`${copy.log}: ack was authoritative terminal; cleaning up without a park`, {
         run_id: flight.runId,
         status: ack.status,
       });
       await batcher.close().catch(() => undefined);
+      await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
       return "stop";
     }
     // Any other 409 (or an unmodelled non-park, non-terminal status): today's failed path,
@@ -5036,6 +5038,11 @@ export class RunRunner {
           status,
         });
         await batcher.close().catch(() => undefined);
+        // Older ownership responses may omit the generation. A terminal status alone
+        // cannot settle this claim: require the explicit exact-generation proof first.
+        if (probe.claim_generation !== undefined && probe.claim_generation === claim.claim_generation) {
+          await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
+        }
         return "stop";
       }
       if (status === "running") {

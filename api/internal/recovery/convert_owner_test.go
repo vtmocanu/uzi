@@ -76,3 +76,19 @@ func TestCaptureToDTOHoldID(t *testing.T) {
 		t.Errorf("identity fields wrong: %+v", got)
 	}
 }
+
+// SQL fields remain authoritative even when raw lifecycle labels disagree.
+func TestOwnerHoldNeedsDecision(t *testing.T) {
+	for _, decision := range []bool{false, true} {
+		row := store.ListCustodyHoldsForOwnerRow{
+			State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: "worker_requeue_exhausted",
+			CaptureState: "available", HasAvailableCapture: true, Attention: "active", DecisionNeeded: decision,
+		}
+		if got := OwnerHoldNeedsDecision(row); got != decision {
+			t.Fatalf("decision = %v, want SQL value %v", got, decision)
+		}
+		if got := custodyHoldToDTO(row).Attention; got != "active" {
+			t.Fatalf("attention = %q, want SQL value active", got)
+		}
+	}
+}

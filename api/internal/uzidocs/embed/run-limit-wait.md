@@ -124,9 +124,9 @@ fallback. `pool_wait` means an `auto`-lane worker's token pool was
 genuinely empty — there was nothing to spend at all — and it clears when you
 opt a token into the pool, or on demand with `uzi run resume-now`. See
 [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection)
-for the pooled-token wait. `recovery_wait` means a resumed turn hit a
-transient interruption — a positively-empty turn or a transient provider
-error — not a limit or an empty pool at all — see
+for the pooled-token wait. `recovery_wait` covers transient interruptions and
+other recovery causes; `worker_requeue_exhausted` requires explicit owner
+Resume or Cancel and has no automatic retry — see
 [Recovering from a transient interruption](run-recovery-wait.md).
 
 ## Not the same as pausing

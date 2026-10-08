@@ -402,6 +402,72 @@ wait_run_mr_state()   { wait_eq "$2" "${3:-30}" "run $1 mr_state" run_mr_state "
 # (a stall needs ~75s of quiet plus a sweep tick).
 wait_health()         { wait_eq "$2" "${3:-120}" "run $1 health" run_health "$1"; }
 
+# wait_custody_headroom NEEDED [TIMEOUT]: fresh claims each add a hold. Read the owner
+# aggregate used by the recovery UI (GetCustodyAggregateForOwner), which counts the
+# same state='open' owner holds as ClaimRun's custody admission predicate. Never delete
+# or discard cross-phase evidence to make room, including source-only owner decisions.
+wait_custody_headroom() {
+  local needed="$1" timeout="${2:-180}" start=$SECONDS snapshot count limit
+  [[ "$needed" =~ ^[1-9][0-9]*$ ]] || fail "custody headroom: invalid needed=$needed"
+  while :; do
+    snapshot="$(apiget /api/recovery/holds)"
+    count="$(printf '%s' "$snapshot" | jq -er '.aggregate.open_holds | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid open count"
+    limit="$(printf '%s' "$snapshot" | jq -er '.aggregate.custody_hold_limit | select(type=="number" and .>=0 and .==floor)')" || fail "custody headroom: invalid admission limit"
+    if [ "$limit" = 0 ] || [ $((count + needed)) -le "$limit" ]; then
+      pass "custody headroom: open=$count limit=$limit needed=$needed; evidence preserved"
+      printf '%s' "$snapshot" | jq -c '.holds[] | select(.state=="open" and .attention=="source_only") | {id,run_id,generation,attention}'
+      return 0
+    fi
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then
+      printf 'custody headroom exhausted: open=%s limit=%s needed=%s\n' "$count" "$limit" "$needed"
+      printf '%s' "$snapshot" | jq -c '.holds[] | select(.state=="open") | {id,run_id,generation,attention,capture_state}'
+      local run
+      while IFS= read -r run; do
+        apiget "/api/runs/$run" | jq -c '.run | {id,status,claim_generation}'
+      done < <(printf '%s' "$snapshot" | jq -r '[.holds[] | select(.state=="open") | .run_id] | unique[]')
+      fail "custody headroom timeout: open=$count limit=$limit needed=$needed after ${timeout}s; evidence preserved"
+    fi
+    sleep 2
+  done
+}
+
+# wait_forge_park_release RUN GENERATION [TIMEOUT] [STATUS]: guarded holds settle after the
+# outcome acknowledgement. Require the exact final receipt while the outcome and
+# generation are unchanged; legacy claims retain their atomic no_adopted_source assertion.
+wait_forge_park_release() {
+  local run="$1" generation="$2" timeout="${3:-10}" want="${4:-recovery_wait}" start=$SECONDS snapshot
+  [[ "$generation" =~ ^[1-9][0-9]*$ ]] || fail "forge park invalid generation: $generation"
+  case "$want" in recovery_wait|failed) ;; *) fail "forge park invalid expected status: $want";; esac
+  while :; do
+    snapshot="$(db_psql "SELECT COALESCE(json_agg(json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
+      'generation',h.generation,'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
+      'after_outcome',h.released_at >= CASE WHEN r.status='failed' THEN r.finished_at ELSE r.status_since END,
+      'run_status',r.status,'claim_generation',r.claim_generation)), '[]'::json)::text
+      FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
+      WHERE h.run_id='$run' AND h.generation=$generation")"
+    printf '%s' "$snapshot" | jq -e 'type=="array" and length==1' >/dev/null \
+      || fail "forge park expected exactly one hold (missing receipt or duplicate): $snapshot"
+    snapshot="$(printf '%s' "$snapshot" | jq -c '.[0]')"
+    printf '%s' "$snapshot" | jq -e --argjson gen "$generation" --arg want "$want" \
+      '.generation==$gen and .claim_generation==$gen and .run_status==$want' >/dev/null \
+      || fail "forge park changed run/generation or lost hold: $snapshot"
+    if printf '%s' "$snapshot" | jq -e '.inventory_guarded==false' >/dev/null; then
+      printf '%s' "$snapshot" | jq -e '.state=="released" and .release_evidence=="no_adopted_source"' >/dev/null \
+        || fail "legacy forge park did not atomically release its hold: $snapshot"
+      return 0
+    fi
+    if printf '%s' "$snapshot" | jq -e '.state=="released"' >/dev/null; then
+      printf '%s' "$snapshot" | jq -e '.final_disposition=="settled" and .release_evidence=="forge_no_output" and .after_outcome==true' >/dev/null \
+        || fail "guarded forge park has wrong release evidence: $snapshot"
+      return 0
+    fi
+    printf '%s' "$snapshot" | jq -e '.state=="open" and .final_disposition==null and .release_evidence==null' >/dev/null \
+      || fail "guarded forge park has unexpected disposition: $snapshot"
+    [ $((SECONDS - start)) -lt "$timeout" ] || fail "guarded forge park release timeout after ${timeout}s: $snapshot"
+    sleep 2
+  done
+}
+
 # wait_status RUN WANT [TIMEOUT] — poll a run until it reaches WANT; abort early
 # if it lands in an unexpected terminal state.
 wait_status() {

@@ -158,13 +158,13 @@ export function sortedArchives(summary: RecoveryArchiveSummary): RecoveryArchive
 // Pure decision logic for the board alert and the Workers per-hold resolution surface.
 // The server derives each hold's `attention` (active | capturing | archive_ready |
 // needs_action | source_only | released | discarded) and the owner-wide aggregate; this
-// file only maps those onto presentation. It NEVER re-derives admission, severity, or the
-// decision-needed count from raw hold rows — those are server-authoritative (D6/D10).
+// file maps the aggregate onto presentation, including alert severity from blocked_runs.
+// Admission and decision counts remain server-authoritative; raw hold rows do not drive them.
 
 // CustodyAlertView is the board alert's resolved presentation, or `null` to render nothing.
 export interface CustodyAlertView {
-  // danger = the admission limit is reached and new claims are blocked (D8 escalation);
-  // warning = attention is required but claims still flow.
+  // danger = blocked_runs > 0; warning = every other visible case, including capacity.
+  // Capacity alone does not establish that any run is currently blocked.
   tone: "warning" | "danger";
   atLimit: boolean;
   // "6 / 8 custody slots used" — the safety-slot line.
@@ -182,25 +182,24 @@ export interface CustodyAlertView {
 
 // custodyAlertView decides whether the board alert renders and, if so, how loud it is.
 //
-// SELF-HIDES (returns null) unless attention is required OR claims are blocked (D8): there
-// is at least one open hold AND (a hold needs an owner decision, a run is blocked, or the
-// admission limit is reached). A fleet carrying only healthy active protection is NOT an
-// incident (D6), so the alert stays hidden — it is not "another permanent alarm card".
-//
-// ESCALATES to `danger` styling the moment counted holds reach custody_hold_limit: at the
-// limit every further code-run claim for the owner stops, which is the incident this whole
-// PRD exists to surface. Below the limit it is `warning`.
-// The server owns admission classification. Older servers omit this count; explicit zero
-// means no capacity is consumed even when custody remains open.
-export function recoveryCapacityUsed(agg: RecoveryCustodyAggregate): number {
+// SELF-HIDES unless there is an open hold AND a decision, a blocked run, or capacity
+// reached against a positive limit. Healthy protection below capacity stays hidden.
+// Admission counts come from the server; total open custody remains separate.
+// Danger requires blocked_runs > 0, even below capacity. All other visible states warn.
+// Headlines prioritize blocked runs, then decisions, then capacity alone.
+// Older servers omit admission_counted_holds; explicit zero is meaningful.
+export function custodyAdmissionCount(agg: RecoveryCustodyAggregate): number {
   return agg.admission_counted_holds ?? agg.open_holds;
 }
+
+// Existing held-work consumers share the same server-authoritative admission count.
+export const recoveryCapacityUsed = custodyAdmissionCount;
 
 export function custodyAlertView(
   agg: RecoveryCustodyAggregate,
   recoveryWaitCount: number,
 ): CustodyAlertView | null {
-  const capacityUsed = recoveryCapacityUsed(agg);
+  const capacityUsed = custodyAdmissionCount(agg);
   const atLimit =
     agg.custody_hold_limit > 0 && capacityUsed >= agg.custody_hold_limit;
   const show =
@@ -208,7 +207,7 @@ export function custodyAlertView(
     (agg.decision_needed > 0 || agg.blocked_runs > 0 || atLimit);
   if (!show) return null;
   return {
-    tone: atLimit ? "danger" : "warning",
+    tone: agg.blocked_runs > 0 ? "danger" : "warning",
     atLimit,
     slotsLabel: `${capacityUsed} / ${agg.custody_hold_limit} custody slots used`,
     slotsUsed: capacityUsed,
@@ -216,9 +215,11 @@ export function custodyAlertView(
     decisionNeeded: agg.decision_needed,
     blockedRuns: agg.blocked_runs,
     recoveryWaitCount,
-    headline: atLimit
+    headline: agg.blocked_runs > 0
       ? "Held work is blocking new runs"
-      : "Held work needs your attention",
+      : agg.decision_needed > 0
+        ? "Held work needs your attention"
+        : "Custody capacity reached",
   };
 }
 
@@ -261,7 +262,7 @@ export interface CustodyHoldView {
   // active protection or archive-ready/release-pending.
   needsDecision: boolean;
   // Ordered action set for this hold. The strongest verb (discard) only appears where the
-  // worker-local source may be the only copy (no available archive).
+  // worker-local source may contain work absent from any available archive.
   actions: CustodyHoldAction[];
   // Where the run's retained published checkpoint currently lives on the forge (PRD #1810),
   // or null when nothing is retained (checkpoint_ref absent/empty).
@@ -381,12 +382,19 @@ function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkp
         group: "attention",
         tone: "warning",
         stateLabel: "Decision required",
-        summary: hold.inventory_guarded && hasArchive
-          ? "An earlier recovery archive is available, but final inventory coverage is pending. The worker retains committed work that may be absent from that archive."
-          : "No server archive exists. The worker-local source may be the only copy — export is not possible, so choose whether to discard it.",
+        summary: (hasArchive
+          ? hold.inventory_guarded
+            ? "An earlier recovery archive is available, but final inventory coverage is pending. The worker retains committed work that may be absent from that archive."
+            : "A recovery archive is available to download, but it may not cover the latest worker-local work. Custody remains open for your decision."
+          : hold.capture_state === "preparing" || hold.capture_state === "uploading"
+            ? "No server archive is available to download yet. The worker-local source may be the only copy; custody remains open for your decision."
+            : "No server archive exists. The worker-local source may be the only copy — export is not possible, so choose whether to discard it.") +
+          (hold.capture_state === "preparing" || hold.capture_state === "uploading"
+            ? ` The latest capture is ${hold.capture_state}; its coverage is not yet verified.`
+            : ""),
         autoReleasing: false,
         needsDecision: true,
-        actions: ["discard"],
+        actions: hasArchive && !hold.inventory_guarded ? ["export", "discard"] : ["discard"],
       };
     case "released":
     case "discarded":

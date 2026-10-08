@@ -41,14 +41,49 @@ it("demo shows matching failure recency, a valid drill-in, and a never-failed us
   }
 });
 
-it("demo renders selected-window cost exclusions and all-time per-user totals", async () => {
+it("demo users partition every factory metric in both windows", async () => {
+  const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
+  const sum = (values: number[]) => values.reduce((a, b) => a + b, 0);
+  const mine = admin.users.find((u) => u.user_id === "u-vlad")!;
+  expect(mine.last_7_days).toEqual(self.last_7_days);
+  expect(mine.last7_outcomes).toEqual(self.outcomes.last_7_days);
+  expect(mine.last7_subscription_run_count).toBe(self.last7_subscription_run_count);
+  for (const field of ["input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "cost_usd"] as const) {
+    expect(sum(admin.users.map((u) => u.usage[field]))).toBeCloseTo(admin.factory.lifetime[field], 8);
+    expect(sum(admin.users.map((u) => u.last_7_days![field]))).toBeCloseTo(admin.factory.last_7_days[field], 8);
+  }
+  for (const field of ["finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing"] as const) {
+    expect(sum(admin.users.map((u) => u.outcomes[field]))).toBe(admin.factory.outcomes.lifetime[field]);
+    expect(sum(admin.users.map((u) => u.last7_outcomes![field]))).toBe(admin.factory.outcomes.last_7_days[field]);
+  }
+  expect(sum(admin.users.map((u) => u.run_count))).toBe(admin.factory.run_count);
+  expect(sum(admin.users.map((u) => u.subscription_run_count))).toBe(admin.factory.lifetime_subscription_run_count);
+  expect(sum(admin.users.map((u) => u.unreported_run_count))).toBe(admin.factory.lifetime_unreported_run_count);
+  expect(sum(admin.users.map((u) => u.last7_subscription_run_count!))).toBe(admin.factory.last7_subscription_run_count);
+  expect(sum(admin.users.map((u) => u.last7_unreported_run_count!))).toBe(admin.factory.last7_unreported_run_count);
+  const origins: Record<string, number> = {};
+  const lifetimeOrigins: Record<string, number> = {};
+  for (const u of admin.users) {
+    expect(u.last7_run_count).toBeGreaterThanOrEqual(u.last7_subscription_run_count! + u.last7_unreported_run_count!);
+    expect(u.last7_run_count).toBeLessThanOrEqual(u.run_count);
+    const o = u.last7_outcomes!;
+    expect(o.finished).toBe(o.completed + o.cancelled + o.plan_rejected + o.failed);
+    expect(sum(Object.values(o.fail_origins))).toBe(o.failed);
+    for (const [origin, count] of Object.entries(o.fail_origins)) origins[origin] = (origins[origin] ?? 0) + count;
+    for (const [origin, count] of Object.entries(u.outcomes.fail_origins)) lifetimeOrigins[origin] = (lifetimeOrigins[origin] ?? 0) + count;
+  }
+  expect(origins).toEqual(admin.factory.outcomes.last_7_days.fail_origins);
+  expect(lifetimeOrigins).toEqual(admin.factory.outcomes.lifetime.fail_origins);
+});
+
+it("demo renders selected-window cost exclusions and seven-day per-user totals", async () => {
   const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
   const { getByRole, getByText } = render(createElement(MemoryRouter, null,
     createElement(UsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {} }),
   ));
   const personal = within(getByRole("region", { name: "Your usage" }));
   expect(personal.getByText("excl. 2 subscription runs").getAttribute("title")).toBe("Cost excludes 2 Codex subscription runs");
-  expect(getByText("Per-user figures are all time.")).toBeTruthy();
+  expect(getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
   const totalRow = getByText("uzi total").closest("tr")!;
-  expect(within(totalRow).getByText("Cost excludes 20 Codex subscription runs")).toBeTruthy();
+  expect(within(totalRow).getByText("Cost excludes 5 Codex subscription runs")).toBeTruthy();
 });

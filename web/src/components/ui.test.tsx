@@ -115,7 +115,10 @@ describe("StatusPill", () => {
     const checked: string[] = [];
     for (const status of Object.keys(RUN_STATUS_TONES)) {
       if (OVERLAY_ONLY.has(status)) continue;
-      const badge = runBadge(latestRun(status), NOW);
+      const input = status === "worker_requeue_exhausted"
+        ? { ...latestRun("recovery_wait"), recovery_wait_cause: status }
+        : latestRun(status);
+      const badge = runBadge(input, NOW);
       if (badge.kind !== "badge") continue;
       const { container, unmount } = render(<StatusPill status={status} />);
       expect([status, container.textContent?.trim()]).toEqual([status, badge.label]);
@@ -139,6 +142,7 @@ describe("StatusPill", () => {
     // word runBadge uses, so it deliberately has NO RUN_STATUS_LABELS override — this
     // loop pins the two surfaces to that one word so a later override on only one drifts.
     expect(checked).toContain("recovery_wait");
+    expect(checked).toContain("worker_requeue_exhausted");
     // PRD #1190: paused must print one word — "‖ paused" — on BOTH the pill and the board
     // badge. The pill carries the "‖" glyph via RUN_STATUS_LABELS so it agrees with
     // runBadge's "‖ paused" label; a missing entry would leave StatusPill printing "paused"

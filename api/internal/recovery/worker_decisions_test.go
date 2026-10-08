@@ -36,7 +36,7 @@ func TestCustodyDecisionsByWorker(t *testing.T) {
 	}
 	// DecisionNeeded is authoritative even when attention carries a different label.
 	for _, decision := range []bool{false, false, false, true, true, true, true, false, false, false, false, false} {
-		st.rows = append(st.rows, store.ListOpenCustodyHoldsForWorkersRow{WorkerID: a, Attention: "active", DecisionNeeded: decision})
+		st.rows = append(st.rows, store.ListOpenCustodyHoldsForWorkersRow{WorkerID: a, State: "open", RunStatus: "recovery_wait", RecoveryWaitCause: "worker_requeue_exhausted", CaptureState: "available", HasAvailableCapture: true, Attention: "active", DecisionNeeded: decision})
 	}
 	counts, err = svc.CustodyDecisionsByWorker(context.Background(), []uuid.UUID{a, b})
 	if err != nil || !reflect.DeepEqual(counts, map[uuid.UUID]int{a: 4, b: 0}) || st.calls != 1 || !reflect.DeepEqual(st.ids, []uuid.UUID{a, b}) {

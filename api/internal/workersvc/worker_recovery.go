@@ -11,6 +11,16 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+func recoveryDispositionCount(rows []store.WorkerRecoveryDisposition, status string) int {
+	count := 0
+	for _, row := range rows {
+		if row.Status == status {
+			count++
+		}
+	}
+	return count
+}
+
 // workerRecoveryLockSet is transaction-local. Only a successful capture constructs
 // an evaluated ledger; the private serialized tuple and parent union are never
 // reconstructed from worker input.
@@ -70,7 +80,7 @@ func workerRecoveryLocksFromRows(rows []store.LockWorkerRecoveryParentsRow) (wor
 	return workerRecoveryLockSet{evaluated: true, frozenJSON: string(frozen), parentIDs: parents}, nil
 }
 
-func (s *Service) runFrozenAttested(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, max int32, reason store.FrozenFailWorkerRunsOverCapParams, finalize validatedFinalizeResume, valid bool, locks workerRecoveryLockSet) ([]uuid.UUID, []uuid.UUID, int, error) {
+func (s *Service) runFrozenAttested(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, max int32, reason store.FrozenFailWorkerRunsOverCapParams, finalize validatedFinalizeResume, valid bool, locks workerRecoveryLockSet) ([]store.WorkerRecoveryDisposition, []uuid.UUID, int, error) {
 	frozen, parents, err := locks.parameters()
 	if err != nil {
 		return nil, nil, 0, err
@@ -79,7 +89,8 @@ func (s *Service) runFrozenAttested(ctx context.Context, qtx *store.Queries, wor
 		return nil, nil, 0, nil
 	}
 	failed, err := qtx.FrozenFailAttestedFinalizeRunsOverCap(ctx, store.FrozenFailAttestedFinalizeRunsOverCapParams{
-		FailureReason: reason.FailureReason, WorkerID: pgconv.UUID(workerID), MaxRequeues: max,
+		ReleasedWorkerNonceOverride: reason.ReleasedWorkerNonceOverride,
+		FailureReason:               reason.FailureReason, WorkerID: pgconv.UUID(workerID), MaxRequeues: max,
 		RunIds: finalize.ids, ClaimGenerations: finalize.generations, FrozenTargets: frozen, LockedParentIds: parents,
 	})
 	if err != nil {

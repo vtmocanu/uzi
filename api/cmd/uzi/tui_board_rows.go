@@ -525,7 +525,7 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != ""
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isWorkerRecoveryExhausted(r.RunDTO)
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -546,6 +546,15 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
+	if isWorkerRecoveryExhausted(r.RunDTO) {
+		allowance := "allowance unknown"
+		if w := r.WorkerRecovery; w != nil {
+			allowance = fmt.Sprintf("%d/%d auto used", w.EpisodeUsed, w.AutomaticRequeueLimit)
+		}
+		line := fmt.Sprintf("Resume/Cancel · %s · lifetime charged %d", allowance, r.RequeueCount)
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	line := codexAccountActionLine(r.RunDTO)
 	if line == "" {
 		// PRD #1732 D14: a run held on credential_disabled has no live activity either; its

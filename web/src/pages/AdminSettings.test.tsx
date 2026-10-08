@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
+import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { api, ApiError } from "../lib/api";
+import { setDemoMode } from "../lib/demoMode";
 
 // Only the api object is swapped; ApiError and types stay real so the page's
 // `instanceof ApiError` checks match what the mocked methods throw.
@@ -15,6 +18,7 @@ vi.mock("../lib/api", async (importActual) => {
       getSettings: vi.fn(),
       updateSettings: vi.fn(),
       vaultMigration: vi.fn(),
+      adminListDockerAllowlistRepos: vi.fn(),
       listRepos: vi.fn(),
       getAgentSource: vi.fn(),
       syncAgentSource: vi.fn(),
@@ -188,8 +192,10 @@ beforeEach(() => {
   mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.checkReleaseNow.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
-  mockApi.listRepos.mockResolvedValue({
-    repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as import("../lib/api").Repo[],
+  // Old caller-scoped fetch control: no cross-user repositories are returned here.
+  mockApi.listRepos.mockResolvedValue({ repos: [] });
+  mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
+    repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", enabled: true, owner_email: "admin@example.com", connection_id: "conn-1", forge_type: "gitlab", base_url: "https://gitlab.example.com" }] as unknown as import("../lib/api").AdminDockerAllowlistRepo[],
   });
   mockApi.getAgentSource.mockResolvedValue({ agent_source: emptyAgentSource() });
   mockApi.syncAgentSource.mockResolvedValue({ agent_source: emptyAgentSource() });
@@ -726,16 +732,13 @@ describe("AdminSettings — run summaries (PRD #362)", () => {
 
 
 describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
-  // The card edits a security control (which repos a docker worker may claim), so its
-  // save logic is behaviorally pinned here, not just its rendering. Auditor Low: the
-  // setting is GLOBAL but listRepos is per-user, so ids the editing admin cannot see
-  // must be PRESERVED on save, never silently clobbered.
+  // The global stored set must survive edits, including deleted/unresolved IDs.
   const twoRepos = () =>
-    mockApi.listRepos.mockResolvedValue({
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
       repos: [
-        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
-        { id: "repo-two", path_with_namespace: "vtmocanu/two" },
-      ] as unknown as import("../lib/api").Repo[],
+        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", enabled: true, owner_email: "admin@example.com", connection_id: "conn-1", forge_type: "gitlab", base_url: "https://gitlab.example.com" },
+        { id: "repo-two", path_with_namespace: "vtmocanu/two", enabled: true, owner_email: "dana@example.com", connection_id: "conn-2", forge_type: "github", base_url: "https://github.com" },
+      ] as unknown as import("../lib/api").AdminDockerAllowlistRepo[],
     });
   const saveBtn = () =>
     screen.getByRole("button", { name: /save repo allowlist/i }) as HTMLButtonElement;
@@ -746,15 +749,15 @@ describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
     renderPage();
 
     // Selection equals the stored value → nothing to save.
-    await screen.findByLabelText("vtmocanu/two");
+    await screen.findByLabelText(/vtmocanu\/two/);
     expect(saveBtn().disabled).toBe(true);
 
-    fireEvent.click(screen.getByLabelText("vtmocanu/two"));
+    fireEvent.click(screen.getByLabelText(/vtmocanu\/two/));
     expect(saveBtn().disabled).toBe(false);
   });
 
-  it("saves the ticked repos as comma-separated ids and PRESERVES ids outside the admin's visibility", async () => {
-    // repo-other is not in this admin's listRepos (another admin's connection).
+  it("saves the ticked repos as comma-separated ids and PRESERVES ids that are unresolved or deleted", async () => {
+    // repo-other no longer resolves to an existing repository.
     mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
     twoRepos();
     mockApi.updateSettings.mockResolvedValue(
@@ -762,12 +765,11 @@ describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
     );
     renderPage();
 
-    // The invisible id is surfaced as preserved, not dropped.
-    expect(await screen.findByText(/outside your visibility \(preserved\)/i)).toBeTruthy();
+    // The deleted id is surfaced as preserved, not dropped.
+    expect(await screen.findByText(/unresolved\/deleted repositories \(preserved\)/i)).toBeTruthy();
 
-    // Tick a visible repo and save. The write must still carry repo-other — the entry
-    // this admin cannot see rides through untouched.
-    fireEvent.click(await screen.findByLabelText("vtmocanu/two"));
+    // Tick another owner’s repo and save. The deleted repo ID rides through untouched.
+    fireEvent.click(await screen.findByLabelText(/vtmocanu\/two/));
     fireEvent.click(saveBtn());
 
     await waitFor(() => {
@@ -779,14 +781,14 @@ describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
 
   it("removing the only visible repo writes an empty (fail-closed) allowlist", async () => {
     mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
-    mockApi.listRepos.mockResolvedValue({
-      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as import("../lib/api").Repo[],
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", enabled: true, owner_email: "admin@example.com", connection_id: "conn-1", forge_type: "gitlab", base_url: "https://gitlab.example.com" }] as unknown as import("../lib/api").AdminDockerAllowlistRepo[],
     });
     mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: "" }));
     renderPage();
 
     // The stored repo is ticked; untick it and save → empty string (fail-closed).
-    const box = (await screen.findByLabelText("vtmocanu/uzi")) as HTMLInputElement;
+    const box = (await screen.findByLabelText(/vtmocanu\/uzi/)) as HTMLInputElement;
     expect(box.checked).toBe(true);
     fireEvent.click(box);
     fireEvent.click(saveBtn());
@@ -796,16 +798,14 @@ describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
     });
   });
 
-  it("does not show the out-of-visibility indicator when the repos list fails to load", async () => {
+  it("does not show the unresolved indicator when the repos list fails to load", async () => {
     mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
-    mockApi.listRepos.mockRejectedValue(new Error("network"));
+    mockApi.adminListDockerAllowlistRepos.mockRejectedValue(new Error("network"));
     renderPage();
 
-    // The card reports the load failure but never the spurious "N outside your
-    // visibility" count — repos never loaded, so it cannot be known, and it must not
-    // promise a removal the admin can't perform.
+    // No unresolved count is meaningful until the admin list has loaded.
     expect(await screen.findByText(/could not load repositories/i)).toBeTruthy();
-    expect(screen.queryByText(/outside your visibility/i)).toBeNull();
+    expect(screen.queryByText(/unresolved\/deleted repositories/i)).toBeNull();
   });
 });
 
@@ -1347,5 +1347,188 @@ describe("AdminSettings — agent source (PRD #602 M5)", () => {
     // Branch-pinned "moved" signal: no version named, and no Bump pin (tag-mode only).
     expect(await c.findByText("Source moved")).toBeTruthy();
     expect(c.queryByRole("button", { name: /bump pin/i })).toBeNull();
+  });
+});
+
+
+describe("DockerAllowlistCard — instance identities", () => {
+  const first = "abcdef12-3456-7890-abcd-ef1234567890";
+  const second = "12345678-1234-5678-9abc-def123456789";
+  const deleted = "99999999-1234-5678-9abc-def123456789";
+  const row = (id = first, over: Partial<import("../lib/api").AdminDockerAllowlistRepo> = {}): import("../lib/api").AdminDockerAllowlistRepo => ({
+    id, path_with_namespace: "team/shared", enabled: true,
+    owner_email: "admin@example.com", connection_id: "conn-admin",
+    forge_type: "gitlab", base_url: "https://gitlab.example.com", ...over,
+  });
+  function card(value: string, sources: Record<string, Src> = {}) {
+    function Harness() {
+      const [resp, setResp] = useState<import("../lib/api").SettingsResponse>(() => response({ docker_repo_allowlist: value }, {}, sources));
+      return <DockerAllowlistCard settings={resp.settings} sources={resp.sources} onSaved={setResp} />;
+    }
+    return render(<Harness />);
+  }
+  const save = () => screen.getByRole("button", { name: /save repo allowlist/i }) as HTMLButtonElement;
+  const checkbox = () => screen.getByRole("checkbox") as HTMLInputElement;
+  const submit = () => fireEvent.submit(save().closest("form")!);
+  const aliases = [
+    first, first.toUpperCase(), first.replace(/-/g, ""),
+    first.replace(/-/g, "").toUpperCase(), "urn:uuid:" + first,
+    "URN:UUID:" + first.toUpperCase(), "UrN:UuId:" + first,
+    "{" + first + "}", "[" + first + "]", "!" + first + "?", "x" + first.toUpperCase() + "y",
+    "\u0085" + first + "\u0085",
+  ];
+
+  it.each(aliases)("revokes accepted UUID spelling %s with no hidden grant", async (alias) => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row(first, { enabled: false })] });
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: "" }));
+    card(alias);
+    await screen.findByText("Disabled");
+    expect(checkbox().checked).toBe(true);
+    expect(save().disabled).toBe(true);
+    fireEvent.click(checkbox());
+    expect(checkbox().checked).toBe(false);
+    expect(screen.getByText("Disabled")).toBeTruthy();
+    fireEvent.click(save());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: "" }));
+  });
+
+  it("counts duplicate identities once, revokes all aliases, and restores a canonical ID without dirtying", async () => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row()] });
+    card(aliases.join(","));
+    await screen.findByRole("checkbox");
+    expect(screen.getByText("Trusted repositories (1 selected)")).toBeTruthy();
+    expect(screen.queryByText(/unresolved\/deleted repositories/i)).toBeNull();
+    fireEvent.click(checkbox());
+    fireEvent.click(checkbox());
+    expect(save().disabled).toBe(true);
+    submit();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    fireEvent.click(checkbox());
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: "" }));
+    fireEvent.click(save());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: "" }));
+  });
+
+  it("preserves unresolved near misses and untouched spellings while saving a different owner's same-path repo", async () => {
+    const invalid = ["é" + first + "é", "😀" + first, "urn:uuidx:" + first, "{" + first.replace("-", "_") + "}", first + "x"];
+    const untouched = "URN:UUID:" + first.toUpperCase();
+    const unknown = "!" + deleted + "?";
+    const stored = [untouched, first, unknown, deleted, ...invalid];
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
+      repos: [row(), row(second, { owner_email: "dana@example.com", connection_id: "conn-dana", forge_type: "forgejo", base_url: "https://forge.example.com" })],
+    });
+    const expected = [untouched, unknown, ...invalid, second].sort().join(",");
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: expected }));
+    card(stored.join(","));
+    const other = await screen.findByRole("checkbox", { name: /team\/shared dana@example.com.*forgejo.*https:\/\/forge.example.com/ });
+    const own = screen.getByRole("checkbox", { name: /team\/shared admin@example.com.*gitlab/ }) as HTMLInputElement;
+    expect(own.checked).toBe(true);
+    expect((other as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText(/6 unresolved\/deleted repositories \(preserved\)/)).toBeTruthy();
+    fireEvent.click(other);
+    expect(own.checked).toBe(true);
+    fireEvent.click(save());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: expected }));
+  });
+
+  it("shows hidden controls as visible escapes in cross-user checkbox labels, retaining the raw ID", async () => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row(second, {
+      path_with_namespace: "team/\u202eoper-dev\u202c",
+      owner_email: "dana\u202e@example.com",
+      base_url: "https://forge.example.com/\n\u200b\u{e0001}",
+    })] });
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: second }));
+    card("");
+    const box = await screen.findByRole("checkbox", { name: /dana\\u\{202e\}@example.com/ });
+    const label = box.closest("label")!.textContent!;
+    expect(label).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(label).toContain("team/\\u{202e}oper-dev\\u{202c}");
+    expect(label).toContain("https://forge.example.com/\\u{a}\\u{200b}\\u{e0001}");
+    fireEvent.click(box);
+    fireEvent.click(save());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: second }));
+  });
+
+  it("masks repo, owner and connection labels in demo mode while saving the raw repo identity", async () => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row(first, {
+      path_with_namespace: "private-group/shared", owner_email: "dana.member@private.example",
+      base_url: "https://private-forge.example/team",
+    })] });
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: first }));
+    act(() => setDemoMode(true));
+    try {
+      card("");
+      const masked = await screen.findByRole("checkbox", { name: /demo\/shared Dana.*gitlab.*https:\/\/forge.example.com/ });
+      expect(screen.queryByText(/private-group|private.example|private-forge.example/)).toBeNull();
+      fireEvent.click(masked);
+      fireEvent.click(save());
+      await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: first }));
+    } finally {
+      act(() => setDemoMode(false));
+    }
+  });
+
+  it("leaves invalid wrappers unresolved instead of granting the fetched repository", async () => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row()] });
+    card("é" + first + "é,😀" + first + ",urn:uuidx:" + first);
+    await screen.findByRole("checkbox");
+    expect(checkbox().checked).toBe(false);
+    expect(screen.getByText(/3 unresolved\/deleted repositories \(preserved\)/)).toBeTruthy();
+    expect(screen.getByText("Trusted repositories (0 selected)")).toBeTruthy();
+  });
+
+  it("guards submit during loading and after fetch failure, with no premature unresolved count", async () => {
+    let reject!: (err: Error) => void;
+    mockApi.adminListDockerAllowlistRepos.mockReturnValue(new Promise((_resolve, fail) => { reject = fail; }));
+    card(deleted);
+    expect(screen.getByText("Loading repositories…")).toBeTruthy();
+    expect(save().disabled).toBe(true);
+    expect(screen.queryByText(/unresolved\/deleted repositories/i)).toBeNull();
+    submit();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    reject(new Error("network"));
+    await screen.findByText(/could not load repositories/i);
+    submit();
+    expect(save().disabled).toBe(true);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    expect(screen.queryByText(/unresolved\/deleted repositories/i)).toBeNull();
+  });
+
+  it("guards environment-fixed controls and direct form submission", async () => {
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row()] });
+    card(first, { docker_repo_allowlist: "env" });
+    await screen.findByRole("checkbox");
+    expect(checkbox().disabled).toBe(true);
+    fireEvent.click(checkbox());
+    expect(checkbox().checked).toBe(true);
+    submit();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    expect(save().disabled).toBe(true);
+  });
+
+  it("guards edits and repeated submission during a write, then retains dirty selection after a save error", async () => {
+    let reject!: (err: Error) => void;
+    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [row()] });
+    mockApi.updateSettings.mockReturnValue(new Promise((_resolve, fail) => { reject = fail; }));
+    card("");
+    await screen.findByRole("checkbox");
+    fireEvent.click(checkbox());
+    fireEvent.click(save());
+    const pending = screen.getByRole("button", { name: "Saving…" }) as HTMLButtonElement;
+    expect(pending.disabled).toBe(true);
+    expect(checkbox().disabled).toBe(true);
+    fireEvent.click(checkbox());
+    fireEvent.submit(pending.closest("form")!);
+    expect(checkbox().checked).toBe(true);
+    expect(mockApi.updateSettings).toHaveBeenCalledTimes(1);
+    reject(new ApiError(400, "save rejected"));
+    await screen.findByText(/save rejected/i);
+    expect(checkbox().disabled).toBe(false);
+    expect(checkbox().checked).toBe(true);
+    expect(save().disabled).toBe(false);
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: first }));
+    fireEvent.click(save());
+    await screen.findByText("Docker worker repo allowlist saved.");
+    expect(save().disabled).toBe(true);
   });
 });

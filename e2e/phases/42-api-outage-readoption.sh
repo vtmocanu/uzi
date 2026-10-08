@@ -107,16 +107,11 @@ done
 [ "$CAP" = 2 ] || fail "readopt: worker did not advertise max_concurrent_runs=2 after recreate (got ${CAP:-none})"
 pass "agent recreated at max_concurrent_runs=2"
 
-# Clear the admin owner's accumulated cross-phase recovery custody holds so the claim
-# admission gate does not wedge our claims in `queued` (the same guard phases 46/52 apply). A
-# CTE keeps the TOP-LEVEL statement a SELECT so the scalar read is a bare count.
+# Two fresh claims need admission headroom. Preserve earlier phases' recovery evidence
+# and let acknowledged final inventories settle, rather than deleting their custody.
+wait_custody_headroom "$CAP"
 RA_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 [ -n "$RA_ADMIN_ID" ] || fail "readopt: could not resolve the admin owner id for '$ADMIN_EMAIL'"
-RA_CLEARED="$(db_psql "WITH del AS (DELETE FROM recovery_custody_holds
-                                    WHERE user_id = '$RA_ADMIN_ID' AND state = 'open'
-                                    RETURNING 1)
-                      SELECT count(*) FROM del")"
-pass "cleared ${RA_CLEARED:-0} accumulated custody hold(s) so the admission gate does not wedge our claims"
 
 # =============================================================================
 # CASE (b) — LIVE stale requeue + heartbeat re-adoption (proves M2a/M2b/M2c).

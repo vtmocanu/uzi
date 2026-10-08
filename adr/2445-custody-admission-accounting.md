@@ -27,7 +27,7 @@ A claim opens a generation-scoped custody hold before execution. Counting health
 
 Old or future generations, null or missing identity evidence, owner/run/worker mismatches, stale or null heartbeats, released claims, terminal runs and statuses outside the allowlist remain counted. Additional qualifying holds on the same run remain counted too. Unknown evidence does not free capacity.
 
-`fn_custody_attention` preserves the existing classification precedence: discarded/released, available unguarded archive, capture in progress, `needs_action`, nonterminal run, then `source_only`. `fn_is_decision_attention` identifies `needs_action` and `source_only`; those decision holds remain counted. Eligibility does not use `attention == 'active'`: that label alone proves neither exact live identity nor heartbeat freshness, and qualifying non-decision holds can have other attention labels. The shared `recovery_custody_hold_facts` view supplies listing/decision facts without changing their meaning.
+`fn_custody_attention` retains discarded/released precedence, then classifies an OPEN hold for `recovery_wait` / `worker_requeue_exhausted` as `needs_action` when its latest capture failed, otherwise `source_only`, before considering available unguarded archives or captures in progress. This narrow cause-specific exception preserves the owner decision even with a downloadable archive or a latest preparing/uploading capture. Other holds retain available unguarded archive, capture in progress, `needs_action`, nonterminal run, then `source_only` precedence. Archive availability remains independent of attention; it does not prove latest-work coverage or automatically release exhaustion custody. `fn_is_decision_attention` identifies `needs_action` and `source_only`; those decision holds remain counted. Eligibility does not use `attention == 'active'`: that label alone proves neither exact live identity nor heartbeat freshness, and qualifying non-decision holds can have other attention labels. The shared `recovery_custody_hold_facts` view supplies listing/decision facts using that classifier. SQL is the sole policy authority; API and clients consume its facts rather than reclassifying attention.
 
 ### D3: Continuation keeps its total-count bound
 
@@ -45,7 +45,7 @@ The current-server owner aggregate emits numeric `admission_counted_holds`, incl
 
 ### D6: Statement snapshot, not a strict ceiling
 
-The SQL function is `STABLE` and the claim gate observes its statement snapshot. It adds no owner serialization. Concurrent claims can observe available capacity together, and a previously discounted hold can become counted when its heartbeat goes stale. Counts can therefore exceed 8; this policy is an admission gate, not a transactional ceiling on custody or admission-counted holds.
+The SQL function is `STABLE` and the claim gate observes its statement snapshot. Admission queries evaluate the accounting function once per statement for the relevant owner and reuse that result for capacity and blocked-run facts (the aggregate uses a materialized CTE). It adds no owner serialization. Concurrent claims can observe available capacity together, and a previously discounted hold can become counted when its heartbeat goes stale. Counts can therefore exceed 8; this policy is an admission gate, not a transactional ceiling on custody or admission-counted holds.
 
 ## Delivery boundary and validation
 

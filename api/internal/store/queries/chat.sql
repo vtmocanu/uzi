@@ -84,7 +84,16 @@ UPDATE runs SET
     status_since = now(),
     worker_id  = @worker_id,
     claimed_at = now(),
-    updated_at = now()
+    updated_at = now(),
+    -- Match ClaimRun: a fresh flight advances the fence and clears the old flight's markers.
+    claim_generation = runs.claim_generation + 1,
+    claim_released_at = NULL,
+    released_worker_id = NULL,
+    released_worker_nonce = NULL,
+    stale_requeue_generation = NULL,
+    worker_recovery_evidence = NULL,
+    checkpoint_contains_latest = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL
 WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
@@ -93,6 +102,12 @@ WHERE id = (
              OR r.worker_id = c.id))
       AND r.kind = 'chat'
       AND r.status = 'queued'
+      -- Match ClaimRun's released-incarnation exclusion BEFORE the UPDATE clears it.
+      -- The materialized claimant holds the worker lock while comparing its current nonce.
+      AND (r.released_worker_id IS NULL
+           OR r.released_worker_id <> @worker_id
+           OR r.released_worker_nonce IS DISTINCT FROM
+                (SELECT c.snapshot_register_nonce FROM claimant c))
       -- PRD #529 Decision 4: an ephemeral worker is run-bound and its bound run is
       -- never a chat, so it never claims a chat (no-foreign-work).
       AND NOT @is_ephemeral::boolean

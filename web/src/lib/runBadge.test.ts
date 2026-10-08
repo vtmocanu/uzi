@@ -28,7 +28,7 @@ import {
 } from "./runBadge";
 import { RUN_STATUS_TONES } from "../components/ui";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
-import type { LatestRun, RunStatus, StopKind } from "./api";
+import type { LatestRun, Run, RunStatus, StopKind } from "./api";
 
 // run builds a LatestRun with sane defaults, overridable per test.
 function run(over: Partial<LatestRun> = {}): LatestRun {
@@ -206,10 +206,41 @@ describe("runBadge taxonomy", () => {
     if (early.kind === "badge") expect(early.label).toBe("waiting for pool");
   });
 
+  it("cause-less board recovery directs readers to run details without an automatic promise", () => {
+    const badge = runBadge(run({ status: "recovery_wait" }), NOW);
+    expect(badge).toMatchObject({
+      kind: "badge", label: "recovery wait", tone: "warning", pulse: false,
+      title: "Recovery is on hold. Open the run page for details and available actions.",
+    });
+  });
+
+  it.each([0, 3])("worker exhaustion tooltip includes configured limit %s and charged counts", (limit) => {
+    const recovery: Run["worker_recovery"] = {
+      episode: 2, automatic_requeue_limit: limit, episode_used: limit, episode_remaining: 0, evidence: null,
+    };
+    const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "worker_requeue_exhausted",
+      worker_recovery: recovery, requeue_count: 8 };
+    const badge = runBadge(input, NOW);
+    expect(badge).toMatchObject({ kind: "badge", label: "recovery needs decision", pulse: false });
+    if (badge.kind !== "badge") throw new Error("Expected recovery badge");
+    expect(badge.title).toContain(`Automatic recovery limit: ${limit}. Used: ${limit}. Remaining: 0.`);
+    expect(badge.title).toContain("Lifetime automatic requeues: 8.");
+    expect(badge.title).toContain("Only the run owner can resume or cancel");
+    expect(runBadge(input, NOW + 3600000)).toEqual(badge);
+  });
+
+  it("worker exhaustion tooltip leaves absent metadata unknown", () => {
+    const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "worker_requeue_exhausted" };
+    const badge = runBadge(input, NOW);
+    if (badge.kind !== "badge") throw new Error("Expected recovery badge");
+    expect(badge.title).toContain("Automatic recovery limit, used and remaining: unknown.");
+    expect(badge.title).toContain("Lifetime automatic requeues: unknown.");
+  });
+
   // Issue #1197. Like the sibling parks, recovery_wait would otherwise fall to the
   // `default:` arm and render as a neutral grey "recovery wait" pill — wrong for a
-  // non-terminal, self-resuming hold.
-  it("recovery_wait → warn 'recovery wait', with a title that explains the auto-resume", () => {
+  // non-terminal recovery hold.
+  it("recovery_wait → warn 'recovery wait', with a title directing readers to details", () => {
     const b = runBadge(run({ status: "recovery_wait" }), NOW);
     expect(b).toMatchObject({
       kind: "badge",
@@ -217,10 +248,10 @@ describe("runBadge taxonomy", () => {
       tone: "warning",
       pulse: false,
     });
-    // NOT a usage-limit / pooled-token park: the title speaks of a transient interruption
-    // and an automatic resume, never a reset window or a pooled token.
+    // Cause-less board projections cannot determine whether owner action is required.
     if (b.kind === "badge") {
-      expect(b.title).toMatch(/resumes automatically/i);
+      expect(b.title).toMatch(/Open the run page for details/i);
+      expect(b.title).not.toMatch(/resumes automatically/i);
       expect(b.title).not.toMatch(/window reopens/i);
       expect(b.title).not.toMatch(/pooled/i);
     }

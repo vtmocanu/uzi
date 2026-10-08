@@ -154,7 +154,8 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin users | runs | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -172,10 +173,23 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 
 A few worth knowing:
 
-- **`uzi admin usage` includes failure recency.** The factory line and each
-  user's `SINCE` column show time since the last failed run in minutes, hours,
-  or days. A scope with finished runs but no failures shows `no failures`;
-  one with no finished runs shows `-`. These are the same lifetime definitions
+- **`uzi admin usage --window lifetime|last_7_days` selects the human report's
+  window (default `lifetime`).** The factory summary and per-user rows use
+  the same window for usage-bearing runs, tokens, metered cost, outcomes and
+  recoverable failures. Failure rate is failed runs divided by finished runs,
+  including runs without usage; `RUNS` counts runs with usage. Cost shows
+  `$0.00` for metered zero and discloses subscription/unreported run counts
+  whose costs are excluded. Recoverable work may already have been landed.
+  `--json` returns the complete API response with both windows and additive
+  per-user seven-day fields; the flag selects only the human report. Invalid
+  window values are rejected before a request, including with `--json`.
+  With an older API missing a user's `last_7_days`, the CLI returns an
+  upgrade error before printing a seven-day human report; lifetime and JSON
+  remain usable.
+  The factory's failure recency and each user's `SINCE` column stay lifetime
+  in both windows, showing minutes, hours or days since the last failed run.
+  A scope with lifetime finished runs but no failures shows `no failures`;
+  one with no lifetime finished runs shows `-`. These are the same definitions
   as Overview: chat, judge, and rejected plans do not count as failures.
 
 - **`--harness` picks the run's execution engine; omit it to let the server
@@ -407,7 +421,15 @@ A few worth knowing:
   number is repo-relative), so `--repo A --repo B ... --issue N` is a usage error
   (exit 2) before any create; `--sweep` and `--prompt` targets group freely.
   `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
-  gate); pass `--auto-approve=false` to keep the gate. `--wait-on-limit` also
+  gate); pass `--auto-approve=false` to keep the gate. **To start an
+  auto-approved run on one issue now**, use a disabled one-shot schedule:
+  `run create` has no auto-approve flag, since auto-approval is reserved for
+  unattended paths. Run `schedule create --repo <id> --issue <iid> --at <any
+  future time> --enabled=false`, then `schedule run-now <schedule-id>`, then
+  `schedule delete <schedule-id>`. `run-now` fires a disabled schedule and
+  never consumes a one-shot; an enabled one-shot remains scheduled at `--at`
+  and may start another run. The run takes the same auto-approve path as a
+  sweep, Plan cross-check included. `--wait-on-limit` also
   defaults **on** for a new schedule — a fired run parks until the Anthropic
   usage window reopens instead of failing — and this now takes effect even on
   the common auto-approve path (a schedule's own setting used to be silently
@@ -979,12 +1001,16 @@ uzi run recovery [--json]
   Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
   `admission_counted_holds` against the limit for capacity, and `open_holds` for total
-  custody. `blocked_runs` excludes continuations eligible for the exemption. For each `source_only` hold it prints
+  custody. `blocked_runs` excludes continuations eligible for the exemption. For each
+  `source_only` hold it reports retained source and archive availability independently.
+  An available archive can be exported but may omit latest worker-local work; a latest
+  preparing/uploading capture is reported as progress, without promising download or
+  coverage. With no archive or in-flight capture it prints
   `run <run-id> hold <hold-id>: no recovery archive; custody of worker <name>'s local source
   is retained (export unavailable; it may be the only copy)`. Then it prints hints: a
-  `uzi run export` hint only when an open hold has an available archive (an `archive_ready`
-  hold), and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
-  `needs_action`, which have no archive to export). With no open holds it says so and
+  `uzi run export` hint when an open hold has an available archive, regardless of attention,
+  and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
+  `needs_action`). With no open holds it says so and
   still prints the aggregate.
 - Without a run id, `--json` returns the endpoint's `aggregate` and `holds` object,
   including settled holds. The current server emits `admission_counted_holds` even
@@ -999,11 +1025,13 @@ uzi run recovery <run-id> [--json]
 - The per-run view shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
-  The status also distinguishes a capture-less source that needs a decision and shows
-  the latest capture state. A `source_only`
-  hold prints `hold <hold-id>: no recovery archive; custody of worker <name>'s local source is
-  retained (export unavailable; it may be the only copy)`, and the same export and discard
-  hints as above follow. `--json` prints
+  The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
+  `worker_requeue_exhausted`: it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Owner Resume/Cancel
+  remains required; archive readiness does not implicitly release this custody.
+  The latest capture state and available archive are independent: an older download may
+  omit latest work while a newer capture prepares/uploads. The same source, coverage,
+  export and discard guidance as above follows. `--json` prints
   the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
@@ -2347,7 +2375,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff until it recovers or you cancel it — see [Recovering
-  from a transient interruption](run-recovery-wait.md). A Codex credential
+  from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
+  `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
+  without an automatic timer. A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -2383,8 +2413,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
 
-`limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
-to do but wait or cancel; `pool_wait` instead clears only when a token is
+`limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
+`worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
+account hold waits for its account. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -2401,6 +2432,41 @@ TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
 
+### Worker recovery exhaustion
+
+`recovery_wait` with cause `worker_requeue_exhausted` means automatic
+worker-death recovery has stopped and the owner must Resume or Cancel.
+`uzi run get <id>` shows `WORKER_RECOVERY` and `RECOVERY_EVIDENCE` rows:
+the automatic limit (0 or N), episode used/remaining allowance, episode
+number, lifetime charged `requeue_count`, historical checkpoint tip or
+available capture at disposition time, and uncertainty flags. Checkpoint
+and capture observations do not verify current availability or latest edits;
+pending publication/capture, retained custody or unavailable server evidence
+do not guarantee an archive/export. See [Worker recovery exhausted](run-recovery-wait.md#worker-recovery-exhausted)
+for the exact evidence wording and server fallback.
+
+With `--json`, `worker_recovery` is a typed object with `episode`,
+`automatic_requeue_limit`, `episode_used`, `episode_remaining` and
+`evidence`. Evidence has `checkpoint_tip`, `available_capture`,
+`publication_uncertain`, `capture_uncertain`, `custody_uncertain`,
+`unknown` and `recorded_at`; it is historical, not current export availability.
+
+The owner can use `uzi run resume <id>` or the existing
+`uzi run resume-now <id>` to release this exact run hold and queue one
+explicit attempt. A new episode gets the current `RUN_MAX_REQUEUES`
+automatic allowance; 0 grants none. Lifetime charges/readoption refunds and
+the existing wall budget survive. The once-per-run finalize-resume exception
+is initial-episode only and cannot exceed an owner-started episode's cap.
+Timer, credential, vault, account and ordinary input events do not release
+or renew this hold.
+
+A default `uzi run wait <id>` stops on this cause; an explicit `--until`
+retains exactly its selected status set, including when it is the default
+set written explicitly. Ordinary recovery waits continue as before.
+`uzi run logs <id> --follow` reports a change to this cause even when the
+status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
+owner actions, counts and historical evidence, without a self-retry countdown.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -2408,11 +2474,13 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `while … run get … sleep` poll loop. With no `--until` it stops on any
 **actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
-rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`):
-limit and recovery waits retry on a timer, pool waits need an available pooled token,
+rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
+except a default wait also stops at `recovery_wait` with cause
+`worker_requeue_exhausted` for an owner decision:
+timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and owner pauses need `uzi run resume`. A bare `run wait` means
-"wait for the plan gate, a clarification, an interactive task's park, **or**
-the end".
+"wait for the plan gate, a clarification, an interactive task's park,
+worker recovery exhaustion, **or** the end".
 
 - It **exits 0** the moment a target state is reached — including if the run is
   already in one when you call it.

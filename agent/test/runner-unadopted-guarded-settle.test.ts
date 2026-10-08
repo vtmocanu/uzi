@@ -2,7 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { RecoveryCoordinator } from "../src/recovery.js";
-import type { RecoveryReleaseResponse, StateAck, StateRequest } from "../src/protocol.js";
+import type { RecoveryReleaseResponse, RunOwnershipResponse, StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
@@ -21,19 +21,23 @@ interface Rig {
   events: string[];
   releases: Array<{ runId: string; generation?: number; evidence?: string; disposition?: unknown }>;
   coordinator: RecoveryCoordinator;
-  run: (iid: number, ensureClone: () => Promise<never>) => Promise<string>;
+  run: (iid: number, ensureClone: () => Promise<never>, prepare?: (runId: string) => Promise<void>) => Promise<string>;
 }
 
-function rig(opts: { releaseFails?: boolean } = {}): Rig {
+function rig(opts: { releaseFails?: boolean; parkAck?: StateAck;
+  parkTransportFailure?: "once" | "always"; ownership?: RunOwnershipResponse } = {}): Rig {
   const events: string[] = [];
   const releases: Rig["releases"] = [];
   client.protocolFeatures = ["recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1"];
   client.hasFeature = (name: string) => name === "recovery_inventory_v1";
+  let parkReports = 0;
   client.reportState = async (_runId: string, body: StateRequest): Promise<StateAck> => {
     events.push(`report:${body.status}`);
-    return body.status === "recovery_wait" ? { applied: true, status: "recovery_wait" } : { applied: true, status: body.status };
+    if (body.status === "recovery_wait" && opts.parkTransportFailure &&
+        (opts.parkTransportFailure === "always" || parkReports++ === 0)) throw new Error("lost park acknowledgement");
+    return body.status === "recovery_wait" ? (opts.parkAck ?? { applied: true, status: "recovery_wait" }) : { applied: true, status: body.status };
   };
-  client.getRunOwnership = async () => ({ status: "failed", claim_generation: GEN, inventory_guarded: true });
+  client.getRunOwnership = async () => opts.ownership ?? ({ status: "failed", claim_generation: GEN, inventory_guarded: true });
   let runId = "";
   client.listRecoveryHolds = async () => ({ run_id: runId, holds: [
     { hold_id: "hold", generation: GEN, inventory_guarded: true, has_available_capture: false },
@@ -50,9 +54,10 @@ function rig(opts: { releaseFails?: boolean } = {}): Rig {
   });
   return {
     events, releases, coordinator,
-    run: async (iid, ensureClone) => {
+    run: async (iid, ensureClone, prepare) => {
       const claim = gitlabClaim(iid, { claim_generation: GEN, inventory_guarded: true });
       runId = claim.run_id;
+      await prepare?.(runId);
       git.ensureClone = ensureClone;
       const { gitlab } = fakeGitlab();
       await runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key", { recovery: coordinator }).execute(claim);
@@ -66,6 +71,73 @@ function trackSettled(): Array<[string, number]> {
   (client as unknown as { markInventoryGuardedClaimSettled: (r: string, g: number) => void })
     .markInventoryGuardedClaimSettled = (r, g) => { marked.push([r, g]); };
   return marked;
+}
+
+for (const status of ["failed", "cancelled"] as const) {
+  it(`pre-clone server ${status} ack settles exactly the empty guarded generation without a terminal re-report`, async () => {
+    const r = rig({ parkAck: { applied: true, status } });
+    const runId = await r.run(9120, async () => { throw TRANSIENT(); });
+    assert.deepEqual(r.releases, [{ runId, generation: GEN, evidence: "forge_no_output",
+      disposition: { kind: "settled", coverage_digest: EMPTY_DIGEST } }]);
+    assert.ok(r.events.indexOf("release") > r.events.indexOf("report:recovery_wait"));
+    assert.equal(r.events.includes(`report:${status}`), false, "the authoritative terminal needs no second report");
+  });
+}
+
+it("a stale pre-clone terminal ack never releases guarded custody", async () => {
+  const r = rig({ parkAck: { applied: false, status: "failed", reason: "stale_claim" } });
+  await r.run(9121, async () => { throw TRANSIENT(); });
+  assert.deepEqual(r.releases, []);
+});
+
+it("a server terminal ack keeps a guarded generation with journaled source", async () => {
+  const r = rig({ parkAck: { applied: true, status: "failed" } });
+  await r.run(9122, async () => { throw TRANSIENT(); }, async (runId) => {
+    await r.coordinator.pin({ runId, generation: GEN, kind: "issue", branch: "task",
+      sourceSha: "a".repeat(40), inventoryGuarded: true });
+  });
+  assert.deepEqual(r.releases, []);
+});
+
+it("a same-generation terminal ownership probe settles after a lost park acknowledgement", async () => {
+  const r = rig({ parkTransportFailure: "always" });
+  const runId = await r.run(9123, async () => { throw TRANSIENT(); });
+  assert.deepEqual(r.releases, [{ runId, generation: GEN, evidence: "forge_no_output",
+    disposition: { kind: "settled", coverage_digest: EMPTY_DIGEST } }]);
+  assert.equal(r.events.includes("report:failed"), false);
+});
+
+it("a resend after a running ownership probe settles the terminal acknowledgement", async () => {
+  const r = rig({ parkTransportFailure: "once", parkAck: { applied: true, status: "failed" },
+    ownership: { status: "running", claim_generation: GEN } });
+  await r.run(9124, async () => { throw TRANSIENT(); });
+  assert.equal(r.releases.length, 1);
+  assert.equal(r.events.filter(e => e === "report:recovery_wait").length, 2);
+  assert.ok(r.events.indexOf("release") > r.events.lastIndexOf("report:recovery_wait"));
+});
+
+for (const ownership of [{ status: "failed" }, { status: "failed", claim_generation: GEN + 1 }] as const) {
+  it(`a terminal ownership probe with ${"claim_generation" in ownership ? "mismatched" : "absent"} generation keeps custody`, async () => {
+    const r = rig({ parkTransportFailure: "always", ownership });
+    await r.run(9125, async () => { throw TRANSIENT(); });
+    assert.deepEqual(r.releases, []);
+  });
+}
+
+for (const source of ["owed pin", "retained clone"] as const) {
+  it(`a server terminal acknowledgement retains an existing ${source}`, async () => {
+    const r = rig({ parkAck: { applied: true, status: "failed" } });
+    await r.run(9126, async () => { throw TRANSIENT(); }, async (runId) => {
+      const bare = git.barePathFor(gitlabClaim(9126).repo.clone_url);
+      fs.mkdirSync(bare, { recursive: true });
+      git.resolveRecoveryBareDir = async () => bare;
+      git.enumerateOwedCandidates = async () => source === "owed pin"
+        ? [{ sha: "b".repeat(40), pinRef: "refs/x", contexts: [{ runId }] }] as never : [];
+      git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [],
+        clones: source === "retained clone" ? [{ path: "retained" }] : [], foreignOwners: [] }) as never;
+    });
+    assert.deepEqual(r.releases, []);
+  });
 }
 
 it("a confirmed empty settle forgets the remembered guarded claim for exactly that generation", async () => {

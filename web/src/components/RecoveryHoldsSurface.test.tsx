@@ -76,6 +76,25 @@ async function renderSurface(resp: RecoveryCustodyHolds) {
 }
 
 describe("RecoveryHoldsSurface", () => {
+  it.each(["available", "preparing", "uploading"])("links source-only export to the run archive section with latest capture %s", async (capture_state) => {
+    await renderSurface(listing([hold({ attention: "source_only", run_id: "run-exhausted", has_available_capture: true, capture_state })]));
+    const row = screen.getByText("Decision required").closest("li")!;
+    expect(within(row).getByRole("link", { name: /Export archive/ }).getAttribute("href")).toBe("/runs/run-exhausted#recovery-archives");
+    expect(within(row).getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+    expect(within(row).getByText(/may not cover the latest worker-local work/)).toBeTruthy();
+    if (capture_state !== "available") expect(within(row).getByText(new RegExp(`latest capture is ${capture_state}`))).toBeTruthy();
+    expect(within(row).queryByText(/releasing automatically/)).toBeNull();
+    expect(mockApi.discardHold).not.toHaveBeenCalled();
+  });
+
+  it.each(["preparing", "uploading"])("shows source-only capture %s without export when no archive exists", async (capture_state) => {
+    await renderSurface(listing([hold({ attention: "source_only", capture_state })]));
+    expect(screen.getByText(/No server archive is available to download yet/)).toBeTruthy();
+    expect(screen.getByText("Decision required")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Export archive/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+  });
+
   it.each([
     [8, undefined, 8, 8],
     [8, 0, 8, 0],

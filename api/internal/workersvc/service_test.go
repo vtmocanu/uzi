@@ -216,8 +216,9 @@ type fakeStore struct {
 	activeRunsAllErr error
 
 	// Ownership + messages + state.
-	runOwned    store.Run
-	runOwnedErr error
+	runOwned             store.Run
+	runOwnedErr          error
+	livePublishAttemptID uuid.UUID
 	// Orphan-classification read (issue #1319): orphanParams captures the args so a test
 	// can prove the owner-scope (user_id + the claimant's repo_id, NOT worker_id);
 	// orphanRow/orphanErr drive the return.
@@ -338,6 +339,7 @@ type fakeStore struct {
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
 	runByIDPlain      store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
 	runByIDPlainErr   error
+	runByIDPlainCalls int
 	userByID          store.User
 	userByIDErr       error
 	createdJudgeRun   *store.CreateJudgeRunParams
@@ -1030,6 +1032,37 @@ func (f *fakeStore) MarkRunFailedByID(_ context.Context, arg store.MarkRunFailed
 	f.markedFailed = &arg
 	return 1, nil
 }
+func (f *fakeStore) RecordLiveCheckpointPublishAttempt(_ context.Context, p store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error) {
+	// Legacy public Publish fixtures omit the owned row ID; configured IDs
+	// still bind admission to that fixture's authorization snapshot.
+	if (f.runOwned.ID != uuid.Nil && p.RunID != f.runOwned.ID) ||
+		p.ExpectedWorkerID != f.runOwned.WorkerID || p.ExpectedClaimGeneration != f.runOwned.ClaimGeneration {
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	if f.livePublishAttemptID == uuid.Nil {
+		f.livePublishAttemptID = uuid.New()
+	}
+	if p.AttemptID != uuid.Nil && p.AttemptID != f.livePublishAttemptID {
+		return uuid.Nil, pgx.ErrNoRows
+	}
+	return f.livePublishAttemptID, nil
+}
+
+func (f *fakeStore) DeleteCheckpointPublishAttempt(_ context.Context, id uuid.UUID) (int64, error) {
+	if id != f.livePublishAttemptID {
+		return 0, pgx.ErrNoRows
+	}
+	f.livePublishAttemptID = uuid.Nil
+	return 1, nil
+}
+
+func (f *fakeStore) MarkCheckpointPublishAttemptReady(_ context.Context, id uuid.UUID) (int64, error) {
+	if id != f.livePublishAttemptID {
+		return 0, pgx.ErrNoRows
+	}
+	return 1, nil
+}
+
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
 }
@@ -1302,15 +1335,23 @@ func (f *fakeStore) PromotePoolWaitRun(_ context.Context, arg store.PromotePoolW
 func (f *fakeStore) ConsumeRunInputs(context.Context, uuid.UUID) ([]store.ConsumeRunInputsRow, error) {
 	return f.consumeRows, nil
 }
-func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	f.failOverCap = &arg
 	f.callOrder = append(f.callOrder, "fail_over_cap")
-	return f.orphanFailedRuns, nil
+	rows := make([]store.WorkerRecoveryDisposition, 0, len(f.orphanFailedRuns))
+	for _, id := range f.orphanFailedRuns {
+		rows = append(rows, store.WorkerRecoveryDisposition{ID: id, Status: "failed"})
+	}
+	return rows, nil
 }
-func (f *fakeStore) FailAttestedFinalizeRunsOverCap(_ context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+func (f *fakeStore) FailAttestedFinalizeRunsOverCap(_ context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]store.WorkerRecoveryDisposition, error) {
 	f.failAttested = &arg
 	f.callOrder = append(f.callOrder, "fail_attested")
-	return f.attestedFailedRuns, nil
+	rows := make([]store.WorkerRecoveryDisposition, 0, len(f.attestedFailedRuns))
+	for _, id := range f.attestedFailedRuns {
+		rows = append(rows, store.WorkerRecoveryDisposition{ID: id, Status: "failed"})
+	}
+	return rows, nil
 }
 func (f *fakeStore) RequeueAttestedFinalizeRuns(_ context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
 	f.requeueAttested = &arg
@@ -1408,6 +1449,7 @@ func (f *fakeStore) GetRunByIDForUser(context.Context, store.GetRunByIDForUserPa
 
 // PRD #46 judge: enqueue funnel + trace/review.
 func (f *fakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	f.runByIDPlainCalls++
 	return f.runByIDPlain, f.runByIDPlainErr
 }
 func (f *fakeStore) GetUserByID(context.Context, uuid.UUID) (store.User, error) {

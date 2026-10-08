@@ -98,6 +98,9 @@ func (s *wiringStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpCol
 func (s *wiringStore) ListOwnersOverCustodyLimit(context.Context, store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
+func (s *wiringStore) ListCustodyHoldsForOwner(context.Context, store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
+	return nil, nil
+}
 func (s *wiringStore) GetControllerReport(context.Context) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, nil
 }

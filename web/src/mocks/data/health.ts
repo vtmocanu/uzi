@@ -3,9 +3,8 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): 16 of its check ids (all but forge.sync, which the fixture
-// has not caught up with), in the SAME stable order the server emits (service.go
-// Evaluate), so the demo and the tests exercise a well-formed document.
+// (api/internal/healthsvc): all 17 of its check ids, in the SAME stable order the
+// server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
 // server composes them from live numbers. Severity, id, group and shape are what must match.
@@ -24,6 +23,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "db", scope: "instance", group: "control", title: "Database", doc: null },
   { id: "loops", scope: "instance", group: "control", title: "Background loops", doc: null },
   { id: "forge.ciwatch", scope: "owner", group: "integrations", title: "CI watch capacity", doc: null },
+  { id: "forge.sync", scope: "owner", group: "integrations", title: "Forge issue sync", doc: null },
   { id: "slack.socket", scope: "owner", group: "integrations", title: "Slack socket", doc: null },
   { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
   { id: "board.drift", scope: "owner", group: "housekeeping", title: "Board drift", doc: null },
@@ -44,6 +44,7 @@ const OK_SUMMARY: Record<string, string> = {
   db: "Database reachable (2ms); schema at head.",
   loops: "All 4 background loops are ticking.",
   "forge.ciwatch": "Every repo's run branches fit within the CI watch cap.",
+  "forge.sync": "0 of 3 failing; 0 pending.",
   "slack.socket": "Slack socket is connected.",
   "schedules.paused": "No user has paused schedules while owning enabled ones.",
   "board.drift": "No column move has been given up in the last 24 hours.",

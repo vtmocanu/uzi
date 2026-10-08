@@ -1,0 +1,81 @@
+{
+  "provenance": {
+    "source_sha": "9cb606111b2b27a66ca96ff9a915d79fb46a80a5",
+    "source_file": "api/internal/workersvc/review_authors_test.go",
+    "source_file_sha256": "8302aec243e15537ac7273be79c07a634b8c43536f2f3b7182f0d2f47cebc2d4",
+    "seam": "ReviewAssessor.Begin -> ReviewAssessment.Snapshot via private newHarness.snapshot",
+    "timestamp": "2030-05-01T12:00:00Z",
+    "generated": [
+      "mixed",
+      "all_withheld"
+    ],
+    "ordinary_empty": "Synthetic version 2 zero-count snapshot; executed zero-input Begin returns nil, so Snapshot cannot be called.",
+    "unknown_lookup": "Unscripted flakyID in lookupFake returns immediate forge unavailable error; no hang or timer.",
+    "generator_source": "\n// TestGenerate2393ReviewSnapshots is appended to a complete copy of review_authors_test.go.\nfunc TestGenerate2393ReviewSnapshots(t *testing.T) {\n\tmakeComment := func(id, author int64, name, body, reply, resolve string) forge.MRComment {\n\t\tc := inline(id, author, name, body, raT0)\n\t\tc.ReplyID, c.ResolveID = reply, resolve\n\t\treturn c\n\t}\n\tmember := makeComment(239301, memberID, \"m2-collaborator\", \"M2-ELIGIBLE-COLLABORATOR-BODY\", \"m2-reply-collaborator\", \"m2-resolve-collaborator\")\n\tbot := makeComment(239302, coderabbit, \"coderabbitai[bot]\", \"M2-ELIGIBLE-BOT-BODY\", \"m2-reply-bot\", \"m2-resolve-bot\")\n\toutsider := makeComment(239303, outsiderID, \"m2-outsider\", \"M2-WITHHELD-OUTSIDER-BODY\", \"m2-withheld-reply-outsider\", \"m2-withheld-resolve-outsider\")\n\tunknown := makeComment(239304, flakyID, \"m2-unknown\", \"M2-WITHHELD-UNKNOWN-BODY\", \"m2-withheld-reply-unknown\", \"m2-withheld-resolve-unknown\")\n\tgenerate := func(comments ...forge.MRComment) *workersvc.ReviewCommentsSnapshot {\n\t\th := newHarness()\n\t\t// flakyID is unscripted: lookupFake returns an immediate error, never a timer.\n\t\tp := h.params(comments...)\n\t\tp.Trusted = []settings.TrustedBot{{BaseURL: \"https://github.com\", ForgeUserID: coderabbit}}\n\t\treturn h.snapshot(t, p).Snapshot\n\t}\n\tmixed := generate(member, bot, outsider, unknown)\n\tallWithheld := generate(outsider, unknown)\n\tif mixed.Version != 2 || len(mixed.Comments) != 2 || mixed.WithheldNotEligible != 1 || mixed.WithheldUnknown != 1 {\n\t\tt.Fatalf(\"unexpected mixed snapshot: %+v\", mixed)\n\t}\n\tif allWithheld.Version != 2 || len(allWithheld.Comments) != 0 || allWithheld.WithheldNotEligible != 1 || allWithheld.WithheldUnknown != 1 {\n\t\tt.Fatalf(\"unexpected all-withheld snapshot: %+v\", allWithheld)\n\t}\n\th := newHarness()\n\tempty, err := h.assessor().Begin(context.Background(), h.params())\n\tif err != nil || empty != nil {\n\t\tt.Fatalf(\"zero-input Begin = %v, %v; want nil, nil\", empty, err)\n\t}\n\tsnapshots := map[string]*workersvc.ReviewCommentsSnapshot{\"mixed\": mixed, \"all_withheld\": allWithheld}\n\traw, err := json.MarshalIndent(snapshots, \"\", \"  \")\n\tif err != nil { t.Fatal(err) }\n\tfor _, c := range []forge.MRComment{outsider, unknown} {\n\t\tfor _, canary := range []string{c.Body, c.ReplyID, c.ResolveID} {\n\t\t\tif strings.Contains(string(raw), canary) { t.Fatalf(\"snapshot leaked %q\", canary) }\n\t\t}\n\t}\n\tif err := os.WriteFile(\"../../../.uzi/scratch/2393-generated-snapshots.json\", append(raw, '\\n'), 0600); err != nil { t.Fatal(err) }\n\tt.Log(\"generated mixed and all-withheld via Begin -> Snapshot; withheld canaries excluded; zero-input Begin nil\")\n}\n",
+    "overlay_recipe": "# Run from the repository root of a revision containing this fixture; source_sha records the upstream seam revision.\n# The digest below verifies that the local upstream source matches that revision. All artifacts stay in .uzi/scratch.\npython3 - <<'REGENERATE'\nimport hashlib, json\nfrom pathlib import Path\nroot = Path.cwd()\nfixture = json.loads((root / 'agent/test/fixtures/2393-review-snapshot.json').read_text())\nsource_path = root / 'api/internal/workersvc/review_authors_test.go'\nassert hashlib.sha256(source_path.read_bytes()).hexdigest() == fixture['provenance']['source_file_sha256'], 'upstream source differs from source_sha'\nsource = source_path.read_text()\nsource = source.replace('\"fmt\"\\n', '\"fmt\"\\n\\t\"os\"\\n', 1)\ncopy = root / '.uzi/scratch/2393-review_authors_test.go'\ncopy.write_text(source + fixture['provenance']['generator_source'])\n(root / '.uzi/scratch/2393-overlay.json').write_text(json.dumps({'Replace': {str(root / 'api/internal/workersvc/review_authors_test.go'): str(copy)}}, indent=2) + '\\n')\nREGENERATE\ncd api\nscratch=../.uzi/scratch\nlog=$(mktemp \"${scratch:?}/gate-log.XXXXXX\")\nrc=0\nGOFLAGS=-buildvcs=false go test -overlay ../.uzi/scratch/2393-overlay.json ./internal/workersvc -run '^TestGenerate2393ReviewSnapshots$' -count=1 -v > \"$log\" 2>&1 || rc=$?\necho \"EXIT=$rc\" >> \"$log\"\nprintf 'LOG=%s\\n' \"$log\"\ntest \"$rc\" -eq 0\n# Read the printed log, then compare .uzi/scratch/2393-generated-snapshots.json\n# with the fixture's mixed and all_withheld fields. ordinary_empty is synthetic.\n"
+  },
+  "source_canaries": [
+    {
+      "id": 239303,
+      "author_username": "m2-outsider",
+      "body": "M2-WITHHELD-OUTSIDER-BODY",
+      "reply_id": "m2-withheld-reply-outsider",
+      "resolve_id": "m2-withheld-resolve-outsider"
+    },
+    {
+      "id": 239304,
+      "author_username": "m2-unknown",
+      "body": "M2-WITHHELD-UNKNOWN-BODY",
+      "reply_id": "m2-withheld-reply-unknown",
+      "resolve_id": "m2-withheld-resolve-unknown"
+    }
+  ],
+  "all_withheld": {
+    "version": 2,
+    "comments": [],
+    "truncated": false,
+    "withheld_not_eligible": 1,
+    "withheld_unknown": 1
+  },
+  "mixed": {
+    "version": 2,
+    "comments": [
+      {
+        "id": 239301,
+        "author_username": "m2-collaborator",
+        "author_forge_user_id": 11,
+        "created_at": "2030-05-01T12:00:00Z",
+        "body": "M2-ELIGIBLE-COLLABORATOR-BODY",
+        "path": null,
+        "line": null,
+        "reply_id": "m2-reply-collaborator",
+        "resolve_id": "m2-resolve-collaborator",
+        "head_sha": "head",
+        "review_state": "inline"
+      },
+      {
+        "id": 239302,
+        "author_username": "coderabbitai[bot]",
+        "author_forge_user_id": 136622811,
+        "created_at": "2030-05-01T12:00:00Z",
+        "body": "M2-ELIGIBLE-BOT-BODY",
+        "path": null,
+        "line": null,
+        "reply_id": "m2-reply-bot",
+        "resolve_id": "m2-resolve-bot",
+        "head_sha": "head",
+        "review_state": "inline"
+      }
+    ],
+    "truncated": false,
+    "withheld_not_eligible": 1,
+    "withheld_unknown": 1
+  },
+  "ordinary_empty": {
+    "version": 2,
+    "comments": [],
+    "truncated": false,
+    "withheld_not_eligible": 0,
+    "withheld_unknown": 0
+  }
+}

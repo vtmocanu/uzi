@@ -650,8 +650,8 @@ func TestRunDiscardConfirmEOFDeclines(t *testing.T) {
 }
 
 // TestOwnerRecoveryHintsSplitByArchive proves the owner listing offers `run export` only for
-// the archive_ready hold, discard for the source_only and needs_action holds (neither has an
-// archive, as the server never pairs those dispositions with one), and explains the
+// the archive-bearing fixture hold, discard for the source_only and needs_action fixtures
+// (neither has an archive in this listing), and explains the
 // source_only hold's missing archive with a custody line.
 func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 	dto := ownerRecoveryFixture()
@@ -676,9 +676,8 @@ func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 	}
 }
 
-// TestOwnerRecoveryHintsDefensiveDoubleCount deliberately pins a state the server never
-// emits (needs_action WITH an available archive): the CLI counts such a hold in both hints
-// rather than hiding either, so a server change surfaces instead of silently dropping one.
+// TestOwnerRecoveryHintsDefensiveDoubleCount pins independent decision and availability
+// facts: the CLI counts a needs_action hold with an available archive in both hints.
 func TestOwnerRecoveryHintsDefensiveDoubleCount(t *testing.T) {
 	dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
 		{ID: "hold-x", RunID: "run-x", Generation: 1, State: "open", Attention: "needs_action",
@@ -712,9 +711,8 @@ func TestOwnerRecoveryFoldsRunIDInCustodyPrefix(t *testing.T) {
 	}
 }
 
-// TestRecoveryHelpTiesExportToArchiveReady pins the help text's disposition guidance: export
-// belongs to archive_ready holds; source_only and needs_action holds await a discard decision.
-func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
+// TestRecoveryHelpSeparatesExportFromAttention pins availability-based export guidance.
+func TestRecoveryHelpSeparatesExportFromAttention(t *testing.T) {
 	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "recovery", "--help")
 	if code != uzicli.ExitOK {
 		t.Fatalf("help exit = %d", code)
@@ -722,6 +720,7 @@ func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
 	flat := strings.Join(strings.Fields(out), " ")
 	for _, want := range []string{
 		"An `archive_ready` hold has a recovery archive: recover it with `run export`",
+		"Archive availability is independent of attention: export an available archive even for a decision hold; it may not cover the latest work.",
 		"A `source_only` or `needs_action` hold retains local inventory and awaits your decision to discard it",
 		"`source_only` means the worker's local inventory remains in custody until a final disposition",
 		"For `source_only` and `needs_action` holds the retained source may be the only copy, so discarding one can destroy the work",
@@ -863,5 +862,39 @@ func TestSourceOnlyLineSanitizes(t *testing.T) {
 	}
 	if strings.ContainsAny(out, "\x1b\r\x07") || strings.Contains(out, "\nforged") {
 		t.Errorf("run view leaked hostile bytes: %q", out)
+	}
+}
+
+func TestSourceOnlyArchiveAndCaptureIndependent(t *testing.T) {
+	for _, state := range []string{"available", "preparing", "uploading"} {
+		t.Run(state, func(t *testing.T) {
+			h := apitypes.RecoveryCustodyHoldDTO{ID: "hold-exhausted", RunID: "run-exhausted", State: "open", Attention: "source_only", WorkerName: "worker", HasAvailableCapture: true, CaptureState: state}
+			out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "recovery", "--help")
+			if code != uzicli.ExitOK {
+				t.Fatalf("help exit = %d", code)
+			}
+			if !strings.Contains(out, "Archive availability is independent of attention") {
+				t.Fatalf("missing independent export help: %s", out)
+			}
+			dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{h}}
+			output, _, outputCode := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery")
+			if outputCode != uzicli.ExitOK || !strings.Contains(output, "1 hold(s) have a recovery archive") || !strings.Contains(output, "1 hold(s) await a decision") {
+				t.Fatalf("archive and decision hints must coexist: exit=%d output=%s", outputCode, output)
+			}
+			line := sourceOnlyLine(h)
+			if !strings.Contains(line, "recovery archive available to export") || !strings.Contains(line, "may not cover the latest") || !strings.Contains(line, "retained for your decision") || strings.Contains(line, "export unavailable") {
+				t.Fatalf("incorrect archive guidance: %s", line)
+			}
+			if state != "available" && !strings.Contains(line, "latest capture is "+state) {
+				t.Fatalf("missing capture progress: %s", line)
+			}
+			h.HasAvailableCapture = false
+			if state != "available" {
+				line = sourceOnlyLine(h)
+				if !strings.Contains(line, "no recovery archive available to export yet") || !strings.Contains(line, "latest capture is "+state) {
+					t.Fatalf("incorrect pending capture guidance: %s", line)
+				}
+			}
+		})
 	}
 }

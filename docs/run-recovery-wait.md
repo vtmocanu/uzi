@@ -6,6 +6,8 @@ audience: user
 
 # Recovering from a transient interruption
 
+`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. The transient-interruption retries below do not describe that hold.
+
 Uzi retries in place and, if the trouble persists, parks the run in
 `recovery_wait` on these transient interruptions:
 
@@ -364,6 +366,79 @@ remove that work before it is recovered.
   run get`'s `FAIL_ORIGIN` row reads `data_volume_full (the worker's data
   volume stayed full after N counted disk parks)`.
 
+## Worker recovery exhausted
+
+When automatic worker-death recovery is exhausted, the server decides from
+recorded server state under the existing transition locks, without a forge
+lookup. A persisted `checkpoint_tip` or available capture, any pending
+publication attempt, a `preparing`/`uploading`/`needs_action`/unknown capture,
+unsettled source custody across the owner's run at any generation, or
+unavailable/unknown server evidence holds the run at `recovery_wait` with
+cause `worker_requeue_exhausted`. No recorded recovery evidence or unresolved
+custody keeps the existing `worker_lost` failure reason, including a
+terminal-record MAC rejection. This does not prove that no unrecorded work
+survives on the worker.
+
+1. Open the run. **Worker recovery needs your decision** shows the automatic
+   limit (including 0), episode used/remaining allowance, episode number and
+   lifetime charged requeue count. Resume and Cancel are available to the
+   confirmed owner. Other viewers see the hold without enabled controls.
+   Open the run page from a board card to see the cause and allowance.
+2. Read the historical evidence and uncertainty:
+   Checkpoint copy: `The server recorded checkpoint <tip> before this hold. Current availability and the latest local edits are not verified.`
+
+   Capture copy: `A recovery capture was recorded as available at <time>. It may later expire or be discarded; it may not contain the latest local edits.`
+
+   Pending publication, pending capture, retained source custody and
+   unavailable server evidence explain uncertainty, not an archive or
+   export guarantee. Local clone availability is not promised; a Docker-lane
+   pod loss cannot recover edits that were never recorded elsewhere.
+3. Choose **Resume** on the run page, `uzi run resume <id>`, or the existing
+   `uzi run resume-now <id>` to release this exact run hold and queue one
+   explicit attempt. Each owner Resume starts a recovery episode with the
+   current `RUN_MAX_REQUEUES` maximum automatic charges; at 0 it grants no
+   automatic requeues. Claims still use normal generation and released-worker
+   incarnation fences. Lifetime charged `requeue_count` and generation-proven
+   readoption refunds survive: episode spend is count minus the episode
+   baseline, not a reset monotonic physical-death counter. The existing wall budget
+   survives; held time is banked only if its clock already started, and old
+   approval/input waits are banked at park. Cancel uses the usual confirmation.
+
+Historical evidence persists until owner Resume or Cancel. Capture expiry
+neither fails nor promotes the hold; there is no automatic reclassification
+or background absence finalizer. Timer, credential, vault, account, extend,
+approval, follow-up and pause inputs neither release the hold nor renew its
+allowance. Even a due retry timestamp does not schedule a self-retry.
+Custody is never implicitly released. There is no innocent-sibling exemption:
+worker registration cannot attribute which run consumed memory.
+
+The once-per-run finalize-resume allowance (#1742) is restricted to initial
+episode 0, with a positive maximum, exhausted allowance and unused lifetime
+marker. Charged worker-death retries in owner-started episodes cannot exceed
+their configured cap, and owner Resume cannot renew that marker. See [Configuration](configuration.md) and [ADR-1742](../adr/1742-finalize-resume-allowance.md).
+
+### Deliberate schema downgrade
+
+Before executing migration `00309` Down, stop or replace the newer application:
+its queries require columns that Down drops. The table alterations and constraint
+validation can lock and scan `runs`; plan maintenance around those operations.
+
+This deliberate downgrade converts each `worker_requeue_exhausted` hold in
+`recovery_wait` to a terminal `failed` run with `fail_origin = worker_lost` and
+an explicit schema-rollback failure reason. It clears the obsolete cause and
+retry timestamp, including on rows outside that hold, so the previous application
+does not leave an unrecognized wait without a retry time. Exhausted work is not
+automatically queued. Other wait causes keep their existing behavior.
+
+Checkpoint tips, publication attempts, captures, source custody and released-claim
+fences remain. Terminal checkpoint retention follows the prior recovery lifecycle:
+open custody retains the checkpoint; otherwise it enters settling. Retained sources
+do not preserve owner exhaustion Resume after downgrade. Reapplying Up creates new
+default episode/baseline values and no historical evidence; it neither restores
+the removed history nor reverses terminalization. This exception applies solely to
+an explicit schema downgrade. During normal operation, the owner-only hold and
+historical-evidence rules above remain in force.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively-empty SDK turn or a transient provider error
@@ -374,9 +449,10 @@ remove that work before it is recovered.
   up or came close to it (see [Worker data volume full](#worker-data-volume-full)
   above), or the Codex subscription account is unavailable (see [Codex
   account unavailable](#codex-account-unavailable) above). The server
-  retries automatically after a backoff, except the
-  Codex account hold, which has no timer and instead resumes when the
-  account does.
+  retries timed causes automatically after a backoff. The Codex account
+  hold has no timer and resumes when the account does.
+  `worker_requeue_exhausted` is an owner-only exhaustion hold: explicit
+  Resume starts a new episode; Cancel ends the run. It has no automatic retry.
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

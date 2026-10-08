@@ -17,7 +17,7 @@ vi.mock("../lib/api", async (importActual) => {
       getSettings: vi.fn(),
       updateSettings: vi.fn(),
       vaultMigration: vi.fn(),
-      listRepos: vi.fn(),
+      adminListDockerAllowlistRepos: vi.fn(),
       getAgentSource: vi.fn(),
       syncAgentSource: vi.fn(),
       applyAgentSource: vi.fn(),
@@ -121,7 +121,7 @@ const releaseCheck = (
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(settingsResponse());
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
-  mockApi.listRepos.mockResolvedValue({ repos: [] });
+  mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [] });
   mockApi.getAgentSource.mockResolvedValue({ agent_source: emptyAgentSource() });
   mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.checkReleaseNow.mockResolvedValue({ release_check: releaseCheck() });

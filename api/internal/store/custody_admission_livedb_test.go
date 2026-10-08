@@ -282,40 +282,115 @@ func TestCustodyAdmissionMirrorsLiveDB(t *testing.T) {
 	})
 }
 
+// Exhaustion holds remain decisions even when archives exist or captures are in flight.
+func TestEightExhaustionHoldsAdmissionLiveDB(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		for _, capture := range []string{"", "available", "preparing", "uploading", "needs_action"} {
+			t.Run(fmt.Sprintf("guarded=%v/capture=%s", guarded, capture), func(t *testing.T) {
+				f := newAdmissionFixture(t, 0)
+				for range 8 {
+					run := f.run("recovery_wait", f.worker, 1)
+					f.exec(`UPDATE runs SET recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1`, run)
+					hold := f.holdWithInventory(run, 1, guarded)
+					if capture != "" {
+						f.capture(hold, run, f.owner, capture)
+					}
+				}
+				owners, err := f.q.ListCustodyHoldsForOwner(f.ctx, store.ListCustodyHoldsForOwnerParams{UserID: f.owner})
+				if err != nil {
+					t.Fatal(err)
+				}
+				workers, err := f.q.ListOpenCustodyHoldsForWorkers(f.ctx, []uuid.UUID{f.worker})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(owners) != 8 || len(workers) != 8 {
+					t.Fatalf("listings owners=%d workers=%d, want eight each", len(owners), len(workers))
+				}
+				want := "source_only"
+				if capture == "needs_action" {
+					want = "needs_action"
+				}
+				for _, row := range owners {
+					if !row.DecisionNeeded || row.Attention != want || row.RecoveryWaitCause != "worker_requeue_exhausted" {
+						t.Fatalf("owner exhaustion facts=%+v", row)
+					}
+				}
+				for _, row := range workers {
+					if !row.DecisionNeeded || row.Attention != want || row.RecoveryWaitCause != "worker_requeue_exhausted" {
+						t.Fatalf("worker exhaustion facts=%+v", row)
+					}
+				}
+				f.mirrors(f.cutoff, 8, 8, 8, false)
+			})
+		}
+	}
+}
+
 func TestCustodyClassifierMatrixLiveDB(t *testing.T) {
 	ctx, pool, _ := openCustodyEpisodeLiveDB(t)
 	for _, tc := range []struct {
 		state, capture, status string
+		cause                  any
 		available, guarded     bool
 		want                   string
 	}{
-		{"discarded", "preparing", "running", true, false, "discarded"},
-		{"released", "available", "completed", true, false, "released"},
-		{"open", "available", "completed", true, false, "archive_ready"},
-		{"open", "preparing", "running", false, false, "capturing"},
-		{"open", "uploading", "running", false, false, "capturing"},
-		{"open", "needs_action", "failed", false, false, "needs_action"},
-		{"open", "", "running", false, false, "active"},
-		{"open", "", "queued", false, false, "active"},
-		{"open", "", "paused", false, false, "active"},
-		{"open", "", "completed", false, false, "source_only"},
-		{"open", "", "failed", false, false, "source_only"},
-		{"open", "", "cancelled", false, false, "source_only"},
-		{"open", "", "", false, false, "source_only"},
-		{"open", "needs_action", "running", true, false, "archive_ready"},
-		{"open", "available", "failed", true, false, "archive_ready"},
-		{"open", "preparing", "completed", false, false, "capturing"},
-		{"open", "needs_action", "running", false, false, "needs_action"},
-		{"open", "available", "running", true, true, "active"},
-		{"open", "available", "completed", true, true, "source_only"},
-		{"open", "needs_action", "running", true, true, "needs_action"},
-		{"open", "uploading", "failed", true, true, "capturing"},
+		{"discarded", "preparing", "running", nil, true, false, "discarded"},
+		{"released", "available", "completed", nil, true, false, "released"},
+		{"open", "available", "completed", nil, true, false, "archive_ready"},
+		{"open", "preparing", "running", nil, false, false, "capturing"},
+		{"open", "uploading", "running", nil, false, false, "capturing"},
+		{"open", "needs_action", "failed", nil, false, false, "needs_action"},
+		{"open", "", "running", nil, false, false, "active"},
+		{"open", "", "queued", nil, false, false, "active"},
+		{"open", "", "paused", nil, false, false, "active"},
+		{"open", "", "completed", nil, false, false, "source_only"},
+		{"open", "", "failed", nil, false, false, "source_only"},
+		{"open", "", "cancelled", nil, false, false, "source_only"},
+		{"open", "", "", nil, false, false, "source_only"},
+		{"open", "needs_action", "running", nil, true, false, "archive_ready"},
+		{"open", "available", "failed", nil, true, false, "archive_ready"},
+		{"open", "preparing", "completed", nil, false, false, "capturing"},
+		{"open", "needs_action", "running", nil, false, false, "needs_action"},
+		{"open", "available", "running", nil, true, true, "active"},
+		{"open", "available", "completed", nil, true, true, "source_only"},
+		{"open", "needs_action", "running", nil, true, true, "needs_action"},
+		{"open", "uploading", "failed", nil, true, true, "capturing"},
+		{"open", "", "recovery_wait", "worker_requeue_exhausted", false, false, "source_only"},
+		{"open", "available", "recovery_wait", "worker_requeue_exhausted", true, false, "source_only"},
+		{"open", "preparing", "recovery_wait", "worker_requeue_exhausted", true, false, "source_only"},
+		{"open", "uploading", "recovery_wait", "worker_requeue_exhausted", false, false, "source_only"},
+		{"open", "needs_action", "recovery_wait", "worker_requeue_exhausted", true, false, "needs_action"},
+		{"open", "available", "recovery_wait", "worker_requeue_exhausted", true, true, "source_only"},
+		{"open", "preparing", "recovery_wait", "worker_requeue_exhausted", true, true, "source_only"},
+		{"open", "uploading", "recovery_wait", "worker_requeue_exhausted", true, true, "source_only"},
+		{"open", "needs_action", "recovery_wait", "worker_requeue_exhausted", true, true, "needs_action"},
+		{"released", "available", "recovery_wait", "worker_requeue_exhausted", true, false, "released"},
+		{"discarded", "uploading", "recovery_wait", "worker_requeue_exhausted", true, true, "discarded"},
+		{"open", "", "recovery_wait", "provider_outage", false, false, "active"},
+		{"open", "available", "recovery_wait", "provider_outage", true, false, "archive_ready"},
+		{"open", "preparing", "recovery_wait", "provider_outage", false, false, "capturing"},
+		{"open", "uploading", "recovery_wait", "provider_outage", false, true, "capturing"},
+		{"open", "needs_action", "recovery_wait", "provider_outage", true, false, "archive_ready"},
+		{"open", "needs_action", "recovery_wait", "provider_outage", true, true, "needs_action"},
+		{"open", "", "recovery_wait", "worker_restart", false, false, "active"},
+		{"open", "available", "recovery_wait", "worker_restart", true, false, "archive_ready"},
+		{"open", "preparing", "recovery_wait", "worker_restart", false, false, "capturing"},
+		{"open", "uploading", "recovery_wait", "worker_restart", false, true, "capturing"},
+		{"open", "needs_action", "recovery_wait", "worker_restart", true, false, "archive_ready"},
+		{"open", "needs_action", "recovery_wait", "worker_restart", true, true, "needs_action"},
+		{"open", "", "recovery_wait", nil, false, false, "active"},
+		{"open", "available", "recovery_wait", nil, true, false, "archive_ready"},
+		{"open", "preparing", "recovery_wait", nil, false, false, "capturing"},
+		{"open", "uploading", "recovery_wait", nil, false, true, "capturing"},
+		{"open", "needs_action", "recovery_wait", nil, true, false, "archive_ready"},
+		{"open", "needs_action", "recovery_wait", nil, true, true, "needs_action"},
 	} {
-		t.Run(fmt.Sprintf("%s/%s/%s/%v/%v", tc.state, tc.capture, tc.status, tc.available, tc.guarded), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/%s/%s/%v/%v/%v", tc.state, tc.capture, tc.status, tc.cause, tc.available, tc.guarded), func(t *testing.T) {
 			var attention string
 			var decision bool
 			err := pool.QueryRow(ctx, `SELECT a,fn_is_decision_attention(a) FROM
- (SELECT fn_custody_attention($1,$2,$3,$4,$5) a) x`, tc.state, tc.available, tc.guarded, tc.capture, tc.status).Scan(&attention, &decision)
+ (SELECT fn_custody_attention($1,$2,$3,$4,$5,$6) a) x`, tc.state, tc.available, tc.guarded, tc.capture, tc.status, tc.cause).Scan(&attention, &decision)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -334,7 +409,7 @@ func TestCustodyClassifierMatrixLiveDB(t *testing.T) {
 		}
 	}
 	var attention string
-	if err := pool.QueryRow(ctx, `SELECT fn_custody_attention(NULL,NULL,NULL,NULL,NULL)`).Scan(&attention); err != nil || attention != "source_only" {
+	if err := pool.QueryRow(ctx, `SELECT fn_custody_attention(NULL,NULL,NULL,NULL,NULL,NULL)`).Scan(&attention); err != nil || attention != "source_only" {
 		t.Fatalf("null inputs: %s %v", attention, err)
 	}
 }

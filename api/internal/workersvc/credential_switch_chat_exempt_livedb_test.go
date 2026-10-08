@@ -11,10 +11,9 @@ import (
 )
 
 // This file is the live-DB proof of the PRD #1247 M5 rework's CHAT EXEMPTION: a
-// credential_switch_v1 capability worker's CHAT runs are NEVER fenced. Chat has no
-// claim-generation contract (its batcher sends generation 0 and the run may omit it
-// entirely), so the fail-closed generation fence — which 409s a capability worker's
-// mutating report / message batch that OMITS claim_generation — must not apply to chat.
+// credential_switch_v1 capability worker's legacy generation-zero CHAT runs remain unfenced.
+// Fresh chat claims now advance their generation and honor supplied generations. Chat
+// reports may still omit claim_generation for compatibility with the current runner.
 // Skipped unless UZI_TEST_DATABASE_URL is set (setupCodexLiveDB skips).
 
 // seedChatRun inserts one chat-kind run owned by o's worker in the given status. Chat's
@@ -38,10 +37,9 @@ func seedChatRun(t *testing.T, env codexTestEnv, o reevalOwner, status string) u
 // claim_generation — no ErrMissingClaimGeneration (the fail-closed guard is skipped for chat) and
 // no stale rejection. Each is seeded fresh because the transitions change status.
 //
-// MUTATION CHECK: removing ONLY the chat guard at the top of stateUsesGenerationFence reddens every
-// sub-test here — stateUsesGenerationFence then returns true for running/failed and (for a
-// non-interlocked run) completed, so SetState's fail-closed check refuses the unstamped report with
-// ErrMissingClaimGeneration.
+// These omission cases preserve nil-generation compatibility independently of the fence for
+// supplied positive generations. The mismatched-generation test below separately checks
+// generation-zero compatibility.
 func TestSetStateChatExemptFromGenerationFenceLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := fenceSvc(env)
@@ -120,7 +118,7 @@ func TestAppendMessagesChatExemptFromGenerationFenceLiveDB(t *testing.T) {
 // MISMATCHED NONZERO claim_generation (the run is at generation 0) is still treated as LEGACY —
 // accepted, persisted, and last_seq advanced — because appendMessages normalizes effectiveClaimGen
 // to nil for a chat run BEFORE the InsertRunMessage / generation_live / UpdateRunLastSeq fence. The
-// server must never fence chat regardless of what generation a buggy or old worker supplies.
+// generation-zero chat keeps supplied-mismatch compatibility with old workers.
 //
 // MUTATION CHECK: reverting the effectiveClaimGen normalization (passing the raw claimGen to
 // InsertRunMessage) reddens this test — the insert fences out against the run's generation 0

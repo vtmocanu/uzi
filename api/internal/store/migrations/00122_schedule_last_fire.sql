@@ -3,7 +3,8 @@
 -- holding the serialized outcome of the last SCHEDULED fire — matched/started/skipped
 -- with typed skip reasons — so the schedules UI and CLI can show "what the last tick did"
 -- without a history table (Decision 1: one last-fire column, not an append-only log). It
--- is written ONLY by AdvanceSchedule on the success/benign advance path; the park and
+-- is written by AdvanceSchedule on the success/benign advance path; a credential-disabled
+-- hold (RecordScheduleHeldFire) also records last_fire, without advancing. The park and
 -- transient paths never touch it, so a parked/transient fire shows the PRIOR last_fire or
 -- none (Decision 5). NULL = the schedule has never fired. RunNow does NOT persist here
 -- (Decision 3), since it never reaches the advance path.

@@ -467,6 +467,17 @@ RETURNING checkpoint_retentions.state;
 -- record does not name is still this run's own publish.
 SELECT checkpoint_tip FROM runs WHERE id = @run_id;
 
+-- name: CheckLiveCheckpointPublishAdmission :one
+-- Separate statement after GetRunByIDForUpdate: READ COMMITTED observes any
+-- exhaustion transition whose run lock the admission transaction waited for.
+SELECT id FROM runs
+WHERE id = @run_id
+  AND worker_id = @expected_worker_id::uuid
+  AND claim_generation = @expected_claim_generation::bigint
+  AND claim_released_at IS NULL
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input',
+                 'awaiting_followup', 'limit_wait', 'pool_wait', 'paused', 'recovery_wait');
+
 -- PRD #1810 D2 (residual 2): checkpoint_publish_attempts, the durable record of a checkpoint push
 -- written BEFORE the forge call (migration 00267).
 

@@ -91,6 +91,11 @@ func captureToDTO(c store.RecoveryCapture) apitypes.RecoveryArchiveDTO {
 // Terminal lifecycle classification is independent of admission and remains used by final_inventory.go.
 var custodyRunTerminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
+// OwnerHoldNeedsDecision returns the canonical SQL listing decision.
+func OwnerHoldNeedsDecision(row store.ListCustodyHoldsForOwnerRow) bool {
+	return row.DecisionNeeded
+}
+
 // custodyHoldToDTO builds the owner-facing custody-hold DTO from a listing row (D7). It carries
 // the OPAQUE original_worker_id and the bounded owner-safe worker display name only — never
 // original_worker_identity (raw provenance) — and stamps the server-derived Attention.

@@ -1026,6 +1026,7 @@ func TestSelfUsageDTOTags(t *testing.T) {
 
 func TestAdminUserUsageDTOTags(t *testing.T) {
 	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count",
+		"last_7_days", "last7_run_count", "last7_outcomes", "last7_subscription_run_count", "last7_unreported_run_count",
 		// PRD #1293: this user's lifetime failed-run rate aggregate.
 		"outcomes",
 		// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts.
@@ -1257,6 +1258,12 @@ func TestGuardrailImpactDTOTags(t *testing.T) {
 		"checked_at", "enabled_repo_count", "blocked_count", "unevaluable_count", "repos")
 	assertTags(t, "GuardrailImpactRepoDTO", GuardrailImpactRepoDTO{},
 		"repo_id", "path", "user_id", "connection_id", "blocked", "unevaluable")
+}
+
+func TestAdminDockerAllowlistDTOTags(t *testing.T) {
+	assertTags(t, "AdminDockerAllowlistRepoDTO", AdminDockerAllowlistRepoDTO{},
+		"id", "path_with_namespace", "enabled", "owner_email", "connection_id", "forge_type", "base_url")
+	assertTags(t, "AdminDockerAllowlistReposDTO", AdminDockerAllowlistReposDTO{}, "repos")
 }
 
 func TestAdminBlockedReposDTOTags(t *testing.T) {

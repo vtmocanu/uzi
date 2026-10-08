@@ -386,6 +386,7 @@ var wantRouteMounts = []routeMount{
 	// call → noLimiter, like the agent-source GET beside it.
 	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
+	{"GET", "/api/admin/docker-allowlist-repos", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},
 	{"GET", "/api/admin/users", noLimiter},

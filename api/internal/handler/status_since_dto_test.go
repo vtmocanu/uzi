@@ -22,7 +22,7 @@ func TestRunToDTOStatusSinceFromColumn(t *testing.T) {
 		Status:      "paused",
 		StatusSince: pgtype.Timestamptz{Time: since, Valid: true},
 		UpdatedAt:   pgtype.Timestamptz{Time: updated, Valid: true},
-	}, "normal", 0, 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow, 0)
 
 	if dto.StatusSince == nil {
 		t.Fatalf("StatusSince = nil, want %v", since)
@@ -38,7 +38,7 @@ func TestRunToDTOStatusSinceFromColumn(t *testing.T) {
 // TestRunToDTOStatusSinceNullWhenColumnInvalid pins the defensive null: an invalid column
 // maps to a nil pointer rather than a zero time, so a client falls back to updated_at.
 func TestRunToDTOStatusSinceNullWhenColumnInvalid(t *testing.T) {
-	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running"}, "normal", 0, 0, 0, dtoTestNow)
+	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running"}, "normal", 0, 0, 0, dtoTestNow, 0)
 	if dto.StatusSince != nil {
 		t.Fatalf("StatusSince = %v, want nil for an invalid column", *dto.StatusSince)
 	}

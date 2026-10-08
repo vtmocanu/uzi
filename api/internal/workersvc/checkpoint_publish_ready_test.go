@@ -91,7 +91,7 @@ func TestCheckpointPublishReadiness(t *testing.T) {
 				}
 				return pushbroker.Result{Disposition: tc.disposition, AlreadyCurrent: tc.already}, tc.err
 			})
-			p := &checkpointPush{s: s, runID: uuid.New()}
+			p := &checkpointPush{s: s, runID: uuid.New(), run: store.Run{Status: "failed"}}
 			err := p.pushOnce(ctx)
 			if !errors.Is(err, tc.err) {
 				t.Fatalf("push result = %v, want %v", err, tc.err)

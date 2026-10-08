@@ -284,7 +284,7 @@ every tunable in this section and its default.
 ## Online, offline, busy
 
 - **online**: a recent heartbeat arrived within the server's staleness window.
-- **offline**: no heartbeat in time; the server re-queues any run the worker was holding.
+- **offline**: no heartbeat in time; the server re-queues eligible runs within their episode allowance, otherwise holds or fails them under [worker-death recovery policy](run-recovery-wait.md#worker-recovery-exhausted).
 - **busy**: the worker holds one or more non-terminal runs — by default just one at a
   time; see [Concurrent runs](#concurrent-runs) to raise that.
 
@@ -438,7 +438,7 @@ and the related knobs.
 
 The same write-ahead journal covers a run-lane attempt's terminal outcome (an issue run, a judge, or a review; chat is excluded — it never carries a claim generation to fence on). Before the worker ever sends a `completed`/`failed` report, it journals the outcome to the same durable outbox tree the message outbox above uses, keyed by the run and its claim generation. Once the api is back, replay sends the run's own messages first and the outcome only after they've caught up, so a run that finished during the outage still gets its MR and its final state exactly once — a journaled outcome is never re-attempted, and a duplicate claim on the same run is refused rather than executed. If the worker container restarts mid-outage, it resolves every pending journal from disk before its claim loops start, so the outcome lands even though the executor that produced it is gone. An outcome the api permanently refuses (most often because the run's messages can't be reconciled, or a completion permit no longer matches) is never discarded on a timer: it's surfaced on the run as a held outcome and cleared only by the owner explicitly cancelling with the discard bit set (`uzi run cancel --discard-pending-outcome`, or the same confirmation from the run page). Same-uid caveat as above: the outcome journal lives in the same worker-owned tree as the message outbox, so on the hosted single-uid runtime it protects against the outage, not against a hostile model.
 
-A restart in the narrower window before that journal exists is also covered, once (issue #1742). Right after the agent's final result, and before the worker starts finalizing (fetching the branch back, pushing, opening the MR), the worker writes a small authenticated finalize-pending record; it is not an outcome. If the worker container restarts while finalizing, it reports that record on register, and the api re-queues the run once even when its re-queue budget is already spent, instead of failing it `worker_lost`. The run resumes through the ordinary claim path and completes only through the normal completion path at a later claim generation (the next claim, or the one after it when that claim first captures retained work and parks) (the claim-generation fences, plus the completion permit where the run is interlocked). A crash before that record is durable behaves as before, the extra resume is once per run and off at `RUN_MAX_REQUEUES=0`, and `uzi run recovery` reports a source it could not archive as retained `source_only` custody rather than offering an export. See [ADR-1742](../adr/1742-finalize-resume-allowance.md).
+A restart in the narrower window before that journal exists is also covered, once in the initial recovery episode (issue #1742). Right after the agent's final result, and before the worker starts finalizing (fetching the branch back, pushing, opening the MR), the worker writes a small authenticated finalize-pending record; it is not an outcome. If the worker container restarts while finalizing, it reports that record on register, and the api re-queues the run once even when that episode's re-queue budget is already spent, provided `RUN_MAX_REQUEUES > 0` and the lifetime finalize-resume marker is unused. Owner-started worker-death recovery episodes get no extra allowance. The run resumes through the ordinary claim path and completes only through the normal completion path at a later claim generation (the next claim, or the one after it when that claim first captures retained work and parks) (the claim-generation fences, plus the completion permit where the run is interlocked). A crash before that record is durable, or a slow restart without timely attested proof, uses ordinary disposition: requeue under the episode cap; at exhaustion, hold for the owner when recorded recovery evidence or uncertainty exists, otherwise fail `worker_lost` (not proof that no unrecorded worker work survives). The extra resume is once per run, never renewed by owner Resume, and off at `RUN_MAX_REQUEUES=0`, and `uzi run recovery` reports a source it could not archive as retained `source_only` custody rather than offering an export. See [ADR-1742](../adr/1742-finalize-resume-allowance.md).
 
 ## Run artifacts and the sandbox
 
@@ -587,9 +587,21 @@ Raising the cap is an informed trade-off, not a free speedup:
   prompt-injected run could shell-write into a sibling's worktree or the shared
   bare-repo cache.
 - **One container, one memory budget.** A runaway run can OOM the whole container,
-  requeuing every in-flight run together; raise `RUN_MAX_REQUEUES` (default 3)
-  alongside any cap above 1 so an innocent sibling isn't failed outright by another
-  run's crash.
+  requeuing eligible in-flight runs together; raise the API's `RUN_MAX_REQUEUES`
+  alongside `workers.maxConcurrentRuns > 1` to give affected runs more automatic
+  worker-death retries per episode. Registration cannot attribute the memory consumer, so
+  there is no innocent-sibling exemption. At exhaustion, recorded recovery evidence
+  or uncertainty holds for owner Resume; no recorded recovery evidence or unresolved
+  custody keeps `worker_lost`, without proving absence of unrecorded work.
+  The API default is 3; 0 disables automatic requeues, but owner Resume still queues
+  one explicit attempt. For Helm, use the existing generic `api.config` route
+  (`api.config.RUN_MAX_REQUEUES`), for example:
+
+  ```yaml
+  api:
+    config:
+      RUN_MAX_REQUEUES: "5"
+  ```
 - **One Anthropic token, N runs.** Every slot on a worker shares that worker's
   credential, so a higher cap multiplies 429 pressure on it — the SDK's own
   retry/backoff is the only mitigation today. Binding two *workers* to two

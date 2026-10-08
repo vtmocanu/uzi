@@ -25,6 +25,18 @@ describe("health scenario routing", () => {
     });
   });
 
+  it("emits forge.sync in the integrations group, ok, right after forge.ciwatch", async () => {
+    vi.mocked(mockScenario).mockReturnValue("health-silent");
+    const doc = await healthApi.getAdminHealth();
+    const ids = doc.checks.map((c) => c.id);
+    expect(ids.indexOf("forge.sync")).toBeGreaterThan(0);
+    expect(ids.indexOf("forge.sync")).toBe(ids.indexOf("forge.ciwatch") + 1);
+    expect(doc.checks.find((c) => c.id === "forge.sync")).toMatchObject({
+      scope: "owner", group: "integrations", title: "Forge issue sync", severity: "ok",
+      summary: "0 of 3 failing; 0 pending.", doc: null,
+    });
+  });
+
   it("serves owner-only danger without an instance episode", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-owner-only");
     const doc = await healthApi.getAdminHealth();
@@ -56,7 +68,7 @@ describe("health scenario routing", () => {
     expect(doc.blocking).toBe(false);
     expect(doc.episode_id).toBeNull();
     expect(doc.snoozed_until).toBeNull();
-    expect(doc.counts).toEqual({ ok: 16, warn: 0, danger: 0, unknown: 0, na: 0 });
+    expect(doc.counts).toEqual({ ok: 17, warn: 0, danger: 0, unknown: 0, na: 0 });
     expect(doc.checks.find((c) => c.id === "fleet.roll")).toMatchObject({
       scope: "instance", severity: "ok", summary: "All 4 hosted workers are rolling cleanly.",
     });

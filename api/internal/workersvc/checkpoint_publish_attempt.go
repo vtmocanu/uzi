@@ -107,6 +107,8 @@ type checkpointPush struct {
 	routedAt time.Time
 	// landed is the attempt row of the push that returned success (uuid.Nil when unrecorded).
 	landed uuid.UUID
+	// preparedID is committed evidence for slot writes, still unsent to the broker.
+	preparedID uuid.UUID
 	// alreadyCurrent: that push wrote nothing, because origin already held the declared tip
 	// (pushbroker.Result.AlreadyCurrent). publishOutcome counts it as published only when the
 	// tip is the run's own.
@@ -123,8 +125,8 @@ type checkpointPush struct {
 // past the cooling period) never move runs.checkpoint_tip or the record BACKWARDS over a newer
 // publish, or over the sweeper's attempts arm re-recording a newer late push.
 type publishBase struct {
-	// observed: the base was read (retention wired). Unobserved, the persist is unconditional
-	// (SetRunCheckpointTip), as no record, attempt row or attempts arm exists to race with.
+	// observed: the base was read (retention wired). Unobserved, the persist is
+	// unconditional (SetRunCheckpointTip); live admission still records attempt evidence.
 	observed bool
 	// runTip is runs.checkpoint_tip (invalid: none persisted); recordTip the run's retention
 	// record tip (invalid: no record).
@@ -173,12 +175,14 @@ func (p *checkpointPush) ownsTip(tip string) bool {
 func (p *checkpointPush) pushOnce(ctx context.Context) error {
 	s := p.s
 	p.alreadyCurrent = false
-	id, err := s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip)
+	id, err := p.recordAttempt(ctx)
 	if err != nil {
+		p.clearPreparedAttempt(ctx)
 		slog.Warn("checkpoint: record publish attempt; push not sent", "run", p.runID, "branch", p.branch, "error", err)
 		return errPushRefused
 	}
 	if err := p.observePublishBase(ctx); err != nil {
+		p.preparedID = uuid.Nil
 		s.clearPublishAttempt(ctx, id)
 		slog.Warn("checkpoint: read the publish's compare-and-set base; push not sent", "run", p.runID, "branch", p.branch,
 			"error", secretscrub.Scrub(err.Error()))
@@ -186,12 +190,15 @@ func (p *checkpointPush) pushOnce(ctx context.Context) error {
 	}
 	if p.live {
 		if elapsed := s.now().Sub(p.routedAt); elapsed > s.livePublishPrePushBudget {
+			p.preparedID = uuid.Nil
 			s.clearPublishAttempt(ctx, id)
 			slog.Warn("checkpoint: live-routed publish exceeded its pre-push budget; push not sent",
 				"run", p.runID, "branch", p.branch, "elapsed", elapsed, "budget", s.livePublishPrePushBudget)
 			return errPushRefused
 		}
 	}
+	// From here the outcome may be unknown: deferred unsent cleanup must not delete it.
+	p.preparedID = uuid.Nil
 	res, perr := s.publishFn(ctx, p.opts)
 	// Only typed evidence of an actual update or a potentially sent, unresolved command
 	// enables live reconciliation. No-op and contradictory results remain pending.
@@ -222,6 +229,42 @@ func pushDefinitelyRefused(err error) bool {
 	return errors.Is(err, pushbroker.ErrNotDescendant) || errors.Is(err, pushbroker.ErrWorkflowScopeRejected) ||
 		errors.Is(err, pushbroker.ErrTipMissing) || errors.Is(err, pushbroker.ErrPackTooLarge) ||
 		errors.Is(err, pushbroker.ErrPackInvalid)
+}
+
+// recordAttempt independently admits every live push, including a prepared one.
+// p.run is the authorization snapshot and is never refreshed to a newer claim.
+func (p *checkpointPush) recordAttempt(ctx context.Context) (uuid.UUID, error) {
+	if terminalStatuses[p.run.Status] {
+		return p.s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip)
+	}
+	return p.s.q.RecordLiveCheckpointPublishAttempt(ctx, store.RecordLiveCheckpointPublishAttemptParams{
+		RecordCheckpointPublishAttemptParams: store.RecordCheckpointPublishAttemptParams{
+			RunID: p.runID, Branch: p.branch, Ref: p.ref, Tip: p.opts.DeclaredTip,
+		},
+		ExpectedWorkerID: p.run.WorkerID, ExpectedClaimGeneration: p.run.ClaimGeneration,
+		AttemptID: p.preparedID,
+	})
+}
+
+// prepareLiveAttempt commits an unsent row before slot forge writes. Terminal
+// routes preserve their existing retention-lock and attempt-record semantics.
+func (p *checkpointPush) prepareLiveAttempt(ctx context.Context) error {
+	if terminalStatuses[p.run.Status] {
+		return nil
+	}
+	id, err := p.recordAttempt(ctx)
+	if err != nil {
+		return errPushRefused
+	}
+	p.preparedID = id
+	return nil
+}
+
+// clearPreparedAttempt performs one bounded best-effort cleanup of unsent evidence.
+func (p *checkpointPush) clearPreparedAttempt(ctx context.Context) {
+	id := p.preparedID
+	p.preparedID = uuid.Nil
+	p.s.clearPublishAttempt(ctx, id)
 }
 
 // recordPublishAttempt writes the attempt row a push needs before it is sent. Inert (uuid.Nil, no

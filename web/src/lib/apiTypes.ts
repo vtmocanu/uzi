@@ -653,6 +653,22 @@ export interface GuardrailOverrideRequest {
   created_at: string;
 }
 
+// Mirrors apitypes.AdminDockerAllowlistRepoDTO.
+export interface AdminDockerAllowlistRepo {
+  id: string;
+  path_with_namespace: string;
+  enabled: boolean;
+  owner_email: string;
+  connection_id: string;
+  forge_type: string;
+  base_url: string;
+}
+
+// GET /api/admin/docker-allowlist-repos always returns an array.
+export interface AdminDockerAllowlistRepos {
+  repos: AdminDockerAllowlistRepo[];
+}
+
 // AdminBlockedRepos is the GET /api/admin/blocked-repos envelope (PRD #66 M9). When
 // checks_unknown is true at least one connection was never privilege-checked, so an
 // empty list is "unknown", NOT "none blocked" (R1) — the page says so.
@@ -2738,6 +2754,22 @@ export interface Run {
   title: string | null;
   resume_of_run_id: string | null;
   status: RunStatus;
+  /** Current episode allowance plus historic exhaustion evidence; no current availability promise. */
+  worker_recovery?: {
+    episode: number;
+    automatic_requeue_limit: number;
+    episode_used: number;
+    episode_remaining: number;
+    evidence: {
+      checkpoint_tip: string | null;
+      available_capture: boolean;
+      publication_uncertain: boolean;
+      capture_uncertain: boolean;
+      custody_uncertain: boolean;
+      unknown: boolean;
+      recorded_at: string;
+    } | null;
+  };
   requeue_count: number;
   iteration_count: number;
   /** issue #321: server-computed planning-phase display flag — true only while a run is
@@ -3586,8 +3618,14 @@ export interface SelfUsage {
   last7_unreported_run_count: number;
 }
 
-// AdminUsageUser is one user's lifetime row in the admin factory breakdown.
+// AdminUsageUser preserves lifetime figures and adds seven-day figures to the factory breakdown.
 export interface AdminUsageUser {
+  // Optional for older API deployments. The new handler always sends a usage bundle.
+  last_7_days?: RunUsage;
+  last7_run_count?: number;
+  last7_outcomes?: RunOutcomes;
+  last7_subscription_run_count?: number;
+  last7_unreported_run_count?: number;
   user_id: string;
   email: string;
   usage: RunUsage;
@@ -3603,8 +3641,8 @@ export interface AdminUsageUser {
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
-// factory totals plus the per-user breakdown. The per-user rows sum to factory
-// lifetime by construction (the server rollup guarantees it).
+// factory totals plus the per-user breakdown. For the same snapshot and cutoff,
+// each window's per-user rows sum to its factory totals; separate reads may differ.
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];

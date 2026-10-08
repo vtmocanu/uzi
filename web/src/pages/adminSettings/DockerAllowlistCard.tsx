@@ -1,36 +1,48 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, type AppSettings, type Repo, type SettingSource, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type AdminDockerAllowlistRepo, type SettingSource, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
-import { Alert, Button, Card, Field, SectionTitle } from "../../components/ui";
+import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 import { useDemoMode } from "../../lib/demoMode";
-import { maskRepoPath } from "../../lib/demoMask";
+import { maskEmail, maskHost, maskRepoPath } from "../../lib/demoMask";
 
-// parseAllowlist splits the comma-separated repo-id allowlist into a deduped id
-// list, dropping empty tokens. normalizeAllowlist canonicalizes for comparison
-// (deduped + sorted) so dirty-checking is order/dup-insensitive.
+// Match google/uuid.Parse v1.6.0, including arbitrary single-byte wrappers.
+// ASCII wrapper checks account for Go's UTF-8 byte length versus JS's UTF-16 length.
+function uuidIdentity(value: string): string | null {
+  let s = value;
+  if (s.length === 45 && /^urn:uuid:/i.test(s)) s = s.slice(9);
+  else if (s.length === 38 && s.charCodeAt(0) <= 0x7f && s.charCodeAt(37) <= 0x7f) s = s.slice(1, 37);
+  if (/^[0-9a-f]{32}$/i.test(s)) {
+    s = s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
+  }
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) ? s.toLowerCase() : null;
+}
+
+// Cross-user trust labels must expose hidden controls instead of allowing them
+// to reorder the identity an admin sees. This affects presentation, never IDs.
+function displayLabel(value: string): string {
+  return value.replace(/[\p{Cc}\p{Cf}]/gu, (char) =>
+    "\\u{" + char.codePointAt(0)!.toString(16) + "}");
+}
+
 function parseAllowlist(value: string): string[] {
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // strings.TrimSpace uses Unicode White_Space; JS trim also strips BOM and misses NEL.
+  return value.split(",").map((s) => s.replace(/^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "")).filter(Boolean);
 }
-function normalizeAllowlist(ids: string[]): string {
-  return [...new Set(ids)].sort().join(",");
+function identity(value: string): string {
+  return uuidIdentity(value) ?? value;
+}
+// Keep the first stored spelling of each identity, including unresolved tokens.
+function chosenSpellings(ids: Iterable<string>): string[] {
+  const chosen = new Map<string, string>();
+  for (const id of ids) if (!chosen.has(identity(id))) chosen.set(identity(id), id);
+  return [...chosen.values()].sort();
+}
+function normalizeAllowlist(ids: Iterable<string>): string {
+  return [...new Set([...ids].map(identity))].sort().join(",");
 }
 
-// DockerAllowlistCard is the admin surface for the docker-worker repo allowlist
-// (PRD #89 M-allow). A docker-capable worker reaches a root Docker daemon, so it may
-// only claim runs for repos an admin has explicitly trusted; the gate binds at claim
-// time. This is a security control: an EMPTY list is fail-closed (a docker worker
-// then claims no repo-bearing run), and non-docker workers are entirely unaffected.
-//
-// The stored value is a comma-separated list of repo UUIDs, but admins pick repos by
-// path — the card resolves paths from the repos API and writes the ids. The repos API
-// (`listRepos`) is scoped to the CALLING admin's own repos, and docker_repo_allowlist
-// is a GLOBAL setting that can hold repo ids from OTHER admins. So stored ids that do
-// not resolve to a repo this admin can see are PRESERVED verbatim on save (surfaced as
-// a labeled count), never dropped — otherwise admin A saving would silently clobber
-// admin B's allowlisted repo just because A can't see it (auditor Low, PRD #89).
+// Writes start from the complete stored set, never just the fetched rows.
+// Deleted/unresolved IDs remain intact; revocation removes every UUID spelling.
 export function DockerAllowlistCard({
   settings,
   sources,
@@ -41,12 +53,7 @@ export function DockerAllowlistCard({
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const demo = useDemoMode();
-  const [repos, setRepos] = useState<Repo[]>([]);
-  // reposLoaded gates the out-of-visibility indicator: until listRepos succeeds we
-  // cannot know which stored ids are genuinely outside this admin's visibility vs
-  // simply not fetched yet, so the count would be spurious (every id looks "unknown"
-  // while repos is empty). reposError distinguishes a failed fetch from a genuinely
-  // empty repo list so the copy can differ.
+  const [repos, setRepos] = useState<AdminDockerAllowlistRepo[]>([]);
   const [reposLoaded, setReposLoaded] = useState(false);
   const [reposError, setReposError] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(
@@ -60,7 +67,7 @@ export function DockerAllowlistCard({
 
   useEffect(() => {
     api
-      .listRepos()
+      .adminListDockerAllowlistRepos()
       .then(({ repos }) => {
         setRepos(repos);
         setReposLoaded(true);
@@ -68,33 +75,32 @@ export function DockerAllowlistCard({
       .catch(() => setReposError(true));
   }, []);
 
-  const toggle = (id: string) =>
+  const locked = busy || isEnv || !reposLoaded;
+  const selectedIds = new Set([...selected].map(identity));
+  const toggle = (id: string) => {
+    if (locked) return;
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      const key = identity(id);
+      if ([...prev].some((token) => identity(token) === key)) {
+        for (const token of prev) if (identity(token) === key) next.delete(token);
+      } else next.add(uuidIdentity(id) ?? id);
       return next;
     });
+  };
 
-  // Selected ids that resolve to no repo THIS admin can see (listRepos is per-user):
-  // another admin's allowlisted repo, or a deleted one. Kept in `selected` and written
-  // back untouched on save so a global setting is never clobbered by an admin who
-  // simply can't see the entry.
-  const knownIds = new Set(repos.map((r) => r.id));
-  const outsideVisibilityCount = [...selected].filter((id) => !knownIds.has(id)).length;
+  const knownIds = new Set(repos.map((r) => identity(r.id)));
+  const unresolvedCount = [...selectedIds].filter((id) => !knownIds.has(id)).length;
 
   const dirty =
     normalizeAllowlist([...selected]) !== normalizeAllowlist(parseAllowlist(settings.docker_repo_allowlist));
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
+    if (locked || !dirty) return;
     setError("");
     setNotice("");
-    if (isEnv) return;
-    // Persist EVERY selected id, including ones outside this admin's visibility — a
-    // global setting must not be clobbered by an admin who cannot see another admin's
-    // repos. Only the checkboxes this admin can see change; the rest ride through.
-    const value = normalizeAllowlist([...selected]);
+    const value = chosenSpellings(selected).join(",");
     setBusy(true);
     try {
       const resp = await api.updateSettings({ docker_repo_allowlist: value });
@@ -108,7 +114,7 @@ export function DockerAllowlistCard({
     }
   };
 
-  const selectedKnown = [...selected].filter((id) => knownIds.has(id)).length;
+  const selectedKnown = [...selectedIds].filter((id) => knownIds.has(id)).length;
 
   return (
     <Card className="space-y-5">
@@ -132,7 +138,8 @@ export function DockerAllowlistCard({
       )}
 
       <form onSubmit={save} className="space-y-4">
-        <Field label={`Trusted repositories (${selectedKnown} selected)`}>
+        <fieldset className="space-y-1.5">
+          <legend className="text-sm font-medium text-muted">Trusted repositories ({selectedKnown} selected)</legend>
           {reposError ? (
             <p className="text-sm text-warn">
               Could not load repositories. The stored allowlist is preserved unchanged; reload to edit it.
@@ -150,32 +157,27 @@ export function DockerAllowlistCard({
                 >
                   <input
                     type="checkbox"
-                    checked={selected.has(r.id)}
-                    disabled={isEnv}
+                    checked={selectedIds.has(identity(r.id))}
+                    disabled={locked}
                     onChange={() => toggle(r.id)}
                     className="h-4 w-4 rounded border-edge accent-brand"
                   />
-                  <span className="truncate text-fg">{maskRepoPath(r.path_with_namespace, demo)}</span>
+                  <span className="truncate text-fg">{maskRepoPath(displayLabel(r.path_with_namespace), demo)}</span>{" "}
+                  <span className="text-muted">{maskEmail(displayLabel(r.owner_email), demo)} · {r.forge_type} · {maskHost(displayLabel(r.base_url), demo)}</span>
+                  {!r.enabled && <span className="text-faint">Disabled</span>}
                 </label>
               ))}
             </div>
           )}
-        </Field>
+        </fieldset>
 
-        {/* Gated on reposLoaded: an unresolved id is only meaningfully "outside your
-            visibility" once the repo list actually loaded — during loading or after a
-            fetch failure every id looks unknown, which would be a false alarm. Purely
-            informational (these ids are preserved on save), so it renders regardless of
-            the dirty state without promising any removal. */}
-        {reposLoaded && outsideVisibilityCount > 0 && (
+        {reposLoaded && unresolvedCount > 0 && (
           <p className="text-xs text-faint">
-            {outsideVisibilityCount} allowlisted repo{outsideVisibilityCount === 1 ? "" : "s"} outside your
-            visibility (preserved) — repos on other admins&rsquo; connections, or since removed. They stay in
-            the allowlist when you save.
+            {unresolvedCount} unresolved/deleted repositories (preserved) — they stay in the allowlist when you save.
           </p>
         )}
 
-        <Button type="submit" disabled={!dirty || busy || isEnv}>
+        <Button type="submit" disabled={!dirty || locked}>
           {busy ? "Saving…" : "Save repo allowlist"}
         </Button>
       </form>

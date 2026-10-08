@@ -39,7 +39,7 @@ func TestRunToDTOWallParkFields(t *testing.T) {
 	}
 
 	t.Run("budget total/used/finalize and can_stop_at_wall true", func(t *testing.T) {
-		dto := runToDTO(base(), "normal", 0, 0, 0, dtoTestNow)
+		dto := runToDTO(base(), "normal", 0, 0, 0, dtoTestNow, 0)
 		if dto.BudgetTotalSeconds == nil || *dto.BudgetTotalSeconds != 3600+1800+0 {
 			t.Fatalf("budget_total_seconds = %v, want 5400 (wall+extension+finalize)", dto.BudgetTotalSeconds)
 		}
@@ -58,7 +58,7 @@ func TestRunToDTOWallParkFields(t *testing.T) {
 	t.Run("budget_total includes the finalize term once granted", func(t *testing.T) {
 		r := base()
 		r.BudgetFinalizeSeconds = 1800
-		dto := runToDTO(r, "normal", 0, 0, 0, dtoTestNow)
+		dto := runToDTO(r, "normal", 0, 0, 0, dtoTestNow, 0)
 		if dto.BudgetTotalSeconds == nil || *dto.BudgetTotalSeconds != 3600+1800+1800 {
 			t.Fatalf("budget_total_seconds = %v, want 7200 (finalize term included)", dto.BudgetTotalSeconds)
 		}
@@ -81,7 +81,7 @@ func TestRunToDTOWallParkFields(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				r := base()
 				tc.mutate(&r)
-				dto := runToDTO(r, "normal", 0, 0, 0, dtoTestNow)
+				dto := runToDTO(r, "normal", 0, 0, 0, dtoTestNow, 0)
 				if dto.CanStopAtWall {
 					t.Fatalf("can_stop_at_wall should be FALSE when %s", tc.name)
 				}
