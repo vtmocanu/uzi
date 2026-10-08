@@ -58,13 +58,27 @@ func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error)
 		PlanCrossCheckCandidate: c, ModelSource: textPtr(cc.CheckerModelSource), EffortSource: textPtr(cc.CheckerEffortSource)}, nil
 }
 
+// singleFamilyCheckerCustody is the checker's credential custody rule (PRD #2149 D3,
+// PRD #2460): a child holds only its OWN family's credential. A codex child carries Codex
+// credentials and no Anthropic token; a claude child carries the Anthropic token and no
+// Codex credentials. Any other harness, or a child holding both or neither, is refused,
+// so a checker can never act as the lead's family.
+func singleFamilyCheckerCustody(harness string, payload *ClaimPayload) bool {
+	switch harness {
+	case string(HarnessCodex):
+		return payload.Secrets.Codex != nil && payload.Secrets.AnthropicOAuthToken == ""
+	case string(HarnessClaude):
+		return payload.Secrets.AnthropicOAuthToken != "" && payload.Secrets.Codex == nil
+	}
+	return false
+}
+
 func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.Worker, run store.Run, payload *ClaimPayload, resolutions ...*agenttmpl.CrossCheckResolution) error {
 	if validateCrossCheckContext(run.IssueTitle, run.IssueDescription) != nil ||
 		validateCrossCheckContext(payload.IssueTitle, payload.IssueDescription) != nil {
 		return ErrCrossCheckRefused
 	}
-	if s.txBeginner == nil || run.UserID != worker.UserID || run.Harness != string(HarnessCodex) || !run.ReportOnly ||
-		payload.Secrets.Codex == nil || payload.Secrets.AnthropicOAuthToken != "" {
+	if s.txBeginner == nil || run.UserID != worker.UserID || !run.ReportOnly || !singleFamilyCheckerCustody(run.Harness, payload) {
 		return ErrCrossCheckRefused
 	}
 	tx, err := s.txBeginner.Begin(ctx)

@@ -36,7 +36,7 @@ func (s *Service) preflightCrossCheckPins(ctx context.Context, worker store.Work
 	if err != nil {
 		return nil, err
 	}
-	if row.Stage != "plan" || row.CheckerHarness.String != "codex" || run.Harness != row.CheckerHarness.String || run.UserID != worker.UserID {
+	if row.Stage != "plan" || (row.CheckerHarness.String != "codex" && row.CheckerHarness.String != "claude") || run.Harness != row.CheckerHarness.String || run.UserID != worker.UserID {
 		return nil, ErrCrossCheckRefused
 	}
 	for _, field := range []struct {
@@ -57,9 +57,16 @@ func (s *Service) preflightCrossCheckPins(ctx context.Context, worker store.Work
 	if (row.Model.Valid || row.Effort.Valid) && !slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1) {
 		return nil, errCrossCheckPinsCapabilityMissing
 	}
+	// The worker defaults are the checker family's own lanes, and the template model is
+	// what Settings shows for the Default cell (PRD #2460).
+	workerModel, workerEffort := row.DefaultClaudeModel, row.DefaultEffort
+	if row.CheckerHarness.String == "codex" {
+		workerModel, workerEffort = row.DefaultCodexModel, row.DefaultCodexEffort
+	}
 	resolved := agenttmpl.ResolveCrossCheck(row.CheckerHarness.String, textPtr(row.Model), textPtr(row.Effort),
-		textPtr(row.WorkerModel), textPtr(row.WorkerEffort), nil)
-	if resolved.Model != nil && !agenttmpl.CuratedCodexModels[*resolved.Model] &&
+		textPtr(workerModel), textPtr(workerEffort), textPtr(row.TemplateModel))
+	// The custom-model capability gates Codex roots only: a Claude model is never a Codex id.
+	if row.CheckerHarness.String == "codex" && resolved.Model != nil && !agenttmpl.CuratedCodexModels[*resolved.Model] &&
 		!slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1) {
 		return nil, errCustomModelCapabilityMissing
 	}

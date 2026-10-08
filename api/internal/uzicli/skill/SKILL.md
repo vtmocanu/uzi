@@ -303,8 +303,9 @@ uzi version
   The default table shows the Claude and Codex plan cross-check cells, including
   active/inactive status, stored model/effort pins, worker default model,
   resolved model/effort, and their sources (`pin` or `worker default`, with
-  unrecognized sources shown as `unknown`). An inactive Claude cell is still shown; its stored pin
-  remains visible. Table rendering inspects at most twenty response cells and
+  unrecognized sources shown as `unknown`). Both cells are active: the Codex cell pins the
+  checker of a Claude-lead run and the Claude cell the checker of a Codex-lead run. A cell the
+  server reports inactive is still shown; its stored pin remains visible. Table rendering inspects at most twenty response cells and
   displays each harness once. `uzi settings get --json` returns the settings
   object at the top level, including `cross_check_pins` and source fields.
 
