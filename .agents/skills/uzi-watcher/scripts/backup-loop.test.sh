@@ -187,7 +187,8 @@ run_case(){
           [ ! -s "$CASE_DIR/kubectl.calls" ] || fail "implicit/current context lookup occurred"
           value='<unset>'
           [ "$CASE" != context-empty ] || value=
-          contains "$CASE_DIR/backup.context" "ctx=$value"
+          [ "$(cat "$CASE_DIR/backup.context")" = "ctx=$value" ] ||
+            fail "backup context changed: $(cat "$CASE_DIR/backup.context")"
           contains "$CASE_DIR/out/backup-loop.state" "context=<unset: current kube context>"
           assert_backups 1 run-a run-b
           assert_startup "$@" ;;
