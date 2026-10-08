@@ -140,7 +140,7 @@ async function registerWith(
   const worker = new Worker(
     { workerName: "finalize-probe", workerTemplate: "base", maxConcurrentRuns: 1, pollIntervalMs: 1 } as Config,
     wc,
-    {} as RunRunner,
+    { recoveryInventoryPending: async () => false } as unknown as RunRunner,
     {} as ChatRunner,
     {} as JudgeRunner,
     {} as ReviewRunner,
