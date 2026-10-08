@@ -1609,6 +1609,145 @@ describe("U2 real runner checked gate", () => {
     assert.equal(gates(c.run_id).length, 0);
   });
 
+  it("automatic REVISE releases concurrent feed producers and the session barrier before the next planning turn", { skip: LINUX_CAPTURE }, async () => {
+    const c = claim();
+    let context!: RunContext;
+    let releasePost!: () => void;
+    const post = new Promise<void>((resolve) => { releasePost = resolve; });
+    let entered = false;
+    const events: string[] = [];
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    const capture = git.capturePlanningDiff.bind(git);
+    const reportState = client.reportState.bind(client);
+    let captures = 0;
+    let sessionSends = 0;
+    const session = "automatic-concurrent-session";
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      const reservation = reserve.call(this);
+      return { ...reservation,
+        release: (response) => {
+          if (response.result === "candidate" && response.round === 1)
+            assert.equal(sessionSends, 0, "session sender is still behind the checked-state barrier at transport release");
+          const released = reservation.release(response);
+          assert.equal(released, true, "decided proof releases the real transport reservation");
+          events.push(`release:${response.result === "candidate" ? response.round : 0}`);
+          return released;
+        },
+        releaseAppliedGate: () => { throw new Error("automatic revision must not settle a human gate"); },
+      };
+    };
+    git.capturePlanningDiff = async (...args) => {
+      captures++;
+      await capture(...args);
+      return Buffer.from(`fresh concurrent candidate ${captures}`);
+    };
+    client.reportState = async (runId, body, ...args) => {
+      if (runId === c.run_id && body.status === "running" && body.session_id === session) {
+        assert.ok(events.includes("release:1"), "session HTTP cannot cross the held checked-state barrier");
+        sessionSends++;
+        events.push("session-send");
+      }
+      return reportState(runId, body, ...args);
+    };
+    api.crossCheckHandler = async ({ runId, body }) => {
+      const round = Number(body.round);
+      assert.equal(gates(runId).length, 0);
+      assert.equal(api.states.filter((s) => s.runId === runId && s.body.plan_md).length, 0);
+      if (round === 1) {
+        assert.equal(api.usageRequests.length, 1, "usage ACK precedes candidate POST");
+        assert.ok(api.messages(runId).some((m) => (m.payload as { text?: string }).text === "before automatic reservation"));
+        entered = true;
+        await post;
+      } else {
+        assert.equal(round, 2, "next candidate uses the explicit fresh round");
+        assert.ok(sessionSends > 0, "independent session sender drains before the next candidate");
+      }
+      return { status: 200, body: answer(runId, body, round === 1 ? "revise" : "approve", round === 1 ? "revise" : "approve", {
+        automatic_revision_limit: 2, automatic_rounds_enabled: true,
+        findings: round === 1 ? { summary: "fresh candidate required", items: [] } : null,
+        candidate: { plan_md: NORMALIZED, milestones: [{ title: "canonical concurrent", done: false }],
+          required_capabilities: [], required_tools: [], size_class: "s",
+          base_commit: body.base_commit, planning_diff: body.planning_diff },
+      }) };
+    };
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      context = ctx;
+      ctx.emit({ kind: "status", payload: { text: "before automatic reservation" } });
+      const leg = ctx.usage!.startLeg();
+      leg.observeAssistant({ message: { id: "automatic-concurrent-usage", model: "claude", usage: { input_tokens: 3 } } });
+      leg.close();
+      const revised = await ctx.gatePlan!(PLAN);
+      events.push("revision-return");
+      seen.push(revised);
+      assert.deepEqual(revised, { kind: "revise", automatic: true, round: 1,
+        feedback: "fresh candidate required", items: [] });
+      assert.ok(!("inputId" in revised));
+      assert.ok(events.indexOf("release:1") < events.indexOf("session-send"));
+      assert.ok(events.indexOf("session-send") < events.indexOf("revision-return"),
+        "independent sender passed the released checked-state barrier before the next planning turn");
+      assert.equal(gates(c.run_id).length, 0);
+      assert.ok(!statuses(c.run_id).includes("awaiting_approval"));
+      events.push("next-planning-turn");
+      const approved = await ctx.gatePlan!(`${PLAN} fresh round two`);
+      seen.push(approved);
+      assert.ok(approved.kind === "approve" && approved.approval === "cross_check");
+      assert.equal(approved.canonical.plan, NORMALIZED);
+      assert.deepEqual(approved.canonical.milestones, [{ title: "canonical concurrent", done: false }]);
+      return { branch: ctx.branch };
+    } };
+    const forge = fakeGitlab();
+    const run = runner(exec, forge.gitlab, undefined, {
+      planCrossCheckTiming: { ...timing, requestMs: 4000 }, planApprovalTimeoutMs: 4000,
+    });
+    const done = run.execute(c);
+    try {
+      assert.ok(await until(() => entered));
+      await Promise.all(Array.from({ length: 4 }, async (_, i) => {
+        context.emit({ kind: "status", payload: { text: `automatic producer ${i}` } });
+      }));
+      context.onSessionId!(session);
+      const feed = api.messages(c.run_id);
+      feed.push({ seq: feed.at(-1)!.seq + 1, kind: "status", payload: { text: "automatic server checker event" } });
+      // Let the already queued sender run to its barrier while the POST remains held.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(sessionSends, 0);
+      assert.ok(!api.states.some((s) => s.runId === c.run_id && s.body.session_id === session));
+      assert.ok(!feed.some((m) => String((m.payload as { text?: string }).text).startsWith("automatic producer ")));
+      assert.deepEqual(events, []);
+      releasePost();
+      await done;
+      assert.deepEqual(seen.map((v) => v.kind), ["revise", "approve"], "no deadlock after automatic release");
+      assert.ok(api.states.some((s) => s.runId === c.run_id && s.body.session_id === session),
+        "independent sender's state was persisted");
+      assert.equal(captures, 2);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.plan_md), [PLAN, `${PLAN} fresh round two`]);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.planning_diff),
+        ["fresh concurrent candidate 1", "fresh concurrent candidate 2"]);
+      assert.equal(api.crossCheckLatestRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
+      assert.ok(!statuses(c.run_id).includes("awaiting_approval"));
+      const stored = api.states.filter((s) => s.runId === c.run_id && s.body.plan_md);
+      assert.equal(stored.length, 1, "only approved canonical bundle is stored");
+      assert.equal(stored[0]!.body.plan_md, NORMALIZED);
+      assert.equal(stored[0]!.body.candidate_digest, digest);
+      assert.deepEqual(stored[0]!.body.milestones, [{ title: "canonical concurrent", done: false }]);
+      const messages = api.messages(c.run_id);
+      for (let i = 0; i < 4; i++)
+        assert.equal(messages.filter((m) => (m.payload as { text?: string }).text === `automatic producer ${i}`).length, 1);
+      assert.equal(messages.filter((m) => (m.payload as { text?: string }).text === "automatic server checker event").length, 1);
+      assert.deepEqual(messages.map((m) => m.seq), Array.from({ length: messages.length }, (_, i) => i + 1));
+    } finally {
+      releasePost();
+      run.shutdown();
+      await done;
+      MessageBatcher.prototype.reserveCandidateTransport = reserve;
+      git.capturePlanningDiff = capture;
+      client.reportState = reportState;
+    }
+  });
+
   for (const decision of ["approve", "revise"] as const) {
     it(`concurrent feed producers and session sender preserve sequences through ${decision} proof`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();

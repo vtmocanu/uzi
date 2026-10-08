@@ -116,36 +116,114 @@ func TestPlanCrossCheckAutomaticRoundsInterruptionClockLiveDB(t *testing.T) {
 }
 
 func TestPlanCrossCheckAutomaticRoundsFrozenInterruptionClockLiveDB(t *testing.T) {
+	observed := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	for _, writer := range []string{"direct", "frozen"} {
+		for _, delta := range []time.Duration{-time.Second, 0, time.Second} {
+			t.Run(writer+"/"+delta.String(), func(t *testing.T) {
+				ctx := context.Background()
+				fx := setupPlanCrossCheckDeletion(ctx, t)
+				f := fx.f
+				// All deadlines predate the later sweep clock. Only the first
+				// supplied custody observation determines supersession versus timeout.
+				deadline := observed.Add(-delta)
+				mustExec(ctx, t, f.pool, "UPDATE runs SET status='running',started_at=$2,status_since=$2,requeue_count=0 WHERE id=$1", f.runID, observed.Add(-time.Minute))
+				mustExec(ctx, t, f.pool, "UPDATE cross_checks SET created_at=$2,deadline_at=$3 WHERE id=$1", fx.crossCheckID, observed.Add(-10*time.Second), deadline)
+				if writer == "direct" {
+					mustExec(ctx, t, f.pool, "UPDATE runs SET status='queued',status_since=$2 WHERE id=$1", f.runID, observed)
+				} else {
+					tx, err := f.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					frozen, parents := freezeWorkerSnapshot(ctx, t, tx, f.workerID, []uuid.UUID{f.runID})
+					rows, err := store.New(tx).FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{WorkerID: pgU(f.workerID), Now: planCrossCheckTime(observed), MissingCutoff: planCrossCheckTime(observed.Add(-time.Second)), MaxRequeues: 5, GlobalTimeoutSeconds: 3600, FrozenTargets: frozen, LockedParentIds: parents})
+					if err != nil || len(rows) != 1 || rows[0].ID != f.runID {
+						t.Fatalf("frozen write: rows=%v err=%v", rows, err)
+					}
+					if err := tx.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cc, err := f.q.GetPlanCrossCheck(ctx, f.runID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				run, err := f.q.GetRunByID(ctx, f.runID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				child, err := f.q.GetRunByID(ctx, fx.checkerID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, credit, decided := "superseded", int32(10), observed
+				if delta >= 0 {
+					want, decided = "timed_out", deadline
+					if delta > 0 {
+						credit = 9
+					}
+				}
+				if cc.Verdict != "failed" || cc.ReasonClass.String != want || !cc.InterruptedAt.Valid ||
+					!cc.InterruptedAt.Time.Equal(observed) || !cc.DecidedAt.Valid || !cc.DecidedAt.Time.Equal(decided) ||
+					!cc.WaitCredited || run.BudgetPausedSeconds != credit || child.Status != "cancelled" || !child.ClaimReleasedAt.Valid {
+					t.Fatalf("frozen settlement: reason=%s interruption=%s decision=%s credit=%d child=%s", cc.ReasonClass.String, cc.InterruptedAt.Time, cc.DecidedAt.Time, run.BudgetPausedSeconds, child.Status)
+				}
+				// Two later sweep attempts must preserve the first cause and timestamps,
+				// with no second cancellation or wait credit.
+				for i := 0; i < 2; i++ {
+					if _, err := f.q.SupersedeExitedPlanCrossChecks(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				again, err := f.q.GetPlanCrossCheck(ctx, f.runID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after, err := f.q.GetRunByID(ctx, f.runID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				childAfter, err := f.q.GetRunByID(ctx, fx.checkerID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if again.Verdict != cc.Verdict || again.ReasonClass != cc.ReasonClass || again.InterruptedAt != cc.InterruptedAt ||
+					again.DecidedAt != cc.DecidedAt || !again.WaitCredited || after.BudgetPausedSeconds != credit ||
+					childAfter.Status != child.Status || childAfter.FinishedAt != child.FinishedAt || childAfter.ClaimReleasedAt != child.ClaimReleasedAt {
+					t.Fatal("later sweep changed first settlement or repeated cancellation/credit")
+				}
+			})
+		}
+	}
+}
+
+func TestPlanCrossCheckAutomaticRoundsLatestSettlementLiveDB(t *testing.T) {
 	ctx := context.Background()
 	fx := setupPlanCrossCheckDeletion(ctx, t)
 	f := fx.f
-	// The supplied observation predates the transaction clock by an hour.
-	observed := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
-	mustExec(ctx, t, f.pool, "UPDATE runs SET status='running',started_at=$2,status_since=$2,requeue_count=0 WHERE id=$1", f.runID, observed.Add(-time.Minute))
-	mustExec(ctx, t, f.pool, "UPDATE cross_checks SET created_at=$2,deadline_at=$3 WHERE id=$1", fx.crossCheckID, observed.Add(-10*time.Second), observed.Add(time.Second))
-	tx, err := f.pool.Begin(ctx)
+	mustExec(ctx, t, f.pool, "DELETE FROM cross_checks WHERE id=$1", fx.crossCheckID)
+	mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
+		(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,automatic_rounds_enabled,automatic_revision_limit,verdict,reason_class,deadline_at,decided_at,wait_credited)
+		VALUES ($1,'plan',1,1,'first plan','[]','s',repeat('a',40),$2,true,2,'revise','revise',now()+interval '1 hour',now(),true)`, f.runID, []byte("first digest"))
+	mustExec(ctx, t, f.pool, `INSERT INTO cross_checks
+		(id,lead_run_id,checker_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,automatic_rounds_enabled,automatic_revision_limit,created_at,deadline_at)
+		VALUES ($1,$2,$3,'plan',2,1,'second plan','[]','s',repeat('b',40),$4,true,2,'2020-01-01 00:00:00+00','2020-01-01 00:00:17.25+00')`, fx.crossCheckID, f.runID, fx.checkerID, []byte("second digest"))
+	mustExec(ctx, t, f.pool, "UPDATE runs SET budget_paused_seconds=7 WHERE id=$1", f.runID)
+	mustExec(ctx, t, f.pool, "UPDATE runs SET status='queued' WHERE id=$1", f.runID)
+	latest, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	frozen, parents := freezeWorkerSnapshot(ctx, t, tx, f.workerID, []uuid.UUID{f.runID})
-	rows, err := store.New(tx).FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{WorkerID: pgU(f.workerID), Now: planCrossCheckTime(observed), MissingCutoff: planCrossCheckTime(observed.Add(-time.Second)), MaxRequeues: 5, GlobalTimeoutSeconds: 3600, FrozenTargets: frozen, LockedParentIds: parents})
-	if err != nil || len(rows) != 1 || rows[0].ID != f.runID {
-		t.Fatalf("frozen write: rows=%v err=%v", rows, err)
+	if latest.Verdict != "failed" || latest.ReasonClass.String != "timed_out" || !latest.WaitCredited || !latest.DecidedAt.Valid {
+		t.Fatalf("round 2 settlement: verdict=%s reason=%s credited=%v decided=%v", latest.Verdict, latest.ReasonClass.String, latest.WaitCredited, latest.DecidedAt.Valid)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if credit := assertPlanCrossCheckSettled(ctx, t, f, fx.checkerID, 25, "timed_out"); credit != 25 {
+		t.Fatalf("round 2 credit=%d want 25", credit)
 	}
-	cc, err := f.q.GetPlanCrossCheck(ctx, f.runID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	run, err := f.q.GetRunByID(ctx, f.runID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cc.ReasonClass.String != "superseded" || !cc.InterruptedAt.Time.Equal(observed) || !cc.DecidedAt.Time.Equal(observed) || run.BudgetPausedSeconds != 10 {
-		t.Fatalf("supplied observation lost: reason=%s interruption=%s decision=%s credit=%d", cc.ReasonClass.String, cc.InterruptedAt.Time, cc.DecidedAt.Time, run.BudgetPausedSeconds)
+	first, err := f.q.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.runID, Round: 1})
+	if err != nil || first.Verdict != "revise" || first.InterruptedAt.Valid {
+		t.Fatalf("older round changed: verdict=%s interrupted=%v err=%v", first.Verdict, first.InterruptedAt.Valid, err)
 	}
 }
 
