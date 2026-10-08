@@ -18,7 +18,7 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		{Stage: "plan", Harness: "codex", Model: &model, WorkerDefaultModel: &worker,
 			ResolvedModel: &model, ResolvedEffort: "high", ModelSource: "pin", EffortSource: "worker default", Active: true},
 		{Stage: "plan", Harness: "claude", Effort: &effort,
-			ResolvedEffort: effort, ModelSource: "worker default", EffortSource: "pin", Active: false},
+			ResolvedEffort: effort, ModelSource: "worker default", EffortSource: "pin", Active: true},
 	}}
 	fc := &uzicli.FakeClient{Settings: settings}
 	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
@@ -30,7 +30,7 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("expected header and two cells: %s", out)
 	}
 	want := []string{
-		"plan claude inactive Default SDK/account default SDK/account default worker default Pin · high high pin",
+		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
 		"plan codex active Pin · checker-custom worker-model checker-custom pin Default high worker default",
 	}
 	for i, row := range want {
@@ -53,11 +53,11 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 	}
 }
 
-func TestSettingsGetInactivePinAndDefaultModel(t *testing.T) {
+func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 	model, codex := "sonnet", "gpt-6.1-sol"
 	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{CrossCheckPins: []apitypes.CrossCheckPinDTO{
 		{Stage: "plan", Harness: "claude", Model: &model, ResolvedModel: &model,
-			ResolvedEffort: "high", ModelSource: "pin", EffortSource: "worker default"},
+			ResolvedEffort: "high", ModelSource: "pin", EffortSource: "worker default", Active: true},
 		{Stage: "plan", Harness: "codex", WorkerDefaultModel: &codex, ResolvedModel: &codex,
 			ResolvedEffort: "medium", ModelSource: "worker default", EffortSource: "worker default", Active: true},
 	}}}
@@ -70,7 +70,7 @@ func TestSettingsGetInactivePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
-		"plan claude inactive Pin · sonnet SDK/account default sonnet pin Default high worker default",
+		"plan claude active Pin · sonnet SDK/account default sonnet pin Default high worker default",
 		"plan codex active Default gpt-6.1-sol gpt-6.1-sol worker default Default medium worker default",
 	} {
 		if got := strings.Join(strings.Fields(lines[i+1]), " "); got != want {

@@ -29,7 +29,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -55,7 +55,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -101,7 +101,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -127,7 +127,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -181,7 +181,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -207,7 +207,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -268,7 +268,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -294,7 +294,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -348,7 +348,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -374,7 +374,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -428,7 +428,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -454,7 +454,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -515,7 +515,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -541,7 +541,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -602,7 +602,7 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -628,7 +628,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",

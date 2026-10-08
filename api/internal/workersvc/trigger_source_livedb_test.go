@@ -216,7 +216,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	exec(`UPDATE runs SET status='running',worker_id=$2,auto_approve=true,
         plan_cross_check_required=true,claim_generation=1 WHERE id=$1`, base1, workerID)
 	r, err = q.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
-		ChildID: uuid.New(), LeadRunID: base1, UserID: userID,
+		ChildID: uuid.New(), ChildHarness: "codex", LeadRunID: base1, UserID: userID,
 		WorkerID: tUUID(workerID), ClaimGeneration: 1, BudgetWallSeconds: 1800,
 	})
 	assert(t, "CreatePlanCrossCheckChild", "cross_check", r, err)

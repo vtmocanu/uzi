@@ -59,19 +59,27 @@ WHERE id = $1 RETURNING plan_cross_check_enabled`, user.ID, req.Plan).Scan(&enab
 	}
 	response := map[string]any{"user": toDTO(updated)}
 	if enabled && !updated.EphemeralWorkersEnabled {
-		var workerAvailable bool
-		err = h.pool.QueryRow(r.Context(), `SELECT EXISTS (
-SELECT 1 FROM workers WHERE user_id = $1 AND status = 'online'
+		// Both directions need cross_check_v1: a Claude lead is checked on Codex (a
+		// codex_harness_v1 worker), and a Codex lead on Claude (PRD #2460, a worker that
+		// advertises cross_check_codex_lead_v1). Each is probed separately so the warning
+		// names the family that has no capable worker.
+		var codexCheckerAvailable, claudeCheckerAvailable bool
+		err = h.pool.QueryRow(r.Context(), `SELECT
+COALESCE(bool_or('codex_harness_v1' = ANY(protocol_capabilities)), false),
+COALESCE(bool_or('cross_check_codex_lead_v1' = ANY(protocol_capabilities)), false)
+FROM workers WHERE user_id = $1 AND status = 'online'
 AND draining_since IS NULL AND NOT ephemeral AND NOT isolated_lane
-AND 'cross_check_v1' = ANY(protocol_capabilities)
-AND 'codex_harness_v1' = ANY(protocol_capabilities))`, user.ID).Scan(&workerAvailable)
+AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerAvailable, &claudeCheckerAvailable)
 		if err != nil {
 			slog.Error("check cross-check workers", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if !workerAvailable {
+		switch {
+		case !codexCheckerAvailable:
 			response["warning"] = "No online worker can run Codex plan cross-checks; enable ephemeral workers or upgrade a worker."
+		case !claudeCheckerAvailable:
+			response["warning"] = "No online worker can run Claude plan cross-checks for Codex-lead runs; enable ephemeral workers or upgrade a worker."
 		}
 	}
 	httpx.JSON(w, http.StatusOK, response)
