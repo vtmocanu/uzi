@@ -204,7 +204,7 @@ describe("RecoveryArchivesPanel — download gating (D7)", () => {
       summary({
         archives: [
           archive({ id: "cap-needs", state: "needs_action", source_sha: "aaaaaaaaaaaa1111" }),
-          archive({ id: "cap-ok", state: "available", source_sha: "bbbbbbbbbbbb2222" }),
+          archive({ id: "cap-ok", state: "available", source_sha: "bbbbbbbbbbbb2222", prerequisite_shas: ["cccccccccccc3333"] }),
         ],
       }),
     );
@@ -220,7 +220,12 @@ describe("RecoveryArchivesPanel — download gating (D7)", () => {
     expect(links[0].querySelector("button")).toBeNull();
     expect(links[0].hasAttribute("download")).toBe(true);
     // The link's own row is the available one.
-    expect(within(links[0].closest("li") as HTMLElement).getByText("Available")).toBeTruthy();
+    const availableRow = within(links[0].closest("li") as HTMLElement);
+    expect(availableRow.getByText("Available")).toBeTruthy();
+    expect(availableRow.getByText("Prerequisites:")).toBeTruthy();
+    expect(availableRow.getByText(/required commits must already exist in your destination clone/)).toBeTruthy();
+    expect(availableRow.getByText(/run git bundle verify <bundle-path> before import/)).toBeTruthy();
+    expect(availableRow.getByText(/Byte count and checksum alone cannot prove independent recovery/)).toBeTruthy();
 
     // The non-downloadable row renders a DISABLED button (not a link), so there is exactly
     // one "Export archive" button and it is disabled and not inside a link.

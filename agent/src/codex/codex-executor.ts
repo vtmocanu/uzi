@@ -159,6 +159,8 @@ import {
   SUPERVISOR_BIN,
   launchCodexEffectRoot,
   launchCodexRoot,
+  watchStartupCleanup,
+  type StartupCleanupAuthorization,
   DEFAULT_REMOVE_CACHE_TIMEOUT_MS,
   removeCommandCache,
   startCommandCacheHolder,
@@ -4423,7 +4425,7 @@ export function registeredRoot(
   };
 }
 
-type EffectLaunch = (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
+type EffectLaunch = (spec: CodexEffectLaunchSpec, deadlineMs?: number, startupCleanup?: StartupCleanupAuthorization) => Promise<CodexRootHandle>;
 
 /** Issue #1598: the run's command cache as a command-identity launch site sees it. */
 export interface RunCommandCache {
@@ -4453,8 +4455,10 @@ function cacheForLaunch(cache: RunCommandCache | undefined, launch: EffectLaunch
  * reported a clean disposal (its registeredRoot reap/dispose, which both go through
  * the handle's dispose) AND no provider-epoch registry of the run was ever poisoned
  * (`isPoisoned()` is sticky across disposal). A launch that threw after the spec named the
- * cache, an unclean or rejected disposal, or a root never disposed by the terminal settle
- * makes it false. False is the safe direction: the directory is retained for the startup
+ * cache makes it false unless that invocation receives the launcher's fresh, exact-attempt
+ * certificate for fully closed rejected-startup cleanup. An unclean or rejected disposal,
+ * or a root never disposed by the terminal settle, also makes it false. False is the safe
+ * direction: the directory is retained for the startup
  * reaper.
  */
 export class HeldRunCommandCache implements RunCommandCache {
@@ -4478,7 +4482,7 @@ export class HeldRunCommandCache implements RunCommandCache {
   }
 
   track(launch: EffectLaunch): EffectLaunch {
-    return async (spec, deadlineMs) => {
+    return async (spec, deadlineMs, startupCleanup) => {
       this.openRoots += 1;
       let settled = false;
       const settle = (clean: boolean): void => {
@@ -4488,12 +4492,13 @@ export class HeldRunCommandCache implements RunCommandCache {
           this.openRoots -= 1;
         }
       };
+      const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
       let handle: CodexRootHandle;
       try {
-        handle = await launch(spec, deadlineMs);
+        handle = await launch(spec, deadlineMs, startupCleanup);
       } catch (error) {
-        // The spec named the cache; whether the command ran is unknown.
-        settle(false);
+        // Only this attempt's launcher certificate accounts for a rejected root.
+        settle(verifiedStartupCleanup(error));
         throw error;
       }
       return {
@@ -4907,8 +4912,8 @@ export function makeDefaultSpawnCommand(
 
 /** The production effect-root launcher: the real M3a supervisor via `launchCodexEffectRoot`,
  *  with the caller's deadline as the `started` deadline. */
-const productionEffectLaunch: EffectLaunch = (spec, deadlineMs) =>
-  launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } });
+const productionEffectLaunch: EffectLaunch = (spec, deadlineMs, startupCleanup) =>
+  launchCodexEffectRoot(spec, { ...(deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } }), startupCleanup });
 
 /**
  * TEST SEAM (issue #1769 m3) — NOT called by production code. Builds the same boundary-process
@@ -4933,12 +4938,12 @@ export function boundaryProcessSpawnerForTest(
 }
 
 function makeBoundaryProcessSpawner(
-  launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
+  launch: EffectLaunch,
   mode: CommandSandboxMode,
   log?: Pick<Logger, "warn">,
   cache?: RunCommandCache,
 ): SpawnBoundaryProcessSeam {
-  return async (request: BoundaryProcessRequest, deadlineMs: number): Promise<SpawnedBoundaryProcess> => {
+  return async (request: BoundaryProcessRequest, deadlineMs: number, startupCleanup): Promise<SpawnedBoundaryProcess> => {
     const [command, ...args] = request.argv;
     if (!command) throw new Error("boundary process argv is empty");
     // Issue #1598: a command-identity boundary process (a post-run durability sink) uses the
@@ -4954,7 +4959,7 @@ function makeBoundaryProcessSpawner(
           env: request.env,
           supervisorBin: SUPERVISOR_BIN,
         };
-    const handle = await withCache.launch(spec, deadlineMs);
+    const handle = await withCache.launch(spec, deadlineMs, startupCleanup);
     // stderr is consumed by GitCache for all boundary processes. The provider
     // adapter below drains its otherwise-unused stderr independently.
     return {
