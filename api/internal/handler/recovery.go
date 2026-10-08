@@ -90,6 +90,38 @@ func (h *Handler) WorkerRecoveryReserve(w http.ResponseWriter, r *http.Request) 
 	httpx.JSON(w, http.StatusOK, res)
 }
 
+// WorkerRecoveryReconcile atomically fences an unaccepted unavailable archive.
+func (h *Handler) WorkerRecoveryReconcile(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	captureID, ok := httpx.PathUUID(w, r, "captureID", "capture")
+	if !ok {
+		return
+	}
+	var wire struct {
+		apitypes.RecoveryReconcileRequest
+		ByteSize *int64 `json:"byte_size"`
+	}
+	if err := httpx.DecodeJSONStrict(r, &wire); err != nil || wire.ByteSize == nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid reconcile request")
+		return
+	}
+	wire.RecoveryReconcileRequest.ByteSize = *wire.ByteSize
+	res, err := h.recovery().Reconcile(r.Context(), wkr, runID, captureID, wire.RecoveryReconcileRequest)
+	if err != nil {
+		mapRecoveryError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
 // WorkerRecoveryUpload streams one octet-stream bundle into encrypted chunks and marks the
 // capture ready in one transaction. The body is wrapped in http.MaxBytesReader so an
 // over-cap body ERRORS (413) rather than being silently truncated.

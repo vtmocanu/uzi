@@ -834,6 +834,28 @@ WHERE id = @id AND hold_id = @hold_id AND run_id = @run_id AND user_id = @user_i
   AND original_worker_id = @worker_id::uuid
 FOR UPDATE;
 
+-- name: FenceUnacceptedInventoryCapture :execrows
+-- The caller holds worker/run/hold/capture locks. Delete bytes only for the
+-- guarded update's returned IDs, so a failed ownership/receipt guard deletes none.
+WITH fenced AS (
+    UPDATE recovery_captures c
+    SET state = 'expired', reserved_bytes = NULL,
+        reason = 'unaccepted_capture_replaced', updated_at = now()
+    WHERE c.id = @id AND c.hold_id = @hold_id AND c.run_id = @run_id
+      AND c.user_id = @user_id AND c.original_worker_id = @worker_id::uuid
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+        WHERE h.id = c.hold_id AND h.run_id = c.run_id AND h.user_id = c.user_id
+          AND h.original_worker_id = @worker_id::uuid AND h.generation = @generation
+          AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
+          AND h.final_disposition IS NULL AND h.final_capture_id IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id = c.id)
+    RETURNING c.id
+), deleted AS (
+    DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM fenced)
+    RETURNING capture_id
+)
+SELECT id FROM fenced WHERE (SELECT count(*) FROM deleted) >= 0;
+
 -- name: ProtectFinalInventoryCapture :execrows
 UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
     ready_retention_seconds = @retention_seconds::bigint, updated_at = now()
