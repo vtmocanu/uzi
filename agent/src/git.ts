@@ -8711,7 +8711,8 @@ export class GitCache {
 
   /** Local archive cleanup is separate from remote publication reconciliation. The caller
    * supplies authenticated FINAL roots and journal pins. One finite pass under the bare lock;
-   * any unknown attribution retains, and IO failure throws for a later coordinator pass. */
+   * unknown recovery-source attribution retains custody; tracking consumers retain contexts.
+   * IO failure throws for a later coordinator pass. */
   async cleanupRecoveryGeneration(barePath: string, context: PositiveOwedCandidateContext,
     roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
     coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
@@ -8756,10 +8757,6 @@ export class GitCache {
       // Config and physical tracking refs are consumers too. An indeterminate tracking owner
       // cannot be treated as publication or as proof that a context is unconsumed.
       const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
-      for (const tracking of allRefs.filter(p => p.ref.startsWith("refs/uzi-runner/"))) {
-        const branch = tracking.ref.slice("refs/uzi-runner/".length);
-        if (!await this.checkedTrackingOwner(barePath, branch, tracking.sha)) return "retained";
-      }
       const exact = metadata.records.filter(r => r.runId === context.runId && r.c.generation === context.generation);
       for (const record of exact) {
         if ("origin" in record.c || !roots.some(root => root.sha === record.sha &&

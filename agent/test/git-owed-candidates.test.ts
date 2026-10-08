@@ -94,9 +94,84 @@ beforeEach(async () => {
 });
 afterEach(() => fx.cleanup());
 
+// Capture publication consumers byte-for-byte; archive retirement must not repair them.
+function trackingConsumers(): { refs: string; config: string; files: Record<string, string> } {
+  const dir = path.join(bare, "uzi-owed");
+  return {
+    refs: gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-runner/"]),
+    config: fs.readFileSync(path.join(bare, "config"), "utf8"),
+    files: Object.fromEntries(fs.readdirSync(dir).filter(n =>
+      /^(context|receipt|governed)-/.test(n)).sort().map(n => [n, fs.readFileSync(path.join(dir, n), "utf8")])),
+  };
+}
+
+for (const damage of ["unrelated-unstamped", "receipt-sha", "owner-stamp", "shared-generations-branches",
+  "renamed-flat-collision"] as const) {
+  it(`rework-2464: covered archive retires with ${damage} tracking consumers`, async () => {
+    const h = root("covered source", [base]);
+    updated(await fetch());
+    const context = positiveContext();
+    let ownerGeneration = 1;
+    if (damage === "shared-generations-branches") {
+      updated(await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, { context: { ...context, generation: 2 } }));
+      ownerGeneration = 2;
+      const sibling = root("uncovered sibling", [h]);
+      updated(await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, { context: { ...context, generation: 2 } }));
+      const other = BRANCH + "-shared";
+      gitIn(clone, ["update-ref", `refs/heads/${other}`, h]);
+      updated(await cache.fetchAgentBranch(bare, clone, other, RUN, { context: { ...context, branch: other } }));
+      const siblingCoverage = await cache.buildRecoveryCoverage(bare, { ...context, generation: 2 }, [sibling], sibling);
+      gitIn(bare, ["update-ref", `refs/uzi-recovery-pin/${RUN}/2`, siblingCoverage.sha]);
+    }
+    if (damage === "renamed-flat-collision") {
+      const other = BRANCH.replace("/", "-");
+      gitIn(clone, ["update-ref", `refs/heads/${other}`, h]);
+      updated(await cache.fetchAgentBranch(bare, clone, other, RUN, { context: { ...context, branch: other } }));
+      for (const branch of [BRANCH, other]) {
+        gitIn(bare, ["update-ref", "-d", `refs/uzi-runner/${branch}`]);
+        gitIn(bare, ["config", "--local", "--remove-section", `uzi-trackowner.${branch}`]);
+        const hash = createHash("sha256").update(branch).digest("hex");
+        for (const prefix of ["receipt", "governed"])
+          fs.unlinkSync(path.join(bare, "uzi-owed", `${prefix}-${hash}.json`));
+      }
+      gitIn(bare, ["config", "--local", `UZI-TRACKOWNER.${other.toUpperCase()}`, RUN]);
+      gitIn(bare, ["update-ref", "refs/uzi-runner/renamed", h]);
+    } else if (damage === "unrelated-unstamped") {
+      gitIn(bare, ["update-ref", "refs/uzi-runner/unrelated", base]);
+    } else {
+      const receipt = JSON.parse(fs.readFileSync(receiptPath(), "utf8"));
+      if (damage === "receipt-sha") receipt.trackingSha = base;
+      else if (damage === "shared-generations-branches") receipt.phase = "pending";
+      else gitIn(bare, ["config", "--local", `uzi-trackowner.${BRANCH}.owner`, "22222222-1111-2222-3333-444444444444"]);
+      fs.writeFileSync(receiptPath(), JSON.stringify(receipt));
+    }
+    const frozen = await cache.enumerateOwedCandidates(bare, RUN);
+    const coverage = await cache.buildRecoveryCoverage(bare, context, [h], h);
+    gitIn(bare, ["update-ref", `refs/uzi-recovery-pin/${RUN}/1`, coverage.sha]);
+    const consumers = trackingConsumers();
+    const siblingRefs = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)",
+      `refs/uzi-coverage/${RUN}/2/`, `refs/uzi-recovery-pin/${RUN}/2`]);
+    assert.equal(await cache.cleanupRecoveryGeneration(bare, context, frozen,
+      [{ fingerprint: coverage.fingerprint, sha: coverage.sha }], [h, coverage.sha], coverage.sha), "removed");
+    assert.deepEqual(trackingConsumers(), consumers);
+    assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname)",
+      `refs/uzi-coverage/${RUN}/1/`, `refs/uzi-recovery-pin/${RUN}/1`]), "");
+    const remaining = await cache.enumerateOwedCandidates(bare, RUN);
+    if (damage === "shared-generations-branches") {
+      assert.equal(remaining.length, 2);
+      assert.ok(remaining.some(c => c.sha === h), "shared physical candidate pin survives");
+      assert.ok(remaining.every(c => c.contexts.every(ctx => ctx.generation === 2)));
+      assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)",
+        `refs/uzi-coverage/${RUN}/2/`, `refs/uzi-recovery-pin/${RUN}/2`]), siblingRefs);
+    } else assert.deepEqual(remaining, []);
+    if (!["unrelated-unstamped", "renamed-flat-collision"].includes(damage))
+      assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, tip(), ownerGeneration)).kind, "not_owned");
+  });
+}
+
 describe("M2 exact generation archive pin cleanup", () => {
   for (const interruption of ["none", "ref-readback", "metadata", "shared", "unknown", "protection", "pending-receipt"] as const) {
-    it(`preserves discovery and receipt identity across ${interruption}`, async () => {
+    it(`${interruption === "pending-receipt" ? "rework-2464: " : ""}preserves discovery and receipt identity across ${interruption}`, async () => {
       const h = root("archive source", [base]);
       updated(await fetch());
       const context = positiveContext();
@@ -112,7 +187,7 @@ describe("M2 exact generation archive pin cleanup", () => {
       const clean = () => cache.cleanupRecoveryGeneration(bare, context, frozen.map(c => ({
         sha: c.sha, contexts: c.contexts,
       })), [{ fingerprint: coverage.fingerprint, sha: coverage.sha }], [h, coverage.sha], coverage.sha, () => !protectedNow || ++checks === 1);
-      const receipt = fs.readFileSync(receiptPath(), "utf8");
+      let receipt = fs.readFileSync(receiptPath(), "utf8");
       let restore = () => {};
       if (interruption === "ref-readback") {
         let deleted = false;
@@ -130,9 +205,8 @@ describe("M2 exact generation archive pin cleanup", () => {
       if (interruption === "protection") protectedNow = true;
       if (interruption === "pending-receipt") {
         fs.writeFileSync(receiptPath(), JSON.stringify({ ...JSON.parse(receipt), phase: "pending" }));
-        assert.equal(await clean(), "retained", "pending identity does not imply a positive tracking owner");
-        assert.ok((await pins()).includes(h));
-        fs.writeFileSync(receiptPath(), receipt);
+        receipt = fs.readFileSync(receiptPath(), "utf8");
+        assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, h, 1)).kind, "not_owned");
       }
       const unknown = path.join(bare, "uzi-owed", "unknown.json");
       if (interruption === "unknown") fs.writeFileSync(unknown, "{}");
@@ -149,7 +223,9 @@ describe("M2 exact generation archive pin cleanup", () => {
           assert.ok(discovered.some(entry => entry.context.runId === RUN), "orphan metadata retains sibling discovery");
         }
       }
+      const consumers = trackingConsumers();
       assert.equal(await clean(), "removed");
+      assert.deepEqual(trackingConsumers(), consumers);
       assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-coverage/", "refs/uzi-recovery-pin/"]), "");
       const remaining = await cache.enumerateOwedCandidates(bare, RUN);
       if (interruption === "shared") {
@@ -162,7 +238,7 @@ describe("M2 exact generation archive pin cleanup", () => {
       assert.equal(fs.readFileSync(receiptPath(), "utf8"), receipt);
       const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
       assert.equal((await fresh.committedTrackingOwnership(bare, BRANCH, RUN, h,
-        interruption === "shared" ? 2 : 1)).kind, "owned");
+        interruption === "shared" ? 2 : 1)).kind, interruption === "pending-receipt" ? "not_owned" : "owned");
     });
   }
 });
@@ -185,6 +261,33 @@ for (const owner of ["modern", "legacy"] as const) {
     gitIn(bare, ["config", "--local", key, RUN]);
     assert.equal(await cache.cleanupRecoveryGeneration(bare, context, frozen, [], [h], h), "removed");
     assert.equal(fs.existsSync(path.join(dir, contexts[0]!)), true);
+  });
+}
+
+for (const matchingSubsection of [true, false]) {
+  it(`M2 config consumer case preserves subsection identity (matching=${matchingSubsection})`, async () => {
+    const h = root("case-sensitive context", [base]);
+    const branch = "agent/Case-Sensitive";
+    gitIn(clone, ["update-ref", `refs/heads/${branch}`, h]);
+    opts.context = { ...positiveContext(), branch };
+    updated(await cache.fetchAgentBranch(bare, clone, branch, RUN, opts));
+    const context = positiveContext();
+    const frozen = await cache.enumerateOwedCandidates(bare, RUN);
+    const dir = path.join(bare, "uzi-owed");
+    const contexts = fs.readdirSync(dir).filter(n => n.startsWith("context-"));
+    assert.equal(contexts.length, 1);
+    for (const name of fs.readdirSync(dir).filter(n => /^(receipt|governed)-/.test(n)))
+      fs.unlinkSync(path.join(dir, name));
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-runner/${branch}`]);
+    gitIn(bare, ["config", "--local", "--remove-section", `uzi-trackowner.${branch}`]);
+    const consumerBranch = matchingSubsection ? branch : branch.toLowerCase();
+    gitIn(bare, ["config", "--local", `UZI-TRACKOWNER.${consumerBranch}.OWNER`, RUN]);
+    const config = fs.readFileSync(path.join(bare, "config"), "utf8");
+    const bytes = fs.readFileSync(path.join(dir, contexts[0]!), "utf8");
+    assert.equal(await cache.cleanupRecoveryGeneration(bare, context, frozen, [], [h], h), "removed");
+    assert.equal(fs.readFileSync(path.join(bare, "config"), "utf8"), config);
+    assert.equal(fs.existsSync(path.join(dir, contexts[0]!)), matchingSubsection);
+    if (matchingSubsection) assert.equal(fs.readFileSync(path.join(dir, contexts[0]!), "utf8"), bytes);
   });
 }
 

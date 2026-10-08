@@ -1,7 +1,8 @@
 import { it } from "node:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { WorkerClient } from "../src/client.js";
-import { nullLogger, makeClaim } from "./helpers.js";
+import { nullLogger, makeClaim, noProofReseed } from "./helpers.js";
 import { Outbox } from "../src/outbox.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -88,7 +89,8 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
   });
 }
 
-it("M2 normal retirement survives actual cleanup in process and with a genuinely fresh WorkerClient", async t => {
+for (const pendingTracking of [false, true]) {
+it(`${pendingTracking ? "rework-2464: pending tracking consumer " : "M2 "}normal retirement survives actual cleanup in process and with a genuinely fresh WorkerClient`, async t => {
   const { gitlab } = fakeGitlab();
   const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
   const internals = r as unknown as {
@@ -100,13 +102,53 @@ it("M2 normal retirement survives actual cleanup in process and with a genuinely
   const bare = await git.ensureClone(fx.originPath);
   const sha = execFileSync("git", ["-C", bare, "rev-parse", "refs/remotes/origin/main"],
     { encoding: "utf8" }).trim();
+  const context = { runId, generation, kind: "issue" as const, branch: "task", barePath: bare,
+    defaultIdentity: { ref: "refs/remotes/origin/main", sha } };
+  let consumers: { config: string; refs: string; files: Record<string, string> } | undefined;
+  const snapshot = () => ({
+    config: fs.readFileSync(path.join(bare, "config"), "utf8"),
+    refs: execFileSync("git", ["-C", bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-runner/"],
+      { encoding: "utf8" }),
+    files: Object.fromEntries(fs.readdirSync(path.join(bare, "uzi-owed")).filter(n =>
+      /^(context|receipt|governed)-/.test(n)).sort().map(n => [n,
+        fs.readFileSync(path.join(bare, "uzi-owed", n), "utf8")])),
+  });
+  if (pendingTracking) {
+    const clone = (await git.runnerCloneForBranch(bare, "task", "cleanup", noProofReseed, runId)).path;
+    assert.equal((await git.fetchAgentBranch(bare, clone, "task", runId, { context })).kind, "updated");
+    const receiptPath = path.join(bare, "uzi-owed",
+      `receipt-${createHash("sha256").update("task").digest("hex")}.json`);
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    fs.writeFileSync(receiptPath, JSON.stringify({ ...receipt, phase: "pending" }));
+    assert.equal((await git.committedTrackingOwnership(bare, "task", runId, sha, generation)).kind, "not_owned");
+    consumers = snapshot();
+  }
   let open = true;
   client.hasFeature = name => name === "recovery_inventory_v1";
   client.getRunOwnership = async () => ({ status: "completed", claim_generation: generation, inventory_guarded: true });
   client.listRecoveryHolds = async () => ({ run_id: runId, holds: open ? [
     { hold_id: "hold", generation, inventory_guarded: true, has_available_capture: false },
   ] : [] });
+  let uploadedBytes = 0;
+  let manifest: Parameters<WorkerClient["uploadRecoveryBundle"]>[2] | undefined;
+  if (pendingTracking) {
+    client.reserveRecoveryCapture = async () => ({ capture_id: "archive-cleanup", state: "preparing" });
+    client.getRecoveryCaptureStatus = async () => ({
+      capture_id: "archive-cleanup", state: manifest ? "available" : "preparing", manifest_bound: !!manifest,
+      checksum: manifest?.checksum, byte_size: manifest?.byte_size, expires_at: "2099-01-01T00:00:00Z",
+    });
+    client.uploadRecoveryBundle = async (_runId, _captureId, supplied, stream) => {
+      for await (const chunk of stream) uploadedBytes += chunk.length;
+      assert.equal(uploadedBytes, supplied.byte_size);
+      manifest = supplied;
+      return client.getRecoveryCaptureStatus(runId, "archive-cleanup");
+    };
+  }
   client.releaseRecoveryCustody = async () => {
+    if (pendingTracking) {
+      assert.ok(uploadedBytes > 0, "real Git bundle was streamed before FINAL ACK");
+      assert.ok(fs.readdirSync(path.join(git.recoveryRoot, runId)).some(n => n.endsWith(".bundle")));
+    }
     open = false;
     return { run_id: runId, generation, released: true, holds_released: 1 };
   };
@@ -114,13 +156,19 @@ it("M2 normal retirement survives actual cleanup in process and with a genuinely
     sourceSha: sha, inventoryGuarded: true });
   assert.ok(source);
   const record = await internals.recovery.freezeInventory({
-    context: { runId, generation, kind: "issue", branch: "task", barePath: bare,
-      defaultIdentity: { ref: "refs/remotes/origin/main", sha } },
+    context,
     currentSha: sha, defaultBranch: "main", settledEvidence: "publication",
   });
   assert.ok(record);
   await internals.recovery.resumePending(undefined, [record]);
   assert.deepEqual(await internals.recovery.inspect(runId), []);
+  if (pendingTracking) {
+    assert.deepEqual(snapshot(), consumers);
+    assert.deepEqual(await git.enumerateOwedCandidates(bare, runId), []);
+    assert.equal(execFileSync("git", ["-C", bare, "for-each-ref", "--format=%(refname)",
+      "refs/uzi-coverage/", "refs/uzi-recovery-pin/"], { encoding: "utf8" }).trim(), "");
+    assert.equal((await git.committedTrackingOwnership(bare, "task", runId, sha, generation)).kind, "not_owned");
+  }
   assert.equal(fs.existsSync(path.join(git.recoveryRoot, runId)), false);
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
     const url = String(input);
@@ -157,6 +205,7 @@ it("M2 normal retirement survives actual cleanup in process and with a genuinely
   assert.equal(terminalRetires, 2);
   assert.equal(finalizeRetires, 2);
 });
+}
 
 it("authenticated pre-generation legacy journal preserves legacy retirement", async () => {
   const { gitlab } = fakeGitlab();
