@@ -269,7 +269,7 @@ func (s *Service) ReserveMemoryIntervention(ctx context.Context, w store.Worker,
 // is immutable; ambiguous/no_signal outcomes never refund. Even a current outcome
 // ACK is non-authorizing, and no outcome settles custody or emits a feed frame.
 func (s *Service) RecordMemoryInterventionOutcome(ctx context.Context, w store.Worker, req MemoryOutcomeRequest) (MemoryReservation, error) {
-	if err := req.MemoryBinding.validate(w); err != nil {
+	if err := req.validate(w); err != nil {
 		return MemoryReservation{}, err
 	}
 	if req.Outcome != "no_signal" && req.Outcome != "unknown" && req.Outcome != "confirmed_drained" {
