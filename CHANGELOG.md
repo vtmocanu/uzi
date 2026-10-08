@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Terminal protection recognizes case-only run directory aliases on case-insensitive filesystems ([#2309](https://github.com/vtmocanu/uzi/issues/2309)).**
+  On a case-insensitive filesystem such as default macOS APFS, a valid UUID run directory whose stored name differs from its id only by letter case is no longer read as unsafe, so a run with no terminal files is not kept under physical terminal protection indefinitely. Symlinked run directories and any other path difference stay unsafe; Linux workers are unaffected.
+
 - **Completed guarded recovery can settle after attributed clone parents disappear ([#2433](https://github.com/vtmocanu/uzi/issues/2433)).**
   After loss of the runner tree, verified absence of an attributed clone's parent directories no longer blocks archive-backed FINAL for a completed run with a valid durable capture; once FINAL is acknowledged, replay can retire its pending terminal journal. Discarded holds (#2417) and unresolved initial clone survival remain outside this fix.
 
