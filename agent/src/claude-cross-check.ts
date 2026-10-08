@@ -51,6 +51,11 @@ const REASON_PATTERN = "denied: a Glob or Grep pattern must be relative to the c
 // An absolute or home-relative pattern, or a `..` segment, at the start or after a `/`, `{` or `,`
 // (brace alternatives expand to separate patterns).
 const ESCAPING_PATTERN = /(^|[{,])\s*[/\\~]|(^|[/\\{,])\.\.([/\\},]|$)/;
+// Brace syntax can assemble a `..` segment from pieces (`.{.,}/*` expands to `../*`), so the
+// pattern is also screened with its brace punctuation removed. This over-approximates every
+// expansion and may deny a harmless pattern; it never allows an escaping one the plain form hides.
+const escapesCheckout = (pattern: string): boolean =>
+  ESCAPING_PATTERN.test(pattern) || ESCAPING_PATTERN.test(pattern.replace(/[{},]/g, ""));
 
 /** Defense in depth for the one path the path guard cannot see: extractToolPaths screens only
  *  file_path/path/notebook_path, so a Glob `pattern` or Grep `glob` is screened here. A pattern
@@ -61,7 +66,7 @@ function buildCheckerPatternGuard(log: Logger): (input: HookInput) => Promise<Ho
     if (input.hook_event_name !== "PreToolUse") return {};
     const toolInput = input.tool_input && typeof input.tool_input === "object" ? input.tool_input as Record<string, unknown> : {};
     const field = input.tool_name === "Glob" ? toolInput["pattern"] : input.tool_name === "Grep" ? toolInput["glob"] : undefined;
-    if (typeof field !== "string" || !ESCAPING_PATTERN.test(field)) return {};
+    if (typeof field !== "string" || !escapesCheckout(field)) return {};
     log.warn("cross-check pattern guard denied a pattern", { tool: input.tool_name });
     return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: REASON_PATTERN } };
   };

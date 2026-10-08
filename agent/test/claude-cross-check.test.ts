@@ -226,7 +226,7 @@ describe("buildClaudeCrossCheckOptions: the checker's confinement", () => {
       const glob = (pattern: string) => decide(o, { tool_name: "Glob", tool_input: { pattern }, cwd: s.checkout });
       const grepGlob = (g: string) => decide(o, { tool_name: "Grep", tool_input: { pattern: "x", glob: g }, cwd: s.checkout });
       for (const ok of ["**/*.ts", "src/**", "*.{ts,tsx}", "a..b/*.ts", "docs/..hidden"]) assert.equal(await glob(ok), "allow", ok);
-      for (const bad of ["/etc/*", "../*", "a/../../b", "~/.ssh/*", "{a,/etc/*}", "{x,../y}", "..", "\\etc\\*"]) {
+      for (const bad of ["/etc/*", "../*", "a/../../b", "~/.ssh/*", "{a,/etc/*}", "{x,../y}", "..", "\\etc\\*", "{a/,}../etc/*", ".{.,}/*", "{.,}./*", "src/{.,}./x"]) {
         assert.match(await glob(bad), /relative to the checkout/, bad);
       }
       assert.equal(await grepGlob("*.ts"), "allow");
