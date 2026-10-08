@@ -777,8 +777,19 @@ pass "case 7: run $RUN_F1 captured at generation $((GEN_F1 + 1)) and completed a
 # -----------------------------------------------------------------------------
 # CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 capture park, a second
 # interruption of the EXECUTING generation G+2 leaves the
-# spent budget to fail the run as worker_lost, and the failed run's recovery hold is never a silent empty one.
-say "CASE 8: allowance is one-shot: G+1 capture park, G+2 finalize interrupted -> worker_lost, mark stays G"
+# spent budget to hold preserved work for owner recovery, with no second finalize allowance.
+# The orphan/finalize exhaustion writers in worker_recovery.sql (#2426) preserve the
+# requeue/allowance counters, stamp worker_requeue_exhausted and set retry to NULL.
+assert_finalize_allowance_spent() {
+  local run="$1" original="$2" executing="$3" max="$4"
+  [ "$(rb_run_field "$run" status)" = recovery_wait ] || fail "case 8: spent allowance did not hold preserved work"
+  [ "$(rb_run_field "$run" recovery_wait_cause)" = worker_requeue_exhausted ] || fail "case 8: wrong recovery hold cause"
+  [ -z "$(rb_run_field "$run" recovery_retry_not_before)" ] || fail "case 8: exhausted hold has an automatic retry"
+  [ "$(rb_run_field "$run" claim_generation)" = "$executing" ] || fail "case 8: an extra claim reused the allowance"
+  [ "$(rb_run_field "$run" finalize_resume_generation)" = "$original" ] || fail "case 8: finalize allowance marker changed"
+  [ "$(rb_run_field "$run" requeue_count)" = "$((max + 1))" ] || fail "case 8: spent requeue count changed"
+}
+say "CASE 8: allowance is one-shot: G+1 capture park, G+2 finalize interrupted -> owner recovery hold, mark stays G"
 make_outbox_run
 RUN_F2="$OUTBOX_RUN"
 GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
@@ -808,22 +819,20 @@ else
   api_back
   f42_cut_judge "$rc" "$RUN_F2" "$GEN_F2B"
 fi
-# The allowance is spent: the orphan pass now fails the run as worker_lost. Bounded wait, it must not complete.
+# The allowance is spent. #2426 parks recoverable work instead of failing it;
+# a second automatic allowance, completion or another claim remains a failure.
 F42_DEADLINE=$((SECONDS + 120)); F42_ST=""
 while [ "$SECONDS" -lt "$F42_DEADLINE" ]; do
   F42_ST="$(rb_run_field "$RUN_F2" status)"
-  case "$F42_ST" in failed|completed|cancelled) break;; esac
+  case "$F42_ST" in recovery_wait|failed|completed|cancelled) break;; esac
   sleep 0.5
 done
-[ "$F42_ST" = failed ] \
-  || fail "case 8: run $RUN_F2 ended '$F42_ST' after the second interruption, want failed (worker_lost) — the allowance must not be reusable"
-[ "$(rb_run_field "$RUN_F2" fail_origin)" = worker_lost ] \
-  || fail "case 8: run $RUN_F2 failed with fail_origin='$(rb_run_field "$RUN_F2" fail_origin)', want worker_lost"
-[ "$(rb_run_field "$RUN_F2" finalize_resume_generation)" = "$GEN_F2" ] \
-  || fail "case 8: finalize_resume_generation moved to '$(rb_run_field "$RUN_F2" finalize_resume_generation)' — the one-shot allowance was reused (want $GEN_F2)"
-pass "case 8: run $RUN_F2 failed worker_lost at generation $GEN_F2B with finalize_resume_generation still $GEN_F2 (allowance not reused)"
+assert_finalize_allowance_spent "$RUN_F2" "$GEN_F2" "$GEN_F2B" "$F42_MAX"
+sleep 6 # three sweep ticks prove the hold does not automatically promote/reclaim
+assert_finalize_allowance_spent "$RUN_F2" "$GEN_F2" "$GEN_F2B" "$F42_MAX"
+pass "case 8: run $RUN_F2 holds preserved work at generation $GEN_F2B; allowance marker and count unchanged, no automatic retry"
 
-# Recovery custody for the failed run: `uzi run recovery` must never show a silent empty hold, i.e. an
+# Recovery custody for the held run: `uzi run recovery` must never show a silent empty hold, i.e. an
 # OPEN hold with neither an available capture nor a source_only/needs_action attention.
 # Wait (bounded) until no hold is still `capturing`, so the judgment is on the settled custody state.
 F42_DEADLINE=$((SECONDS + 60)); F42_REC=""; F42_CAPTURING=1
@@ -836,7 +845,7 @@ done
 [ "$F42_CAPTURING" = 0 ] \
   || fail "case 8: a custody hold on run $RUN_F2 was still capturing after 60s: $F42_REC"
 [ "$(printf '%s' "$F42_REC" | jq -r 'length')" -gt 0 ] \
-  || fail "case 8: uzi run recovery lists no custody hold at all for the failed run $RUN_F2"
+  || fail "case 8: uzi run recovery lists no custody hold at all for the held run $RUN_F2"
 # Every OPEN hold is either an archive_ready one (with an available capture) or a source_only/needs_action one.
 F42_SILENT="$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open" and (((.attention == "archive_ready") and (.has_available_capture // false)) or (.attention | IN("source_only", "needs_action")) | not)) | .id] | join(",")')"
 [ -z "$F42_SILENT" ] \
@@ -857,6 +866,11 @@ for F42_ATT in $(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open")
   esac
 done
 pass "case 8: uzi run recovery on run $RUN_F2 shows no silent empty hold ($(printf '%s' "$F42_REC" | jq -r 'length') hold(s) listed)"
+# End only this test-owned held run. Cancellation keeps its recovery evidence;
+# it also prevents a nonterminal fixture from leaking into later credential tests.
+apipost "/api/runs/$RUN_F2/inputs" '{"kind":"cancel","body":""}' >/dev/null
+wait_status "$RUN_F2" cancelled 30
+pass "case 8: owner cancelled the test-owned recovery hold without discarding its source"
 
 # =============================================================================
 # RESTORE — return the api stale window and the agent outbox knobs to their defaults so

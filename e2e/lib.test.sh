@@ -339,6 +339,23 @@ for variant in wrong-generation wrong-order two-captures missing-id; do
   custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_park R 2
 done
 
+# The spent finalize allowance preserves recoverable work after #2426. Exercise
+# the phase's exact outcome assertions without a stack or timing dependency.
+eval "$(awk '/^assert_finalize_allowance_spent\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+rb_run_field() { jq -r --arg key "$2" '.[$key] // empty' "$SEQ_DIR/finalize"; }
+finalize_fixture() {
+  jq -nc '{status:"recovery_wait",recovery_wait_cause:"worker_requeue_exhausted",recovery_retry_not_before:null,
+    claim_generation:3,finalize_resume_generation:1,requeue_count:4}' > "$SEQ_DIR/finalize"
+}
+finalize_fixture
+custody_case "spent allowance parks preserved work without another claim" pass "" assert_finalize_allowance_spent R 1 3 3
+for change in 'status="failed"' 'recovery_wait_cause="provider_outage"' 'recovery_retry_not_before="later"' 'claim_generation=4' 'finalize_resume_generation=3' 'requeue_count=3'; do
+  finalize_fixture
+  jq ".$change" "$SEQ_DIR/finalize" > "$SEQ_DIR/changed"
+  mv "$SEQ_DIR/changed" "$SEQ_DIR/finalize"
+  custody_case "spent allowance refuses $change" fail "case 8:" assert_finalize_allowance_spent R 1 3 3
+done
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -349,6 +366,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 55 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 62 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 55 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 62 ] && [ "$cases" -eq "$passed" ]
