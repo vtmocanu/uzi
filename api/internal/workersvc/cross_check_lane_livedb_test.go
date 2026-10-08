@@ -286,7 +286,7 @@ func TestCrossCheckLaneEligibilityLiveDB(t *testing.T) {
 		{"ephemeral-bound-child", `UPDATE workers SET ephemeral=true,ephemeral_run_id=$2 WHERE id=$1`, true},
 		{"ephemeral-foreign", `UPDATE workers SET ephemeral=true,ephemeral_run_id=(SELECT target_run_id FROM runs WHERE id<>$2 AND kind='cross_check' AND user_id=(SELECT user_id FROM workers WHERE id=$1) LIMIT 1) WHERE id=$1`, false},
 		{"expired-parent", `UPDATE cross_checks SET deadline_at=now()-interval '1 second' WHERE checker_run_id=$2`, false},
-		{"stale-parent-generation", `UPDATE runs SET claim_generation=2 WHERE id=(SELECT target_run_id FROM runs WHERE id=$2)`, false},
+		{"stale-parent-generation", `UPDATE cross_checks SET lead_claim_generation=2 WHERE checker_run_id=$2`, false},
 		{"decided-verdict", `UPDATE cross_checks SET verdict='approve',decided_at=now() WHERE checker_run_id=$2`, false},
 		{"second-round", `UPDATE cross_checks SET round=2 WHERE checker_run_id=$2`, false},
 		{"inactive-parent", `UPDATE runs SET status='completed' WHERE id=(SELECT target_run_id FROM runs WHERE id=$2)`, false},
@@ -324,7 +324,48 @@ func TestCrossCheckLaneEligibilityLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.name == "inactive-parent" || tc.name == "released-parent" {
+				// settle_exited_plan_cross_check cancels the child and settles its
+				// attempt. Model a stale queued attempt while retaining the invalid lead.
+				f.env.exec(`UPDATE runs SET status='queued',finished_at=NULL,claim_released_at=NULL WHERE id=$1`, f.runID)
+				f.env.exec(`UPDATE cross_checks SET verdict='pending',reason_class=NULL,decided_at=NULL WHERE checker_run_id=$1`, f.runID)
+			}
 			before := mustRun(t, f.env, f.runID)
+			if before.Status != "queued" {
+				t.Fatalf("eligibility fixture child status=%q, want queued", before.Status)
+			}
+			var verdict string
+			var pending bool
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT verdict,
+				verdict='pending' AND reason_class IS NULL AND decided_at IS NULL
+				FROM cross_checks WHERE checker_run_id=$1`, f.runID).Scan(&verdict, &pending); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "decided-verdict" {
+				if verdict != "approve" {
+					t.Fatalf("decided fixture verdict=%q, want approve", verdict)
+				}
+			} else if !pending {
+				t.Fatal("eligibility fixture must retain an undecided pending attempt")
+			}
+			if tc.name == "stale-parent-generation" || tc.name == "inactive-parent" || tc.name == "released-parent" {
+				var isolated bool
+				if err := f.env.pool.QueryRow(f.env.ctx, `SELECT
+					cc.lead_run_id=$2 AND child.target_run_id=lead.id
+					AND cc.stage='plan' AND cc.round=1 AND cc.deadline_at>now()
+					AND lead.claim_generation=1
+					AND cc.lead_claim_generation=CASE WHEN $3='stale-parent-generation' THEN 2 ELSE 1 END
+					AND lead.status=CASE WHEN $3='inactive-parent' THEN 'completed' ELSE 'running' END
+					AND (lead.claim_released_at IS NOT NULL)=($3='released-parent')
+					FROM cross_checks cc JOIN runs lead ON lead.id=cc.lead_run_id
+					JOIN runs child ON child.id=cc.checker_run_id
+					WHERE cc.checker_run_id=$1`, f.runID, f.lead, tc.name).Scan(&isolated); err != nil {
+					t.Fatal(err)
+				}
+				if !isolated {
+					t.Fatal("parent refusal fixture lost its witness or invalidated another parent predicate")
+				}
+			}
 			var checkBefore string
 			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT to_jsonb(cc)::text FROM cross_checks cc WHERE checker_run_id=$1`, f.runID).Scan(&checkBefore); err != nil {
 				t.Fatal(err)
