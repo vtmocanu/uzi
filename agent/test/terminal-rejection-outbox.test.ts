@@ -613,7 +613,7 @@ test("physical protection visits a matching UUID case alias beyond 256 unrelated
   const lower = "abcdefab-1111-4111-8111-111111111111";
   const mixed = "ABCDefab-1111-4111-8111-111111111111";
   if (!await caseSensitiveRoot(root)) {
-    t.skip("distinct UUID case siblings require a case-sensitive filesystem");
+    t.skip("filesystem folds case; fixture requires distinct case-variant sibling directories");
     return;
   }
   await fs.mkdir(path.join(root, lower));
@@ -653,11 +653,11 @@ for (const kind of ["symlink", "file"] as const) {
     await fs.unlink(file);
     const lower = "abcdefab-1111-4111-8111-111111111111";
     const mixed = "ABCDefab-1111-4111-8111-111111111111";
-    await fs.mkdir(path.join(root, lower));
     if (!await caseSensitiveRoot(root)) {
-      t.skip("distinct UUID case siblings require a case-sensitive filesystem");
+      t.skip("filesystem folds case; fixture requires distinct case-variant sibling directories");
       return;
     }
+    await fs.mkdir(path.join(root, lower));
     const alias = path.join(root, mixed);
     if (kind === "symlink") await fs.symlink(path.join(root, run), alias);
     else await fs.writeFile(alias, "");
