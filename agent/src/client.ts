@@ -1777,6 +1777,11 @@ export class WorkerClient {
     return await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/reconcile`,
       req,
+      this.httpTimeoutMs,
+      undefined,
+      // The immutable receipt carries IDs, generation, outcome and optional disposition/evidence;
+      // 16 KiB leaves ample protocol headroom while bounding actual response bytes.
+      16 * 1024,
     ) as RecoveryReconcileResponse;
   }
 
