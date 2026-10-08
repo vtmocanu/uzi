@@ -441,7 +441,7 @@ wait_forge_park_release() {
   while :; do
     snapshot="$(db_psql "SELECT COALESCE(json_agg(json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
       'generation',h.generation,'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
-      'after_outcome',h.released_at >= CASE WHEN r.status='failed' THEN r.finished_at ELSE r.claim_released_at END,
+      'after_outcome',h.released_at >= CASE WHEN r.status='failed' THEN r.finished_at ELSE r.status_since END,
       'run_status',r.status,'claim_generation',r.claim_generation)), '[]'::json)::text
       FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
       WHERE h.run_id='$run' AND h.generation=$generation")"
