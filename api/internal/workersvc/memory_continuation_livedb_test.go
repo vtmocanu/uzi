@@ -354,10 +354,10 @@ func memoryCheckerFixture(t *testing.T) (memoryFixture, uuid.UUID) {
 	t.Helper()
 	f := newMemoryFixture(t)
 	lead := seedOutageRun(t, f.e, f.w.UserID, f.repo, f.w.ID, "running", "issue", 2, 0)
-	f.e.exec("UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,report_only=true WHERE id=$1", f.b.RunID, lead)
+	f.e.exec("UPDATE runs SET kind='cross_check',harness='codex',issue_iid=NULL,target_run_id=$2,report_only=true WHERE id=$1", f.b.RunID, lead)
 	f.e.exec(`INSERT INTO cross_checks
 		(lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,checker_run_id,checker_harness,deadline_at)
-		VALUES($1,'plan',1,2,'plan','[]','s',$2,$3,$4,'claude',now()+interval '30 minutes')`,
+		VALUES($1,'plan',1,2,'plan','[]','s',$2,$3,$4,'codex',now()+interval '30 minutes')`,
 		lead, strings.Repeat("a", 40), []byte("memory-candidate"), f.b.RunID)
 	return f, lead
 }
