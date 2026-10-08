@@ -975,7 +975,7 @@ WITH claimant AS MATERIALIZED (
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim($6::boolean, $7::uuid[], r.repo_id, r.kind, $8::text[], r.required_capabilities, $9::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
-      -- already holds >= @custody_hold_limit UNRESOLVED (state='open') custody holds — the
+      -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
       -- matches no row, so the run stays queued (the health resolver surfaces a distinct
       -- custody-limit reason against this SAME predicate in a later milestone). This is an
@@ -1009,8 +1009,7 @@ WITH claimant AS MATERIALIZED (
                              WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
                AND (SELECT count(*) FROM recovery_custody_holds oh2
                       WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $10::int)
-           OR (SELECT count(*) FROM recovery_custody_holds ch
-                 WHERE ch.user_id = $2 AND ch.state = 'open') < $10::int)
+           OR (SELECT fn_custody_admission_count($2::uuid, $3::timestamptz)) < $10::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -4965,41 +4964,49 @@ func (q *Queries) GetConsumedCompletionPermit(ctx context.Context, arg GetConsum
 
 const getCustodyAdmissionForRun = `-- name: GetCustodyAdmissionForRun :one
 SELECT
+    fn_custody_admission_count($1::uuid, $2::timestamptz)::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
         WHERE h.user_id = $1::uuid AND h.state = 'open')::bigint AS open_holds,
     COALESCE((SELECT (r.claim_generation >= 1
                       AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
                                     WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
                       AND (SELECT count(*) FROM recovery_custody_holds oh2
-                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $2::int)
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $3::int)
                 FROM runs r
-                WHERE r.id = $3::uuid AND r.user_id = $1::uuid), false)::boolean AS continuation_exempt
+                WHERE r.id = $4::uuid AND r.user_id = $1::uuid), false)::boolean AS continuation_exempt
 `
 
 type GetCustodyAdmissionForRunParams struct {
-	UserID           uuid.UUID `json:"user_id"`
-	CustodyHoldLimit int32     `json:"custody_hold_limit"`
-	RunID            uuid.UUID `json:"run_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	HeartbeatCutoff  pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	CustodyHoldLimit int32              `json:"custody_hold_limit"`
+	RunID            uuid.UUID          `json:"run_id"`
 }
 
 type GetCustodyAdmissionForRunRow struct {
-	OpenHolds          int64 `json:"open_holds"`
-	ContinuationExempt bool  `json:"continuation_exempt"`
+	AdmissionCountedHolds int64 `json:"admission_counted_holds"`
+	OpenHolds             int64 `json:"open_holds"`
+	ContinuationExempt    bool  `json:"continuation_exempt"`
 }
 
 // Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
-// its reasonCustodyLimit pill agrees with ClaimRun. open_holds is the owner's UNRESOLVED
-// (state='open') hold count, the same count ClaimRun's custody clause compares against
-// @custody_hold_limit; continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
+// its reasonCustodyLimit pill agrees with ClaimRun. open_holds is total open custody;
+// admission_counted_holds is the shared live-claim-discounted count compared against
+// @custody_hold_limit (ADR-2445); continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
 // the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
 // custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
 // stops a run that the never-started sweep keeps requeueing from opening holds forever (see
 // ClaimRun). An exempt run is never blocked by the custody cap. A run that does not exist (or
 // belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
 func (q *Queries) GetCustodyAdmissionForRun(ctx context.Context, arg GetCustodyAdmissionForRunParams) (GetCustodyAdmissionForRunRow, error) {
-	row := q.db.QueryRow(ctx, getCustodyAdmissionForRun, arg.UserID, arg.CustodyHoldLimit, arg.RunID)
+	row := q.db.QueryRow(ctx, getCustodyAdmissionForRun,
+		arg.UserID,
+		arg.HeartbeatCutoff,
+		arg.CustodyHoldLimit,
+		arg.RunID,
+	)
 	var i GetCustodyAdmissionForRunRow
-	err := row.Scan(&i.OpenHolds, &i.ContinuationExempt)
+	err := row.Scan(&i.AdmissionCountedHolds, &i.OpenHolds, &i.ContinuationExempt)
 	return i, err
 }
 

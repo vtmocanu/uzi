@@ -165,7 +165,7 @@ func TestRecoveryHoldsDecodes(t *testing.T) {
 	if gotAuth != "Bearer uzc_test" {
 		t.Errorf("auth = %q, want Bearer uzc_test", gotAuth)
 	}
-	if got.Aggregate.OpenHolds != 2 || got.Aggregate.CustodyHoldLimit != 8 || got.Aggregate.DecisionNeeded != 1 {
+	if got.Aggregate.OpenHolds != 2 || got.Aggregate.AdmissionCountedHolds != 2 || got.Aggregate.CustodyHoldLimit != 8 || got.Aggregate.DecisionNeeded != 1 {
 		t.Errorf("aggregate = %+v, want open 2 / limit 8 / decision 1", got.Aggregate)
 	}
 	if len(got.Holds) != 1 || got.Holds[0].ID != "h1" || got.Holds[0].Attention != "source_only" || got.Holds[0].TerminalRecordRejection != "mac_failure" {
@@ -209,5 +209,28 @@ func TestDiscardRecoveryHoldNotFoundMapsExit(t *testing.T) {
 	err := newTestClient(srv).DiscardRecoveryHold(context.Background(), "r1", "h1")
 	if got := ExitCodeFor(err); got != ExitNotFound {
 		t.Fatalf("exit = %d, want %d (not found) (err: %v)", got, ExitNotFound, err)
+	}
+}
+
+func TestRecoveryHoldsAdmissionCountPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		want        int
+	}{
+		{"absent old server", "", 11},
+		{"explicit zero", `,"admission_counted_holds":0`, 0},
+		{"explicit nonzero", `,"admission_counted_holds":8`, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"aggregate":{"open_holds":11` + tc.field + `},"holds":[]}`))
+			}))
+			defer srv.Close()
+			got, err := newTestClient(srv).RecoveryHolds(context.Background())
+			if err != nil || got.Aggregate.OpenHolds != 11 || got.Aggregate.AdmissionCountedHolds != tc.want {
+				t.Fatalf("aggregate=%+v err=%v, want total=11 counted=%d", got.Aggregate, err, tc.want)
+			}
+		})
 	}
 }

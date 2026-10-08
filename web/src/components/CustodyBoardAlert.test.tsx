@@ -43,6 +43,21 @@ async function renderAlert(resp: RecoveryCustodyHolds, recoveryWaitCount = 0) {
 }
 
 describe("CustodyBoardAlert", () => {
+  it.each([undefined, 0, 3, 8])("renders admission %s separately from total custody", async (admission_counted_holds) => {
+    const resp = holds({ open_holds: 12, admission_counted_holds, decision_needed: 1 });
+    if (admission_counted_holds === undefined) delete resp.aggregate.admission_counted_holds;
+    await renderAlert(resp);
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText(`${admission_counted_holds ?? 12} / 8 custody slots used`)).toBeTruthy();
+    expect(screen.getByText(/open custody holds/).textContent).toBe("12 open custody holds");
+    expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
+  });
+
+  it("hides discounted healthy holds even above total capacity", async () => {
+    const { container } = await renderAlert(holds({ open_holds: 12, admission_counted_holds: 0 }));
+    expect(container.innerHTML).toBe("");
+  });
+
   it.each([8, 9])("renders capacity-only holds at %i as a polite warning without action", async (open_holds) => {
     await renderAlert(holds({ open_holds }));
     const region = screen.getByRole("status");

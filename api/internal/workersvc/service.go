@@ -3038,10 +3038,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	// transactional path (only the request arrays differ, and they are empty in the no-snapshot
 	// path). @snapshot_fresh_cutoff is the stale window plus one heartbeat interval (D3): a
 	// worker_active_runs row reported within it fences the run out of every claim.
+	claimNow := s.now()
 	params := store.ClaimRunParams{
 		WorkerID:            pgconv.UUID(wkr.ID),
 		UserID:              wkr.UserID,
-		AffinityCutoff:      pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
+		AffinityCutoff:      pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
 		IsDockerWorker:      isDocker,
 		WorkerDockerEnabled: s.effectiveDockerTier,
 		DockerRepoAllowlist: allowlist,
@@ -3061,20 +3062,20 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
 		IsEphemeral:    wkr.Ephemeral,
 		EphemeralRunID: wkr.EphemeralRunID,
-		SpreadCutoff:   pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		SpreadCutoff:   pgconv.Time(claimNow.Add(-s.p.WorkerSpreadGrace)),
 		// PRD #2006: the configured lease for EVERY claimant, read by ClaimRun's spread-peer mirror so a
 		// leased ephemeral peer is a deferral target. A claimant's own lease identity (LeaseSince,
 		// LeaseRepoID, LeaseBranch, LeaseAt) stays confined to claimRunInTx. Lease 0 yields a NULL interval.
 		EphemeralLease:        LeaseInterval(s.ephemeralLease),
-		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
-		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
+		BackgroundGraceCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerBackgroundGrace)),
+		HeartbeatCutoff:       pgconv.Time(claimNow.Add(-s.p.WorkerHeartbeatStale)),
 		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
 		// drain gate above and the `NOT @claimant_draining OR r.worker_id = @worker_id`
 		// clause in ClaimRun). A non-draining worker passes false — a no-op.
 		ClaimantDraining: wkr.DrainingSince.Valid,
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
-		//     >= this many unresolved (open) custody holds (owner-scoped, never global).
+		//     >= this many admission-counted open holds (ADR-2445; owner-scoped, never global).
 		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
 		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
 		//     versioned contract; any one of the three suffices): the custody hold is
@@ -3090,7 +3091,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs
 		// (empty in the no-snapshot path). All three are always passed so an old worker still gets
 		// the persisted-snapshot exclusions + the overflow closure.
-		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
+		SnapshotFreshCutoff: pgconv.Time(claimNow.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
 		RequestActiveIds:    reqIDs,
 		RequestActiveGens:   reqGens,
 		// PRD #1551 M4 (D6): the curated Codex model vocabulary, feeding ClaimRun's non-bypassable

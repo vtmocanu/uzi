@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgtype"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -219,7 +221,7 @@ func (s *custodyEpisodeSeeder) release(ids []uuid.UUID) {
 
 func (s *custodyEpisodeSeeder) listOver(limit int32) []uuid.UUID {
 	s.t.Helper()
-	got, err := store.New(s.pool).ListOwnersOverCustodyLimit(s.ctx, limit)
+	got, err := store.New(s.pool).ListOwnersOverCustodyLimit(s.ctx, store.ListOwnersOverCustodyLimitParams{CustodyHoldLimit: limit, HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true}})
 	if err != nil {
 		s.t.Fatalf("ListOwnersOverCustodyLimit(%d): %v", limit, err)
 	}
@@ -228,7 +230,7 @@ func (s *custodyEpisodeSeeder) listOver(limit int32) []uuid.UUID {
 
 func (s *custodyEpisodeSeeder) listCleared(limit int32) []uuid.UUID {
 	s.t.Helper()
-	got, err := store.New(s.pool).ListOwnersWithClearedCustodyEpisode(s.ctx, limit)
+	got, err := store.New(s.pool).ListOwnersWithClearedCustodyEpisode(s.ctx, store.ListOwnersWithClearedCustodyEpisodeParams{CustodyHoldLimit: limit, HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true}})
 	if err != nil {
 		s.t.Fatalf("ListOwnersWithClearedCustodyEpisode(%d): %v", limit, err)
 	}

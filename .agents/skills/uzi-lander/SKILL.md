@@ -98,7 +98,9 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   → ask for a replacement or a local buddy. Never downgrade silently.
 - **A local buddy waives only the peer buddy**, never independent review, CI or a user
   review. Spawn one fresh subagent per request, brief it as below, pin it to the head;
-  it shares your model's blind spots, so name it in the trail.
+  it shares your model's blind spots, so name it in the trail. Every review brief asks
+  for applicable cleanup lenses (reuse, simplification, efficiency, fix altitude),
+  reported apart from mandatory findings.
 - **A buddy never reviews a diff it wrote.** When the buddy implemented the change, the
   independent review is a bot or a fresh local reviewer; the buddy only verifies findings.
 - **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
@@ -117,8 +119,8 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   user-authorized multi-round loop run `peers.py budget allow buddy --replies N` once,
   not a reset per round. A correlated `ask`/`dispatch` reply needs no allowance.
 - **Issues you file** (follow-ups, inherited or incidental findings): label `reviewed`
-  per the root `CLAUDE.md` rule, and decide with the buddy whether each is sweep-ready
-  (step 8).
+  per the root `CLAUDE.md` rule, and queue or ask per the *Filing default* in
+  `.agents/skills/issue-triage/references/on-deck.md` (step 8).
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
   `reviewed` label, so the user sees both agents agreed. Same with a local buddy.
 - The buddy's `APPROVE` is required where this skill says so below. It never
@@ -306,7 +308,10 @@ changes it); trust it over a handover's claim.
      validators as operator constraints, so name an identifier as binding only when
      compatibility needs that exact name; otherwise call it an example;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
-     is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
+     is fixed or filed per the on-deck *Filing default*, never silently skipped.
+   - **optional cleanup** (a Non-blocking reuse, simplification, efficiency or altitude
+     note with no demonstrated defect): record it in the PR's deferred notes for step 8;
+     never fix locally or trigger rework for it alone, unless the user asks.
    Decide, then report the decisions in one message (finding, label, choice, why) and
    execute; do not wait for answers. Several PRs with findings → assess all, report once,
    execute unattended.
@@ -430,11 +435,10 @@ changes it); trust it over a handover's claim.
      only the unedited server text, so use it only when that text is the approved draft.
      Deferred notes without findings: `gh issue create --body-file`. Then add `area::*` and
      `priority::*` per `.agents/skills/issue-triage/references/taxonomy.md` (omit when
-     unsure) and `reviewed`. Decide with the buddy, per issue, whether it is sweep-ready
-     (premise verified, fix scoped, no design decision open, no `.github/workflows/**` change,
-     which a uzi push cannot carry): if so add its sweep selector (`bug` for a defect,
-     `Planned` for planned work) plus `uzi`; if not, leave both off and
-     say why in the trail. A set over the grouped-filing limit (50) is "needs you"; never
+     unsure) and `reviewed`. Draft each body in the shape of
+     `.agents/skills/issue-triage/references/on-deck.md` and apply its *Filing default*:
+     `on-deck` + `uzi` when every criterion holds; otherwise name why in the trail and ask
+     the user for the disposition. A set over the grouped-filing limit (50) is "needs you"; never
      split or truncate it silently. Name each issue in the trail.
    - Already-tracked issue not moving (no active run, not sweep-fireable per issue-triage's
      Step 1 selector plus `uzi` or bot assignment, no enabled one-time schedule still to
@@ -505,7 +509,7 @@ and they precede every merge (step 6):
   unmodified `main` in its own pinned worktree. Treat it as pre-existing only on matching
   failure evidence (same step, same error, same logs), not a similar symptom. Checks that
   failure blocks are still unvalidated for this PR: say which and get the user's call before
-  merging. File the regression with both results; add `uzi` only once it is sweep-ready.
+  merging. File the regression with both results; queue it per the on-deck *Filing default*.
   Compare failing-test sets, not counts. A worker's Go can be older than CI's `setup-go`:
   gofmt with CI's Go before trusting a worker's `fmt-check`.
 - **Pin every local review to the immutable head.** The buddy is the default reviewer

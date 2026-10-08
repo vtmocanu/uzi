@@ -678,13 +678,28 @@ uzi version
   you have before export or discard. The human view lists only open custody holds across
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
   `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
-  `open_holds`, `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate, plus
+  `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
+  `blocked_runs` aggregate. Capacity uses admission count against the fixed limit 8;
+  `open_holds` remains total custody. At most one hold per run is excluded when it backs
+  an exact-owner/run/live-run, unreleased current-generation claim on a matching existing
+  same-owner worker with a fresh non-null heartbeat (inclusive configured
+  `WorkerHeartbeatStale` cutoff), in `claimed`, `running`, `awaiting_approval`,
+  `awaiting_input` or `awaiting_followup`, without a `needs_action`/`source_only` decision.
+  Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
+  remain counted; `active` attention alone is not eligibility. Accounting releases nothing
+  and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
+  bypass owner admission with 1–7 own total open holds, losing that exemption at 8;
+  `blocked_runs` excludes exempt continuations. Concurrent claims and late staleness can
+  exceed the limit under the statement-snapshot gate. The current API emits the new field
+  even at zero; the CLI falls back to total only when an older API omits it, preserving
+  explicit zero. The human view also prints
   a recover-or-discard hint when an open hold needs a decision. With no run id, `--json`
   returns the endpoint's `aggregate` and `holds`, including settled holds, without captures.
   Supply a run id to list that run's retained holds (owner-only): each hold's exact id,
   claim generation, server-derived **disposition** and latest capture state.
   A `source_only` or `needs_action` disposition awaits your decision;
-  `archive_ready` self-releases and `active` is healthy protection of a still-running run.
+  `archive_ready` can release after its required evidence is accepted; `active` labels
+  nonterminal protection but does not prove admission eligibility.
   Recover an available archive with `uzi run export`, or discard a held source with
   `uzi run discard`. `--json` emits the run's raw hold DTOs, each with a `captures` array
   (id, state, source_sha, byte_size, created_at); pass a capture id to
@@ -727,9 +742,11 @@ uzi version
   keeps `worker_lost` as its origin, with this rejection prose; it does not prove
   absence of unrecorded worker work. Recorded evidence or uncertainty at exhaustion
   instead holds the run at `recovery_wait` / `worker_requeue_exhausted` for owner Resume.
-  The originating worker's exact-generation open hold remains in custody. For a terminal
-  run or a non-terminal exhaustion hold without an available independently verified
-  capture, it reports `source_only` rather than `active_protected`:
+  The originating worker's exact-generation open hold remains in custody. An exhaustion
+  hold stays an owner decision (`source_only`, or `needs_action` after a failed capture),
+  independently of archive availability or a capture preparing/uploading. An available
+  archive stays exportable but may not cover the latest worker-local work. Without an
+  available archive or a capture in progress, source-only custody reports:
   "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)".
   Export requires an available independent capture; a verified pin must first be archived.
   Hold discard changes database custody; it does not repair the worker journal.

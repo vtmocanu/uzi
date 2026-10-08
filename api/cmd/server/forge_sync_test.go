@@ -95,7 +95,7 @@ func (s *wiringStore) CountUsersPausedWithEnabledSchedules(context.Context, pgty
 func (s *wiringStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
 	return nil, nil
 }
-func (s *wiringStore) ListOwnersOverCustodyLimit(context.Context, int32) ([]uuid.UUID, error) {
+func (s *wiringStore) ListOwnersOverCustodyLimit(context.Context, store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
 func (s *wiringStore) ListCustodyHoldsForOwner(context.Context, store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {

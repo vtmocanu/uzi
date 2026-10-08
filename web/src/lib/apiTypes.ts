@@ -4810,9 +4810,11 @@ export interface RecoveryCustodyHold {
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
-// one-per-episode Slack DM read. All four counts are always present (0 is meaningful).
+// one-per-episode Slack DM read. Counts are numeric (0 is meaningful).
+// admission_counted_holds is optional for compatibility with older servers.
 export interface RecoveryCustodyAggregate {
   open_holds: number;
+  admission_counted_holds?: number;
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;

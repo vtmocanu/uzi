@@ -788,6 +788,20 @@ type RecoveryCustodyHold struct {
 	FinalCoverageDigest        pgtype.Text        `json:"final_coverage_digest"`
 }
 
+type RecoveryCustodyHoldFact struct {
+	ID                  uuid.UUID `json:"id"`
+	UserID              uuid.UUID `json:"user_id"`
+	RunID               uuid.UUID `json:"run_id"`
+	State               string    `json:"state"`
+	InventoryGuarded    bool      `json:"inventory_guarded"`
+	HasAvailableCapture bool      `json:"has_available_capture"`
+	CaptureState        string    `json:"capture_state"`
+	RunStatus           string    `json:"run_status"`
+	RecoveryWaitCause   string    `json:"recovery_wait_cause"`
+	Attention           string    `json:"attention"`
+	DecisionNeeded      bool      `json:"decision_needed"`
+}
+
 type Repo struct {
 	ID                      uuid.UUID          `json:"id"`
 	ConnectionID            uuid.UUID          `json:"connection_id"`

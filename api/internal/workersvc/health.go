@@ -241,11 +241,11 @@ const (
 	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it.
 	reasonRepoNotDockerAllowed = "this repo isn't on the Docker worker allowlist, so no Docker worker can run it"
 	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
-	// the custody-hold admission limit — they hold >= custodyHoldLimit UNRESOLVED (open)
-	// custody holds, so ClaimRun's owner-scoped custody-admission clause matches no row and
+	// the custody-hold admission limit — they hold >= custodyHoldLimit admission-counted
+	// open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
 	// the run stays queued until the owner resolves or discards some unpublished-work
 	// archives. Resolved against the SAME predicate the claim gates on
-	// (GetCustodyAdmissionForRun's owner open-hold count vs the same custodyHoldLimit
+	// (GetCustodyAdmissionForRun's admission-counted holds vs the same custodyHoldLimit
 	// constant, plus ClaimRun's continuation exemption, issue #1751), so the pill and the
 	// claim can never disagree. Maps to the SAME healthWaitingWorker enum (no
 	// migration — runs.health_reason is free text). A NEW const, never a reuse of the
@@ -939,13 +939,13 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		return reasonVaultLocked
 	}
 	// PRD #1296 M4 (D4): the owner-scoped custody-admission block. When the owner holds
-	// >= custodyHoldLimit UNRESOLVED (open) custody holds, ClaimRun's custody-admission
+	// >= custodyHoldLimit admission-counted open holds (ADR-2445), ClaimRun's custody-admission
 	// clause matches no row and the run stays queued no matter how many idle, capable
 	// workers exist — so this is a FUNDAMENTAL, fleet-independent block, resolved right
 	// after the vault-lock (the only other owner-account-state block) and AHEAD of every
-	// worker-availability reason: bringing a worker online cannot clear it, and naming a
+	// worker-availability reason: adding worker slots cannot clear counted custody, and naming a
 	// worker reason would point at the wrong cause. Read against the SAME predicate the
-	// claim gates on (GetCustodyAdmissionForRun: the owner's open-hold count and the same
+	// claim gates on (GetCustodyAdmissionForRun: the owner's admission-counted holds and the same
 	// custodyHoldLimit constant), so the pill and the claim never disagree. Issue #1751 /
 	// ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold count
 	// at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
@@ -958,10 +958,11 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if custodyHoldLimit > 0 {
 		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
 			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: custodyHoldLimit,
+			HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		})
 		if cerr != nil {
 			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
-		} else if !adm.ContinuationExempt && adm.OpenHolds >= int64(custodyHoldLimit) {
+		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(custodyHoldLimit) {
 			return reasonCustodyLimit
 		}
 	}

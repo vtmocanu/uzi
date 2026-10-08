@@ -183,3 +183,8 @@ uzi_cli run mr-rework "$SRC_RUN" --enabled=false >/dev/null \
 active_mrr_now() { uzi_cli run list --json | active_mrr; }
 wait_eq 0 "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}" "active mr_rework runs on MR !$MR_IID after the override" active_mrr_now
 pass "mr_rework turned off for MR !$MR_IID's source run $SRC_RUN (no later rework can start)"
+
+# Completion can arrive before FINAL. Phase 72 seeds to an exact owner-wide limit;
+# these fresh holds must stop changing its baseline before this phase returns.
+wait_completed_custody_receipt "$RUN_MRR"
+wait_completed_custody_receipt "$RUN_MRR2"

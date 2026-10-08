@@ -1148,9 +1148,11 @@ chain in the diagram above, with no intervening `running`.
   still-running turn from a local checkpoint, while this one preserves a
   run's original commits across a `failed` finalization and the worker's
   eventual teardown. A **claim-scoped custody hold** (`recovery_custody_holds`,
-  H-free, opened in the same `ClaimRun` transaction) reserves owner-scoped
-  admission capacity and blocks the worker's teardown while the work is
-  unpublished; the **archive capture** (`recovery_captures`) is the later,
+  H-free, opened in the same `ClaimRun` transaction) protects unpublished work
+  and blocks the worker's teardown. Admission counts open holds except at most
+  one per run backing a healthy current claim without an owner decision;
+  total custody remains protected. See [ADR-2445](adr/2445-custody-admission-accounting.md).
+  The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
   (a v2 worker advertises `recovery_archive_v2`; an ambiguous/older case
