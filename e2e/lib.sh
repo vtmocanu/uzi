@@ -431,23 +431,25 @@ wait_custody_headroom() {
   done
 }
 
-# wait_forge_park_release RUN GENERATION [TIMEOUT]: guarded holds settle after the
-# park acknowledgement. Require the exact final receipt while still parked in the
-# same generation; legacy claims retain their atomic no_adopted_source assertion.
+# wait_forge_park_release RUN GENERATION [TIMEOUT] [STATUS]: guarded holds settle after the
+# outcome acknowledgement. Require the exact final receipt while the outcome and
+# generation are unchanged; legacy claims retain their atomic no_adopted_source assertion.
 wait_forge_park_release() {
-  local run="$1" generation="$2" timeout="${3:-10}" start=$SECONDS snapshot
+  local run="$1" generation="$2" timeout="${3:-10}" want="${4:-recovery_wait}" start=$SECONDS snapshot
   [[ "$generation" =~ ^[1-9][0-9]*$ ]] || fail "forge park invalid generation: $generation"
+  case "$want" in recovery_wait|failed) ;; *) fail "forge park invalid expected status: $want";; esac
   while :; do
     snapshot="$(db_psql "SELECT COALESCE(json_agg(json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
       'generation',h.generation,'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
-      'after_park',h.released_at >= r.claim_released_at,'run_status',r.status,'claim_generation',r.claim_generation)), '[]'::json)::text
+      'after_outcome',h.released_at >= CASE WHEN r.status='failed' THEN r.finished_at ELSE r.claim_released_at END,
+      'run_status',r.status,'claim_generation',r.claim_generation)), '[]'::json)::text
       FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
       WHERE h.run_id='$run' AND h.generation=$generation")"
     printf '%s' "$snapshot" | jq -e 'type=="array" and length==1' >/dev/null \
       || fail "forge park expected exactly one hold (missing receipt or duplicate): $snapshot"
     snapshot="$(printf '%s' "$snapshot" | jq -c '.[0]')"
-    printf '%s' "$snapshot" | jq -e --argjson gen "$generation" \
-      '.generation==$gen and .claim_generation==$gen and .run_status=="recovery_wait"' >/dev/null \
+    printf '%s' "$snapshot" | jq -e --argjson gen "$generation" --arg want "$want" \
+      '.generation==$gen and .claim_generation==$gen and .run_status==$want' >/dev/null \
       || fail "forge park changed run/generation or lost hold: $snapshot"
     if printf '%s' "$snapshot" | jq -e '.inventory_guarded==false' >/dev/null; then
       printf '%s' "$snapshot" | jq -e '.state=="released" and .release_evidence=="no_adopted_source"' >/dev/null \
@@ -455,7 +457,7 @@ wait_forge_park_release() {
       return 0
     fi
     if printf '%s' "$snapshot" | jq -e '.state=="released"' >/dev/null; then
-      printf '%s' "$snapshot" | jq -e '.final_disposition=="settled" and .release_evidence=="forge_no_output" and .after_park==true' >/dev/null \
+      printf '%s' "$snapshot" | jq -e '.final_disposition=="settled" and .release_evidence=="forge_no_output" and .after_outcome==true' >/dev/null \
         || fail "guarded forge park has wrong release evidence: $snapshot"
       return 0
     fi

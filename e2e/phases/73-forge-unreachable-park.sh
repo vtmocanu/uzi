@@ -207,8 +207,12 @@ FB="$(apiget "/api/runs/$RUN_B")"
   || fail "fail_origin != forge_unreachable (got: $(echo "$FB" | jq -c '.run.fail_origin'))"
 [ "$(echo "$FB" | jq -r '.run.forge_park_count')" = 2 ] \
   || fail "forge_park_count != 2 after the cap-fail (got: $(echo "$FB" | jq -c '.run.forge_park_count'))"
+# forgepark.go's cap branch calls SetRunFailed, which stamps finished_at. Guarded
+# settlement follows that terminal ACK, so its release must follow finished_at.
+PARK_GENERATION_B="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_B'")"
+wait_forge_park_release "$RUN_B" "$PARK_GENERATION_B" 10 failed
 [ "$(db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id='$RUN_B' AND state='open'")" = 0 ] \
-  || fail "the cap-failed run left an open custody hold — the fail path released the hold before the cap check"
+  || fail "the cap-failed run left an open custody hold after its final receipt"
 # Confirm no judge run exists for the cap-fail. NOTE: the judge is globally disabled at this
 # point in the suite (phases 35/39 leave judge_enabled=false), so this checks ABSENCE rather
 # than exercising the exclusion gate itself. The forge_unreachable exclusion (neverJudgeFailOrigins)
@@ -227,7 +231,8 @@ dispatch_run_forge_broken "E2E forge park cancel"
 RUN_C="$DISPATCHED_RUN"
 # Cancel while the worker is still in its clone-retry window (pre-park). The park
 # transaction reads the stamped cancel under its lock and transitions to cancelled instead
-# of parking (D4), still releasing the generation's hold; a latched cancel converges the
+# of parking (D4). Legacy custody releases in that transaction; guarded custody
+# requires worker evidence after the terminal ACK. A latched cancel converges the
 # same way. Landing slightly after a park still cancels on the next cycle — allow room.
 apipost "/api/runs/$RUN_C/inputs" '{"kind":"cancel","body":""}' >/dev/null
 pass "dispatched run $RUN_C and queued an owner cancel during the retries"

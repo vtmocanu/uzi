@@ -205,17 +205,19 @@ custody_case "missing ceiling cannot read green" fail "invalid admission limit" 
 
 park_fixture() {
   : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
-  local step
+  local step status
   for step in "$@"; do
-    jq -nc --arg step "$step" '{state:"open",inventory_guarded:true,generation:1,claim_generation:1,run_status:"recovery_wait",final_disposition:null,release_evidence:null,after_park:null}
-      | if $step=="released" then .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_park:true}
-        elif $step=="wrong" then .+{state:"released",final_disposition:"no_adopted_source",release_evidence:"no_adopted_source",after_park:true}
-        elif $step=="early" then .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_park:false}
+    status=recovery_wait
+    if [[ "$step" == failed:* ]]; then status=failed; step="${step#failed:}"; fi
+    jq -nc --arg step "$step" --arg status "$status" '{state:"open",inventory_guarded:true,generation:1,claim_generation:1,run_status:$status,final_disposition:null,release_evidence:null,after_outcome:null}
+      | if $step=="released" then .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_outcome:true}
+        elif $step=="wrong" then .+{state:"released",final_disposition:"no_adopted_source",release_evidence:"no_adopted_source",after_outcome:true}
+        elif $step=="early" then .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_outcome:false}
         elif $step=="reclaimed" then .claim_generation=2
         elif $step=="promoted" then .run_status="queued"
         elif $step=="legacy" then .+{inventory_guarded:false,state:"released",release_evidence:"no_adopted_source"}
         elif $step=="legacy-open" then .inventory_guarded=false
-        elif $step=="duplicate" then [., .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_park:true}]
+        elif $step=="duplicate" then [., .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_outcome:true}]
         else . end' >> "$SEQ_DIR/seq"
   done
 }
@@ -241,6 +243,14 @@ park_fixture duplicate
 custody_case "two matching holds cannot mask the open first row" fail "expected exactly one hold" wait_forge_park_release R 1 2
 park_fixture released
 custody_case "null generation cannot reach SQL" fail "invalid generation" wait_forge_park_release R null 2
+park_fixture failed:open failed:released
+custody_case "guarded cap failure waits for its final receipt" pass "" wait_forge_park_release R 1 5 failed
+park_fixture failed:wrong
+custody_case "cap failure refuses wrong final evidence" fail "wrong release evidence" wait_forge_park_release R 1 2 failed
+park_fixture failed:early
+custody_case "cap release predating terminal outcome is refused" fail "wrong release evidence" wait_forge_park_release R 1 2 failed
+park_fixture promoted
+custody_case "cap failure refuses status change" fail "changed run/generation" wait_forge_park_release R 1 2 failed
 
 # Drive the real sequential outbox creation seam, not just the admission helper.
 # Each fresh claim must observe a saturated-then-free owner before create_run.
@@ -285,10 +295,16 @@ readoption_owner_queries() {
   echo 'owner resolved for the later sibling precondition'
 }
 custody_case "readoption keeps its later owner-scoped precondition" pass 'owner resolved' readoption_owner_queries
-wait_forge_park_release() { [ "$2" = 1 ] || fail 'phase did not use authoritative DB generation'; }
+wait_forge_park_release() {
+  [ "$2" = 1 ] || fail 'phase did not use authoritative DB generation'
+  [ "$1" != B ] || [ "${4:-}" = failed ] || fail 'cap call lacks the expected terminal status'
+  park_calls=$((park_calls + 1))
+}
 park_phase_call() {
-  local -x RUN_A=R FA='{"run":{"status":"recovery_wait"}}'
-  eval "$(awk '/^PARK_GENERATION=/ || /^wait_forge_park_release /' "$ROOT/e2e/phases/73-forge-unreachable-park.sh")"
+  local park_calls=0
+  local -x RUN_A=R RUN_B=B FA='{"run":{"status":"recovery_wait"}}'
+  eval "$(awk '/^PARK_GENERATION(_B)?=/ || /^wait_forge_park_release /' "$ROOT/e2e/phases/73-forge-unreachable-park.sh")"
+  [ "$park_calls" = 2 ] || fail 'phase did not wait for both park and cap receipts'
   echo 'phase used authoritative DB generation'
 }
 custody_case "park phase gets generation absent from run DTO" pass 'phase used authoritative DB generation' park_phase_call
@@ -333,6 +349,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 51 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 55 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 51 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 55 ] && [ "$cases" -eq "$passed" ]
