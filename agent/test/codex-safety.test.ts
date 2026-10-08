@@ -350,9 +350,11 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const first = defer<ReapOutcome>();
     const second = defer<ReapOutcome>();
+    const secondAdmitted = defer<void>();
     let spawnCalls = 0;
     const seam: SpawnRootSeam = async () => {
       spawnCalls += 1;
+      if (spawnCalls === 2) secondAdmitted.resolve();
       const reap = spawnCalls === 1 ? first.promise : second.promise;
       return new FakeRoot("boundary_action", async () => reap);
     };
@@ -369,7 +371,7 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
         boundarySettled = true;
       });
 
-    await tick();
+    await secondAdmitted.promise;
     assert.equal(spawnCalls, 2, "the second action was admitted while the first batch drained");
     first.resolve({ ok: true });
     await tick();

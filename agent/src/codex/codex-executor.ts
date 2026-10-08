@@ -4414,8 +4414,10 @@ function cacheForLaunch(cache: RunCommandCache | undefined, launch: EffectLaunch
  * reported a clean disposal (its registeredRoot reap/dispose, which both go through
  * the handle's dispose) AND no provider-epoch registry of the run was ever poisoned
  * (`isPoisoned()` is sticky across disposal). A launch that threw after the spec named the
- * cache, an unclean or rejected disposal, or a root never disposed by the terminal settle
- * makes it false. False is the safe direction: the directory is retained for the startup
+ * cache makes it false unless that invocation receives the launcher's fresh, exact-attempt
+ * certificate for fully closed rejected-startup cleanup. An unclean or rejected disposal,
+ * or a root never disposed by the terminal settle, also makes it false. False is the safe
+ * direction: the directory is retained for the startup
  * reaper.
  */
 export class HeldRunCommandCache implements RunCommandCache {
