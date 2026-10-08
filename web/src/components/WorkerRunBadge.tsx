@@ -14,6 +14,9 @@ export function WorkerRunBadge({
     <>
       {runs && <Badge tone={runs.tone} title={runs.title}>{runs.label}</Badge>}
       {checks && <Badge tone={checks.tone} title={checks.title}>{checks.label}</Badge>}
+      {worker.busy && worker.active_runs === 0 && worker.active_cross_checks === 0 &&
+        (worker.max_cross_check_slots ?? 0) > 0 &&
+        <Badge tone="warning" title="Chat active">busy</Badge>}
     </>
   );
 }

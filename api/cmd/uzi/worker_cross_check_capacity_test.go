@@ -52,9 +52,21 @@ func TestWorkerCrossCheckCapacityDisplays(t *testing.T) {
 			if strings.Contains(detail, "chat active") {
 				t.Fatalf("cross-check mislabeled as chat: %s", detail)
 			}
-			summary := stripANSI(m.workersSummary(200))
-			if !strings.Contains(summary, "0/2 run slots in use") || !strings.Contains(summary, "1/") || !strings.Contains(summary, "cross-checks") {
-				t.Fatalf("summary: %s", summary)
+			for _, width := range []int{40, 80, 120, 200} {
+				summary := stripANSI(m.workersSummary(width))
+				var capacity string
+				for _, part := range strings.Split(summary, " · ") {
+					if strings.Contains(part, "cross-checks") || strings.Contains(part, "checks") {
+						capacity = part
+					}
+				}
+				want := tc.want + " cross-checks"
+				if width <= 80 {
+					want = tc.want + " checks"
+				}
+				if capacity != want {
+					t.Fatalf("width %d: fleet capacity = %q, want %q; summary: %s", width, capacity, want, summary)
+				}
 			}
 		})
 	}

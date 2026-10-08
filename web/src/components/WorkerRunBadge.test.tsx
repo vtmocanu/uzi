@@ -26,6 +26,24 @@ describe("WorkerRunBadge cross-check lane", () => {
     expect(screen.getByText(`1/${cap ?? "?"} cross-checks`)).toBeTruthy();
   });
 
+  it("shows busy alongside both capacity badges for uncounted chat activity", () => {
+    render(<WorkerRunBadge worker={{ ...worker, active_runs: 0, active_cross_checks: 0 }} />);
+    expect(screen.getByText("0/1 runs")).toBeTruthy();
+    expect(screen.getByText("0/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("busy")).toBeTruthy();
+  });
+
+  it.each([
+    { busy: true, active_runs: 1, active_cross_checks: 0 },
+    { busy: true, active_runs: 0, active_cross_checks: 1 },
+    { busy: false, active_runs: 0, active_cross_checks: 0 },
+  ])("does not add busy for counted lane activity or idle workers: %s", (activity) => {
+    render(<WorkerRunBadge worker={{ ...worker, ...activity }} />);
+    expect(screen.getByText(`${activity.active_runs}/1 runs`)).toBeTruthy();
+    expect(screen.getByText(`${activity.active_cross_checks}/1 cross-checks`)).toBeTruthy();
+    expect(screen.queryByText("busy")).toBeNull();
+  });
+
   it("shows idle capacity without labeling a cross-check-only worker busy", () => {
     render(<WorkerRunBadge worker={{ ...worker, active_runs: 0 }} />);
     expect(screen.getByText("0/1 runs")).toBeTruthy();

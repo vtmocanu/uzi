@@ -70,6 +70,24 @@ it("dedicated cross-check claims retain the bounded response decoder", async (t)
   assert.equal(cancelled, true);
 });
 
+it("unmarked dedicated valid oversized response closes the stream and throws the 2MiB limit", async (t) => {
+  let cancelled = false;
+  let sent = false;
+  const body = Buffer.from(JSON.stringify({ run_id: "check", kind: "cross_check", padding: "x".repeat(8 * 1024 * 1024) }));
+  t.mock.method(globalThis, "fetch", async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) controller.close();
+      else {
+        sent = true;
+        controller.enqueue(body);
+      }
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 })));
+  await assert.rejects(client().claimCrossCheck(), /response body exceeds 2097152 bytes/);
+  assert.equal(cancelled, true);
+});
+
 it("aborted dedicated claims never start transport", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { assert.fail("unexpected transport"); });
   await assert.rejects(client().claimCrossCheck(snapshot, AbortSignal.abort()), { name: "AbortError" });

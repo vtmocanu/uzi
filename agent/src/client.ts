@@ -1281,10 +1281,10 @@ export class WorkerClient {
 
   /** Dedicated lane; uses the run snapshot, deadline and guarded claim decoder. */
   async claimCrossCheck(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
-    return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim?lane=cross_check`, activeSnapshot, signal, timeoutMs);
+    return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim?lane=cross_check`, activeSnapshot, signal, timeoutMs, true);
   }
 
-  private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<ClaimResponse | null> {
+  private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number, dedicated = false): Promise<ClaimResponse | null> {
     // The same deadline reaches fetch AND its body. Await the real request rather than a race:
     // admission must remain held until a late transport has definitively stopped.
     const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
@@ -1302,9 +1302,9 @@ export class WorkerClient {
       await res.body?.cancel();
       throw new Error("unknown dedicated claim marker");
     }
-    // Unmarked ordinary claims keep their existing decoder. This does not bound an
-    // arbitrary compromised unmarked response; the server envelope is a separate gate.
-    const claim = (marker === "cross_check"
+    // Dedicated requests are bounded even without a marker; unmarked ordinary
+    // claims keep their existing decoder.
+    const claim = (dedicated || marker === "cross_check"
       ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
       : await res.json()) as ClaimResponse;
     if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {

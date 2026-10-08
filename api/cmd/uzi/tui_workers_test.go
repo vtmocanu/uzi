@@ -24,7 +24,7 @@ func TestWorkersDemoFleet(t *testing.T) {
 		t.Fatal("demo healthy busy worker needs retained source and no owner decisions")
 	}
 	m := workersScene(true, "workers-list-120")
-	want := "workers · 9 · 8 online · 5/12 run slots in use · 0/0 cross-checks · 1 holding · 1 draining · 7 need attention"
+	want := "workers · 9 · 8 online · 5/12 run slots in use +1 ?cap · 0/? cross-checks · 1 holding · 1 draining · 7 need attention"
 	if got := stripANSI(m.workersSummary(120)); got != want {
 		t.Fatalf("summary %q", got)
 	}
@@ -716,9 +716,9 @@ func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
 		used, cap int
 		want      string
 	}{
-		{"unknown cap first", 1, 2, "workers · 2 · 2 online · 1/2 run slots in use · 0/0 cross-checks · 1 holding · 1 need attention"},
-		{"admission next", 12345, 12345, "workers · 2 · 2 online · 12345/12345 run slots in use · 0/0 cross-checks · 1 need attention"},
-		{"online last", 1234567890, 1234567890, "workers · 1234567890/1234567890 runs · 0/0 checks · 1 need attention"},
+		{"unknown cap first", 1, 2, "workers · 2 · 2 online · 1/2 run slots in use · 0/? cross-checks · 1 holding · 1 need attention"},
+		{"admission next", 12345, 12345, "workers · 2 · 2 online · 12345/12345 run slots in use · 0/? cross-checks · 1 need attention"},
+		{"online last", 1234567890, 1234567890, "workers · 1234567890/1234567890 runs · 0/? checks · 1 need attention"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := workersScene(true, "workers-list-80")

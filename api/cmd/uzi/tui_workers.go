@@ -581,12 +581,13 @@ func (m tuiModel) workersSummary(width int) string {
 			slots = fmt.Sprintf("%d/%d runs", used, cap)
 		}
 		parts = append(parts, slots)
-		cross := fmt.Sprintf("%d/%d cross-checks", crossUsed, crossCap)
-		if showUnknown && crossUnknown > 0 {
-			cross += fmt.Sprintf(" +%d ?cap", crossUnknown)
+		crossDenom := itoa(crossCap)
+		if crossUnknown > 0 {
+			crossDenom = "?"
 		}
+		cross := fmt.Sprintf("%d/%s cross-checks", crossUsed, crossDenom)
 		if !showCount {
-			cross = fmt.Sprintf("%d/%d checks", crossUsed, crossCap)
+			cross = fmt.Sprintf("%d/%s checks", crossUsed, crossDenom)
 		}
 		parts = append(parts, cross)
 		if showAdmission {
