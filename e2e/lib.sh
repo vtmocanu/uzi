@@ -455,6 +455,45 @@ wait_custody_headroom() {
   done
 }
 
+# End-of-fixture owner choice, ONLY for an explicit run/generation whose phase
+# already proved preservation. Available archives survive the product hold discard.
+resolve_fixture_source_hold() {
+  local run="$1" generation="$2" view hold id state before after reply
+  [[ "$run" =~ ^[0-9a-fA-F-]{36}$ && "$generation" =~ ^[1-9][0-9]*$ ]] \
+    || fail "invalid fixture hold identity: run=$run generation=$generation"
+  apiget "/api/runs/$run" | jq -e --arg run "$run" '.run.id==$run and (.run.status|IN("completed","failed","cancelled"))' >/dev/null \
+    || fail "fixture hold run is not terminal: $run"
+  view="$(apiget /api/recovery/holds)"
+  hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
+    '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
+  [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
+  id="$(printf '%s' "$hold" | jq -r '.[0].id')"
+  [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid fixture hold id: $hold"
+  state="$(printf '%s' "$hold" | jq -r '.[0].state')"
+  case "$state" in
+    released|discarded) pass "fixture hold already resolved: run=$run generation=$generation hold=$id"; return ;;
+    open) ;;
+    *) fail "unexpected fixture hold state: $hold" ;;
+  esac
+  printf '%s' "$hold" | jq -e '.[0] | .attention=="source_only" and .has_available_capture==false and (.capture_state // "")==""' >/dev/null \
+    || fail "fixture hold is not a capture-less owner decision: $hold"
+  before="$(apiget "/api/runs/$run/archives")"
+  printf '%s' "$before" | jq -e --arg id "$id" '.archives|type=="array" and all(.[]; .hold_id!=$id)' >/dev/null \
+    || fail "fixture hold has capture evidence: $id"
+  before="$(printf '%s' "$before" | jq -c '[.archives[]|select(.state=="available")|{id,checksum,byte_size}]')"
+  reply="$(uzi_cli run discard "$run" --hold "$id" --yes --json)" || fail "fixture owner disposition failed: run=$run hold=$id"
+  printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "fixture owner disposition not acknowledged: $reply"
+  view="$(apiget /api/recovery/holds)"
+  printf '%s' "$view" | jq -e --arg run "$run" --arg id "$id" --argjson generation "$generation" \
+    '[.holds[] | select(.id==$id and .run_id==$run and .generation==$generation)] | length==1 and .[0].state=="discarded"' >/dev/null \
+    || fail "fixture owner disposition has no exact discarded row: run=$run hold=$id"
+  after="$(apiget "/api/runs/$run/archives")"
+  printf '%s' "$after" | jq -e --argjson before "$before" \
+    '[.archives[]|select(.state=="available")|{id,checksum,byte_size}] as $after | all($before[]; . as $archive | any($after[]; .==$archive))' >/dev/null \
+    || fail "fixture owner disposition changed an available archive: run=$run hold=$id"
+  pass "fixture owner decision recorded: run=$run generation=$generation hold=$id; archives preserved"
+}
+
 # A completed status precedes the worker's final custody ACK. Wait only for this
 # run's current generation, preserving every older or unrelated source hold.
 wait_completed_custody_receipt() {

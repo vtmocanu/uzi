@@ -535,6 +535,127 @@ custody_case "autoselect observes all three cancellations before credential tear
 custody_case "autoselect cancel POST failure cannot proceed to teardown" fail 'could not cancel auto-selection run' autoselect_cancel_boundary post-failed
 custody_case "autoselect unexpected failed outcome cannot proceed to teardown" fail "entered 'failed'" autoselect_cancel_boundary failed
 
+eval "$(awk '/^resolve_fixture_source_hold\(\) \{/,/^\}/' "$LIB")"
+fixture_owner_decision() {
+  local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 sibling=b4dec5cf-e6d4-413b-b3a8-0005a2835771
+  local other=b4dec5cf-e6d4-413b-b3a8-0005a2835772 status=completed
+  echo 0 > "$SEQ_DIR/dispositions"
+  jq -nc --arg run "$UUID" --arg id "$target" --arg sibling "$sibling" --arg other "$other" --arg mode "$mode" \
+    '{holds:[{id:$id,run_id:$run,generation:1,state:"open",attention:"source_only",has_available_capture:false},
+      {id:$sibling,run_id:$run,generation:2,state:"released",attention:"released",has_available_capture:true},
+      {id:$other,run_id:$other,generation:1,state:"open",attention:"source_only",has_available_capture:false}]}
+      | if $mode=="missing" then .holds|=.[1:]
+        elif $mode=="duplicate" then .holds += [ .holds[0] ]
+        elif $mode=="wrong-generation" then .holds[0].generation=9
+        elif $mode=="released" or $mode=="discarded" then .holds[0].state=$mode
+        elif $mode=="capturing" then .holds[0] += {attention:"capturing",capture_state:"uploading"}
+        elif $mode=="needs_action" then .holds[0] += {attention:"needs_action",capture_state:"needs_action"}
+        elif $mode=="ready" then .holds[0].has_available_capture=true
+        elif $mode=="invalid-id" then .holds[0].id="bad"
+        else . end' > "$SEQ_DIR/fixture-holds"
+  jq -nc --arg sibling "$sibling" --arg target "$target" --arg mode "$mode" \
+    '{archives:[{id:"ready-archive",hold_id:$sibling,state:"available",checksum:"stable",byte_size:123}]}
+      | if $mode=="target-capture" then .archives += [{id:"partial",hold_id:$target,state:"preparing"}] else . end' > "$SEQ_DIR/fixture-archives"
+  [ "$mode" != live ] || status=awaiting_approval
+  apiget() {
+    case "$1" in
+      /api/recovery/holds) cat "$SEQ_DIR/fixture-holds" ;;
+      "/api/runs/$UUID/archives") cat "$SEQ_DIR/fixture-archives" ;;
+      "/api/runs/$UUID") jq -nc --arg run "$UUID" --arg status "$status" '{run:{id:$run,status:$status}}' ;;
+      *) fail 'unexpected fixture read' ;;
+    esac
+  }
+  uzi_cli() {
+    [ "$*" = "run discard $UUID --hold $target --yes --json" ] || fail 'unscoped fixture disposition'
+    echo $(( $(cat "$SEQ_DIR/dispositions") + 1 )) > "$SEQ_DIR/dispositions"
+    [ "$mode" != rpc-failed ] || return 1
+    if [ "$mode" != post-state ]; then
+      jq --arg id "$target" '(.holds[]|select(.id==$id)).state="discarded"' "$SEQ_DIR/fixture-holds" > "$SEQ_DIR/fixture-next"
+      mv "$SEQ_DIR/fixture-next" "$SEQ_DIR/fixture-holds"
+    fi
+    case "$mode" in
+      archive-lost) echo '{"archives":[]}' > "$SEQ_DIR/fixture-archives" ;;
+      archive-changed) jq '.archives[0].checksum="changed"' "$SEQ_DIR/fixture-archives" > "$SEQ_DIR/fixture-next"; mv "$SEQ_DIR/fixture-next" "$SEQ_DIR/fixture-archives" ;;
+    esac
+    [ "$mode" != ack-false ] || { echo '{"discarded":false}'; return; }
+    echo '{"discarded":true}'
+  }
+  resolve_fixture_source_hold "$UUID" 1
+  jq -e --arg sibling "$sibling" --arg other "$other" \
+    '([.holds[]|select(.id==$sibling)][0].state=="released") and ([.holds[]|select(.id==$other)][0].state=="open")' "$SEQ_DIR/fixture-holds" >/dev/null \
+    || fail 'fixture disposition changed a sibling or unrelated hold'
+  if [ "$mode" = released ] || [ "$mode" = discarded ]; then
+    [ "$(cat "$SEQ_DIR/dispositions")" = 0 ] || fail 'resolved hold was mutated'
+  else [ "$(cat "$SEQ_DIR/dispositions")" = 1 ] || fail 'exact owner choice missing'
+  fi
+  echo 'exact fixture generation resolved, siblings and ready archive preserved'
+}
+custody_case "exact fixture owner choice preserves sibling and archive" pass 'exact fixture generation resolved' fixture_owner_decision source
+for mode in released discarded; do
+  custody_case "already $mode fixture hold is a no-op" pass 'exact fixture generation resolved' fixture_owner_decision "$mode"
+done
+for mode in missing duplicate wrong-generation; do
+  custody_case "fixture decision rejects $mode identity" fail 'missing/ambiguous' fixture_owner_decision "$mode"
+done
+custody_case "fixture decision rejects a live run" fail 'not terminal' fixture_owner_decision live
+for mode in capturing needs_action ready; do
+  custody_case "fixture decision rejects $mode work" fail 'not a capture-less owner decision' fixture_owner_decision "$mode"
+done
+custody_case "fixture decision catches capture evidence omitted by hold summary" fail 'has capture evidence' fixture_owner_decision target-capture
+custody_case "fixture decision refuses malformed hold id" fail 'invalid fixture hold id' fixture_owner_decision invalid-id
+custody_case "fixture decision rejects failed owner RPC" fail 'disposition failed' fixture_owner_decision rpc-failed
+custody_case "fixture decision requires positive owner ACK" fail 'not acknowledged' fixture_owner_decision ack-false
+custody_case "fixture decision rechecks exact discarded row" fail 'no exact discarded row' fixture_owner_decision post-state
+for mode in archive-lost archive-changed; do
+  custody_case "fixture decision detects $mode evidence" fail 'changed an available archive' fixture_owner_decision "$mode"
+done
+
+# Execute the actual owning phase boundaries against the real owner helper. The
+# nine-hold fixture includes the completed outage case, which must remain open.
+fixture_phase_boundary() {
+  local phase="$1" before after run gen n=0 entry
+  local X=b4dec5cf-e6d4-413b-b3a8-0005a2835701 ED=b4dec5cf-e6d4-413b-b3a8-0005a2835702
+  local RUN_KA=b4dec5cf-e6d4-413b-b3a8-0005a2835703 RUN_KB=b4dec5cf-e6d4-413b-b3a8-0005a2835704
+  local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
+  # shellcheck disable=SC2034  # read by the extracted owning phase statements
+  local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3
+  echo '{"holds":[]}' > "$SEQ_DIR/boundary-holds"
+  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1"; do
+    run="${entry%:*}"; gen="${entry##*:}"; n=$((n + 1))
+    jq --arg run "$run" --argjson gen "$gen" --arg id "$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")" \
+      '.holds += [{id:$id,run_id:$run,generation:$gen,state:"open",attention:"source_only",has_available_capture:false}]' \
+      "$SEQ_DIR/boundary-holds" > "$SEQ_DIR/boundary-next"
+    mv "$SEQ_DIR/boundary-next" "$SEQ_DIR/boundary-holds"
+  done
+  apiget() {
+    case "$1" in
+      /api/recovery/holds) cat "$SEQ_DIR/boundary-holds" ;;
+      /api/runs/*/archives) echo '{"archives":[]}' ;;
+      /api/runs/*) jq -nc --arg run "${1##*/}" '{run:{id:$run,status:"cancelled"}}' ;;
+      *) fail 'unexpected boundary read' ;;
+    esac
+  }
+  uzi_cli() {
+    [ "$1 $2 $4 $6 $7" = 'run discard --hold --yes --json' ] || fail 'unexpected fixture command'
+    [ "$3" != "$UUID" ] || fail 'completed outage case was discarded'
+    jq -e --arg run "$3" --arg id "$5" '[.holds[]|select(.id==$id and .run_id==$run and .state=="open")]|length==1' "$SEQ_DIR/boundary-holds" >/dev/null \
+      || fail 'fixture command targeted a foreign hold'
+    jq --arg id "$5" '(.holds[]|select(.id==$id)).state="discarded"' "$SEQ_DIR/boundary-holds" > "$SEQ_DIR/boundary-next"
+    mv "$SEQ_DIR/boundary-next" "$SEQ_DIR/boundary-holds"
+    echo '{"discarded":true}'
+  }
+  before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
+  eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$ROOT/e2e/phases/$phase.sh")"
+  after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
+  [ "$before" = 9 ] && [ "$after" -lt 8 ] || fail 'next sweep still blocked by deliberate fixture holds'
+  jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
+    || fail 'completed outage case lost its evidence'
+  echo 'own phase relieved capacity while completed outage evidence stayed open'
+}
+for phase in 42-api-outage-readoption 45-bounded-concurrency 52-api-outage-outbox; do
+  custody_case "$phase resolves only its intentional fixture obligations" pass 'own phase relieved capacity' fixture_phase_boundary "$phase"
+done
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -545,6 +666,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 86 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 106 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 86 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 106 ] && [ "$cases" -eq "$passed" ]

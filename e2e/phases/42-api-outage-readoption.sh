@@ -330,6 +330,7 @@ worker_db_status() { db_psql "SELECT status FROM workers WHERE id = '$1'"; }
 
 # A live run so the worker actually has a snapshot to send across the rollback.
 make_hold_run;  ED="$HOLD_RUN"
+GEN_ED_ORIGINAL="$(run_field "$ED" claim_generation)"
 pass "case d: hold run $ED running on the worker"
 WORKER_D="$(run_field "$ED" worker_id)"
 export UZI_ACTIVE_SNAPSHOT_DISABLED=1
@@ -380,5 +381,13 @@ done
 # run first); wait for them to land so the quarantine does not find a run still settling
 # after the restore and log a LEAK (seen in CI).
 settle_runs_terminal 45 "${E:-}" "${G:-}" "${EA:-}" "${GA:-}" "${X:-}" "${ED:-}"
+
+# The loss/rollback fixtures proved retention above. End their explicit owner
+# obligations before later phases inherit them; no other run/generation is selected.
+wait_status "$X" cancelled
+wait_status "$ED" cancelled
+resolve_fixture_source_hold "$X" "$GEN_X0"
+resolve_fixture_source_hold "$X" "$GEN_X1"
+resolve_fixture_source_hold "$ED" "$GEN_ED_ORIGINAL"
 
 fi
