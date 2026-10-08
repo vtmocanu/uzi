@@ -1109,7 +1109,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
   const recovery = o.recovery === undefined ? undefined : recoveryProgress(o.recovery);
   let retainedSources: RecoverySource[] | undefined;
   if (o.retainedSources !== undefined) {
-    if (!Array.isArray(o.retainedSources) || o.retainedSources.length > 8) throw new Error("invalid retained sources");
+    if (!Array.isArray(o.retainedSources)) throw new Error("invalid retained sources");
     retainedSources = o.retainedSources.map(recoverySource);
   }
   if (recovery && !sameRecoverySource(source, recovery.source) &&
@@ -4289,7 +4289,7 @@ export class GitCache {
       }
     }
     let missing = false;
-    // At most ten descriptors, one pass, no retries. Any unsafe sibling refuses discovery.
+    // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
     for (const source of this.recoverySources(journal)) {
       let absent = false;
       for (const dir of [path.resolve(this.runnerRoot), path.dirname(source.clonePath), source.clonePath]) {
@@ -4474,7 +4474,6 @@ export class GitCache {
         runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
         ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
       }));
-      if (retainedSources.length >= 8) throw new Error("retained source limit reached");
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
       await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
@@ -4526,12 +4525,21 @@ export class GitCache {
       for (const source of this.recoverySources(journal)) {
         if (!this.clonePathShape(source.clonePath, this.runnerClonePath(barePath, key))) throw new Error("recovery key mismatch");
       }
+      // The worker-owned run namespace retains attribution for every capture, including
+      // superseded tips and pins created before a failed journal write. Validate the
+      // complete snapshot before deleting anything; sibling run namespaces are excluded.
+      const prefix = `refs/uzi-recovery-episode/${journal.runId}/`;
+      const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", prefix]);
+      const pins = listing.trim().split("\n").filter(Boolean).map(line => {
+        const [ref, oid, extra] = line.split(" ");
+        const tip = ref?.startsWith(prefix) ? ref.slice(prefix.length) : "";
+        if (ref === undefined || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
+        return { ref, tip };
+      });
+      // One attempt per enumerated pin, no retries. The first failed delete stops
+      // cleanup and keeps the journal; a later explicit discard can retry remaining pins.
+      for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "-d", ref, tip]);
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      // Bounded by the validated descriptor count. A failed pin delete stops cleanup;
-      // leaked pins are conservative and never imply custody release.
-      const tips = new Set(this.recoverySources(journal).map(s => s.restoreTip).filter((s): s is string => !!s));
-      if (journal.recovery?.restoreTip) tips.add(journal.recovery.restoreTip);
-      for (const tip of tips) await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
     });
   }
 

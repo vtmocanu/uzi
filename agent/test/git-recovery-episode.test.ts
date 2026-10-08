@@ -352,6 +352,111 @@ test("effective attempt mode refuses unknown markers, unsafe coordinates and con
   assert.equal(await cache.recoveryAttemptMode(fx.originPath, key), false);
 });
 
+test("more than eight settled recovery episodes retain every source, pin and byte and adopt fresh paths", async () => {
+  let expected: { runId: string; clonePath: string; attemptId?: string } = source;
+  const retained: Array<{ clonePath: string; head: Buffer; bytes: Buffer; tip: string }> = [];
+  // Ten episodes exceed both former descriptor limits; each performs real capture and handoff.
+  for (let n = 1; n <= 10; n++) {
+    const reservation = await recreate().reserveRecoveryIteration(bare, branch, key, expected);
+    assert.equal(reservation.attempts, 1, "only the preceding recorded completion reset the budget");
+    fs.writeFileSync(path.join(expected.clonePath, "work.txt"), "episode " + n + "\n");
+    git(expected.clonePath, ["add", "work.txt"]);
+    git(expected.clonePath, ["commit", "-m", "episode " + n]);
+    await fixtureFetchTracking(cache, bare, expected.clonePath, branch, runId);
+    const tip = git(expected.clonePath, ["rev-parse", "HEAD"]);
+    retained.push({ clonePath: expected.clonePath, tip,
+      head: fs.readFileSync(path.join(expected.clonePath, ".git", "HEAD")),
+      bytes: fs.readFileSync(path.join(expected.clonePath, "work.txt")) });
+    await cache.recordRecoveryCapture(bare, branch, key, expected, 1, tip);
+    const successor = await cache.prepareRecoverySuccessor(bare, branch, key, expected, 1, aid(n + 1));
+    assert.notEqual(successor.path, expected.clonePath);
+    expected = { runId, clonePath: successor.path, attemptId: aid(n + 1) };
+    assert.equal(journal().recovery.attempts, 1, "capture and handoff keep the charged budget");
+    assert.equal(journal().recovery.deadline, reservation.deadline);
+    await assert.rejects(cache.completeRecoveryEpisode(bare, branch, key, expected,
+      { settled: true, processedEvents: 0, attemptId: aid(n + 1) }), /evidence/);
+    assert.equal(journal().recovery.attempts, 1, "unrecorded processing cannot reset");
+    await cache.completeRecoveryEpisode(bare, branch, key, expected,
+      { settled: true, processedEvents: 1, attemptId: aid(n + 1) });
+    assert.equal(journal().recovery, undefined);
+  }
+  const discovered = (await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))!.journal;
+  assert.equal(discovered.retainedSources!.length, 10);
+  for (const saved of retained) {
+    assert.ok(discovered.retainedSources!.some(s => s.clonePath === saved.clonePath));
+    assert.deepEqual(fs.readFileSync(path.join(saved.clonePath, ".git", "HEAD")), saved.head);
+    assert.deepEqual(fs.readFileSync(path.join(saved.clonePath, "work.txt")), saved.bytes);
+    assert.equal(git(bare, ["rev-parse", "refs/uzi-recovery-episode/" + runId + "/" + saved.tip]), saved.tip);
+  }
+});
+
+for (const stage of ["captured", "handoff", "completed"] as const) {
+  test("explicit discard tracks distinct retry captures through " + stage + " and retries failed pin deletion", async () => {
+    const first = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const tipA = await capture();
+    await cache.recordRecoveryCapture(bare, branch, key, source, 1, tipA);
+    const retry = await recreate().reserveRecoveryIteration(bare, branch, key, source);
+    assert.equal(retry.attempts, 2);
+    assert.equal(retry.deadline, first.deadline);
+    fs.writeFileSync(path.join(source.clonePath, "work.txt"), "second capture\n");
+    git(source.clonePath, ["add", "work.txt"]);
+    git(source.clonePath, ["commit", "-m", "distinct retry capture"]);
+    await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
+    const tipB = git(source.clonePath, ["rev-parse", "HEAD"]);
+    assert.notEqual(tipA, tipB);
+    await cache.recordRecoveryCapture(bare, branch, key, source, 2, tipB);
+    let expected: { runId: string; clonePath: string; attemptId?: string } = source;
+    if (stage !== "captured") {
+      const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, 2, aid(2));
+      expected = { runId, clonePath: successor.path, attemptId: aid(2) };
+      assert.equal(journal().recovery.attempts, 2);
+      if (stage === "completed") await cache.completeRecoveryEpisode(bare, branch, key, expected,
+        { settled: true, processedEvents: 1, attemptId: aid(2) });
+    }
+    const pins: [string, string] = [
+      "refs/uzi-recovery-episode/" + runId + "/" + tipA,
+      "refs/uzi-recovery-episode/" + runId + "/" + tipB,
+    ];
+    const sibling = "refs/uzi-recovery-episode/" + runId + "-sibling/" + tipA;
+    const unrelated = "refs/keep/" + tipB;
+    git(bare, ["update-ref", sibling, tipA]);
+    git(bare, ["update-ref", unrelated, tipB]);
+    for (const [i, pin] of pins.entries()) assert.equal(git(bare, ["rev-parse", pin]), [tipA, tipB][i]);
+    const before = journal();
+    const lock = path.join(bare, ...pins[1].split("/")) + ".lock";
+    fs.writeFileSync(lock, "");
+    await assert.rejects(recreate().discardRetainedRecovery(bare, branch, key, expected, true));
+    assert.deepEqual(journal(), before, "failed cleanup retains trusted attribution");
+    assert.equal(git(bare, ["rev-parse", pins[1]]), tipB);
+    fs.unlinkSync(lock);
+    await recreate().discardRetainedRecovery(bare, branch, key, expected, true);
+    for (const pin of pins) assert.throws(() => git(bare, ["rev-parse", "--verify", pin]));
+    assert.equal(git(bare, ["config", "uzi-recovery." + branch + ".clone"]), "");
+    assert.equal(git(bare, ["rev-parse", sibling]), tipA);
+    assert.equal(git(bare, ["rev-parse", unrelated]), tipB);
+    assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "second capture\n");
+    assert.equal(fs.readFileSync(path.join(expected.clonePath, "work.txt"), "utf8"), "second capture\n");
+    assert.equal(await cache.recoveryAttemptMode(fx.originPath, key), true);
+  });
+}
+
+test("discard refuses malformed or changed run pin identity before deleting any pins or attribution", async () => {
+  const { expected, tip } = await ready();
+  const before = journal();
+  const good = "refs/uzi-recovery-episode/" + runId + "/" + tip;
+  const parent = git(bare, ["rev-parse", tip + "^"]);
+  for (const bad of ["refs/uzi-recovery-episode/" + runId + "/unexpected",
+    "refs/uzi-recovery-episode/" + runId + "/" + parent,
+    "refs/uzi-recovery-episode/" + runId + "/nested/" + tip]) {
+    git(bare, ["update-ref", bad, tip]);
+    await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true), /pin identity/);
+    assert.deepEqual(journal(), before);
+    assert.equal(git(bare, ["rev-parse", good]), tip);
+    assert.equal(git(bare, ["rev-parse", bad]), tip);
+    git(bare, ["update-ref", "-d", bad, tip]);
+  }
+});
+
 test("explicit owner discard keeps paths intact and per-key attempt mode outlives cleared journal", async () => {
   assert.equal(await cache.recoveryAttemptMode(fx.originPath, key), false);
   const { expected, tip } = await ready();
