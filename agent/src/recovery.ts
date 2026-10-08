@@ -637,13 +637,14 @@ export class RecoveryCoordinator {
     this.enabled = this.key !== undefined;
   }
 
-  // ── D1: unconditional local pin + authenticated journal ────────────────────────
+  // ── D1: source pin + authenticated journal ─────────────────────────────────────
 
   /**
-   * Pin H into the durable authenticated journal. UNCONDITIONAL, local and credential-free
-   * — this never waits for a server response and never uses a forge PAT. Idempotent within
-   * a run: an existing verified record for the same (runId, sourceSha) is reused, so a
-   * re-execution of the same committed head does not duplicate the pin.
+   * Pin H into the authenticated local journal without a forge PAT. Creating a new guarded
+   * journal requires a fresh exact open-hold read; unavailable or closed custody refuses
+   * creation. Updates to existing journals and legacy pins remain local. Reuses an existing
+   * verified source record for the same run and claim generation, or for the same run and
+   * source SHA when the legacy input has no generation.
    *
    * Returns the record, or undefined when recovery is disabled or the pin failed (the
    * caller treats undefined as "no capture to drive", never as a release authority).
@@ -1890,10 +1891,11 @@ export class RecoveryCoordinator {
    * Bounded and cheap to call: it returns at once while any pass (this or the boot sweep) is in
    * flight or before `nextPassAt`; rejected credentials exclude uploads but permit local ACK cleanup.
    * A pass touches at most `liveMaxPerPass` records, least recently attempted first, and backs off
-   * exponentially (capped) after a pass with a transient failure. Only records with a journaled
-   * bundle that are `bundled`, or `needs_action` for a transient reason or `credential_rejected`,
-   * are candidates; the upload is the journaled-bytes upload (no forge PAT; a journaled bundle is
-   * never re-produced). A run that is executing is skipped, and each record step takes the
+   * exponentially (capped) after a pass with a transient failure. Guarded records with a FINAL
+   * ACK retry local cleanup, including uploaded records. Other guarded candidates follow
+   * inventory retry eligibility; legacy candidates need a journaled bundle in `bundled` or
+   * transient/credential-rejected `needs_action`. Uploads use journaled bytes without a forge
+   * PAT and never reproduce the bundle. A run that is executing is skipped, and each step takes the
    * capture-cycle lock in skip mode, so it never waits behind a foreground capture or sweep step
    * on the same record.
    */
