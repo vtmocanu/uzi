@@ -13,6 +13,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { StrictMode } from "react";
 
 import { AdminHealth } from "./AdminHealth";
 import { likelyCause } from "../components/WorkerUpgradeBadge";
@@ -38,24 +39,33 @@ vi.mock("../lib/api", async (importOriginal) => {
 const mockApi = vi.mocked(api);
 
 const originalMatchMedia = window.matchMedia;
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 
 afterEach(() => {
   cleanup();
+  vi.clearAllTimers();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   vi.clearAllMocks();
+  if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+  else Reflect.deleteProperty(navigator, "clipboard");
   window.matchMedia = originalMatchMedia;
 });
 
-async function renderHealth(doc: HealthDoc, fleet: AdminWorker[] = []) {
+async function renderHealth(doc: HealthDoc, fleet: AdminWorker[] = [], strict = false) {
   mockApi.getAdminHealth.mockResolvedValue(doc);
   mockApi.adminListWorkers.mockResolvedValue({ workers: fleet });
   const utils = render(
     <MemoryRouter initialEntries={["/admin/health"]}>
       <AdminHealth />
     </MemoryRouter>,
+    { wrapper: strict ? StrictMode : undefined },
   );
   // The Copy diagnostics button renders only once the doc resolves, so waiting on it ensures
   // no assertion races the load (and it is unambiguous — one per page).
   await waitFor(() => expect(screen.getByText("Copy diagnostics")).toBeTruthy());
+  // Settle the loaded content's mount effects before a test switches to fake timers.
+  await act(async () => {});
   return utils;
 }
 
@@ -237,6 +247,132 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
     expect(writeText).toHaveBeenCalledWith(JSON.stringify(doc, null, 2));
     expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
+  });
+});
+
+describe("AdminHealth — copy feedback lifecycle", () => {
+  for (const kind of ["diagnostics", "command"] as const) {
+    it(`clears the exact ${kind} feedback timer on unmount`, async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      const { container, unmount } = await renderHealth(incidentDoc());
+      const button = kind === "diagnostics"
+        ? screen.getByRole("button", { name: "Copy diagnostics" })
+        : within(attentionItem(container, "fleet.roll")!).getByRole("button", { name: "Copy" });
+      vi.useFakeTimers();
+      const setTimeout = vi.spyOn(window, "setTimeout");
+      const clearTimeout = vi.spyOn(window, "clearTimeout");
+      await act(async () => { fireEvent.click(button); });
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(button.textContent).toBe("Copied");
+      const feedbackCalls = setTimeout.mock.calls
+        .map((args, index) => ({ delay: args[1], id: setTimeout.mock.results[index].value }))
+        .filter(({ delay }) => delay === 1600);
+      expect(feedbackCalls).toHaveLength(1);
+      const timerId = feedbackCalls[0].id;
+      unmount();
+      act(() => { vi.advanceTimersByTime(1700); });
+      expect(clearTimeout).toHaveBeenCalledWith(timerId);
+    });
+  }
+
+  for (const kind of ["diagnostics", "command"] as const) {
+    it(`resets ${kind} feedback at 1600 ms and preserves the payload`, async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      const doc = incidentDoc();
+      const { container } = await renderHealth(doc);
+      const roll = attentionItem(container, "fleet.roll")!;
+      const button = kind === "diagnostics"
+        ? screen.getByRole("button", { name: "Copy diagnostics" })
+        : within(roll).getByRole("button", { name: "Copy" });
+      const payload = kind === "diagnostics"
+        ? JSON.stringify(doc, null, 2)
+        : doc.checks.find((check) => check.id === "fleet.roll")!.command;
+      vi.useFakeTimers();
+      await act(async () => { fireEvent.click(button); });
+      expect(writeText).toHaveBeenCalledExactlyOnceWith(payload);
+      expect(button.textContent).toBe("Copied");
+      act(() => { vi.advanceTimersByTime(1599); });
+      expect(button.textContent).toBe("Copied");
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(button.textContent).toBe(kind === "diagnostics" ? "Copy diagnostics" : "Copy");
+    });
+
+    it(`rearms ${kind} feedback from the latest click`, async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      const { container } = await renderHealth(incidentDoc());
+      const button = kind === "diagnostics"
+        ? screen.getByRole("button", { name: "Copy diagnostics" })
+        : within(attentionItem(container, "fleet.roll")!).getByRole("button", { name: "Copy" });
+      vi.useFakeTimers();
+      const setTimeout = vi.spyOn(window, "setTimeout");
+      const clearTimeout = vi.spyOn(window, "clearTimeout");
+      await act(async () => { fireEvent.click(button); });
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(button.textContent).toBe("Copied");
+      const firstIndex = setTimeout.mock.calls.findIndex((args) => args[1] === 1600);
+      expect(firstIndex).toBeGreaterThanOrEqual(0);
+      const firstId = setTimeout.mock.results[firstIndex].value;
+      act(() => { vi.advanceTimersByTime(800); });
+      await act(async () => { fireEvent.click(button); });
+      const feedbackCalls = setTimeout.mock.calls
+        .map((args, index) => ({ delay: args[1], id: setTimeout.mock.results[index].value }))
+        .filter(({ delay }) => delay === 1600);
+      expect(feedbackCalls).toHaveLength(2);
+      expect(feedbackCalls[1].id).not.toBe(firstId);
+      expect(clearTimeout).toHaveBeenCalledWith(firstId);
+      expect(writeText).toHaveBeenCalledTimes(2);
+      act(() => { vi.advanceTimersByTime(801); });
+      expect(button.textContent).toBe("Copied");
+      act(() => { vi.advanceTimersByTime(798); });
+      expect(button.textContent).toBe("Copied");
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(button.textContent).toBe(kind === "diagnostics" ? "Copy diagnostics" : "Copy");
+    });
+  }
+
+  it("keeps diagnostics and command feedback independent after StrictMode replay", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const { container } = await renderHealth(incidentDoc(), [], true);
+    const diagnostics = screen.getByRole("button", { name: "Copy diagnostics" });
+    const command = within(attentionItem(container, "fleet.roll")!).getByRole("button", { name: "Copy" });
+    vi.useFakeTimers();
+    await act(async () => { fireEvent.click(diagnostics); });
+    expect(diagnostics.textContent).toBe("Copied");
+    expect(command.textContent).toBe("Copy");
+    act(() => { vi.advanceTimersByTime(800); });
+    await act(async () => { fireEvent.click(command); });
+    expect(command.textContent).toBe("Copied");
+    expect(writeText).toHaveBeenCalledTimes(2);
+    act(() => { vi.advanceTimersByTime(800); });
+    expect(diagnostics.textContent).toBe("Copy diagnostics");
+    expect(command.textContent).toBe("Copied");
+    act(() => { vi.advanceTimersByTime(800); });
+    expect(command.textContent).toBe("Copy");
+  });
+
+  it("does not schedule feedback when diagnostics clipboard resolves after unmount", async () => {
+    let resolveClipboard!: () => void;
+    const clipboardPromise = new Promise<void>((resolve) => { resolveClipboard = resolve; });
+    const writeText = vi.fn().mockReturnValue(clipboardPromise);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const doc = degradedDoc();
+    const { unmount } = await renderHealth(doc);
+    vi.useFakeTimers();
+    const setTimeout = vi.spyOn(window, "setTimeout");
+    fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
+    expect(writeText).toHaveBeenCalledWith(JSON.stringify(doc, null, 2));
+    expect(setTimeout).not.toHaveBeenCalled();
+    unmount();
+    setTimeout.mockClear();
+    await act(async () => {
+      resolveClipboard();
+      await clipboardPromise;
+    });
+    expect(setTimeout).not.toHaveBeenCalled();
   });
 });
 
