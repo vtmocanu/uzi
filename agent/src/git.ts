@@ -699,12 +699,13 @@ export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: st
     const bytes = Buffer.alloc(16 * 1024);
     const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
     const end = bytes.subarray(0, bytesRead).indexOf("\n\n");
-    if (end < 0 || end + 6 > bytesRead || bytes.toString("ascii", end + 2, end + 6) !== "PACK") {
+    if (end < 0 || end + 6 > bytesRead || !bytes.subarray(end + 2, end + 6).equals(Buffer.from("PACK"))) {
       throw new Error("invalid or excessive recovery bundle header");
     }
     const header = bytes.subarray(0, end);
-    if (header.some(byte => byte < 32 && byte !== 10 || byte > 126)) throw new Error("invalid recovery header encoding");
-    const lines = header.toString("ascii").split("\n");
+    if (header.some(byte => byte < 32 && byte !== 10 || byte === 127)) throw new Error("invalid recovery header encoding");
+    // Latin-1 preserves opaque prerequisite comment bytes without masking structural bytes.
+    const lines = header.toString("latin1").split("\n");
     const version = lines.shift();
     if (version !== "# v2 git bundle" && version !== "# v3 git bundle") throw new Error("invalid recovery bundle version");
     if (version === "# v3 git bundle" && lines[0] === "@object-format=sha1") lines.shift();
@@ -739,8 +740,8 @@ export interface RecoveryBundleResult {
   prerequisiteShas: string[];
   /** The resolved original committed head H (40-hex). */
   sourceSha: string;
-  /** True when no forge-reachable prerequisite existed and the bundle carries H's full
-   *  reachable history self-contained within the size limit (D5). */
+  /** True when the verified bundle header declares no external prerequisites and the
+   *  bundle carries H's full reachable history within the size limit (D5). */
   selfContained: boolean;
   /** True when H is ALREADY reachable from the fresh forge tip (merge-base(H, forgeTip) ==
    *  H) — i.e. the committed head is already published, so there is NOTHING to archive.

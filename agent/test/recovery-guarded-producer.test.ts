@@ -29,7 +29,7 @@ function randomBytes(size: number): Buffer {
   }
   return bytes;
 }
-function fixture(size = 256 * 1024) {
+function fixture(size = 256 * 1024, publicSubject = "public deletion") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "guarded-acceptance-"));
   const data = path.join(root, "data");
   const bare = path.join(data, "repos", "worker.git");
@@ -50,7 +50,7 @@ function fixture(size = 256 * 1024) {
   const base = git(work, "rev-parse", "HEAD");
   fs.unlinkSync(path.join(work, "large"));
   fs.writeFileSync(path.join(work, "current"), "public small tree\n");
-  git(work, "add", "-A"); git(work, "commit", "-m", "public deletion");
+  git(work, "add", "-A"); git(work, "commit", "-m", publicSubject);
   const tip = git(work, "rev-parse", "HEAD");
   git(work, "push", forge, "main");
   // Populate the admissible cache through a real fetch, rather than planting a ref.
@@ -150,6 +150,28 @@ it("production 64MiB cap captures real coverage of divergent retained roots into
       fullBytes: full.byteSize, thinBytes: thin.byteSize, runtimeMs: Math.round(performance.now() - start) }));
   } finally { cleanup(f); }
 });
+
+for (const guarded of [true, false]) {
+  it(`${guarded ? "guarded" : "legacy"} thin Unicode prerequisite imports into a fresh forge clone`, async () => {
+    const f = fixture(256 * 1024, "公開された履歴");
+    try {
+      const bundle = guarded
+        ? await produce(f, f.head, "unicode-guarded", 32 * 1024)
+        : await f.cache.produceRecoveryBundle(f.bare, {
+          sourceSha: f.head, outPath: path.join(f.root, "unicode-legacy.bundle"),
+          forgeTip: f.tip, maxBytes: 32 * 1024,
+        });
+      const repo = fresh(f, "unicode-import");
+      git(repo, "bundle", "verify", bundle.bundlePath);
+      assert.ok(fs.readFileSync(bundle.bundlePath).includes(Buffer.from("公開された履歴")));
+      assert.deepEqual(await readRecoveryBundleHeader(bundle.bundlePath, f.head),
+        { prerequisiteShas: [f.tip], selfContained: false });
+      assert.equal(bundle.selfContained, false);
+      assert.deepEqual(bundle.prerequisiteShas, [f.tip]);
+      importAndCheck(f, repo, f.head, [f.head], bundle.bundlePath, bundle.prerequisiteShas);
+    } finally { cleanup(f); }
+  });
+}
 
 it("criss-cross public graph declares all actual sorted dependencies and imports both merge bases", async () => {
   const f = fixture();
