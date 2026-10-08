@@ -1138,7 +1138,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00311 owns settlement and cancellation
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -1389,7 +1389,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00311 owns settlement and cancellation
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -1602,7 +1602,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00311 owns settlement and cancellation
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -1978,7 +1978,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00311 owns settlement and cancellation
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -2307,7 +2307,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00311 owns settlement and cancellation
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
@@ -2606,7 +2606,7 @@ WITH candidates AS MATERIALIZED (
       )
   )
 ), eligible_parent_exits AS MATERIALIZED (
-    -- Shared by parent writes and suppression; 00311 owns settlement and cancellation
+    -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
     SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
