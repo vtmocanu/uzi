@@ -858,6 +858,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/release", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
+	{"POST", "/api/worker/runs/{id}/archives/{captureID}/reconcile", noLimiter},
 	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated; a call that
 	// reaches the proof spends the OWNER's forge quota (one branch-head read plus up to three
 	// compares, up to six on Forgejo, which compares both directions per candidate), so it
