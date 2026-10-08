@@ -7,19 +7,22 @@
 # skills, instructions) as configuration, so a hostile repo cannot widen the
 # agent's own permissions from inside its own tree. See ARCHITECTURE.md's
 # guardrails section and agent/src/claude-harness.ts (the lead run lane, the widest
-# blast radius of the sites). There are exactly three real assignments today
-# -- claude-harness.ts, chat-executor.ts, and claude-advice-harness.ts (the consolidated
+# blast radius of the sites). There are exactly seven real assignments today
+# (recount with `git grep -n "settingSources: \[\]" -- agent/src`, ignoring comment lines):
+# claude-harness.ts, chat-executor.ts, claude-advice-harness.ts (the consolidated
 # advice-lane site: PRD #920 M2 folded the former judge-runner.ts /
 # summary-runner.ts / review-runner.ts literals into one query site in
-# ClaudeAdviceHarness.run, called by runReadOnlyModelPass) -- and ALL are
-# `settingSources: []`. The run-lane literal
+# ClaudeAdviceHarness.run, called by runReadOnlyModelPass), isolated-executor.ts
+# (buildIsolatedSdkOptions), job-runner.ts (two: the ordinary job options and the
+# isolated-lane job options) and claude-cross-check.ts (buildClaudeCrossCheckOptions,
+# the plan checker, PRD #2460) -- and ALL are `settingSources: []`. The run-lane literal
 # lives in claude-harness.ts `buildSdkOptions` as of PRD #1146 M2, which moved the
 # SdkOptions assembly out of sdk-executor.ts into the Claude adapter. This rule
 # forbids any other value.
 #
 # THE PATTERN. `settingSources: $X` matches every assignment; `pattern-not:
 # settingSources: []` subtracts the exact empty-array literal. So the clean tree
-# (all three sites `[]`) yields ZERO findings, while any EXPLICIT non-empty VALUE
+# (every site `[]`) yields ZERO findings, while any EXPLICIT non-empty VALUE
 # fires: an array with elements (`settingSources: ["project"]`), a variable
 # (`settingSources: someVar`), or any other expression in the value position.
 # semgrep parses TypeScript, so the many `settingSources: []` mentions in COMMENTS

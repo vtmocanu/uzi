@@ -19,6 +19,7 @@ import { IsolatedExecutor } from "./isolated-executor.js";
 import { IsolatedRunner } from "./isolated-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { CrossCheckRunner } from "./cross-check-runner.js";
+import { stubClaudeCrossCheckQueryFn } from "./claude-cross-check.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { JobRunner } from "./job-runner.js";
@@ -653,6 +654,10 @@ async function main(): Promise<void> {
     homeRoot: sdkHomeRoot, modelTimeoutMs: config.crossCheckModelTimeoutMs,
     pollMs: config.pollIntervalMs, activeRuns, outbox,
     outboxTerminalMaxBytes: config.outboxTerminalMaxBytes, gapFillMax: config.gapFillMax,
+    // PRD #2460: the Claude checker's path guard denies the same worker-credential set as the other
+    // read-only Claude lanes. Under UZI_EXECUTOR=stub its model call is a canned APPROVE (no network).
+    secretPaths: [...SECRET_PATH_PREFIXES, ...workerSecretDenyPaths(config.workerTokenFile)],
+    ...(config.executor === "stub" ? { claudeQueryFn: stubClaudeCrossCheckQueryFn } : {}),
   });
 
   // The review lane (PRD #400 M4b): a slim runner for a `task` claim carrying a

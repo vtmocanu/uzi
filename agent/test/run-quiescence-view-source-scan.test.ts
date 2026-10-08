@@ -173,10 +173,10 @@ describe("every queryFn call site asserts the residue quarantine immediately bef
     return lines.flatMap((line, i) => (CALL.test(line) ? [{ file: path.relative(SRC, f), line, before: lines.slice(Math.max(0, i - 3), i) }] : []));
   });
 
-  it("finds the five known call sites", () => {
+  it("finds the six known call sites", () => {
     assert.deepEqual(
       sites.map((s) => s.file).sort(),
-      ["chat-executor.ts", "claude-advice-harness.ts", "claude-harness.ts", "isolated-executor.ts", "job-runner.ts"],
+      ["chat-executor.ts", "claude-advice-harness.ts", "claude-cross-check.ts", "claude-harness.ts", "isolated-executor.ts", "job-runner.ts"],
     );
   });
 

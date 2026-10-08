@@ -2154,3 +2154,96 @@ it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real s
     assert.equal(api.crossCheckRequests.length, 1, "no second candidate after give-up");
   }
 });
+
+// PRD #2460: a Codex lead (claim.secrets.codex) takes the same checked path as a Claude lead.
+// The runner no longer parks it as codex_lead_unsupported; the Claude checker is server-side.
+describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
+  const codexClaim = () => freshClaim(1, { kind: "issue", auto_approve: true, plan_cross_check_required: true,
+    secrets: { forge_pat: "fixture-forge-pat-000000", codex: {
+      auth_mode: "subscription" as const, access_token: "fixture-codex-access-token-abc123",
+      capability: "fixture-codex-capability-abc123", generation: 1, chatgpt_account_id: "verified-account",
+      chatgpt_plan_type: null } } });
+  const canonicalOf = (body: Record<string, unknown>) => ({
+    candidate: { ...body, plan_md: NORMALIZED, milestones: [{ title: "canonical", done: false }],
+      required_capabilities: [], required_tools: [], size_class: "s" } });
+
+  it("submits a candidate and takes the approved canonical plan (acceptance 1)", { skip: LINUX_CAPTURE }, async () => {
+    const c = codexClaim();
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", canonicalOf(body)) });
+    const { exec, verdicts } = checkedExec();
+    await start(exec, c);
+    assert.equal(api.crossCheckRequests.length, 1, "the Codex lead's candidate is submitted for a cross-check");
+    assert.equal(verdicts.length, 1);
+    const v = verdicts[0]!;
+    assert.ok(v.kind === "approve" && v.approval === "cross_check");
+    assert.equal(v.kind === "approve" && v.approval === "cross_check" ? v.canonical.plan : "", NORMALIZED);
+    const states = api.states.filter((s) => s.runId === c.run_id).map((s) => s.body);
+    assert.ok(!states.some((s) => (s as { plan_cross_check_gate_reason?: string }).plan_cross_check_gate_reason === "codex_lead_unsupported"), "no unsupported park");
+    assert.ok(!states.some((s) => s.status === "awaiting_approval"), "no human gate on APPROVE");
+    assert.ok(statuses(c.run_id).includes("completed"));
+  });
+
+  // The Codex executor wires neither attemptCredentialSwitch nor deferCredentialSwitch, so a held-state
+  // switch signal that reached a Codex lead mid-gate would take the runner's safety-net release. The
+  // server never stamps one for a Codex run (ErrCredentialOverrideHarnessUnsupported); this proves the
+  // worker side stays safe if one arrived anyway: the run is released NON-terminal and nothing
+  // implements the checked approval.
+  it("a credential switch signal at a Codex lead's checked gate releases the claim; it never fails or implements the run", { skip: LINUX_CAPTURE }, async () => {
+    const c = codexClaim();
+    api.crossCheckHandler = ({ runId, body }) => {
+      api.requestCredentialSwitch(runId, 1);
+      return { status: 200, body: answer(runId, body, "approve", "approve", canonicalOf(body)) };
+    };
+    let implemented = false;
+    const exec: Executor = { run: async (ctx) => {
+      const verdict = await ctx.gatePlan!(PLAN);
+      if (verdict.kind === "approve") implemented = true;
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    const states = api.states.filter((s) => s.runId === c.run_id).map((s) => s.body);
+    assert.ok(!states.some((s) => s.status === "failed"), `a switch never fails the run: ${JSON.stringify(states.map((s) => s.status))}`);
+    assert.ok(states.some((s) => s.status === "credential_switch"), `the safety-net release ran: ${JSON.stringify(states.map((s) => s.status))}`);
+    assert.ok(!states.some((s) => s.status === "completed"), "the run does not complete on the old claim");
+    assert.equal(implemented, false, "no implementation follows the interrupted gate");
+  });
+
+  it("a reclaimed Codex lead discovers its eligible round once, like a Claude lead", { skip: LINUX_CAPTURE }, async () => {
+    const c = freshClaim(2, { kind: "issue", auto_approve: true, plan_cross_check_required: true, secrets: codexClaim().secrets });
+    api.crossCheckLatestHandler = () => ({ status: 200, body: {
+      result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
+      automatic_rounds_enabled: true, next_round: 2, next_round_eligible: true, fallback_reason: "",
+    } });
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+      ...proof(runId, 2), candidate_generation: 2, automatic_revision_limit: 2, automatic_rounds_enabled: true,
+    }) });
+    const { exec, verdicts } = checkedExec();
+    await start(exec, c);
+    assert.deepEqual(api.crossCheckLatestRequests, [{ runId: c.run_id, generation: 2 }], "discovery ran for the Codex lead");
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [2]);
+    assert.equal(verdicts[0]!.kind, "approve");
+  });
+
+  it("returns an automatic revision and submits round 2 after REVISE (acceptance 2)", { skip: LINUX_CAPTURE }, async () => {
+    const c = codexClaim();
+    api.crossCheckHandler = ({ runId, body }) => {
+      const round = Number(body.round);
+      return { status: 200, body: answer(runId, body, round < 2 ? "revise" : "approve", round < 2 ? "revise" : "approve", {
+        automatic_revision_limit: 2, automatic_rounds_enabled: true,
+        findings: round < 2 ? { summary: "tighten scope", items: [] } : null, ...canonicalOf(body) }) };
+    };
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      for (let round = 1; round <= 2; round++) {
+        const verdict = await ctx.gatePlan!(`${PLAN} ${round}`);
+        seen.push(verdict);
+        if (round === 1) assert.deepEqual(verdict, { kind: "revise", automatic: true, round: 1, feedback: "tighten scope", items: [] });
+      }
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
+    assert.deepEqual(seen.map((v) => v.kind), ["revise", "approve"]);
+    assert.equal(gates(c.run_id).length, 0, "no human gate was published");
+  });
+});

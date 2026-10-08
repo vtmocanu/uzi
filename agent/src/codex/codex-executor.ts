@@ -53,6 +53,7 @@
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
+import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -102,7 +103,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -2466,6 +2467,8 @@ export class CodexExecutor implements Executor {
       // plan_md, so without this every implement turn fell back to the queue-time issue text.
       // A run() local, so it survives every later implement turn and new-root epoch recreation.
       let gatedPlan: string | undefined;
+      // PRD #2460: the approved plan is a checked server bundle, restated in the implement prompt.
+      let checkedPlan = false;
       // Issue #1674: the milestone breakdown of the plan version the gate approved (the final
       // planResult.milestones after any revise rounds, mirroring sdk-executor's
       // `frozenMilestones = candidateMilestones`). ctx.frozenMilestones comes from the claim and is
@@ -2577,20 +2580,33 @@ export class CodexExecutor implements Executor {
         pauseNow.vaultLock.gateOpen = true;
         let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones);
         const maxRevisions = planMaxRevisionsOf(ctx.config);
+        // Human revises only: an automatic (cross-check) round never spends this budget, so a later
+        // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
         let revisions = 0;
+        let automaticRound = 0;
         while (verdict.kind === "revise") {
-          if (verdict.automatic === true)
-            throw new TrustedExecutionRefusal("codex cannot consume automatic plan revision");
+          const automatic = verdict.automatic === true;
+          if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
+          // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
+          assertResidueQuarantineOpen("provider_turn");
           const feedback = verdict.feedback;
-          // Issue #1604: the re-gate below settles this revise once the revised plan is persisted.
-          const settles = verdict.inputId;
-          ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback } });
-          if (revisions >= maxRevisions) {
-            throw new TrustedExecutionRefusal("codex plan revision budget exhausted");
+          // Issue #1604: the re-gate below settles a human revise once the revised plan is persisted.
+          // An automatic round has no input row to settle.
+          const settles = automatic ? undefined : verdict.inputId;
+          ctx.emit({ kind: "plan_feedback", agent: "worker",
+            payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback } });
+          if (!automatic) {
+            if (revisions >= maxRevisions) {
+              throw new TrustedExecutionRefusal("codex plan revision budget exhausted");
+            }
+            revisions++;
           }
-          revisions++;
-          ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
-          const reviseTurn = await drivePlan(buildRevisePlanPrompt(feedback));
+          ctx.emit({ kind: "plan_revising", agent: "worker",
+            payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions } });
+          // The revise turn resumes the plan thread, which holds the plan being revised.
+          const reviseTurn = await drivePlan(verdict.automatic === true
+            ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
+            : buildRevisePlanPrompt(feedback));
           if (reviseTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (reviseTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: reviseTurn.reason } };
           planResult = reviseTurn.result;
@@ -2602,11 +2618,18 @@ export class CodexExecutor implements Executor {
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
-        if (verdict.approval === "cross_check")
-          throw new TrustedExecutionRefusal("codex cannot consume checked plan approval");
         pauseNow.vaultLock.gateOpen = false;
-        gatedPlan = planMd;
-        approvedMilestones = planResult.milestones;
+        if (verdict.approval === "cross_check") {
+          // Exactly the approved server candidate: the bundle is validated whole before either value
+          // is adopted, and it supersedes the plan thread's local plan and milestones.
+          const canonical = validateCheckedPlanBundle(verdict.canonical, ctx.claimGeneration);
+          gatedPlan = canonical.plan;
+          approvedMilestones = canonical.milestones;
+          checkedPlan = true;
+        } else {
+          gatedPlan = planMd;
+          approvedMilestones = planResult.milestones;
+        }
         approvedSelection = verdict.selection;
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
@@ -2872,7 +2895,8 @@ export class CodexExecutor implements Executor {
           depsNote = depsProvisionImplementNote(result.results, result.truncated);
           installState.noted = true;
         }
-        const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
+        const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
+          checkedPlan ? { milestones: approvedMilestones } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
         const implementBody = systemFollowUp !== undefined
@@ -4282,9 +4306,22 @@ export class CodexExecutor implements Executor {
    *  recreated epoch still sees the facts cached at run start. The completion-rework follow-up
    *  and the clarification continuation replace this prompt for their turn and do not carry the
    *  block. Empty block ⇒ byte-identical. */
-  private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts): string {
+  private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts,
+    checked?: { milestones: Milestone[] | undefined }): string {
     const approved = ctx.approvedPlan?.trim();
-    const body = gatedPlan !== undefined
+    // PRD #2460: a cross-check approved the server's normalized candidate, not the lead's local plan.
+    // The contract (plan prose plus the full milestone list) leads every implement attempt and
+    // supersedes whatever the plan thread holds.
+    const body = gatedPlan !== undefined && checked !== undefined
+      ? [
+          checkedImplementationContext(gatedPlan, checked.milestones ?? []).trimEnd(),
+          "",
+          "Your plan was cross-checked and the server contract above was approved. Implement THAT contract now",
+          "on the current branch, delegating to your subagents and iterating until the review passes. It is",
+          "your authoritative instruction for this run: it supersedes the issue text and the plan you drafted",
+          "in this thread; do not re-plan or resubmit it.",
+        ].join("\n")
+      : gatedPlan !== undefined
       ? [
           "Your plan was approved at the gate. Implement it now on the current branch, delegating to",
           "your subagents and iterating until the review passes. The approved plan below, between the",

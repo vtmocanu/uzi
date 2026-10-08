@@ -923,9 +923,8 @@ describe("RunRunner — required plan cross-check fallback", () => {
       assert.ok(!states.some((s) => s.iteration_count === 1), "refusal never starts implementation");
       assert.ok(!states.some((s) => s.status === "completed"), "refusal never completes");
       assert.equal(calls.length, 0, "refusal never publishes an MR");
-      const reason = codexLead
-        ? "plan cross-check: not yet supported for a Codex lead"
-        : "plan cross-check: checker unavailable";
+      // PRD #2460: a Codex lead takes the same checked path, so the server's refusal reads the same.
+      const reason = "plan cross-check: checker unavailable";
       assert.ok(api.messages(claim.run_id).some((m) => m.kind === "status" && m.payload.text === reason));
     });
   }

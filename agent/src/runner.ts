@@ -9701,7 +9701,7 @@ export class RunRunner {
             // separately drains usage debounce/in-flight HTTP and outbox delivery receipts.
             await Promise.all(flight.stateSenders ?? []);
             steering.lifecycleSignal().throwIfAborted();
-            if (discoverRound && !claim.secrets.codex) {
+            if (discoverRound) {
               // One bounded, owner-cancellable discovery per reclaimed execution. Metadata
               // selects a submit attempt; it never supplies content or an approval grant.
               const owner = steering.lifecycleSignal();
@@ -9728,10 +9728,6 @@ export class RunRunner {
             }
             if (checkedHuman) {
               // Discovery selected an existing fallback, without adopting a human presentation.
-            } else if (claim.secrets.codex) {
-              crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
-              checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
-              checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
               const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {

@@ -23,6 +23,7 @@
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "./checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "./scope-cap.js";
 import fs from "node:fs/promises";
@@ -2087,11 +2088,7 @@ export class SdkExecutor implements Executor {
         let automaticRound = 0;
         while (verdict.kind === "revise") {
           const automatic = verdict.automatic === true;
-          if (verdict.automatic === true) {
-            if (!Number.isInteger(verdict.round) || verdict.round <= automaticRound || verdict.round > 4)
-              throw new TrustedExecutionRefusal("invalid automatic plan revision round");
-            automaticRound = verdict.round;
-          }
+          if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
           const feedback = verdict.feedback;
@@ -2195,26 +2192,8 @@ export class SdkExecutor implements Executor {
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
         if (verdict.approval === "cross_check") {
-          const canonical = verdict.canonical;
-          // Validate the entire bundle before adopting either value. The digest is an opaque
-          // server SHA-256 identity, not a locally recomputed proof of approval.
-          if (
-            !canonical || typeof canonical !== "object" ||
-            typeof canonical.plan !== "string" || !canonical.plan.trim() ||
-            !Array.isArray(canonical.milestones) ||
-            !Array.from(canonical.milestones).every((m) =>
-              m !== null && typeof m === "object" &&
-              typeof m.id === "string" && m.id.trim().length > 0 &&
-              typeof m.title === "string" && m.title.trim().length > 0
-            ) ||
-            typeof canonical.candidate_digest !== "string" ||
-            canonical.candidate_digest.length !== 64 ||
-            !/^[0-9a-f]{64}$/.test(canonical.candidate_digest) ||
-            !Number.isSafeInteger(canonical.claimGeneration) || canonical.claimGeneration <= 0 ||
-            !Number.isSafeInteger(ctx.claimGeneration) || (ctx.claimGeneration ?? 0) <= 0 ||
-            canonical.claimGeneration !== ctx.claimGeneration
-          ) throw new TrustedExecutionRefusal("invalid checked plan approval bundle");
-          // Preserve server values verbatim, including nested keys and explicit [].
+          // Validate the entire bundle before adopting either value (checked-plan.ts).
+          const canonical = validateCheckedPlanBundle(verdict.canonical, ctx.claimGeneration);
           approvedPlan = canonical.plan;
           candidateMilestones = canonical.milestones;
           drive.checkedPlan = true;
@@ -2401,9 +2380,7 @@ export class SdkExecutor implements Executor {
       // Repeat the checked server contract on every implement attempt: an interrupted
       // first attempt may not have delivered it to the model or updated the old session.
       // Serialize the entire approved list, including nested values and explicit [].
-      const checkedImplementationContext = drive.checkedPlan
-        ? `The following server contract is explicitly approved for implementation and supersedes the local plan in this session. Follow its prose and full milestone contract.\n\n${approvedPlan}\n\n<approved_milestone_contract>\n${JSON.stringify(frozenMilestones)}\n</approved_milestone_contract>\n\n`
-        : "";
+      const checkedContext = drive.checkedPlan ? checkedImplementationContext(approvedPlan, frozenMilestones) : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,
@@ -2740,7 +2717,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          checkedImplementationContext + buildImplementPrompt({
+          checkedContext + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),

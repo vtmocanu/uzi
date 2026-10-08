@@ -5868,37 +5868,123 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
 // are fail-old/pass-fixed: without the signals frame planResult.plan is undefined and run()
 // throws "produced no plan" before the gate, so a resolving success test can only pass wired.
 describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
-  it("refuses automatic plan revision before feedback or another provider turn", async () => {
-    const rig = makeMultiEpochRig([
-      epochResponder("th-1", "tn-1", (t, th, tn) => {
-        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+  // PRD #2460: a plan thread that submits a fresh plan on every turn, then a recreated implement
+  // epoch that finishes on signal_done. Returns the rig so a test can read each epoch's requests.
+  const planThenImplementRig = () => {
+    const planResponder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `local plan ${c.turnStartCount}` }, "th-plan", turnId, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    return makeMultiEpochRig([
+      planResponder,
+      epochResponder("resumed-plan", "tn-implement", (t, th, tn) => {
+        t.push(toolCall(99, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
       }),
     ]);
-    let gates = 0;
+  };
+  const turnTexts = (rig: ReturnType<typeof planThenImplementRig>, epoch: number): string[] =>
+    rig.epochs[epoch]!.transport.requests.filter((r) => r.method === "turn/start").map((r) => JSON.stringify(r.params));
+  const humanApprove = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+
+  it("PRD #2460: automatic rounds revise the plan thread without spending the human budget, even at plan_max_revisions 0", async () => {
+    const rig = planThenImplementRig();
+    const settled: unknown[] = [];
+    let call = 0;
     const { ctx, emitted } = makeCtx({
       planApproved: false,
       approvedPlan: undefined,
-      gatePlan: async () => {
-        gates++;
-        return { kind: "revise", automatic: true, round: 1, feedback: "checker advice" };
+      config: { plan_max_revisions: 0 },
+      gatePlan: async (_plan, _milestones, _onAwaiting, settles) => {
+        settled.push(settles);
+        call++;
+        return call <= 4
+          ? { kind: "revise", automatic: true, round: call, feedback: `checker advice ${call}`, items: [] }
+          : humanApprove;
       },
     });
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "automatic revision refusal"),
-      /codex cannot consume automatic plan revision/,
-    );
-    assert.equal(gates, 1);
-    assert.equal(rig.epochs.length, 1);
-    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
-    assert.ok(!emitted.some((m) => m.kind === "plan_feedback" || m.kind === "plan_revising"));
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "automatic rounds");
+    const planTurns = turnTexts(rig, 0);
+    assert.equal(planTurns.length, 5, "the initial turn plus four automatic revisions on the plan thread");
+    for (let round = 1; round <= 4; round++) {
+      assert.match(planTurns[round]!, new RegExp(`checker advice ${round}`));
+      assert.match(planTurns[round]!, /automated checker suggested revisions/, "the automatic revision prompt, not the human one");
+    }
+    assert.deepEqual(emitted.filter((m) => m.kind === "plan_feedback").map((m) => m.payload),
+      [1, 2, 3, 4].map((round) => ({ feedback: `checker advice ${round}`, automatic: true, cross_check_round: round })));
+    assert.deepEqual(emitted.filter((m) => m.kind === "plan_revising").map((m) => m.payload),
+      [1, 2, 3, 4].map((round) => ({ automatic: true, cross_check_round: round })));
+    assert.deepEqual(settled.slice(1), [undefined, undefined, undefined, undefined], "automatic rounds settle no input row");
   });
-  it("refuses checked plan approval before provider epoch recreation or implementation", async () => {
-    const rig = makeMultiEpochRig([
-      epochResponder("th-1", "tn-1", (t, th, tn) => {
-        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
-      }),
-    ]);
+
+  it("PRD #2460: a human revise after automatic rounds keeps its full budget, and only human revises spend it", async () => {
+    const rig = planThenImplementRig();
+    const verdicts = [
+      { kind: "revise", automatic: true, round: 1, feedback: "auto 1" },
+      { kind: "revise", automatic: true, round: 2, feedback: "auto 2" },
+      { kind: "revise", feedback: "human 1", inputId: 11 },
+      humanApprove,
+    ];
+    const settled: unknown[] = [];
+    let call = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { plan_max_revisions: 1 },
+      gatePlan: async (_p, _m, _a, settles) => { settled.push(settles); return verdicts[call++] as never; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "human after automatic");
+    assert.deepEqual(emitted.filter((m) => m.kind === "plan_revising").map((m) => m.payload),
+      [{ automatic: true, cross_check_round: 1 }, { automatic: true, cross_check_round: 2 }, { round: 1 }]);
+    assert.deepEqual(settled, [undefined, undefined, undefined, 11], "the human revise settles its own input row");
+
+    // The same budget refuses a SECOND human revise.
+    const capped = planThenImplementRig();
+    const again = [
+      { kind: "revise", automatic: true, round: 1, feedback: "auto 1" },
+      { kind: "revise", feedback: "human 1", inputId: 1 },
+      { kind: "revise", feedback: "human 2", inputId: 2 },
+    ];
+    let n = 0;
+    await assert.rejects(
+      withTimeout(makeExecutor(capped, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        planApproved: false, approvedPlan: undefined, config: { plan_max_revisions: 1 },
+        gatePlan: async () => again[n++] as never,
+      }).ctx), 8000, "second human revise"),
+      /revision budget exhausted/,
+    );
+    assert.equal(turnTexts(capped, 0).length, 3, "no turn runs for the refused human revise");
+  });
+
+  for (const [name, rounds] of [["a repeated round", [1, 1]], ["a round above the bound", [5]], ["a zero round", [0]]] as const) {
+    it(`PRD #2460: ${name} is refused before feedback or another provider turn`, async () => {
+      const rig = planThenImplementRig();
+      let call = 0;
+      const { ctx, emitted } = makeCtx({
+        planApproved: false,
+        approvedPlan: undefined,
+        gatePlan: async () => ({ kind: "revise", automatic: true, round: rounds[call++]!, feedback: "advice" }) as never,
+      });
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, name),
+        /invalid automatic plan revision round/,
+      );
+      assert.equal(turnTexts(rig, 0).length, rounds.length, "the refused round starts no further turn");
+      assert.equal(emitted.filter((m) => m.kind === "plan_feedback").length, rounds.length - 1, "the refused round records no feedback");
+    });
+  }
+
+  it("PRD #2460: a checked approval implements exactly the server contract, which supersedes the local plan", async () => {
+    const rig = planThenImplementRig();
     let iterations = 0;
+    const milestones = [{ id: "m1", title: "Canonical one", nested: { keep: [] } }];
     const { ctx } = makeCtx({
       planApproved: false,
       approvedPlan: undefined,
@@ -5906,17 +5992,46 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       reportIteration: async () => { iterations++; return undefined; },
       gatePlan: async () => ({
         kind: "approve", approval: "cross_check", selection: { status: "absent" },
-        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
-      }),
+        canonical: { plan: "server canonical contract", milestones, candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }) as never,
     });
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checked approval refusal"),
-      /codex cannot consume checked plan approval/,
-    );
-    assert.equal(iterations, 0);
-    assert.equal(rig.epochs.length, 1);
-    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "checked approval");
+    assert.ok(iterations >= 1, "implementation started");
+    const implement = turnTexts(rig, 1).join("\n");
+    assert.match(implement, /server canonical contract/);
+    assert.match(implement, /supersedes the local plan/);
+    assert.match(implement, /<approved_milestone_contract>/);
+    assert.match(implement, /Canonical one/);
+    assert.match(implement, /\\"keep\\":\[\]/, "nested values and explicit [] are serialized verbatim");
+    assert.doesNotMatch(implement, /local plan 1/, "the lead's local plan is not the implementation instruction");
   });
+
+  for (const [name, canonical, generation] of [
+    ["a stale claim generation", { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 6 }, 7],
+    ["a missing execution generation", { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 }, undefined],
+    ["a malformed digest", { plan: "canonical", milestones: [], candidate_digest: "xyz", claimGeneration: 7 }, 7],
+    ["a blank plan", { plan: "  ", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 }, 7],
+    ["a milestone without an id", { plan: "canonical", milestones: [{ title: "t" }], candidate_digest: "a".repeat(64), claimGeneration: 7 }, 7],
+  ] as const) {
+    it(`PRD #2460: a checked approval with ${name} is refused before provider epoch recreation or implementation`, async () => {
+      const rig = planThenImplementRig();
+      let iterations = 0;
+      const { ctx } = makeCtx({
+        planApproved: false,
+        approvedPlan: undefined,
+        claimGeneration: generation,
+        reportIteration: async () => { iterations++; return undefined; },
+        gatePlan: async () => ({ kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical }) as never,
+      });
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, name),
+        /invalid checked plan approval bundle/,
+      );
+      assert.equal(iterations, 0);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "no implement turn started");
+    });
+  }
   it("(m2-1) a folded submit_plan gates, approval recreates a fresh provider epoch, and a root signal_done on the NEW root resolves { branch }", async () => {
     // m4 change: plan approval now RECREATES the provider epoch (new-root resume), so the plan
     // turn and the implement turn run on DISTINCT provider roots/transports. Each epoch is scripted
