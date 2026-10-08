@@ -51,9 +51,9 @@ func TestAssessmentTotalTimeout(t *testing.T) {
 				if d != forge.AuthorUnknown || !errors.Is(err, context.DeadlineExceeded) || time.Now() != deadline || parent.Err() != nil {
 					t.Fatalf("late positive=%v %v now=%v", d, err, time.Now())
 				}
-				a.Author(forge.Issue{AuthorForgeUserID: 2})
-				if l.calls != 1 {
-					t.Fatalf("cached failure looked up %d times", l.calls)
+				d, err = a.Author(forge.Issue{AuthorForgeUserID: 2})
+				if d != forge.AuthorUnknown || !errors.Is(err, context.DeadlineExceeded) || l.calls != 1 {
+					t.Fatalf("cached failure=%v %v lookups=%d", d, err, l.calls)
 				}
 			})
 		})
