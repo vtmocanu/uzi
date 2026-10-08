@@ -236,7 +236,7 @@ func TestPlanCrossCheckAutomaticRoundsConflictingCandidatesLiveDB(t *testing.T) 
 			t.Fatalf("conflicting round %d: winner err=%v loser err=%v", round, winner.err, loser.err)
 		}
 		stored, err := env.q.GetExactPlanCrossCheck(env.ctx, store.GetExactPlanCrossCheckParams{LeadRunID: lead, Round: round})
-		if err != nil || stored.ID != winner.cc.ID || stored.PlanMd != winner.candidate.PlanMd {
+		if err != nil || stored.ID != winner.cc.ID || !stored.PlanMd.Valid || stored.PlanMd.String != winner.candidate.PlanMd {
 			t.Fatalf("winning candidate not immutable: err=%v", err)
 		}
 		retry, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, winner.candidate, round)
