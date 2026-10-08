@@ -23,6 +23,7 @@ printf '\n' >> "$CASE_DIR/kubectl.calls"
 case "$CASE" in
   reject-unknown) printf '%s\n' other-ctx ;;
   reject-prefix) printf '%s\n' test-ctx-extra ;;
+  reject-multiline) printf '%s\n' test-ctx ;;
   reject-kubectl-error) echo "fixture config failure" >&2; exit 7 ;;
   reject-kubectl-error-matching)
     echo test-ctx; echo "fixture config failure" >&2; exit 7 ;;
@@ -149,6 +150,7 @@ run_case(){
     case "$CASE" in
       context-unset) unset UZI_CTX ;;
       context-empty) export UZI_CTX= ;;
+      reject-multiline) export UZI_CTX=$'test-ctx\nmissing-context' ;;
     esac
     "$BASH_BIN" "$SCRIPT" "$@"
   ) > "$CASE_DIR/stdout" 2> "$CASE_DIR/stderr" || RC=$?
@@ -164,6 +166,9 @@ run_case(){
       [ "$RC" -eq 2 ] || { echo "FAIL [$CASE]: expected exit 2, got $RC"; bad=1; }
       if ! awk 'tolower($0) ~ /error/ && tolower($0) ~ /context/ && /test-ctx/ {found=1} END {exit !found}' "$CASE_DIR/stderr"; then
         echo "FAIL [$CASE]: context error absent from stderr"; bad=1
+      fi
+      if [ "$CASE" = reject-multiline ] && ! grep -Fq -- missing-context "$CASE_DIR/stderr"; then
+        echo "FAIL [$CASE]: rejected context component missing from stderr"; bad=1
       fi
       [ ! -e "$CASE_DIR/out" ] || { echo "FAIL [$CASE]: output root/state/pid writes occurred"; bad=1; }
       [ ! -s "$CASE_DIR/uzi.calls" ] || { echo "FAIL [$CASE]: status probes occurred"; bad=1; }
@@ -221,7 +226,7 @@ run_case(){
   echo "PASS [$CASE]"
 }
 
-CASES='baseline reject-unknown reject-prefix reject-kubectl-error reject-kubectl-error-matching context-known context-unset context-empty advisory-terminal advisory-empty advisory-failing advisory-unrecognized advisory-active advisory-failing-terminal retain-empty retain-failing retain-unrecognized'
+CASES='baseline reject-unknown reject-prefix reject-multiline reject-kubectl-error reject-kubectl-error-matching context-known context-unset context-empty advisory-terminal advisory-empty advisory-failing advisory-unrecognized advisory-active advisory-failing-terminal retain-empty retain-failing retain-unrecognized'
 SELECTED="${1:-${TEST_CASE:-all}}"
 if [ "$SELECTED" != all ]; then
   case " $CASES " in

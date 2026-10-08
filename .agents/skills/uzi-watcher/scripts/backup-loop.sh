@@ -48,6 +48,10 @@ INTERVAL=$((10#$INTERVAL)); MAX_HOURS=$((10#$MAX_HOURS))
 
 if [ -n "${UZI_CTX:-}" ]; then
   if contexts="$("${UZI_KUBECTL:-kubectl}" config get-contexts -o name)"; then
+    # grep treats embedded newlines as alternative patterns, even with -Fx.
+    case "$UZI_CTX" in
+      *$'\n'*) echo "error: kube context '$UZI_CTX' contains a newline" >&2; exit 2 ;;
+    esac
     if ! printf '%s\n' "$contexts" | grep -Fx -- "$UZI_CTX" >/dev/null; then
       echo "error: kube context '$UZI_CTX' not found" >&2
       exit 2
