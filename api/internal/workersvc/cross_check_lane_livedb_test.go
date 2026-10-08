@@ -87,6 +87,7 @@ func TestCrossCheckLaneNegotiationLiveDB(t *testing.T) {
 		{"slots-no-cap-run", `UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,'cross_check_lane_v1') WHERE id=$1`, "run", false},
 		{"slots-no-cap-lane", `UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,'cross_check_lane_v1') WHERE id=$1`, "cross_check", false},
 		{"missing-check-protocol", `UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,'cross_check_v1') WHERE id=$1`, "cross_check", false},
+		{"missing-harness", `UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,'codex_harness_v1') WHERE id=$1`, "cross_check", false},
 		{"missing-runtime", `UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,'codex_runtime_v2') WHERE id=$1`, "cross_check", false},
 		{"missing-custom-model", `UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,'codex_custom_model_v1') WHERE id=$1`, "cross_check", false},
 	} {
@@ -96,6 +97,7 @@ func TestCrossCheckLaneNegotiationLiveDB(t *testing.T) {
 			if tc.name == "legacy-full" {
 				f.env.exec(`UPDATE runs SET worker_id=$2 WHERE id=$1`, f.lead, f.workerID)
 			}
+			before := mustRun(t, f.env, f.runID)
 			p := laneClaim(t, f, tc.lane, nil)
 			if (p != nil) != tc.want {
 				t.Fatalf("payload present=%v want=%v", p != nil, tc.want)
@@ -114,8 +116,78 @@ func TestCrossCheckLaneNegotiationLiveDB(t *testing.T) {
 						t.Fatal("legacy child did not consume run load")
 					}
 				}
-			} else if mustRun(t, f.env, f.runID).ClaimGeneration != 0 {
-				t.Fatal("refused child was claimed")
+			} else {
+				f.unchanged(t, before)
+			}
+		})
+	}
+}
+
+func TestCrossCheckLaneRequiredCapabilityLiveDB(t *testing.T) {
+	for _, capable := range []bool{true, false} {
+		t.Run(fmt.Sprint(capable), func(t *testing.T) {
+			f := laneFixture(t)
+			ctx, cancel := context.WithTimeout(f.env.ctx, 5*time.Second)
+			defer cancel()
+			f.env.ctx = ctx
+			f.env.exec(`UPDATE runs SET required_capabilities='{jvm}' WHERE id=$1`, f.runID)
+			if capable {
+				f.env.exec(`UPDATE workers SET capabilities='{jvm}' WHERE id=$1`, f.workerID)
+			}
+			before := mustRun(t, f.env, f.runID)
+			p := laneClaim(t, f, "cross_check", nil)
+			if capable {
+				f.claimed(t, p)
+				if !mustRun(t, f.env, f.runID).CrossCheckLane {
+					t.Fatal("capable worker's child did not use cross-check lane")
+				}
+			} else {
+				if p != nil {
+					t.Fatal("worker missing required capability claimed child")
+				}
+				f.unchanged(t, before)
+			}
+		})
+	}
+}
+
+func TestCrossCheckLaneInterlockNegotiationLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name, missing string
+	}{
+		{"baseline", ""},
+		{"missing-completion-interlock", "completion_interlock_v1"},
+		{"missing-codex-completion-interlock", "codex_completion_interlock_v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := laneFixture(t)
+			ctx, cancel := context.WithTimeout(f.env.ctx, 5*time.Second)
+			defer cancel()
+			f.env.ctx = ctx
+			// Like interlockLiveDB.seedQueuedRun, stamp the queued child before
+			// approval freezes a contract; keep its valid Codex binding and kind shape.
+			f.env.exec(`UPDATE runs SET completion_contract_version=1 WHERE id=$1`, f.runID)
+			f.env.exec(`UPDATE workers SET protocol_capabilities=protocol_capabilities ||
+				ARRAY['completion_interlock_v1','codex_completion_interlock_v1'] WHERE id=$1`, f.workerID)
+			if tc.missing != "" {
+				f.env.exec(`UPDATE workers SET protocol_capabilities=array_remove(protocol_capabilities,$2) WHERE id=$1`,
+					f.workerID, tc.missing)
+			}
+			before := mustRun(t, f.env, f.runID)
+			p := laneClaim(t, f, "cross_check", nil)
+			if tc.missing == "" {
+				f.claimed(t, p)
+				if !mustRun(t, f.env, f.runID).CrossCheckLane {
+					t.Fatal("interlocked child did not use cross-check lane")
+				}
+				if p.Config.CompletionContractVersion == nil || *p.Config.CompletionContractVersion != 1 {
+					t.Fatal("claim omitted child's completion contract version")
+				}
+			} else {
+				if p != nil {
+					t.Fatal("worker missing interlock protocol claimed child")
+				}
+				f.unchanged(t, before)
 			}
 		})
 	}
@@ -239,9 +311,18 @@ func TestCrossCheckLaneEligibilityLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			before := mustRun(t, f.env, f.runID)
 			p := laneClaim(t, f, "cross_check", nil)
 			if (p != nil) != tc.want {
 				t.Fatalf("payload present=%v want=%v", p != nil, tc.want)
+			}
+			if tc.want {
+				f.claimed(t, p)
+				if !mustRun(t, f.env, f.runID).CrossCheckLane {
+					t.Fatal("eligible child did not use cross-check lane")
+				}
+			} else {
+				f.unchanged(t, before)
 			}
 		})
 	}
