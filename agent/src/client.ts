@@ -1067,6 +1067,7 @@ export class WorkerClient {
     capabilities?: string[],
     protocolCapabilities?: string[],
     initialSnapshot?: ActiveSnapshot,
+    maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
@@ -1081,6 +1082,7 @@ export class WorkerClient {
     // 1); M3a's register handler accepts it and a pre-#42 server ignores it. Distinct
     // from the chat lane's WORKER_CHAT_SESSIONS — this bounds issue/ci_fix runs only.
     if (typeof maxConcurrentRuns === "number") body.max_concurrent_runs = maxConcurrentRuns;
+    if (typeof maxCrossCheckSlots === "number") body.max_cross_check_slots = maxCrossCheckSlots;
     // Self-reported REACHABLE capabilities (PRD #83 Q1). Only send when non-empty
     // (mirrors `template`): a worker with no daemon wired omits it entirely, so the
     // register wire stays byte-identical to today. The api declares-and-ignores it in
@@ -1274,6 +1276,15 @@ export class WorkerClient {
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
    *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
   async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
+    return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim`, activeSnapshot, signal, timeoutMs);
+  }
+
+  /** Dedicated lane; uses the run snapshot, deadline and guarded claim decoder. */
+  async claimCrossCheck(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
+    return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim?lane=cross_check`, activeSnapshot, signal, timeoutMs);
+  }
+
+  private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<ClaimResponse | null> {
     // The same deadline reaches fetch AND its body. Await the real request rather than a race:
     // admission must remain held until a late transport has definitively stopped.
     const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
@@ -1282,10 +1293,10 @@ export class WorkerClient {
     if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
       body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     }
-    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body, timeoutMs, deadline);
+    const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
     deadline.throwIfAborted();
     if (res.status === 204) return null;
-    if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
+    if (res.status >= 400) throw await this.toError("POST", path, res);
     const marker = res.headers.get("X-Uzi-Claim-Kind");
     if (marker !== null && marker !== "cross_check") {
       await res.body?.cancel();

@@ -49,6 +49,8 @@ export const workersApi = {
       // No runs and no advertised cap until the worker registers (PRD #42).
       active_runs: 0,
       max_concurrent_runs: null,
+      active_cross_checks: 0,
+      max_cross_check_slots: null,
       // Declared at issuance; reported stays null until the worker registers.
       template_declared: template ?? null,
       template_reported: null,
@@ -155,6 +157,8 @@ export const workersApi = {
       busy: false,
       active_runs: 0,
       max_concurrent_runs: null,
+      active_cross_checks: 0,
+      max_cross_check_slots: null,
       kind: "hosted" as const,
       hosted_size: size,
       docker,

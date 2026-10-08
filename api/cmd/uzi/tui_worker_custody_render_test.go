@@ -87,7 +87,7 @@ func TestWorkerCustodyDecisionSurfaces(t *testing.T) {
 						second := r
 						second.w.ID, second.w.Name = "second", "second"
 						m.workers.rows = []workerRow{r, second}[:n]
-						want := fmt.Sprintf("workers · %d · %d online · %d/%d slots in use", n, n, n, n*2)
+						want := fmt.Sprintf("workers · %d · %d online · %d/%d run slots in use · 0/0 cross-checks +%d ?cap", n, n, n, n*2, n)
 						if tc.cue {
 							want += fmt.Sprintf(" · %d holding · %d need attention", n, n)
 						}
@@ -114,7 +114,7 @@ func TestWorkersHealthyCustodySummary(t *testing.T) {
 					CustodyDecisionsNeeded: custodyCount(0),
 				}})
 			}
-			want := fmt.Sprintf("workers · %d · %d online · %d/%d slots in use", n, n, n, n*2)
+			want := fmt.Sprintf("workers · %d · %d online · %d/%d run slots in use · 0/0 cross-checks +%d ?cap", n, n, n, n*2, n)
 			if got := stripANSI(m.workersSummary(180)); got != want {
 				t.Fatalf("healthy custody summary: got %q, want %q", got, want)
 			}

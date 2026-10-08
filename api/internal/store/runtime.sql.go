@@ -8063,6 +8063,12 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat' AND NOT r.cross_check_lane
        ) AS active_runs,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+             AND r.cross_check_lane
+       ) AS active_cross_checks,
        u.email AS owner_email,
        rh.phase              AS roll_phase,
        rh.phase_since        AS roll_phase_since,
@@ -8084,6 +8090,7 @@ type ListAllWorkersRow struct {
 	Worker                Worker             `json:"worker"`
 	Busy                  bool               `json:"busy"`
 	ActiveRuns            int64              `json:"active_runs"`
+	ActiveCrossChecks     int64              `json:"active_cross_checks"`
 	OwnerEmail            string             `json:"owner_email"`
 	RollPhase             pgtype.Text        `json:"roll_phase"`
 	RollPhaseSince        pgtype.Timestamptz `json:"roll_phase_since"`
@@ -8195,6 +8202,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.MaxCrossCheckSlots,
 			&i.Busy,
 			&i.ActiveRuns,
+			&i.ActiveCrossChecks,
 			&i.OwnerEmail,
 			&i.RollPhase,
 			&i.RollPhaseSince,
@@ -10551,6 +10559,12 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat' AND NOT r.cross_check_lane
        ) AS active_runs,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+             AND r.cross_check_lane
+       ) AS active_cross_checks,
        -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
        -- custody hold? Healthy live runs included: custody is independent of busy/active_runs
        -- and owner decisions. It protects source through deletion, cleanup and per-owner
@@ -10656,6 +10670,7 @@ type ListWorkersByUserRow struct {
 	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                     bool               `json:"busy"`
 	ActiveRuns               int64              `json:"active_runs"`
+	ActiveCrossChecks        int64              `json:"active_cross_checks"`
 	RetainingUnpublishedWork bool               `json:"retaining_unpublished_work"`
 	RollPhase                pgtype.Text        `json:"roll_phase"`
 	RollPhaseSince           pgtype.Timestamptz `json:"roll_phase_since"`
@@ -10669,12 +10684,15 @@ type ListWorkersByUserRow struct {
 	RollWorkerImageTag       pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
-// Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
+// Worker list for the owning user. Three derived signals (PRD #42 Decision 10):
 //   - active_runs counts the worker's NON-CHAT active runs (claimed/running/
-//     awaiting_approval/awaiting_input) — the RUN lane that max_concurrent_runs
+//     awaiting_approval/awaiting_input/awaiting_followup), not on
+//     the durable cross-check lane — the RUN lane that max_concurrent_runs
 //     bounds. Chat runs
 //     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
 //     them, so counting a live chat here would render a false "3/2 runs" over-cap.
+//   - active_cross_checks uses the same active statuses, including released claims,
+//     selected by the durable lane marker rather than current advertisement.
 //   - busy is the ANY-kind non-terminal signal (a lone active chat still shows the
 //     worker as busy), so it is its own EXISTS over every kind — NOT derived from
 //     active_runs, which now omits chat.
@@ -10768,6 +10786,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
+			&i.ActiveCrossChecks,
 			&i.RetainingUnpublishedWork,
 			&i.RollPhase,
 			&i.RollPhaseSince,

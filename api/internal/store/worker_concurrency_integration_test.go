@@ -17,8 +17,9 @@ import (
 // never run the SQL: RegisterWorker persisting (and overwriting) the advertised
 // max_concurrent_runs cap, and the ListWorkersByUser / ListAllWorkers active_runs
 // count (the EXISTS→count(*) change, Decision 10). The count includes exactly the
-// claimed/running/awaiting_approval statuses — queued and the terminal statuses are
-// excluded — and busy stays derivable as active_runs > 0.
+// claimed/running/awaiting_approval/awaiting_input/awaiting_followup statuses,
+// including released active claims. Queued and terminal statuses are excluded;
+// chat contributes to busy but not to either capacity count.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the store
 // e2e runner (e2e/run-store-it.sh) provides one.
@@ -136,9 +137,29 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	}
 	seedChatRun("running", wkr2.ID)
 
-	const wantActive = 3
+	// Durable lane claims include every active state, including released claims,
+	// but not queued or terminal claims. Legacy children still consume run slots.
+	leadID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO runs (id,user_id,repo_id,issue_iid,issue_title,issue_description,status,worker_id)
+	 VALUES ($1,$2,$3,99,'lead','d','running',$4)`, leadID, userID, repoID, wkr.ID)
+	for _, tc := range []struct {
+		status         string
+		lane, released bool
+	}{
+		{"claimed", true, false}, {"running", true, false}, {"awaiting_approval", true, false},
+		{"awaiting_input", true, false}, {"awaiting_followup", true, false},
+		{"queued", true, false}, {"completed", true, false}, {"running", true, true},
+		{"running", false, false}, {"running", false, true},
+	} {
+		mustExec(ctx, t, pool, `INSERT INTO runs (id,user_id,repo_id,kind,target_run_id,harness,report_only,budget_wall_seconds,status,worker_id,cross_check_lane,claim_released_at,issue_title,issue_description)
+	 VALUES ($1,$2,$3,'cross_check',$4,'codex',true,600,$5,$6,$7,CASE WHEN $8::boolean THEN now() ELSE NULL END,'checker','d')`,
+			uuid.New(), userID, repoID, leadID, tc.status, wkr.ID, tc.lane, tc.released)
+	}
+	mustExec(ctx, t, pool, `UPDATE workers SET max_cross_check_slots=16 WHERE id=$1`, wkr.ID)
+	const wantActive = 6      // three original runs, lead, and two legacy children (one released)
+	const wantCrossChecks = 6 // five active states plus the released active child
 
-	// ── ListWorkersByUser: wkr = active_runs 3 / busy true / cap 3; the chat-only
+	// ── ListWorkersByUser: wkr = active_runs 6 / busy true / cap 3; the chat-only
 	//    worker = active_runs 0 but busy true. ──
 	byUser, err := q.ListWorkersByUser(ctx, userID)
 	if err != nil {
@@ -149,11 +170,17 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 		switch row.ID {
 		case wkr.ID:
 			sawWkr = true
+			if row.ActiveCrossChecks != wantCrossChecks {
+				t.Fatalf("cross-check count = %d, want %d", row.ActiveCrossChecks, wantCrossChecks)
+			}
 			if row.ActiveRuns != wantActive {
 				t.Fatalf("ListWorkersByUser active_runs = %d, want %d (chat must not count)", row.ActiveRuns, wantActive)
 			}
 			if !row.Busy {
 				t.Fatalf("ListWorkersByUser busy = false, want true")
+			}
+			if !row.MaxCrossCheckSlots.Valid || row.MaxCrossCheckSlots.Int32 != 16 {
+				t.Fatalf("owner cross-check cap: %+v", row.MaxCrossCheckSlots)
 			}
 			if !row.MaxConcurrentRuns.Valid || row.MaxConcurrentRuns.Int32 != 3 {
 				t.Fatalf("ListWorkersByUser cap = %+v, want 3", row.MaxConcurrentRuns)
@@ -182,11 +209,17 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 		switch row.Worker.ID {
 		case wkr.ID:
 			sawWkr = true
+			if row.ActiveCrossChecks != wantCrossChecks {
+				t.Fatalf("cross-check count = %d, want %d", row.ActiveCrossChecks, wantCrossChecks)
+			}
 			if row.ActiveRuns != wantActive {
 				t.Fatalf("ListAllWorkers active_runs = %d, want %d", row.ActiveRuns, wantActive)
 			}
 			if !row.Busy {
 				t.Fatalf("ListAllWorkers busy = false, want true")
+			}
+			if !row.Worker.MaxCrossCheckSlots.Valid || row.Worker.MaxCrossCheckSlots.Int32 != 16 {
+				t.Fatalf("admin cross-check cap: %+v", row.Worker.MaxCrossCheckSlots)
 			}
 			if !row.Worker.MaxConcurrentRuns.Valid || row.Worker.MaxConcurrentRuns.Int32 != 3 {
 				t.Fatalf("ListAllWorkers cap = %+v, want 3", row.Worker.MaxConcurrentRuns)
