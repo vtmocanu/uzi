@@ -1161,17 +1161,19 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       await r.settlement.put(adoptedRecord(r, HOLD_A));
       r.settleClient.liveAnswer = () => "hang";
       const flight = liveFlight();
-      const t0 = Date.now();
       assert.equal(await publish(r, flight, PUBLISHED_OK), true);
-      assert.ok(Date.now() - t0 < 1_000, "the publish returned without waiting on the settle");
       await Promise.all(r.observed);
       // The send is (or will shortly be) in flight and hangs; the run is not waiting on it.
       for (let i = 0; i < 100 && r.settleClient.liveCalls.length === 0; i++) await new Promise((res) => setTimeout(res, 10));
       assert.equal(r.settleClient.liveCalls.length, 1, "the live settle was sent in the background");
-      const t1 = Date.now();
+      assert.equal(r.settled.length, 1, "the live settlement promise was captured");
+      let settlementCompleted = false;
+      const completion = r.settled[0]!.then(() => { settlementCompleted = true; });
+      await Promise.resolve();
+      assert.equal(settlementCompleted, false, "the publish returned while the live settlement remained pending");
       flight.cancel.abort();
-      await Promise.all(r.settled);
-      assert.ok(Date.now() - t1 < 1_000, "the flight's cancel signal ends the hanging settle");
+      await completion;
+      assert.equal(settlementCompleted, true, "the flight's cancel signal ends the hanging settle");
       const [rec] = await r.settlement.listRun(RUN_ID);
       assert.deepEqual(
         [rec!.state, rec!.live?.sent, rec!.live?.attempts],
