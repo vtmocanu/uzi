@@ -2603,6 +2603,349 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
   });
 });
 
+describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
+  const label = (e: HarnessEvent): string => e.kind !== "frame" ? e.kind :
+    e.items.some(i => i.kind === "tool") ? e.items.filter(i => i.kind === "tool").map(i => i.phase).join(",") :
+      JSON.stringify(e).includes("commentary") ? "commentary" : "signal";
+  async function pullUntil(iter: AsyncIterator<HarnessEvent>, wanted: string): Promise<HarnessEvent[]> {
+    const events: HarnessEvent[] = [];
+    for (let n = 0; n < 20; n++) {
+      const step = await withTimeout(iter.next(), 1000, wanted);
+      assert.equal(step.done, false);
+      events.push(step.value!);
+      if (label(step.value!) === wanted) return events;
+    }
+    assert.fail(`missing ${wanted}`);
+  }
+
+  for (const ordering of ["notification-first", "completion-first", "co-ready notification-first", "co-ready completion-first"] as const) {
+    it(`${ordering}: retained read and finished projection follow readiness order`, async () => {
+      const ac = new AbortController();
+      const { broker, release } = wedgeBroker();
+      const { harness, transport } = makeHarness({ broker });
+      transport.push(toolCall(1, "Bash", { command: "echo blocked" }));
+      const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+      try {
+        await iter.next();
+        await pullUntil(iter, "started");
+        let first: HarnessEvent[];
+        if (ordering.includes("notification-first")) {
+          transport.push(agentMessage("commentary"));
+          if (ordering.startsWith("co-ready")) {
+            await tick();
+            release({ ok: true, output: {} });
+            await tick();
+          }
+          first = await pullUntil(iter, "commentary");
+          assert.ok(!first.some(e => label(e) === "finished"));
+          if (!ordering.startsWith("co-ready")) {
+            assert.equal(transport.responses.length, 0);
+            release({ ok: true, output: {} });
+          }
+          await pullUntil(iter, "finished");
+          await pullUntil(iter, "activity");
+        } else {
+          release({ ok: true, output: {} });
+          await tick();
+          if (ordering.startsWith("co-ready")) transport.push(agentMessage("commentary"));
+          first = await pullUntil(iter, "finished");
+          assert.ok(!first.some(e => label(e) === "commentary"));
+          if (!ordering.startsWith("co-ready")) {
+            await pullUntil(iter, "activity");
+            transport.push(agentMessage("commentary"));
+          }
+          await pullUntil(iter, "commentary");
+        }
+        transport.push(turnCompleted());
+        const rest = await collect({ [Symbol.asyncIterator]: () => iter });
+        assert.equal(rest.at(-1)?.kind, "turn_finished");
+        assert.equal(transport.responses.length, 1);
+      } finally {
+        ac.abort();
+        release({ ok: true, output: {} });
+        await iter.return?.();
+        await harness.close();
+      }
+    });
+  }
+
+  it("A blocked, B queued, C commentary: effects stay serial and terminal waits without reading beyond it", async () => {
+    const ac = new AbortController();
+    let releaseA!: (r: CallbackResult) => void;
+    let releaseB!: (r: CallbackResult) => void;
+    const a = new Promise<CallbackResult>(r => { releaseA = r; });
+    const b = new Promise<CallbackResult>(r => { releaseB = r; });
+    const calls: unknown[] = [];
+    const broker = stubBroker((_rt, _tool, args) => {
+      calls.push(args);
+      return calls.length === 1 ? a : b;
+    });
+    const { harness, transport } = makeHarness({ broker });
+    let reads = 0;
+    let reading = false;
+    const notifications = transport.notifications.bind(transport);
+    transport.notifications = () => {
+      const notes = notifications();
+      return {
+        next: () => {
+          assert.equal(reading, false, "notification reads never overlap");
+          reading = true;
+          reads++;
+          const pending = notes.next();
+          void pending.then(() => { reading = false; }, () => { reading = false; });
+          return pending;
+        },
+        return: notes.return?.bind(notes),
+        [Symbol.asyncIterator]() { return this; },
+      };
+    };
+    transport.push(toolCall(1, "Bash", { command: "A" }, "th-1", "tn-1", "A"));
+    const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+    let pending: Promise<IteratorResult<HarnessEvent>> | undefined;
+    try {
+      await iter.next();
+      await pullUntil(iter, "started");
+      transport.push(toolCall(2, "Bash", { command: "B" }, "th-1", "tn-1", "B"))
+        .push(agentMessage("commentary C"))
+        .push(turnCompleted("completed", undefined, "th-1", "stale"))
+        .push(turnCompleted("completed", undefined, "foreign", "tn-1"))
+        .push(agentMessage("commentary after stale"))
+        .push(turnCompleted())
+        .push(toolCall(3, "Bash", { command: "beyond terminal" }));
+      await pullUntil(iter, "commentary");
+      assert.deepEqual(calls, [{ command: "A" }]);
+      await pullUntil(iter, "commentary");
+      pending = iter.next();
+      await tick();
+      assert.equal(transport.responses.length, 0);
+      releaseA({ ok: true, output: {} });
+      const finished = await withTimeout(pending, 1000, "A finished");
+      assert.equal(label(finished.value!), "finished");
+      await pullUntil(iter, "started");
+      assert.deepEqual(calls, [{ command: "A" }, { command: "B" }]);
+      pending = iter.next();
+      await tick();
+      assert.equal(transport.responses.length, 1);
+      releaseB({ ok: true, output: {} });
+      assert.equal(label((await pending).value!), "finished");
+      const rest = await collect({ [Symbol.asyncIterator]: () => iter });
+      assert.deepEqual(rest.map(label), ["activity", "turn_finished"]);
+      assert.deepEqual(transport.responses.map(r => r.requestId), [1, 2]);
+      assert.equal(reads, 7, "the read stops at the active terminal, leaving the next request unread");
+    } finally {
+      ac.abort();
+      releaseA({ ok: true, output: {} });
+      releaseB({ ok: true, output: {} });
+      await pending?.catch(() => {});
+      await iter.return?.();
+      await harness.close();
+    }
+  });
+
+  it("throwing callback completes its pair and reply before dispatching a queued sibling", async () => {
+    let rejectA!: (error: Error) => void;
+    const a = new Promise<CallbackResult>((_resolve, reject) => { rejectA = reject; });
+    let calls = 0;
+    const broker = stubBroker(() => ++calls === 1 ? a : Promise.resolve({ ok: true, output: {} }));
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(toolCall(1, "Bash", {}, "th-1", "tn-1", "A"));
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    try {
+      await iter.next();
+      await pullUntil(iter, "started");
+      transport.push(toolCall(2, "Bash", {}, "th-1", "tn-1", "B")).push(agentMessage("commentary"));
+      await pullUntil(iter, "commentary");
+      assert.equal(calls, 1);
+      rejectA(new Error("broker threw"));
+      transport.push(turnCompleted());
+      const events = await collect({ [Symbol.asyncIterator]: () => iter });
+      assert.deepEqual(events.map(label), ["finished", "activity", "started", "finished", "activity", "turn_finished"]);
+      const error = events[0];
+      assert.ok(error?.kind === "frame");
+      assert.deepEqual(error.items.map(i => i.kind === "tool" && i.phase === "finished" ? [i.phase, i.isError, i.output] : []),
+        [["finished", true, "the callback failed"]]);
+      assert.equal(calls, 2);
+      assert.deepEqual(transport.responses.map(r => r.requestId), [1, 2]);
+    } finally {
+      rejectA(new Error("cleanup"));
+      await iter.return?.();
+      await harness.close();
+    }
+  });
+
+  for (const stop of ["abort", "requestStop"] as const) {
+    for (const barrier of [false, true]) {
+      it(`${stop} while ${barrier ? "terminal waits" : "reading"} refuses queued requests and isolates the next turn`, async () => {
+        let turns = 0;
+        const transport = new FakeTransport(method => method === "turn/start" ? { turn: { id: `tn-${++turns}` } } : defaultResponder(method));
+        const ac = new AbortController();
+        const { broker, release } = wedgeBroker();
+        const { harness } = makeHarness({ broker, transport });
+        transport.push(toolCall(1, "Bash", {}));
+        const turn = harness.startTurn(makeRequest({ signal: ac.signal }));
+        const iter = turn.events[Symbol.asyncIterator]();
+        let pending: Promise<IteratorResult<HarnessEvent>> | undefined;
+        try {
+          await iter.next();
+          await pullUntil(iter, "started");
+          transport.push(toolCall(2, "Bash", {})).push(agentMessage("commentary queued"));
+          await pullUntil(iter, "commentary");
+          if (barrier) transport.push(turnCompleted());
+          pending = iter.next();
+          await tick();
+          if (stop === "abort") ac.abort(); else await turn.requestStop("cancel");
+          assert.equal((await withTimeout(pending, 1000, "stop")).done, true);
+          assert.deepEqual(transport.responses.map(r => r.requestId), [2]);
+          assert.deepEqual(transport.responses[0]?.response, { result: { success: false, contentItems: [{ type: "inputText", text: "callback does not match the active turn" }] } });
+          const next = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+          const nextPull = next.next();
+          await tick();
+          release({ ok: true, output: {} });
+          await tick();
+          transport.push(turnCompleted("completed", undefined, "th-1", "tn-2"));
+          const nextEvents: HarnessEvent[] = [];
+          for (let step = await nextPull; !step.done; step = await next.next()) nextEvents.push(step.value);
+          assert.ok(!nextEvents.some(e => e.kind === "frame"));
+          assert.deepEqual(transport.responses.map(r => r.requestId), [2, 1]);
+        } finally {
+          ac.abort();
+          release({ ok: true, output: {} });
+          await pending?.catch(() => {});
+          await iter.return?.();
+          await harness.close();
+        }
+      });
+    }
+  }
+
+  for (const failure of ["EOF", "read failure", "iterator teardown"] as const) {
+    it(`${failure} refuses the FIFO and suppresses late callback output`, async () => {
+      const { broker, release } = wedgeBroker();
+      const { harness, transport } = makeHarness({ broker });
+      transport.push(toolCall(1, "Bash", {}));
+      const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+      try {
+        await iter.next();
+        await pullUntil(iter, "started");
+        transport.push(toolCall(2, "Bash", {})).push(agentMessage("commentary"));
+        await pullUntil(iter, "commentary");
+        if (failure === "iterator teardown") {
+          await iter.return?.();
+        } else {
+          const pending = iter.next();
+          if (failure === "EOF") transport.end(); else transport.fail(new Error("test notification failure"));
+          await assert.rejects(withTimeout(pending, 1000, "prompt read failure"),
+            failure === "EOF" ? /stream ended before turn completion/ : /test notification failure/);
+        }
+        assert.deepEqual(transport.responses.map(r => r.requestId), [2]);
+        assert.deepEqual(transport.responses[0]?.response, { result: { success: false, contentItems: [{ type: "inputText", text: "callback does not match the active turn" }] } });
+        release({ ok: true, output: {} });
+        await tick();
+        assert.deepEqual(transport.responses.map(r => r.requestId), [2, 1]);
+        assert.equal((await iter.next()).done, true);
+      } finally {
+        release({ ok: true, output: {} });
+        await iter.return?.();
+        await harness.close();
+      }
+    });
+  }
+
+  for (const limit of ["count", "bytes"] as const) {
+    it(`${limit} overflow refuses overflow and every undispatched request exactly once`, async () => {
+      let calls = 0;
+      const { broker: wedged, release } = wedgeBroker();
+      const broker = stubBroker((rt, name, args, origin) => {
+        calls++;
+        return wedged.handleToolCall(rt, name, args, origin);
+      });
+      const { harness, transport } = makeHarness({ broker });
+      transport.push(toolCall(1, "Bash", {}));
+      const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+      try {
+        await iter.next();
+        await pullUntil(iter, "started");
+        const count = limit === "count" ? 4097 : 2;
+        for (let n = 0; n < count; n++)
+          transport.push(toolCall(n + 2, "Bash", limit === "bytes" ? { data: "x".repeat(32 * 1024 * 1024) } : {}));
+        await assert.rejects(withTimeout(iter.next(), 10000, "queue overflow"), /deferred request queue overflow/);
+        assert.equal(calls, 1);
+        assert.equal(transport.responses.length, count);
+        assert.equal(new Set(transport.responses.map(r => r.requestId)).size, count);
+        for (const response of transport.responses) assert.deepEqual(response.response, { result: { success: false, contentItems: [{ type: "inputText", text: "callback does not match the active turn" }] } });
+        release({ ok: true, output: {} });
+        await tick();
+        assert.equal(transport.responses.length, count + 1);
+      } finally {
+        release({ ok: true, output: {} });
+        await iter.return?.();
+        await harness.close();
+      }
+    });
+  }
+
+  for (const accepted of [true, false]) {
+    it(`blocked signal with queued request permits commentary; ${accepted ? "accepted" : "denied"} signal folds once`, async () => {
+      const { broker: wedged, entered, release } = wedgeBroker();
+      let calls = 0;
+      const broker = stubBroker((rt, name, args, origin) => ++calls === 1 ?
+        wedged.handleToolCall(rt, name, args, origin) : Promise.resolve({ ok: true, output: {} }));
+      const { harness, transport } = makeHarness({ broker });
+      transport.push(toolCall(1, "signal_done", {}));
+      const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+      let pending: Promise<IteratorResult<HarnessEvent>> | undefined;
+      try {
+        await iter.next();
+        pending = iter.next();
+        await entered;
+        transport.push(toolCall(2, "Bash", {}, "th-1", "tn-1", "B")).push(agentMessage("commentary during signal"));
+        assert.equal(label((await withTimeout(pending, 1000, "signal commentary")).value!), "commentary");
+        assert.equal(calls, 1);
+        assert.equal(transport.responses.length, 0);
+        release(accepted ? { ok: true, output: { done: true } } : { ok: false, code: "denied", message: "denied" });
+        transport.push(turnCompleted());
+        const events = await collect({ [Symbol.asyncIterator]: () => iter });
+        assert.equal(events.filter(e => e.kind === "frame" && e.signals !== undefined).length, accepted ? 1 : 0);
+        assert.equal(events.filter(e => label(e) === "started").length, 1);
+        assert.equal(events.filter(e => label(e) === "finished").length, 1);
+        assert.deepEqual(transport.responses.map(r => r.requestId), [1, 2]);
+      } finally {
+        release({ ok: false, code: "denied", message: "cleanup" });
+        await pending?.catch(() => {});
+        await iter.return?.();
+        await harness.close();
+      }
+    });
+  }
+
+  it("direct commentary emits while Bash remains blocked", async () => {
+    const ac = new AbortController();
+    const { broker, entered, release } = wedgeBroker();
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(toolCall(2283, "Bash", { command: "echo blocked" }));
+    const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+    let pull: Promise<IteratorResult<HarnessEvent>> | undefined;
+    try {
+      await iter.next();
+      const started = await withTimeout(iter.next(), 1000, "started projection");
+      assert.ok(started.value?.kind === "frame");
+      await entered;
+      pull = iter.next();
+      transport.push(agentMessage("commentary while blocked"));
+      const commentary = await withTimeout(pull, 300, "issue #2283 commentary while callback is unreleased");
+      assert.ok(commentary.value?.kind === "frame");
+      assert.match(JSON.stringify(commentary.value), /commentary while blocked/);
+      assert.equal(transport.responses.length, 0);
+    } finally {
+      ac.abort();
+      release({ ok: true, output: {} });
+      await pull?.catch(() => {});
+      await iter.return?.();
+      await harness.close();
+    }
+  });
+});
+
 describe("CodexHarness: root tool projection outbox (issue #1583)", () => {
   function toolItems(events: HarnessEvent[]): Extract<HarnessEvent, { kind: "frame" }>["items"][number][] {
     return events.flatMap((e) => (e.kind === "frame" ? e.items : [])).filter((i) => i.kind === "tool");

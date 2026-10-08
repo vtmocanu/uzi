@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Guarded recovery records safe inventory-source refusal diagnostics ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
   Worker logs and authenticated local recovery reasons identify the first failed source check and a bounded inventory-read cause without raw errors or paths. Existing custody and release decisions stay unchanged; the observed automatic hold-release failure still needs live evidence.
 
+### Fixed
+
+- **Codex commentary stays live during long tool calls ([#2283](https://github.com/vtmocanu/uzi/issues/2283)).**
+  Assistant commentary is emitted while a tool callback is still running, so the run feed and transcript show it before the tool result. Later callbacks remain serial, and cancellation still ends the turn promptly.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
