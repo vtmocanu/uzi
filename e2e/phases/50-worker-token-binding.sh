@@ -37,6 +37,10 @@
 # of this one, or restart the agent yourself.
 say "PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim"
 login
+# ClaimRun still applies owner count < limit to these non-recovery-capable
+# synthetic workers, but they add no custody. Wait while the real agent can settle
+# its pending final inventories, before stopping it for the payload-only claims.
+wait_custody_headroom 1
 "${COMPOSE[@]}" stop agent >/dev/null 2>&1 || true
 
 # A SECOND credential with a DISTINCT value — distinct is the whole test: the two
@@ -211,4 +215,3 @@ CANCELLED_N="$(db_psql "WITH c AS (
 [ "$CANCELLED_N" = 3 ] \
   || fail "binding phase cleanup: expected to terminate 3 leftover claimed runs, cancelled $CANCELLED_N (B1=$RUN_B1 B2=$RUN_B2 B3=$RUN_B3)"
 pass "binding-phase cleanup: the three claimed binding runs terminated so they cannot dirty the auto-stop queue"
-

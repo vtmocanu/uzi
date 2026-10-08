@@ -356,6 +356,35 @@ for change in 'status="failed"' 'recovery_wait_cause="provider_outage"' 'recover
   custody_case "spent allowance refuses $change" fail "case 8:" assert_finalize_allowance_spent R 1 3 3
 done
 
+# Drive the actual manual-worker setup. These workers advertise no recovery
+# capability, so they add no hold but still need owner count < limit to claim.
+binding_fake_stop() {
+  if [ "$(cat "$SEQ_DIR/n")" -gt 1 ]; then echo ready > "$SEQ_DIR/stopped"; else echo early > "$SEQ_DIR/stopped"; fi
+}
+binding_stop_setup() {
+  headroom_fixture 8 7
+  # shellcheck disable=SC2034  # read by the extracted phase setup
+  COMPOSE=(binding_fake_stop)
+  eval "$(awk '/^wait_custody_headroom / || /^"\$\{COMPOSE\[@\]\}" stop agent/' "$ROOT/e2e/phases/50-worker-token-binding.sh")"
+  [ "$(cat "$SEQ_DIR/stopped")" = ready ] || fail 'agent stopped before final inventories had admission headroom'
+  echo 'binding stop waited for headroom'
+}
+custody_case "binding waits while the real agent can still settle" pass 'binding stop waited' binding_stop_setup
+asw_claim() {
+  [ "$(cat "$SEQ_DIR/n")" -gt 1 ] || return 1
+  local calls; calls="$(cat "$SEQ_DIR/claims")"
+  echo $((calls + 1)) > "$SEQ_DIR/claims"
+  echo "R$calls"
+}
+autostop_claim_setup() {
+  headroom_fixture 8 7
+  echo 0 > "$SEQ_DIR/claims"
+  eval "$(awk '/^wait_custody_headroom / || /^C[12]=/' "$ROOT/e2e/phases/51-auto-stop-poison.sh")"
+  [ "$(cat "$SEQ_DIR/claims")" = 2 ] || fail 'manual claims did not both occur'
+  echo 'both non-recovery claims followed headroom'
+}
+custody_case "auto-stop manual claims require one slot without adding holds" pass 'both non-recovery claims followed headroom' autostop_claim_setup
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -366,6 +395,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 62 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 64 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 62 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 64 ] && [ "$cases" -eq "$passed" ]
