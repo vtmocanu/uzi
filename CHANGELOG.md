@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Expired guarded recovery archives can be replaced safely ([#2416](https://github.com/vtmocanu/uzi/issues/2416)).**
+  Recovery uploads a replacement after the server confirms that the old capture was never accepted, keeping the local bundle and source pins until FINAL acknowledgment. Accepted releases remain idempotent; integrity mismatches and uncertain capture status keep custody pending.
+
 - **Terminal protection recognizes case-only run directory aliases on case-insensitive filesystems ([#2309](https://github.com/vtmocanu/uzi/issues/2309)).**
   On a case-insensitive filesystem such as default macOS APFS, a valid UUID run directory whose stored name differs from its id only by letter case is no longer read as unsafe, so a run with no terminal files is not kept under physical terminal protection indefinitely. Symlinked run directories and any other path difference stay unsafe; Linux workers are unaffected.
 

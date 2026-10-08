@@ -1,11 +1,12 @@
 import { it } from "node:test";
 import { RequestError } from "../src/client.js";
+import type { RecoveryFinalDisposition, RecoveryReserveRequest } from "../src/protocol.js";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { RecoveryCoordinator, canonicalJson, type RecoveryRecord } from "../src/recovery.js";
+import { RecoveryCoordinator, canonicalJson, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
 import { createHash, createHmac } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
@@ -243,7 +244,7 @@ it("issue1924 a symlinked ancestor of the recovery root still finalizes; a symli
   } finally { await fs.rm(outer, { recursive: true, force: true }); }
 });
 
-async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
+async function fixture(sourceBoundary = false, rootParent = os.tmpdir(), receiptModel = false) {
   const root = await fs.mkdtemp(path.join(rootParent, "inventory-"));
   const context: PositiveOwedCandidateContext = {
     runId: "run-1", generation: 7, kind: "issue", branch: "task",
@@ -258,14 +259,20 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
-    sourceRefused: false, uploads: 0,
+    sourceRefused: false, uploads: 0, pinDeletes: 0,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
+    beforeFinalAck: undefined as (() => Promise<void>) | undefined,
   };
   const aggregates: string[][] = [];
   const finals: unknown[][] = [];
   let reserves = 0;
-  const captures = new Map<string, { id: string; manifest?: { checksum: string; byte_size: number } }>();
+  const reserveKeys: string[] = [];
+  const committedReceipts = new Map<number, Readonly<RecoveryFinalDisposition>>();
+  const captures = new Map<string, {
+    id: string; request: RecoveryReserveRequest; state?: string; expires?: string; reason?: string;
+    manifest?: { checksum: string; byte_size: number };
+  }>();
   const client = {
     hasFeature: () => state.feature,
     getRunOwnership: async () => {
@@ -275,12 +282,14 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
     listRecoveryHolds: async (runId = context.runId) => ({ run_id: runId, holds: state.open ? [{
       hold_id: "hold-7", generation: state.holdGeneration, inventory_guarded: true, has_available_capture: false,
     }] : [] }),
-    reserveRecoveryCapture: async (_run: string, request: { idempotency_key: string }) => {
+    reserveRecoveryCapture: async (_run: string, request: RecoveryReserveRequest) => {
       reserves++;
+      reserveKeys.push(request.idempotency_key);
       if (state.reserveError) throw state.reserveError;
       let capture = captures.get(request.idempotency_key);
       if (!capture) {
-        capture = { id: "server-" + (captures.size + 1) };
+        capture = { id: "server-" + (captures.size + 1), request: structuredClone(request),
+          expires: receiptModel ? state.expires : undefined };
         captures.set(request.idempotency_key, capture);
       }
       return { capture_id: capture.id, state: "preparing" };
@@ -289,8 +298,8 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
       const capture = [...captures.values()].find(c => c.id === id);
       assert.ok(capture);
       return {
-        capture_id: id, state: capture.manifest ? "available" : "preparing", manifest_bound: !!capture.manifest,
-        checksum: capture.manifest?.checksum, byte_size: capture.manifest?.byte_size, expires_at: state.expires,
+        capture_id: id, state: capture.state ?? (capture.manifest ? "available" : "preparing"), manifest_bound: !!capture.manifest,
+        checksum: capture.manifest?.checksum, byte_size: capture.manifest?.byte_size, expires_at: capture.expires ?? state.expires, reason: capture.reason,
       };
     },
     uploadRecoveryBundle: async (_run: string, id: string, m: { checksum: string; byte_size: number }, stream: AsyncIterable<unknown>) => {
@@ -298,18 +307,69 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
       const capture = [...captures.values()].find(c => c.id === id);
       assert.ok(capture);
       state.uploads++;
-      capture.manifest = m;
+      capture.manifest = structuredClone(m);
       return { capture_id: id, state: "available", manifest_bound: true };
     },
+    ...(receiptModel ? {
+      reconcileRecoveryCapture: async (run: string, id: string, request: {
+        generation: number; source_sha: string; coverage_digest: string; checksum: string; byte_size: number;
+      }) => {
+        const response = { run_id: run, generation: request.generation, capture_id: id };
+        const receipt = committedReceipts.get(request.generation);
+        if (receipt) return { ...response, outcome: "accepted", final_receipt: structuredClone(receipt) };
+        const capture = [...captures.values()].find(c => c.id === id);
+        assert.ok(capture);
+        assert.equal(request.generation, capture.request.generation);
+        assert.equal(request.source_sha, capture.request.source_sha);
+        assert.equal(request.coverage_digest, capture.request.coverage_digest);
+        if ((capture.manifest && (request.checksum !== capture.manifest.checksum || request.byte_size !== capture.manifest.byte_size))) {
+          return { ...response, outcome: "retained", reason: "capture_manifest_integrity_mismatch" };
+        }
+        if (capture.state === "available" && !capture.manifest) return { ...response, outcome: "retained", reason: "available_capture_manifest_unbound" };
+        if (capture.reason === "archive integrity check failed" ||
+            (capture.state === "needs_action" && !["upload_retry_window_exhausted", "storage quota exceeded", "upload failed; retry available"].includes(capture.reason ?? "")) ||
+            (["preparing", "uploading", "discarded", "available"].includes(capture.state ?? "") && !!capture.reason)) {
+          return { ...response, outcome: "retained", reason: "capture_failure_requires_attention" };
+        }
+        if (state.open && (capture.state === "expired" || Date.parse(capture.expires ?? "") <= state.now ||
+            ["preparing", "uploading", "discarded", "needs_action"].includes(capture.state ?? ""))) {
+          capture.state = "expired";
+          return { ...response, outcome: "replaceable" };
+        }
+        return { ...response, outcome: "retained", reason: "capture_available" };
+      },
+    } : {}),
     releaseRecoveryCustody: async (...args: unknown[]) => {
-      finals.push(args);
+      finals.push(structuredClone(args));
       if (state.finalError) throw state.finalError;
+      if (receiptModel) {
+        const generation = args[1] as number;
+        const disposition = args[3] as RecoveryFinalDisposition;
+        const committed = committedReceipts.get(generation);
+        if (committed) {
+          assert.deepEqual(disposition, committed, "committed FINAL receipts cannot be replaced");
+        } else {
+          assert.equal(disposition.kind, "archive");
+          const capture = [...captures.values()].find(c => c.id === disposition.capture_id);
+          assert.ok(capture);
+          if (capture.state === "expired" || Date.parse(capture.expires ?? "") <= state.now) {
+            throw new RequestError("POST", "/api/worker/runs/run-1/recovery/release", 409, "capture expired");
+          }
+          assert.equal(disposition.source_sha, capture.request.source_sha);
+          assert.equal(disposition.coverage_digest, capture.request.coverage_digest);
+          assert.ok(capture.manifest);
+          await state.beforeFinalAck?.();
+          committedReceipts.set(generation, Object.freeze(structuredClone(disposition)));
+          state.open = false;
+        }
+      }
       if (state.loseAck) { state.open = false; throw new Error("ACK lost"); }
       if (state.closeOnRelease && !state.wrongAck) state.open = false; // opt-in: a real server closes the hold
       return { run_id: state.wrongAck ? "other-run" : args[0], generation: args[1] as number, released: true, holds_released: 1 };
     },
   };
   const git = {
+    deleteRecoveryPin: async () => { state.pinDeletes++; state.candidates = []; },
     readInventoryCloneHeads: async () => state.cloneReadable
       ? ({ kind: "verified", heads: state.cloneHeads, clones: [], foreignOwners: [] }) : ({ kind: "unknown" }),
     ancestry: async (_bare: string, head: string, target?: string) =>
@@ -354,7 +414,476 @@ async function fixture(sourceBoundary = false, rootParent = os.tmpdir()) {
     record, barePath: context.barePath, defaultBranch: "main",
   });
   return { root, context, state, aggregates, finals, coordinator, make, freeze, capture, git,
+    captures, reserveKeys, committedReceipts, client,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
+}
+
+async function pendingReceiptFixture(savedFinal = true) {
+  const f = await fixture(false, os.tmpdir(), true);
+  if (savedFinal) f.state.finalError = new Error("unaccepted FINAL");
+  else f.state.expires = "1970-01-01T00:00:00Z";
+  const record = await f.freeze();
+  assert.ok(record);
+  await f.capture(record);
+  f.state.finalError = undefined;
+  f.state.expires = "2099-01-01T00:00:00Z";
+  const before = (await f.coordinator.inspect("run-1"))[0]!;
+  return { f, before, capture: f.captures.get(f.reserveKeys[0]!)! };
+}
+
+for (const state of ["expired", "available", "preparing", "uploading", "discarded", "needs_action"]) {
+  const reasons = state === "needs_action"
+    ? ["upload_retry_window_exhausted", "storage quota exceeded", "upload failed; retry available"] : [undefined];
+  for (const reason of reasons) for (const saved of [false, true]) {
+    it(`issue2416 replacement allowlist ${state}/${reason} saved=${saved}`, async () => {
+      const { f, before, capture } = await pendingReceiptFixture(saved);
+      try {
+        capture.state = state; capture.reason = reason; capture.expires = "1970-01-01T00:00:00Z";
+        await f.make().resumePending(undefined, [before]);
+        const after = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(after.finalAcknowledged, true);
+        assert.equal(after.captureId, before.captureId);
+        assert.equal(after.bundlePath, before.bundlePath);
+        assert.equal(f.state.produced, 1);
+        assert.equal(f.reserveKeys.length, 2);
+        assert.equal(f.reserveKeys[0], before.captureId, "legacy reserve key fallback");
+        assert.match(after.reserveIdempotencyKey!, /^[0-9a-f-]{36}$/);
+      } finally { await f.close(); }
+    });
+  }
+}
+
+for (const variant of ["checksum", "size", "expired-checksum", "expired-size", "discarded-checksum", "discarded-size", "integrity", "unknown", "absent", "unbound"]) {
+  for (const saved of [false, true]) for (const expired of [false, true]) {
+    it(`issue2416 retained ${variant} saved=${saved} expired=${expired} keeps bytes and cleanup pending`, async () => {
+      const { f, before, capture } = await pendingReceiptFixture(saved);
+      try {
+        capture.expires = expired ? "1970-01-01T00:00:00Z" : "2099-01-01T00:00:00Z";
+        capture.state = variant.startsWith("expired") ? "expired" : variant.startsWith("discarded") ? "discarded" :
+          ["integrity", "unknown", "absent"].includes(variant) ? "needs_action" : "available";
+        if (variant.includes("checksum")) capture.manifest!.checksum = "0".repeat(64);
+        if (variant.includes("size")) capture.manifest!.byte_size++;
+        if (variant === "integrity") capture.reason = "archive integrity check failed";
+        if (variant === "unknown") capture.reason = "unexpected failure";
+        if (variant === "unbound") delete capture.manifest;
+        const bytes = await fs.readFile(before.bundlePath!);
+        const pins = structuredClone(f.state.candidates);
+        const finals = f.finals.length;
+        const remote = structuredClone([...f.captures]);
+        const outcome = await f.capture(before);
+        const reason = variant.includes("checksum") || variant.includes("size") ? "capture_manifest_integrity_mismatch" :
+          variant === "unbound" ? "available_capture_manifest_unbound" : "capture_failure_requires_attention";
+        assert.equal(outcome.reason, reason, "foreground outcome exposes bounded owner attention");
+        const expected = { ...before, reason };
+        assert.deepEqual((await f.coordinator.inspect("run-1"))[0], expected, "only bounded reason may change");
+        assert.deepEqual([...f.captures], remote, "remote manifests and captures are untouched");
+        assert.equal(f.state.uploads, 1);
+        assert.equal(f.reserveKeys.length, 1);
+        assert.equal(f.finals.length, finals);
+        assert.deepEqual(await fs.readFile(before.bundlePath!), bytes);
+        assert.equal(await f.make().inventoryCleanupState("run-1", 7), "pending");
+        await f.make().forgetGeneration("run-1", 7);
+        assert.deepEqual((await f.coordinator.inspect("run-1"))[0], expected);
+        assert.deepEqual(await fs.readFile(before.bundlePath!), bytes);
+        assert.deepEqual(f.state.candidates, pins);
+        assert.equal(f.state.pinDeletes, 0, "forget must not invoke the pin deletion seam before ACK");
+      } finally { await f.close(); }
+    });
+  }
+}
+
+for (const state of ["preparing", "uploading", "needs_action"]) {
+  it(`issue2416 incomplete unbound ${state} explicitly replaces before expiry`, async () => {
+    const { f, before, capture } = await pendingReceiptFixture();
+    try {
+      capture.state = state;
+      capture.expires = "2099-01-01T00:00:00Z";
+      capture.reason = state === "needs_action" ? "upload_retry_window_exhausted" : undefined;
+      delete capture.manifest;
+      await f.make().resumePending(undefined, [before]);
+      assert.equal(f.reserveKeys.length, 2);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+    } finally { await f.close(); }
+  });
+}
+
+it("issue2416 replacement FINAL lost ACK preserves custody then exact accepted receipt avoids third key", async () => {
+  const { f, before, capture } = await pendingReceiptFixture();
+  try {
+    capture.state = "expired";
+    await patchAuthenticated(f, before, { recoveryPinBareDir: "repo.git" });
+    const bytes = await fs.readFile(before.bundlePath!);
+    const pins = structuredClone(f.state.candidates);
+    const client = f.client as RecoveryArchiveClient;
+    const reconcile = client.reconcileRecoveryCapture!;
+    client.reconcileRecoveryCapture = async (...args) => {
+      if (f.committedReceipts.has(7)) throw new Error("reconciliation temporarily unavailable after lost ACK");
+      return reconcile(...args);
+    };
+    f.state.loseAck = true;
+    await f.make().resumePending(undefined, [before]);
+    const pending = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.ok(pending.finalRequest);
+    assert.notDeepEqual(pending.finalRequest, before.finalRequest);
+    assert.notEqual(pending.finalAcknowledged, true);
+    assert.equal(await f.make().inventoryCleanupState("run-1", 7), "pending");
+    await f.make().forgetGeneration("run-1", 7);
+    assert.deepEqual((await f.make().inspect("run-1"))[0], pending);
+    assert.deepEqual(await fs.readFile(pending.bundlePath!), bytes);
+    assert.deepEqual(f.state.candidates, pins);
+    assert.equal(f.state.pinDeletes, 0);
+    assert.equal(f.reserveKeys.length, 2);
+    const finals = f.finals.length;
+    client.reconcileRecoveryCapture = reconcile;
+    // Force reconciliation rather than a healthy status replay of FINAL.
+    f.captures.get(pending.reserveIdempotencyKey!)!.state = "expired";
+    await f.make().resumePending(undefined, [pending]);
+    const accepted = (await f.make().inspect("run-1"))[0]!;
+    assert.equal(accepted.finalAcknowledged, true);
+    assert.deepEqual(accepted.finalRequest, pending.finalRequest);
+    assert.equal(accepted.reserveIdempotencyKey, pending.reserveIdempotencyKey);
+    assert.equal(f.reserveKeys.length, 2);
+    assert.equal(f.finals.length, finals);
+    assert.equal(await f.make().inventoryCleanupState("run-1", 7), "acknowledged");
+  } finally { await f.close(); }
+});
+
+for (const newer of ["identity", "acknowledged"]) {
+  it(`issue2416 stale replaceable response preserves newer ${newer} journal`, async () => {
+    const { f, before, capture } = await pendingReceiptFixture();
+    try {
+      capture.state = "expired";
+      const client = f.client as RecoveryArchiveClient;
+      const reconcile = client.reconcileRecoveryCapture!;
+      let latest: RecoveryRecord | undefined;
+      client.reconcileRecoveryCapture = async (...args) => {
+        const response = await reconcile(...args);
+        const patch = newer === "acknowledged" ? { finalAcknowledged: true } : {
+          serverCaptureId: "new-server-identity", reserveIdempotencyKey: "00000000-0000-4000-8000-000000000241",
+          finalRequest: { disposition: { ...before.finalRequest!.disposition, capture_id: "new-server-identity" } },
+        };
+        await patchAuthenticated(f, before, patch);
+        latest = (await f.make().inspect("run-1"))[0]!;
+        return response;
+      };
+      await f.make().resumePending(undefined, [before]);
+      assert.ok(latest);
+      assert.deepEqual((await f.make().inspect("run-1"))[0], latest);
+      assert.equal(f.reserveKeys.length, 1);
+      assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
+it("issue2416 retained manifest invalid reason is bounded and stale reason writes are refused", async () => {
+  const { f, before, capture } = await pendingReceiptFixture();
+  try {
+    capture.state = "expired";
+    const client = f.client as RecoveryArchiveClient;
+    client.reconcileRecoveryCapture = async (run, id, req) => ({
+      run_id: run, capture_id: id, generation: req.generation,
+      outcome: "retained", reason: "capture_manifest_invalid",
+    });
+    assert.equal((await f.capture(before)).reason, "capture_manifest_invalid");
+    const current = (await f.make().inspect("run-1"))[0]!;
+    client.reconcileRecoveryCapture = async (run, id, req) => {
+      await patchAuthenticated(f, current, { reserveIdempotencyKey: "00000000-0000-4000-8000-000000000241" });
+      return { run_id: run, capture_id: id, generation: req.generation,
+        outcome: "retained", reason: "capture_failure_requires_attention" };
+    };
+    await f.capture(current);
+    const latest = (await f.make().inspect("run-1"))[0]!;
+    assert.equal(latest.reason, "capture_manifest_invalid");
+    assert.equal(latest.reserveIdempotencyKey, "00000000-0000-4000-8000-000000000241");
+    assert.deepEqual(latest.finalRequest, before.finalRequest);
+    assert.equal(f.reserveKeys.length, 1);
+  } finally { await f.close(); }
+});
+
+for (const same of [true, false]) {
+  it(`issue2416 accepted expired receipt exact=${same} never reserves`, async () => {
+    const f = await fixture(false, os.tmpdir(), true);
+    try {
+      f.state.loseAck = true;
+      const reconcile = f.client.reconcileRecoveryCapture;
+      delete f.client.reconcileRecoveryCapture;
+      const record = await f.freeze(); assert.ok(record);
+      await f.capture(record);
+      f.client.reconcileRecoveryCapture = reconcile;
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      f.captures.get(f.reserveKeys[0]!)!.state = "expired";
+      f.captures.get(f.reserveKeys[0]!)!.manifest!.checksum = "0".repeat(64);
+      if (!same) f.committedReceipts.set(7, { ...before.finalRequest!.disposition, source_sha: H2 });
+      await f.make().resumePending(undefined, [before]);
+      const after = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(after.finalAcknowledged === true, same);
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(f.reserveKeys.length, 1);
+      assert.equal(f.finals.length, 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const mode of ["foreground", "boot", "live", "concurrent"]) {
+  it(`issue2416 ${mode} replacement uses existing generation lock`, async () => {
+    const { f, before, capture } = await pendingReceiptFixture();
+    try {
+      capture.state = "expired";
+      const restarted = f.make();
+      if (mode === "foreground") await f.capture(before);
+      if (mode === "boot") await restarted.resumePending(undefined, [before]);
+      if (mode === "live") await restarted.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+      if (mode === "concurrent") {
+        let active = 0, maximum = 0;
+        let entered!: () => void, release!: () => void;
+        const entry = new Promise<void>(resolve => { entered = resolve; });
+        const barrier = new Promise<void>(resolve => { release = resolve; });
+        const timer = setTimeout(release, 2000);
+        const upload = f.client.uploadRecoveryBundle;
+        f.client.uploadRecoveryBundle = async (...args) => {
+          active++; maximum = Math.max(maximum, active); entered();
+          try { await barrier; return await upload(...args); } finally { active--; }
+        };
+        const first = f.capture(before);
+        const tasks: Promise<unknown>[] = [first];
+        try {
+          await Promise.race([entry, new Promise<never>((_, reject) => {
+            const timeout = setTimeout(() => reject(new Error("upload barrier not reached")), 3000);
+            entry.finally(() => clearTimeout(timeout));
+          })]);
+          const siblings = [restarted.resumePending(undefined, [before]), f.capture(before)];
+          tasks.push(...siblings);
+          await new Promise<void>(resolve => setTimeout(resolve, 25));
+          assert.equal(active, 1);
+          release();
+          await Promise.all([first, ...siblings]);
+          assert.equal(maximum, 1, "concurrent boot/foreground uploads never overlap");
+          assert.equal(active, 0);
+        } finally { clearTimeout(timer); release(); await Promise.allSettled(tasks); }
+      }
+      assert.equal(f.reserveKeys.length, 2);
+      assert.equal(f.state.uploads, 2);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+    } finally { await f.close(); }
+  });
+}
+
+it("issue2416 immediately unusable replacement is bounded to one reserve per pass", async () => {
+  const { f, before, capture } = await pendingReceiptFixture();
+  try {
+    capture.state = "expired";
+    f.state.expires = "1970-01-01T00:00:00Z";
+    await f.make().resumePending(undefined, [before]);
+    assert.equal(f.reserveKeys.length, 2);
+    assert.equal(f.state.uploads, 2);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+    assert.equal(await f.make().inventoryCleanupState("run-1", 7), "pending");
+  } finally { await f.close(); }
+});
+
+for (const lostAck of [true, false]) {
+  it(`issue2416 persisted replacement key survives restart reserve failure lostAck=${lostAck}`, async () => {
+    const { f, before, capture } = await pendingReceiptFixture();
+    try {
+      capture.state = "expired";
+      await patchAuthenticated(f, before, { finalAcknowledged: false, recoveryPinBareDir: "repo.git" });
+      const bytes = await fs.readFile(before.bundlePath!);
+      const pins = structuredClone(f.state.candidates);
+      const assertPending = async () => {
+        assert.equal(await f.make().inventoryCleanupState("run-1", 7), "pending");
+        const journal = await f.make().inspect("run-1");
+        await f.make().forgetGeneration("run-1", 7);
+        assert.deepEqual(await f.make().inspect("run-1"), journal);
+        assert.deepEqual(await fs.readFile(before.bundlePath!), bytes);
+        assert.deepEqual(f.state.candidates, pins);
+        assert.equal(f.state.pinDeletes, 0);
+      };
+      const reserve = f.client.reserveRecoveryCapture;
+      let fail = true;
+      f.client.reserveRecoveryCapture = async (run, req) => {
+        const persisted = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(persisted.reserveIdempotencyKey, req.idempotency_key);
+        assert.equal(Object.hasOwn(persisted, "finalAcknowledged"), false);
+        assert.equal(persisted.finalRequest, undefined);
+        if (!fail) return reserve(run, req);
+        if (lostAck) await reserve(run, req);
+        else { f.reserveKeys.push(req.idempotency_key); }
+        throw new RequestError("POST", "/archives/reserve", lostAck ? 500 : 507, "storage quota exceeded");
+      };
+      await f.make().resumePending(undefined, [before]);
+      const pending = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.ok(pending.reserveIdempotencyKey);
+      assert.equal(pending.serverCaptureId, undefined);
+      await assertPending();
+      await f.make().resumePending(undefined, [pending]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.reserveIdempotencyKey, pending.reserveIdempotencyKey);
+      await assertPending();
+      fail = false;
+      await f.make().resumePending(undefined, [pending]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+      assert.deepEqual(new Set(f.reserveKeys.slice(1)), new Set([pending.reserveIdempotencyKey]));
+      assert.equal(await f.make().inventoryCleanupState("run-1", 7), "acknowledged");
+      // Model the runner cleanup caller: pin deletion is authorized only after checked ACK.
+      await f.git.deleteRecoveryPin();
+      assert.equal(f.state.pinDeletes, 1, "the explicit deletion seam is exercised after ACK");
+      await f.make().forgetGeneration("run-1", 7);
+      await assert.rejects(fs.readFile(before.bundlePath!), { code: "ENOENT" });
+    } finally { await f.close(); }
+  });
+}
+
+it("issue2416 authenticated malformed reservation UUID and tampering are refused", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    await patchAuthenticated(f, before, { reserveIdempotencyKey: "invalid-uuid" });
+    assert.deepEqual(await f.make().inspect("run-1"), []);
+    await patchAuthenticated(f, before, { reserveIdempotencyKey: "00000000-0000-4000-8000-000000000241" });
+    assert.equal((await f.make().inspect("run-1"))[0]!.reserveIdempotencyKey, "00000000-0000-4000-8000-000000000241");
+    const file = path.join(f.root, "journal", before.runId, before.captureId + ".json");
+    await fs.writeFile(file, (await fs.readFile(file, "utf8")).replace("000000000241", "000000000242"));
+    assert.deepEqual(await f.make().inspect("run-1"), []);
+  } finally { await f.close(); }
+});
+
+for (const variant of ["missing", "route", "auth", "transport", "run", "generation", "capture", "outcome", "receipt", "evidence", "reason", "integrity-contradiction", "status", "hold", "null", "array", "retained-unknown", "retained-receipt", "retained-evidence"]) {
+  it(`issue2416 reconciliation fails closed for ${variant}`, async () => {
+    const { f, before, capture } = await pendingReceiptFixture();
+    try {
+      capture.state = "expired";
+      const client = f.client as RecoveryArchiveClient;
+      const reconcile = client.reconcileRecoveryCapture!;
+      if (variant === "missing") delete client.reconcileRecoveryCapture;
+      else client.reconcileRecoveryCapture = async (run, id, req) => {
+        if (["route", "auth", "transport"].includes(variant)) throw new RequestError("POST", "/archives/reconcile", variant === "route" ? 404 : variant === "auth" ? 401 : 500, "unavailable");
+        if (variant === "null") return null as never;
+        if (variant === "array") return [] as never;
+        const result = await reconcile(run, id, req);
+        if (variant.startsWith("retained-")) {
+          result.outcome = "retained";
+          result.reason = variant === "retained-unknown" ? "unbounded raw failure " + "x".repeat(2048) : "capture_manifest_invalid";
+          if (variant === "retained-receipt") result.final_receipt = before.finalRequest!.disposition;
+          if (variant === "retained-evidence") result.release_evidence = "archive";
+        }
+        if (variant === "run") result.run_id = "other";
+        if (variant === "generation") result.generation++;
+        if (variant === "capture") result.capture_id = "other";
+        if (variant === "outcome") result.outcome = "unknown" as never;
+        if (variant === "receipt") result.final_receipt = before.finalRequest!.disposition;
+        if (variant === "evidence") result.release_evidence = "archive";
+        if (variant === "reason") result.reason = "unknown";
+        if (variant === "integrity-contradiction" || variant === "status") return { run_id: run, generation: req.generation, capture_id: id, outcome: "replaceable" };
+        return result;
+      };
+      if (variant === "integrity-contradiction") capture.manifest!.checksum = "0".repeat(64);
+      if (variant === "status") client.getRecoveryCaptureStatus = async () => ({ capture_id: "other", state: "expired", manifest_bound: true });
+      if (variant === "hold") client.listRecoveryHolds = async () => { throw new Error("hold transport failed"); };
+      const finals = f.finals.length;
+      await f.make().resumePending(undefined, [before]);
+      assert.deepEqual((await f.coordinator.inspect("run-1"))[0], before);
+      assert.equal(f.reserveKeys.length, 1);
+      assert.equal(f.finals.length, finals);
+    } finally { await f.close(); }
+  });
+}
+
+for (const seam of ["reconcile", "retained-reconcile", "hold"]) {
+  it(`issue2416 quarantine arriving during ${seam} prevents reset and replacement RPCs`, async () => {
+    const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+    const { f, before, capture } = await pendingReceiptFixture();
+    try {
+      capture.state = "expired";
+      const client = f.client as RecoveryArchiveClient;
+      if (seam === "reconcile" || seam === "retained-reconcile") {
+        const reconcile = client.reconcileRecoveryCapture!;
+        client.reconcileRecoveryCapture = async (...args) => {
+          const result = await reconcile(...args);
+          latchResidueQuarantine({ cause: "fixture", site: "reconcile_return" }, nullLogger());
+          return seam === "retained-reconcile" ? { ...result, outcome: "retained", reason: "capture_manifest_invalid" } : result;
+        };
+      } else {
+        const hold = client.listRecoveryHolds;
+        client.listRecoveryHolds = async (...args) => {
+          const result = await hold(...args);
+          latchResidueQuarantine({ cause: "fixture", site: "hold_return" }, nullLogger());
+          return result;
+        };
+      }
+      const finals = f.finals.length;
+      await f.make().resumePending(undefined, [before]);
+      assert.deepEqual((await f.coordinator.inspect("run-1"))[0], before);
+      assert.equal(f.reserveKeys.length, 1);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.finals.length, finals);
+    } finally { resetResidueQuarantineForTests(); await f.close(); }
+  });
+}
+
+async function patchAuthenticated(f: Awaited<ReturnType<typeof fixture>>, record: RecoveryRecord, patch: Partial<RecoveryRecord>) {
+  const file = path.join(f.root, "journal", record.runId, record.captureId + ".json");
+  const envelope = JSON.parse(await fs.readFile(file, "utf8"));
+  const { mac: _mac, ...payload } = envelope;
+  Object.assign(payload, patch);
+  const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+  await fs.writeFile(file, JSON.stringify({ ...payload, mac: createHmac("sha256", key).update(canonicalJson(payload)).digest("hex") }));
+}
+
+for (const savedFinal of [false, true]) {
+  it(`issue2416 core expired ${savedFinal ? "saved-unaccepted FINAL" : "uploaded no FINAL"} reserves replacement and acknowledges stable journal`, async () => {
+    const f = await fixture(false, os.tmpdir(), true);
+    try {
+      if (savedFinal) f.state.finalError = new Error("FINAL rejected before acceptance");
+      else f.state.expires = "1970-01-01T00:00:00Z";
+      const record = await f.freeze();
+      assert.ok(record);
+      await f.capture(record);
+      const before = (await f.coordinator.inspect("run-1")).find(r => r.captureId === record.captureId)!;
+      assert.equal(before.state, "uploaded");
+      assert.equal(!!before.finalRequest, savedFinal);
+      assert.notEqual(before.finalAcknowledged, true);
+      assert.equal(f.committedReceipts.size, 0, "the original FINAL was never accepted");
+      assert.equal(f.state.open, true);
+      assert.equal(f.reserveKeys.length, 1);
+      const oldKey = f.reserveKeys[0]!;
+      const oldCapture = f.captures.get(oldKey)!;
+      oldCapture.state = "expired";
+      oldCapture.expires = "1970-01-01T00:00:00Z";
+      f.state.expires = "2099-01-01T00:00:00Z";
+      f.state.finalError = undefined;
+      const pins = structuredClone(f.state.candidates);
+      const bundle = await fs.readFile(before.bundlePath!);
+      const savedIdentity = structuredClone(before.finalRequest);
+      let ackBoundaryChecked = false;
+      f.state.beforeFinalAck = async () => {
+        const pending = (await f.coordinator.inspect("run-1")).find(r => r.captureId === record.captureId)!;
+        assert.ok(pending, "the original source journal survives replacement");
+        assert.notEqual(pending.finalAcknowledged, true);
+        assert.equal(pending.bundlePath, before.bundlePath);
+        assert.deepEqual(await fs.readFile(pending.bundlePath!), bundle, "bundle bytes survive until ACK");
+        assert.deepEqual(f.state.candidates, pins, "owed pins survive until ACK");
+        assert.deepEqual(pending.originalRoots, before.originalRoots);
+        assert.equal(pending.sourceSha, before.sourceSha);
+        assert.equal(pending.coverageDigest, before.coverageDigest);
+        assert.equal(await f.make().inventoryCleanupState("run-1", 7), "pending");
+        ackBoundaryChecked = true;
+      };
+      await f.make().resumePending(undefined, [before]);
+      assert.ok(f.reserveKeys.length > 1, "expired unaccepted capture must reserve a replacement");
+      assert.notEqual(f.reserveKeys[1], oldKey, "replacement uses a distinct server idempotency key");
+      assert.equal(f.state.produced, 1, "replacement reuses the verified local bundle");
+      assert.equal(f.state.uploads, 2);
+      assert.ok(ackBoundaryChecked, "replacement reaches FINAL while local custody is retained");
+      const after = (await f.coordinator.inspect("run-1")).find(r => r.captureId === record.captureId)!;
+      assert.ok(after, "replacement preserves the stable journal captureId");
+      assert.equal(after.finalAcknowledged, true);
+      assert.notEqual(after.serverCaptureId, before.serverCaptureId);
+      assert.equal(after.finalRequest?.disposition.capture_id, after.serverCaptureId);
+      assert.deepEqual(before.finalRequest, savedIdentity, "the saved request snapshot remains immutable");
+      assert.deepEqual(f.committedReceipts.get(7), after.finalRequest?.disposition);
+      assert.equal(f.committedReceipts.size, 1);
+      assert.equal(f.state.open, false);
+      assert.equal(await f.make().inventoryCleanupState("run-1", 7), "acknowledged");
+    } finally { await f.close(); }
+  });
 }
 
 it("guarded boot failure does not block a sibling run", async () => {
