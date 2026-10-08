@@ -604,6 +604,70 @@ test("fractional monotonic time supplies positive integer port budgets", async (
   await f.monitor.stop();
 });
 
+test("one millisecond sampling yields with advancing fractional time and stop cancels the wait", async () => {
+  const { WorkerMemoryMonitor } = await import("../src/worker-memory-guard.js");
+  const { WorkerMemoryCommands } = await import("../src/worker-memory-commands.js");
+  let time = 0;
+  let reads = 0;
+  let readLimitReached = false;
+  let runningError: unknown;
+  const timers = new Set<{ callback: () => void; ms: number }>();
+  const timerArgs: number[] = [];
+  const monitor = new WorkerMemoryMonitor({ ...settings, sampleMs: 1 }, {
+    commands: new WorkerMemoryCommands(),
+    now: () => { time += 0.25; return time; },
+    incarnation: () => undefined,
+    sample: () => {
+      if (++reads > 10) {
+        readLimitReached = true;
+        throw new Error("sampling read limit");
+      }
+      return sample(reads, time, 100);
+    },
+    timer: (callback, ms) => {
+      timerArgs.push(ms);
+      const timer = { callback, ms };
+      timers.add(timer);
+      return () => { timers.delete(timer); };
+    },
+    reserve: async () => { throw new Error("unexpected reservation"); },
+    report: async () => { throw new Error("unexpected report"); },
+    feedback: async () => { throw new Error("unexpected feedback"); },
+    preserve: async () => { throw new Error("unexpected preserve"); },
+  });
+  const running = monitor.run();
+  void running.catch((error: unknown) => { runningError = error; });
+  try {
+    assert.equal(monitor.run(), running);
+    await until(() => timers.size > 0 || readLimitReached);
+    assert.deepEqual(timerArgs, [1]);
+    assert.equal(reads, 1);
+    for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+    assert.equal(reads, 1);
+    const timer = [...timers][0]!;
+    timers.delete(timer);
+    timer.callback();
+    await until(() => reads === 2 && timers.size === 1);
+    assert.deepEqual(timerArgs, [1, 1]);
+    const stoppedTimer = [...timers][0]!;
+    let joined = false;
+    const stopping = monitor.stop().then(() => { joined = true; });
+    assert.equal(timers.size, 0, "stop clears the interval before its first await");
+    await until(() => joined);
+    await stopping;
+    await running;
+    stoppedTimer.callback();
+    monitor.tick();
+    assert.equal(monitor.run(), running);
+    for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+    assert.equal(reads, 2);
+    assert.equal(timers.size, 0);
+    assert.equal(runningError, undefined);
+  } finally {
+    await monitor.stop();
+  }
+});
+
 test("maximum sample interval uses safe timers and stop joins run", async () => {
   const f = await fixture({ sampleMs: 2147483647 });
   f.usage(100);

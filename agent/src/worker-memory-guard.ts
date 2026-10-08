@@ -202,6 +202,7 @@ export class WorkerMemoryMonitor {
   private unsubscribe: (() => void) | undefined;
   private readonly unsubscribeDrain: () => void;
   private running: Promise<void> | undefined;
+  private interruptWait: (() => void) | undefined;
 
   constructor(private readonly config: Settings, private readonly ports: {
     sample: () => Sample;
@@ -293,13 +294,24 @@ export class WorkerMemoryMonitor {
   private async loop(): Promise<void> {
     while (!this.closed) {
       this.tick();
-      try { await this.bounded(() => new Promise<void>(() => {}),
-        this.ports.now() + this.config.sampleMs); } catch { /* deadline or shutdown interrupts wait */ }
+      if (this.closed) break;
+      await new Promise<void>((resolve) => {
+        const clear = this.timer(() => {
+          this.interruptWait = undefined;
+          resolve();
+        }, this.config.sampleMs);
+        this.interruptWait = () => {
+          clear();
+          this.interruptWait = undefined;
+          resolve();
+        };
+      });
     }
   }
 
   async stop(): Promise<void> {
     this.closed = true;
+    this.interruptWait?.();
     this.ports.commands.shutdown(); // invalidate authority before the first await
     this.unsubscribe?.();
     this.unsubscribe = undefined;
