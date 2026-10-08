@@ -1008,6 +1008,8 @@ for (const lostAck of [true, false]) {
       assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
       assert.deepEqual(new Set(f.reserveKeys.slice(1)), new Set([pending.reserveIdempotencyKey]));
       assert.equal(await f.make().inventoryCleanupState("run-1", 7), "acknowledged");
+      // #2464: an acknowledged guarded generation is removed only through guarded cleanup.
+      Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
       await f.make().forgetGeneration("run-1", 7);
       assert.deepEqual(await f.make().inspect("run-1"), []);
       await assert.rejects(fs.readFile(before.bundlePath!), { code: "ENOENT" });
