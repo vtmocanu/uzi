@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
+  Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
+
 - **Interactive author assessments leave room for run creation ([#2372](https://github.com/vtmocanu/uzi/issues/2372)).**
   Manual issue starts and on-demand MR rework use a five-second total author-assessment budget, preserving fail-closed unknown handling and the live parent for persistence; background assessments retain thirty seconds.
 
