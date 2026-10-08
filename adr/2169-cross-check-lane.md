@@ -19,7 +19,7 @@ The lane selects children through `ClaimRun`, then uses the existing claim assem
 
 The transaction locks and re-reads the worker in a **separate statement before ClaimRun** (`GetWorkerForUpdate`, also in `ephemeral_lease.go`). Under READ COMMITTED the later statement sees occupancy committed by a competing claimant while the lock waited. A worker lock inside the selection statement would retain that statement's earlier snapshot and could over-admit. Dedicated lane paths explicitly set READ COMMITTED.
 
-`fn_cross_check_child_eligible` (migration 00309) centralizes child placement for claim, health and provisioning, with other fences at each caller. Plan-stage run-lane fallback requires both a NULL slot cap and no lane capability. Explicit zero, positive slots without capability, or capability without slots cannot silently use fallback. Legacy children still consume run slots.
+`fn_cross_check_child_eligible` (migration 00313) centralizes child placement for claim, health and provisioning, with other fences at each caller. Plan-stage run-lane fallback requires both a NULL slot cap and no lane capability. Explicit zero, positive slots without capability, or capability without slots cannot silently use fallback. Legacy children still consume run slots.
 
 ### Placement and lifetime
 
@@ -31,7 +31,7 @@ An ephemeral worker admits its bound parent's child or the child it was provisio
 
 `runs.cross_check_lane` records active dedicated occupancy. Queuing must clear that bool, including when an older API writes the row. The bool alone therefore loses the lane selection needed when recovery restores the **same claim generation**.
 
-Migration 00309 adds `cross_check_lane_generation bigint` beyond the originally planned occupancy bool. Its trigger retains the historical generation through queuing, restores dedicated accounting on same-generation recovery independently of current worker advertisements, and clears/replaces history when the generation changes. This mandatory recovery fix prevents a recovered checker being charged to the run lane. A generation-zero placement pin remains a placement hint, not proof of prior custody.
+Migration 00313 adds `cross_check_lane_generation bigint` beyond the originally planned occupancy bool. Its trigger retains the historical generation through queuing, restores dedicated accounting on same-generation recovery independently of current worker advertisements, and clears/replaces history when the generation changes. This mandatory recovery fix prevents a recovered checker being charged to the run lane. A generation-zero placement pin remains a placement hint, not proof of prior custody.
 
 Run load excludes dedicated occupancy and includes legacy run-slot children. The active-snapshot live allowance adds valid advertised lane slots to run cap + 2; the absolute entry ceiling still applies (`active_snapshot.go`).
 
@@ -53,4 +53,4 @@ The [PRD validation record](../prds/2169-cross-check-lane.md#validation-provenan
 
 Drain active checker children before reverting lane-aware services/workers. Take and retain a database backup before migration and before destructive rollback, including worker cap data and lane history accumulated after migration if it must be recovered.
 
-Migration 00309's DBA Down path drops the eligibility function, trigger and all three columns, irreversibly deleting stored caps, occupancy and generation history. Down removes schema; it does **not** restore deleted data. Restore required values from a retained backup with an explicit recovery plan. A mixed-image forward rollout instead keeps the narrowly negotiated legacy plan-stage fallback.
+Migration 00313's DBA Down path drops the eligibility function, trigger and all three columns, irreversibly deleting stored caps, occupancy and generation history. Down removes schema; it does **not** restore deleted data. Restore required values from a retained backup with an explicit recovery plan. A mixed-image forward rollout instead keeps the narrowly negotiated legacy plan-stage fallback.

@@ -1014,11 +1014,11 @@ type Run struct {
 	IssueInputReason          pgtype.Text        `json:"issue_input_reason"`
 	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
 	PlanCrossCheckDiffRefusal pgtype.Text        `json:"plan_cross_check_diff_refusal"`
-	CrossCheckLane            bool               `json:"cross_check_lane"`
-	CrossCheckLaneGeneration  pgtype.Int8        `json:"cross_check_lane_generation"`
 	WorkerRecoveryEpisode     int64              `json:"worker_recovery_episode"`
 	RequeueEpisodeBaseline    int32              `json:"requeue_episode_baseline"`
 	WorkerRecoveryEvidence    []byte             `json:"worker_recovery_evidence"`
+	CrossCheckLane            bool               `json:"cross_check_lane"`
+	CrossCheckLaneGeneration  pgtype.Int8        `json:"cross_check_lane_generation"`
 }
 
 type RunCompletionAttempt struct {

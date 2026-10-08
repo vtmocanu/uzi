@@ -732,7 +732,7 @@ on legacy fallback, and cannot lease, tear down or reap while a child is active.
 An eligible own lane with space suppresses an extra pod; full or unsupported
 capacity keeps existing provisioning caps and saturation policy.
 
-Migration 00309 records occupancy in `runs.cross_check_lane` and its
+Migration 00313 records occupancy in `runs.cross_check_lane` and its
 claim-generation history in `cross_check_lane_generation`. Queuing clears
 the bool, including older API writes; same-generation recovery restores lane
 accounting independently of later advertisements, while a new generation
