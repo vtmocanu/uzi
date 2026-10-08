@@ -28,13 +28,13 @@ func testPrerequisiteSQLGuards(t *testing.T, ctx context.Context, pool *pgxpool.
 		}
 	}
 	digest := strings.Repeat("a", 64)
-	exec("UPDATE recovery_captures SET manifest_bound=true,coverage_digest=$2,prerequisite_shas=ARRAY['base1'] WHERE id=$1", cap.ID, digest)
+	exec("UPDATE recovery_captures SET manifest_bound=true,prerequisite_shas=ARRAY['base1'] WHERE id=$1", cap.ID)
 	protect := store.ProtectFinalInventoryCaptureParams{ID: cap.ID, HoldID: hold, WorkerID: worker, SourceSha: cap.SourceSha, CoverageDigest: pgtype.Text{String: digest, Valid: true}, RetentionSeconds: 3600}
 	if n, err := q.ProtectFinalInventoryCapture(ctx, protect); err != nil || n != 0 {
 		t.Fatalf("SQL thin protection: %d %v", n, err)
 	}
 	var intact bool
-	if err := tx.QueryRow(ctx, "SELECT local_replica_worker_id IS NULL AND ready_retention_seconds IS NULL FROM recovery_captures WHERE id=$1", cap.ID).Scan(&intact); err != nil || !intact {
+	if err := tx.QueryRow(ctx, "SELECT manifest_bound AND prerequisite_shas=ARRAY['base1'] AND coverage_digest=$2 AND local_replica_worker_id IS NULL AND ready_retention_seconds IS NULL FROM recovery_captures WHERE id=$1", cap.ID, digest).Scan(&intact); err != nil || !intact {
 		t.Fatalf("SQL protection rejection mutated markers: %v %v", intact, err)
 	}
 	// Stamp protection deliberately so the release query must enforce its own guard.
@@ -48,12 +48,15 @@ func testPrerequisiteSQLGuards(t *testing.T, ctx context.Context, pool *pgxpool.
 	}
 	// Positive controls prove every other predicate is satisfied for nil and empty.
 	for _, prerequisites := range [][]string{nil, {}} {
+		exec("SAVEPOINT empty_prerequisites")
 		exec("UPDATE recovery_captures SET prerequisite_shas=$2 WHERE id=$1", cap.ID, prerequisites)
 		if n, err := q.ProtectFinalInventoryCapture(ctx, protect); err != nil || n != 1 {
 			t.Fatalf("SQL empty protection: %d %v", n, err)
 		}
-	}
-	if n, err := q.ReleaseFinalInventoryHold(ctx, release); err != nil || n != 1 {
-		t.Fatalf("SQL empty release: %d %v", n, err)
+		if n, err := q.ReleaseFinalInventoryHold(ctx, release); err != nil || n != 1 {
+			t.Fatalf("SQL empty release: %d %v", n, err)
+		}
+		exec("ROLLBACK TO SAVEPOINT empty_prerequisites")
+		exec("RELEASE SAVEPOINT empty_prerequisites")
 	}
 }

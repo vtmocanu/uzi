@@ -103,6 +103,10 @@ func TestRecoveryHistoricalPrerequisiteReceiptLiveDB(t *testing.T) {
 	req := e.request(id)
 	e.release(req)
 	// Model an already-committed receipt from before the new admission rule.
-	e.exec("UPDATE recovery_captures SET prerequisite_shas=ARRAY['bbbb2222'],state='expired' WHERE id=$1", id)
+	e.exec("UPDATE recovery_captures SET prerequisite_shas=ARRAY['bbbb2222'] WHERE id=$1", id)
+	var bound bool
+	if err := e.pool.QueryRow(e.ctx, "SELECT manifest_bound AND prerequisite_shas=ARRAY['bbbb2222'] AND state='available' FROM recovery_captures WHERE id=$1", id).Scan(&bound); err != nil || !bound {
+		t.Fatalf("historical bound prerequisites: %v %v", bound, err)
+	}
 	e.release(req)
 }

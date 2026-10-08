@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,7 +88,7 @@ func TestRecoveryInventoryClaimLiveDB(t *testing.T) {
 			if n, err := q.ReleaseClaimCustodyNoAdoptedSource(ctx, noAdopt); err != nil || n != 0 {
 				t.Fatalf("running no-adopt: %d %v", n, err)
 			}
-			cap, err := q.ReserveCaptureExact(ctx, store.ReserveCaptureExactParams{RunID: run, UserID: user, OriginalWorkerID: pgtype.UUID{Bytes: worker, Valid: true}, OriginalWorkerIdentity: worker.String(), Generation: 1, SourceSha: "aaaa1111", IdempotencyKey: "earlier"})
+			cap, err := q.ReserveCaptureExact(ctx, store.ReserveCaptureExactParams{RunID: run, UserID: user, OriginalWorkerID: pgtype.UUID{Bytes: worker, Valid: true}, OriginalWorkerIdentity: worker.String(), Generation: 1, SourceSha: "aaaa1111", IdempotencyKey: "earlier", CoverageDigest: pgtype.Text{String: strings.Repeat("a", 64), Valid: true}})
 			if err != nil {
 				t.Fatal(err)
 			}
