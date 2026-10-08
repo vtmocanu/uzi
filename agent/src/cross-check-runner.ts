@@ -136,10 +136,12 @@ export class CrossCheckRunner {
         if (isStaleClaimRefusal(delivery) || (checkerClaimRefused(delivery) && await custodyLost())) return;
         this.log.warn("cross-check failed verdict delivery failed", { run_id: runId, error: errMessage(delivery) });
       }
+      const failureReason = reason === "checker_unavailable" && err instanceof CrossCheckCheckerUnavailableError
+        ? "plan cross-check: checker unavailable" : "The cross-check did not complete.";
       try {
         await postTerminalState(this.terminalDeps, this.client, {
           runId, claimGeneration: generation, phase: "running", messagesThroughSeq: seq,
-          body: { status: "failed", failure_reason: "The cross-check did not complete.", claim_generation: claim.claim_generation },
+          body: { status: "failed", failure_reason: failureReason, claim_generation: claim.claim_generation },
         });
       } catch (terminal) {
         this.log.warn("cross-check failed-state delivery pending", { run_id: runId, error: errMessage(terminal) });

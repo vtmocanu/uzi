@@ -241,6 +241,9 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   assert.equal(posts[verdictIndex]!.body.verdict, expectedVerdict);
   assert.equal(posts[verdictIndex]!.body.reason_class, expectedReason);
   assert.equal(posts[verdictIndex + 1]!.body.status, expectedStatus);
+  if (expectedStatus === "failed") assert.equal(posts[verdictIndex + 1]!.body.failure_reason,
+   ["rejection", "terminal-rejection", "invalid-effort"].includes(mode)
+    ? "plan cross-check: checker unavailable" : "The cross-check did not complete.");
   assert.equal(outbox.hasPendingTerminal(c.run_id, 7), false);
   assert.equal(registry.size, 0);
   assert.deepEqual(removed, ["/checkout"]);
