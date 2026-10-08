@@ -210,7 +210,7 @@ export interface Config {
    * only — the chat lane has its own, distinct ceiling (chatSessions above).
    */
   maxConcurrentRuns: number;
-  /** Explicit opt-in; limit-relative thresholds are validated by the future guard. */
+  /** Explicit opt-in; limit-relative thresholds are validated by the memory guard. */
   memoryGuard?: { enabled: false } | {
     enabled: true;
     reserveBytes: number;

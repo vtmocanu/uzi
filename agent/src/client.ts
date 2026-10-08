@@ -1045,6 +1045,12 @@ export class WorkerClient {
     };
   }
 
+  /** Fence pending registration completions as well as already captured permits. */
+  revokeMemoryAuthority(): void {
+    ++this.memoryRegistrationRevision;
+    this.invalidateMemoryIncarnation();
+  }
+
   private invalidateMemoryIncarnation(): void {
     this.memoryIncarnationValue = undefined;
     this.memoryInvalidationListener?.();

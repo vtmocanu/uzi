@@ -24,6 +24,7 @@ import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
+import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
@@ -804,6 +805,9 @@ async function main(): Promise<void> {
           log,
         })
       : undefined;
+  const memory = config.memoryGuard?.enabled
+    ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
+    : undefined;
   worker = new Worker(
     config,
     client,
@@ -826,6 +830,7 @@ async function main(): Promise<void> {
     dindMaintenance,
     terminalRejections,
     crossCheckRunner,
+    memory,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these
@@ -845,6 +850,8 @@ async function main(): Promise<void> {
       // the unwinding execute()s, which the claim-loop drain — gated by `worker.run`
       // below — waits for within the container's termination grace. controller.abort()
       // then unblocks the loops as today.
+      // Revoke memory authority before any cancellation can begin or await IO.
+      void worker.shutdownMemory();
       runner.shutdown();
       // PRD #1906 M4: abort any in-flight isolated research session too; each reports its
       // run failed as it unwinds, so the drain does not wait out the run's timeout.

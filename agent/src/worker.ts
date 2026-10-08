@@ -25,6 +25,9 @@ import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
+import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
+
+class UnsupportedMemoryAPI extends Error {}
 
 /** PRD #1906 M4: the protocol capability proving this image runs the isolated research lane
  *  (the IsolatedRunner, the fetch tool and the fixed tool set). The api's dedicated claim
@@ -117,6 +120,7 @@ export class Worker {
     private readonly dindMaintenance?: DindMaintenanceController,
     private readonly terminalRejections?: TerminalRejectionCoordinator,
     private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute">,
+    private readonly memory?: Pick<WorkerMemoryRuntime, "run" | "stop">,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -151,90 +155,135 @@ export class Worker {
   /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
   private sweepingTerminals = false;
 
-  async run(signal: AbortSignal): Promise<void> {
-    // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
-    // A worker whose `/nix` store is missing the baked go/python3/gcc/pip/openssl (a stale seed
-    // after an image roll — see PRD #92 root cause) must FAIL REGISTRATION visibly, not
-    // retry forever (the toolchain won't appear by retrying) or emit silent 127s to
-    // subagents mid-run. THROW so it propagates to main.ts's fatal handler (exit 1) and
-    // the pod surfaces the error to an operator — do NOT swallow it into registerWithRetry.
-    const pf = this.preflight();
-    if (!pf.ok) {
-      this.log.error("toolchain preflight FAILED — refusing to register", {
-        missing: pf.missing,
-        likely_cause:
-          "the baked worker toolchain is missing from the runner PATH — most likely a stale /nix seed after an image roll (PRD #92): the seed init container tars /nix into the PVC once, so a rolled image does not re-seed an existing worker",
-      });
-      throw new Error(
-        `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
-      );
+  private running: Promise<void> | undefined;
+  private stopping: Promise<void> | undefined;
+
+  /** Synchronous authority revocation, followed by the monitor's bounded join. */
+  shutdownMemory(): Promise<void> {
+    return this.stopping ??= this.memory?.stop() ?? Promise.resolve();
+  }
+
+  run(signal: AbortSignal): Promise<void> {
+    return this.running ??= this.runOnce(signal);
+  }
+
+  private async runOnce(signal: AbortSignal): Promise<void> {
+    const controller = new AbortController();
+    const abort = () => { void this.shutdownMemory(); controller.abort(); };
+    signal.addEventListener("abort", abort, { once: true });
+    let sampler: Promise<void> | undefined;
+    try {
+      if (signal.aborted || this.stopping) { abort(); return; }
+      if (this.config.memoryGuard?.enabled && !this.memory) {
+        throw new Error("enabled memory guard requires a worker runtime");
+      }
+      sampler = this.memory?.run();
+      // A sampler failure is fatal and stops the lifecycle, with its original error joined below.
+      void sampler?.catch(abort);
+      await this.runLifecycle(controller);
+    } finally {
+      abort();
+      signal.removeEventListener("abort", abort);
+      await this.shutdownMemory();
+      await sampler;
     }
-    // issue #1742 D4(a): snapshot the previous process's recovery records BEFORE register, so the
-    // restart sweep below provably excludes any record a live flight of this process writes later.
-    // A runner stub without the method (older test doubles) simply has nothing to snapshot.
-    const bootRecoveries =
-      typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
-    let heartbeat = Promise.resolve();
-    let rejections = Promise.resolve();
-    let registered = false;
-    await this.registerWithRetry(signal, (workerId) => {
-      if (registered) return;
-      registered = true;
-      // Start before finalize retirement or any other post-registration await.
-      heartbeat = this.heartbeatLoop(signal);
-      rejections = this.terminalRejections?.loop(workerId, signal) ?? Promise.resolve();
-    });
-    if (signal.aborted) {
-      await Promise.all([heartbeat, rejections]);
-      return;
-    }
-    // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
-    // any durable-recovery capture the previous life left journaled: re-upload the exact
-    // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
-    // resume failure must never block the claim loops, and the source stays protected by
-    // the journal + the server custody hold regardless.
-    void this.runner.resumePendingRecoveries(signal, bootRecoveries).catch((err) => {
-      this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
-    });
-    // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
-    // once in the background. On boot, for each run whose `spilled_unclean` flag was set
-    // at init, log ONCE that an unflushed tail MAY have been lost — naming NO span and
-    // NO count, because nothing durable can size it (the crash-before-range-flush
-    // admitted-loss log). Then a boot drain replays any pending segments without waiting
-    // for the first heartbeat. Fire-and-forget and fully swallowed — a drain must never
-    // block the claim loops.
-    if (this.outbox) {
-      for (const runId of this.outbox.uncleanRuns()) {
-        this.log.warn(
-          "outbox: a run was spilling when the worker last stopped; an unflushed tail may have been lost",
-          { run_id: runId },
+  }
+
+  private async runLifecycle(controller: AbortController): Promise<void> {
+    const signal = controller.signal;
+    const tasks: Promise<void>[] = [];
+    try {
+      // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
+      // A worker whose `/nix` store is missing the baked go/python3/gcc/pip/openssl (a stale seed
+      // after an image roll — see PRD #92 root cause) must FAIL REGISTRATION visibly, not
+      // retry forever (the toolchain won't appear by retrying) or emit silent 127s to
+      // subagents mid-run. THROW so it propagates to main.ts's fatal handler (exit 1) and
+      // the pod surfaces the error to an operator — do NOT swallow it into registerWithRetry.
+      const pf = this.preflight();
+      if (!pf.ok) {
+        this.log.error("toolchain preflight FAILED — refusing to register", {
+          missing: pf.missing,
+          likely_cause:
+            "the baked worker toolchain is missing from the runner PATH — most likely a stale /nix seed after an image roll (PRD #92): the seed init container tars /nix into the PVC once, so a rolled image does not re-seed an existing worker",
+        });
+        throw new Error(
+          `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
         );
       }
-      void this.drainOutbox(signal).catch((err) => {
-        this.log.warn("outbox boot drain failed", { error: errMessage(err) });
+      // issue #1742 D4(a): snapshot the previous process's recovery records BEFORE register, so the
+      // restart sweep below provably excludes any record a live flight of this process writes later.
+      // A runner stub without the method (older test doubles) simply has nothing to snapshot.
+      const bootRecoveries =
+        typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
+      let heartbeat = Promise.resolve();
+      let rejections = Promise.resolve();
+      let registered = false;
+      await this.registerWithRetry(signal, (workerId) => {
+        if (registered) return;
+        registered = true;
+        // Start before finalize retirement or any other post-registration await.
+        heartbeat = this.heartbeatLoop(signal);
+        rejections = this.terminalRejections?.loop(workerId, signal) ?? Promise.resolve();
+        tasks.push(heartbeat, rejections);
       });
+      if (signal.aborted) {
+        await Promise.all([heartbeat, rejections]);
+        return;
+      }
+      // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
+      // any durable-recovery capture the previous life left journaled: re-upload the exact
+      // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
+      // resume failure must never block the claim loops, and the source stays protected by
+      // the journal + the server custody hold regardless.
+      void this.runner.resumePendingRecoveries(signal, bootRecoveries).catch((err) => {
+        this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
+      });
+      // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
+      // once in the background. On boot, for each run whose `spilled_unclean` flag was set
+      // at init, log ONCE that an unflushed tail MAY have been lost — naming NO span and
+      // NO count, because nothing durable can size it (the crash-before-range-flush
+      // admitted-loss log). Then a boot drain replays any pending segments without waiting
+      // for the first heartbeat. Fire-and-forget and fully swallowed — a drain must never
+      // block the claim loops.
+      if (this.outbox) {
+        for (const runId of this.outbox.uncleanRuns()) {
+          this.log.warn(
+            "outbox: a run was spilling when the worker last stopped; an unflushed tail may have been lost",
+            { run_id: runId },
+          );
+        }
+        void this.drainOutbox(signal).catch((err) => {
+          this.log.warn("outbox boot drain failed", { error: errMessage(err) });
+        });
+      }
+      // PRD #1391 Run B M4 (D7/SC3) — the boot claim gate. START THE HEARTBEAT LOOP FIRST, before the
+      // pending-terminal replay, so a pending run's terminal_pending lease keeps refreshing throughout
+      // (a lease that lapsed mid-replay would let a sibling reclaim it). Then RESOLVE every pending
+      // terminal journal (send, retire, or leave it listed) BEFORE the claim loops start — this is the
+      // correctness gate with NO time bound: no run-lane run may claim while an unleased pending outcome
+      // exists. The claim loops themselves additionally stay closed while the pending set exceeds the
+      // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
+      // background above. The heartbeat promise is created once and awaited alongside the claim loops.
+      await this.resolveBootTerminals(signal);
+      // issue #1582 M2: ONLY after the boot pending-terminal gate, start the ancestry-settlement loop
+      // alongside the claim loops (it never gates them): an immediate sweep of every due
+      // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
+      const settlement = this.settlementLoop(signal);
+      // The run lane and the chat lane join the already-running heartbeat until abort.
+      // issue #1759 M3: the DinD prune loop, only when enabled (createDindPrune returned a
+      // controller). Its loop never throws.
+      const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
+      const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
+      // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
+      const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
+      tasks.push(settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal));
+      await Promise.all(tasks);
+    } finally {
+      // Boot/registration failures also stop and join loops already started.
+      void this.shutdownMemory();
+      controller.abort();
+      await Promise.allSettled(tasks);
     }
-    // PRD #1391 Run B M4 (D7/SC3) — the boot claim gate. START THE HEARTBEAT LOOP FIRST, before the
-    // pending-terminal replay, so a pending run's terminal_pending lease keeps refreshing throughout
-    // (a lease that lapsed mid-replay would let a sibling reclaim it). Then RESOLVE every pending
-    // terminal journal (send, retire, or leave it listed) BEFORE the claim loops start — this is the
-    // correctness gate with NO time bound: no run-lane run may claim while an unleased pending outcome
-    // exists. The claim loops themselves additionally stay closed while the pending set exceeds the
-    // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
-    // background above. The heartbeat promise is created once and awaited alongside the claim loops.
-    await this.resolveBootTerminals(signal);
-    // issue #1582 M2: ONLY after the boot pending-terminal gate, start the ancestry-settlement loop
-    // alongside the claim loops (it never gates them): an immediate sweep of every due
-    // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
-    const settlement = this.settlementLoop(signal);
-    // The run lane and the chat lane join the already-running heartbeat until abort.
-    // issue #1759 M3: the DinD prune loop, only when enabled (createDindPrune returned a
-    // controller). Its loop never throws.
-    const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
-    const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
-    // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
-    const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
-    await Promise.all([heartbeat, rejections, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -595,6 +644,7 @@ export class Worker {
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
+        if (this.config.memoryGuard?.enabled) protocolCapabilities.push("worker_memory_pressure_v1");
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,
@@ -604,6 +654,13 @@ export class Worker {
           protocolCapabilities,
           initialSnapshot,
         );
+        // Shutdown has already revoked the pending registration. Its late reply
+        // must neither start loops nor turn normal cancellation into a capability error.
+        if (signal.aborted) return;
+        if (this.config.memoryGuard?.enabled &&
+            (!this.client.hasFeature("worker_memory_pressure_v1") || !this.client.memoryIncarnation)) {
+          throw new UnsupportedMemoryAPI("enabled memory guard requires worker_memory_pressure_v1 and a valid registration incarnation");
+        }
         this.log.info("registered", {
           name: this.config.workerName,
           template: this.config.workerTemplate,
@@ -633,6 +690,7 @@ export class Worker {
         }
         return;
       } catch (err) {
+        if (err instanceof UnsupportedMemoryAPI) throw err;
         // A 401/403 is a PERMANENT auth rejection of the worker join token (rotated or
         // invalid): retrying can never clear it, so FAIL LOUD — throw so it propagates to
         // main.ts's fatal handler (exit 1) and the pod surfaces the error, exactly like the

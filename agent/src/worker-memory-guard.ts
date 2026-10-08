@@ -212,7 +212,7 @@ export class WorkerMemoryMonitor {
     subscribeInvalidation?: (callback: () => void) => () => void;
     reserve: (request: MemoryReservationRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
     report: (request: MemoryOutcomeRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
-    feedback: (result: WorkerMemoryPressureResult) => Promise<void>;
+    feedback: (result: WorkerMemoryPressureResult, context: Context) => Promise<void>;
     preserve: (context: Context) => Promise<void>;
     timer?: Timer;
   }) {
@@ -400,7 +400,7 @@ export class WorkerMemoryMonitor {
     });
     this.ports.commands.resolveToolOutcome(a.entry, result);
     // Ports receive bounded, scrubbed worker-owned metadata, never raw errors/observations.
-    try { await this.bounded(() => this.ports.feedback(result), this.ports.now() + this.config.responseBudgetMs); } catch {}
+    try { await this.bounded(() => this.ports.feedback(result, a.context), this.ports.now() + this.config.responseBudgetMs); } catch {}
     if (preserve && this.ports.commands.memoryPark(a.context)) {
       try { await this.bounded(() => this.ports.preserve(a.context), this.ports.now() + this.config.responseBudgetMs); } catch {}
     }
