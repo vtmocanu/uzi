@@ -348,10 +348,10 @@ completed-run check above.
 
 ## Reviewing and resolving held work
 
-At most **8 unresolved holds per owner** (the *Unresolved recovery holds*
-limit above) can accumulate before uzi pauses admitting **new** runs for you.
-A run that was interrupted and requeued while it still has its own unresolved
-hold keeps resuming, until that one run alone holds 8.
+Once **8 admission-counted holds per owner** (the *Admission-counted recovery
+holds* limit above) accumulate, uzi pauses admitting **new** runs for you.
+A run that was interrupted and requeued while it has 1 to 7 of its own open
+holds keeps resuming; once that one run alone holds 8, it loses the exemption.
 When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
