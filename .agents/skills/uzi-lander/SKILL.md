@@ -308,7 +308,7 @@ changes it); trust it over a handover's claim.
      validators as operator constraints, so name an identifier as binding only when
      compatibility needs that exact name; otherwise call it an example;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
-     is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
+     is fixed or filed per the on-deck *Filing default*, never silently skipped.
    - **optional cleanup** (a Non-blocking reuse, simplification, efficiency or altitude
      note with no demonstrated defect): record it in the PR's deferred notes for step 8;
      never fix locally or trigger rework for it alone, unless the user asks.
