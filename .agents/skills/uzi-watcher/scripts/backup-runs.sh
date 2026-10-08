@@ -413,7 +413,7 @@ aid_newer(){
 # (aid_newer).
 select_clone(){
   local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
-  local LC_ALL=C listing journal ledger ledger_ok jr="" jc="" ja="" path br name aid
+  local LC_ALL=C listing journal ledger ledger_ok journal_ok="" journal_current="" retained="" path br name aid
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
   [ -n "$branch" ] || return 1
   local rc=0
@@ -433,11 +433,26 @@ select_clone(){
   ledger="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
   probe_absent "$rc" || ledger=""
+  # The journal also keeps canonical predecessors, which have no ledger identity.
+  # Only worker attribution is accepted; a recorded successor is not execution authority.
   if [ -n "$journal" ]; then
-    jr="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .runId // "" else "" end' 2>/dev/null)" || jr=""
-    jc="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .clonePath // "" else "" end' 2>/dev/null)" || jc=""
-    ja="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .attemptId // "" else "" end' 2>/dev/null)" || ja=""
+    # shellcheck disable=SC2016
+    journal_ok="$(printf '%s' "$journal" | "$JQ" -r --arg rid "$rid" '
+      def source: type == "object" and (.runId | type) == "string"
+        and (.clonePath | type) == "string"
+        and ((.attemptId // "") | type) == "string";
+      select(source and .runId == $rid)
+      | select(.recovery == null or (.recovery.version == 1
+        and (.recovery.attempts | type) == "number"
+        and .recovery.attempts >= 1 and .recovery.attempts <= 3
+        and .recovery.deadline == .recovery.startedAt + 300000
+        and .recovery.backoffMs >= 0 and .recovery.backoffMs <= 480000
+        and (.recovery.source | source)))
+      | [., (.retainedSources // [])[], .recovery.source // empty]
+      | .[] | select(source and .runId == $rid)
+      | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || journal_ok=""
   fi
+  journal_current="${journal_ok%%$'\n'*}"
   # Ledger: the LAST value per attemptId wins. Keep "<attemptId><TAB><clonePath>" for
   # each attempt whose winning entry names this run; unparseable values are skipped.
   # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
@@ -463,16 +478,20 @@ select_clone(){
     # clone may hold its work: that is an unfinished search, not absence. An unnamed
     # unreadable dir (e.g. an empty root-owned attempt) is still skipped silently.
     if [ -z "$br" ]; then
-      if { [ "$jr" = "$rid" ] && [ "$jc" = "$path" ]; } \
+      if { printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; } \
          || { [ -n "$aid" ] && printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path"; }; then
         probe_inconclusive
       fi
       continue
     fi
     [ "$br" = "$branch" ] || continue
-    if [ "$jr" = "$rid" ] && [ "$jc" = "$path" ] && { [ -z "$ja" ] || [ "$ja" = "$aid" ]; }; then
+    if [ "$journal_current" = "$aid$tab$path" ]; then
       printf '%s\n' "$path"
       return 0
+    fi
+    if printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; then
+      [ -n "$retained" ] || retained="$path"
+      continue
     fi
     [ -n "$aid" ] || continue
     printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path" || continue
@@ -480,6 +499,10 @@ select_clone(){
       best="$path"; best_aid="$aid"; have_best=1
     fi
   done <<< "$listing"
+  if [ -n "$retained" ]; then
+    printf '%s\n' "$retained"
+    return 0
+  fi
   [ "$have_best" -eq 1 ] || return 1
   printf '%s\n' "$best"
 }

@@ -61,6 +61,12 @@ function readJournal(bare: string, branch: string): { runId: string; clonePath: 
   return JSON.parse(raw) as { runId: string; clonePath: string };
 }
 
+/** Inject racing/corrupt metadata without bypassing the guarded production writer. */
+function writeFixtureJournal(bare: string, branch: string, runId: string, clonePath: string): void {
+  execFileSync("git", ["-C", bare, "config", "--local", `uzi-recovery.${branch}.clone`,
+    JSON.stringify({ runId, clonePath })], { env: GIT_ENV, stdio: "pipe" });
+}
+
 const holdingRoot = (): string => path.join(fx.dataDir, "runner-quarantine");
 const runnerRoot = (): string => path.join(fx.dataDir, "runner");
 
@@ -381,7 +387,14 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       };
       try { await retry.run(); } finally { seam.runGit = real; }
       assert.ok(clearedDuringClone.every((capture) => capture?.runId !== s.claimant), "retry never clears successor custody during clone preparation");
-      assertEntry(s, retry, true, stage !== "canonical-journal");
+      if (stage === "canonical-journal") {
+        assert.equal(retry.entry(), undefined, "missing known source refuses successor execution");
+        assert.deepEqual(configValues(s.bare, `uzi-recovery.${branch}.clone`), journal);
+        assert.equal(fs.existsSync(s.clonePath), false, "no canonical source overwrite");
+        assert.ok(api.states.some(state => state.runId === s.claimant && state.body.status === "failed"));
+      } else {
+        assertEntry(s, retry, true, true);
+      }
       assertBytes(retained, s);
     });
   }
@@ -990,7 +1003,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "SUCCESSOR.txt");
     // The lock gap: after the guard threw ForeignCaptureBlockedError(ownerRunId), a
     // successor re-journals the SAME canonical path under a DIFFERENT runId.
-    await git.markRecoveryCapture(bare, clonePath, branch, successorRunId);
+    writeFixtureJournal(bare, branch, successorRunId, clonePath);
 
     await assert.rejects(
       git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false }),
@@ -1420,7 +1433,7 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
   }
 
   for (const discard of [true, false]) {
-    it(`T1354-d (discard=${discard}): a journal-clear failure AFTER the rename leaves no capture-guard wedge`, async () => {
+    it(`T1354-d (discard=${discard}): a journal-clear failure AFTER the rename blocks reseeding with custody retained`, async () => {
       const iid = discard ? 1476 : 1477;
       const ownerRunId = `d1354d${discard ? "1" : "0"}0-0000-4000-8000-000000000006`;
       const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "MARK.txt");
@@ -1458,11 +1471,15 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
         assert.equal(q.length, 1, "the already-complete PVC copy survives the clear failure (copied before the rename)");
         assert.equal(fs.readFileSync(path.join(holdingRoot(), q[0]!, "MARK.txt"), "utf8"), "owner-only bytes\n");
       }
-      // The stale journal does NOT wedge the next claim: the guard's lstat→ENOENT (canonical
-      // gone via the rename) lets it reseed despite the uncleared journal.
-      const reseeded = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId);
-      assert.equal(reseeded.path, clonePath);
-      assert.equal(fs.existsSync(clonePath), true);
+      const retainedJournal = readJournal(bare, branch);
+      const saved = [...scratchDirs().map(name => path.join(runnerRoot(), name, "clone")), ...(fs.existsSync(holdingRoot())
+        ? fs.readdirSync(holdingRoot()).map(name => path.join(holdingRoot(), name)) : [])]
+        .filter(dir => fs.existsSync(path.join(dir, "MARK.txt")));
+      assert.ok(saved.length > 0, "renamed source or holding copy retains the only bytes");
+      await assert.rejects(git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId), /known recovery source is missing/);
+      assert.equal(fs.existsSync(clonePath), false, "no replacement clone can enter a model");
+      assert.deepEqual(readJournal(bare, branch), retainedJournal);
+      for (const dir of saved) assert.equal(fs.readFileSync(path.join(dir, "MARK.txt"), "utf8"), "owner-only bytes\n");
     });
   }
 
@@ -1569,7 +1586,7 @@ describe("1848 M2 local retirement disposition and stage diagnostics", () => {
         clonePath = path.join(fx.dataDir, "outside-runner");
         fs.mkdirSync(clonePath);
         fs.writeFileSync(path.join(clonePath, "M2.txt"), "owner-only bytes\n");
-        await git.markRecoveryCapture(seeded.bare, clonePath, seeded.branch, owner);
+        writeFixtureJournal(seeded.bare, seeded.branch, owner, clonePath);
       }
       const logs = diagnosticLogger();
       const fault = Object.assign(new Error("/private/path\n" + "glpat-" + "0123456789abcdefghij"), { code: stage === "rename" ? "ENOENT" : "EIO" });
@@ -1633,7 +1650,7 @@ describe("1848 M2 local retirement disposition and stage diagnostics", () => {
         // The refusal above left both fixtures untouched; restore canonical custody
         // before retrying a path that retirement is permitted to move.
         assert.equal(fs.readFileSync(path.join(seeded.clonePath, "M2.txt"), "utf8"), "owner-only bytes\n");
-        await git.markRecoveryCapture(seeded.bare, seeded.clonePath, seeded.branch, owner);
+        writeFixtureJournal(seeded.bare, seeded.branch, owner, seeded.clonePath);
         clonePath = seeded.clonePath;
       }
       assert.equal(await git.retireRunnerClone(seeded.bare, clonePath, seeded.branch, owner, {

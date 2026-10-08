@@ -650,6 +650,24 @@ journal run-4242 "$RB/issue-4242.attempt-$A1" "$A1"
 TEST_RUNNER_BASE="$RB//" expect_pick 18 "$RB/issue-4242.attempt-$A1" a1
 echo "PASS case18: trailing slash on the runner base ignored"
 
+# Retained canonical predecessor discovery after handoff: no invented ledger id.
+reset_layout
+make_clone "$RB/issue-4242" agent/issue-4242 retained-canonical
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-other successor
+git --git-dir="$BARE" config "$JKEY" \
+  "{\"runId\":\"run-4242\",\"clonePath\":\"$RB/issue-4242.attempt-$A2\",\"attemptId\":\"$A2\",\"retainedSources\":[{\"runId\":\"run-4242\",\"clonePath\":\"$RB/issue-4242\"}]}"
+expect_pick retained-canonical "$RB/issue-4242" retained-canonical
+echo "PASS retained-canonical: predecessor without ledger identity is discoverable"
+
+# Both paths are valid: current work wins over the earlier-listed predecessor
+# and a newer ledger-only attempt.
+rm -rf "$RB/issue-4242.attempt-$A2"
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 current-newer-bytes
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 ledger-newest
+ledger "$A3" run-4242 "$RB/issue-4242.attempt-$A3" live
+expect_pick current-over-retained "$RB/issue-4242.attempt-$A2" current-newer-bytes
+echo "PASS current-over-retained: current journal clone takes precedence"
+
 # case 19: a LIVE run whose clone is gone and whose every recorded attempt is retired or
 # abandoned says so on the BARE line; a ledger-less bare (case 4) and a mixed ledger say
 # `attempt state unknown`. The archive is kept in all of them.

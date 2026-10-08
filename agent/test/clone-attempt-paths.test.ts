@@ -943,12 +943,14 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
       `${path.sep}${path.basename(runnerRepoDir())}${path.sep}..${path.sep}${path.basename(runnerRepoDir())}${path.sep}`,
     );
     assert.ok(traversal.includes(`${path.sep}..${path.sep}`), `a traversal path: ${traversal}`);
-    await git.markRecoveryCapture(b, traversal, `agent/issue-${iid}`, owner, tid);
+    await assert.rejects(git.markRecoveryCapture(b, traversal, `agent/issue-${iid}`, owner, tid), /invalid retained recovery progress/);
+    execFileSync("git", ["-C", b, "config", "--local", `uzi-recovery.agent/issue-${iid}.clone`,
+      JSON.stringify({ runId: owner, clonePath: traversal, attemptId: tid })], { env: GIT_ENV, stdio: "pipe" });
     terminalOwner(owner, iid);
     const ct = gitlabClaim(iid);
     await wired(factory).execute(ct);
     assert.equal(started(), 0);
-    assert.match(failureOf(ct.run_id), /recovery journal points at a different clone path/);
+    assert.match(failureOf(ct.run_id), /invalid retained recovery progress/);
     assert.equal(fs.existsSync(path.join(real, "FOREIGN.txt")), true);
     assert.equal(readJournal(iid)?.clonePath, traversal);
   });
