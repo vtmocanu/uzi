@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Empty pre-clone terminal claims settle guarded custody ([#2469](https://github.com/vtmocanu/uzi/issues/2469)).**
+  A confirmed forge-park cap failure or cancellation releases its exact-generation hold after positive evidence that no source was adopted. Lost acknowledgements require a matching terminal ownership generation; stale or unknown claims and retained source keep their custody protection.
+
 - **Guarded recovery accepts cleared clone journals ([#2458](https://github.com/vtmocanu/uzi/issues/2458)).**
   Inventory discovery recognizes the latest empty retirement value as no journal, so a cleared entry on another branch does not block finalization. Malformed nonempty attribution, ledger validation, physical-source checks and quiescence requirements remain enforced.
 
