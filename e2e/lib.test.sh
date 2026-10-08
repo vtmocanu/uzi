@@ -240,6 +240,31 @@ custody_case "missing exact hold fails closed" fail "missing receipt" wait_forge
 park_fixture duplicate
 custody_case "two matching holds cannot mask the open first row" fail "expected exactly one hold" wait_forge_park_release R 1 2
 
+# Drive the real sequential outbox creation seam, not just the admission helper.
+# Each fresh claim must observe a saturated-then-free owner before create_run.
+eval "$(awk '/^make_outbox_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+headroom_fixture 8 7 8 7
+echo 0 > "$SEQ_DIR/claims"
+export REPO_ID=repo
+apipost() { printf '%s\n' '{"card":{"iid":1}}'; }
+wait_status() { :; }
+tick_count() { echo 3; }
+create_run() {
+  local calls expected
+  calls="$(cat "$SEQ_DIR/claims")"
+  expected=$((calls + 3))
+  [ "$(cat "$SEQ_DIR/n")" = "$expected" ] || { echo 'fresh claim before its admission wait' >&2; return 1; }
+  echo $((calls + 1)) > "$SEQ_DIR/claims"
+  echo R
+}
+outbox_sequence() {
+  make_outbox_run
+  make_outbox_run
+  [ "$(cat "$SEQ_DIR/claims")" = 2 ] || fail "outbox did not create both claims"
+  echo 'two fresh claims after their admission waits'
+}
+custody_case "each sequential outbox claim waits for one slot" pass 'two fresh claims after their admission waits' outbox_sequence
+
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
 for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
@@ -250,6 +275,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 41 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 42 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 40 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 42 ] && [ "$cases" -eq "$passed" ]

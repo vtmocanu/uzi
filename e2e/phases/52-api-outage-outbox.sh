@@ -147,6 +147,9 @@ make_outbox_run() {
     '{"title":"E2E outbox UZI_STUB_OUTBOX","description":"implements prds/1391-worker-outbox-durable-reports.md UZI_STUB_OUTBOX"}' \
     | jq -r '.card.iid')"
   { [ -n "$iid" ] && [ "$iid" != null ]; } || fail "outbox phase: could not create the stub issue"
+  # Cases create one fresh run at a time. Re-check before each initial claim;
+  # earlier completion can precede final custody acknowledgement.
+  wait_custody_headroom 1
   OUTBOX_RUN="$(create_run "$REPO_ID" "$iid")" || fail "outbox phase: run-create failed (non-transient; see stderr)"
   { [ -n "$OUTBOX_RUN" ] && [ "$OUTBOX_RUN" != null ]; } || fail "outbox phase: run was not created"
   wait_status "$OUTBOX_RUN" awaiting_approval
@@ -304,12 +307,6 @@ export E2E_WORKER_HEARTBEAT_STALE=300s
 wait_http
 login
 pass "api recreated with a 300s heartbeat-stale window so the outage cannot requeue the running run"
-
-# Reserve headroom for the worker's advertised concurrency, read from the live API.
-# Outbox legs run sequentially, but final custody acknowledgement can lag completion.
-OB_CAP="$(apiget /api/workers | jq -er '[.workers[] | select(.status=="online") | .max_concurrent_runs] | max | select(type=="number" and .>0 and .==floor)')" \
-  || fail "outbox phase: no online worker advertises a positive concurrency"
-wait_custody_headroom "$OB_CAP"
 
 # =============================================================================
 # CASE 1 — spill + drain, contiguous, no drops, no `failed` report.
