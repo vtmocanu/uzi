@@ -98,7 +98,9 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   → ask for a replacement or a local buddy. Never downgrade silently.
 - **A local buddy waives only the peer buddy**, never independent review, CI or a user
   review. Spawn one fresh subagent per request, brief it as below, pin it to the head;
-  it shares your model's blind spots, so name it in the trail.
+  it shares your model's blind spots, so name it in the trail. Every review brief asks
+  for applicable cleanup lenses (reuse, simplification, efficiency, fix altitude),
+  reported apart from mandatory findings.
 - **A buddy never reviews a diff it wrote.** When the buddy implemented the change, the
   independent review is a bot or a fresh local reviewer; the buddy only verifies findings.
 - **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
@@ -307,6 +309,9 @@ changes it); trust it over a handover's claim.
      compatibility needs that exact name; otherwise call it an example;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
      is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
+   - **optional cleanup** (a Non-blocking reuse, simplification, efficiency or altitude
+     note with no demonstrated defect): record it in the PR's deferred notes for step 8;
+     never fix locally or trigger rework for it alone, unless the user asks.
    Decide, then report the decisions in one message (finding, label, choice, why) and
    execute; do not wait for answers. Several PRs with findings → assess all, report once,
    execute unattended.
