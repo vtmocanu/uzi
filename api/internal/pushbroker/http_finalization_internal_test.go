@@ -63,7 +63,7 @@ func (f finalizationFixture) RoundTrip(req *http.Request) (*http.Response, error
 	return &http.Response{StatusCode: f.status, Header: make(http.Header), Body: f.body}, nil
 }
 
-func realFinalizationSession(t *testing.T, body io.ReadCloser, status int) (forwardPackResult, error, *rawReport) {
+func realFinalizationSession(t *testing.T, body io.ReadCloser, status int) (forwardPackResult, *rawReport, error) {
 	t.Helper()
 	ep, _ := transport.NewEndpoint("https://example.invalid/origin.git")
 	raw := &rawReport{ref: "refs/uzi-checkpoints/main"}
@@ -81,7 +81,7 @@ func realFinalizationSession(t *testing.T, body io.ReadCloser, status int) (forw
 	req := packp.NewReferenceUpdateRequestFromCapabilities(ar.Capabilities)
 	req.Commands = []*packp.Command{{Name: plumbing.ReferenceName(raw.ref), New: plumbing.NewHash(strings.Repeat("1", 40))}}
 	result, err := receiveObservedPack(context.Background(), sess, req, raw)
-	return result, err, raw
+	return result, raw, err
 }
 
 func serveFinalizationAdvertisement(t *testing.T, w http.ResponseWriter) {
@@ -103,7 +103,7 @@ func serveFinalizationAdvertisement(t *testing.T, w http.ResponseWriter) {
 	}
 }
 
-func realServerFinalization(t *testing.T, ctx context.Context, url string) (forwardPackResult, error, *rawReport) {
+func realServerFinalization(t *testing.T, ctx context.Context, url string) (forwardPackResult, *rawReport, error) {
 	t.Helper()
 	ep, _ := transport.NewEndpoint(url)
 	raw := &rawReport{ref: "refs/uzi-checkpoints/main"}
@@ -118,12 +118,12 @@ func realServerFinalization(t *testing.T, ctx context.Context, url string) (forw
 	defer func() { _ = sess.Close() }()
 	ar, err := sess.AdvertisedReferencesContext(ctx)
 	if err != nil {
-		return forwardPackResult{}, err, raw
+		return forwardPackResult{}, raw, err
 	}
 	req := packp.NewReferenceUpdateRequestFromCapabilities(ar.Capabilities)
 	req.Commands = []*packp.Command{{Name: plumbing.ReferenceName(raw.ref), New: plumbing.NewHash(strings.Repeat("1", 40))}}
 	result, err := receiveObservedPack(ctx, sess, req, raw)
-	return result, err, raw
+	return result, raw, err
 }
 
 func TestHTTPInvocationCanonicalDiscovery(t *testing.T) {
@@ -146,7 +146,7 @@ func TestHTTPInvocationCanonicalDiscovery(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	result, err, raw := realServerFinalization(t, ctx, server.URL+"/origin.git")
+	result, raw, err := realServerFinalization(t, ctx, server.URL+"/origin.git")
 	if err != nil || !result.success || !raw.attached || posts.Load() != 1 {
 		t.Fatalf("canonical attachment: result=%+v raw=%+v error=%v posts=%d", result, raw, err, posts.Load())
 	}
@@ -164,16 +164,40 @@ func TestHTTPInvocationRedirectRefusal(t *testing.T) {
 					return
 				}
 				_, _ = io.Copy(io.Discard, r.Body)
-				http.Redirect(w, r, target.URL+r.URL.Path+"?"+r.URL.RawQuery, http.StatusTemporaryRedirect)
+				http.Redirect(w, r, target.URL+"/origin.git/info/refs?service=git-receive-pack", http.StatusTemporaryRedirect)
 			}))
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			result, err, _ := realServerFinalization(t, ctx, server.URL+"/origin.git")
+			result, _, err := realServerFinalization(t, ctx, server.URL+"/origin.git")
 			if err == nil || result.success || result.rejected || forbidden.Load() != 0 {
 				t.Fatalf("redirect refusal: result=%+v error=%v prohibited=%d", result, err, forbidden.Load())
 			}
 		})
+	}
+}
+
+func TestHTTPInvocationSameOriginPOSTRefusal(t *testing.T) {
+	var redirected atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			serveFinalizationAdvertisement(t, w)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/redirected.git/git-receive-pack" {
+			redirected.Add(1)
+			_, _ = w.Write(rawFixtureWire(t, "unpack ok", "ok refs/uzi-checkpoints/main"))
+			return
+		}
+		http.Redirect(w, r, "/redirected.git/git-receive-pack", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, _, err := realServerFinalization(t, ctx, server.URL+"/origin.git")
+	if err == nil || result.success || result.rejected || redirected.Load() != 0 {
+		t.Fatalf("same-origin POST redirect followed: result=%+v error=%v requests=%d", result, err, redirected.Load())
 	}
 }
 
@@ -228,7 +252,7 @@ func TestHTTPFinalizationOriginalContext(t *testing.T) {
 				defer func() { brokerHTTPClient.Transport = original }()
 			}
 			start := time.Now()
-			result, err, raw := realServerFinalization(t, ctx, server.URL+"/origin.git")
+			result, raw, err := realServerFinalization(t, ctx, server.URL+"/origin.git")
 			expected := context.DeadlineExceeded
 			if !deadline {
 				expected = context.Canceled
@@ -294,7 +318,7 @@ func (e *typedReportFailure) Error() string { return e.text }
 func TestHTTPFinalizationErrorIdentity(t *testing.T) {
 	cause := &typedReportFailure{text: "https://credential@remote.invalid/\u202e" + "glpat-" + strings.Repeat("D", 20)}
 	body := &boundaryBody{data: rawFixtureWire(t, "unpack ok", "ok refs/uzi-checkpoints/main"), chunk: 1024, terminal: cause}
-	result, err, _ := realFinalizationSession(t, body, 200)
+	result, _, err := realFinalizationSession(t, body, 200)
 	var got *typedReportFailure
 	if result.success || result.rejected || !errors.As(err, &got) || got != cause {
 		t.Fatalf("error identity lost: %v", err)
@@ -335,7 +359,7 @@ func TestHTTPFinalizationEvidence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := &boundaryBody{data: append([]byte(nil), tc.wire...), chunk: 97, terminal: tc.terminal, closeErr: tc.closeErr}
-			result, err, raw := realFinalizationSession(t, body, tc.status)
+			result, raw, err := realFinalizationSession(t, body, tc.status)
 			if result.success != tc.success || result.rejected != tc.rejected || body.closes != 1 {
 				t.Fatalf("result=%+v closes=%d error=%v", result, body.closes, err)
 			}
@@ -420,7 +444,7 @@ func TestHTTPFinalizationActualBoundaries(t *testing.T) {
 			} {
 				t.Run(schedule.name, func(t *testing.T) {
 					body := &boundaryBody{data: append([]byte(nil), wire...), chunk: schedule.chunk, terminal: io.EOF}
-					result, err, _ := realFinalizationSession(t, body, 200)
+					result, _, err := realFinalizationSession(t, body, 200)
 					t.Logf("actual read boundaries=%v report flush=%d result=%+v error=%v", body.boundaries, flush, result, err)
 					if !result.invoked || result.success != (tc.kind == "") || result.rejected || (err == nil) != (tc.kind == "") {
 						t.Fatalf("unexpected disposition: result=%+v error=%v", result, err)
