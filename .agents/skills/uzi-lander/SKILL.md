@@ -439,7 +439,11 @@ changes it); trust it over a handover's claim.
      (premise verified, fix scoped, no design decision open, no `.github/workflows/**` change,
      which a uzi push cannot carry): if so add its sweep selector (`bug` for a defect,
      `Planned` for planned work) plus `uzi`; if not, leave both off and
-     say why in the trail. A set over the grouped-filing limit (50) is "needs you"; never
+     say why in the trail. A low or normal issue meeting every criterion in
+     `.agents/skills/issue-triage/references/on-deck.md` takes `on-deck` instead of
+     `bug`/`Planned`; draft its body in that file's shape at filing time. Queue it only
+     with the buddy's approval of the exact body and label set plus the user's
+     authorization (their OK or an existing scoped grant). A set over the grouped-filing limit (50) is "needs you"; never
      split or truncate it silently. Name each issue in the trail.
    - Already-tracked issue not moving (no active run, not sweep-fireable per issue-triage's
      Step 1 selector plus `uzi` or bot assignment, no enabled one-time schedule still to

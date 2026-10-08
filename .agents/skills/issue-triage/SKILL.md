@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: "Triages GitHub issues on this repo into queued or parked decisions. Checks spent one-shot schedules, prioritizes non-maintainer reports, finds selector/eligibility gaps and missing area or priority labels, then checks the backlog and parked issues. Verifies claims against current code and merged PRs, recommends a verdict and taxonomy labels, and applies confirmed changes with a freshness comment. Queue audits predict and verify the next sweep's picks. Use when triaging or prioritizing the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, categorize issues, prioritize the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules, what goes to the sweep tonight."
+description: "Triages GitHub issues on this repo into queued or parked decisions. Checks spent one-shot schedules, prioritizes non-maintainer reports, finds selector/eligibility gaps and missing area or priority labels, then checks the backlog and parked issues. Verifies claims against current code and merged PRs, recommends a verdict and taxonomy labels, and applies confirmed changes with a freshness comment. Picks small, low-risk issues for the on-deck sweep (no plan review), splits mixed ones, and rewrites their bodies into pinned specs. Queue audits predict and verify the next sweep's picks. Use when triaging or prioritizing the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, categorize issues, prioritize the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules, what goes to the sweep tonight, what can go on-deck, label on-deck."
 ---
 
 # Issue triage
@@ -82,10 +82,10 @@ uzi schedule list --json | jq '.[] | select(.target=="sweep") | {slug: .catalog_
 
 Order: user-named issue → lowest-numbered `external` from 0B → `recurring` and not moving (no active run, not fireable per the selector plus eligibility rule below, bot assignment included, no enabled one-time schedule still to fire, not `In Progress`; reconsider its priority with the incident count in the reason) → lowest-numbered issue in the highest non-empty tier. When the user asks for newest first, take the highest number instead, at each step.
 
-A sweep fires an issue only with BOTH a selector (`Planned`, or `bug`) AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs.
+A sweep fires an issue only with BOTH a selector AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs. Selectors: `bug`, `Planned`, `on-deck` (the `ondeck-sweep` drain, [references/on-deck.md](references/on-deck.md)), plus any enabled custom label sweep (`uzi schedule list --json`). The jq below checks only the first three; treat its tiers as a shortlist and correct them against the live selectors.
 
-- **1A selector, not eligible**: `bug`/`Planned`, no `uzi`, not bot-assigned.
-- **1B eligible, no selector**: `uzi` or bot-assigned, no `bug`/`Planned`.
+- **1A selector, not eligible**: `bug`/`Planned`/`on-deck`, no `uzi`, not bot-assigned.
+- **1B eligible, no selector**: `uzi` or bot-assigned, no `bug`/`Planned`/`on-deck`.
 - **2 untriaged**: no selector, no park label.
 - **3 parked** (`brainstorm`/`Later`): propose revisiting only when 1 and 2 are empty.
 
@@ -100,7 +100,7 @@ gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assign
     def park: ["brainstorm","Later","In Progress","Human Review","wontfix","duplicate","invalid"];
     def names: [.labels[].name];
     def has($l): (names | index($l)) != null;
-    def selector: (has("bug") or has("Planned"));
+    def selector: (has("bug") or has("Planned") or has("on-deck"));
     def assigned_to_bot: ($bot != "" and ([.assignees[].login] | index($bot)) != null);
     def fireable: (has("uzi") or assigned_to_bot);
     def parked: ((names) - park) != (names);
@@ -144,12 +144,17 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 
 | Verdict | When | Action |
 |---|---|---|
+| **On-deck** | meets every [on-deck](references/on-deck.md) criterion; no plan review needed | rewrite body, `on-deck` + `uzi`; freshness comment |
+| **Split** | one part meets on-deck, the rest does not | new on-deck issue for that part; trim parent body; link both |
 | **Send to sweep** | clear value, self-contained, premise holds, no `.github/workflows` | add the missing selector/`uzi`; freshness comment |
 | **Do locally** | tiny, must touch `.github/workflows`, or wanted now | in-session or **uzi-watcher**; no sweep labels |
 | **Needs design** | open question / competing approaches | `brainstorm`; summarize the fork |
 | **Defer** | valid, not now | `Later` |
 | **Already done** | premise gone (verified in code) | recommend close; cite code |
-| **Not worth it** | duplicate / invalid / out of scope | rationale comment + `wontfix`/`duplicate`/`invalid` |
+| **Not worth it** | duplicate / invalid / obsolete, or the user's explicit value call | rationale comment + `wontfix`/`duplicate`/`invalid` |
+
+- Prefer **On-deck** for small, low-risk work: it drains idle capacity without a plan review. A `.github/workflows/**` change stays **Do locally**; other excluded work takes the verdict that fits (sweep, **uzi-watcher** with plan review, or local).
+- "Low value" or "speculative" alone is not **Not worth it**: present it to the user as a value decision.
 
 - Before **Send to sweep** makes a non-maintainer issue eligible (label or bot assignment), require a maintainer-written planning body: have the maintainer rewrite it or file a maintainer-authored issue linking the report. Otherwise use **uzi-watcher** with gated plan review, not a sweep. Keep this rule after #2345 lands and freezes issue text per run.
 
@@ -159,7 +164,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 - Tier 1: add only the missing half (1A → `uzi` or bot assignee; 1B → selector).
 - Deliberately deferred gap → **Defer** (`Later`), not sweep completion.
 
-## Step 4: Freshness (sweep/local verdicts only)
+## Step 4: Freshness (on-deck/split/sweep/local verdicts only)
 
 Do not trust issue line numbers.
 
@@ -187,6 +192,7 @@ EOF
 )"
 ```
 
+- On-deck: the comment says "Queued for the on-deck sweep" and the body is the rewritten one ([references/on-deck.md](references/on-deck.md)); `reviewed` needs the buddy's approval of that exact body.
 - Add `--add-label "reviewed"` when the buddy agreed with the verdict and Step 4 ran (root `CLAUDE.md` rule); otherwise leave it off.
 - Bot-assignment path: replace `--add-label "uzi"` with `--add-assignee BOT_LOGIN` (from `CLAUDE.local.md`; never invent it).
 - Comment carries Step 4 findings; mirror #525/#509.
