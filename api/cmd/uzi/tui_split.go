@@ -229,6 +229,9 @@ func (m tuiModel) withSplitNote(footer string) string {
 }
 
 func (m tuiModel) splitFooterLine() string {
+	if line, ok := m.restartFooter(" ? keys · q quit"); ok {
+		return line
+	}
 	var hints []string
 	if m.view == viewBoard {
 		hints = []string{"enter/→ open", "tab pane", "/ filter", "a scope", "h fold done", "r refresh", "? keys", "q quit"}

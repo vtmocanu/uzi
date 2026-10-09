@@ -94,7 +94,7 @@ func TestSkewWarning(t *testing.T) {
 			// passed in (so the live-incident row carries `v0.11.8` and `0.14.0`,
 			// not two normalised strings), and the remedy must be the one documented
 			// install path.
-			for _, want := range []string{r.cli, r.srv, "brew upgrade uzi-cli"} {
+			for _, want := range []string{r.cli, r.srv, "brew upgrade vtmocanu/tap/uzi-cli"} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("message %q does not contain %q", msg, want)
 				}
@@ -120,7 +120,7 @@ func TestSkewWarningUsesStampedChannel(t *testing.T) {
 			if !ok {
 				t.Fatal("expected a skew warning")
 			}
-			want := "Run: brew upgrade " + tc.formula
+			want := "Run: brew upgrade vtmocanu/tap/" + tc.formula
 			if !strings.Contains(msg, want) {
 				t.Fatalf("warning = %q, want %q", msg, want)
 			}

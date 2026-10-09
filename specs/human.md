@@ -185,6 +185,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Per-user worker-model defaults are retained separately for Claude and Codex and saved together with the default harness in Settings. (AI-synced 2026-09-23)
 - Both worker-model defaults offer curated models plus a custom model ID; Codex custom IDs apply to the worker root and the dedicated Plan cross-check checker pin, not schedule or role pins. Cross-check pins also configure the Claude checker of a Codex lead. (AI-synced 2026-10-08)
 - Precedence: the user's default for the run's selected harness wins over the lead template's model (unset = inherit the lead template's model, opus by default). (AI-synced 2026-09-23)
+- The lead overlaps the integration gate with the read-only review wave by default, but after review invalidates a candidate with a costly full gate it finishes repair reviews and focused checks before repeating the gate, and triages a failed gate (narrowest reproducer on candidate and base) before rerunning; prompt-level guidance, still blocking. (AI-synced 2026-10-09)
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
 - Switching the default harness never clears either saved worker-model choice. [PRD #1551] (AI-synced 2026-09-23)
 - Task review uses its own built-in model (Codex: `gpt-6-sol`) independent of these saved defaults; there is no setting to choose the task-review model in this release. [PRD #1551] (AI-synced 2026-09-23)

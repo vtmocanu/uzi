@@ -206,7 +206,7 @@ function planningScript(runId: string): Timed[] {
     {
       delay: 1600,
       step: () => {
-        appendMessage(runId, "plan", "lead", { text: SAMPLE_PLAN() });
+        appendMessage(runId, "plan", "lead", { plan_md: SAMPLE_PLAN() });
         // PRD #40: the plan TURN ends with its own result frame (cumulative usage so
         // far), so the per-phase table shows a "Plan" phase distinct from implement.
         // PRD #311: the frame is PLAN_RESULT_FRAME (module-level, guarded).
@@ -447,7 +447,7 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
       delay: 1500,
       step: () => {
         const plan = `${SAMPLE_PLAN()}\n\n> Revised after rejection: ${reason || "(no reason given)"}`;
-        appendMessage(runId, "plan", "lead", { text: plan });
+        appendMessage(runId, "plan", "lead", { plan_md: plan });
         appendMessage(runId, "status", null, { text: "revised plan submitted — awaiting approval" });
         // PRD #122: the re-gate still shows the milestones as PRE-APPROVAL candidates.
         patchRun(runId, {
@@ -616,6 +616,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     case "reject_plan":
       if (run.status !== "awaiting_approval") return null;
       patchRun(runId, { status: "running" });
+      appendMessage(runId, "plan_feedback", null, { feedback: body });
       appendMessage(runId, "status", null, { text: "plan rejected — sending feedback to the agent" });
       schedule(runId, revisedPlanScript(runId, body));
       return null;

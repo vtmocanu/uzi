@@ -17,12 +17,16 @@ import (
 // fakeSettings is an in-memory SettingsReader: a fixed enabled flag + optional token,
 // counting Invalidate calls so a persist is observable.
 type fakeSettings struct {
-	enabled     bool
-	enabledErr  error
-	token       string
-	tokenErr    error
-	interval    time.Duration
-	invalidated atomic.Int64
+	enabled       bool
+	enabledErr    error
+	token         string
+	tokenErr      error
+	interval      time.Duration
+	intervalReads atomic.Int64
+	checkedAt     string
+	checkedErr    error
+	checkedReads  atomic.Int64
+	invalidated   atomic.Int64
 }
 
 func (f *fakeSettings) ReleaseCheckEnabled(context.Context) (bool, error) {
@@ -34,7 +38,12 @@ func (f *fakeSettings) ReleaseCheckToken(context.Context) (string, error) {
 	return f.token, f.tokenErr
 }
 func (f *fakeSettings) ReleaseCheckInterval(context.Context) (time.Duration, error) {
+	f.intervalReads.Add(1)
 	return f.interval, nil
+}
+func (f *fakeSettings) ReleaseCheckedAt(context.Context) (string, error) {
+	f.checkedReads.Add(1)
+	return f.checkedAt, f.checkedErr
 }
 func (f *fakeSettings) Invalidate() { f.invalidated.Add(1) }
 

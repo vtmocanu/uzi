@@ -1,6 +1,6 @@
 # PRD #2560: Price-table freshness reminders and Codex price coverage
 
-**Status**: Complete (in-scope M1 and M2). The weekly maintainer-local workflow remains out of scope and unshipped. Child 2 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2559 (API-equivalent cost for Codex subscription runs); they overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`.
+**Status**: Complete (in-scope M1 and M2). The weekly maintainer-local workflow follow-up shipped separately in PR #2595 (`.github/workflows/pricing-freshness.yml` plus `scripts/pricing-freshness-issue.sh`). Child 2 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2559 (API-equivalent cost for Codex subscription runs); they overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`.
 
 Planning facts were read at `main` `140b5c767`. External facts were checked by the maintainer on 2026-10-09 and are recorded here, because the implementing worker has no open-web access.
 
@@ -165,8 +165,8 @@ passed repository, docs and embedded-mirror checks at `5b00e197`.
 - [x] Final M2 records validation at `5b00e197`: `task gate:repo`,
   `task check-docs:web` and uncached `TestEmbeddedDocsMatchSource` passed
   (log suffixes bFjUKo, FpLdCp and wGWunB, each EXIT=0).
-- [ ] **Out of scope, unshipped:** weekly maintainer-local workflow follow-up,
-  including its bot-owned issue lifecycle. No workflow file was changed.
+- [x] **Shipped separately (PR #2595):** weekly maintainer-local workflow follow-up,
+  including its bot-owned issue lifecycle; this PRD's own run changed no workflow file.
   The other exclusions above remain out of scope.
 
 ## Decision Log

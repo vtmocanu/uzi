@@ -162,6 +162,8 @@ import {
   type AttemptSeedOptions,
   type CanonicalReseedOptions,
   ScratchPublicationError,
+  type ScratchPublicationKind,
+  type ScratchPublicationStep,
   MAX_OWED_CANDIDATES_PER_RUN,
   RemoteBranchAdvancedError,
   type PublicationFloor,
@@ -1541,6 +1543,28 @@ function scratchPublicationFailureReason(
   const at = err.step === undefined ? "" : ` at ${err.step}`;
   const reason = err.kind === "floor_unverified" ? "cannot verify fresh remote floor" : "candidate history cannot be published";
   return `scratch_publication_refused: ${reason} (${err.kind}${at})`;
+}
+
+/** Normalize runtime metadata before it reaches either the feed or its dedupe key. */
+function scratchPublicationCheckpointDiagnostic(err: ScratchPublicationError): { key: string; text: string } {
+  const kinds: readonly ScratchPublicationKind[] = [
+    "tip_unavailable", "shallow_history", "missing_objects", "object_walk_failed",
+    "exec_failed", "scratch_present", "floor_unverified", "checkpoint_range",
+    "remote_changed_during_refresh", "remote_candidate_diverged",
+    "new_remote_candidate_diverged", "remote_branch_advanced",
+  ];
+  const steps: readonly ScratchPublicationStep[] = [
+    "resolve_tip", "shallow_check", "object_walk", "scratch_walk", "floor_refresh", "checkpoint_floor",
+  ];
+  const rawKind = err.kind;
+  const rawStep = err.step;
+  const kind = kinds.includes(rawKind) ? rawKind : "other";
+  const step = rawStep !== undefined && steps.includes(rawStep) ? rawStep : undefined;
+  const pair = `${kind}${step === undefined ? "" : ` at ${step}`}`;
+  return {
+    key: `scratch_publication_refused:${pair}`,
+    text: `checkpoint publish failed: scratch_publication_refused (${pair})`,
+  };
 }
 
 /** Log why a scratch publication was refused: kind, step, detail and the cause chain, each
@@ -11187,7 +11211,8 @@ export class RunRunner {
       if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
       if (e instanceof ScratchPublicationError) {
         logScratchPublicationRefused(runLog, flight.redactText, e, "park_bridge");
-        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        const diagnostic = scratchPublicationCheckpointDiagnostic(e);
+        this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text);
         return { kind: "failed" };
       }
       // Never let a bridge failure undo a park/shutdown/capture (D4).
@@ -12180,7 +12205,8 @@ export class RunRunner {
       if (e instanceof PreservationRefusedError) return { published: false, reason: "preservation_refused" };
       if (e instanceof ScratchPublicationError) {
         logScratchPublicationRefused(flight.runLog, flight.redactText, e, "checkpoint_publish");
-        this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
+        const diagnostic = scratchPublicationCheckpointDiagnostic(e);
+        this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text);
         return { published: false, reason: "scratch_publication_refused" };
       }
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a

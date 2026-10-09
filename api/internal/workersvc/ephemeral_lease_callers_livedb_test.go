@@ -18,7 +18,7 @@ import (
 // not a deferral target and the same worker claims the run, which is the positive control.
 func TestClaimSpreadDefersToLeasedEphemeralPeerLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
-	peer, _, iid := e.seedLeasedWorker(t, 0)
+	peer, _, iid := e.seedLeasedWorker(t)
 	e.exec(`UPDATE workers SET max_concurrent_runs = 2 WHERE id = $1`, peer)
 
 	// The claimant: persistent, cap 2, already running one run so that the idle peer is strictly
@@ -52,7 +52,7 @@ func TestClaimSpreadDefersToLeasedEphemeralPeerLiveDB(t *testing.T) {
 // "restart worker". With the lease off the same state does name the released worker (control).
 func TestQueuedReasonCountsLeasedEphemeralWorkerLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
-	_, _, iid := e.seedLeasedWorker(t, 0)
+	_, _, iid := e.seedLeasedWorker(t)
 
 	released := uuid.New()
 	e.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at, snapshot_register_nonce)

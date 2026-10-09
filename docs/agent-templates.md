@@ -100,9 +100,12 @@ starting the next:
   prompt, doesn't commit, and doesn't run repo-wide build or test commands;
   the lead diffs the working tree against the last commit to confirm only the
   declared scopes changed, commits each landed unit, then runs the quality gate
-  over that commit — overlapped with the read-only validator wave rather than
-  serialized ahead of it, but still blocking: a red gate holds that unit, it is
-  not advanced or built on until the gate is green.
+  over that commit — by default overlapped with the read-only validator wave
+  rather than serialized ahead of it, but still blocking: a red gate holds that
+  unit, it is not advanced or built on until the gate is green. Once review
+  invalidates a candidate whose full gate is costly, the lead finishes the repair
+  reviews and focused checks before repeating the full gate. A failed gate is
+  triaged (narrowest reproducer, on candidate and base) before it is rerun.
 - **A unit others depend on can publish its seam early.** When the plan declares
   that one unit's output (a schema change, a shared type, an interface or route
   shape) another builds on, the lead can land and commit that seam first so the

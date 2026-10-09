@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
@@ -29,6 +27,9 @@ func updatePromptModel(t *testing.T) tuiModel {
 	m.skewCheck = true
 	m.showVersion = true
 	m.updatePrompt.brewKnown = true
+	m.installedVersion = func(string) (string, error) { return version, nil }
+	m.splitMode = "off"
+	m.workers.active = true
 	return m
 }
 
@@ -99,7 +100,7 @@ func TestUpdatePromptRejectsRCZero(t *testing.T) {
 			if tc.stable != "" {
 				stable = &apitypes.LatestReleaseDTO{Version: tc.stable}
 			}
-			next, _ := m.Update(buildInfoMsg{
+			next, _ := settledUpdate(m, buildInfoMsg{
 				latest:   stable,
 				latestRC: &apitypes.LatestReleaseDTO{Version: tc.rc},
 			})
@@ -115,7 +116,7 @@ func TestUpdatePromptRejectsRCZero(t *testing.T) {
 func TestUpdatePromptShowsOnNewerStable(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	m := updatePromptModel(t)
-	next, _ := m.Update(buildInfoMsg{version: "0.83.0", latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
+	next, _ := settledUpdate(m, buildInfoMsg{version: "0.83.0", latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
 	m = next.(tuiModel)
 	if !m.updatePrompt.showing {
 		t.Fatal("expected the update prompt to show for a newer stable release")
@@ -131,7 +132,7 @@ func TestUpdatePromptShowsOnNewerStable(t *testing.T) {
 func TestUpdatePromptNotShownWhenLatestNil(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	m := updatePromptModel(t)
-	next, _ := m.Update(buildInfoMsg{version: "0.83.0", latest: nil})
+	next, _ := settledUpdate(m, buildInfoMsg{version: "0.83.0", latest: nil})
 	m = next.(tuiModel)
 	if m.updatePrompt.showing {
 		t.Fatal("a nil Latest (no check ran / feature disabled) must not prompt")
@@ -146,7 +147,7 @@ func TestUpdatePromptNotShownWhenCurrentOrAhead(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withVersion(t, tc.cli)
 			m := updatePromptModel(t)
-			next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: tc.latest}})
+			next, _ := settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: tc.latest}})
 			m = next.(tuiModel)
 			if m.updatePrompt.showing {
 				t.Fatalf("must not prompt when CLI is %s and latest is %s", tc.cli, tc.latest)
@@ -160,7 +161,7 @@ func TestUpdatePromptNeverOffersPrerelease(t *testing.T) {
 	for _, latest := range []string{"v0.85.0-rc.1", "v0.83.0-rc.2", "v0.90.0-rc.3", "v0.85.0-beta.1", "v0.85.0-alpha.1"} {
 		t.Run(latest, func(t *testing.T) {
 			m := updatePromptModel(t)
-			next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: latest}})
+			next, _ := settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: latest}})
 			m = next.(tuiModel)
 			if m.updatePrompt.showing {
 				t.Fatalf("must never prompt to upgrade to a prerelease (%s)", latest)
@@ -173,7 +174,7 @@ func TestUpdatePromptNotShownWhenProbeDisabled(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	// tuiTestModel leaves skewCheck/showVersion false, as --demo and direct construction do.
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
-	next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
+	next, _ := settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
 	m = next.(tuiModel)
 	if m.updatePrompt.showing {
 		t.Fatal("a session that may not probe (skewCheck/showVersion false) must not prompt")
@@ -190,7 +191,7 @@ func TestUpdatePromptRespectsDismissal(t *testing.T) {
 
 	dismissed := updatePromptModel(t)
 	dismissed.store, dismissed.serverURL = store, url
-	next, _ := dismissed.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
+	next, _ := settledUpdate(dismissed, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
 	dismissed = next.(tuiModel)
 	if dismissed.updatePrompt.showing {
 		t.Fatal("a version dismissed via 'don't remind me' must not re-prompt")
@@ -199,7 +200,7 @@ func TestUpdatePromptRespectsDismissal(t *testing.T) {
 	// A NEWER release re-prompts despite the older dismissal.
 	newer := updatePromptModel(t)
 	newer.store, newer.serverURL = store, url
-	next, _ = newer.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.86.0"}})
+	next, _ = settledUpdate(newer, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.86.0"}})
 	newer = next.(tuiModel)
 	if !newer.updatePrompt.showing {
 		t.Fatal("a release newer than the dismissed one must re-prompt")
@@ -209,13 +210,13 @@ func TestUpdatePromptRespectsDismissal(t *testing.T) {
 func TestUpdatePromptShowsOncePerSession(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	m := updatePromptModel(t)
-	next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
+	next, _ := settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
 	m = next.(tuiModel)
 	m = press(t, m, keyEsc) // "not now" closes it for the session
 	if m.updatePrompt.showing {
 		t.Fatal("esc must close the modal")
 	}
-	next, _ = m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
+	next, _ = settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0"}})
 	m = next.(tuiModel)
 	if m.updatePrompt.showing {
 		t.Fatal("the prompt must fire at most once per session")
@@ -231,7 +232,7 @@ func TestUpdatePromptRenderNormal(t *testing.T) {
 	stripped := stripANSI(out)
 	for _, want := range []string{
 		"Update available", "v0.83.0", "v0.85.0",
-		"Update now", "brew upgrade uzi-cli", "Not now", "Don't remind me for v0.85.0",
+		"Update now", "brew upgrade vtmocanu/tap/uzi-cli", "Not now", "Don't remind me for v0.85.0",
 	} {
 		if !strings.Contains(stripped, want) {
 			t.Errorf("normal update prompt missing %q\n%s", want, stripped)
@@ -331,7 +332,7 @@ func TestUpdatePromptRenderReleaseName(t *testing.T) {
 									}
 									// Also retain the brew action for each channel.
 									m.updatePrompt.owner = channel.owner
-									if got := stripANSI(m.View().Content); !strings.Contains(got, "brew upgrade "+channel.owner) {
+									if got := stripANSI(m.View().Content); !strings.Contains(got, "brew upgrade vtmocanu/tap/"+channel.owner) {
 										t.Errorf("prompt missing brew action\n%s", got)
 									}
 								})
@@ -499,7 +500,7 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 			if cmd == nil || m.updatePrompt.showing || m.updatePrompt.shownThisSession {
 				t.Fatal("probe must precede comparison and latch")
 			}
-			next, _ = m.Update(cmd())
+			next, _ = settledUpdate(m, cmd())
 			m = next.(tuiModel)
 			if m.updatePrompt.owner != tc.owner {
 				t.Fatalf("owner = %q, want %q", m.updatePrompt.owner, tc.owner)
@@ -520,12 +521,12 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 				t.Fatal("unknown ownership must be info-only")
 			}
 			if tc.owner == "uzi-cli-rc" && tc.want != "" {
-				if m.updateChoiceLabel(updateChoiceUpdateNow) != "Update now  (brew upgrade uzi-cli-rc)" {
+				if m.updateChoiceLabel(updateChoiceUpdateNow) != "Update now  (brew upgrade vtmocanu/tap/uzi-cli-rc)" {
 					t.Fatal("wrong RC label")
 				}
 				next, _ = m.updatePromptKey(keyEnter)
 				m = next.(tuiModel)
-				if strings.Join(m.updatePrompt.upgradeArgv, " ") != "upgrade uzi-cli-rc" {
+				if strings.Join(m.updatePrompt.upgradeArgv, " ") != "upgrade vtmocanu/tap/uzi-cli-rc" {
 					t.Fatalf("argv = %v", m.updatePrompt.upgradeArgv)
 				}
 			}
@@ -544,12 +545,12 @@ func TestUpdatePromptKeepsRCFactAcrossFailedBuildProbe(t *testing.T) {
 	if cmd == nil || !m.updatePrompt.brewPending {
 		t.Fatal("expected pending ownership probe")
 	}
-	next, _ = m.Update(buildInfoMsg{err: errors.New("transient failure")})
+	next, _ = settledUpdate(m, buildInfoMsg{err: errors.New("transient failure")})
 	m = next.(tuiModel)
 	if m.updatePrompt.latestRC == nil {
 		t.Fatal("failed build probe cleared the saved RC release")
 	}
-	next, _ = m.Update(cmd())
+	next, _ = settledUpdate(m, cmd())
 	m = next.(tuiModel)
 	if !m.updatePrompt.showing || m.updatePrompt.latestVersion != "v0.84.0-rc.2" {
 		t.Fatalf("RC prompt lost after failed probe: %+v", m.updatePrompt)
@@ -560,77 +561,17 @@ func TestUpdatePromptUsesNewRCFactOnLaterPoll(t *testing.T) {
 	withVersion(t, "v0.84.0-rc.1")
 	m := updatePromptModel(t)
 	m.updatePrompt.owner = "uzi-cli-rc"
-	next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.83.0"}})
+	next, _ := settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.83.0"}})
 	m = next.(tuiModel)
 	if m.updatePrompt.showing || m.updatePrompt.shownThisSession {
 		t.Fatal("no newer release fact must not latch the prompt")
 	}
-	next, _ = m.Update(buildInfoMsg{latestRC: &apitypes.LatestReleaseDTO{Version: "v0.84.0-rc.2"}})
+	next, _ = settledUpdate(m, buildInfoMsg{latestRC: &apitypes.LatestReleaseDTO{Version: "v0.84.0-rc.2"}})
 	m = next.(tuiModel)
 	if !m.updatePrompt.showing || m.updatePrompt.latestVersion != "v0.84.0-rc.2" {
 		t.Fatalf("later RC fact did not open the prompt: %+v", m.updatePrompt)
 	}
 }
-
-func TestCappedBrewOutput(t *testing.T) {
-	var out cappedBrewOutput
-	chunk := []byte(strings.Repeat("x", 40*1024))
-	if n, err := out.Write(chunk); n != len(chunk) || err != nil {
-		t.Fatalf("first write = %d, %v", n, err)
-	}
-	if n, err := out.Write(chunk); n != 24*1024 || !errors.Is(err, errBrewProbeOverflow) {
-		t.Fatalf("overflow write = %d, %v", n, err)
-	}
-	if n, err := out.Write(chunk); n != 0 || !errors.Is(err, errBrewProbeOverflow) {
-		t.Fatalf("later write = %d, %v", n, err)
-	}
-	if out.Len() != 64*1024 || !out.didOverflow() {
-		t.Fatalf("accepted %d bytes, overflow = %v", out.Len(), out.didOverflow())
-	}
-}
-
-func TestRealBrewQuietProbe(t *testing.T) {
-	dir := t.TempDir()
-	brew := filepath.Join(dir, "brew")
-	// The fake prints past the cap on both pipes, then hangs if the probe keeps draining.
-	script := "#!/bin/sh\ncase \"$1\" in\n" +
-		"noisy) printf '%40000s' x; printf '%40000s' y >&2; exec sleep 30 ;;\n" +
-		"hang) exec sleep 30 ;;\n" +
-		"small) printf 'prefix\\n'; printf 'note\\n' >&2 ;;\n" +
-		"esac\n"
-	if err := os.WriteFile(brew, []byte(script), 0700); err != nil { //nolint:gosec // G306: this temporary fake must be executable by the probe.
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	t.Run("overflow cancels promptly", func(t *testing.T) {
-		start := time.Now()
-		output, err := realBrew(false, "noisy")
-		if output != "" || !errors.Is(err, errBrewProbeOverflow) {
-			t.Fatalf("realBrew noisy = %q, %v", output, err)
-		}
-		if elapsed := time.Since(start); elapsed > 5*time.Second {
-			t.Fatalf("overflow took %s", elapsed)
-		}
-	})
-	t.Run("timeout cancels", func(t *testing.T) {
-		start := time.Now()
-		output, err := realBrew(false, "hang")
-		if output != "" || !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("realBrew hang = %q, %v", output, err)
-		}
-		if elapsed := time.Since(start); elapsed > 15*time.Second {
-			t.Fatalf("timeout took %s", elapsed)
-		}
-	})
-	t.Run("small output", func(t *testing.T) {
-		output, err := realBrew(false, "small")
-		if err != nil || (output != "prefix\nnote\n" && output != "note\nprefix\n") {
-			t.Fatalf("realBrew small = %q, %v", output, err)
-		}
-	})
-}
-
 func TestBrewOwnerSymlinkAndBoundary(t *testing.T) {
 	dir := t.TempDir()
 	prefix := filepath.Join(dir, "Cellar", "uzi-cli", "1")
@@ -673,8 +614,8 @@ func TestUpdatePromptUpdateNowArmsForegroundUpgrade(t *testing.T) {
 	if !m.updatePrompt.pendingUpgrade {
 		t.Fatal("'Update now' must arm the pending upgrade")
 	}
-	if strings.Join(m.updatePrompt.upgradeArgv, " ") != "upgrade uzi-cli" {
-		t.Errorf("upgradeArgv = %v, want [upgrade uzi-cli]", m.updatePrompt.upgradeArgv)
+	if strings.Join(m.updatePrompt.upgradeArgv, " ") != "upgrade vtmocanu/tap/uzi-cli" {
+		t.Errorf("upgradeArgv = %v, want [upgrade vtmocanu/tap/uzi-cli]", m.updatePrompt.upgradeArgv)
 	}
 	if m.updatePrompt.showing {
 		t.Error("'Update now' must close the modal before exiting")
@@ -707,8 +648,8 @@ func TestUpdatePromptDismissPersists(t *testing.T) {
 
 func TestRunPendingUpgradeCallsSeamForeground(t *testing.T) {
 	b := &brewRec{}
-	env := Env{Stdout: io.Discard, Stderr: io.Discard, Brew: b.fn}
-	if err := runPendingUpgrade(env, []string{"upgrade", "uzi-cli"}); err != nil {
+	env := Env{Stdout: io.Discard, Stderr: io.Discard, Brew: b.fn, InstalledVersion: func(string) (string, error) { return "v0.85.0", nil }}
+	if err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0"); err != nil {
 		t.Fatalf("runPendingUpgrade: %v", err)
 	}
 	call := b.upgradeCall()
@@ -718,14 +659,14 @@ func TestRunPendingUpgradeCallsSeamForeground(t *testing.T) {
 	if !call.foreground {
 		t.Error("the upgrade must run in the foreground so compile output is visible (D1)")
 	}
-	if strings.Join(call.args, " ") != "upgrade uzi-cli" {
-		t.Errorf("brew args = %v, want [upgrade uzi-cli]", call.args)
+	if strings.Join(call.args, " ") != "upgrade vtmocanu/tap/uzi-cli" {
+		t.Errorf("brew args = %v, want [upgrade vtmocanu/tap/uzi-cli]", call.args)
 	}
 }
 
 func TestRunPendingUpgradeNilSeam(t *testing.T) {
 	env := Env{Stdout: io.Discard, Stderr: io.Discard, Brew: nil}
-	if err := runPendingUpgrade(env, []string{"upgrade", "uzi-cli"}); err == nil {
+	if err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0"); err == nil {
 		t.Error("a nil brew seam must return an error, not panic")
 	}
 }
@@ -745,7 +686,7 @@ func TestBuildInfoCarriesLatestRCAndRendersSafely(t *testing.T) {
 		t.Fatalf("RC fact lost in buildInfoMsg: %+v", msg.latestRC)
 	}
 	m.updatePrompt.owner = "uzi-cli-rc"
-	next, _ := m.Update(msg)
+	next, _ := settledUpdate(m, msg)
 	m = next.(tuiModel)
 	if !m.updatePrompt.showing {
 		t.Fatal("RC fact should prompt RC owner")
@@ -762,15 +703,38 @@ func TestBuildInfoCarriesLatestRCAndRendersSafely(t *testing.T) {
 func TestRunPendingUpgradeRCStatusAndError(t *testing.T) {
 	var out, errOut strings.Builder
 	env := Env{Stdout: &out, Stderr: &errOut, Brew: func(foreground bool, args ...string) (string, error) {
-		if !foreground || strings.Join(args, " ") != "upgrade uzi-cli-rc" {
+		if !foreground || strings.Join(args, " ") != "upgrade vtmocanu/tap/uzi-cli-rc" {
 			t.Fatalf("wrong upgrade call: %v %v", foreground, args)
 		}
 		return "", fmt.Errorf("compile failed")
 	}}
-	if err := runPendingUpgrade(env, []string{"upgrade", "uzi-cli-rc"}); err == nil || !strings.Contains(err.Error(), "uzi-cli-rc") {
+	if err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli-rc"}, "v0.85.0"); err == nil || !strings.Contains(err.Error(), "uzi-cli-rc") {
 		t.Fatalf("RC error omitted formula: %v", err)
 	}
 	if !strings.Contains(out.String(), "Updating uzi-cli-rc via Homebrew") || !strings.Contains(errOut.String(), "compile failed") {
 		t.Fatalf("status = %q, stderr = %q", out.String(), errOut.String())
 	}
+}
+
+func settledUpdate(m tuiModel, msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.Update(msg)
+	m = next.(tuiModel)
+	return settleObservation(m, cmd), nil
+}
+
+func settleObservation(m tuiModel, cmd tea.Cmd) tuiModel {
+	if cmd == nil {
+		return m
+	}
+	result := cmd()
+	switch result := result.(type) {
+	case tea.BatchMsg:
+		for _, child := range result {
+			m = settleObservation(m, child)
+		}
+	case installedVersionMsg, brewInfoMsg:
+		next, follow := m.Update(result)
+		m = settleObservation(next.(tuiModel), follow)
+	}
+	return m
 }

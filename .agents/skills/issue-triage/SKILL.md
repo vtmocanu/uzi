@@ -13,8 +13,6 @@ Sanitize forge text before printing it with the shared uzi-lander renderer below
 
 Area and priority labels, their rubric, and the labels that must never be renamed: [references/taxonomy.md](references/taxonomy.md). Read it before proposing labels.
 
-Open each issue you present to the maintainer in their browser when you first name it (pick, candidate, predicted sweep pick, or an issue cited as related or fixed): `gh issue view NNN --repo vtmocanu/uzi --web`. Do not reopen one already opened this session.
-
 Out of scope, read instead:
 - Sweep gating and this instance's schedules: `CLAUDE.local.md` → "uzi scheduled jobs", `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`. Live truth: `uzi schedule list`.
 - Dispatching and plan steering: **uzi-watcher**. Landing the PR: **uzi-lander**.
@@ -97,7 +95,7 @@ set -o pipefail
 source .agents/skills/uzi-lander/scripts/lib/sanitize.sh
 gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assignees,body --limit 400 \
   | jq -r --arg bot "$BOT_LOGIN" "$UNTRUSTED_JQ"'
-    def park: ["brainstorm","Later","In Progress","Human Review","wontfix","duplicate","invalid"];
+    def park: ["brainstorm","Later","In Progress","Human Review","wontfix","duplicate","invalid","acceptance","local"];
     def names: [.labels[].name];
     def has($l): (names | index($l)) != null;
     def selector: (has("bug") or has("Planned") or has("on-deck"));
@@ -151,6 +149,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 | **Needs design** | open question / competing approaches | `brainstorm`; summarize the fork |
 | **Defer** | valid, not now | `Later` |
 | **Already done** | premise gone (verified in code) | recommend close; cite code |
+| **Acceptance only** | implementation landed (verified in code); only a maintainer live acceptance remains | `acceptance`; remove `bug`/`Planned`/`on-deck`/`uzi`; comment citing the landing PR |
 | **Not worth it** | duplicate / invalid / obsolete, or the user's explicit value call | rationale comment + `wontfix`/`duplicate`/`invalid` |
 
 - Prefer **On-deck** for small, low-risk work: it drains idle capacity without a plan review. A `.github/workflows/**` change stays **Do locally**; other excluded work takes the verdict that fits (sweep, **uzi-watcher** with plan review, or local).
@@ -168,7 +167,7 @@ One verdict, one-line reason. Apply only after Step 5 confirmation.
 
 Do not trust issue line numbers.
 
-1. **Premise**: inspect current code. Already implemented → **Already done**, even if the issue remains open. Search `git log -S`/`--grep` for the mechanism. For a reported recurrence, check whether its tree contains the fix: ancestry (`git merge-base --is-ancestor FIX RECURRENCE`) establishes inclusion, but non-ancestry requires inspecting equivalent cherry-picked or rebased changes before concluding the fix was absent.
+1. **Premise**: inspect current code. Already implemented → **Already done** (**Acceptance only** when a maintainer live acceptance remains), even if the issue remains open. Search `git log -S`/`--grep` for the mechanism. For a reported recurrence, check whether its tree contains the fix: ancestry (`git merge-base --is-ancestor FIX RECURRENCE`) establishes inclusion, but non-ancestry requires inspecting equivalent cherry-picked or rebased changes before concluding the fix was absent.
 2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`). Before deferring to, or folding scope into, another issue, confirm that issue is open and its implementation has not landed: inspect its linked PRs and the current code.
 3. **Anchors**: re-grep named symbols; record current locations and omitted/extra sites.
 4. **Design forks**: pin a direction with reason; verify any ADR/PRD conflict against code, not the issue's framing.

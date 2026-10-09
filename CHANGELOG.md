@@ -33,13 +33,33 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
+  Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
+
+- **Label sweep help includes bot-assignment eligibility.**
+  The schedule modal clarifies that selector candidates can fire with the configured eligibility label or assignment to the uzi bot.
+
+- **Review author checks can use slower shared repository evidence ([#2427](https://github.com/vtmocanu/uzi/issues/2427)).**
+  Shared evidence uses the remaining assessment time (30 seconds in the background watcher, 5 seconds for on-demand rework after #2372) while author-specific requests retain their original 5-second child deadline. GitHub can finish from shared results after child expiry; Forgejo's permission fallback keeps the expired child and returns unknown, while a later author with a fresh child can succeed. Failed or incomplete evidence still fails closed, and fairness remains conditional.
+
 - **Interactive author assessments leave room for run creation ([#2372](https://github.com/vtmocanu/uzi/issues/2372)).**
   Manual issue starts and on-demand MR rework use a five-second total author-assessment budget, preserving fail-closed unknown handling and the live parent for persistence; background assessments retain thirty seconds.
 
 - **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
   Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
 
+- Checkpoint and park-bridge scratch publication refusals now name bounded kind and step codes in the feed, deduped per pair.
+
+- **CLI updates verify the installed version and tell you when to restart ([#2496](https://github.com/vtmocanu/uzi/issues/2496)).**
+  Homebrew upgrades use tap-qualified stable or RC targets and inherit your auto-update settings; a zero Homebrew exit succeeds only when the formula-owned CLI reaches the offered version. The TUI detects external upgrades on successful five-minute build-info polls, closes the update modal and shows the actual installed version with a restart hint, without automatic re-exec. Server release checks use the persisted checked-at timestamp to schedule their first attempt after startup, then wait the full configured interval after each attempt; existing opt-outs remain in effect.
+
 ### Changed
+
+- **The lead defers a costly full gate after review invalidates a candidate ([#2593](https://github.com/vtmocanu/uzi/issues/2593)).**
+  The lead still overlaps the integration gate with the read-only review wave by default (refining #215), but once review invalidates a candidate whose full gate is costly it completes the repair reviews and focused checks before repeating the full gate, and it triages a failed gate (narrowest reproducer on candidate and base) before rerunning it. This is prompt-level guidance, not enforcement; it ships in the worker image (agent prompt) and in the app release (builtin lead body).
+
+- **Plan revisions can be compared with the plan that received feedback ([#2144](https://github.com/vtmocanu/uzi/issues/2144)).**
+  The web plan panel offers a comparison that starts collapsed, with line changes, added/removed counts and a warning when a revision is identical after feedback. `uzi run plan` reads the latest or a selected version as verbatim Markdown, a unified diff or JSON. Comparisons use the immediate predecessor only when feedback falls between the two plans, and are limited to 200 KiB per side; approval gate decisions are unchanged.
 
 - **A Codex lead's plan is now cross-checked by a read-only Claude checker ([#2460](https://github.com/vtmocanu/uzi/issues/2460)).**
   With Plan cross-check enabled, an auto-approved Codex run no longer waits for a human by default: its plan is checked by a Claude child with only Read, Grep and Glob, the checker is always the opposite family of the lead, and only an APPROVE of the latest exact plan implements. A Codex lead consumes automatic REVISE rounds without spending its human revision allowance. This needs the new worker capability `cross_check_codex_lead_v1`; roll the api and migration 00314 first, because a new worker on an older api does not submit the check and parks the Codex lead at the human gate as not yet supported, the same park a Codex lead on an older worker keeps. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, fails `plan cross-check: checker unavailable` and the lead takes the human gate; no credential is delivered. The Plan cross-check Claude pin cell is now active (Default follows your Claude worker default), and with ephemeral workers off the settings toggle also warns when no online worker advertises the capability. The migration's Down deletes Claude checker runs but keeps the check history; run it with the new api stopped.
@@ -67,6 +87,9 @@ through `[0.52.0]`.)
 
 - **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
   Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
+
+- **Documentation heading links work in the app ([#2262](https://github.com/vtmocanu/uzi/issues/2262)).**
+  In-app documentation headings have fragment IDs, and links to a heading scroll it into view with space for the mobile navigation bar.
 
 ### Security
 

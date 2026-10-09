@@ -56,7 +56,7 @@ func TestSkewWarningGoesToStderrNotStdout(t *testing.T) {
 	if !strings.Contains(errOut, "is behind server 0.14.0") {
 		t.Fatalf("stderr carries no skew warning; the hook is not wired:\n%q", errOut)
 	}
-	if !strings.Contains(errOut, "brew upgrade uzi-cli") {
+	if !strings.Contains(errOut, "brew upgrade vtmocanu/tap/uzi-cli") {
 		t.Errorf("stderr warning is missing the remedy:\n%q", errOut)
 	}
 	if strings.Contains(out, "is behind") {
@@ -762,7 +762,7 @@ func TestSkewWarningUsesExecutableOwner(t *testing.T) {
 				return "", errors.New("unexpected brew call")
 			}
 			_, errOut, code := runCLI(t, env, "run", "list", "--url", skewURL)
-			if code != uzicli.ExitOK || !strings.Contains(errOut, "Run: brew upgrade "+tc.want+"\n") {
+			if code != uzicli.ExitOK || !strings.Contains(errOut, "Run: brew upgrade vtmocanu/tap/"+tc.want+"\n") {
 				t.Fatalf("code=%d, stderr=%q; want formula %s", code, errOut, tc.want)
 			}
 		})

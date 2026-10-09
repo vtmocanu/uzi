@@ -19,7 +19,7 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	if userResp == nil || !completeAuthorResponse(userResp.Response) || u == nil || u.GetID() != authorID || u.GetLogin() == "" {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
-	members, err := assessmentEvidence(ctx, evidenceKey{g, projectID, "collaborators"}, func() (map[int64]*gh.User, error) {
+	members, err := assessmentEvidence(ctx, evidenceKey{g, projectID, "collaborators"}, func(ctx context.Context) (map[int64]*gh.User, error) {
 		r, repoResp, err := g.client.Repositories.GetByID(ctx, projectID)
 		if err != nil {
 			return nil, g.wrapErr("author repository", err)
