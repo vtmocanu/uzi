@@ -1,7 +1,9 @@
 # Issue #2397: partial worker-UID investigation
 
-Cause diagnosis and fix are **not completed**. No flake fix yet; M2/M3 remain
-incomplete. There is no local reproduction or cause regression test.
+The approved M3 diagnostics-only disposition is complete; cause diagnosis and
+fix are **not completed**. No controlled defect RED was found, M2 was not
+attempted, and there is no cause regression test. Privileged image acceptance
+remains pending post-finalize ordinary PR CI, observed by the maintainer.
 
 ## Explicit human decision
 
@@ -13,7 +15,8 @@ On 2026-10-07, after the evidence question, the human supplied this decision:
 >
 > Do not start M3 and do not claim a cause or fix. The PR must use "Refs #2397", not "Closes".
 
-Milestone disposition under that decision:
+Historical milestone disposition under that decision (the approved M3
+diagnostics-only exit is recorded below):
 
 - **M1 — diagnostics: completed.** This delivery is diagnostics-only; the quoted
   instruction records the human decision, not proof of a cause or fix.
@@ -100,9 +103,10 @@ controlled reproducer before a behavioral fix. Repeated passes are insufficient.
 This extension is diagnostic-only. **No controlled local defect RED was found;
 M2 was not attempted.** Other reported cases and the cause of the natural CI
 failure remain unproven. Earlier diagnostic history above remains intact.
-No behavioral fix, worker-image validation, CI retry, or M3 completion is claimed.
-The approved delivery takes the M1-only exit; privileged image acceptance remains
-pending post-finalize CI, which this worker cannot observe while the run executes.
+At this M1 checkpoint, no behavioral fix, worker-image validation, CI retry, or
+M3 completion was claimed. The approved diagnostics-only delivery's M3 validation
+and reporting are recorded below; privileged image acceptance remains
+pending post-finalize ordinary PR CI, observed by the maintainer.
 
 The affected path was traced before editing: the real
 `makeProductionLaunchAdviceRoot` closure awaits the launcher's `dispose` outcome;
@@ -164,7 +168,8 @@ with only the six changed TypeScript paths: exit 0, zero warnings/errors,
 The full launcher file check preceded the final diagnostic error-preservation
 adjustment; the final focused probe and diagnostic tests ran after it.
 Repo-wide gates/builds/tests, project typecheck/deadcode, dependency installation,
-and workflows inspection were excluded by this dispatch.
+and workflows inspection were excluded by that M1 dispatch. Subsequent lead
+verification is recorded below.
 The executor selection is not worker-UID validation: this host is UID 10003,
 while the real suite requires WORKER_UID and the required group memberships.
 The next natural worker-UID CI failure remains the evidence source.
@@ -187,4 +192,57 @@ each **unproven** as sharing the natural failure's cause. The legitimate unclean
 control demonstrates a possible symptom path, not attribution of those incidents.
 Image identity and CI head/run/attempt correlation must come from the future
 natural failure's ordinary job/build record; none is claimed from this host.
-The lead records integration gates and review results during M3.
+
+## M3 verification and disposition (2026-10-09)
+
+**Approved diagnostics-only exit; no cause or fix claimed.** No controlled defect
+RED was found; M2 was not attempted. Owner refusal, symlink refusal and
+initialization/session cleanup are each unproven as a shared cause. The PR uses
+`Refs #2397`; the issue remains open. Persistent diagnostics remain for the
+**next natural failure**.
+
+The lead supplied verification at code commit
+`bf53e0aafc0326b18678c41d581ab86e2250163c`:
+
+| Verification | Result | Log under .uzi/scratch/ |
+| --- | --- | --- |
+| `task gate:agent` | EXIT=0; full unsharded unit suite + M4, both with zero failures/cancellations; M4 run-completeness OK. Dependency check, lint, deadcode and typecheck prerequisites succeeded. | gate-log.fZgqfo |
+| Isolated final probe + diagnostic tests | EXIT=0; eight executed, zero skipped/cancelled. Exit-first and evidence-first controls were clean; nonzero-exit controls showed legitimate retention, not defect RED. | gate-log.YoPgen |
+| `python3 e2e/worker-uid/check_test.py` | EXIT=0; ran locally under M3. | gate-log.iKbFmv |
+| `python3 e2e/worker-uid/run_test.py` | EXIT=0; ran locally under M3. | gate-log.5erwZm |
+
+Immutable M1 review of `c9107fc79d201f57b1510514a2878ef5c5bc20bf..bf53e0aa`
+reported no blocking, correctness, acceptance-criteria or privacy findings from
+reviewer or tester. Their focused tests passed: eight executed, zero
+skipped/cancelled (review logs `MUCt5w` and `dnZKGs`). Tester focused lint
+(`HmNPGI`), syntax (`cNetGU`) and inventory (`NgAt8a`) checks each recorded
+EXIT=0. The lead inspected the report logs and diff.
+
+One nonblocking coverage note is deferred: the existing bounds test reaches the
+64-frame limit before oversized input, so the 8 KiB and 64 KiB byte limits are
+not independently exercised. The implemented caps were inspected; no runtime
+defect was demonstrated. The tester's every-bound/mutation residual duplicates
+this limitation and adds no independent optional note.
+
+The source-derived immutable base/current inventory was byte-identical. The
+existing parser derives leaves from the current recognized suites, including new
+leaves added there; acceptance does not hardcode 29.
+The agent `npm test` glob `test/*.test.ts` still includes the changed/new tests,
+and the Task shard target delegates to unit; selection and scripts are unchanged.
+The unsharded gate covers ordinary tests, but did not run the two CI shards or
+their union check; post-finalize ordinary CI owns that proof. Host skips of
+privileged tests do not count as validation.
+
+The privileged image lane was **not run by this worker**. Acceptance remains
+pending post-finalize ordinary PR CI, which the maintainer observes; there is no
+CI waiting or rerun in this delivery. A first green lane does not establish
+cause. The composite `task test:worker-uid-harness` and `gate_test.py` were
+excluded because a component reads the workflow file; they are deferred to
+normal CI, and the existing target is untouched. No CI/image identity was
+observed here, and no timing savings or runtime speedup is claimed.
+
+ENOENT, refusal and outside-content assertions, inventory, UID/cap/entrypoint
+posture and diagnostic caps remain unchanged. The code gate ran once at the
+commit above; M3 changes documentation only, so the unchanged code gate needs
+no repeat. Scratch logs are ephemeral; the commands and results recorded here
+are the persistent verification record.
