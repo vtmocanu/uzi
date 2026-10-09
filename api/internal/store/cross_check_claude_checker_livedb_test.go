@@ -356,10 +356,12 @@ func TestPlanCrossCheckClaudeChildClaimGateLiveDB(t *testing.T) {
 				child, _ := seedClaudeChild(fx, w, round)
 				now := time.Now()
 				got, err := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{WorkerID: pgU(w), UserID: fx.userID,
-					AffinityCutoff:  pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
-					SpreadCutoff:    pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
-					HeartbeatCutoff: pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
-					WorkerCaps:      []string{}, WorkerProtocolCaps: caps, CapabilityAware: false})
+					CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+					CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+					AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+					SpreadCutoff:             pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
+					HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
+					WorkerCaps:               []string{}, WorkerProtocolCaps: caps, CapabilityAware: false})
 				if with {
 					if err != nil || got.ID != child || got.Harness != "claude" {
 						t.Fatalf("capable worker could not claim the claude child: run=%s err=%v", got.ID, err)
@@ -386,14 +388,17 @@ func TestPlanCrossCheckClaudeChildPeerDeferralLiveDB(t *testing.T) {
 			mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", a, aCaps)
 			mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", b, bCaps)
 			child, _ := seedClaudeChild(fx, a, 1)
-			fx.holdActive(a, 1)
+			// The lead already occupies one of a's two slots (1/2): busy next to the idle peer, yet
+			// still holding the free slot a run-lane child needs. Do not fill a to 2/2.
 			now := time.Now()
 			claim := func(w uuid.UUID, caps []string) (store.Run, error) {
 				return fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{WorkerID: pgU(w), UserID: fx.userID,
-					AffinityCutoff:  pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
-					SpreadCutoff:    pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
-					HeartbeatCutoff: pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
-					WorkerCaps:      []string{}, WorkerProtocolCaps: caps, CapabilityAware: false})
+					CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+					CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+					AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+					SpreadCutoff:             pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
+					HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
+					WorkerCaps:               []string{}, WorkerProtocolCaps: caps, CapabilityAware: false})
 			}
 			got, err := claim(a, aCaps)
 			if peerCapable {

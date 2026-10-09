@@ -654,10 +654,11 @@ worker values fall back to 1. Zero disables lane advertisement and polling;
 it does not turn checks into ordinary run-slot work. The worker registers
 its slot count even when zero.
 
-A Claude lead can hold its run slot while its read-only Codex checker uses
-a cross-check slot on the same worker. The worker must support the required
-Codex harness/model. The reverse direction and Code cross-check are not
-shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
+A lead can hold its run slot while its read-only opposite-family checker
+uses a cross-check slot on the same worker: a Codex checker for a Claude lead
+(the worker must support the required Codex harness/model), or a Claude
+checker for a Codex lead (the worker must advertise
+`cross_check_codex_lead_v1`). Code cross-check is not shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
 own-worker preference, the 2-minute default fallback grace and mixed-image
 rollout behavior. Cordoning permits the worker's own pinned child to finish;
 quarantine and maintenance fencing still block claims. Shutdown and draining

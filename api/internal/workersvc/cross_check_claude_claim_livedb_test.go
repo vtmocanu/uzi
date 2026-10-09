@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -300,12 +301,22 @@ func TestClaudeCheckerChildFinishTakesLeadLockBeforeChildLiveDB(t *testing.T) {
 	}
 }
 
+// crossCheckClaimParams adds the cross-check eligibility clock fn_cross_check_child_eligible
+// reads (deadline and affinity grace), which the service's ClaimRun sets from claimNow.
+func crossCheckClaimParams(w store.Worker) store.ClaimRunParams {
+	p := claimRunParamsFor(w)
+	now := time.Now()
+	p.CrossCheckEvaluatedAt = pgconv.Time(now)
+	p.CrossCheckAffinityCutoff = pgconv.Time(now.Add(-2 * time.Minute))
+	return p
+}
+
 // A locked vault is transient: the child is requeued and its check stays pending, never
 // decided checker_unavailable.
 func TestClaudeCheckerChildVaultLockedStaysTransientLiveDB(t *testing.T) {
 	fx := newClaudeCheckerFix(t, BindModePinned)
 	w := wkrRow(t, fx.env, fx.workerID)
-	run, err := fx.env.q.ClaimRun(fx.env.ctx, claimRunParamsFor(w))
+	run, err := fx.env.q.ClaimRun(fx.env.ctx, crossCheckClaimParams(w))
 	if err != nil || run.ID != fx.kid {
 		t.Fatalf("ClaimRun: id=%s err=%v", run.ID, err)
 	}
@@ -388,7 +399,7 @@ func TestClaudeCheckerChildInvalidPinIsCheckerUnavailableLiveDB(t *testing.T) {
 func TestClaudeCheckerChildAssemblyRefusesLeakedFamilyLiveDB(t *testing.T) {
 	fx := newClaudeCheckerFix(t, BindModePinned)
 	worker := wkrRow(t, fx.env, fx.workerID)
-	child, err := fx.env.q.ClaimRun(fx.env.ctx, claimRunParamsFor(worker))
+	child, err := fx.env.q.ClaimRun(fx.env.ctx, crossCheckClaimParams(worker))
 	if err != nil || child.ID != fx.kid {
 		t.Fatalf("ClaimRun: id=%s err=%v", child.ID, err)
 	}

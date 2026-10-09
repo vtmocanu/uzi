@@ -119,4 +119,4 @@ Every Claude `cross_check` claim takes the lead lock before the child lock, incl
 
 ### Not shipped
 
-Dedicated checker slots (#2169) and Code cross-check (#2170) remain out of scope; the child claims through ordinary slots. Hosted authenticated Claude model acceptance is not proven by local tests.
+Code cross-check (#2170) remains out of scope. A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
