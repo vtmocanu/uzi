@@ -516,11 +516,26 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     let markAcquired!: () => void;
     const acquired = new Promise<void>((resolve) => { markAcquired = resolve; });
     let blockedFetches = 0;
+    let softArms = 0;
+    let softExpiries = 0;
+    let softCancels = 0;
+    let fireSoft: (() => void) | undefined;
     git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
       if (++blockedFetches !== 1) return originalFetch(...args);
       const holder = git.withBareLock(bare, async () => { markAcquired(); await held; });
       await acquired;
-      try { return await originalFetch(...args); }
+      try {
+        const locks = (git as unknown as { locks: Map<string, Promise<void>> }).locks;
+        const holderChain = locks.get(bare);
+        assert.ok(holderChain, "the acquired holder owns the bare lock chain");
+        const pending = originalFetch(...args);
+        void pending.catch(() => {});
+        assert.notEqual(locks.get(bare), holderChain, "the default-tip waiter queued behind the held lock");
+        assert.ok(fireSoft, "checkpoint soft abort is armed before contention");
+        softExpiries += 1;
+        fireSoft();
+        return await pending;
+      }
       finally { releaseHolder(); await holder; }
     }) as typeof git.fetchDefaultTip;
     const tips: string[] = [];
@@ -567,7 +582,15 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
           tick = bound;
           return () => { if (tick === bound) tick = undefined; };
         },
-        checkpointTestHooks: { softDeadlineMs: 2_500, onTickOutcome: resolveOutcome },
+        checkpointTestHooks: {
+          armSoftDeadline: (fire, ms) => {
+            assert.equal(ms, 10_000, "retain the default production soft budget");
+            softArms += 1;
+            fireSoft = fire;
+            return { cancel: () => { softCancels += 1; fireSoft = undefined; } };
+          },
+          onTickOutcome: resolveOutcome,
+        },
       }).execute(claim);
     } finally {
       releaseHolder();
@@ -575,6 +598,10 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
     }
     assert.equal(tickResult, "published", "the tick completed before the executor returned");
+    assert.equal(softArms, 1);
+    assert.equal(softExpiries, 1);
+    assert.equal(softCancels, 1);
+    assert.equal(fireSoft, undefined, "the soft-skipped checkpoint cancelled its callback");
     assert.ok(statuses(claim.run_id).includes("completed"));
     assert.ok(!statuses(claim.run_id).includes("failed"));
   });
@@ -593,11 +620,26 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     let markAcquired!: () => void;
     const acquired = new Promise<void>((resolve) => { markAcquired = resolve; });
     let defaultFetches = 0;
+    let softArms = 0;
+    let softExpiries = 0;
+    let softCancels = 0;
+    let fireSoft: (() => void) | undefined;
     git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
       if (++defaultFetches !== 1) return originalFetch(...args);
       const holder = git.withBareLock(bare, async () => { markAcquired(); await held; });
       await acquired;
-      try { return await originalFetch(...args); }
+      try {
+        const locks = (git as unknown as { locks: Map<string, Promise<void>> }).locks;
+        const holderChain = locks.get(bare);
+        assert.ok(holderChain, "the acquired holder owns the bare lock chain");
+        const pending = originalFetch(...args);
+        void pending.catch(() => {});
+        assert.notEqual(locks.get(bare), holderChain, "the default-tip waiter queued behind the held lock");
+        assert.ok(fireSoft, "checkpoint soft abort is armed before contention");
+        softExpiries += 1;
+        fireSoft();
+        return await pending;
+      }
       finally { releaseHolder(); await holder; }
     }) as typeof git.fetchDefaultTip;
     let firstFlight = true;
@@ -636,9 +678,20 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     try {
       await runnerWith(() => ({ executor: exec1 }), gitlab, undefined, undefined, {
         github, codexBoundaryDeadlineMs: 8_000, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
-        checkpointTestHooks: { softDeadlineMs: 2_500 }, recoveryRetryMs: 5,
+        checkpointTestHooks: {
+          armSoftDeadline: (fire, ms) => {
+            assert.equal(ms, 10_000, "retain the default production soft budget");
+            softArms += 1;
+            fireSoft = fire;
+            return { cancel: () => { softCancels += 1; fireSoft = undefined; } };
+          },
+        }, recoveryRetryMs: 5,
       }).execute(claim);
       assert.equal(softSkipped, true, "the first flight returned from its soft-skipped checkpoint");
+      assert.equal(softArms, 1);
+      assert.equal(softExpiries, 1);
+      assert.equal(softCancels, 1);
+      assert.equal(fireSoft, undefined, "the first flight cancelled its soft callback before reclaim");
       assert.equal(parkReports(claim.run_id).length, 1, "the first flight parked for same-worker reclaim");
       assert.deepEqual(confirmedTips, [], "neither the skip nor recovery park claimed remote durability");
       assert.equal(await git.trackingTip(bare, "agent/issue-1923"), committedTip,
