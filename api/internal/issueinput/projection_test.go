@@ -116,7 +116,7 @@ func TestM2CaptureParentCancellation(t *testing.T) {
 	}
 }
 
-// The child budget expires on synctest's fake clock; the production defaults are
+// Both child-expiry tests run on synctest's fake clock; the production defaults are
 // asserted separately in interactive_timeout_test.go.
 func TestM2CaptureChildExpiryValidRaw(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -125,7 +125,7 @@ func TestM2CaptureChildExpiryValidRaw(t *testing.T) {
 		budget := issueinput.InteractiveAssessmentTimeout
 		start := time.Now()
 		f := &expiryForge{expireDuringAssessment: true}
-		f.comments = []forge.IssueComment{{AuthorForgeUserID: 2, Body: "UNVERIFIED_RAW"}}
+		f.comments = []forge.IssueComment{{AuthorForgeUserID: 4, Body: "UNVERIFIED_RAW"}}
 		c, err := issueinput.FetchWithTimeout(parent, f, 7, 11, 1, budget)
 		if err != nil || c == nil {
 			t.Fatalf("valid raw lost on child expiry: %+v %v", c, err)
@@ -134,7 +134,7 @@ func TestM2CaptureChildExpiryValidRaw(t *testing.T) {
 			t.Fatalf("child expiry cancelled the parent: %v", parent.Err())
 		}
 		if time.Now() != start.Add(budget) {
-			t.Fatalf("expired at %v, want child budget %v", time.Now().Sub(start), budget)
+			t.Fatalf("expired at %v, want child budget %v", time.Since(start), budget)
 		}
 		if c.Issue.Description != "raw" {
 			t.Fatalf("raw description=%q", c.Issue.Description)
@@ -161,7 +161,7 @@ func TestM2CaptureLateRawRejected(t *testing.T) {
 			t.Fatalf("late raw cancelled the parent: %v", parent.Err())
 		}
 		if time.Now() != start.Add(budget) {
-			t.Fatalf("expired at %v, want child budget %v", time.Now().Sub(start), budget)
+			t.Fatalf("expired at %v, want child budget %v", time.Since(start), budget)
 		}
 	})
 }
