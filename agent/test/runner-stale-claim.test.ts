@@ -230,6 +230,7 @@ describe("RunRunner — PRD #1247 M5b stop-on-stale_claim", () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1247-ack-switch-"));
     try {
       const claim = gitlabClaim(1280, { claim_generation: 5 });
+      api.setOwnershipStatus(claim.run_id, "running", 5);
       await client.register("w-ack-switch", undefined, 1, undefined, ["credential_switch_v1"]);
       let clonePath: string | undefined;
       let journal: string | undefined;
@@ -264,13 +265,14 @@ describe("RunRunner — PRD #1247 M5b stop-on-stale_claim", () => {
           discoveries++;
           const active = (r as unknown as { activeRuns: Map<string, { steering: SteeringChannel }> }).activeRuns.get(claim.run_id);
           assert.ok(active, "steering is registered before discovery completes");
-          active.steering.tripCredentialSwitch(5);
+          // Inject after the initial discovery; the switch handler also reads the existing journal.
+          if (discoveries === 1) active.steering.tripCredentialSwitch(5);
           assert.ok(active.steering.lifecycleSignal().reason instanceof CredentialSwitchSignal);
           return result;
         };
       }
       await r.execute(claim);
-      assert.equal(discoveries, stage === "after-discovery" ? 1 : 0);
+      assert.equal(discoveries, stage === "after-discovery" ? 2 : 0);
 
       const s = api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body.status);
       assert.deepEqual(s, ["running", "credential_switch_failed"], "discovery alone cannot authorize a release");
