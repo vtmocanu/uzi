@@ -224,7 +224,7 @@ func (h *Handler) WorkerCodexRefresh(w http.ResponseWriter, r *http.Request) {
 
 	var routeErr error
 	wroteSuccess := false
-	defer func() { logCodexRouteTiming(opID, routeStart, codexRouteResult(routeErr, wroteSuccess)) }()
+	defer func() { logCodexRouteTiming(opID, routeStart, codexRouteResult(routeErr, wroteSuccess), routeErr) }()
 
 	res, err := h.wsvc.CoordinatedCodexRefresh(ctx, wkr, runID, req.Capability, opID, *req.ObservedGeneration)
 	routeErr = err
@@ -301,6 +301,9 @@ func codexHTTPError(err error) (int, string, string) {
 	case errors.Is(err, workersvc.ErrCodexVaultLocked):
 		return http.StatusConflict, codexErrVaultLocked, codexReasonVaultLocked
 
+	case errors.Is(err, workersvc.ErrCodexAccountUnavailable):
+		return http.StatusConflict, codexErrCredUnavailable, "codex_account_unavailable"
+
 	// Refresh outcome: contended is the retry-and-reconcile signal (same op id).
 	case errors.Is(err, workersvc.ErrCodexRefreshContended):
 		return http.StatusConflict, codexErrRefreshContended, ""
@@ -357,12 +360,61 @@ func codexRouteResult(routeErr error, wroteSuccess bool) string {
 	return "error"
 }
 
-func logCodexRouteTiming(operationID uuid.UUID, start time.Time, result string) {
-	slog.Info(codexTimingMsgRoute,
+func logCodexRouteTiming(operationID uuid.UUID, start time.Time, result string, routeErrors ...error) {
+	var err error
+	if len(routeErrors) > 0 {
+		err = routeErrors[0]
+	}
+	fields := []any{
 		"operation_id", operationID.String(),
 		"route_total_ms", workersvc.CodexTimingMS(time.Since(start)),
 		"result", result,
-	)
+		"error_class", codexRouteErrorClass(err, result == "ok"),
+	}
+	if hold, computed := workersvc.CodexAccountHoldVerdict(err); computed {
+		fields = append(fields, "account_hold", hold)
+	}
+	slog.Info(codexTimingMsgRoute, fields...)
+}
+
+// codexRouteErrorClass uses only fixed names and the underlying sentinels.
+// Parent sentinels follow their more specific children; authority and vault win.
+func codexRouteErrorClass(err error, success bool) string {
+	if err == nil && success {
+		return ""
+	}
+	classes := []struct {
+		sentinel error
+		name     string
+	}{
+		{workersvc.ErrRunNotOwned, "not_found"},
+		{workersvc.ErrCodexRunNotBound, "not_found"},
+		{workersvc.ErrCodexWorkerMismatch, "not_found"},
+		{workersvc.ErrCodexCapabilityMismatch, "capability"},
+		{workersvc.ErrCodexCapabilityEpoch, "capability_epoch"},
+		{workersvc.ErrCodexScopeNotApplicable, "scope_not_applicable"},
+		{workersvc.ErrCodexKindModeMismatch, "kind_mode_mismatch"},
+		{workersvc.ErrCodexVaultLocked, "vault_locked"},
+		{workersvc.ErrCodexRefreshContended, "contended"},
+		{workersvc.ErrCodexRefreshRejected, "refresh_rejected"},
+		{workersvc.ErrCodexRefreshQuarantined, "refresh_quarantined"},
+		{workersvc.ErrCodexRefreshUnrecoverable, "refresh_unrecoverable"},
+		{workersvc.ErrCodexRefreshNoToken, "refresh_no_token"},
+		{workersvc.ErrCodexRefreshNoClient, "refresh_no_client"},
+		{workersvc.ErrCodexRunNotActivelyClaimed, "run_not_actively_claimed"},
+		{workersvc.ErrCodexMaterialRevisionStale, "material_revision_stale"},
+		{workersvc.ErrCodexAccountKeyUnfrozen, "account_key_unfrozen"},
+		{workersvc.ErrCodexAccountTupleMismatch, "account_tuple_mismatch"},
+		{workersvc.ErrCodexAccountRevisionStale, "account_revision_stale"},
+		{workersvc.ErrCodexAccountQuarantined, "account_quarantined"},
+		{workersvc.ErrCodexBindingConflict, "binding_conflict"},
+	}
+	for _, class := range classes {
+		if errors.Is(err, class.sentinel) {
+			return class.name
+		}
+	}
+	return "internal"
 }
 
 // codexRefreshOutcomeString renders a CoordinatedCodexRefresh outcome as a stable wire

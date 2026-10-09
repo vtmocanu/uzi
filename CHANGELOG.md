@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Codex account holds at running checkpoints ([#1595](https://github.com/vtmocanu/uzi/issues/1595)).**
+  Capable workers receive a credential-free account-unavailable reason and may request a server-verified park that retains source custody and worker affinity, revokes the claim capability, and resumes after the same account becomes usable.
+
 - **Live issue runs show a progress percent ([#2602](https://github.com/vtmocanu/uzi/issues/2602)).**
   The server derives it from the frozen milestone list (`11% + 89% × completed / total`, capped at 99% until the run finishes) and shows it on the web dashboard and runs list, in a `PROG` column on the TUI board, and as a `PROGRESS` row in `uzi run get` (`progress` object in `--json`); a flag (waits on you, parked, queued, stalled, planning) replaces the number when it would mislead, other run kinds show none, and no time remaining is shown because the estimate is too unreliable.
   The run page gets a progress card (percent, segmented plan track, active milestone, the active role's current phase) and the TUI run detail a `PROGRESS` block above `MILESTONES`. On a run waiting on a question, the run page, TUI detail and `uzi run get` add `may be blocked by <run id>` when the open, unanswered question mentions `#N` and another live run of the same owner on the same repo is working issue N; it is a hint from the question text, not a recorded dependency, reads at most 5 references, and never matches another user's run, another repo or the run itself.

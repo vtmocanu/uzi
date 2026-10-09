@@ -124,7 +124,7 @@ func TestLogCodexRouteTimingSchema(t *testing.T) {
 
 	wantResults := []string{"ok", "error"}
 	for i, rec := range routes {
-		assertTimingKeySet(t, rec, "operation_id", "route_total_ms", "result")
+		assertTimingKeySet(t, rec, "operation_id", "route_total_ms", "result", "error_class")
 		if rec.attrs["route_total_ms"].Kind() != slog.KindInt64 {
 			t.Fatalf("record %d: route_total_ms kind=%v want Int64", i, rec.attrs["route_total_ms"].Kind())
 		}

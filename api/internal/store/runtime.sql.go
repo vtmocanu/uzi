@@ -12520,7 +12520,7 @@ type ParkQueuedCodexAccountUnavailablePageRow struct {
 //
 // The SET list is the M1 exact-claim park's, minus the worker_id affinity rewrite: a queued run
 // has no claim of this pass's making, so claim_generation and worker_id are left alone and no
-// custody hold is opened or released. Both writers clear recovery_retry_not_before because this
+// custody hold is opened or released. All three writers clear recovery_retry_not_before because this
 // cause is resumed by the account, never by the timer (PromoteRecoveryWaitRuns skips it).
 //
 // Returns one row even when nothing parks: page_size (rows examined), last_scanned_id (the nil
@@ -12559,7 +12559,7 @@ type ParkRunCodexAccountUnavailableParams struct {
 // Called under the exact-claim row lock, after settling this generation's hold.
 // recovery_retry_not_before is cleared: this cause is resumed by the account, never by the
 // timer (PromoteRecoveryWaitRuns skips it). The SET list is
-// ParkQueuedCodexAccountUnavailablePage's (the other writer of this cause) plus one extra
+// ParkQueuedCodexAccountUnavailablePage's plus one extra
 // column: this exact-claim park also rewrites worker_id to the newest open custody holder (D4),
 // while the queued park leaves worker_id alone.
 func (q *Queries) ParkRunCodexAccountUnavailable(ctx context.Context, arg ParkRunCodexAccountUnavailableParams) (Run, error) {
@@ -13193,6 +13193,44 @@ func (q *Queries) ParkRunForgeUnreachable(ctx context.Context, arg ParkRunForgeU
 		&i.CrossCheckLaneGeneration,
 	)
 	return i, err
+}
+
+const parkRunningCodexAccountUnavailable = `-- name: ParkRunningCodexAccountUnavailable :execrows
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    recovery_wait_cause = 'codex_account_unavailable',
+    recovery_retry_not_before = NULL,
+    started_at = NULL, budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    session_id = COALESCE($1, session_id),
+    updated_at = now()
+WHERE id = $2 AND worker_id = $3
+  AND claim_generation = $4
+  AND status = 'running' AND claim_released_at IS NULL
+  AND kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+`
+
+type ParkRunningCodexAccountUnavailableParams struct {
+	SessionID       pgtype.Text `json:"session_id"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+// The running checkpoint park retains worker affinity, custody, counters and pause requests.
+// The caller re-derives the hold under run -> alias -> account locks.
+func (q *Queries) ParkRunningCodexAccountUnavailable(ctx context.Context, arg ParkRunningCodexAccountUnavailableParams) (int64, error) {
+	result, err := q.db.Exec(ctx, parkRunningCodexAccountUnavailable,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const parkRunsAtWall = `-- name: ParkRunsAtWall :many
@@ -13942,8 +13980,8 @@ type PromoteRecoveryWaitRunsRow struct {
 // budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
 // over-credited — both exactly as PromoteLimitWaitRuns does. NULL <= @now is UNKNOWN, so a
 // run whose recovery_retry_not_before is NULL is never promoted. Every timer-driven park
-// writes a finite stamp; both writers of cause codex_account_unavailable
-// (ParkRunCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
+// writes a finite stamp; all three writers of cause codex_account_unavailable
+// (ParkRunCodexAccountUnavailable, ParkRunningCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
 // cause fence below is what keeps this timer promoter off that cause, whatever its stamp: that
 // hold is resumed only by the account (PromoteCodexAccountWaitRun, PRD #1590 D3).
 //
