@@ -150,7 +150,10 @@ re-invokes you when it exits:
 
 It also exits 4 with `STOP=needs_attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
-consecutive polls; `0` disables. It means investigate, not dead.
+consecutive polls; `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
+same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
+health episode, so a run that stays stalled in it (a long test suite) stops only on a park,
+a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a question parks unseen.
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
