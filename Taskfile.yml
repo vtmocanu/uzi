@@ -318,6 +318,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:forge-fake
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -1004,6 +1005,11 @@ tasks:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
       - node ./scripts/renovate-codex-runtime.test.mjs
+
+  test:forge-fake:
+    desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
+    cmds:
+      - node --test e2e/forge-fake/issue-comments.test.mjs
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
