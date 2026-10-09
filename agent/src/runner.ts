@@ -949,6 +949,12 @@ class RetainedRecoveryStop extends Error {
   constructor() { super("retained recovery stopped; custody retained"); }
 }
 
+class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
+
+class RetainedRecoveryMissingJournalError extends Error {
+  constructor() { super("Retained recovery blocked: required journal is missing; local work and custody retained"); }
+}
+
 class CredentialSwitchRetainedStop extends Error {
   constructor() {
     super("credential switch unconfirmed; retaining work and stopping the flight");
@@ -1592,6 +1598,8 @@ interface RunFlight {
   executor: Executor;
   effectiveAttemptPaths?: boolean;
   retainedEpisode?: boolean;
+  retainedEpisodeCustody?: boolean;
+  completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
   readonly runHome: string | undefined;
   readonly runScopedSecrets: string[];
@@ -3389,6 +3397,10 @@ export class RunRunner {
         flight.preserveSession = true;
         flight.retainedLocalCustody = true;
         flight.keepGuardedInventoryOpen = true;
+        if (err instanceof RetainedRecoveryCancelled && !flight.active?.shuttingDown &&
+            !this.shuttingDownGlobal && flight.steering.claimFence() === undefined) {
+          await this.reportGenericFailure(claim, flight, new Error("run cancelled"), { keepCustody: true });
+        }
         runLog.info("retained recovery stopped; source and accounting kept");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchRetainedStop) {
@@ -3685,10 +3697,10 @@ export class RunRunner {
       // run-owned process (process half `survivors`/`unverified`) keeps the clone AND its recovery
       // journal — retiring a tree a live process still writes would hand the next attempt a
       // half-removed clone. The Docker half never blocks the retire; it is logged.
-      if (flight.retainedLocalCustody) {
+      if (flight.retainedLocalCustody || flight.completedRetainedSuccessor) {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
-        flight.keepGuardedInventoryOpen = true;
+        if (flight.retainedLocalCustody) flight.keepGuardedInventoryOpen = true;
       }
       let retireBlocked = false;
       // issue #2213: the root guard for the worker residue quarantine is the read right before the
@@ -3785,6 +3797,34 @@ export class RunRunner {
               : "runner clone cleanup failed",
             { error: errMessage(e) },
           );
+        }
+      }
+      // A completed retained episode keeps its predecessors and shared HOME. Only an
+      // authenticated covering FINAL for this exact successor can retire its own clone.
+      if (flight.completedRetainedSuccessor && flight.terminalResolved && !flight.parked &&
+          claim.inventory_guarded === true && !terminalDisposeUnproven && flight.barePath && flight.branch && flight.worktreePath &&
+          flight.attemptId && !flight.retainedLocalCustody) {
+        const acknowledged = async () => {
+          if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
+              residueQuarantine() !== undefined) return false;
+          return await this.recovery.inventoryCleanupState(runId, flight.claimGeneration) === "acknowledged";
+        };
+        try {
+          if (await acknowledged()) {
+            const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "terminal_retire" });
+            if (!q.blocked && await acknowledged()) {
+              await this.git.retireRunnerClone(flight.barePath, flight.worktreePath, flight.branch, runId, {
+                discard: true, attemptId: flight.attemptId,
+                verifiedSuccessor: { key: this.cloneCoordinates(claim).key, generation: flight.claimGeneration,
+                  expected: flight.completedRetainedSuccessor, acknowledged },
+              });
+              flight.preserveRecoveryClone = false;
+              ownAttemptRetired = true;
+            }
+          }
+        } catch (error) {
+          flight.preserveRecoveryClone = true;
+          runLog.warn("verified successor retirement refused; predecessor custody retained", { error: errMessage(error) });
         }
       }
       // issue #1783 (R2): this attempt's final reap is done; it is no longer live.
@@ -4205,7 +4245,7 @@ export class RunRunner {
     opts: { keepCustody?: boolean } = {},
   ): Promise<void> {
     const { batcher, redactText, runLog } = flight;
-    if (flight.retainedLocalCustody) opts = { ...opts, keepCustody: true };
+    if (flight.retainedLocalCustody || flight.completedRetainedSuccessor) opts = { ...opts, keepCustody: true };
     // issue #2213: a run stopped by the worker quarantine (raised at a turn boundary, a provider
     // dispatch or a git funnel, possibly with no finalize gate in front of it) keeps its clone and
     // its recovery journal exactly like a finalize-gate residue block: the terminal retire must not
@@ -4262,7 +4302,7 @@ export class RunRunner {
     // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
     await batcher.awaitPermanentFailureSettled();
     const ownerCancel = this.isCredentialFreeOwnerCancel(claim, flight);
-    if (ownerCancel) await this.disposeCredentialFreeOwnerCancel(claim, flight);
+    if (ownerCancel && !opts.keepCustody) await this.disposeCredentialFreeOwnerCancel(claim, flight);
     // PRD #1391 Run B M3 (fact 2, D5, N2): suppress a SECOND `failed` when a terminal outcome
     // resolved or a competing outcome was deferred for an unavailable selected winner
     // (the `terminalResolved` latch survives a 200 retiring the journal), or a pending terminal
@@ -4320,12 +4360,12 @@ export class RunRunner {
     // process survived the reap, so no PAT-bearing git may start while it lives. issue #1766: a
     // custody-keeping park (opts.keepCustody) keeps the provider hold for the recovery settle.
     const reaped =
-      ownerCancel || opts.keepCustody || quarantined || err instanceof RunResidueBlockedError
+      ownerCancel || (opts.keepCustody && (!flight.completedRetainedSuccessor || flight.retainedLocalCustody)) || quarantined || err instanceof RunResidueBlockedError
         ? false
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
           : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
-    if (reaped && !opts.keepCustody) await flight.prepareTerminalInventory();
+    if (reaped && (!opts.keepCustody || flight.completedRetainedSuccessor)) await flight.prepareTerminalInventory();
     await batcher.close().catch(() => undefined);
     // issue #2213: a run that failed because the worker is quarantined keeps a verified local copy of
     // the committed work already in the worker bare (additive, credential-free; see
@@ -8366,72 +8406,84 @@ export class RunRunner {
     const coordinates = this.cloneCoordinates(claim);
     flight.effectiveAttemptPaths = this.attemptPaths;
     let retainedJournal: RecoveryJournalEntry | undefined;
-    try {
-      const discover = async () => {
-        const cachePresent = typeof this.git.discoverRetainedRecovery === "function" && await fs.lstat(this.git.barePathFor(claim.repo.clone_url)).then(() => true, error => {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-          throw error;
-        });
-        if (cachePresent && typeof this.git.recoveryAttemptMode === "function") {
-          flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
-        }
-        if (typeof this.git.discoverRetainedRecovery === "function") {
-          const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, coordinates.branch, coordinates.key, runId);
-          if (retained) {
-            flight.barePath = retained.barePath;
-            retainedJournal = retained.journal;
+    const discoverRetained = async (required = false, branch = coordinates.branch) => {
+      retainedJournal = undefined;
+      try {
+        this.retainedLifecycleGuard(flight);
+        if (required && branch !== coordinates.branch) throw new Error("retained recovery branch mismatch");
+        const discover = async () => {
+          const cachePresent = typeof this.git.discoverRetainedRecovery === "function" && await fs.lstat(this.git.barePathFor(claim.repo.clone_url)).then(() => true, error => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+          });
+          if (cachePresent && typeof this.git.recoveryAttemptMode === "function") {
+            flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
           }
-        }
-      };
-      if (typeof this.git.withRecoveryOperation === "function") {
-        await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs, discover);
-      } else {
-        await discover();
-      }
-      this.retainedLifecycleGuard(flight);
-    } catch (error) {
-      // A switch can abort discovery or land just after it returns, when the
-      // retainedLifecycleGuard masks it as RetainedRecoveryStop. Keep unknown
-      // custody and clear the switch stamp without authorizing capture or release.
-      const switchError = error instanceof RetainedRecoveryStop ? flight.steering.lifecycleSignal().reason : error;
-      if (switchError instanceof CredentialSwitchSignal && !flight.active?.shuttingDown &&
-          !this.shuttingDownGlobal && !flight.steering.terminalLifecycleSignal().aborted &&
-          flight.steering.claimFence() === undefined) {
-        flight.preserveRecoveryClone = true;
-        flight.preserveSession = true;
-        flight.retainedLocalCustody = true;
-        flight.keepGuardedInventoryOpen = true;
-        throw switchError;
-      }
-      this.retainedLifecycleGuard(flight);
-      if (!(error instanceof ForeignRetainedRecoveryError)) {
-        flight.preserveRecoveryClone = true;
-        flight.preserveSession = true;
-        flight.keepGuardedInventoryOpen = true;
-        flight.retainedLocalCustody = true;
-        let reason = "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
-        if (error instanceof RetainedRecoveryBlockedError) {
-          flight.barePath = error.barePath;
-          flight.worktreePath = error.journal.clonePath;
-          flight.branch = error.branch;
-          reason = "Retained recovery blocked: required source is missing; local work and custody retained";
-          try {
-            // Bookkeeping gets its own allowance after the discovery scope has ended.
-            await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
-              async () => {
-                this.retainedLifecycleGuard(flight);
-                await this.git.blockRecoveryEpisode(error.barePath, error.branch, error.key, error.journal,
-                  "source_missing", error.journal.recovery ?? null, () => this.retainedLifecycleGuard(flight));
-                this.retainedLifecycleGuard(flight);
-              });
+          if (typeof this.git.discoverRetainedRecovery === "function") {
+            const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, branch, coordinates.key, runId);
+            if (retained) {
+              flight.barePath = retained.barePath;
+              retainedJournal = retained.journal;
+            }
           }
-          catch { reason += "; blocker persistence unavailable"; }
+        };
+        if (typeof this.git.withRecoveryOperation === "function") {
+          await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs, discover);
+        } else {
+          await discover();
         }
         this.retainedLifecycleGuard(flight);
-        await this.reportGenericFailure(claim, flight, new Error(reason), { keepCustody: true });
-        throw new RetainedRecoveryStop();
+        if (required && !retainedJournal) throw new RetainedRecoveryMissingJournalError();
+      } catch (error) {
+        // A switch can abort discovery or land just after it returns, when the
+        // retainedLifecycleGuard masks it as RetainedRecoveryStop. Keep unknown
+        // custody and clear the switch stamp without authorizing capture or release.
+        const switchError = error instanceof RetainedRecoveryStop ? flight.steering.lifecycleSignal().reason : error;
+        if (switchError instanceof CredentialSwitchSignal && !flight.active?.shuttingDown &&
+            !this.shuttingDownGlobal && !flight.steering.terminalLifecycleSignal().aborted &&
+            flight.steering.claimFence() === undefined) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.retainedLocalCustody = true;
+          flight.keepGuardedInventoryOpen = true;
+          throw switchError;
+        }
+        this.retainedLifecycleGuard(flight);
+        if (!(error instanceof ForeignRetainedRecoveryError)) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          let reason = error instanceof RetainedRecoveryMissingJournalError ? error.message :
+            "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
+          if (error instanceof RetainedRecoveryBlockedError) {
+            flight.barePath = error.barePath;
+            flight.worktreePath = error.journal.clonePath;
+            flight.branch = error.branch;
+            reason = "Retained recovery blocked: required source is missing; local work and custody retained";
+            try {
+              // Bookkeeping gets its own allowance after the discovery scope has ended.
+              await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+                async () => {
+                  this.retainedLifecycleGuard(flight);
+                  await this.git.blockRecoveryEpisode(error.barePath, error.branch, error.key, error.journal,
+                    "source_missing", error.journal.recovery ?? null, () => this.retainedLifecycleGuard(flight));
+                  this.retainedLifecycleGuard(flight);
+                });
+            }
+            catch (error) {
+              this.retainedLifecycleGuard(flight);
+              if (error instanceof RetainedRecoveryStop) throw error;
+              reason += "; blocker persistence unavailable";
+            }
+          }
+          this.retainedLifecycleGuard(flight);
+          await this.reportGenericFailure(claim, flight, new Error(reason), { keepCustody: true });
+          throw new RetainedRecoveryStop();
+        }
       }
-    }
+    };
+    await discoverRetained();
     if (retainedJournal) {
       await this.recoverRetainedClaim(claim, flight, coordinates.key, retainedJournal);
       return;
@@ -8517,9 +8569,12 @@ export class RunRunner {
         flight.branch = err.branch;
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
-        const journal = (await this.git.discoverRetainedRecovery(claim.repo.clone_url, err.branch, coordinates.key, runId))?.journal;
-        if (!journal) throw new RetainedRecoveryStop();
-        await this.recoverRetainedClaim(claim, flight, coordinates.key, journal);
+        flight.retainedLocalCustody = true;
+        flight.retainedEpisodeCustody = true;
+        flight.keepGuardedInventoryOpen = true;
+        await discoverRetained(true, err.branch);
+        if (!retainedJournal) throw new RetainedRecoveryMissingJournalError();
+        await this.recoverRetainedClaim(claim, flight, coordinates.key, retainedJournal);
         return;
       } else if (err instanceof ForeignCaptureBlockedError) {
         // issue #1315/#1319 Case B: the canonical clone is journaled to ANOTHER run's
@@ -9676,11 +9731,17 @@ export class RunRunner {
         if (!flight.retainedEpisode || !flight.barePath || !flight.branch || !flight.worktreePath || !flight.attemptId) return;
         try {
           await this.requireRetainedOwnership(flight);
-          await this.git.completeRecoveryEpisode(flight.barePath, flight.branch, this.cloneCoordinates(claim).key,
+          flight.completedRetainedSuccessor = await this.git.completeRecoveryEpisode(flight.barePath, flight.branch, this.cloneCoordinates(claim).key,
             { runId, clonePath: flight.worktreePath, attemptId: flight.attemptId },
             { settled: true, processedEvents, attemptId: flight.attemptId }, () => this.retainedLifecycleGuard(flight));
           flight.retainedEpisode = false;
+          if (flight.retainedEpisodeCustody) {
+            flight.retainedLocalCustody = false;
+            flight.retainedEpisodeCustody = false;
+          }
         } catch (error) {
+          this.retainedLifecycleGuard(flight);
+          if (error instanceof RetainedRecoveryStop) throw error;
           runLog.warn("settled model turn could not clear recovery budget; retained", { error: errMessage(error) });
         }
       },
@@ -12947,7 +13008,7 @@ export class RunRunner {
   ): Promise<"released" | "retained"> {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
-    if (residueQuarantine() !== undefined) return "retained";
+    if (flight.retainedLocalCustody || flight.keepGuardedInventoryOpen || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
     const gen = claim.claim_generation;
     const fenced = () => flight.steering.claimFence() !== undefined;
     if (!Number.isSafeInteger(gen) || gen === undefined || gen <= 0 ||
@@ -15077,8 +15138,9 @@ export class RunRunner {
   }
 
   private retainedLifecycleGuard(flight: RunFlight): void {
-    if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted ||
-        flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined) throw new RetainedRecoveryStop();
+    if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined) throw new RetainedRecoveryStop();
+    if (flight.steering.isCancelled()) throw new RetainedRecoveryCancelled();
+    if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted) throw new RetainedRecoveryStop();
   }
 
   private retainedLifecycleSignal(flight: RunFlight): AbortSignal {
@@ -15086,10 +15148,7 @@ export class RunRunner {
   }
 
   private async requireRetainedOwnership(flight: RunFlight, deadline = Date.now() + this.codexBoundaryDeadlineMs, signal = this.retainedLifecycleSignal(flight)): Promise<void> {
-    if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted ||
-        flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined) {
-      throw new RetainedRecoveryStop();
-    }
+    this.retainedLifecycleGuard(flight);
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()));
@@ -15100,12 +15159,12 @@ export class RunRunner {
         signal: boundedSignal, log: flight.runLog, schedule: [],
       });
     } catch (error) {
+      this.retainedLifecycleGuard(flight);
       if (isRunOwnershipLost(error, flight.runId)) throw new RetainedRecoveryStop();
       throw error;
     } finally { clearTimeout(timer); }
-    if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted ||
-        flight.active?.shuttingDown || flight.steering.claimFence() !== undefined ||
-        own?.status !== "running" || own.claim_generation !== flight.claimGeneration) {
+    this.retainedLifecycleGuard(flight);
+    if (own?.status !== "running" || own.claim_generation !== flight.claimGeneration) {
       throw new RetainedRecoveryStop();
     }
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
@@ -15122,6 +15181,7 @@ export class RunRunner {
     flight.worktreePath = source.clonePath;
     flight.effectiveAttemptPaths = true;
     flight.retainedEpisode = true;
+    flight.retainedEpisodeCustody = true;
     flight.retainedLocalCustody = true;
     flight.predecessorCapture = true;
     flight.preserveRecoveryClone = true;

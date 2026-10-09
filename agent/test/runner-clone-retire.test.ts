@@ -5,7 +5,8 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import net from "node:net";
 import { execFileSync } from "node:child_process";
-import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
+import { GitCache, ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
+import { latchResidueQuarantine } from "../src/residue-quarantine.js";
 import type { Logger } from "../src/log.js";
 import { RequestError } from "../src/client.js";
 import { type ExecutorFactory } from "../src/runner.js";
@@ -36,6 +37,205 @@ import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 // runner's owner-probe-and-dispose, and every fail-closed edge of retireRunnerClone.
 
 installHarness();
+
+describe("verified successor retirement", () => {
+  function command(repo: string, ...args: string[]): string {
+    return execFileSync("git", ["-C", repo, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+  }
+
+  async function seedCompleted() {
+    const owner = randomUUID(), key = "issue-2512", branch = "agent/issue-2512";
+    const bare = await git.ensureClone(fx.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700);
+    fs.chmodSync(bare, 0o700);
+    const initial = await git.createOrAttachRunnerClone(bare, 2512, noProofReseed, owner);
+    await git.markRecoveryCapture(bare, initial.path, branch, owner);
+    fs.writeFileSync(path.join(initial.path, "predecessor.txt"), "original dirty bytes\n");
+    const tip = command(initial.path, "rev-parse", "HEAD");
+    let source: import("../src/recovery-progress.js").RecoverySource = { runId: owner, clonePath: initial.path };
+    // Two real completed adoptions exercise retention of the entire predecessor set.
+    for (const n of [1, 2]) {
+      const reservation = await git.reserveRecoveryIteration(bare, branch, key, source, 1);
+      await git.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, tip);
+      const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, n.toString(16).padStart(16, "0"));
+      const successor = await git.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, attemptId);
+      source = await git.completeRecoveryEpisode(bare, branch, key,
+        { runId: owner, clonePath: successor.path, attemptId },
+        { settled: true, processedEvents: 1, attemptId });
+      fs.writeFileSync(path.join(successor.path, "predecessor.txt"), n === 1 ? "intermediate dirty bytes\n" : "successor bytes\n");
+    }
+    const expected = JSON.parse(command(bare, "config", "--get", `uzi-recovery.${branch}.clone`)) as import("../src/git.js").RecoveryJournalEntry;
+    assert.equal(expected.retainedSources!.length, 2);
+    const opts = { discard: true, attemptId: expected.attemptId!,
+      verifiedSuccessor: { key, generation: 2, expected, acknowledged: async () => true } };
+    const ledger = () => command(bare, "config", "--get-all", `uzi-attempts.${branch}.entry`).split("\n")
+      .map(raw => JSON.parse(raw) as { attemptId: string; state: string; clonePath: string });
+    return { bare, branch, key, owner, expected, opts, ledger, tip,
+      pin: `refs/uzi-recovery-episode/${owner}/${tip}`,
+      retire: () => git.retireRunnerClone(bare, expected.clonePath, branch, owner, opts) };
+  }
+
+  type Seed = Awaited<ReturnType<typeof seedCompleted>>;
+  async function assertPredecessors(s: Seed, anchored: boolean) {
+    const fresh = new GitCache(fx.dataDir, nullLogger());
+    const discovery = await fresh.discoverRetainedRecovery(fx.originPath, s.branch, s.key, s.owner);
+    assert.ok(discovery, "fresh cache discovers retained custody");
+    const sources = [discovery.journal, ...(discovery.journal.retainedSources ?? [])];
+    if (anchored) {
+      assert.equal(discovery.journal.clonePath, s.expected.retainedSources![0]!.clonePath);
+      assert.deepEqual(sources.map(src => src.clonePath), s.expected.retainedSources!.map(src => src.clonePath));
+    } else assert.deepEqual(discovery.journal, s.expected);
+    for (const predecessor of s.expected.retainedSources!) {
+      assert.equal(fs.readFileSync(path.join(predecessor.clonePath, "predecessor.txt"), "utf8"),
+        predecessor.attemptId ? "intermediate dirty bytes\n" : "original dirty bytes\n");
+      assert.equal(command(predecessor.clonePath, "rev-parse", "HEAD"), s.tip);
+      assert.equal(await fresh.classifyOwnerClonePath(s.bare, s.branch, s.key, s.owner, predecessor.clonePath),
+        predecessor.attemptId ? "attempt" : "canonical");
+    }
+    assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
+  }
+
+  for (const exdev of [false, true]) {
+    it(`covering FINAL retires successor and ledger, preserving predecessors and pins (EXDEV=${exdev})`, async (t) => {
+      const s = await seedCompleted();
+      const rename = fsp.rename.bind(fsp);
+      let moves = 0;
+      t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+        if (String(from) === s.expected.clonePath) {
+          moves++;
+          if (exdev && String(to).startsWith(holdingRoot())) throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        }
+        return rename(from, to);
+      });
+      await s.retire();
+      assert.equal(moves, exdev ? 2 : 1);
+      assert.equal(fs.existsSync(s.expected.clonePath), false);
+      assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "retired");
+      assert.equal(fs.readdirSync(holdingRoot()).length, 0);
+      assert.equal(fs.readdirSync(runnerRoot()).filter(name => name.startsWith(".retire-")).length, 0);
+      await assertPredecessors(s, true);
+    });
+  }
+
+  for (const refusal of ["ordinary caller", "missing callback", "missing proof", "wrong generation", "changed identity", "changed predecessor set", "unsafe predecessor", "wrong ledger"] as const) {
+    it(`${refusal} refuses successor retirement without a rename`, async (t) => {
+      const s = await seedCompleted();
+      let moves = 0;
+      const rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => { moves++; return rename(from, to); });
+      if (refusal === "missing proof") s.opts.verifiedSuccessor.acknowledged = async () => false;
+      if (refusal === "missing callback") Reflect.deleteProperty(s.opts.verifiedSuccessor, "acknowledged");
+      if (refusal === "wrong generation") s.opts.verifiedSuccessor.generation = 3;
+      if (refusal === "changed identity") s.opts.verifiedSuccessor.expected = { ...s.expected, attemptId: formatAttemptId(new Date(), 3, "1111111111111111") };
+      if (refusal === "changed predecessor set") s.opts.verifiedSuccessor.expected = { ...s.expected, retainedSources: s.expected.retainedSources!.slice(1) };
+      if (refusal === "unsafe predecessor") {
+        const predecessor = s.expected.retainedSources![0]!.clonePath;
+        fs.renameSync(predecessor, predecessor + ".saved");
+        fs.symlinkSync(predecessor + ".saved", predecessor);
+      }
+      if (refusal === "wrong ledger") command(s.bare, "config", "--add", `uzi-attempts.${s.branch}.entry`,
+        JSON.stringify({ attemptId: s.opts.attemptId, runId: s.owner, clonePath: s.expected.clonePath, state: "retired" }));
+      await assert.rejects(refusal === "ordinary caller"
+        ? git.retireRunnerClone(s.bare, s.expected.clonePath, s.branch, s.owner, { discard: true, attemptId: s.opts.attemptId })
+        : s.retire());
+      assert.equal(moves, 0);
+      assert.ok(fs.existsSync(s.expected.clonePath));
+      assert.deepEqual(JSON.parse(command(s.bare, "config", "--get", `uzi-recovery.${s.branch}.clone`)), s.expected);
+    });
+  }
+
+  for (const crash of ["failed journal write", "durable reanchor before rename", "immediately after rename"] as const) {
+    it(`${crash} leaves usable predecessors discoverable by a fresh GitCache`, async (t) => {
+      const s = await seedCompleted();
+      const fault = new Error(crash);
+      let injected = false, synced = 0;
+      if (crash === "failed journal write") {
+        const internal = git as unknown as { writeRecovery(...args: unknown[]): Promise<void> };
+        t.mock.method(internal, "writeRecovery", async () => { injected = true; throw fault; });
+      } else {
+        const open = fsp.open.bind(fsp);
+        t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+          const handle = await open(...args);
+          if ([s.bare, path.join(s.bare, "config")].includes(String(args[0]))) {
+            const sync = handle.sync.bind(handle);
+            t.mock.method(handle, "sync", async () => { await sync(); synced++; });
+          }
+          return handle;
+        });
+        const rename = fsp.rename.bind(fsp);
+        t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+          if (String(from) !== s.expected.clonePath) return rename(from, to);
+          assert.equal(synced, 2, "file and bare directory are synced before successor move");
+          injected = true;
+          if (crash === "immediately after rename") await rename(from, to);
+          throw fault;
+        });
+      }
+      await assert.rejects(s.retire(), error => error === fault);
+      assert.equal(injected, true);
+      assert.equal(fs.existsSync(s.expected.clonePath), crash !== "immediately after rename");
+      assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "live");
+      await assertPredecessors(s, crash !== "failed journal write");
+    });
+  }
+
+  for (const seam of ["journal write", "primary rename", "EXDEV scratch rename", "disposal"] as const) {
+    for (const denial of ["authority", "quarantine"] as const) {
+      it(`${denial} at ${seam} retains successor evidence`, async (t) => {
+        const s = await seedCompleted();
+        let allowed = true, injected = false, moves = 0;
+        const deny = () => {
+          injected = true;
+          if (denial === "authority") allowed = false;
+          else latchResidueQuarantine({ cause: "fixture", site: "terminal_retire", runId: s.owner }, nullLogger());
+        };
+        s.opts.verifiedSuccessor.acknowledged = async () => allowed;
+        if (seam === "journal write") {
+          const internal = git as unknown as { writeRecovery(...args: unknown[]): Promise<void> };
+          const write = internal.writeRecovery.bind(git);
+          t.mock.method(internal, "writeRecovery", async (...args: Parameters<typeof internal.writeRecovery>) => { deny(); return write(...args); });
+        }
+        if (seam === "primary rename") {
+          const open = fsp.open.bind(fsp);
+          t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+            const handle = await open(...args);
+            if (String(args[0]) === s.bare) {
+              const sync = handle.sync.bind(handle);
+              t.mock.method(handle, "sync", async () => { await sync(); deny(); });
+            }
+            return handle;
+          });
+        }
+        const rename = fsp.rename.bind(fsp);
+        t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+          if (String(from) === s.expected.clonePath) {
+            if (seam === "EXDEV scratch rename" && String(to).startsWith(holdingRoot())) {
+              deny();
+              throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+            }
+            moves++;
+          }
+          return rename(from, to);
+        });
+        if (seam === "disposal") {
+          const protection = git.hasPhysicalTerminalProtection.bind(git);
+          t.mock.method(git, "hasPhysicalTerminalProtection", async (...args: Parameters<typeof git.hasPhysicalTerminalProtection>) => {
+            if (s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state === "retired") deny();
+            return protection(...args);
+          });
+        }
+        if (seam === "disposal" && denial === "quarantine") await s.retire();
+        else await assert.rejects(s.retire());
+        assert.equal(injected, true);
+        assert.equal(moves, seam === "disposal" ? 1 : 0);
+        assert.equal(fs.existsSync(s.expected.clonePath), seam !== "disposal");
+        if (seam === "disposal") assert.equal(fs.readdirSync(holdingRoot()).length, 1);
+        await assertPredecessors(s, seam !== "journal write");
+      });
+    }
+  }
+});
+
 
 const GIT_ENV = {
   ...process.env,
