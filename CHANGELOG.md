@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Completed publication serializes safely with worker updates.**
+  Persistent workers complete under the same worker-before-run lock order as claims and registration, even with leasing disabled. A worker capability downgrade still completes and consumes its matching permit without stamping a publication head or custody identity. Completion migrations also support schema rollback and reapplication while keeping released custody released.
+
 - **Interactive author assessments leave room for run creation ([#2372](https://github.com/vtmocanu/uzi/issues/2372)).**
   Manual issue starts and on-demand MR rework use a five-second total author-assessment budget, preserving fail-closed unknown handling and the live parent for persistence; background assessments retain thirty seconds.
 

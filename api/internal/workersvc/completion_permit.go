@@ -692,12 +692,10 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := store.New(tx)
 
-	// PRD #2006: with the lease on, an ephemeral worker's completion locks the WORKER row before
-	// the run row (the canonical order Claim, Register, Heartbeat and the sweepers use), so the
-	// lease entry below serializes against a claim, a cordon and the reaper. A nil-generation
-	// report (a worker without credential_switch_v1) never enters a lease, as on the fence path.
+	// Completed publication and ephemeral leasing serialize on the worker before the run.
+	// A persistent worker or nil-generation report never enters a lease.
 	leaseTx := s.ephemeralLease > 0 && wkr.Ephemeral && req.ClaimGeneration != nil
-	if leaseTx {
+	if leaseTx || completedPublicationCapable(wkr, req) {
 		if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 			if errors.Is(werr, pgx.ErrNoRows) {
 				return 0, false, lease, nil // the worker row is gone: no longer this worker's run

@@ -4171,18 +4171,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
-		// PRD #2006: an ephemeral worker's terminal report locks the WORKER row before the run
-		// row, the canonical order Claim, Register, Heartbeat and the sweepers use, so the lease
-		// entry below serializes against a claim, a cordon and the reaper. Only a terminal fenced
-		// report on an ephemeral worker with the lease on; every other report is unchanged.
-		if s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed") {
+		// Completed publication and ephemeral leasing serialize on the worker before the run.
+		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
+		leaseFence = s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
+		if leaseFence || completedPublicationCapable(wkr, req) {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
 				}
 				return store.Run{}, false, werr
 			}
-			leaseFence = true
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
