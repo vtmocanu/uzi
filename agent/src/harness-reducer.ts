@@ -96,6 +96,18 @@ export class RunTurnReducerImpl implements RunTurnReducer {
           ),
         );
         break;
+      case "usage_record":
+        reduction.messages.push({
+          kind: "status",
+          ...event.attribution,
+          payload: {
+            event: "codex_response_usage",
+            usage_response_id: event.responseId,
+            usage: event.usage,
+            model: event.model,
+          },
+        });
+        break;
       case "frame":
         this.acceptFrame(event, reduction);
         break;

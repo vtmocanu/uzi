@@ -79,9 +79,9 @@ export interface HarnessMetrics {
   cost: HarnessCost;
   // Optional normalized measurements do not replace D0's exact wire values.
   wire?: {
-    num_turns: unknown;
-    duration_ms: unknown;
-    total_cost_usd: unknown;
+    num_turns?: unknown;
+    duration_ms?: unknown;
+    total_cost_usd?: unknown;
   };
 }
 
@@ -245,6 +245,18 @@ export type HarnessEvent = HarnessEventMeta &
         // Issue #1800: model-authored output (an assistant message / root model item).
         // Never set on a user, tool_result or replay frame. Read by evidencesModelProcessing.
         assistantAuthored?: true;
+      }
+    | {
+        kind: "usage_record";
+        attribution: HarnessAttribution;
+        responseId: string;
+        model: string;
+        usage: Readonly<{
+          input_tokens: number;
+          cache_read_input_tokens: number;
+          cache_creation_input_tokens: number;
+          output_tokens: number;
+        }>;
       }
     | {
         kind: "turn_finished";

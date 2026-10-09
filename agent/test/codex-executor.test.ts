@@ -4625,6 +4625,56 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
   });
 });
 
+describe("CodexExecutor: m1 response usage", () => {
+  it("emits exactly two lead responses and one child response through ctx.emit before the first terminal", async () => {
+    const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
+    const total = { inputTokens: 200, cachedInputTokens: 60, cacheWriteInputTokens: 40, outputTokens: 80, totalTokens: 280 };
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(tokenUsageUpdated("th-child", "tn-child", last))
+          .push(turnCompleted("completed", "th-child", "tn-child"))
+          .push(signalDone())
+          .push(turnCompleted("completed"));
+        return { turn: { id: "tn-child" } };
+      }
+      return defaultResponder(c);
+    } });
+    rig.transport
+      .push(tokenUsageUpdated("th-1", "tn-1", last))
+      .push(tokenUsageUpdated("th-1", "tn-1", total, last))
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help", description: "[m1] usage" }, "th-1", "tn-1", "m1-child"));
+    const { ctx, emitted } = makeCtx({ agents: [
+      { name: "lead", description: "lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+    ] });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "m1 usage emission");
+    const usage = emitted.filter(m => m.payload.event === "codex_response_usage");
+    assert.equal(usage.length, 3, "the executor stops at its first terminal; every adopted response must already be emitted");
+    assert.equal(new Set(usage.map(m => m.payload.usage_response_id)).size, 3);
+    assert.deepEqual(usage.map(m => [m.agent, m.payload.model]), [
+      ["lead", provider.model], ["lead", provider.model], ["coder", "gpt-5.6-sol"],
+    ]);
+    for (const m of usage) {
+      assert.equal(m.kind, "status");
+      assert.match(String(m.payload.usage_response_id), /^[0-9a-f-]{36}$/);
+      assert.deepEqual(m.payload.usage, {
+        input_tokens: 50, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 40,
+      });
+    }
+    const dispatch = emitted.find(m => m.kind === "tool_use" && m.payload.name === "Agent");
+    assert.ok(dispatch);
+    assert.equal(usage[2]!.agentInstance, dispatch.payload.id);
+    assert.equal(usage[2]!.agentLabel, "[m1] usage");
+    const terminal = emitted.find(m => m.payload.event === "result");
+    assert.ok(terminal);
+    for (const m of usage) assert.ok(emitted.indexOf(m) < emitted.indexOf(terminal));
+    assert.equal(rig.transport.turnStartCount, 2, "one root turn and one child turn");
+  });
+});
+
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
   it("forwards the claim's medium and explicit effort to the actual turn/start wire field", async () => {
     for (const effort of ["medium", "xhigh"] as const) {
