@@ -208,12 +208,12 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	sb.WriteString(m.expandedRoster(now))
 	appendRailBlock(&sb, block)
 	if spend {
-		// renderSpend drops its 3 lines whole unless they + the 1-row separator fit under usedRows.
+		// renderSpend drops its 4 lines whole unless they + the 1-row separator fit under usedRows.
 		usedRows := strings.Count(sb.String(), "\n") + 1
-		if 3 > vp-usedRows-1 {
+		if 4 > vp-usedRows-1 {
 			return true
 		}
-		appendRailBlock(&sb, "x\nx\nx") // advance past SPEND's 3 rows so ACCOUNTS is measured below it
+		appendRailBlock(&sb, "x\nx\nx\nx") // advance past SPEND's 4 rows so ACCOUNTS is measured below it
 	}
 	if accountFloorRows > 0 {
 		// Protect the run-bound Codex snapshot even when its alias was deleted or

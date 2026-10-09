@@ -189,24 +189,11 @@ func fmtCostBoard(usd float64) string {
 	}
 }
 
-// ── cost_status-aware rendering (PRD #1429 M5, D7) ─────────────────────────────────
-//
-// Every reader above this point (fmtCostCents/fmtCostWhole/fmtCostBoard) takes a raw
-// USD float with NO branch on cost_status — the bug this section retires: a
-// subscription run (billed on a plan, no per-token metering) and an unreported run
-// (metering genuinely unknown) both priced their cost_usd at 0 and rendered
-// identically to a real metered $0. costStatusKind + classifyCostStatus give every
-// TUI/CLI caller ONE fold to switch on, mirroring web costStatus.ts's costDisplay
-// exactly, so the terminal and the browser read a run's cost the same honest way.
-
-// costStatusKind narrows a per-run cost_status to the three cases every cost renderer
-// must branch on: metered (a real dollar figure — even an exact $0 is a genuine
-// reading, e.g. a tiny or cache-only call), subscription (billed via a subscription,
-// never rendered as a dollar figure), and unavailable (unreported, the pre-M1 empty
-// string, or any value this build has not heard of). cost_status is a closed wire
-// enum a NEWER server can extend without this build knowing (RunDTO.Harness carries
-// the identical forward-compat contract), so anything other than the two known
-// non-unavailable values folds SAFELY to unavailable rather than guessing metered.
+// costStatusKind classifies stored per-run cost observability. Metered amounts are
+// API-equivalent estimates, including genuine zero. Legacy subscription rows retain
+// tokens without an estimate; unreported rows may retain a partial amount, but per-run
+// readers suppress dollars because the estimate is incomplete. Unknown markers also
+// suppress dollars. Window aggregates retain partial amounts and disclose run counts.
 type costStatusKind int
 
 const (
@@ -228,19 +215,14 @@ func classifyCostStatus(status string) costStatusKind {
 	}
 }
 
-// costDetailCell renders the `uzi run get` COST row (PRD #1429 M5): the spacious,
-// single-row form — a real dollar figure for "metered" (via fmtCostCents, the same
-// cents-precision formatter the TUI SPEND block uses), the word "subscription" for
-// "subscription" (never a dollar figure, never $0), and "cost unavailable" with the
-// run's total token count for anything else ("unreported", the pre-M1 empty string,
-// or a future status this build has not heard of) — mirroring web costSubLabel's
-// "tokens only · cost unavailable" phrasing.
+// costDetailCell renders the spacious run/checker COST value. Only metered rows
+// show dollars. Legacy usage has no estimate; incomplete cost is unavailable.
 func costDetailCell(u apitypes.UsageDTO) string {
 	switch classifyCostStatus(u.CostStatus) {
 	case costStatusMetered:
-		return fmtCostCents(u.CostUSD)
+		return fmtCostCents(u.CostUSD) + " · API-equivalent"
 	case costStatusSubscription:
-		return "subscription"
+		return fmtTokens(u.InputTokens+u.CacheReadTokens+u.CacheCreationTokens+u.OutputTokens) + " tokens · no estimate"
 	default:
 		total := u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens + u.OutputTokens
 		return fmtTokens(total) + " tokens · cost unavailable"

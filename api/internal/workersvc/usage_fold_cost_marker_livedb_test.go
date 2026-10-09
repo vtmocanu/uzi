@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -180,5 +182,173 @@ func TestUsageFoldHonorsCodexCostMarkerLiveDB(t *testing.T) {
 	}
 	if h, cs, cost := readUsage(claudeRunID, "claude-fable-5"); h != "claude" || cs != "metered" || cost != "0.012300" {
 		t.Fatalf("claude usage row = harness %q / cost_status %q / cost_usd %q, want claude/metered/0.012300 (marker ignored)", h, cs, cost)
+	}
+}
+
+// Example 4 composes agent-shaped result frames with the existing persisted fold and
+// aggregate readers. It does not exercise a provider or infer a credential's billing.
+func TestUsageFoldPricedSubscriptionAndLegacyLegsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("foldmarker-%s@e2e", userID))
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	before, err := q.AdminUsageTotals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeRun := func(iid int64, age int) store.Run {
+		t.Helper()
+		id := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, harness, session_id, created_at)
+        VALUES ($1,$2,$3,$4,'t','d','running','issue','codex',$5,now()-make_interval(days => $6))`, id, userID, repoID, iid, uuid.NewString(), age)
+		run, err := q.GetRunByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run
+	}
+	fold := func(run store.Run, seq int32, model string, usage map[string]any) {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{"event": "result", "modelUsage": map[string]any{model: usage}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := foldUsageFrames(ctx, q, run, []IncomingMessage{{Seq: seq, Kind: "status", Agent: "lead", Payload: payload}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Exact priced subscription-shaped agent checker fixture: reasoning is included
+	// in outputTokens, not charged again. The server honors the emitted marker/amount.
+	priced := map[string]any{"inputTokens": 300, "cacheReadInputTokens": 600, "cacheCreationInputTokens": 100, "outputTokens": 200, "reasoningOutputTokens": 50, "costStatus": "metered", "costUSD": 0.00291}
+	legacy := map[string]any{"inputTokens": 120, "outputTokens": 40, "costStatus": "subscription", "costUSD": 0}
+	newRun := makeRun(41, 0)
+	fold(newRun, 10, "gpt-6.1-sol", priced)
+	mixed := makeRun(42, 0)
+	fold(mixed, 10, "gpt-6.1-sol", legacy)
+	// Persist an init between results so the second leg has BOTH a distinct session
+	// and a distinct epoch, rather than exercising same-key conflict suppression.
+	exec(`INSERT INTO run_messages (run_id,seq,kind,agent,payload) VALUES ($1,20,'status','lead','{"event":"init"}'::jsonb)`, mixed.ID)
+	exec(`UPDATE runs SET session_id=$2 WHERE id=$1`, mixed.ID, uuid.NewString())
+	mixed, err = q.GetRunByID(ctx, mixed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fold(mixed, 30, "gpt-6.1-sol", priced)
+	oldRun := makeRun(43, 10)
+	fold(oldRun, 10, "legacy-model", legacy)
+	oldWorker := makeRun(44, 0)
+	fold(oldWorker, 10, "old-worker", map[string]any{"inputTokens": 70, "outputTokens": 30})
+
+	for _, run := range []store.Run{newRun, mixed} {
+		var marker, amount, model string
+		var in, read, create, out int64
+		if err := pool.QueryRow(ctx, `SELECT model,cost_status,cost_usd::text,input_tokens,cache_read_tokens,cache_creation_tokens,output_tokens FROM run_usage WHERE run_id=$1 AND cost_status='metered'`, run.ID).Scan(&model, &marker, &amount, &in, &read, &create, &out); err != nil {
+			t.Fatal(err)
+		}
+		if model != "gpt-6.1-sol" || marker != "metered" || amount != "0.002910" || in != 300 || read != 600 || create != 100 || out != 200 {
+			t.Fatalf("persisted priced row: %s %s %s tokens %d/%d/%d/%d", model, marker, amount, in, read, create, out)
+		}
+	}
+	var legs, sessions, epochs int64
+	if err := pool.QueryRow(ctx, `SELECT count(*),count(DISTINCT session_id),count(DISTINCT lineage_epoch) FROM run_usage WHERE run_id=$1`, mixed.ID).Scan(&legs, &sessions, &epochs); err != nil {
+		t.Fatal(err)
+	}
+	if legs != 2 || sessions != 2 || epochs != 2 {
+		t.Fatalf("mixed identities: legs=%d sessions=%d epochs=%d, want 2/2/2", legs, sessions, epochs)
+	}
+	number := func(n pgtype.Numeric) float64 {
+		t.Helper()
+		v, err := n.Float64Value()
+		if err != nil || !v.Valid {
+			t.Fatalf("numeric %v: %v", n, err)
+		}
+		return v.Float64
+	}
+	for _, tc := range []struct {
+		run                   store.Run
+		status                string
+		in, read, create, out int64
+		cost                  float64
+	}{
+		{newRun, "metered", 300, 600, 100, 200, 0.00291},
+		{mixed, "unreported", 420, 600, 100, 240, 0.00291},
+		{oldRun, "subscription", 120, 0, 0, 40, 0},
+		{oldWorker, "unreported", 70, 0, 0, 30, 0},
+	} {
+		total, err := q.GetRunUsageTotal(ctx, tc.run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total.CostStatus != tc.status || total.InputTokens != tc.in || total.CacheReadTokens != tc.read || total.CacheCreationTokens != tc.create || total.OutputTokens != tc.out || number(total.CostUsd) != tc.cost {
+			t.Fatalf("run total %s: %+v", tc.status, total)
+		}
+	}
+	self, err := q.SelfUsage(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if number(self.LifetimeCostUsd) != 0.00582 || number(self.Last7CostUsd) != 0.00582 || self.LifetimeSubscriptionRunCount != 1 || self.LifetimeUnreportedRunCount != 2 || self.Last7SubscriptionRunCount != 0 || self.Last7UnreportedRunCount != 2 || self.RunCount != 4 {
+		t.Fatalf("self windows: %+v", self)
+	}
+	if self.LifetimeInputTokens != 910 || self.LifetimeCacheReadTokens != 1200 || self.LifetimeCacheCreationTokens != 200 || self.LifetimeOutputTokens != 510 || self.Last7InputTokens != 790 || self.Last7CacheReadTokens != 1200 || self.Last7CacheCreationTokens != 200 || self.Last7OutputTokens != 470 {
+		t.Fatalf("self tokens: %+v", self)
+	}
+	rows, err := q.AdminUsagePerUser(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.UserID != userID {
+			continue
+		}
+		found = true
+		if number(row.CostUsd) != 0.00582 || number(row.Last7CostUsd) != 0.00582 || row.SubscriptionRunCount != 1 || row.UnreportedRunCount != 2 || row.Last7SubscriptionRunCount != 0 || row.Last7UnreportedRunCount != 2 || row.RunCount != 4 || row.Last7RunCount != 3 {
+			t.Fatalf("admin user windows: %+v", row)
+		}
+		if row.InputTokens != 910 || row.CacheReadTokens != 1200 || row.CacheCreationTokens != 200 || row.OutputTokens != 510 || row.Last7InputTokens != 790 || row.Last7CacheReadTokens != 1200 || row.Last7CacheCreationTokens != 200 || row.Last7OutputTokens != 470 {
+			t.Fatalf("admin user tokens: %+v", row)
+		}
+	}
+	if !found {
+		t.Fatal("missing admin user")
+	}
+	after, err := q.AdminUsageTotals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Factory readers share the test DB. Compare this fixture's literal contribution
+	// against the snapshot taken before seeding; no truncate of sibling fixtures.
+	if math.Abs(number(after.LifetimeCostUsd)-number(before.LifetimeCostUsd)-0.00582) > 1e-9 || math.Abs(number(after.Last7CostUsd)-number(before.Last7CostUsd)-0.00582) > 1e-9 || after.LifetimeSubscriptionRunCount-before.LifetimeSubscriptionRunCount != 1 || after.LifetimeUnreportedRunCount-before.LifetimeUnreportedRunCount != 2 || after.Last7SubscriptionRunCount-before.Last7SubscriptionRunCount != 0 || after.Last7UnreportedRunCount-before.Last7UnreportedRunCount != 2 {
+		t.Fatalf("admin factory windows: before=%+v after=%+v", before, after)
+	}
+	if after.LifetimeInputTokens-before.LifetimeInputTokens != 910 || after.LifetimeCacheReadTokens-before.LifetimeCacheReadTokens != 1200 || after.LifetimeCacheCreationTokens-before.LifetimeCacheCreationTokens != 200 || after.LifetimeOutputTokens-before.LifetimeOutputTokens != 510 || after.Last7InputTokens-before.Last7InputTokens != 790 || after.Last7CacheReadTokens-before.Last7CacheReadTokens != 1200 || after.Last7CacheCreationTokens-before.Last7CacheCreationTokens != 200 || after.Last7OutputTokens-before.Last7OutputTokens != 470 {
+		t.Fatalf("admin factory tokens: before=%+v after=%+v", before, after)
 	}
 }

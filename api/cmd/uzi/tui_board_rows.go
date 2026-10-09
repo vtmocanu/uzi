@@ -381,7 +381,7 @@ func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string
 // render identically to a real metered $0. Four states: a nil Usage (a pre-#40 or unclaimed run)
 // draws a BLANK cell, matching boardCredSeg's empty convention; "metered" draws fmtCostBoard's
 // whole-dollar figure (0 < usd < 0.5 renders "<$1" so a real cost never shows as $0, and an exact
-// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "sub"
+// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "n/a"
 // label (never a dollar figure); anything else — "unreported", the pre-M1 empty string, or a
 // status this build has not heard of — draws "n/a", the same safe-unavailable fold web's
 // costCellText uses.
@@ -394,7 +394,7 @@ func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string
 	case costStatusMetered:
 		s = fmtCostBoard(r.Usage.CostUSD) // width-capped so a pathological cost can't blow the cell
 	case costStatusSubscription:
-		s = "sub"
+		s = "n/a"
 	default:
 		s = "n/a"
 	}

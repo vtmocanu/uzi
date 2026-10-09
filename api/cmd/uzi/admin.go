@@ -901,7 +901,9 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO, window string
 func adminUsageCost(cost float64, subscription, unreported int64) string {
 	value := fmt.Sprintf("$%.2f", cost)
 	if subscription > 0 || unreported > 0 {
-		value += fmt.Sprintf(" (subscription/unreported costs excluded: subscription_runs=%d unreported_runs=%d)", subscription, unreported)
+		value += fmt.Sprintf(" (API-equivalent estimate incomplete; legacy runs have tokens without an estimate; unreported partial costs included: subscription_runs=%d unreported_runs=%d)", subscription, unreported)
+	} else {
+		value += " (API-equivalent)"
 	}
 	return value
 }

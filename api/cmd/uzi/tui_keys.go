@@ -151,7 +151,10 @@ func helpLines(v tuiView) []string {
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs; keep active and needs-you",
-			"+ after 7d cost means subscription/unreported costs excluded",
+			"cost       API-equivalent estimate",
+			"+ after 7d cost means the estimate is incomplete",
+			"           runs without estimates: tokens only",
+			"           unreported: recorded partials included",
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 		}, common...)

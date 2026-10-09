@@ -1556,7 +1556,7 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 }
 
 // The board COST cell (boardCostSeg, PRD #650 / #1429 M5) branches on cost_status (D7): a
-// metered cost as "$N" (no decimal), a subscription-status run as "sub" (never "$0" — even a $0
+// metered cost as "$N" (no decimal), a subscription-status run as "n/a" (never "$0" — even a $0
 // with recorded tokens), an unreported/legacy-empty-status run as "n/a", a sub-dollar metered
 // cost as "<$1", and a nil-Usage run as a blank cell (the boardCredSeg convention).
 func TestTUIBoardCostCell(t *testing.T) {
@@ -1568,10 +1568,10 @@ func TestTUIBoardCostCell(t *testing.T) {
 		t.Errorf("cost cell: want whole-dollar $9 with no decimal, got %q", s)
 	}
 
-	// A subscription-status run (even at $0 with recorded tokens) → "sub", never "$0".
+	// A subscription-status run (even at $0 with recorded tokens) → "n/a", never "$0".
 	sub := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "sub") || strings.Contains(s, "$0") {
-		t.Errorf("cost cell: a subscription-status run must render sub not $0, got %q", s)
+	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$0") {
+		t.Errorf("cost cell: a subscription-status run must render n/a without dollars, got %q", s)
 	}
 
 	// An unreported-status run → "n/a", never a dollar figure.
@@ -2344,7 +2344,7 @@ func spendModel(t *testing.T, usage *apitypes.UsageDTO) tuiModel {
 // TestTUIDetailHeadlineCost — PRD #650 M3 Part A / #1429 M5: the run-view status tag carries the
 // run's rolled-up cost, faint, beside the duration, branching on cost_status (D7) rather than
 // guessing from cost_usd == 0: "metered" renders the real dollar figure, "subscription" renders
-// the short "sub" label (never a dollar figure, never $0), anything else ("unreported", the pre-M1
+// the short "n/a" label (never a dollar figure, never $0), anything else ("unreported", the pre-M1
 // empty string) renders "n/a", and a pre-#40 nil-Usage run appends no cost token at all.
 func TestTUIDetailHeadlineCost(t *testing.T) {
 	header := func(m tuiModel) string { return stripANSI(strings.Join(m.detailHeaderLines(), "\n")) }
@@ -2353,10 +2353,10 @@ func TestTUIDetailHeadlineCost(t *testing.T) {
 		t.Errorf("headline status tag missing the cost $9.55:\n%s", h)
 	}
 
-	// A subscription-billed run (real token usage, no metered cost) → "sub", never "$0.00".
+	// A stored legacy subscription run (real token usage, no metered cost) → "n/a", never "$0.00".
 	sub := header(spendModel(t, &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}))
-	if !strings.Contains(sub, "sub") {
-		t.Errorf("a subscription-status run should render the sub label:\n%s", sub)
+	if !strings.Contains(sub, "n/a") {
+		t.Errorf("a subscription-status run should render the n/a label:\n%s", sub)
 	}
 	if strings.Contains(sub, "$0.00") || strings.Contains(sub, "$") {
 		t.Errorf("a subscription-status run must not render a dollar cost:\n%s", sub)
@@ -2428,7 +2428,7 @@ func TestTUIDetailSpendBlock(t *testing.T) {
 }
 
 // TestTUIDetailSpendDropsWhole — the SPEND block is whole-block-or-nothing: when the remaining
-// rail height cannot hold all three lines, renderSpend returns "" rather than a half-drawn block
+// rail height cannot hold all four lines, renderSpend returns "" rather than a half-drawn block
 // (header with no cache line), because joinColumns clamps the rail by dropping its bottom lines.
 func TestTUIDetailSpendDropsWhole(t *testing.T) {
 	m := spendModel(t, spendUsage())
@@ -2436,6 +2436,13 @@ func TestTUIDetailSpendDropsWhole(t *testing.T) {
 	// A large usedRows leaves no room: renderSpend returns "" (never a partial block).
 	if got := m.renderSpend(m.transcriptViewport()); got != "" {
 		t.Errorf("renderSpend must be empty when the rail height is exhausted, got %q", got)
+	}
+	// Three available rows cannot hold the amount, basis, and both token lines.
+	if got := m.renderSpend(m.transcriptViewport() - 4); got != "" {
+		t.Errorf("SPEND must drop whole with only three rows, got %q", got)
+	}
+	if got := stripANSI(m.renderSpend(m.transcriptViewport() - 5)); !strings.Contains(got, "API-equivalent") || !strings.Contains(got, "cache") {
+		t.Errorf("SPEND must fit whole with four rows, got %q", got)
 	}
 	// With generous room it renders the whole block.
 	full := stripANSI(m.renderSpend(0))
@@ -2465,13 +2472,13 @@ func TestTUIDetailSpendDropsWhole(t *testing.T) {
 }
 
 // TestTUIDetailSpendZeroCost — PRD #1429 M5: a subscription-status run WITH real token usage
-// shows the "Subscription" total in the SPEND block (never "—" or "$0.00") while the in/out/cache
+// shows the "n/a" total in the SPEND block (never "—" or "$0.00") while the in/out/cache
 // lines still render (the token breakdown does not depend on cost).
 func TestTUIDetailSpendZeroCost(t *testing.T) {
 	m := spendModel(t, &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 1000, OutputTokens: 50})
 	out := stripANSI(m.renderSpend(0))
-	if !strings.Contains(out, "Subscription") {
-		t.Errorf("a subscription-status SPEND total should render Subscription:\n%s", out)
+	if !strings.Contains(out, "n/a") {
+		t.Errorf("a subscription-status SPEND total should render n/a:\n%s", out)
 	}
 	if strings.Contains(out, "$0") || strings.Contains(out, "—") {
 		t.Errorf("a subscription-status SPEND total must not render a dollar figure or an em-dash:\n%s", out)
@@ -2500,7 +2507,7 @@ func TestTUIDetailSpendUnreportedCost(t *testing.T) {
 }
 
 // TestTUIBoardCostAsciiSurvives — PRD #650 M4 / #1429 M5: under an Ascii (NO_COLOR) colorprofile
-// downgrade the board's plain-text cost cues survive. The "$", digits, and the "sub" label are
+// downgrade the board's plain-text cost cues survive. The "$", digits, and the "n/a" label are
 // derived numerics/words, not coloured chrome — only the tungsten/faint accent is stripped
 // downstream at flush — so cost is never signalled by colour alone. Mirrors
 // TestBoardRateLimitStripAsciiSignalSurvives. NOTE: the colorprofile Writer strips SGR downstream
@@ -2510,16 +2517,16 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	// Two tokens so the credential gate clears (secretsMsg{count:2}); at width 120 the mile
 	// threshold (111) is under the terminal so every column, COST included, renders.
 	//
-	// The second run's IssueTitle deliberately avoids "sub"/"subscription" (unlike an earlier
+	// The second run's IssueTitle deliberately avoids "n/a"/"subscription" (unlike an earlier
 	// version of this fixture, "a subscription run") — that title text would satisfy a plain
-	// whole-frame strings.Contains(out, "sub") on its own, so a boardCostSeg regression that
-	// rendered "$0" instead of "sub" for a subscription-status run would go undetected. The
+	// whole-frame strings.Contains(out, "n/a") on its own, so a boardCostSeg regression that
+	// rendered "$0" instead of "n/a" for a subscription-status run would go undetected. The
 	// per-row assertion below additionally scopes the check to this run's OWN rendered line.
 	runs := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "a real cost",
 			Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 12.0, InputTokens: 100}}}, // → "$12"
-		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a plan-billed run",
-			Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}, // → "sub"
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a plan-legacy run",
+			Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}, // → "n/a"
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
 	m.width = 120
@@ -2538,13 +2545,13 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 		t.Errorf("Ascii-profile board dropped the plain cost cue %q:\n%s", "$12", out)
 	}
 
-	// The subscription run's "sub" cue must appear on ITS OWN row (found by its unique title,
-	// which carries no "sub"/"subscription" substring itself) — a $0/n/a regression in
-	// boardCostSeg would drop "sub" from this line even though other chrome elsewhere in the
+	// The subscription run's "n/a" cue must appear on ITS OWN row (found by its unique title,
+	// which carries no "n/a"/"subscription" substring itself) — a $0/n/a regression in
+	// boardCostSeg would drop "n/a" from this line even though other chrome elsewhere in the
 	// frame might coincidentally contain it.
 	var subRow string
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "a plan-billed run") {
+		if strings.Contains(line, "a plan-legacy run") {
 			subRow = line
 			break
 		}
@@ -2552,8 +2559,8 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	if subRow == "" {
 		t.Fatalf("no board row found for the subscription run:\n%s", out)
 	}
-	if !strings.Contains(subRow, "sub") {
-		t.Errorf("Ascii-profile board dropped the plain cost cue %q on the subscription run's row:\n%s", "sub", subRow)
+	if !strings.Contains(subRow, "n/a") {
+		t.Errorf("Ascii-profile board dropped the plain cost cue %q on the subscription run's row:\n%s", "n/a", subRow)
 	}
 }
 

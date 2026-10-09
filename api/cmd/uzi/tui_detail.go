@@ -714,15 +714,15 @@ func (m tuiModel) detailHeaderLines() []string {
 	}
 	if d.run.Usage != nil {
 		// Same cost_status branch as boardCostSeg/renderSpend (PRD #1429 M5, D7): this
-		// compact inline tag uses the SAME short labels as the board cell ("sub"/"n/a"),
-		// not renderSpend's spacious "Subscription"/"Unavailable" — the crumb line is a
+		// compact inline tag uses the SAME short "n/a" label as the board cell for nonmetered usage,
+		// not renderSpend's "n/a"/"Unavailable" — the crumb line is a
 		// dense row of tags (status · elapsed · cost · transport), not a dedicated headline.
 		var cost string
 		switch classifyCostStatus(d.run.Usage.CostStatus) {
 		case costStatusMetered:
 			cost = fmtCostCents(d.run.Usage.CostUSD)
 		case costStatusSubscription:
-			cost = "sub"
+			cost = "n/a"
 		default:
 			cost = "n/a"
 		}
