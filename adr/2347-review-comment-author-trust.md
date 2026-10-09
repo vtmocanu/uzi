@@ -113,8 +113,8 @@ yields permission-unknown, while a later author with a fresh child can succeed.
 Shared reads remain subject to assessment cancellation and existing pagination
 checks; a listing is not guaranteed to succeed. A tick counts in the bound
 below only when the required shared evidence answers within the remaining
-assessment time. GitLab lookups are per-user calls with no shared evidence, so
-only each lookup's own timeout applies there.
+assessment time. GitLab lookups are per-user calls with no shared evidence; each
+is bounded by its child timeout and the assessment deadline.
 
 **Conditional delay bound.** For a waiting author X with R_0 entries ahead that
 are not eligible (not-eligible or permission-unknown), let A_t be the lookups actually attempted on tick t (logged; only

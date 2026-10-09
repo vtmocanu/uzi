@@ -218,7 +218,7 @@ The bound assumes:
   later author with a fresh child can succeed. Shared reads still honor
   assessment cancellation and existing pagination checks; a listing is not
   guaranteed to succeed. GitLab lookups are per-user calls with no shared
-  evidence, so only each lookup's own timeout matters there;
+  evidence; each is bounded by its child timeout and the assessment deadline;
 - the connection token's rate limit, shared with every other MR on it, isn't
   exhausted;
 - other MRs don't touch this MR's queue. They share only the verdict cache,
