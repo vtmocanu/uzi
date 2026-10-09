@@ -25,7 +25,7 @@ func formulaFixture(t *testing.T, formula string) string {
 	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(prefix, "bin", "uzi"), []byte("fixture only; never executed"), 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(prefix, "bin", "uzi"), []byte("fixture only; never executed"), 0700); err != nil { //nolint:gosec // G306: private fixture must pass executable-bit validation; the fake runner never executes it.
 		t.Fatal(err)
 	}
 	return prefix
@@ -131,7 +131,7 @@ func TestInstalledProbeRejectsPathsAndOutput(t *testing.T) {
 				}
 			case "escaping symlink":
 				outside := filepath.Join(t.TempDir(), "uzi")
-				if err := os.WriteFile(outside, []byte("fixture"), 0700); err != nil {
+				if err := os.WriteFile(outside, []byte("fixture"), 0600); err != nil {
 					t.Fatal(err)
 				}
 				if err := os.Remove(path); err != nil {
