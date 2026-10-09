@@ -844,7 +844,12 @@ const (
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
-	boardMileMinWidth = 91
+	// It includes the PROG cell (narrow form, boardProgNarrowWidth + gap) that is shown with it
+	// (PRD #2602): the pre-PROG threshold of 91 plus the PROG cell and its gap.
+	boardMileMinWidth = 91 + boardProgNarrowWidth + 2
+	// boardProgBarMinWidth is the narrowest own board that keeps the PROG bar; below it the cell
+	// is the percent or a short flag alone, so the bar drops before the percent.
+	boardProgBarMinWidth = boardMileMinWidth + boardProgWideWidth - boardProgNarrowWidth
 	// boardCostMinWidth is the narrowest own board that keeps the COST column. It sits BELOW
 	// boardMileMinWidth so COST (the higher-priority cost signal) is retained after the milestone
 	// micro-bar drops on a narrowing terminal (PRD #650 M2; issue #379 invariant).

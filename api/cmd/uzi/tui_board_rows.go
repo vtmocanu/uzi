@@ -287,6 +287,12 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 
 	if m.boardShowMile() {
 		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
+		// PROG (PRD #2602): shown with MILES; a finished row has no progress (nil) and stays blank.
+		var prog string
+		if !terminal {
+			prog = m.boardProgCell(r.Progress, r.Status, bg, m.boardShowProgBar())
+		}
+		row += padSeg(prog, m.boardProgWidth(), bg) + gap
 	}
 
 	// WHICH credential this run spent, gated by its own harness:

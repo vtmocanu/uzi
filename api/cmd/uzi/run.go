@@ -593,7 +593,8 @@ func nonEmpty(in []string) []string {
 // map[string]json.RawMessage makes its key set the source of truth (self-maintaining as
 // the DTO grows), gives `null → empty line` for free, and makes the non-scalar case a
 // one-byte test — a RawMessage whose first non-space byte is `[` or `{` (the four array
-// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress)
+// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress, plus
+// the progress object while a run is non-terminal; null on a terminal run prints an empty line)
 // has no meaningful one-line raw form and is a usage error. An unknown field is likewise
 // a usage error (exit 2), never a silent blank.
 //

@@ -444,6 +444,14 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
 	runs[5].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
 	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → n/a
+	// PRD #2602: the PROG column, mirroring TUI mock 1 — a percent (55% here: 2 of 4 done), a
+	// stalled run, a looping run (also stalled), a run waiting on the plan gate, and a parked run.
+	pct := 55
+	runs[0].Progress = &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4, ActiveMilestoneID: "m3"}
+	runs[1].Progress = &apitypes.RunProgress{State: "waiting"}
+	runs[2].Progress = &apitypes.RunProgress{State: "stalled"}
+	runs[4].Progress = &apitypes.RunProgress{State: "stalled"}
+	runs[6].Progress = &apitypes.RunProgress{State: "parked"}
 	return runs
 }
 
