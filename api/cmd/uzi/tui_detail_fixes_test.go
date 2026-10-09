@@ -648,7 +648,7 @@ func TestTUIAdminBoardRowsFitNarrowWidth(t *testing.T) {
 			t.Errorf("milestone micro-bar should be hidden on the narrow admin board at width %d\n%s", w, out)
 		}
 	}
-	if wide := stripANSI(render(150)); !strings.Contains(wide, "▰▰▱▱") {
+	if wide := stripANSI(render(130)); !strings.Contains(wide, "▰▰▱▱") {
 		t.Errorf("milestone micro-bar should return on a wide admin board\n%s", wide)
 	}
 }

@@ -30,11 +30,14 @@ func TestProgressRow(t *testing.T) {
 		{"plan gate", apitypes.RunDTO{Status: "awaiting_approval", Progress: &apitypes.RunProgress{State: "waiting"}}, "waits on you · plan gate"},
 		{"question", apitypes.RunDTO{Status: "awaiting_input", Progress: &apitypes.RunProgress{State: "waiting"}}, "waits on you · question"},
 		{"follow-up", apitypes.RunDTO{Status: "awaiting_followup", Progress: &apitypes.RunProgress{State: "waiting"}}, "waits on you · follow-up"},
-		{"parked limit", apitypes.RunDTO{Status: "limit_wait", Progress: &apitypes.RunProgress{State: "parked"}}, "parked · limit"},
+		{"parked limit", apitypes.RunDTO{Status: "limit_wait", Progress: &apitypes.RunProgress{State: "parked"}}, "parked · limit wait"},
+		{"parked pool", apitypes.RunDTO{Status: "pool_wait", Progress: &apitypes.RunProgress{State: "parked"}}, "parked · pool wait"},
+		{"parked recovery", apitypes.RunDTO{Status: "recovery_wait", Progress: &apitypes.RunProgress{State: "parked"}}, "parked · recovery wait"},
 		{"parked paused", apitypes.RunDTO{Status: "paused", Progress: &apitypes.RunProgress{State: "parked"}}, "parked · paused"},
 		{"queued", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "queued"}}, "queued"},
 		{"planning", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "planning"}}, "planning"},
-		{"none", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "none"}}, "–"},
+		{"none", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "none"}}, ""},
+		{"unknown state", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "future"}}, ""},
 	}
 	for _, c := range cases {
 		row := progressRow(c.r)

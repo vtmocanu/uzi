@@ -866,7 +866,8 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 // byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
 // in the frozen order, else `done/total done`), `stalled · since 16:41` (health_since, UTC like
 // the other since clauses), `waits on you · plan gate|question|follow-up` by status,
-// `parked · <park word>`, `queued`, `planning`, and `–` for none or an unknown state. Only
+// `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`; none or an unknown
+// state prints no row. Only
 // the closed state enum, the integer counts and server timestamps are drawn; the active
 // milestone id is used for its position and never printed.
 func progressRow(r apitypes.RunDTO) []string {
@@ -878,7 +879,7 @@ func progressRow(r apitypes.RunDTO) []string {
 	switch p.State {
 	case runprogress.StatePercent:
 		if p.Pct == nil {
-			return row("–")
+			return nil
 		}
 		out := fmt.Sprintf("≈%d%%", *p.Pct)
 		if p.ActiveMilestoneID != "" {
@@ -905,13 +906,28 @@ func progressRow(r apitypes.RunDTO) []string {
 		}
 		return row("waits on you")
 	case runprogress.StateParked:
-		return row("parked · " + progParkWord(r.Status))
+		return row("parked · " + progressParkWord(r.Status))
 	case runprogress.StateQueued:
 		return row("queued")
 	case runprogress.StatePlanning:
 		return row("planning")
 	}
-	return row("–")
+	// none and any state this build does not know draw nothing, like the board's blank cell.
+	return nil
+}
+
+// progressParkWord is the CLI's full park wording; the 8-col board abbreviations
+// (progParkWord) stay board-local. The HOLD row already names a pause's reason.
+func progressParkWord(status string) string {
+	switch status {
+	case "limit_wait":
+		return "limit wait"
+	case "pool_wait":
+		return "pool wait"
+	case "recovery_wait":
+		return "recovery wait"
+	}
+	return "paused"
 }
 
 // nowRow renders the NOW line of `uzi run get` (PRD #1064 M5, D7): the run's

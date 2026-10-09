@@ -18,13 +18,37 @@ const (
 	boardProgNarrowWidth = 8
 )
 
+// boardProgTitleFloor is the computed title room (before the variable "#iid " prefix and the
+// judge-marker allowance, ~10 cols together) the PROG cell must leave. It keeps at least ~20
+// real title columns at every width where PROG is shown.
+const boardProgTitleFloor = 25
+
+// boardProgRoom is the title width left at the current terminal width once the PROG cell of
+// width cell is drawn next to the MILES cell.
+func (m tuiModel) boardProgRoom(cell int) int {
+	worker := 0
+	if m.width >= 120 {
+		worker = 18 // the worker column, see boardRow
+	}
+	prefix := boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost())
+	return m.width - worker - (prefix + boardMileWidth + 2 + cell + 2)
+}
+
+// boardShowProg reports whether the PROG column is drawn (PRD #2602). It is drawn exactly when
+// boardShowMile is, taking its narrow cell out of the flexible title width so MILES keeps its
+// #379 threshold; only where that would leave the title under boardProgTitleFloor (the admin
+// board with its owner and credential cells) does PROG shed first, before MILES.
+func (m tuiModel) boardShowProg() bool {
+	return m.boardShowMile() && m.boardProgRoom(boardProgNarrowWidth) >= boardProgTitleFloor
+}
+
 // boardShowProgBar reports whether the PROG cell keeps its 8-cell bar. The bar drops before
-// the percent (PRD #2602), so this threshold sits above boardMileMinWidth, shifted up by the
-// same extra prefix columns (owner, credential, cost) that shift boardShowMile.
+// the percent (PRD #2602): it needs boardProgBarMinWidth (shifted by the same extra prefix
+// columns that shift boardShowMile) and the wide cell must still leave the title its floor.
 func (m tuiModel) boardShowProgBar() bool {
 	min := boardProgBarMinWidth
 	min += boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false)
-	return m.width >= min
+	return m.boardShowProg() && m.width >= min && m.boardProgRoom(boardProgWideWidth) >= boardProgTitleFloor
 }
 
 func (m tuiModel) boardProgWidth() int {
