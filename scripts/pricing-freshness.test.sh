@@ -330,12 +330,14 @@ for date in 0000-01-01 1900-02-29 2026-02-29 2026-02-30 2026-04-31 2026-00-01 20
   anthropic 2026-01-01 https://example.com/anthropic
   bad --today "$date" --json
 done
-# macOS libc can reject year 0001 in jq's gmtime even at its known timestamp.
+# macOS libc can reject year 0001 in jq's mktime/gmtime. Probe the script's own
+# strptime | mktime | gmtime path: macOS fails at mktime, without a "gmtime/1:" prefix.
 # Only that exact capability error skips this one positive case.
 gmtime_capability=$(jq -cner '
-  try (-62135596800 | gmtime | [.[0], .[1] + 1, .[2]]
+  try ("0001-01-01" | strptime("%Y-%m-%d") | mktime | gmtime | [.[0], .[1] + 1, .[2]]
     | if . == [1,1,1] then "supported" else error("unexpected year 0001 components") end)
-  catch if . == "gmtime/1: invalid gmtime representation" then "unsupported" else error(.) end
+  catch if . == "invalid gmtime representation" or . == "gmtime/1: invalid gmtime representation"
+    then "unsupported" else error(.) end
 ' </dev/null) || die "year 0001 gmtime capability probe failed"
 for date in 0001-01-01 9999-12-31 2000-02-29 2024-02-29; do
   if [[ "$date" == 0001-01-01 && "$gmtime_capability" == unsupported ]]; then
