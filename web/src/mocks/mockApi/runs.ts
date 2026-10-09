@@ -623,7 +623,8 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    return delay({ run: { ...harnessOverlay(credentialOverlay(run)), own_agents } }, 60);
+    const decorated = harnessOverlay(credentialOverlay(run));
+    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and

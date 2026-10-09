@@ -95,7 +95,7 @@ export function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview[
       <JudgeStat label="Duration" value={durationMs !== null ? formatDuration(durationMs) : "—"} />
       <div>
         <JudgeStat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"} />
-        <div className="bg-raised/75 px-3.5 pb-2 text-[11px] text-muted">{costSubLabel(cost, "claude")}</div>
+        <div className="bg-raised/75 px-3.5 pb-2 text-[11px] text-muted">{costSubLabel(cost)}</div>
       </div>
     </div>
   );

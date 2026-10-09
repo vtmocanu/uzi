@@ -24,6 +24,14 @@ it("keeps a visible legacy row and an unavailable mixed row with recorded partia
   expect(mixed.usage).toMatchObject({ cost_status: "unreported", cost_usd: 0.61 });
 });
 
+it("detail fixtures retain the list cost status and partial amounts", async () => {
+  for (const id of ["run-closed", "run-failed"]) {
+    const listed = runListItem(mockRuns.find((r) => r.id === id)!);
+    const { run } = await mockApi.getRun(id);
+    expect(run.usage).toEqual(listed.usage);
+  }
+});
+
 it("aggregate fixtures retain the mixed run's partial contribution and separate counts", async () => {
   const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
   expect(self.lifetime.cost_usd).toBe(27.01);

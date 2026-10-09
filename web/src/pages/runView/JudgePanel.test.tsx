@@ -60,7 +60,9 @@ describe("JudgeUsageStrip", () => {
       <JudgeUsageStrip judgeRun={judgeRun({ usage: usage({ cost_status: "metered", cost_usd: 1.23 }) })} />,
     );
     expect(container.textContent).toContain("$1.23");
-    expect(container.textContent).toContain("API-equivalent · Claude SDK");
+    expect(container.textContent).toContain("API-equivalent");
+    expect(container.textContent).not.toContain("Claude SDK");
+    expect(container.textContent).not.toContain("uzi price table");
   });
 
   it("subscription: never a dollar figure even with real tokens spent — labelled, not hidden", () => {
