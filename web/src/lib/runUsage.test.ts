@@ -1307,6 +1307,16 @@ describe("m2 accounting attribution", () => {
     expect(deriveRunUsage([zero, finish({ num_turns: 2 })]).total).toMatchObject({ turns: 2, durationMs: null });
     expect(deriveRunUsage([zero, finish({ duration_ms: 5 })]).total).toMatchObject({ turns: null, durationMs: 5 });
   });
+  it.each([Number.MAX_VALUE, -Number.MAX_VALUE])("keeps overflowing aggregate metrics unknown: %s", (value) => {
+    const both = deriveRunUsage([finish({ num_turns: value, duration_ms: value }), finish({ num_turns: value, duration_ms: value })]);
+    expect(both.phases).toHaveLength(2);
+    expect(both.phases.map(phase => [phase.turns, phase.durationMs])).toEqual([[value, value], [value, value]]);
+    expect(both.total).toMatchObject({ turns: null, durationMs: null });
+    const durationOnly = deriveRunUsage([finish({ num_turns: 1, duration_ms: value }), finish({ num_turns: 1, duration_ms: value })]);
+    expect(durationOnly.total).toMatchObject({ turns: 2, durationMs: null });
+    const turnsOnly = deriveRunUsage([finish({ num_turns: value, duration_ms: 1 }), finish({ num_turns: value, duration_ms: 1 })]);
+    expect(turnsOnly.total).toMatchObject({ turns: null, durationMs: 2 });
+  });
   it("deduplicates Claude across legs, keeps lanes, frequencies and latest context", () => {
     const a = assistantUsageInst("coder", "lane-a", { input: 10, output: 2, model: "z-model" });
     const b = assistantUsageInst("coder", "lane-b", { input: 10, output: 2, model: "a-model" });
