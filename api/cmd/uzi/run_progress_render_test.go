@@ -53,6 +53,20 @@ func TestProgressRow(t *testing.T) {
 	}
 }
 
+func TestProgressRowBlockedByHint(t *testing.T) {
+	id := "fca7a801-aaaa-bbbb-cccc-dddddddddddd"
+	r := apitypes.RunDTO{Status: "awaiting_input", Progress: &apitypes.RunProgress{State: "waiting", MaybeBlockedByRunID: &id}}
+	row := progressRow(r)
+	if len(row) != 2 || row[1] != "waits on you · question · may be blocked by fca7a801" {
+		t.Errorf("got %v", row)
+	}
+	hostile := "\x1b[2J\u202E\x07evil"
+	r.Progress.MaybeBlockedByRunID = &hostile
+	if row := progressRow(r); strings.ContainsAny(row[1], "\x1b\x07\u202e") {
+		t.Errorf("hostile id reached the row: %q", row[1])
+	}
+}
+
 func TestRunGetPrintsProgressRowAndFieldIsUsageErrorWhileLive(t *testing.T) {
 	pct := 70
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{

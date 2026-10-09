@@ -40,6 +40,7 @@ func (m tuiModel) renderLaneRail() string {
 		// A milestone-structured run has a frozen list before any frame arrives (queued /
 		// just-claimed), so the block must show even with no lanes yet. usedRows for the budgeted
 		// blocks is counted BEFORE appendRailBlock, so the boundary is unmoved (D6/R3).
+		appendRailBlock(&sb, m.renderProgress())
 		appendRailBlock(&sb, m.renderMilestones())
 		if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
 			appendRailBlock(&sb, sp)
@@ -70,6 +71,7 @@ func (m tuiModel) renderLaneRail() string {
 	// usedRows for renderSpend/railRateMeters is counted on the builder BEFORE appendRailBlock, so
 	// the whole-block-or-nothing budgets keep the exact boundary they had (D6/R3); appendRailBlock
 	// only collapses the previously double-drawn blank separator to one row.
+	appendRailBlock(&sb, m.renderProgress())
 	appendRailBlock(&sb, m.renderMilestones())
 	if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
 		appendRailBlock(&sb, sp)
@@ -160,7 +162,7 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 
 // railAutoFolded reports whether the EXPANDED rail's roster plus every PRESENT protected block
 // would overrun transcriptViewport(), so the rail must fold by itself (PRD #1257 D1/D2). The
-// protected set includes the worker-name row when present, the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
+// protected set includes the worker-name row when present, the PROGRESS block (PRD #2602, above MILESTONES, no budget of its own) and the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
 // 3-line SPEND block, the run's OWN ACCOUNTS entry (three Claude rows or one Codex
 // snapshot row under a 1-row header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
 // account, the analog of the Claude own-account floor; railCodexFloorRows). Sibling Claude/Codex
@@ -185,6 +187,7 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	if len(d.lanes) == 0 {
 		return false
 	}
+	progress := m.renderProgress()
 	block := m.renderMilestones()
 	spend := d.run.Usage != nil
 	accountFloorRows := 0
@@ -198,7 +201,7 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
+	if progress == "" && block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
@@ -206,6 +209,7 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	sb.WriteString("crew\n") // stand-in title row: only its trailing "\n" counts toward the budget
 	sb.WriteString(m.railWorkerLine())
 	sb.WriteString(m.expandedRoster(now))
+	appendRailBlock(&sb, progress)
 	appendRailBlock(&sb, block)
 	if spend {
 		// renderSpend drops its 4 lines whole unless they + the 1-row separator fit under usedRows.

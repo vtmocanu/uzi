@@ -39,6 +39,7 @@ const (
 
 func sp(s string) *string       { return &s }
 func ip(n int64) *int64         { return &n }
+func ip32(n int) *int           { return &n }
 func tp(t time.Time) *time.Time { return &t }
 
 // uxModel builds a model at the lab's fixed size and theme. The renderer is rebuilt
@@ -95,6 +96,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
 		"detail-accounting-backfill":   func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
 		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
+		"detail-blocked-by":            func(d bool) string { return detailBlockedBy(d, now) },
 		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
 		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
@@ -711,7 +713,10 @@ func detailRunning(dark bool, now time.Time) string {
 		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
 		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
-		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}} // two in flight (#1176)
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, // two in flight (#1176)
+		// PRD #2602: the crew rail's PROGRESS block (TUI mock 2).
+		Progress: &apitypes.RunProgress{State: "percent", Pct: ip32(70), MilestoneDone: 2, MilestoneTotal: 4,
+			ActiveMilestoneID: "m3", Phase: "implement"}}
 	// The credential label rides the right of the header's first line, before the transport tag
 	// (PRD #295), coherent with the board's meta label for this same run id.
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
@@ -720,6 +725,18 @@ func detailRunning(dark bool, now time.Time) string {
 	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// detailBlockedBy is a run waiting on a question that mentions another live run: the PROGRESS
+// block draws the waits-on-you flag and the may-be-blocked-by hint (TUI mock 3).
+func detailBlockedBy(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll", StatusSince: tp(now.Add(-12 * time.Minute)),
+		Milestones: milestoneList, MilestonesCompleted: []string{"m1"},
+		Progress: &apitypes.RunProgress{State: "waiting", MilestoneDone: 1, MilestoneTotal: 4,
+			MaybeBlockedByRunID: sp("fca7a801-3b1c-4d52-9e0a-6c1f2d7e8a90")}}
+	m := detailBase(dark, run, now, true)
 	return m.View().Content
 }
 

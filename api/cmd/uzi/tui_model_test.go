@@ -870,6 +870,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// distinct "milesafe" tail, so only railMilestoneAgentLines' render of MilestoneAgent.AgentLabel
 	// can put it in the frame (the title yields "safe", the account label "credsafe").
 	hostileMileLabel := "\x1b[2J\u202E\x07\x01milesafe"
+	pct40 := 40
 	// A hostile per-run CredentialOverride.Label (PRD #1247 M8) exercises the crew rail's token line
 	// (railCredentialLine \u2192 railCredentialTokenLine \u2192 railOverrideMode \u2192 renderer.Plain). Its "ovrsafe"
 	// tail differs from every other marker so only THAT render path can put it in the frame. The
@@ -891,6 +892,11 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		AnthropicSecretID: &secretID, AnthropicSecretLabel: &detailCredLabel,
 		Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
 		MilestonesInProgress: []string{"m1"},
+		// PRD #2602: the PROGRESS block draws the active milestone's title (hostile above) and, when the
+		// id is not in the frozen list, the hostile id itself; Phase and the blocked-by id are server
+		// strings from untrusted text. All four go through renderer.Plain.
+		Progress: &apitypes.RunProgress{State: "percent", Pct: &pct40, MilestoneDone: 0, MilestoneTotal: 2,
+			ActiveMilestoneID: "m1", Phase: nasty + "phasesafe", MaybeBlockedByRunID: sptr("\u202E\x07\x01\x1bblk1")},
 		// A hostile per-milestone agent attribution (PRD #1224 M6). With m1 in progress AND
 		// attributed, the effective-attribution branch (D8) draws the DECLARED role
 		// (MilestoneAgent.Agent) and label (MilestoneAgent.AgentLabel) via railMilestoneAgentLines,
@@ -924,6 +930,9 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// via railMilestoneAgentLines' render of the attributed milestone's label (the title yields "safe",
 	// the account label "credsafe"). Its presence proves the PRD #1224 attribution render path ran and,
 	// paired with assertNoRawControls above, that it folded the hostile Agent/AgentLabel it drew.
+	if !strings.Contains(detailOut, "phasesafe") || !strings.Contains(detailOut, "blk1") {
+		t.Fatalf("the crew rail PROGRESS block is not drawing Phase/MaybeBlockedByRunID, so this test is not exercising the PRD #2602 render path\n%s", detailOut)
+	}
 	if !strings.Contains(detailOut, "milesafe") {
 		t.Fatalf("the crew rail is not drawing MilestoneAgent attribution, so this test is not exercising the PRD #1224 render path\n%s", detailOut)
 	}

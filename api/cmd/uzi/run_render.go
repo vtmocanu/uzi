@@ -874,7 +874,18 @@ func progressRow(r apitypes.RunDTO) []string {
 	if p == nil {
 		return nil
 	}
-	row := func(v string) []string { return []string{"PROGRESS", v} }
+	row := func(v string) []string {
+		// The hint comes from untrusted question text server-side, so the id is cleaned
+		// and cut to 8 characters before it is printed.
+		if p.MaybeBlockedByRunID != nil && *p.MaybeBlockedByRunID != "" {
+			id := []rune(cellText(*p.MaybeBlockedByRunID))
+			if len(id) > 8 {
+				id = id[:8]
+			}
+			v += " · may be blocked by " + string(id)
+		}
+		return []string{"PROGRESS", v}
+	}
 	switch p.State {
 	case runprogress.StatePercent:
 		if p.Pct == nil {
