@@ -170,9 +170,13 @@ using its own status (currently 201). It fetches no prices and changes no
 rates. Aging alone does not disable pricing; existing promotional expiry behavior remains.
 Only the hermetic script tests run in the repository gate.
 
-The planned M2 Health check will warn about recent Codex usage on models
-without a currently valid price in the API's embedded table; that check is
-not built in M1.
+The read-only `pricing.codex` [Health check](admin-health.md#codex-price-coverage)
+warns about recent Codex usage on models without a currently valid price in
+the API's embedded release table, distinguishing missing prices from expired
+promotions. It counts distinct runs whose usage last folded within seven
+days (including redelivery, not exact inference time), and caches results,
+including query failures reported as `unknown`, for ten minutes per API
+replica. It fetches no rates and does not verify price freshness.
 
 A Codex pricing edit reaches running workers through a release and worker
 roll: changing `agent/src` triggers the release's worker-tag autobump.

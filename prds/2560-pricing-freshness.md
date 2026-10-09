@@ -1,12 +1,12 @@
 # PRD #2560: Price-table freshness reminders and Codex price coverage
 
-**Status**: Draft. Child 2 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2559 (API-equivalent cost for Codex subscription runs); they overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`.
+**Status**: Implementation complete; final repository gate on the completion records is pending after commit; the weekly maintainer-local workflow remains out of scope and unshipped. Child 2 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2559 (API-equivalent cost for Codex subscription runs); they overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`.
 
 Planning facts were read at `main` `140b5c767`. External facts were checked by the maintainer on 2026-10-09 and are recorded here, because the implementing worker has no open-web access.
 
 ## Problem
 
-uzi prices runs from two hand-maintained tables, and nothing reminds anyone to re-check either:
+At planning time, uzi priced runs from two hand-maintained tables, and nothing reminded anyone to re-check either:
 
 - **Codex**: `agent/src/codex/codex-pricing.ts` (`TABLE`, version `openai-standard-2026-10-01`, four models). The table was introduced in `9d5d53b51`; `gpt-6-sol` was added in `a2970cdf9`/`3a25e7387` and `gpt-6.1-sol` in `842ddb865`, each alongside a Codex runtime bump. No row has been re-verified since it was added.
 - **Anthropic**: `api/internal/anthropicprice/anthropicprice.go` (`AnthropicPriceFetchedAt = "2026-10-03"`, used for the estimated tail of interrupted Claude sessions).
@@ -17,12 +17,12 @@ OpenAI publishes no machine-readable price list: `/v1/models` and the Codex app-
 - A model the fleet starts using has no row, so its runs read "cost unavailable". The bundled Codex catalog already lists `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-terra` and `gpt-6-luna`, none of them priced.
 - The `gpt-5.6-sol` promotional review date (2026-11-21) passes and its runs turn unavailable.
 
-The existing nudges (`task nudge:roles`, `task nudge:builtins`) report only when someone runs them, so a nudge of that shape alone would never be seen.
+The existing nudges (`task nudge:roles`, `task nudge:builtins`) required someone to run them; a nudge alone would not provide an in-app signal.
 
 ## Outcome
 
 1. The Codex price table lives in one JSON file with per-model `verified_at` and official source URLs. The agent prices from it with no rate change; the API embeds a byte-identical mirror.
-2. `task nudge:pricing` reports every Codex model verified more than 30 days ago, every Codex promotional row whose review date is within 14 days or passed, and the Anthropic table when its fetch date is more than 30 days old. Advisory: it never fails a build and never changes a rate.
+2. `task nudge:pricing` reports every Codex model verified more than 30 days ago, every Codex promotional row whose review date is within 14 days or passed, and the Anthropic table when its fetch date is more than 30 days old. Advisory: findings exit 0 and change no rate; malformed inputs exit 2. The nudge is not a gate member.
 3. The admin Health tab gains a `pricing.codex` check that warns when a Codex model with recent usage has no currently valid price in this release's table, distinguishing "no price" from "promotional price expired".
 4. A maintainer-local follow-up (Out of scope) adds the weekly GitHub workflow that runs the nudge and opens or updates one issue.
 
@@ -83,7 +83,7 @@ Acceptance examples (all dates UTC):
 - New Store method and query in `api/internal/store/queries/health.sql`, taking an injected `@cutoff` (the Service's clock minus 7 days, never database `now()`) and `@priced` (`codexprice.PricedModels` at that clock): `SELECT model, COUNT(DISTINCT run_id) AS runs FROM run_usage WHERE harness = 'codex' AND updated_at >= @cutoff AND model <> ALL(@priced::text[]) GROUP BY model ORDER BY runs DESC, model ASC LIMIT 11`. `run_usage.harness` exists (migration 00226), so no join. Filtering priced models in SQL before the limit means supported models can never fill the window and hide an unpriced one.
 - `updated_at` is the last fold time of the usage row, including redelivery, not exact inference time; the check's wording says "recent Codex usage", not "used in the last 7 days".
 - Evidence: one `HealthEvidenceDTO` per returned model (at most 10), `label` = model and `value` = `N runs, no price` or `N runs, promotional price expired` (from `Coverage`), both through the existing `safe()` bound (`maxEvidenceBytes`); an eleventh row becomes a single `and more` evidence row.
-- Severity: `warn` with any finding; `ok` otherwise; `unknown` on query failure; never `danger`.
+- Severity: `warn` with any finding; `ok` otherwise, with summary "no recent Codex usage on unpriced models"; `unknown` on query failure, including the five-second query deadline; no `danger` band. Successful reads and failures use the same ten-minute cache.
 - Cost: `Evaluate` runs on every admin Health GET and once a minute per replica in the episode reconciler, and there is no index on `run_usage.updated_at`. Memoize this check's result in the Service for 10 minutes (single shared result, injected clock), so the scan runs at most six times an hour per replica. The refresh is synchronized so concurrent evaluations never start more than one scan; a query failure is cached as `unknown` and never leaves an expired `ok` in place. The warning can therefore appear up to 10 minutes late; `docs/admin-health.md` says so. No new index or migration.
 - Version skew: the check compares against the api's embedded table while workers price with their own copy. The two normally agree (a table change rolls the fleet via the autobump above); during a roll or under a per-cluster `workers.image.tag` override they can differ for that window. Accepted and documented.
 
@@ -101,7 +101,7 @@ Red-before/green-after for each new behaviour.
 - API `codexprice`: byte-equality mirror test; loader rejects each malformed case; a `Coverage` differential table: unknown model gives `NoPrice`; `gpt-5.6-sol` at 2026-11-20 gives `Priced`, at 2026-11-21 and 2026-11-22 gives `PromoExpired`; `gpt-6.1-sol` gives `Priced`; `PricedModels` is sorted, includes `gpt-5.6-sol` on 2026-11-20 and excludes it on 2026-11-21.
 - API `healthsvc` unit test with a fake Store (follow `healthsvc_test.go`): warn with both reason labels, the 10-row cap plus `and more`, ok, unknown on store error, memoization (two evaluations within 10 minutes call the Store once; after 10 minutes, twice; concurrent evaluations on an expired cache call it once; a store error after an `ok` yields `unknown`, not the stale `ok`).
 - Live-DB test for the query in an existing `*LiveDB` package: claude rows excluded, cutoff boundary, priced filter, distinct-run count, ordering.
-- Registry inventory updates (each asserts the exact 17-check set and must become 18): `api/internal/healthsvc/scope_test.go`, `api/internal/healthsvc/healthsvc_test.go` (ordered `wantIDs`), `api/internal/handler/health_admin_livedb_test.go`, `web/src/mocks/data/health.ts`, `web/src/components/HealthOverviewCard.test.tsx`, `web/src/pages/AdminHealth.test.tsx` (per-group tallies). Every fake implementing the healthsvc Store interface gains the new method.
+- Registry inventories and presentation tallies were updated from the planning baseline of 17 checks to the completed 18-check registry: `api/internal/healthsvc/scope_test.go`, `api/internal/healthsvc/healthsvc_test.go` (ordered `wantIDs`), `api/internal/handler/health_admin_livedb_test.go`, `web/src/mocks/data/health.ts`, `web/src/components/HealthOverviewCard.test.tsx`, `web/src/pages/AdminHealth.test.tsx` (per-group tallies). Every fake implementing the healthsvc Store interface gains the new method.
 - Script: `scripts/pricing-freshness.test.sh` driven by `--today`: 30 versus 31 days, promotional 15/14/0/-1 days, Anthropic 30 versus 31 days, malformed JSON and a missing Go constant each exit 2. Wire it into `gate:repo` beside the existing `scripts/*.test.sh` entries.
 
 ## Milestones
@@ -122,6 +122,53 @@ The `pricing.codex` check, Store method and query, memoization, the registry inv
 
 Acceptance: example 4; `uzi admin health --all` lists the check; `task gate:api`, `task gate:web`, `task check-docs:web` green.
 
+## Completion and verification record
+
+All functional work in M1 and M2 is complete. The following direct evidence
+was supplied and verified by the lead; full gates were not rerun for the final
+serial documentation unit.
+
+- [x] M1 completed at `2c5bc9e9`: canonical JSON and API mirror, validation,
+  sync and byte-equality guard, coverage helpers, freshness nudge and docs.
+  Full agent, API, repository and docs checks passed (log suffixes E1XVHf,
+  73PkDR, jCpweD and S6dPbQ, each EXIT=0).
+- [x] M2 backend completed at `665ba3d6`: seven-day fold query, distinct-run
+  counts, filtering before the limit, reason labels, evidence cap, five-second
+  query deadline and ten-minute cache for successful reads and failures.
+  Full API passed (J4m1ew, EXIT=0). The full throwaway store integration run
+  passed (of5dtT, EXIT=0), including
+  `TestRecentUnpricedCodexModelsLiveDB`; 2465 tests passed, zero skipped.
+- [x] M2 presentation completed at `6ca777575e2000f3d0877e8b1822a6becb026ddf`:
+  18-check inventories, Health and Overview evidence with docs links, CLI
+  bounded continuation rows in default attention and `--all`, JSON unchanged.
+  Full API passed (so667s, EXIT=0), and full web passed, including docs
+  (xD6MK7, EXIT=0). Focused CLI race tests, 48 web tests and typecheck passed.
+- [x] Acceptance examples **1–3** directly verified by M1 hermetic freshness
+  tests: Codex 30/31-day boundary, promotional 15/14/0/past boundaries and
+  Anthropic 30/31-day boundary. Rates and recorded verification dates were
+  preserved; these checks did not perform a new price verification.
+- [x] Acceptance examples **5–6** directly verified by M1 mirror-drift and
+  malformed-schema tests in the agent and API. Implemented validation also
+  rejects malformed raw UTF-8 and unpaired Unicode surrogate escapes before
+  replacement decoding, including overwritten string values; final decoded
+  duplicate fields retain ordinary last-key-wins semantics.
+- [x] Acceptance example **4** directly verified by health-service and CLI
+  tests for both reason labels, warning and empty-result wording, plus the
+  named live-DB test for harness/cutoff/filter/distinct/order behavior.
+  Isolated SQL mutations removing DISTINCT or limiting before filtering
+  compiled and made the actual named live test fail on expected rows; the
+  baseline passed with zero skips. Cache TTL and copy-control mutations also
+  failed as expected.
+- [x] Final M2 documentation and records cover operator behavior, price-update
+  guidance, instance scope, the human coverage decision and the Unreleased
+  entry; the PRD will move to prds/done after final validation.
+- [ ] **Pending lead validation:** the final repository gate on these records
+  after commit. M1 repository validation passed; it is not evidence that this
+  final M2 records gate has run.
+- [ ] **Out of scope, unshipped:** weekly maintainer-local workflow follow-up,
+  including its bot-owned issue lifecycle. No workflow file was changed.
+  The other exclusions above remain out of scope.
+
 ## Decision Log
 
 - **D1. Hand-maintained, versioned tables; no live source.** OpenAI publishes no machine-readable rate catalog (checked 2026-10-09). Rejected: scraping pricing pages (fragile, and an automatic overwrite of a value that prices runs); a community price list (unofficial, new runtime dependency and egress).
@@ -133,3 +180,4 @@ Acceptance: example 4; `uzi admin health --all` lists the check; `task gate:api`
 - **D7. The weekly workflow is maintainer-local.** Worker PATs cannot push workflow files; including it would lose the whole branch at push.
 - **D8. Per-model `verified_at`.** Adding one model must not make older rows look freshly checked.
 - **D9. The nudge also covers the Anthropic table, by its existing date constant.** Same staleness problem, near-zero cost; the user chose to include it. Rejected: migrating it to JSON in this PRD.
+- **D10. Human-approved instance scope and coverage record.** The approved final serial M2 plan explicitly extends the current instance enumerations with `pricing.codex`, superseding the older statement that every check outside `db`, `controller.report`, `loops` and `fleet.roll` is owner-scoped. The human requirements record describes read-only recent Codex coverage against the same release table, no rate fetch, warning findings and unknown query failures, both cached ten minutes per replica. (AI-synced 2026-10-09)

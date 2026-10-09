@@ -2194,8 +2194,8 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 rationale, and the deferred items (version skew, per-connection sync freshness).
 
 The health registry supplies each check's `scope` (#2293): `db`,
-`controller.report`, `loops` and `fleet.roll` are `instance`; the rest are
-`owner`. `fleet.roll` remains instance infrastructure even for a single owner.
+`controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
+the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
 status still cover the full registry. Episodes, admin Slack notices, banner
@@ -2204,6 +2204,16 @@ the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
 sends no admin DM and raises no banner; owner run-health routing is unchanged.
+
+`pricing.codex` compares recent Codex usage folds against the API's embedded
+release price table. `codexprice.PricedModels` filters the usage query and
+`codexprice.Coverage` supplies the reason, both at the same Service clock.
+A ten-minute per-replica cache covers successful reads and failures. Workers price from their own copy; a roll or worker image tag
+override can produce accepted temporary skew. This read-only check fetches
+no rates and does not explain individual run costs. See
+[PRD #2560](prds/2560-pricing-freshness.md) for the decisions and
+[Codex price coverage](docs/admin-health.md#codex-price-coverage) for the
+observation window, evidence bounds and failure behavior.
 
 The web derives blocker count/cause from server scope with no client ID map.
 A present `blocking` is authoritative; an absent field conservatively uses
