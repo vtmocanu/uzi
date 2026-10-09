@@ -65,8 +65,8 @@ export class CrossCheckRunner {
     });
   }
 
-  async snapshotBootCodeSnapshots(): Promise<CodeSnapshotBootCandidate[]> {
-    return await this.git.discoverCodeSnapshots();
+  async snapshotBootCodeSnapshots(signal?: AbortSignal): Promise<CodeSnapshotBootCandidate[]> {
+    return await this.git.discoverCodeSnapshots(signal);
   }
 
   async cleanupBootCodeSnapshots(candidates: CodeSnapshotBootCandidate[], signal: AbortSignal): Promise<void> {

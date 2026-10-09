@@ -79,6 +79,85 @@ for (const failure of ["none", "snapshot", "cleanup"] as const) {
   });
 }
 
+for (const mode of ["deadline", "shutdown"] as const) {
+  it(`CODE boot discovery ${mode} settles behind a held lock without releasing serialization`, async (t) => {
+    const fx = makeFixture({ "source.txt": "code\n" });
+    const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    const abort = new AbortController();
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const events: string[] = [];
+    let fallback: NodeJS.Timeout | undefined;
+    let shutdown: NodeJS.Timeout | undefined;
+    let holder: Promise<void> | undefined;
+    try {
+      const bare = await git.ensureClone(fx.originPath, "");
+      const head = execFileSync("git", ["-C", bare, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      await git.pinCodeSnapshot(bare, "lead", head, head, true, 1);
+      execFileSync("git", ["-C", bare, "update-ref", "refs/uzi-cross-check/unrelated", head]);
+      const refs = () => execFileSync("git", ["-C", bare, "show-ref"], { encoding: "utf8" });
+      const before = refs();
+      holder = git.withBareLock(bare, async () => { acquired(); await held; events.push("released"); });
+      await ready;
+      // The fallback completes an unbounded implementation, yielding an assertion failure rather than a test timeout.
+      fallback = setTimeout(release, 250);
+      const discover = git.discoverCodeSnapshots.bind(git);
+      t.mock.method(git, "discoverCodeSnapshots", async (signal?: AbortSignal) => {
+        events.push("discover");
+        if (mode === "shutdown") shutdown = setTimeout(() => abort.abort(), 10);
+        return discover(signal, mode === "deadline" ? 10 : 30_000);
+      });
+      const deletion = t.mock.method(git, "deleteCodeSnapshot", async () => { events.push("deleted"); });
+      let candidates: unknown;
+      const client = {
+        register: async () => { events.push("register"); return { worker_id: "worker" }; },
+        hasFeature: () => false, heartbeat: async () => {},
+        claimRun: async () => { abort.abort(); return null; },
+        claimChat: async () => null, claimCrossCheck: async () => null,
+      } as unknown as WorkerClient;
+      const checker = new CrossCheckRunner(client, git, nullLogger(), { model: { run: async () => "" } });
+      const cleanup = checker.cleanupBootCodeSnapshots.bind(checker);
+      t.mock.method(checker, "cleanupBootCodeSnapshots", async (value: Parameters<typeof cleanup>[0], signal: AbortSignal) => {
+        candidates = value;
+        await cleanup(value, signal);
+      });
+      const runner = { snapshotBootRecoveries: async () => [], resumePendingRecoveries: async () => {},
+        settlePendingPredecessors: async () => {}, protectRecoveryTerminalDeps: (deps: unknown) => deps,
+      } as unknown as RunRunner;
+      const config = loadConfig({ UZI_API_URL: "http://example.com", UZI_WORKER_TOKEN: "worker-token" });
+      config.pollIntervalMs = config.chatPollMs = config.heartbeatIntervalMs = 2;
+      const outbox = { isDisabled: () => false, uncleanRuns: () => [], runsWithPending: () => [],
+        listPendingTerminals: () => [], listPendingFinalizes: () => [], } as unknown as Outbox;
+      const worker = new Worker(config, client, runner, {} as ChatRunner, {} as JudgeRunner,
+        {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }), outbox,
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        () => ({ collect: () => ({}) }) as unknown as StatsCollector,
+        undefined, undefined, undefined, undefined, checker);
+      await worker.run(abort.signal);
+      assert.ok(!events.includes("released"), "worker must settle discovery before the held lock releases");
+      if (mode === "deadline") {
+        assert.ok(events.includes("register"), "deadline must allow registration to continue");
+        assert.deepEqual(candidates, [], "cancelled discovery cannot authorize cleanup");
+      }
+      clearTimeout(fallback);
+      let followerRan = false;
+      const follower = git.withBareLock(bare, async () => { followerRan = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(followerRan, false, "cancelled waiter cannot let a follower overtake the holder");
+      release();
+      await holder;
+      await follower;
+      assert.equal(followerRan, true);
+      assert.equal(deletion.mock.callCount(), 0, "no deferred continuation may delete refs");
+      assert.equal(refs(), before, "discovery cannot delete, rebind or mutate unrelated refs");
+    } finally {
+      clearTimeout(fallback); clearTimeout(shutdown); release?.(); await holder; fx.cleanup();
+    }
+  });
+}
+
 it("real Git CODE boot sweep deletes terminal/foreign CLOSED refs and retains uncertain observations", async () => {
   const fx = makeFixture({ "source.txt": "code\n" });
   const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());

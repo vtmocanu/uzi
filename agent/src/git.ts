@@ -4210,47 +4210,72 @@ export class GitCache {
     });
   }
 
-  /** At most 256 known bares and 256 refs per bare, no retries; each git call uses GIT_TIMEOUT_MS.
-   * An unreadable bare is retained and does not block sibling discovery. */
-  async discoverCodeSnapshots(): Promise<CodeSnapshotBootCandidate[]> {
-    const result: CodeSnapshotBootCandidate[] = [];
-    let directory: Awaited<ReturnType<typeof fs.opendir>>;
-    try { directory = await fs.opendir(this.reposRoot); }
-    catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw cause;
-    }
-    let count = 0;
-    for await (const entry of directory) {
-      if (++count > 256) break;
-      const barePath = path.join(path.resolve(this.reposRoot), entry.name);
-      try {
-        await this.assertOwedBare(barePath);
-        await this.withLock(barePath, async () => {
-          const output = await this.runGit(barePath,
-            ["for-each-ref", "--count=257", "--format=%(refname) %(objectname)", "refs/uzi-cross-check/"]);
-          if (Buffer.byteLength(output) > 65536) return;
-          const lines = output.split("\n").filter(Boolean);
-          if (lines.length > 256) return;
-          for (const line of lines) {
-            const parts = line.split(" ");
-            const leadId = parts[0]?.slice("refs/uzi-cross-check/".length);
-            if (parts.length !== 2 || !parts[0]?.startsWith("refs/uzi-cross-check/") ||
-                !leadId || !CODE_ID.test(leadId) || !CODE_SHA.test(parts[1]!)) continue;
-            try {
-              const metadata = await this.readCodeSnapshotMetadata(barePath, leadId);
-              if (!metadata || metadata.head !== parts[1] || metadata.readers.some(r => r.state === "OPEN")) continue;
-              result.push({ barePath, leadId, head: metadata.head, metadataToken: this.codeSnapshotToken(metadata), metadata });
-            } catch { /* Unknown or malformed metadata retains this exact ref. */ }
-          }
-        });
-      } catch (cause) {
-        this.log.warn("code snapshot boot discovery retained unsafe or unreadable bare", {
-          bare: barePath, error: gitErrorMessage(cause),
-        });
+  /** At most 256 bares and 256 refs per bare, no retries, within one 30s deadline.
+   * Unreadable bares do not block siblings; cancellation discards observations and retains refs. */
+  async discoverCodeSnapshots(signal?: AbortSignal, timeoutMs = 30_000): Promise<CodeSnapshotBootCandidate[]> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid discovery deadline");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 30_000));
+    const passSignal = AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]);
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    let onAbort!: () => void;
+    const cancelled = new Promise<CodeSnapshotBootCandidate[]>((resolve) => {
+      onAbort = () => resolve([]);
+      if (passSignal.aborted) onAbort();
+      else passSignal.addEventListener("abort", onAbort, { once: true });
+    });
+    // Late filesystem completions only finish reads; no cancelled observation reaches cleanup.
+    const discover = async (): Promise<CodeSnapshotBootCandidate[]> => {
+      const result: CodeSnapshotBootCandidate[] = [];
+      if (passSignal.aborted) return [];
+      let directory: Awaited<ReturnType<typeof fs.opendir>>;
+      try { directory = await fs.opendir(this.reposRoot); }
+      catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw cause;
       }
+      let count = 0;
+      for await (const entry of directory) {
+        if (passSignal.aborted || ++count > 256) break;
+        const barePath = path.join(path.resolve(this.reposRoot), entry.name);
+        try {
+          await this.assertOwedBare(barePath,
+            { maxBytes: 32, timeoutMs: deadline - Date.now(), signal: passSignal });
+          await this.withLock(barePath, async () => {
+            if (passSignal.aborted) return;
+            const read = await this.readBare(barePath,
+              ["for-each-ref", "--count=257", "--format=%(refname) %(objectname)", "refs/uzi-cross-check/"],
+              { maxBytes: 65536, timeoutMs: deadline - Date.now(), signal: passSignal });
+            if (read.truncated || passSignal.aborted) return;
+            const output = read.text;
+            const lines = output.split("\n").filter(Boolean);
+            if (lines.length > 256) return;
+            for (const line of lines) {
+              if (passSignal.aborted) return;
+              const parts = line.split(" ");
+              const leadId = parts[0]?.slice("refs/uzi-cross-check/".length);
+              if (parts.length !== 2 || !parts[0]?.startsWith("refs/uzi-cross-check/") ||
+                  !leadId || !CODE_ID.test(leadId) || !CODE_SHA.test(parts[1]!)) continue;
+              try {
+                const metadata = await this.readCodeSnapshotMetadata(barePath, leadId);
+                if (passSignal.aborted || !metadata || metadata.head !== parts[1] || metadata.readers.some(r => r.state === "OPEN")) continue;
+                result.push({ barePath, leadId, head: metadata.head, metadataToken: this.codeSnapshotToken(metadata), metadata });
+              } catch { /* Unknown or malformed metadata retains this exact ref. */ }
+            }
+          }, passSignal);
+        } catch (cause) {
+          this.log.warn("code snapshot boot discovery retained unsafe or unreadable bare", {
+            bare: barePath, error: gitErrorMessage(cause),
+          });
+        }
+      }
+      return passSignal.aborted ? [] : result;
+    };
+    try { return await Promise.race([discover(), cancelled]); }
+    finally {
+      clearTimeout(timer);
+      passSignal.removeEventListener("abort", onAbort);
     }
-    return result;
   }
 
   async anchorRecoveryHead(
@@ -8542,7 +8567,7 @@ export class GitCache {
   }
 
   /** Worker-only directories are the ownership root; runner-provided Git config is not. */
-  private async assertOwedBare(barePath: string): Promise<void> {
+  private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions): Promise<void> {
     const root = path.resolve(this.reposRoot);
     if (typeof barePath !== "string" || path.dirname(barePath) !== root || path.resolve(barePath) !== barePath) {
       throw new Error("owed candidates require a known worker bare path");
@@ -8554,7 +8579,9 @@ export class GitCache {
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
             (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
     }
-    if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") {
+    const args = ["rev-parse", "--is-bare-repository"];
+    const read = readOptions ? await this.readBare(barePath, args, readOptions) : undefined;
+    if (read?.truncated || (read ? read.text : await this.runGit(barePath, args)).trim() !== "true") {
       throw new Error("owed candidates require a bare repository");
     }
   }
@@ -9352,7 +9379,7 @@ export class GitCache {
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
    * let a later mutation overtake the holder and violate serialization. */
-  private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
     const scope = this.boundaryProcesses.getStore();
     let started = false;
@@ -9368,24 +9395,26 @@ export class GitCache {
       if (started || settled) return;
       settled = true;
       removeAbortListener();
-      rejectResult(scope?.signal.aborted
+      rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
         ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE)
         : new CheckpointSoftDeadlineError());
     };
-    if (scope) {
+    if (scope || signal) {
       removeAbortListener = (): void => {
-        scope.signal.removeEventListener("abort", abortBeforeAcquisition);
-        scope.softSignal?.removeEventListener("abort", abortBeforeAcquisition);
+        signal?.removeEventListener("abort", abortBeforeAcquisition);
+        scope?.signal.removeEventListener("abort", abortBeforeAcquisition);
+        scope?.softSignal?.removeEventListener("abort", abortBeforeAcquisition);
       };
-      if (scope.signal.aborted || scope.softSignal?.aborted) abortBeforeAcquisition();
+      if (signal?.aborted || scope?.signal.aborted || scope?.softSignal?.aborted) abortBeforeAcquisition();
       else {
-        scope.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
-        scope.softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        signal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        scope?.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        scope?.softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
       }
     }
     const run = async (): Promise<void> => {
       if (settled) return;
-      if (scope?.signal.aborted || scope?.softSignal?.aborted) {
+      if (signal?.aborted || scope?.signal.aborted || scope?.softSignal?.aborted) {
         abortBeforeAcquisition();
         return;
       }

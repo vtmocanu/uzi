@@ -71,24 +71,29 @@ it("new worker treats an old API claim with absent code consent as disabled", as
 it("legacy code gate snapshots committed work locally, ignoring dirty scratch and making no checkpoint publication", async (t) => {
   t.mock.method(client, "codeCrossCheckStatus", async () => ({ stage: "code", result: "no_row" }));
   let expected = "";
-  let submitted: unknown;
+  let expectedBase = "";
+  let gateResult: unknown;
+  let submitted: Parameters<WorkerClient["submitCodeCrossCheck"]>[2] | undefined;
   t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _gen: number, snapshot: Parameters<WorkerClient["submitCodeCrossCheck"]>[2]) => {
     submitted = snapshot;
-    assert.ok("head_commit" in snapshot);
-    assert.equal(snapshot.head_commit, expected);
-    return record(snapshot.head_commit, snapshot.base_commit);
+    return "head_commit" in snapshot ? record(snapshot.head_commit, snapshot.base_commit) : record();
   });
   const publish = t.mock.method(client, "publishCheckpoint", async () => { throw new Error("unexpected remote checkpoint"); });
   const exec: Executor = { run: async (ctx) => {
+    expectedBase = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     expected = commit(ctx);
     fs.mkdirSync(path.join(ctx.worktreePath, ".uzi/scratch"), { recursive: true });
     fs.writeFileSync(path.join(ctx.worktreePath, ".uzi/scratch/dirty"), "uncommitted");
-    assert.deepEqual(await ctx.codeCrossCheckGate!({ interlocked: false }), { action: "proceed" });
+    gateResult = await ctx.codeCrossCheckGate!({ interlocked: false });
     return { branch: ctx.branch };
   } };
   const forge = fakeGitlab();
   await runner(exec, forge.gitlab, undefined, { checkpointIntervalMs: 0 }).execute(gitlabClaim(2171, { code_cross_check_required: true, claim_generation: 1 }));
-  assert.ok(submitted);
+  assert.ok(submitted && "head_commit" in submitted);
+  assert.equal(submitted.head_commit, expected, "submitted SHA must equal original committed H");
+  assert.equal(submitted.base_commit, expectedBase, "submitted base must equal original default commit");
+  assert.notEqual(expected, expectedBase);
+  assert.deepEqual(gateResult, { action: "proceed" });
   assert.equal(publish.mock.callCount(), 0);
 });
 
@@ -128,15 +133,18 @@ it("deadline read lets the server settle pending timeout without another snapsho
 });
 
 it("unknown persisted status proceeds without snapshot or resubmission", async () => {
+  let posts = 0, snapshots = 0;
   const result = await checkCode({
     client: {
       codeCrossCheckStatus: async () => { throw new Error("unknown status"); },
-      submitCodeCrossCheck: async () => { assert.fail("unknown read cannot authorize POST"); },
+      submitCodeCrossCheck: async () => { posts++; throw new Error("unexpected POST"); },
     },
     runId: "lead", generation: 1, signal: new AbortController().signal,
-    snapshot: async () => { assert.fail("unknown read cannot authorize snapshot"); },
+    snapshot: async () => { snapshots++; throw new Error("unexpected snapshot"); },
   });
   assert.equal(result, undefined);
+  assert.equal(posts, 0);
+  assert.equal(snapshots, 0);
 });
 
 it("terminal no-child refusal releases only the locally captured snapshot", async (t) => {
@@ -148,11 +156,10 @@ it("terminal no-child refusal releases only the locally captured snapshot", asyn
     return { ...record(head, snapshot.base_commit), outcome: "failed", reason_class: "checker_unavailable" };
   });
   const remove = git.deleteCodeSnapshot.bind(git);
+  const observations: { tip: string; checked: string; bare: string; id: string }[] = [];
   const deleted = t.mock.method(git, "deleteCodeSnapshot", async (bare: string, id: string, checked: string, proof?: Parameters<typeof git.deleteCodeSnapshot>[3]) => {
-    assert.equal(await git.codeSnapshotTip(bare, id), head);
-    assert.equal(checked, head);
+    observations.push({ tip: await git.codeSnapshotTip(bare, id), checked, bare, id });
     await remove(bare, id, checked, proof);
-    await assert.rejects(git.codeSnapshotTip(bare, id));
   });
   const exec: Executor = { run: async (ctx) => {
     commit(ctx);
@@ -162,6 +169,10 @@ it("terminal no-child refusal releases only the locally captured snapshot", asyn
   const forge = fakeGitlab();
   await runner(exec, forge.gitlab).execute(gitlabClaim(2173, { code_cross_check_required: true, claim_generation: 1 }));
   assert.equal(deleted.mock.callCount(), 1);
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0]!.tip, head);
+  assert.equal(observations[0]!.checked, head);
+  await assert.rejects(git.codeSnapshotTip(observations[0]!.bare, observations[0]!.id));
 });
 
 it("Codex lead records worker_unsupported before snapshot", async (t) => {

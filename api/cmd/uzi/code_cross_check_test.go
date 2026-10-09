@@ -50,6 +50,36 @@ func TestRunGetCodeCrossCheckStates(t *testing.T) {
 	}
 }
 
+func TestRunGetCodeCrossCheckMissingTerminalOutcome(t *testing.T) {
+	for _, status := range []string{"running", "awaiting_approval", "completed", "failed", "cancelled"} {
+		for _, required := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/required=%t", status, required), func(t *testing.T) {
+				fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+					"r1": {ID: "r1", Kind: "issue", Status: status, CodeCrossCheckRequired: required},
+				}}
+				out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+				if code != uzicli.ExitOK {
+					t.Fatalf("exit %d: %s", code, stderr)
+				}
+				if !required {
+					if strings.Contains(out, "CODE_CHECK") {
+						t.Fatalf("opt-out evidence invented: %s", out)
+					}
+					return
+				}
+				want := "Pending"
+				if apitypes.IsTerminalRunStatus(status) {
+					want = "outcome unavailable"
+				}
+				if !strings.Contains(out, want) || strings.Contains(out, "REASON") ||
+					(apitypes.IsTerminalRunStatus(status) && strings.Contains(out, "Pending")) {
+					t.Fatalf("missing-row outcome invented: %s", out)
+				}
+			})
+		}
+	}
+}
+
 func TestRunGetCodeCrossCheckMetadata(t *testing.T) {
 	family, model, effort, child, head := "codex", "recorded-model", "high", "checker-child", strings.Repeat("a", 40)
 	for _, usage := range []*apitypes.UsageDTO{nil, {CostStatus: "metered", CostUSD: 1.25}, {CostStatus: "subscription"}, {CostStatus: "unreported"}} {

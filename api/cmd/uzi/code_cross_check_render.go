@@ -16,6 +16,9 @@ func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
 	s := r.CodeCrossCheckSummary
 	if s == nil {
 		if r.CodeCrossCheckRequired {
+			if apitypes.IsTerminalRunStatus(r.Status) {
+				return [][]string{{"CODE_CHECK", "Incomplete · outcome unavailable"}}
+			}
 			return [][]string{{"CODE_CHECK", "Pending · evidence unavailable"}}
 		}
 		return nil

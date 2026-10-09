@@ -329,7 +329,7 @@ export class Worker {
       typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
     let bootCodeSnapshots: Awaited<ReturnType<CrossCheckRunner["snapshotBootCodeSnapshots"]>> = [];
     try {
-      bootCodeSnapshots = structuredClone(await this.crossCheckRunner?.snapshotBootCodeSnapshots?.() ?? []);
+      bootCodeSnapshots = structuredClone(await this.crossCheckRunner?.snapshotBootCodeSnapshots?.(signal) ?? []);
     } catch {
       this.log.warn("code snapshot boot discovery failed; snapshots retained");
     }

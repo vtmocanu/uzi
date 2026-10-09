@@ -60,6 +60,19 @@ it("production dedicated claim client discriminates stages and retains plan requ
   assert.equal((await client().claimCrossCheck())?.cross_check?.stage, "code");
 });
 
+it("production code claim rejects lead identifiers with trailing newline or controls", async (t) => {
+  const cross_check = { stage: "code", lead_run_id: "valid_lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "plan", base_commit: "a".repeat(40), head_commit: "d".repeat(40), code_context: {} };
+  for (const suffix of ["", "\n", "\r", "\u0000", "\u001b", "\u202e"]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(makeClaim({ kind: "cross_check",
+      cross_check: { ...cross_check, lead_run_id: cross_check.lead_run_id + suffix } as NonNullable<ReturnType<typeof makeClaim>["cross_check"]> }),
+      { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+    if (suffix) await assert.rejects(client().claimCrossCheck(), /invalid cross-check claim/);
+    else assert.equal((await client().claimCrossCheck())?.cross_check?.lead_run_id, "valid_lead");
+  }
+});
+
 it("production code verdict client rejects duplicate IDs, non-ASCII IDs and actual UTF-8 bounds before HTTP", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({}));
   const finding = { id: "F1", severity: "major" as const, path: "source.ts", line: 1, title: "defect", detail: "" };

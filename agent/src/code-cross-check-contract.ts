@@ -73,7 +73,7 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     || typeof v.deadline_at !== "string" || !Number.isFinite(Date.parse(v.deadline_at))
     || !bounded(v.plan_md, 256 * 1024)) return invalid();
   if (v.stage === "code") {
-    if (!/^[A-Za-z0-9_-]+(?![\\s\\S])/.test(v.lead_run_id as string) || v.base_commit.length !== 40 || (v.candidate_digest as string).length !== 64 || v.round !== 1 || !/^[a-f0-9]{64}$/.test(v.candidate_digest as string) || typeof v.head_commit !== "string" || v.head_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.head_commit)
+    if (!/^[A-Za-z0-9_-]+(?![\s\S])/.test(v.lead_run_id as string) || v.base_commit.length !== 40 || (v.candidate_digest as string).length !== 64 || v.round !== 1 || !/^[a-f0-9]{64}$/.test(v.candidate_digest as string) || typeof v.head_commit !== "string" || v.head_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.head_commit)
       || v.code_context === undefined || Buffer.byteLength(JSON.stringify(v.code_context)) > 512 * 1024
       || (v.guidance_snapshot !== undefined && !bounded(v.guidance_snapshot, 8192))) return invalid();
     return { ...v, guidance_snapshot: v.guidance_snapshot ?? "" } as unknown as ClaimCodeCrossCheck;

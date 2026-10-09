@@ -84,7 +84,15 @@
     "findings": {},
     "interrupted_at": "2020-01-02T03:04:05Z",
     "finalized_at": "2020-01-02T03:04:05Z",
-    "deadline_at": "2020-01-02T03:04:05Z"
+    "deadline_at": "2020-01-02T03:04:05Z",
+    "usage": {
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "cost_usd": 1.5,
+      "cost_status": "x"
+    }
   },
   "trigger_source": "x",
   "milestones": [
