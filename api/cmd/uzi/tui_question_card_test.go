@@ -204,6 +204,50 @@ func TestTUIQuestionCardLosslessFieldsAndGuards(t *testing.T) {
 	}
 }
 
+func TestTUIQuestionCardViewPreservesWholeWords(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		for _, word := range []string{
+			"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789END",
+			strings.Repeat("a", 245) + "END",
+		} {
+			for _, field := range []string{"header", "question", "label", "description"} {
+				t.Run(fmt.Sprintf("dark=%t/%s/%d", dark, field, len(word)), func(t *testing.T) {
+					q := map[string]any{"header": "Header", "question": "Choose"}
+					option := map[string]any{"label": "Choice", "description": "Details"}
+					switch field {
+					case "header", "question":
+						q[field] = word
+					case "label", "description":
+						option[field] = word
+					}
+					q["options"] = []any{option}
+					raw, err := json.Marshal(map[string]any{"questions": []any{q}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					m := cardModel(t, string(raw))
+					m.height, m.dark = 100, dark
+					m.renderer, err = newTUIRenderer(m.transcriptWidth(), dark)
+					if err != nil {
+						t.Fatal(err)
+					}
+					rows := cardRows(m.View().Content)
+					if len(rows) > 12 || strings.Contains(strings.Join(rows, "\n"), "… +") {
+						t.Fatalf("fixture must show complete pinned card: %q", rows)
+					}
+					var prose strings.Builder
+					for _, row := range rows {
+						prose.WriteString(strings.TrimSpace(strings.TrimPrefix(row, "┃")))
+					}
+					if !strings.Contains(prose.String(), word) {
+						t.Fatalf("%s lost characters at a wrap boundary: want %q in %q", field, word, prose.String())
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestTUIQuestionCardMalformedPayloadBeyondCellCap(t *testing.T) {
 	m := cardModel(t, strings.Repeat("x", 245)+"raw-tail")
 	rows := cardRows(m.View().Content)
@@ -279,6 +323,108 @@ func TestTUIQuestionCardPausedContentAnchor(t *testing.T) {
 	m = cardUpdateZ(t, m)
 	if !m.detail.follow || m.detail.scroll != 12 || !strings.Contains(m.View().Content, "anchor-line-070") {
 		t.Fatal("toggle changed follow tail")
+	}
+}
+
+func TestTUIQuestionCardPaddedBottomNavigation(t *testing.T) {
+	for _, status := range []string{"awaiting_input", "running"} {
+		t.Run(status, func(t *testing.T) {
+			m := cardModel(t, cardFixture)
+			m.height = 24
+			for i := int32(2); i <= 70; i++ {
+				m.detail.addFrames([]laneFrame{laneFrameFromMessage(msgDTO(i, "text", "", "", "", fmt.Sprintf("anchor-line-%03d", i), time.Now()))})
+			}
+			m.detail.rebuild()
+			m.detail.focus, m.detail.follow = focusTranscript, false
+			total, vp := m.transcriptExtent()
+			m.detail.scroll = total - vp - 1
+			first := func(m tuiModel) string {
+				for _, row := range strings.Split(stripANSI(m.View().Content), "\n") {
+					if divider := strings.Index(row, "▏"); divider >= 0 {
+						content := row[divider+len("▏"):]
+						if at := strings.Index(content, "anchor-line-"); at >= 0 {
+							return strings.TrimSpace(content[at:])
+						}
+					}
+				}
+				t.Fatal("no transcript anchor in View")
+				return ""
+			}
+			anchor, offset := first(m), m.detail.scroll
+			m = cardUpdateZ(t, m)
+			m.detail.run.Status = status
+			total, vp = m.transcriptExtent()
+			if offset <= max(0, total-vp) || first(m) != anchor {
+				t.Fatal("fixture did not preserve a padded bottom anchor")
+			}
+			down := press(t, m, keyDown)
+			if down.detail.scroll != offset || down.detail.follow || first(down) != anchor {
+				t.Errorf("Down moved padded bottom: offset %d -> %d anchor %q -> %q follow %v", offset, down.detail.scroll, anchor, first(down), down.detail.follow)
+			}
+			expected := m
+			expected.detail.scroll = offset - 1
+			up := press(t, m, keyUp)
+			if up.detail.scroll != offset-1 || up.detail.follow || first(up) != first(expected) || first(up) >= anchor {
+				t.Errorf("Up must move one row older from saved anchor: offset %d -> %d anchor %q -> %q", offset, up.detail.scroll, anchor, first(up))
+			}
+			for _, stale := range []int{-100, total + 100} {
+				m.detail.scroll = stale
+				for _, key := range []string{keyDown, keyUp} {
+					got := press(t, m, key)
+					_ = got.View()
+					if got.detail.scroll < 0 || got.detail.scroll > max(0, total-1) {
+						t.Errorf("stale %d after %s: offset %d", stale, key, got.detail.scroll)
+					}
+				}
+			}
+			for _, live := range []string{"running", "claimed"} {
+				m.detail.run.Status, m.detail.follow = live, false
+				total, vp = m.transcriptExtent()
+				m.detail.scroll = max(0, total-vp) - 1
+				got := press(t, m, keyDown)
+				if !got.detail.follow || got.detail.scroll != max(0, total-vp) {
+					t.Errorf("%s normal bottom did not rearm follow", live)
+				}
+			}
+		})
+	}
+}
+
+func TestTUIQuestionCardLongSummaryAsciiWriter(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dark=%v", dark), func(t *testing.T) {
+			m := cardModel(t, `{"questions":[{"header":`+quoteJSON(strings.Repeat("long header ", 30))+`,"question":"body"}]}`)
+			m.dark = dark
+			var err error
+			m.renderer, err = newTUIRenderer(m.transcriptWidth(), dark)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+			m = cardUpdateZ(t, next.(tuiModel))
+			var buf bytes.Buffer
+			writer := colorprofile.NewWriter(&buf, nil)
+			writer.Profile = colorprofile.Ascii
+			if _, err := writer.Write([]byte(m.View().Content)); err != nil {
+				t.Fatal(err)
+			}
+			rows := cardRows(buf.String())
+			if len(rows) != 1 || !strings.HasSuffix(rows[0], ") · z expand") {
+				t.Fatalf("long summary lost closing parenthesis or remedy: %q", rows)
+			}
+			for _, row := range strings.Split(stripANSI(buf.String()), "\n") {
+				if visualWidth(row) > 100 {
+					t.Fatalf("row exceeds 100 cells: %q", row)
+				}
+			}
+			for _, width := range []int{10, 20, 35} {
+				m.width = width
+				rows := cardRows(m.View().Content)
+				if len(rows) != 1 || visualWidth(rows[0]) > width || !strings.Contains(rows[0], "z expand") {
+					t.Fatalf("narrow width %d lost remedy or overflowed: %q", width, rows)
+				}
+			}
+		})
 	}
 }
 

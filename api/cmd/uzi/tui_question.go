@@ -104,10 +104,15 @@ func (m tuiModel) questionCardLines() []string {
 				headers = append(headers, header)
 			}
 		}
-		if len(headers) > 0 {
-			title += " (" + strings.Join(headers, ", ") + ")"
+		const hint = " · z expand"
+		room := m.width - ansi.StringWidth(title+hint)
+		if len(headers) > 0 && room >= 4 {
+			title += " (" + clampVisual(strings.Join(headers, ", "), room-3) + ")"
 		}
-		return []string{clampVisual(title+" · z expand", m.width)}
+		if ansi.StringWidth(title+hint) > m.width {
+			return []string{clampVisual("┃ z expand", m.width)}
+		}
+		return []string{title + hint}
 	}
 	capRows := min(12, (budget+1)/2, budget-3)
 	if capRows < 4 {

@@ -737,8 +737,9 @@ func TestTUIQuestionAnswerViewStripsHostileFields(t *testing.T) {
 		if collapsed {
 			m = cardUpdateZ(t, m)
 		}
-		card := strings.Join(cardRows(m.View().Content), "\n")
-		assertNoRawControls(t, "question card", card)
+		raw := m.View().Content
+		assertNoRawControls(t, "question card", raw)
+		card := strings.Join(cardRows(raw), "\n")
 		for _, marker := range []string{"header-safe", "ANSWER REQUIRED"} {
 			if !strings.Contains(card, marker) {
 				t.Fatalf("hostile card marker %q never reached View: %s", marker, card)
@@ -754,8 +755,9 @@ func TestTUIQuestionAnswerViewStripsHostileFields(t *testing.T) {
 	}
 	m.detail.frames[0].Payload = json.RawMessage(hostile + "raw-card-safe")
 	m = cardUpdateZ(t, m)
-	card := strings.Join(cardRows(m.View().Content), "\n")
-	assertNoRawControls(t, "raw question card", card)
+	raw := m.View().Content
+	assertNoRawControls(t, "raw question card", raw)
+	card := strings.Join(cardRows(raw), "\n")
 	if !strings.Contains(card, "raw-card-safe") {
 		t.Fatalf("hostile raw card marker never reached View: %s", card)
 	}
