@@ -171,6 +171,15 @@ is satisfied.
   isolated live-DB, docs and Codex conformance passed; none marks the full
   agent gate as passed or substitutes for the required PR-head agent jobs.
 
+  A further serial attempt on 2026-10-09 (`D59AGw`,
+  `UZI_AGENT_TEST_CONCURRENCY=1`, `UV_THREADPOOL_SIZE=16`) was stopped by
+  the runtime's 60-minute command deadline while unit tests were still running.
+  The command tree was reaped; the log ends with
+  `task: Signal received: "terminated"` and has no final test summary or
+  recorded gate exit status.
+  This attempt is incomplete, neither a pass nor a fourth completed failing
+  run. The three completed failures above remain the local full-run results.
+
 ## Risks
 
 - **Model-id match.** A subscription run is priced only when its recorded model id exactly matches a table key; otherwise it reads "Unavailable". Checked before filing: the last 12 Codex runs on the hosted instance recorded only `gpt-6.1-sol` (26 per-model entries), which the table prices.
