@@ -306,6 +306,8 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
       let freshStarted!: () => void;
       const freshReady = new Promise<void>((resolve) => { freshStarted = resolve; });
       let cleaningUp = false;
+      let primaryFailure: { error: unknown } | undefined;
+      let cleanupFailure: { error: unknown } | undefined;
       const tickOutcomes: string[] = [];
       const claim = claimFor(2284, { kind: "issue", plan_approved: true,
         plan_md: "approved", plan_source: "seeded", config: { max_iterations: 1 },
@@ -412,11 +414,11 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         setTimer: (cb, ms) => {
           // Hold only the answer deadline; tick deadlines retain their real bounded timers.
           if (ms === 3000) {
-            const release = answerDeadline.arm(cb, ms);
+            const cancelAnswerTimer = answerDeadline.arm(cb, ms);
             answerArmed();
             // An observation can fail before the park arms; never strand a late timer.
             if (cleaningUp) answerDeadline.fire();
-            return release;
+            return cancelAnswerTimer;
           }
           const timer = setTimeout(cb, ms);
           timer.unref();
@@ -481,6 +483,8 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         assert.equal(mrCalls, 1, JSON.stringify({ states: api.states, messages: api.messages(claim.run_id), logs }));
         assert.equal(statuses(claim.run_id).at(-1), "completed", failureReason(claim.run_id));
         assert.deepEqual(questionMessageIds(claim.run_id), [questionId]);
+      } catch (error) {
+        primaryFailure = { error };
       } finally {
         cleaningUp = true;
         if (!settled) runner.shutdown();
@@ -489,12 +493,23 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         await fresh.close();
         try {
           await waitForTestEvent(running, "clarification cleanup");
+        } catch (error) {
+          cleanupFailure = { error };
         } finally {
           client.publishCheckpoint = publish;
           client.releaseCodex = release;
           client.refreshCodex = refresh;
         }
       }
+      if (primaryFailure) {
+        if (cleanupFailure) {
+          throw new AggregateError([primaryFailure.error, cleanupFailure.error],
+            primaryFailure.error instanceof Error ? primaryFailure.error.message : "clarification observation failed",
+            { cause: primaryFailure.error });
+        }
+        throw primaryFailure.error;
+      }
+      if (cleanupFailure) throw cleanupFailure.error;
     });
   }
 });

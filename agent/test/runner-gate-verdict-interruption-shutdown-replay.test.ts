@@ -168,6 +168,7 @@ describe("shutdown at an observed plan gate", () => {
         assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
         let resumedGateObserved!: () => void;
         const resumedGateReady = new Promise<void>((resolve) => { resumedGateObserved = resolve; });
+        // onState has one slot; replace the first-flight hook after that flight ended.
         api.onState(s.runId, (body) => { if (body.status === "awaiting_approval") resumedGateObserved(); });
         const resumed = s.start(claim);
         await waitForTestEvent(Promise.race([resumedGateReady, resumed.done]), "resumed held-GET gate observed");
