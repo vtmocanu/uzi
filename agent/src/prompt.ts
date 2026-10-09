@@ -366,8 +366,10 @@ export const CODEX_LONG_COMMAND_APPEND = [
  * against the CLI bundled with the Agent SDK: a Bash call past its timeout is
  * auto-backgrounded (`timedOutAfterMs`), only a standalone `sleep N` is blocked, and each
  * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. Since
- * SDK 0.3.285 a background command (explicit or auto-backgrounded) is stopped at its `timeout`,
- * default 1800000 ms, max 7200000 ms, so the long-command start carries 7200000. The
+ * SDK 0.3.285, an explicitly backgrounded command is stopped at its requested background
+ * timeout (default 1800000 ms, max 7200000 ms). An auto-backgrounded command receives the
+ * default background deadline from that transition, so the long-command start explicitly
+ * carries 7200000. The
  * exit status goes to a sidecar `.rc` file written even when the command fails, so gate output
  * cannot fake completion, and the paths are literal because shell variables do not persist
  * between Bash calls.

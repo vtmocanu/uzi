@@ -28,7 +28,7 @@ through `[0.52.0]`.)
   The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
 
 - **Claude Agent SDK 0.3.287; long worker commands keep running up to two hours ([#2551](https://github.com/vtmocanu/uzi/pull/2551)).**
-  From SDK 0.3.285 a backgrounded Bash command is stopped at its `timeout` (default 30 minutes, maximum two hours) instead of running until the turn ends. Claude agents are now told to start a command expected to outlast the 10-minute foreground limit in the background with the two-hour `timeout`; a command still stopped at the limit writes no exit-status file and its result is reported unverified, as before.
+  From SDK 0.3.285 a backgrounded Bash command is stopped at its `timeout` (default 30 minutes, maximum two hours) in addition to being stopped when the turn ends. Claude agents are now told to start a command expected to outlast the 10-minute foreground limit in the background with the two-hour `timeout`; a command still stopped at the limit writes no exit-status file and its result is reported unverified, as before.
 
 - **Ground PR description diagrams in visible flows**
   The editor now requests compact diagrams for evidenced flows, fallback chains and component interactions; an opt-in Claude/Codex evaluator compares a frozen baseline with five fixed fixtures through the real sanitizer and publication rendering pipeline.
