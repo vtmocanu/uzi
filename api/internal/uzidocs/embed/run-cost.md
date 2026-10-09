@@ -135,6 +135,47 @@ carries it as `usage_estimated_tail`). The design is in
   exists). It is shown on the run only.
 - **Claude runs only.** Codex and chat runs record no tail.
 
+## Updating prices
+
+Codex's canonical table is `agent/src/codex/codex-pricing.json`; the API
+embeds its byte-identical mirror at
+`api/internal/codexprice/codex-pricing.json`. Anthropic's estimated-tail
+rates and provenance constants live in
+`api/internal/anthropicprice/anthropicprice.go`.
+
+A human must verify the affected rates and model coverage against the
+official pricing and model pages recorded in each row's `sources`, or
+Anthropic's `AnthropicPriceSourceURL`. Update the Codex table's `version`
+when its pricing changes, and each checked row's `verified_at` to the actual
+verification date; review any `promo_review_date` against the official
+promotion terms. For Anthropic, update `AnthropicPriceTableVersion` when
+rates, model rows or pricing rules change and `AnthropicPriceFetchedAt`
+when the official pages are checked. Moving data into JSON does not
+re-verify it: the recorded dates retain their original provenance.
+
+After a Codex edit, run `task codex-pricing:sync` and include both JSON files
+in the change. Run `task nudge:pricing` to review freshness, or
+`task --output interleaved nudge:pricing -- --today 2026-11-07 --json`
+for a deterministic UTC date and findings array without Task's global
+output prefixes. The nudge reports verification/fetch dates more
+than 30 days old and promotional reviews within 14 days or already passed.
+It exits 0 whether or not there are findings; invalid sources, schema or
+arguments exit 2. It fetches no prices and changes no rates. Aging alone
+does not disable pricing; existing promotional expiry behavior remains.
+Only the hermetic script tests run in the repository gate.
+
+The planned M2 Health check will warn about recent Codex usage on models
+without a currently valid price in the API's embedded table; that check is
+not built in M1.
+
+A Codex pricing edit reaches running workers through a release and worker
+roll: changing `agent/src` triggers the release's worker-tag autobump.
+Updating the API alone does not update workers. During delivery, or with a
+cluster-specific worker image tag override, the API's embedded coverage
+table and a worker's pricing copy can temporarily differ. Anthropic's
+estimated-tail table ships with the API release. After editing this page,
+run `task docs:sync` and include its embed mirror in the change.
+
 ## The model tier is not the difference
 
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,

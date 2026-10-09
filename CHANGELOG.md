@@ -46,6 +46,9 @@ through `[0.52.0]`.)
 - **Codex subscription runs record API-equivalent cost for comparison ([#2559](https://github.com/vtmocanu/uzi/issues/2559)).**
   Codex prices either auth mode per response with uzi's pinned Standard table, retaining fail-closed handling of unknown, expired or incomplete pricing evidence; Claude keeps its SDK-computed figure. The cost is a comparison, not a bill, and subscription users may consume purchased credits. Legacy subscription rows show no estimate with tokens retained, not zero dollars; unreported runs show no per-run dollars even when a partial is stored. Self/Admin totals retain recorded partials and disclose runs without estimates and unreported runs; same-key status conflicts zero that row only. Dashboard cost is labelled API-equivalent and Claude tails read "Estimated, not in the total". No historical backfill, price/freshness, auth, capacity, SQL, schema, DTO or wire change.
 
+- **Codex pricing has one canonical data source and an advisory freshness nudge ([#2560](https://github.com/vtmocanu/uzi/issues/2560)).**
+  Codex rates now live in validated JSON with per-model verification dates and official source URLs, mirrored into the API without changing rates or recorded verification dates. `task codex-pricing:sync` updates the mirror; `task nudge:pricing` reports Codex and Anthropic dates more than 30 days old and promotional reviews within 14 days or passed, with UTC date overrides and JSON output. Findings exit 0; malformed inputs exit 2. No automatic fetching or age-based pricing disablement is added.
+
 - **Usage ranks users by total tokens**
   The per-user table now matches token Share, including Codex subscription usage. Cards and rows disclose runs without a cost estimate and unreported runs with explanatory tooltips; incomplete cost totals retain recorded partials.
 

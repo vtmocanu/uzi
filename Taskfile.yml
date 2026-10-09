@@ -414,6 +414,8 @@ tasks:
       - task: test:semgrep-parity
       - task: check:semgrep-parity
       - task: test:semgrep-gate
+      # Hermetic fixture tests only; aging real prices is advisory and never gates.
+      - task: test:pricing-freshness
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -3097,6 +3099,11 @@ tasks:
       - rm -f api/internal/uzidocs/embed/*.md
       - cp docs/*.md api/internal/uzidocs/embed/
 
+  test:pricing-freshness:
+    desc: hermetic pricing freshness CLI schema and calendar tests
+    cmds:
+      - bash scripts/pricing-freshness.test.sh
+
   # Explicit writer only; the codexprice mirror test detects drift in gates.
   codex-pricing:sync:
     desc: mirror canonical agent Codex pricing bytes into the API embed package
@@ -3142,6 +3149,13 @@ tasks:
     dir: api
     cmds:
       - go run ./cmd/roleparity
+
+  # Offline advisory: findings exit 0; invalid inputs/instrument failures exit 2.
+  # Deliberately absent from gates: only test:pricing-freshness is a gate member.
+  nudge:pricing:
+    desc: 'pricing freshness NUDGE - recorded verification and promotional review dates (never gates)'
+    cmds:
+      - bash scripts/pricing-freshness.sh {{.CLI_ARGS}}
 
   # Same contract as nudge:roles: never in a gate, exits 0 on any drift. It
   # compares each builtin byte for byte with the upstream product-agents/ file at
