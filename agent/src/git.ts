@@ -4544,9 +4544,29 @@ export class GitCache {
     });
   }
 
+  /** Check every recorded source against its existing restore pin; one incomplete source refuses all. */
+  async verifiedRetainedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      if (JSON.stringify(journal) !== JSON.stringify(expected)) return false;
+      // The finite descriptor and caller's shared recovery-operation deadline bound this pass.
+      for (const source of this.recoverySources(journal)) {
+        const tip = source.restoreTip ?? (journal.recovery && sameRecoverySource(source, journal.recovery.source)
+          ? journal.recovery.restoreTip : undefined);
+        if (!tip || !await this.verifiedRecoverySourceBytes(barePath, source, tip)) return false;
+      }
+      return true;
+    });
+  }
+
   async verifiedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoverySource, tip: string): Promise<boolean> {
     return this.withLock(barePath, async () => {
       await this.checkedRecovery(barePath, branch, key, expected);
+      return this.verifiedRecoverySourceBytes(barePath, expected, tip);
+    });
+  }
+
+  private async verifiedRecoverySourceBytes(barePath: string, expected: RecoverySource, tip: string): Promise<boolean> {
       if (!await this.verifyRecoveryClosure(barePath, tip)) return false;
       if (await this.revParse(barePath, `refs/uzi-recovery-episode/${expected.runId}/${tip}`) !== tip) return false;
       const head = (await this.runGitAsRunner(expected.clonePath, ["rev-parse", "HEAD"])).trim();
@@ -4555,7 +4575,6 @@ export class GitCache {
       return tree === expectedTree && await this.isAncestor(barePath, head, tip) &&
         (await this.runGitAsRunner(expected.clonePath, ["diff", "--name-only"])).trim() === "" &&
         (await this.runGitAsRunner(expected.clonePath, ["ls-files", "--others", "--exclude-standard"])).trim() === "";
-    });
   }
 
   async verifyRecoveryClosure(barePath: string, tip: string): Promise<boolean> {

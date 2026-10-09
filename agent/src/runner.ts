@@ -3425,6 +3425,12 @@ export class RunRunner {
         // at B/C. Caught here BEFORE the generic terminal path so a switch NEVER becomes a `failed`
         // run. Enter the same two-phase release; enterCredentialSwitch already set the flight's flags
         // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
+        if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
+            flight.completedRetainedSuccessor) {
+          await this.enterRetainedCredentialSwitch(claim, flight, runLog);
+          await batcher.close().catch(() => undefined);
+          return;
+        }
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
         if (outcome === "released") {
           // The flight ends: the finally retires the clone and preserves the HOME; the server
@@ -8449,18 +8455,18 @@ export class RunRunner {
         this.retainedLifecycleGuard(flight);
         if (required && !retainedJournal) throw new RetainedRecoveryMissingJournalError();
       } catch (error) {
-        // A switch can abort discovery or land just after it returns, when the
-        // retainedLifecycleGuard masks it as RetainedRecoveryStop. Keep unknown
-        // custody and clear the switch stamp without authorizing capture or release.
-        const switchError = error instanceof RetainedRecoveryStop ? flight.steering.lifecycleSignal().reason : error;
-        if (switchError instanceof CredentialSwitchSignal && !flight.active?.shuttingDown &&
-            !this.shuttingDownGlobal && !flight.steering.terminalLifecycleSignal().aborted &&
-            flight.steering.claimFence() === undefined) {
+        // Discovery can stop before a source identity reaches the flight. Keep unknown
+        // custody and preserve either typed abort reason after terminal precedence.
+        this.retainedTerminalGuard(flight);
+        if (error instanceof CredentialSwitchSignal ||
+            flight.cancel.signal.reason instanceof CredentialSwitchSignal ||
+            flight.steering.lifecycleSignal().reason instanceof CredentialSwitchSignal) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.retainedLocalCustody = true;
           flight.keepGuardedInventoryOpen = true;
-          throw switchError;
+          this.retainedLifecycleGuard(flight);
+          throw error;
         }
         this.retainedLifecycleGuard(flight);
         if (!(error instanceof ForeignRetainedRecoveryError)) {
@@ -8487,7 +8493,7 @@ export class RunRunner {
             }
             catch (error) {
               this.retainedLifecycleGuard(flight);
-              if (error instanceof RetainedRecoveryStop) throw error;
+              if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
               reason += "; blocker persistence unavailable";
             }
           }
@@ -9762,7 +9768,7 @@ export class RunRunner {
           }
         } catch (error) {
           this.retainedLifecycleGuard(flight);
-          if (error instanceof RetainedRecoveryStop) throw error;
+          if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
           runLog.warn("settled model turn could not clear recovery budget; retained", { error: errMessage(error) });
         }
       },
@@ -14868,6 +14874,12 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
   ): Promise<"released" | "gave_up" | "retained_stop"> {
+    // In-place callers must also stop when this flight still carries retained authority.
+    if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
+        flight.completedRetainedSuccessor) {
+      await this.enterRetainedCredentialSwitch(claim, flight, runLog);
+      return "retained_stop";
+    }
     // The generation this switch targets (equals flight.claimGeneration by construction — the
     // steering channel trips only on a generation match). Logged for provenance; the release
     // report's claim_generation is stamped by the reportState closure from flight.claimGeneration.
@@ -15161,10 +15173,150 @@ export class RunRunner {
     return { branch: `agent/issue-${claim.issue_iid}`, key: `issue-${claim.issue_iid}`, issueIid: claim.issue_iid };
   }
 
-  private retainedLifecycleGuard(flight: RunFlight): void {
+  private retainedTerminalGuard(flight: RunFlight): void {
     if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined) throw new RetainedRecoveryStop();
     if (flight.steering.isCancelled()) throw new RetainedRecoveryCancelled();
+    if (flight.steering.terminalLifecycleSignal().aborted) throw new RetainedRecoveryStop();
+  }
+
+  private retainedLifecycleGuard(flight: RunFlight): void {
+    this.retainedTerminalGuard(flight);
+    for (const signal of [flight.cancel.signal, flight.steering.lifecycleSignal()]) {
+      if (signal.aborted && signal.reason instanceof CredentialSwitchSignal) throw signal.reason;
+    }
     if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted) throw new RetainedRecoveryStop();
+  }
+
+  /** One bounded, credential-free verification pass over EXISTING evidence. Every outcome
+   * stops this flight; neither an ACK nor a verification failure grants cleanup authority. */
+  private async enterRetainedCredentialSwitch(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<void> {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.retainedLocalCustody = true;
+    flight.retainedEpisodeCustody = true;
+    flight.keepGuardedInventoryOpen = true;
+    const generation = flight.steering.pendingCredentialSwitch();
+    const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+    const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    const identity = () => {
+      this.retainedTerminalGuard(flight);
+      for (const signal of [flight.cancel.signal, flight.steering.lifecycleSignal()]) {
+        if (signal.aborted && !(signal.reason instanceof CredentialSwitchSignal)) throw new RetainedRecoveryStop();
+      }
+      if (generation === undefined || generation !== flight.claimGeneration ||
+          generation !== claim.claim_generation || flight.steering.pendingCredentialSwitch() !== generation)
+        throw new Error("retained credential switch generation changed");
+    };
+    try {
+      identity();
+      await this.git.withRecoveryOperation(lifecycle, deadline, async signal => {
+        const guard = () => {
+          identity();
+          signal.throwIfAborted();
+          if (Date.now() >= deadline) throw new Error("retained credential switch deadline exhausted");
+        };
+        const check = async () => {
+          guard();
+          const own = await withForgeRetry(() => this.client.getRunOwnership(flight.runId, signal), {
+            signal, log: runLog, schedule: [],
+          });
+          guard();
+          if (own?.status !== "running" || own.claim_generation !== generation) throw new RetainedRecoveryStop();
+        };
+        // A GET failure or lost ownership cannot authorize even a stamp-clear report.
+        await check();
+        let verified = false;
+        let finalProof: (() => Promise<void>) | undefined;
+        try {
+          const { branch, key } = this.cloneCoordinates(claim);
+          const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, branch, key, flight.runId);
+          await check();
+          const source = retained?.journal;
+          const tip = source?.recovery?.restoreTip ?? source?.restoreTip;
+          if (!retained || !source || !tip || source.runId !== flight.runId ||
+              (flight.barePath && flight.barePath !== retained.barePath) ||
+              (flight.worktreePath && flight.worktreePath !== source.clonePath) ||
+              (flight.attemptId && flight.attemptId !== source.attemptId))
+            throw new Error("retained credential switch has no exact existing restore point");
+          const snapshot = JSON.stringify(source);
+          if (!await this.git.verifiedRetainedRecoveryRestorePoint(retained.barePath, branch, key, source))
+            throw new Error("retained credential switch restore point unverified");
+          await check();
+          let guardedProof: (() => Promise<void>) | undefined;
+          if (claim.inventory_guarded === true) {
+            if (!this.recovery.enabled) throw new Error("retained credential switch guarded evidence unavailable");
+            const records = await this.recovery.snapshotBootRecords();
+            await check();
+            const record = records.find(record => record.runId === flight.runId && record.generation === generation &&
+              record.branch === branch && record.inventoryGuarded === true && record.coverageDigest &&
+              record.coverageContext?.generation === generation && record.coverageContext.runId === flight.runId &&
+              record.coverageContext.branch === branch && record.coverageContext.barePath === retained.barePath &&
+              record.sourceSha === tip);
+            if (!record) throw new Error("retained credential switch existing guarded capture unavailable");
+            guardedProof = async () => {
+              const current = await this.recovery.snapshotBootRecords();
+              guard();
+              if (!current.some(value => JSON.stringify(value) === JSON.stringify(record)) ||
+                  JSON.stringify(await this.recovery.verifiedLocalCapture(record, signal)) !== JSON.stringify(record))
+                throw new Error("retained credential switch guarded evidence changed");
+              guard();
+            };
+            const local = await this.recovery.verifiedLocalCapture(record, signal);
+            await check();
+            if (!local?.bundlePath || !local.checksum || !Array.isArray(local.prerequisiteShas) ||
+                JSON.stringify(local) !== JSON.stringify(record))
+              throw new Error("retained credential switch bundle unverified");
+            // Prerequisites are independent; the first failed closure rejects the whole proof.
+            // The finite manifest and shared operation deadline bound this loop.
+            for (const prerequisite of local.prerequisiteShas) {
+              if (!await this.git.verifyRecoveryClosure(retained.barePath, prerequisite))
+                throw new Error("retained credential switch prerequisite unverified");
+              await check();
+            }
+          }
+          // Re-read the physical identity and source coverage after all other awaited proofs.
+          finalProof = async () => {
+            const latest = await this.git.discoverRetainedRecovery(claim.repo.clone_url, branch, key, flight.runId);
+            guard();
+            if (!latest || latest.barePath !== retained.barePath || JSON.stringify(latest.journal) !== snapshot ||
+                !await this.git.verifiedRetainedRecoveryRestorePoint(retained.barePath, branch, key, source))
+              throw new Error("retained credential switch evidence changed");
+            guard();
+            await guardedProof?.();
+          };
+          await finalProof();
+          await check();
+          verified = true;
+        } catch (error) {
+          guard();
+          if (error instanceof RetainedRecoveryStop || isRunOwnershipLost(error, flight.runId)) throw error;
+          runLog.warn("retained credential switch verification failed; custody retained", { error: errMessage(error) });
+        }
+        await check();
+        await flight.batcher.close();
+        await check();
+        if (verified) {
+          try { await finalProof!(); }
+          catch (error) {
+            guard();
+            verified = false;
+            runLog.warn("retained credential switch final proof failed; custody retained", { error: errMessage(error) });
+          }
+        }
+        guard();
+        const status = verified ? "credential_switch" : "credential_switch_failed";
+        const ack = await flight.reportState({ status }, signal);
+        guard();
+        const confirmed = verified ? ack.credentialSwitchReleased === true : ack.applied === true;
+        runLog.info("retained credential switch stopped; all local work and custody retained", {
+          run_id: flight.runId, generation, status, confirmed,
+        });
+      });
+    } catch (error) {
+      runLog.warn("retained credential switch stopped without confirmed disposition; custody retained", {
+        run_id: flight.runId, generation, error: errMessage(error),
+      });
+    }
   }
 
   private retainedLifecycleSignal(flight: RunFlight): AbortSignal {
@@ -15232,6 +15384,8 @@ export class RunRunner {
           });
       }
       catch (error) {
+        this.retainedLifecycleGuard(flight);
+        if (error instanceof CredentialSwitchSignal) throw error;
         flight.runLog.warn("retained recovery blocker could not be persisted", { error: sanitizeForLog(errMessage(error)) });
         persistence = "; blocker persistence unavailable";
       }
@@ -15254,6 +15408,8 @@ export class RunRunner {
           Math.min(episode?.deadline ?? now + 300_000, now + 300_000),
           () => this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs));
       } catch (error) {
+        this.retainedLifecycleGuard(flight);
+        if (error instanceof CredentialSwitchSignal) throw error;
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";
         flight.runLog.warn("retained recovery reservation failed", { error: sanitizeForLog(message), blocker });
@@ -15366,8 +15522,8 @@ export class RunRunner {
         });
         return;
       } catch (error) {
-        if (error instanceof RetainedRecoveryStop) throw error;
         this.retainedLifecycleGuard(flight);
+        if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         if (error instanceof RecoveryClosureLimitError) { blocker = "decoded_history_limit"; await fail(); }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
         if (error === finalize || blocker === "quiescence_failed") await fail();
@@ -15376,7 +15532,10 @@ export class RunRunner {
           await fail();
         }
         try { await this.requireRetainedOwnership(flight, iteration.deadline); }
-        catch (ownershipError) { if (ownershipError instanceof RetainedRecoveryStop) throw ownershipError; }
+        catch (ownershipError) {
+          this.retainedLifecycleGuard(flight);
+          if (ownershipError instanceof RetainedRecoveryStop || ownershipError instanceof CredentialSwitchSignal) throw ownershipError;
+        }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
         if (blocker === "adoption_failed") await fail();
         if (iteration.attempts >= 3 || Date.now() >= iteration.deadline) {

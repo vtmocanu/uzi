@@ -6,6 +6,7 @@ import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, createHmac } from "node:crypto";
 import { PendingRecoveryCaptureError } from "../src/git.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
 import { deflateSync } from "node:zlib";
 import { Readable } from "node:stream";
@@ -380,6 +381,250 @@ async function seed(iid = 2512, large = false) {
   api.setOwnershipStatus(claim.run_id, "running", 2);
   return { claim, bare, clone, key: `issue-${iid}` };
 }
+it("retained recovery credential switch acknowledges verified exact generation without releasing custody", async () => {
+  await retainedSwitchRegression("capture", true);
+});
+
+it("retained recovery credential switch rejects unverified evidence and retains custody", async () => {
+  await retainedSwitchRegression("ownership", false);
+});
+
+type RetainedSwitchOptions = {
+  ack?: "lost" | "statusless" | "stale" | "idempotent";
+  deadline?: boolean;
+  proofTerminal?: "shutdown" | "fence" | "cancel";
+  terminal?: "shutdown" | "fence" | "cancel";
+  mismatch?: "pending" | "ownership";
+  guarded?: boolean;
+  unsafe?: "bundle" | "source" | "late bundle" | "late source";
+  interruption?: "execution" | "lifecycle";
+  cancelOnly?: boolean;
+};
+
+for (const ack of ["lost", "statusless", "stale", "idempotent"] as const) {
+  for (const verified of [true, false]) {
+    it(`retained recovery credential switch retains custody on ${ack} ${verified ? "release" : "clear"} ACK`, async () => {
+      await retainedSwitchRegression(verified ? "capture" : "ownership", verified, { ack });
+    });
+  }
+}
+for (const terminal of ["shutdown", "fence", "cancel"] as const) {
+  it(`retained recovery credential switch honors ${terminal} precedence`, async () => {
+    await retainedSwitchRegression("capture", true, { terminal });
+  });
+}
+for (const mismatch of ["pending", "ownership"] as const) {
+  it(`retained recovery credential switch stops on ${mismatch} generation mismatch`, async () => {
+    await retainedSwitchRegression("capture", true, { mismatch });
+  });
+}
+it("retained recovery credential switch verifies existing guarded bundle", async () => {
+  await retainedSwitchRegression("capture", true, { guarded: true });
+});
+for (const unsafe of ["bundle", "source"] as const) {
+  it(`retained recovery credential switch rejects changed ${unsafe} evidence`, async () => {
+    await retainedSwitchRegression("capture", false, { guarded: unsafe === "bundle", unsafe });
+  });
+}
+it("retained recovery credential switch preserves cancel-controller typed reason", async () => {
+  await retainedSwitchRegression("ownership", false, { cancelOnly: true });
+});
+for (const interruption of ["execution", "lifecycle"] as const) {
+  it(`retained recovery credential switch rejects unrelated ${interruption} interruption`, async () => {
+    await retainedSwitchRegression("capture", true, { interruption });
+  });
+}
+it("retained recovery credential switch rejects changed retained sibling", async () => {
+  await retainedSwitchRegression("adoption", false, { unsafe: "source" });
+});
+for (const unsafe of ["late bundle", "late source"] as const) {
+  it(`retained recovery credential switch rejects ${unsafe} change during drain`, async () => {
+    await retainedSwitchRegression("capture", false, { unsafe, guarded: unsafe === "late bundle" });
+  });
+}
+it("retained recovery credential switch during successor adoption keeps both clones", async () => {
+  await retainedSwitchRegression("adoption", true);
+});
+
+it("retained recovery credential switch during discovery keeps unknown custody", async () => {
+  await retainedSwitchRegression("discovery", false);
+});
+it("retained recovery credential switch completes bounded ownership verification on deadline", async () => {
+  await retainedSwitchRegression("ownership", false, { deadline: true });
+});
+for (const proofTerminal of ["shutdown", "fence", "cancel"] as const) {
+  it(`retained recovery credential switch honors ${proofTerminal} during verification`, async () => {
+    await retainedSwitchRegression("ownership", false, { proofTerminal });
+  });
+}
+
+async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoption" | "discovery", verified: boolean,
+  options: RetainedSwitchOptions = {}): Promise<void> {
+  const { claim, bare, clone } = await seed();
+  claim.inventory_guarded = options.guarded === true;
+  client.protocolFeatures = ["claim_generation_fence", ...(options.guarded ? ["recovery_inventory_v1"] : [])];
+  if (options.guarded) {
+    client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: [{
+      hold_id: "fixture-hold", generation: 2, inventory_guarded: true, has_available_capture: false,
+    }] });
+    client.reserveRecoveryCapture = async () => ({ capture_id: "00000000-0000-4000-8000-000000002512", state: "preparing" });
+    client.uploadRecoveryBundle = async (_run, capture, _manifest, stream) => {
+      for await (const _chunk of stream) { /* real production bundle */ }
+      return { capture_id: capture, state: "available", manifest_bound: true };
+    };
+  }
+  const retainedHome = path.join(homeDir, claim.run_id);
+  fs.mkdirSync(retainedHome, { recursive: true });
+  fs.writeFileSync(path.join(retainedHome, "session"), "predecessor session");
+  let models = 0, captures = 0, releases = 0, injected = false, proofInterrupted = false;
+  let flight: any;
+  const log = recordingLogger();
+  const r = runnerWith(factory(async () => { models++; throw new Error("must not resume model"); }),
+    fakeGitlab().gitlab, "fixture-journal-key", log.logger, { recoveryRetryMs: 1 });
+  const phaseClone = (r as any).phaseClone.bind(r);
+  (r as any).phaseClone = async (...args: any[]) => {
+    flight = args[1];
+    return phaseClone(...args);
+  };
+  const owner = client.getRunOwnership.bind(client);
+  client.getRunOwnership = async (...args) => {
+    if (injected && (options.deadline || options.proofTerminal) && !proofInterrupted) {
+      proofInterrupted = true;
+      if (options.deadline) {
+        assert.ok(args[1], "verification passes its independent bounded signal");
+        return new Promise<Awaited<ReturnType<typeof owner>>>((_resolve, reject) => {
+          const aborted = () => reject(args[1]!.reason);
+          if (args[1]!.aborted) aborted();
+          else args[1]!.addEventListener("abort", aborted, { once: true });
+        });
+      }
+      if (options.proofTerminal === "shutdown") (r as any).shuttingDownGlobal = true;
+      if (options.proofTerminal === "fence") flight.steering.claimFence = () => ({ kind: "superseded" });
+      if (options.proofTerminal === "cancel") flight.steering.isCancelled = () => true;
+    }
+    return owner(...args);
+  };
+  const trip = async () => {
+    injected = true;
+    flight.steering.tripCredentialSwitch(2);
+    if (options.interruption) {
+      const interrupted = new AbortController();
+      interrupted.abort(new Error("unrelated interruption"));
+      if (options.interruption === "execution") flight.cancel = interrupted;
+      else flight.steering.lifecycleSignal = () => interrupted.signal;
+    }
+    if (options.unsafe?.startsWith("late ")) {
+      const close = flight.batcher.close.bind(flight.batcher);
+      let changed = false;
+      flight.batcher.close = async () => {
+        await close();
+        if (changed) return;
+        changed = true;
+        if (options.unsafe === "late source") fs.appendFileSync(path.join(clone.path, "retained.txt"), "changed during drain");
+        else {
+          const records = await r.snapshotBootRecoveries();
+          const record = records.find(record => record.coverageDigest && record.bundlePath);
+          assert.ok(record);
+          fs.appendFileSync(record.bundlePath!, "changed during drain");
+        }
+      };
+    }
+    if (options.deadline) (r as any).codexBoundaryDeadlineMs = 50;
+    if (options.cancelOnly) {
+      const live = new AbortController();
+      flight.steering.lifecycleSignal = () => live.signal;
+    }
+    if (options.terminal === "shutdown") (r as any).shuttingDownGlobal = true;
+    if (options.terminal === "fence") flight.steering.claimFence = () => ({ kind: "superseded" });
+    if (options.terminal === "cancel") flight.steering.isCancelled = () => true;
+    if (options.mismatch === "pending") flight.steering.pendingCredentialSwitch = () => 3;
+    if (options.mismatch === "ownership") api.setOwnershipStatus(claim.run_id, "running", 3);
+    if (options.unsafe === "source") fs.appendFileSync(path.join(clone.path, "retained.txt"), "changed after capture");
+    if (options.unsafe === "bundle") {
+      const records = await r.snapshotBootRecoveries();
+      const record = records.find(record => record.coverageDigest && record.bundlePath);
+      assert.ok(record, "real guarded bundle already exists");
+      fs.appendFileSync(record.bundlePath!, "tampered bytes");
+    }
+  };
+  const report = client.reportState.bind(client);
+  client.reportState = async (...args) => {
+    const ack = await report(...args);
+    if (!["credential_switch", "credential_switch_failed"].includes(args[1].status ?? "")) return ack;
+    if (options.ack === "lost") throw new Error("ACK lost after server applied");
+    if (options.ack === "statusless") return { applied: true };
+    if (options.ack === "idempotent") return { applied: true, status: "running",
+      ...(args[1].status === "credential_switch" ? { credentialSwitchReleased: true } : {}) };
+    if (options.ack === "stale") return { applied: false, status: "running", staleClaim: true };
+    return ack;
+  };
+  const discover = git.discoverRetainedRecovery.bind(git);
+  git.discoverRetainedRecovery = async (...args) => {
+    const retained = await discover(...args);
+    if (seam === "discovery" && !injected) await trip();
+    return retained;
+  };
+  const ownership = (r as any).requireRetainedOwnership.bind(r);
+  (r as any).requireRetainedOwnership = async (...args: any[]) => {
+    flight = args[0];
+    if (seam === "ownership" && !injected) {
+      await trip();
+    }
+    return ownership(...args);
+  };
+  const capture = (r as any).captureRecoveryRestorePoint.bind(r);
+  (r as any).captureRecoveryRestorePoint = async (...args: any[]) => {
+    captures++;
+    assert.equal(injected, false, "switch must never create another capture");
+    return capture(...args);
+  };
+  const record = git.recordRecoveryCapture.bind(git);
+  git.recordRecoveryCapture = async (...args) => {
+    await record(...args);
+    if (seam === "capture" && !injected) await trip();
+  };
+  const adopt = git.prepareRecoverySuccessor.bind(git);
+  git.prepareRecoverySuccessor = async (...args) => {
+    const successor = await adopt(...args);
+    if (seam === "adoption" && !injected) await trip();
+    return successor;
+  };
+  client.releaseRecoveryCustody = async () => { releases++; throw new Error("custody must remain"); };
+  await r.execute(claim);
+  assert.equal(injected, true, "actual retained recovery await received the switch");
+  if (options.interruption !== "execution") assert.ok(flight.cancel.signal.reason instanceof CredentialSwitchSignal);
+  assert.equal(models, 0);
+  assert.equal(captures, seam === "ownership" || seam === "discovery" ? 0 : 1);
+  assert.equal(releases, 0);
+  const reports = api.states.filter(s => s.body.status === "credential_switch" || s.body.status === "credential_switch_failed");
+  assert.deepEqual(reports.map(s => [s.body.status, s.body.claim_generation]),
+    options.terminal || options.mismatch || options.deadline || options.proofTerminal || options.interruption ? [] :
+      [[verified ? "credential_switch" : "credential_switch_failed", 2]]);
+  assert.equal(api.states.some(s => s.body.status === "failed"), options.terminal === "cancel");
+  if (options.deadline || options.proofTerminal) assert.equal(proofInterrupted, true, "verification await was interrupted");
+  if (!options.terminal && !options.mismatch && !options.deadline && !options.proofTerminal && !options.interruption) {
+    const disposition = log.lines.find(line => (line as { msg: string }).msg ===
+      "retained credential switch stopped; all local work and custody retained") as { confirmed: boolean } | undefined;
+    if (options.ack === "lost" || options.ack === "stale") assert.equal(disposition, undefined);
+    else assert.equal(disposition?.confirmed, options.ack !== "statusless" || !verified);
+  }
+  for (const flag of ["preserveRecoveryClone", "preserveSession", "retainedEpisode",
+    "retainedEpisodeCustody", "retainedLocalCustody", "keepGuardedInventoryOpen"]) {
+    if (seam === "discovery" && flag === "retainedEpisode") assert.equal(flight[flag], undefined, flag);
+    else assert.equal(flight[flag], true, flag);
+  }
+  assert.equal(fs.readFileSync(path.join(retainedHome, "session"), "utf8"), "predecessor session");
+  assert.equal(flight.steering.pendingCredentialSwitch(), options.mismatch === "pending" ? 3 : 2, "never rearm retained recovery");
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"),
+    "only local dirty work\n" + (options.unsafe === "source" ? "changed after capture" :
+      options.unsafe === "late source" ? "changed during drain" : ""));
+  const journal = readJournal(bare, clone.branch);
+  if (seam === "adoption") {
+    assert.notEqual(journal.clonePath, clone.path);
+    assert.equal(fs.readFileSync(path.join(journal.clonePath, "retained.txt"), "utf8"), "only local dirty work\n");
+  } else assert.equal(journal.clonePath, clone.path);
+}
+
 function readJournal(bare: string, branch: string): any {
   return JSON.parse(command(bare, "config", `uzi-recovery.${branch}.clone`));
 }
