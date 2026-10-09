@@ -422,6 +422,50 @@ describe("RunRunner M2 fatal rejected startup", () => {
   }
 });
 
+function observeSoftSkipPost(runId: string, hold: boolean) {
+  const observedClient = client;
+  const original = observedClient.postMessages;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  let rejectEntered!: (error: Error) => void;
+  const started = new Promise<void>((resolve, reject) => { entered = resolve; rejectEntered = reject; });
+  let delivered!: () => void;
+  let rejectDelivered!: (error: unknown) => void;
+  const persisted = new Promise<void>((resolve, reject) => { delivered = resolve; rejectDelivered = reject; });
+  // An earlier executor assertion may fail before either observation is awaited.
+  void started.catch(() => {});
+  void persisted.catch(() => {});
+  let disposed = false;
+  observedClient.postMessages = async (...args) => {
+    const matches = args[0] === runId && args[1].some(message => message.kind === "status" &&
+      String((message.payload as { text?: unknown } | null | undefined)?.text).includes("checkpoint publish skipped: soft deadline"));
+    if (matches) {
+      entered();
+      if (hold) await held;
+    }
+    try {
+      await original.apply(observedClient, args);
+      if (matches) delivered(); // FakeApi stores the batch before answering the real request.
+    } catch (error) {
+      if (matches) rejectDelivered(error);
+      throw error;
+    }
+  };
+  return {
+    started, persisted, release,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      observedClient.postMessages = original;
+      release();
+      const error = new Error("soft-skip post observation disposed");
+      rejectEntered(error);
+      rejectDelivered(error);
+    },
+  };
+}
+
 describe("RunRunner M2 positive rejected startup acceptance", () => {
   const cases = [
     { target: "fetch", fire: true, sink: "milestone_checkpoint" },
@@ -432,7 +476,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
     { target: "owed", fire: false, sink: "milestone_checkpoint" },
   ] as const;
   for (const [index, scenario] of cases.entries()) {
-    it(`${scenario.target} ${scenario.sink}: verified rejected startup with soft callback ${scenario.fire ? "fired" : "pending"}`, async () => {
+    it(`${scenario.target} ${scenario.sink}: verified rejected startup with soft callback ${scenario.fire ? "fired" : "pending"}`, async (t) => {
       const { gitlab } = fakeGitlab();
       const { github } = fakeGitHub();
       const { logger, lines } = recordingLogger();
@@ -449,6 +493,9 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
       let firstReturned = false;
       let retryReturned = false;
       let turnFailure: unknown;
+      let softSkipPost: ReturnType<typeof observeSoftSkipPost> | undefined;
+      const holdSoftSkip = scenario.target === "pack" && scenario.sink === "milestone_checkpoint" && scenario.fire;
+      t.after(() => softSkipPost?.dispose());
       let transport: RejectedStartupTransport | undefined;
       const events: string[] = [];
       const publishedStates: Array<{ lastPublishedTip?: string; checkpointFloor?: string }> = [];
@@ -576,6 +623,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
           fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
           commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
           armedTarget = true;
+          if (scenario.target !== "owed") softSkipPost = observeSoftSkipPost(ctx.runId, holdSoftSkip);
           await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: scenario.sink });
           firstReturned = true;
           assert.equal(injections, 1);
@@ -603,7 +651,13 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
             assert.deepEqual(snapshot(), before, "unpublished floor and publication bookkeeping stay unchanged");
             assert.ok(lines.some((line) => (line as { msg?: string }).msg === "checkpoint publish skipped: soft deadline"),
               "Runner records the soft-skip outcome");
+            assert.ok(softSkipPost, "persistence observation armed before the checkpoint");
+            // The existing pack/fired case holds a timer-owned post across flush(),
+            // reproducing the old feed read while that post is still in flight.
+            if (holdSoftSkip) await softSkipPost.started;
             await observedFlight!.batcher.flush();
+            softSkipPost.release();
+            await softSkipPost.persisted;
             assert.ok(feedTexts(ctx.runId).some((line) => line.includes("checkpoint publish skipped: soft deadline")));
             assert.ok(!feedTexts(ctx.runId).some((line) => /checkpoint publishing recovered|published to origin/.test(line)));
             await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: scenario.sink });
@@ -620,7 +674,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
               entry.classification === "started_deadline" && entry.cleanup === "verified";
           }), "worker Git logger records the fixed recovery classification");
           return { branch: ctx.branch };
-        } catch (error) { turnFailure = error; throw error; }
+        } catch (error) { softSkipPost?.dispose(); turnFailure = error; throw error; }
       });
       const claim = gitlabClaim(247500 + index, {
         repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
@@ -652,6 +706,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
         client.publishCheckpoint = originalPublish;
         gitLog.log = originalGitLog;
         transport?.destroy();
+        softSkipPost?.dispose();
       }
       assert.equal(turnFailure, undefined, `executor assertions: ${String(turnFailure)}`);
       assert.equal(lockFailure, undefined, `lock-release assertion: ${String(lockFailure)}`);
