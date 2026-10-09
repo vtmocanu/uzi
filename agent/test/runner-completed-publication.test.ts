@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import type { RecoveryCoordinator } from "../src/recovery.js";
 import { fixture as codexReapFixture } from "./codex-reap-fixture.js";
 import { Outbox } from "../src/outbox.js";
+import { resolvePendingTerminal } from "../src/terminal-resolve.js";
 import type { StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
@@ -27,9 +28,10 @@ function commit(dir: string, name: string): string {
 }
 
 for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
-  for (const variant of kind === "self_improve" ? ["receipt", "excluded"] : kind === "issue" ? ["receipt", "codex"] : ["receipt"]) {
+  for (const variant of kind === "self_improve" ? ["receipt", "excluded", "lost-ack"] : kind === "issue" ? ["receipt", "codex", "lost-ack"] : ["receipt", "lost-ack"]) {
     const excluded = variant === "excluded";
-    it(`${kind}/${variant}: full execute ${excluded ? "falls back when advertised API omits receipt" : "accepts authenticated completion receipt without archive or heartbeat"}`, async t => {
+    const lostAck = variant === "lost-ack";
+    it(`${kind}/${variant}: full execute ${lostAck ? "preserves lost-ACK completion through closed fallback, exact replay and real cleanup" : excluded ? "falls back when advertised API omits receipt" : "accepts authenticated completion receipt without archive or heartbeat"}`, async t => {
       const claim = gitlabClaim(2507, {
         run_id: literal.run_id, kind, claim_generation: 29, inventory_guarded: true,
         ...(kind === "mr_rework" ? { issue_iid: null, branch: "agent/issue-42", base_branch: "main" } : {}),
@@ -40,6 +42,9 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
       api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature]);
       const registration = await client.register("completion-full-execute", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
       assert.ok(registration.worker_id);
+      let serverAuthoritativeHoldReleased = false, replaying = false;
+      let storedAck: typeof wire.ack | undefined;
+      let originalTerminal: Awaited<ReturnType<Outbox["readTerminalJournal"]>>;
       let open = true, manifest: { checksum: string; byte_size: number } | undefined;
       let reserves = 0, uploads = 0, finals = 0;
       const captureId = "00000000-0000-4000-8000-000000002507";
@@ -54,10 +59,12 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
       }] : [] });
       client.reserveRecoveryCapture = async () => {
         reserves++;
+        if (serverAuthoritativeHoldReleased) throw new Error("capture reservation refused: hold closed");
         return { capture_id: captureId, state: "preparing" };
       };
       client.uploadRecoveryBundle = async (_run, _id, m, stream) => {
         uploads++;
+        assert.equal(serverAuthoritativeHoldReleased, false, "closed hold refuses upload");
         for await (const chunk of stream) assert.ok(chunk);
         manifest = m;
         return { capture_id: captureId, state: "available", manifest_bound: true };
@@ -69,6 +76,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
       });
       client.releaseRecoveryCustody = async () => {
         finals++;
+        assert.equal(serverAuthoritativeHoldReleased, false, "no archive FINAL after completed release");
         open = false;
         return { run_id: claim.run_id, generation: claim.claim_generation!, released: true, holds_released: 1 };
       };
@@ -100,7 +108,11 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
         runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86_400_000,
       });
       await outbox.init();
-      const forge = fakeGitlab();
+      let forgeUnavailable = false;
+      const forge = fakeGitlab({ intercept: () => {
+        if (forgeUnavailable) throw new Error("forge unavailable during stored-receipt replay");
+        return undefined;
+      } });
       const r = runner({ ...(codex ? { safety: codex.safety } : {}), run: async ctx => {
         clone = ctx.worktreePath;
         assert.equal(ctx.branch, branch);
@@ -129,6 +141,13 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
         const body = JSON.parse(String(init?.body)) as StateRequest;
         if (body.status !== "completed") return response;
         acknowledgements++;
+        if (replaying) {
+          assert.ok(storedAck);
+          assert.deepEqual(body, { ...originalTerminal!.body, claim_generation: claim.claim_generation },
+            "exact original terminal body replays with its generation fence after WIP fallback");
+          assert.equal(serverAuthoritativeHoldReleased, true, "replay never reopens hold");
+          return Response.json(storedAck);
+        }
         assert.equal(response.status, 200);
         assert.equal(insideFinalize, false, "deferred Codex completion sends after finalize boundary release");
         assert.equal(body.completion_final_head, finalHead, "terminal carries the delivered post-checkpoint SHA");
@@ -142,7 +161,8 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           assert.equal(freeze.mock.callCount(), 0, "no preterminal inventory freeze");
           assert.equal(transfer.mock.callCount(), 0, "no preterminal restore-point transfer");
           assert.equal(wip.mock.callCount(), 0, "no WIP marker before receipt");
-          open = false;
+          if (!lostAck) open = false;
+          serverAuthoritativeHoldReleased = true;
         }
         const ack = { ...wire.ack, run: { ...wire.ack.run, id: claim.run_id, worker_id: registration.worker_id } };
         if (excluded) delete ack.completed_publication_receipt;
@@ -151,6 +171,15 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           generation: claim.claim_generation, repo_id: claim.repo!.id, branch,
           final_head: finalHead, observed_branch_head: finalHead, mr_iid: body.mr_iid,
         };
+        if (lostAck) {
+          storedAck ??= ack;
+          assert.deepEqual(ack, storedAck, "server stores an immutable receipt across lost retries");
+          const installed = await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!);
+          assert.ok(installed, "original completion installed write-ahead before released response is lost");
+          originalTerminal ??= installed;
+          assert.deepEqual(installed, originalTerminal, "all initial completed responses are lost with journal preserved");
+          throw new TypeError("response lost after authoritative completed release");
+        }
         return Response.json(ack);
       });
       const report = client.reportState.bind(client);
@@ -168,12 +197,86 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
         return ack;
       });
       await r.execute(claim);
-      assert.equal(acknowledgements, 1, "one completed terminal");
+      assert.equal(acknowledgements, lostAck ? 3 : 1, "all initial completed retries lose their responses");
       assert.equal(api.states.filter(s => s.body.status === "failed").length, 0);
-      assert.equal(api.states.filter(s => s.body.status === "completed").length, 1);
+      assert.equal(api.states.filter(s => s.body.status === "completed").length, lostAck ? 3 : 1);
       assert.equal(r.isExecuting(claim.run_id), false, "execute releases its tail");
       assert.equal(heartbeat.mock.callCount(), 0, "custody disposition needs no heartbeat");
-      if (excluded) {
+      if (lostAck) {
+        assert.equal(accepted, 0);
+        assert.equal(serverAuthoritativeHoldReleased, true);
+        assert.equal(await recovery.hasPersistedCompletionReceipt(claim.run_id, claim.claim_generation!), false);
+        assert.deepEqual(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!), originalTerminal);
+        assert.equal(originalTerminal!.body.completion_final_head, finalHead);
+        assert.ok(transfer.mock.callCount() > 0, "unknown ACK invokes real restore-point fallback");
+        assert.ok(wip.mock.callCount() > 0, "fallback captures untracked work");
+        assert.ok(freeze.mock.callCount() > 0);
+        assert.ok(capture.mock.callCount() > 0);
+        assert.ok(reserves > 0, "stale authenticated open listing reaches closed reservation refusal");
+        assert.equal(uploads, 0);
+        assert.equal(finals, 0);
+        assert.ok(fs.existsSync(clone), "closed refusal grants no physical deletion authority");
+        assert.equal(command(fx.originPath, ["rev-parse", `refs/heads/${branch}`]), finalHead);
+        const records = await recovery.inspect(claim.run_id);
+        assert.ok(records.length > 0, "original completing generation remains physically retained");
+        assert.ok(records.every(record => record.generation === claim.claim_generation));
+        const retire = outbox.retireTerminal.bind(outbox);
+        let retirements = 0;
+        t.mock.method(outbox, "retireTerminal", async (...args: Parameters<typeof retire>) => {
+          assert.equal(await recovery.hasPersistedCompletionReceipt(claim.run_id, claim.claim_generation!), true,
+            "authenticated generation receipt persists before terminal retirement");
+          retirements++;
+          return retire(...args);
+        });
+        forgeUnavailable = true;
+        const forgeCalls = forge.all.length;
+        replaying = true;
+        let replayError: unknown;
+        await resolvePendingTerminal(r.protectRecoveryTerminalDeps({ outbox, client,
+          gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }), {
+          runId: claim.run_id, claimGeneration: claim.claim_generation!, send: async body => {
+            try {
+              const fencedBody = { ...body, claim_generation: claim.claim_generation! };
+              const ack = await client.reportState(claim.run_id, fencedBody);
+              await r.observeSettlementTerminalAck(claim.run_id, claim.claim_generation!, fencedBody, ack);
+              return ack;
+            } catch (error) { replayError = error; throw error; }
+          },
+        });
+        assert.equal(replayError, undefined, "stored receipt replay must succeed");
+        assert.equal(retirements, 1);
+        assert.equal(accepted, 1);
+        assert.equal(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!), undefined);
+        const persisted = await recovery.inspect(claim.run_id);
+        assert.ok(persisted.some(record => record.completionReceipt?.final_head === finalHead));
+        assert.ok(persisted.length > 1, "WIP fallback leaves multiple existing exact-generation records");
+        const boundSource = persisted[0]?.completionSource;
+        assert.ok(boundSource);
+        assert.notEqual(command(clone, ["rev-parse", "HEAD"]), finalHead, "local WIP HEAD advanced after delivered completion");
+        for (const record of persisted) {
+          assert.deepEqual(record.completionSource, boundSource,
+            "all existing same-attempt records bind the same authenticated source snapshot");
+          assert.equal(record.completionSource?.expectedHead, command(clone, ["rev-parse", "HEAD"]));
+        }
+        const cleanup = git.cleanupRecoveryGeneration.bind(git);
+        const cleanupResults: string[] = [];
+        t.mock.method(git, "cleanupRecoveryGeneration", async (...args: Parameters<typeof cleanup>) => {
+          const result = await cleanup(...args);
+          cleanupResults.push(result);
+          return result;
+        });
+        await r.resumePendingRecoveries();
+        assert.equal(fs.existsSync(clone), false, "real safe physical cleanup later retires own source: " + JSON.stringify({
+          cleanupResults, pins: command(boundSource.context.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-recovery-pin", "refs/uzi-coverage", "refs/uzi-owed"]),
+          cloneHead: fs.existsSync(clone) ? command(clone, ["rev-parse", "HEAD"]) : null,
+          records: persisted.map(record => ({ sourceSha: record.sourceSha, expectedHead: record.completionSource?.expectedHead,
+            hasReceipt: !!record.completionReceipt, roots: record.completionSource?.roots })),
+        }));
+        assert.equal(forge.all.length, forgeCalls, "stored receipt replay and cleanup need no forge reads");
+        assert.equal(serverAuthoritativeHoldReleased, true);
+        assert.equal(finals, 0);
+        assert.equal(api.states.filter(s => s.body.status === "failed").length, 0);
+      } else if (excluded) {
         assert.equal(accepted, 0);
         assert.ok(transfer.mock.callCount() > 0, "receipt absence prepares the existing restore point");
         assert.ok(wip.mock.callCount() > 0, "fallback captures deliberate untracked work");

@@ -2430,6 +2430,8 @@ export class RunRunner {
    */
   private readonly completionReceipts = new Map<string, StateAck["completedPublicationReceipt"]>();
   private readonly unpersistedCompletionReceipts = new Set<string>();
+  // Retirement only: physical cleanup still requires the authenticated on-disk receipt.
+  private readonly persistedCompletionReceipts = new Set<string>();
   private readonly attemptedPublicationTerminals = new Set<string>();
 
   private completionKey(runId: string, generation: number): string {
@@ -2458,7 +2460,10 @@ export class RunRunner {
       // Protected retirement sees failure before it can consult server release authority.
       this.unpersistedCompletionReceipts.add(key);
       const persisted = await this.recovery.persistCompletionReceipt(receipt).catch(() => false);
-      if (persisted) this.unpersistedCompletionReceipts.delete(key);
+      if (persisted) {
+        this.unpersistedCompletionReceipts.delete(key);
+        this.persistedCompletionReceipts.add(key);
+      }
       this.log.info("recovery: completed publication receipt accepted", {
         run_id: runId, generation: claimGeneration, hold_id: receipt.hold_id,
         physical_retirement_receipt_persisted: persisted,
@@ -4019,7 +4024,12 @@ export class RunRunner {
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
   async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
     if (this.unpersistedCompletionReceipts.has(this.completionKey(runId, generation))) return true;
-    if (await this.recovery.hasPersistedCompletionReceipt(runId, generation)) return false;
+    const key = this.completionKey(runId, generation);
+    if (this.persistedCompletionReceipts.has(key)) return false;
+    if (await this.recovery.hasPersistedCompletionReceipt(runId, generation)) {
+      this.persistedCompletionReceipts.add(key);
+      return false;
+    }
     try {
       const state = await this.recovery.inventoryCleanupState(runId, generation);
       if (state === "acknowledged") return false;

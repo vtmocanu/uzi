@@ -5522,9 +5522,11 @@ export class GitCache {
         }
         throw new CloneRetainedByQuarantineError();
       }
-      if (still?.runId === ownerRunId && still.clonePath === clonePath) {
+      if (!opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
+      // Completion keeps its existing journal until physical disposal succeeds, so a caught
+      // disposal failure can restore the exact canonical source under the held bare lock.
       // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
       // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
       // cleared, so a failed append must neither fail the completed retire nor skip step 6's
@@ -5555,7 +5557,7 @@ export class GitCache {
     const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) ||
       (opts.completionSource !== undefined && !opts.completionSource.canDelete());
     // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
-    if (residueQuarantine() !== undefined) {
+    if (!opts.completionSource && residueQuarantine() !== undefined) {
       if (holding || scratch) {
         this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
           run_id: ownerRunId,
@@ -5571,13 +5573,45 @@ export class GitCache {
         if (protectedNow || residueQuarantine() !== undefined || !opts.completionSource!.canDelete())
           throw new Error("completion disposal protection changed");
       };
-      open();
-      if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
-      open();
-      if (scratch) await fs.rm(scratch, { recursive: true, force: true });
-      open();
-      if (opts.attemptId !== undefined) await this.appendAttemptLedger(barePath, branch,
-        { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
+      try {
+        open();
+        if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
+        open();
+        if (scratch) await fs.rm(scratch, { recursive: true, force: true });
+        open();
+        if (opts.attemptId !== undefined) await this.appendAttemptLedger(barePath, branch,
+          { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
+        const pending = await this.readRecoveryCapture(barePath, branch);
+        if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
+          throw new Error("completion source journal changed");
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      } catch (error) {
+        // One rollback attempt, still under adoption exclusion. Partial deletion or a failed
+        // proof/rename retains the journal and remaining residue; no new crash discovery.
+        const movedTo = scratch ? path.join(scratch, "clone") : holding;
+        if (movedTo) {
+          try {
+            const pending = await this.readRecoveryCapture(barePath, branch);
+            if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
+              throw new Error("completion rollback journal changed");
+            const canonicalAbsent = await fs.lstat(clonePath).then(() => false, (err: NodeJS.ErrnoException) => {
+              if (err.code === "ENOENT") return true;
+              throw err;
+            });
+            const stat = await fs.lstat(movedTo);
+            if (!canonicalAbsent || !stat.isDirectory() || stat.isSymbolicLink() ||
+                await this.worktreeHead(movedTo) !== opts.completionSource.expectedHead)
+              throw new Error("completion rollback source cannot be verified");
+            await fs.rename(movedTo, clonePath);
+            if (scratch) await fs.rmdir(scratch).catch(() => undefined);
+          } catch (rollbackError) {
+            this.log.warn("retireRunnerClone: completion rollback retained residue", {
+              clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
+            });
+          }
+        }
+        throw error;
+      }
       return result.disposition;
     }
     if (holding && opts.discard && !protectedNow) {

@@ -2323,7 +2323,8 @@ export class RecoveryCoordinator {
         bundles.add(canonical);
       }
       const pins = selected.filter(r => r.coverageDigest).map(r => ({ fingerprint: r.coverageDigest!, sha: r.sourceSha }));
-      const recoverySources = [...new Set(selected.map(r => r.sourceSha))];
+      const recoverySources = [...new Set(selected.flatMap(r =>
+        [r.sourceSha, r.originalSourceSha, r.inventoryCurrentSha].filter((sha): sha is string => !!sha)))];
       // Refuse malformed/unknown attribution before moving the physical completing source.
       const preflight = await this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
         recoverySources, authority.completionReceipt!.final_head,
@@ -2425,11 +2426,31 @@ export class RecoveryCoordinator {
     const ctx = source.context;
     try {
       return await this.withJournalLock(ctx.runId, async () => {
-        const existing = (await this.checkedRecords(ctx.runId)).find(r => r.inventoryGuarded &&
-          r.generation === ctx.generation && r.branch === ctx.branch && r.kind === ctx.kind);
-        if (!existing || existing.completionReceipt) return false;
-        await this.writeRecordUnlocked({ ...existing, completionSource: source });
-        return canonicalJson((await this.requireRecord(existing)).completionSource) === canonicalJson(source);
+        const records = await this.checkedRecords(ctx.runId);
+        if (records.some(r => r.generation === undefined)) return false;
+        const selected = records.filter(r => r.generation === ctx.generation);
+        if (!selected.length) return false;
+        // Only HEAD and roots may advance for the same completing attempt before a receipt.
+        // Validate the entire cohort before writing so foreign attribution is never replaced.
+        const bareDir = path.basename(ctx.barePath);
+        if (selected.some(r => !r.inventoryGuarded || r.runId !== ctx.runId ||
+            r.branch !== ctx.branch || r.kind !== ctx.kind || r.completionReceipt ||
+            (r.bareDir && r.bareDir !== bareDir) ||
+            (r.recoveryPinBareDir && r.recoveryPinBareDir !== bareDir) ||
+            (r.coverageContext && canonicalJson(r.coverageContext) !== canonicalJson(ctx)) ||
+            (r.bundlePath && path.resolve(r.bundlePath) !== path.resolve(this.bundlePath(r))) ||
+            (r.completionSource && (canonicalJson(r.completionSource.context) !== canonicalJson(ctx) ||
+              r.completionSource.clonePath !== source.clonePath ||
+              r.completionSource.attemptId !== source.attemptId)))) return false;
+        // One pass bounded by the existing cohort; a failed write/readback stops siblings.
+        for (const record of selected) {
+          await this.writeRecordUnlocked({ ...record, completionSource: source });
+        }
+        for (const record of selected) {
+          const readback = await this.requireRecord(record);
+          if (canonicalJson(readback.completionSource) !== canonicalJson(source)) return false;
+        }
+        return true;
       });
     } catch { return false; }
   }

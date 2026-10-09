@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { procfsTable, quiesceRunAttempt, type ProcTable } from "../src/run-quiescence.js";
 import { GitCache } from "../src/git.js";
+import { Outbox } from "../src/outbox.js";
 import { RunRunner, type RunnerOptions } from "../src/runner.js";
 import type { RecoveryCoordinator, CompletionSource } from "../src/recovery.js";
 import type { WorkerClient } from "../src/client.js";
@@ -19,7 +22,7 @@ const wire = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publ
 const literal: CompletedPublicationReceipt = wire.ack.completed_publication_receipt;
 
 // All Git children are local, bounded to 10 seconds, and use no forge credentials.
-async function fixture(shared = false) {
+async function fixture(shared = false, attempted = false, receipted = true, foreignSibling = false) {
   const root = await fs.mkdtemp(path.join(scratch, "receipt-cleanup-"));
   const cmd = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
@@ -40,7 +43,9 @@ async function fixture(shared = false) {
   await fs.chmod(bare, 0o700);
   const base = cmd(bare, ["rev-parse", "refs/remotes/origin/main"]);
   const runId = literal.run_id, generation = literal.generation, branch = literal.branch;
-  const clone = (await git.runnerCloneForBranch(bare, branch, "issue-7", noProofReseed, runId)).path;
+  const attemptId = attempted ? `20261009T000000Z-g${generation}-1234567890abcdef` : undefined;
+  const clone = (await git.runnerCloneForBranch(bare, branch, "issue-7", noProofReseed, runId, false, undefined,
+    attemptId ? { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true } : undefined)).path;
   cmd(clone, ["config", "user.name", "fixture"]);
   cmd(clone, ["config", "user.email", "fixture@example.com"]);
   cmd(clone, ["config", "commit.gpgsign", "false"]);
@@ -49,7 +54,7 @@ async function fixture(shared = false) {
   cmd(clone, ["commit", "-m", "after checkpoint"]);
   const head = cmd(clone, ["rev-parse", "HEAD"]);
   cmd(clone, ["push", bare, head + ":refs/heads/fixture-source"]);
-  await git.markRecoveryCapture(bare, clone, branch, runId);
+  await git.markRecoveryCapture(bare, clone, branch, runId, attemptId);
   const context: CompletionSource["context"] = { barePath: bare, runId, generation, kind: "issue", branch,
     defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } };
   assert.equal((await git.updateTrackingRef(bare, branch, head, { context })).kind, "updated");
@@ -73,8 +78,15 @@ async function fixture(shared = false) {
   const initial = make();
   const record = await initial.recovery.pin({ runId, generation, kind: "issue", branch, sourceSha: head, inventoryGuarded: true });
   assert.ok(record);
-  assert.equal(await initial.recovery.bindCompletionSource({ context, clonePath: clone, expectedHead: head, roots }), true);
-  assert.equal(await initial.recovery.persistCompletionReceipt({ ...literal, final_head: head, observed_branch_head: head }), true);
+  assert.equal(await initial.recovery.bindCompletionSource({ context, clonePath: clone, expectedHead: head, roots,
+    ...(attemptId ? { attemptId } : {}) }), true);
+  if (receipted) assert.equal(await initial.recovery.persistCompletionReceipt({ ...literal, final_head: head, observed_branch_head: head }), true);
+  if (foreignSibling) {
+    assert.ok(await initial.recovery.freezeInventory({
+      context: { ...context, branch: "agent/foreign" }, currentSha: head,
+      originalSourceSha: head, defaultBranch: "main", locallyQuiescent: true,
+    }));
+  }
   let siblingJournal: string | undefined;
   let siblingBundle: string | undefined;
   if (shared) {
@@ -111,6 +123,30 @@ async function fixture(shared = false) {
     close: () => fs.rm(root, { recursive: true, force: true }) };
 }
 
+for (const conflict of ["foreign-clone", "different-attempt", "sibling-branch", "missing-MAC", "frozen-receipt"] as const) {
+  it(conflict + " refuses completion source rebinding and retains physical state", async () => {
+    const f = await fixture(false, true, conflict === "frozen-receipt", conflict === "sibling-branch");
+    try {
+      const source = f.snapshot[0]?.completionSource;
+      assert.ok(source);
+      let proposed = { ...source, expectedHead: f.cmd(f.bare, ["rev-parse", "refs/remotes/origin/main"]) };
+      if (conflict === "foreign-clone") proposed = { ...proposed, clonePath: path.join(f.root, "foreign-clone") };
+      if (conflict === "different-attempt") proposed = { ...proposed,
+        attemptId: `20261009T000001Z-g${f.generation}-fedcba0987654321` };
+      if (conflict === "missing-MAC") {
+        await fs.writeFile(path.join(path.dirname(f.journal), "unknown.json"),
+          JSON.stringify({ ...f.snapshot[0], captureId: "unknown" }));
+      }
+      const journals = (await fs.readdir(path.dirname(f.journal))).filter(name => name.endsWith(".json"));
+      const before = await Promise.all(journals.map(name => fs.readFile(path.join(path.dirname(f.journal), name), "utf8")));
+      assert.equal(await f.restarted.recovery.bindCompletionSource(proposed), false);
+      const after = await Promise.all(journals.map(name => fs.readFile(path.join(path.dirname(f.journal), name), "utf8")));
+      assert.deepEqual(after, before, "refusal must preserve every record's exact authority");
+      await f.retained();
+    } finally { await f.close(); }
+  });
+}
+
 it("persisted receipt removes actual dirty own clone, generation bundle and journal after quiescence", async () => {
   const f = await fixture();
   try {
@@ -136,6 +172,67 @@ it("active execution retains receipt source then permits cleanup when the execut
     await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
     await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
   } finally { await f.close(); }
+});
+
+it("actual active child retains receipt source until exit permits real physical cleanup", async () => {
+  const f = await fixture();
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: f.clone, env: {}, stdio: "ignore",
+  });
+  const exited = once(child, "exit");
+  try {
+    await once(child, "spawn");
+    assert.ok(child.pid);
+    const ownedPid = child.pid;
+    const ownedRead = <T,>(reader: (pid: number) => T) => (pid: number): T => {
+      if (pid !== ownedPid) throw Object.assign(new Error("outside owned child fixture"), { code: "ENOENT" });
+      return reader(pid);
+    };
+    // The explicit table overrides the suite's empty hermetic view. No host enumeration occurs;
+    // even parent-stat probes cannot read outside the child created by this test.
+    const table: ProcTable = {
+      listPids: () => child.exitCode === null && child.signalCode === null ? [ownedPid] : [],
+      readStatus: ownedRead(procfsTable.readStatus),
+      readEnviron: ownedRead(procfsTable.readEnviron),
+      readCwd: ownedRead(procfsTable.readCwd),
+      readStat: ownedRead(procfsTable.readStat),
+    };
+    const outcomes: string[] = [];
+    const checked = f.make({ quiesceRun: async request => {
+      assert.equal(request.mode, "capture");
+      const result = await quiesceRunAttempt(request, {
+        targetUid: process.getuid!(),
+        // Model the separate helper scanner identity: the test parent
+        // must not exempt its own deliberately unmarked fixture child.
+        reap: { viaHelper: false, table, selfPid: 0, deadlineMs: 100, intervalMs: 10 },
+      });
+      outcomes.push(result.process!.state);
+      if (child.exitCode === null && child.signalCode === null) {
+        assert.equal(result.process!.state, "survivors");
+        assert.deepEqual(result.process!.processes.map(p => [p.pid, p.reason]),
+          [[ownedPid, "unattributed_in_scope"]]);
+        assert.deepEqual(result.process!.killed, []);
+      }
+      return result;
+    } });
+    await checked.recovery.resumePending(undefined, f.snapshot);
+    await f.retained();
+    assert.deepEqual(outcomes, ["survivors"]);
+    assert.equal(child.exitCode, null, "capture scanner retains the live unmarked child");
+    assert.equal(child.signalCode, null);
+    assert.equal(child.kill("SIGTERM"), true);
+    await exited;
+    await checked.recovery.resumePending(undefined, f.snapshot);
+    assert.deepEqual(outcomes.slice(1), ["quiescent", "quiescent"]);
+    for (const target of [f.clone, f.journal, f.bundle]) {
+      await assert.rejects(fs.stat(target), { code: "ENOENT" }, "exit permits actual attributed source retirement");
+    }
+    assert.equal(f.rpc(), 0);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    await exited;
+    await f.close();
+  }
 });
 
 it("nonquiescent process proof retains receipt source until both process checks pass", async () => {
@@ -284,6 +381,107 @@ it("paused physical disposal excludes actual successor clone admission until the
     await f.close();
   }
 });
+
+it("completed generation finalize must retire after receipt cleanup", async () => {
+  const f = await fixture();
+  try {
+    const outbox = new Outbox({ root: path.join(f.root, "outbox"), log: nullLogger(),
+      runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+    await outbox.init();
+    assert.equal((await outbox.journalFinalize(f.runId, f.generation)).written, true);
+    const current = f.make({ outbox });
+    await current.runner.observeSettlementTerminalAck(f.runId, f.generation,
+      { ...wire.request, completion_final_head: f.head },
+      { applied: true, completedPublicationReceipt: { ...literal, final_head: f.head, observed_branch_head: f.head } });
+    await current.recovery.resumePending(undefined, f.snapshot);
+    await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
+    await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
+    assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation), false);
+    assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation + 1), true,
+      "receipt success is scoped to the exact generation");
+    await (current.runner as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
+      .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation }, "completion-cleanup-regression");
+    assert.deepEqual(await outbox.listPendingFinalizes(), [], "completed generation finalize must retire after receipt cleanup");
+    assert.equal(f.rpc(), 0, "completion cleanup and finalize retirement require no custody RPC");
+  } finally { await f.close(); }
+});
+
+for (const code of ["EIO", "EBUSY"]) {
+  it(code + " completion disposal restores exact attempt attribution for a fresh coordinator retry", async t => {
+    const f = await fixture(true, true);
+    const remove = fs.rm.bind(fs);
+    let holding = "";
+    let injected = false;
+    t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (!injected && path.dirname(String(args[0])) === (f.git as unknown as { runnerHoldingRoot: string }).runnerHoldingRoot) {
+        injected = true;
+        holding = String(args[0]);
+        throw Object.assign(new Error("transient completion disposal failure"), { code });
+      }
+      return remove(...args);
+    });
+    try {
+      const sibling = await fs.readFile(f.siblingJournal!, "utf8");
+      await f.sweep();
+      assert.equal(injected, true, "actual attempt clone reached physical disposal");
+      await f.retained();
+      await assert.rejects(fs.stat(holding), { code: "ENOENT" }, "surviving source rolls back to canonical");
+      t.mock.restoreAll();
+      const fresh = f.make();
+      fresh.executionTails.set(f.runId, Promise.resolve());
+      await fresh.recovery.resumePending();
+      await f.retained();
+      fresh.executionTails.delete(f.runId);
+      await fresh.recovery.resumePending();
+      for (const target of [f.clone, holding, f.journal, f.bundle])
+        await assert.rejects(fs.stat(target), { code: "ENOENT" });
+      assert.equal(await fs.readFile(f.siblingJournal!, "utf8"), sibling);
+      assert.equal(await fs.readFile(f.siblingBundle!, "utf8"), "successor bundle");
+      assert.ok((await f.git.enumerateOwedCandidates(f.bare, f.runId))
+        .some(c => c.sha === f.head && c.contexts.some(x => x.generation === f.generation + 1)));
+      assert.equal(f.rpc(), 0);
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+}
+
+for (const failure of ["partial", "rollback", "successor"] as const) {
+  it("completion disposal " + failure + " failure retains receipt and residue without overwriting a canonical occupant", async t => {
+    const f = await fixture(false, true);
+    const remove = fs.rm.bind(fs);
+    const rename = fs.rename.bind(fs);
+    let holding = "";
+    t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (!holding && path.dirname(String(args[0])) === (f.git as unknown as { runnerHoldingRoot: string }).runnerHoldingRoot) {
+        holding = String(args[0]);
+        if (failure === "partial") await remove(path.join(holding, ".git"), { recursive: true, force: true });
+        if (failure === "successor") {
+          await fs.mkdir(f.clone);
+          await fs.writeFile(path.join(f.clone, "successor.txt"), "retain occupant");
+        }
+        throw Object.assign(new Error("disposal interrupted"), { code: "EIO" });
+      }
+      return remove(...args);
+    });
+    if (failure === "rollback") t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+      if (String(args[0]) === holding) throw Object.assign(new Error("rollback interrupted"), { code: "EBUSY" });
+      return rename(...args);
+    });
+    try {
+      await f.sweep();
+      assert.ok(holding, "actual attempt disposal reached");
+      assert.ok(await fs.stat(holding));
+      assert.ok(await fs.stat(f.journal));
+      assert.ok(await fs.stat(f.bundle));
+      t.mock.restoreAll();
+      await f.make().recovery.resumePending();
+      assert.ok(await fs.stat(holding), "unverified residue is never treated as successful disposal");
+      assert.ok(await fs.stat(f.journal));
+      if (failure === "successor")
+        assert.equal(await fs.readFile(path.join(f.clone, "successor.txt"), "utf8"), "retain occupant");
+      else await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+}
 
 it("worker quarantine retains receipt authority and dirty clone", async () => {
   const f = await fixture();
