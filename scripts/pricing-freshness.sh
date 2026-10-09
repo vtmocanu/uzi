@@ -64,6 +64,7 @@ metadata=$(awk '
     if (line !~ /^[[:space:]]*const[[:space:]]+AnthropicPrice(FetchedAt|SourceURL)[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$/) bad=1
     sub(/^[^"]*"/, "", line)
     sub(/"[[:space:]]*$/, "", line)
+    if (line ~ /[[:cntrl:]]/) bad=1
     values[name]=line
   }
   END {
