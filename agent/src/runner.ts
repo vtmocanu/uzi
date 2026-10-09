@@ -9680,6 +9680,9 @@ export class RunRunner {
         const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
         const eligible = claim.auto_approve === true && claim.plan_cross_check_required === true &&
           !seeded && !forceGate && ["issue", "prompt", "self_improve", "ci_fix", "mr_rework"].includes(resolveRunKind(claim.kind));
+        // Older api (no plan_cross_check_codex_lead): do not submit a Codex lead's check, park at
+        // the human gate. This is a capability check, NOT a mapping of 409 refusals.
+        const codexLeadUnsupported = !!claim.secrets.codex && claim.plan_cross_check_codex_lead !== true;
         let crossCheckReason: string | undefined;
         let checkedApproval: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"] | undefined;
         let checkedFields: PlanCrossCheckStateRequest | undefined;
@@ -9701,7 +9704,7 @@ export class RunRunner {
             // separately drains usage debounce/in-flight HTTP and outbox delivery receipts.
             await Promise.all(flight.stateSenders ?? []);
             steering.lifecycleSignal().throwIfAborted();
-            if (discoverRound) {
+            if (discoverRound && !codexLeadUnsupported) {
               // One bounded, owner-cancellable discovery per reclaimed execution. Metadata
               // selects a submit attempt; it never supplies content or an approval grant.
               const owner = steering.lifecycleSignal();
@@ -9728,6 +9731,10 @@ export class RunRunner {
             }
             if (checkedHuman) {
               // Discovery selected an existing fallback, without adopting a human presentation.
+            } else if (codexLeadUnsupported) {
+              crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
+              checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
+              checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
               const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {

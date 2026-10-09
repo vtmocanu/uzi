@@ -686,6 +686,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		PlanMd:                   textPtr(run.PlanMd),
 		AutoApprove:              run.AutoApprove,
 		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
+		PlanCrossCheckCodexLead:  planCrossCheckCodexLeadSupported(run),
 		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
@@ -1194,3 +1195,10 @@ func (e legacyReviewClaimError) Error() string {
 }
 
 func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim }
+
+// planCrossCheckCodexLeadSupported reports whether the claim should carry
+// plan_cross_check_codex_lead: this api accepts a Codex lead's checked-plan submission,
+// so the signal is set for a Codex run that requires the cross-check.
+func planCrossCheckCodexLeadSupported(run store.Run) bool {
+	return run.PlanCrossCheckRequired && run.Harness == harnessCodex
+}

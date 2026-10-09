@@ -901,6 +901,7 @@ describe("RunRunner — required plan cross-check fallback", () => {
       const claim = gitlabClaim(codexLead ? 21492 : 21491, {
         auto_approve: true,
         plan_cross_check_required: true,
+        ...(codexLead ? { plan_cross_check_codex_lead: true } : {}),
         claim_generation: 1,
         ...(codexLead ? { secrets: {
           forge_pat: "fixture-forge-pat-000000",

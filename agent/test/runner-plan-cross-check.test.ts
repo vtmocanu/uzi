@@ -2159,6 +2159,7 @@ it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real s
 // The runner no longer parks it as codex_lead_unsupported; the Claude checker is server-side.
 describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
   const codexClaim = () => freshClaim(1, { kind: "issue", auto_approve: true, plan_cross_check_required: true,
+    plan_cross_check_codex_lead: true,
     secrets: { forge_pat: "fixture-forge-pat-000000", codex: {
       auth_mode: "subscription" as const, access_token: "fixture-codex-access-token-abc123",
       capability: "fixture-codex-capability-abc123", generation: 1, chatgpt_account_id: "verified-account",
@@ -2209,7 +2210,8 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
   });
 
   it("a reclaimed Codex lead discovers its eligible round once, like a Claude lead", { skip: LINUX_CAPTURE }, async () => {
-    const c = freshClaim(2, { kind: "issue", auto_approve: true, plan_cross_check_required: true, secrets: codexClaim().secrets });
+    const c = freshClaim(2, { kind: "issue", auto_approve: true, plan_cross_check_required: true,
+      plan_cross_check_codex_lead: true, secrets: codexClaim().secrets });
     api.crossCheckLatestHandler = () => ({ status: 200, body: {
       result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
       automatic_rounds_enabled: true, next_round: 2, next_round_eligible: true, fallback_reason: "",
@@ -2245,5 +2247,50 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
     assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
     assert.deepEqual(seen.map((v) => v.kind), ["revise", "approve"]);
     assert.equal(gates(c.run_id).length, 0, "no human gate was published");
+  });
+});
+
+// PRD #2460 rework: a new worker against an older api (no plan_cross_check_codex_lead) must not submit a
+// Codex lead's check (the old api answers 409 cross_check_refused, unrecoverable for a non-Claude lead).
+// It parks at the human gate as codex_lead_unsupported; this is a capability check, not a 409 mapping.
+describe("Codex lead against an older api (no plan_cross_check_codex_lead)", () => {
+  const oldApiCodexClaim = (generation: number) => freshClaim(generation, { kind: "issue", auto_approve: true,
+    plan_cross_check_required: true,
+    secrets: { forge_pat: "fixture-forge-pat-000000", codex: {
+      auth_mode: "subscription" as const, access_token: "fixture-codex-access-token-abc123",
+      capability: "fixture-codex-capability-abc123", generation: 1, chatgpt_account_id: "verified-account",
+      chatgpt_plan_type: null } } });
+  const assertParked = (c: { run_id: string }) => {
+    const states = api.states.filter((s) => s.runId === c.run_id).map((s) => s.body);
+    assert.ok(states.some((s) => s.status === "awaiting_approval" &&
+      (s as { plan_cross_check_gate_reason?: string }).plan_cross_check_gate_reason === "codex_lead_unsupported"),
+      `parked as codex_lead_unsupported: ${JSON.stringify(states)}`);
+    assert.ok(api.messages(c.run_id).some((m) => m.kind === "status" &&
+      (m.payload as { text?: string }).text === "plan cross-check: not yet supported for a Codex lead"));
+    assert.ok(!states.some((s) => s.status === "failed"), "the run is not failed");
+  };
+  const humanApproves = (c: { run_id: string }) =>
+    api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("approve_plan", "human ok")); });
+
+  it("never submits a cross-check and parks at the human gate", { skip: LINUX_CAPTURE }, async () => {
+    const c = oldApiCodexClaim(1);
+    api.crossCheckHandler = () => ({ status: 409, body: { reason: "cross_check_refused" } });
+    humanApproves(c);
+    const { exec } = checkedExec();
+    await start(exec, c);
+    assert.equal(api.crossCheckRequests.length, 0, "no submit to an api that would refuse it");
+    assertParked(c);
+  });
+
+  it("a reclaimed generation-2 Codex claim skips latest-round discovery and parks", { skip: LINUX_CAPTURE }, async () => {
+    const c = oldApiCodexClaim(2);
+    api.crossCheckLatestHandler = () => ({ status: 200, body: { result: "no_row" } });
+    api.crossCheckHandler = () => ({ status: 409, body: { reason: "cross_check_refused" } });
+    humanApproves(c);
+    const { exec } = checkedExec();
+    await start(exec, c);
+    assert.equal(api.crossCheckLatestRequests.length, 0, "discovery skipped");
+    assert.equal(api.crossCheckRequests.length, 0);
+    assertParked(c);
   });
 });
