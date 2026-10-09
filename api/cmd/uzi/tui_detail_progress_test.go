@@ -56,8 +56,8 @@ func TestDetailRailProgressVariants(t *testing.T) {
 		want []string
 		not  []string
 	}{
-		{"percent", percent, []string{"PROGRESS ≈70%", "milestone 3 of 3", "recovery-docs-validation", "▰│▰▰▣", "phase ▸ implement", "MILESTONES"}, nil},
-		{"no active", noActive, []string{"PROGRESS ≈70%", "2 of 3 done", "▰│▰▰▱"}, []string{"phase ▸", "milestone 3 of 3"}},
+		{"percent", percent, []string{"PROGRESS ≈70% · 2/3", "phase ▸ implement", "MILESTONES"}, []string{"milestone 3 of 3"}},
+		{"no active", noActive, []string{"PROGRESS ≈70% · 2/3"}, []string{"phase ▸"}},
 		{"stalled", stalled, []string{"PROGRESS ◼ stalled", "since 16:41"}, nil},
 		{"plan gate", waiting, []string{"PROGRESS ● waits on you", "plan gate since 16:50"}, nil},
 		{"blocked by", blockedQ, []string{"PROGRESS ● waits on you", "question since 16:50", "⧗ may be blocked by", "fca7a801"}, []string{"fca7a801-"}},
@@ -113,22 +113,70 @@ func TestRailAutoFoldCountsProgressBlock(t *testing.T) {
 	t.Fatal("no height where the PROGRESS block alone tips the auto-fold")
 }
 
-// A hostile active milestone title and (title-less) id reach the PROGRESS block through
-// renderer.Plain only; each marker differs from the MILESTONES block's so the PROGRESS draw is
-// what proves it.
-func TestDetailRailProgressStripsHostileMilestoneText(t *testing.T) {
+// The standard running scene (uxlab detail-running, 100x34) keeps the crew roster unfolded with
+// the PROGRESS block drawn: the compact percent form must not push the rail over its budget.
+func TestDetailRunningSceneKeepsCrewExpandedWithProgress(t *testing.T) {
+	out := stripANSI(detailRunning(false, time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)))
+	for _, w := range []string{"CREW  ▾", "PROGRESS ≈70%", "MILESTONES"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("missing %q in:\n%s", w, out)
+		}
+	}
+}
+
+// PROGRESS is not protected content: a run whose only rail block is PROGRESS (planning, no
+// milestones, usage, account or worker) never auto-folds at any height.
+func TestRailAutoFoldIgnoresProgressOnlyRun(t *testing.T) {
+	run, messages := autoFoldRun(false, false)
+	run.Milestones, run.MilestonesCompleted, run.MilestonesInProgress = nil, nil, nil
+	run.Progress = &apitypes.RunProgress{State: "planning"}
+	for height := 8; height <= 80; height++ {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		m.width, m.height = 100, height
+		m = applyDetail(m, run, messages)
+		if m.renderProgress() == "" {
+			t.Fatal("fixture draws no PROGRESS block")
+		}
+		if m.railAutoFolded(time.Now()) {
+			t.Fatalf("PROGRESS-only run auto-folded at height %d", height)
+		}
+	}
+}
+
+// The blocked-by hint is drawn in the wait ink, not the faint ink of the surrounding rows.
+func TestDetailRailProgressBlockedByUsesWaitInk(t *testing.T) {
+	blocker := "fca7a801-aaaa-bbbb-cccc-dddddddddddd"
+	run := apitypes.RunDTO{ID: "r-wait", Kind: "issue", Status: "awaiting_input", Health: "ok", IssueTitle: "t",
+		Progress: &apitypes.RunProgress{State: "waiting", MaybeBlockedByRunID: &blocker}}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m = applyDetail(m, run, nil)
+	raw := m.renderProgress()
+	for _, w := range []string{paintSeg(m.pal.wait, nil, false, "⧗ may be blocked by"), paintSeg(m.pal.wait, nil, false, "fca7a801")} {
+		if !strings.Contains(raw, w) {
+			t.Errorf("hint segment not in wait ink: %q in %q", w, raw)
+		}
+	}
+	if paintSeg(m.pal.wait, nil, false, "x") == m.pal.faint.Render("x") {
+		t.Fatal("wait and faint inks are indistinguishable; the assertion proves nothing")
+	}
+}
+
+// A hostile Phase and blocked-by id reach the PROGRESS block through renderer.Plain only.
+func TestDetailRailProgressStripsHostileText(t *testing.T) {
 	const nasty = "\x1b[2J\u202E\x07\x01"
 	pct := 50
+	blk := "\u202E\x07\x01\x1bidsafe"
 	for _, c := range []struct {
-		name, id, title, marker string
+		name, phase string
+		blocked     *string
+		marker      string
 	}{
-		{"title", "m1", nasty + "titlesafe", "titlesafe"},
-		{"id fallback", nasty + "idsafe", "", "idsafe"},
+		{"phase", nasty + "phasesafe", nil, "phasesafe"},
+		{"blocked-by", "", &blk, "idsafe"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			run := apitypes.RunDTO{ID: "r-hostile", Kind: "issue", Status: "running", Health: "ok", IssueTitle: "t",
-				Milestones: []apitypes.Milestone{{ID: c.id, Title: c.title}},
-				Progress:   &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneTotal: 1, ActiveMilestoneID: c.id}}
+				Progress: &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneTotal: 1, Phase: c.phase, MaybeBlockedByRunID: c.blocked}}
 			m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 			m = applyDetail(m, run, nil)
 			raw := m.renderProgress()

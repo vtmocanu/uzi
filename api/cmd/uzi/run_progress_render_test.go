@@ -24,7 +24,7 @@ func TestProgressRow(t *testing.T) {
 			"≈70% · milestone 3 of 3"},
 		{"no active milestone", apitypes.RunDTO{Milestones: ms,
 			Progress: &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 3}},
-			"≈70% · 2/3 done"},
+			"≈70% · 2 of 3 done"},
 		{"stalled", apitypes.RunDTO{HealthSince: &since, Progress: &apitypes.RunProgress{State: "stalled"}}, "stalled · since 16:41"},
 		{"stalled no time", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "stalled"}}, "stalled"},
 		{"plan gate", apitypes.RunDTO{Status: "awaiting_approval", Progress: &apitypes.RunProgress{State: "waiting"}}, "waits on you · plan gate"},

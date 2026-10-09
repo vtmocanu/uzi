@@ -864,11 +864,13 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 // progress cell and the TUI board PROG column. It reads the server-derived RunDTO.Progress and
 // returns nil when it is absent (a terminal run, or an older server), so those runs render
 // byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
-// in the frozen order, else `done/total done`), `stalled · since 16:41` (health_since, UTC like
-// the other since clauses), `waits on you · plan gate|question|follow-up` by status,
-// `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`; none or an
-// unknown state prints no row. Only the closed state enum, the integer counts and server
-// timestamps are drawn; the active milestone id is used for its position and never printed.
+// in the frozen order, else `N of M done`; the pct is clamped to 0..100), `stalled · since 16:41`
+// (health_since, UTC like the other since clauses), `waits on you · plan gate|question|follow-up`
+// by status, `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`. A
+// non-empty MaybeBlockedByRunID appends ` · may be blocked by <id8>` to any of them, and alone
+// (`may be blocked by <id8>`) for a none, unknown or pct-less percent state, like the TUI block.
+// Only the closed state enum, the integer counts, server timestamps and the cleaned, shortened
+// blocked-by id are drawn; the active milestone id is used for its position and never printed.
 func progressRow(r apitypes.RunDTO) []string {
 	p := r.Progress
 	if p == nil {
@@ -876,22 +878,26 @@ func progressRow(r apitypes.RunDTO) []string {
 	}
 	row := func(v string) []string {
 		// The hint comes from untrusted question text server-side, so the id is cleaned
-		// and cut to 8 characters before it is printed.
+		// and shortened before it is printed.
 		if p.MaybeBlockedByRunID != nil && *p.MaybeBlockedByRunID != "" {
-			id := []rune(cellText(*p.MaybeBlockedByRunID))
-			if len(id) > 8 {
-				id = id[:8]
+			hint := "may be blocked by " + shortRunID(cellText(*p.MaybeBlockedByRunID))
+			if v == "" {
+				v = hint
+			} else {
+				v += " · " + hint
 			}
-			v += " · may be blocked by " + string(id)
+		}
+		if v == "" {
+			return nil
 		}
 		return []string{"PROGRESS", v}
 	}
 	switch p.State {
 	case runprogress.StatePercent:
 		if p.Pct == nil {
-			return nil
+			return row("")
 		}
-		out := fmt.Sprintf("≈%d%%", *p.Pct)
+		out := fmt.Sprintf("≈%d%%", min(max(*p.Pct, 0), 100))
 		if p.ActiveMilestoneID != "" {
 			for i, m := range r.Milestones {
 				if m.ID == p.ActiveMilestoneID {
@@ -899,7 +905,7 @@ func progressRow(r apitypes.RunDTO) []string {
 				}
 			}
 		}
-		return row(fmt.Sprintf("%s · %d/%d done", out, p.MilestoneDone, p.MilestoneTotal))
+		return row(fmt.Sprintf("%s · %d of %d done", out, p.MilestoneDone, p.MilestoneTotal))
 	case runprogress.StateStalled:
 		if r.HealthSince != nil {
 			return row("stalled · since " + r.HealthSince.UTC().Format("15:04"))
@@ -922,8 +928,8 @@ func progressRow(r apitypes.RunDTO) []string {
 	case runprogress.StatePlanning:
 		return row("planning")
 	}
-	// none and any state this build does not know draw nothing, like the board's blank cell.
-	return nil
+	// none and any state this build does not know draw only the blocked-by hint, when set.
+	return row("")
 }
 
 // progressParkWord is the CLI's full park wording; the 8-col board abbreviations

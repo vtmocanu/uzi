@@ -162,11 +162,14 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 
 // railAutoFolded reports whether the EXPANDED rail's roster plus every PRESENT protected block
 // would overrun transcriptViewport(), so the rail must fold by itself (PRD #1257 D1/D2). The
-// protected set includes the worker-name row when present, the PROGRESS block (PRD #2602, above MILESTONES, no budget of its own) and the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
+// protected set includes the worker-name row when present, the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
 // 3-line SPEND block, the run's OWN ACCOUNTS entry (three Claude rows or one Codex
 // snapshot row under a 1-row header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
 // account, the analog of the Claude own-account floor; railCodexFloorRows). Sibling Claude/Codex
 // accounts stay best-effort and drop bottom-up as today, so only the first of each is counted (D2).
+// The PROGRESS block (PRD #2602, above MILESTONES, no budget of its own) is counted in the height
+// so it cannot push MILESTONES off, but it is not protected content itself and never triggers a
+// fold on its own (specs/human.md names the closed set the rail folds to protect).
 // A run with no lanes has nothing to fold; a run with an empty required set (no milestone list, no
 // usage, no own account, no shown Codex account, no worker name) never folds either — its roster just clips at the
 // bottom exactly as today (D2/D5).
@@ -201,7 +204,7 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if progress == "" && block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()

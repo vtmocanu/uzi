@@ -3,12 +3,8 @@ package main
 import (
 	"strings"
 
-	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 )
-
-// progressBlockedIDWidth is the shortened blocked-by run id width (the board and CLI show 8 chars).
-const progressBlockedIDWidth = 8
 
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
@@ -33,8 +29,13 @@ func (m tuiModel) renderProgress() string {
 		if p.Pct == nil {
 			break
 		}
-		lines = append(lines, head+" "+paintSeg(m.pal.tungsten, nil, true, "≈"+itoa(min(max(*p.Pct, 0), 100))+"%"))
-		lines = append(lines, m.progressMilestoneLines(run, p)...)
+		// MILESTONES draws position, title and bar just below, so this is the compact two-row form
+		// that keeps the crew roster unfolded on the standard running scene.
+		top := head + " " + paintSeg(m.pal.tungsten, nil, true, "≈"+itoa(min(max(*p.Pct, 0), 100))+"%")
+		if p.MilestoneTotal > 0 {
+			top += faint(" · " + itoa(p.MilestoneDone) + "/" + itoa(p.MilestoneTotal))
+		}
+		lines = append(lines, top)
 		if p.Phase != "" {
 			lines = append(lines, faint("phase ▸ ")+m.renderer.Plain(p.Phase, laneRailWidth-visualWidth("phase ▸ ")))
 		}
@@ -75,70 +76,14 @@ func (m tuiModel) renderProgress() string {
 		}
 	}
 	if p.MaybeBlockedByRunID != nil && *p.MaybeBlockedByRunID != "" {
-		id := []rune(m.renderer.Plain(*p.MaybeBlockedByRunID, 64))
-		if len(id) > progressBlockedIDWidth {
-			id = id[:progressBlockedIDWidth]
-		}
+		id := shortRunID(m.renderer.Plain(*p.MaybeBlockedByRunID, 64))
 		if len(lines) == 0 {
 			lines = append(lines, head)
 		}
-		lines = append(lines, paintSeg(m.pal.wait, nil, false, "⧗ may be blocked by"), "  "+paintSeg(m.pal.wait, nil, false, string(id)))
+		lines = append(lines, paintSeg(m.pal.wait, nil, false, "⧗ may be blocked by"), "  "+paintSeg(m.pal.wait, nil, false, id))
 	}
 	if len(lines) == 0 {
 		return ""
 	}
 	return strings.Join(lines, "\n")
-}
-
-// progressMilestoneLines draws the percent state's position rows: "milestone k of M" (or
-// "N of M done" when no milestone is active), the active milestone title, and the segmented
-// bar (plan cell, then one cell per frozen milestone). The bar falls back to the N/M text
-// when it would not fit the rail.
-func (m tuiModel) progressMilestoneLines(run apitypes.RunDTO, p *apitypes.RunProgress) []string {
-	total := p.MilestoneTotal
-	if total <= 0 {
-		return nil
-	}
-	faint := func(s string) string { return m.pal.faint.Render(s) }
-	var lines []string
-	title := ""
-	pos := -1
-	for i, ms := range run.Milestones {
-		if p.ActiveMilestoneID != "" && ms.ID == p.ActiveMilestoneID {
-			pos, title = i, ms.Title
-			break
-		}
-	}
-	if pos >= 0 {
-		lines = append(lines, faint("milestone "+itoa(pos+1)+" of "+itoa(total)))
-		if title == "" {
-			title = p.ActiveMilestoneID
-		}
-		lines = append(lines, m.renderer.Plain(title, laneRailWidth))
-	} else {
-		lines = append(lines, faint(itoa(p.MilestoneDone)+" of "+itoa(total)+" done"))
-	}
-	// plan cell + "│" + one cell per milestone; the count text is the fallback.
-	if len(run.Milestones) > 0 && len(run.Milestones)+2 <= laneRailWidth {
-		completed := make(map[string]bool, len(run.MilestonesCompleted))
-		for _, id := range run.MilestonesCompleted {
-			completed[id] = true
-		}
-		var sb strings.Builder
-		sb.WriteString(paintSeg(m.pal.tungsten, nil, false, "▰") + faint("│"))
-		for i, ms := range run.Milestones {
-			switch {
-			case i == pos:
-				sb.WriteString(paintSeg(m.pal.tungsten, nil, true, "▣"))
-			case completed[ms.ID]:
-				sb.WriteString(paintSeg(m.pal.tungsten, nil, false, "▰"))
-			default:
-				sb.WriteString(faint("▱"))
-			}
-		}
-		lines = append(lines, sb.String())
-	} else {
-		lines = append(lines, faint(itoa(p.MilestoneDone)+"/"+itoa(total)))
-	}
-	return lines
 }
