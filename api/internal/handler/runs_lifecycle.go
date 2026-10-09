@@ -465,6 +465,18 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			slog.Error("current activity", "run_id", run.ID, "error", err)
 		} else {
 			dto.CurrentActivity = activity[run.ID]
+			setProgressPhase(&dto)
+		}
+	}
+	// PRD #2602: the "may be blocked by" hint, GetRun only (a list read never runs it).
+	// Best-effort: an error is logged and the field stays absent. Owner scoping lives in
+	// MaybeBlockedByRun (the run's owner, not this viewer).
+	if dto.Progress != nil {
+		if blocker, err := h.wsvc.MaybeBlockedByRun(r.Context(), run); err != nil {
+			slog.Error("maybe blocked by run", "run_id", run.ID, "error", err)
+		} else if blocker != nil {
+			id := blocker.String()
+			dto.Progress.MaybeBlockedByRunID = &id
 		}
 	}
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null

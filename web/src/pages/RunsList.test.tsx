@@ -1794,3 +1794,66 @@ describe("RunRow — needs-landing status pill (issue #1418)", () => {
     expect(screen.getByText("stopped")).toBeTruthy();
   });
 });
+
+// PRD #2602 M1: RunRow carries the server-derived Progress cell beside the milestone badge,
+// and hides it under the waiting-for-vault state exactly as it hides the milestone badge.
+describe("RunRow — Progress cell (PRD #2602)", () => {
+  const renderRow = (over: Partial<RunListItem> = {}, waitingForVault = false) =>
+    render(
+      <MemoryRouter>
+        <ul>
+          <RunRow run={aRun(over)} now={Date.parse("2026-07-05T12:04:00Z")} waitingForVault={waitingForVault} />
+        </ul>
+      </MemoryRouter>,
+    );
+  const prog = (state: NonNullable<RunListItem["progress"]>["state"]) => ({
+    state,
+    pct: null,
+    milestone_done: 0,
+    milestone_total: 0,
+    active_milestone_id: "",
+    phase: "" as const,
+  });
+
+  it("shows the stalled flag with its since time on a running row", () => {
+    const { container } = renderRow({
+      status: "running",
+      health: "stalled",
+      health_since: "2026-07-05T11:41:00Z",
+      progress: prog("stalled"),
+    });
+    const cell = container.querySelector('[data-run-progress="stalled"]')!;
+    expect(cell).toBeTruthy();
+    expect(cell.textContent).toMatch(/^◼ stalledsince /);
+    // One stall, one flag: the health badge yields to the cell (its word is in the tooltip).
+    expect(container.textContent).not.toContain("⚠");
+  });
+
+  it("keeps the health badge when the cell is not showing the stalled flag", () => {
+    const { container } = renderRow({
+      status: "running",
+      health: "slow",
+      health_since: "2026-07-05T11:41:00Z",
+      progress: { ...prog("percent"), pct: 40, milestone_done: 1, milestone_total: 3 },
+    });
+    expect(container.textContent).toContain("⚠ near timeout");
+  });
+
+  it("names the park in screen-reader text only (the status pill shows it)", () => {
+    const { container } = renderRow({ status: "limit_wait", progress: prog("parked") });
+    const cell = container.querySelector('[data-run-progress="parked"]')!;
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe("Progress: limit wait");
+  });
+
+  it("is hidden while the row reads waiting for vault unlock", () => {
+    const { container } = renderRow({ status: "queued", progress: prog("queued") }, true);
+    expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
+    expect(container.querySelector("[data-run-progress]")).toBeNull();
+  });
+
+  it("renders no cell for a pre-feature row without progress", () => {
+    const { container } = renderRow({ status: "running" });
+    expect(container.querySelector("[data-run-progress]")).toBeNull();
+  });
+});

@@ -29,6 +29,15 @@
   "requeue_count": 1,
   "iteration_count": 1,
   "is_planning": true,
+  "progress": {
+    "state": "x",
+    "pct": 1,
+    "milestone_done": 1,
+    "milestone_total": 1,
+    "active_milestone_id": "x",
+    "phase": "x",
+    "maybe_blocked_by_run_id": "x"
+  },
   "auto_approve": true,
   "auto_approve_blocked_reasons": [
     "x"

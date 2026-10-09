@@ -55,6 +55,7 @@ import {
   uniqueLiveMatchMilestoneId,
 } from "../lib/runBadge";
 import { activityAge, latestActivity } from "../lib/runActivity";
+import { RunProgressCard } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
@@ -2711,6 +2712,15 @@ export function RunView() {
           </div>
         }
       />
+
+      {/* PRD #2602 M2: the progress card under the header's budget facts — percent, the
+          segmented plan track, the active role's phase, or the state flag that replaces a
+          misleading number. Renders nothing without a server-derived progress (terminal
+          runs, older servers). The role line uses the now-line's activity (live frames),
+          falling back to the DTO's current_activity before the first frame arrives. The
+          card itself shows that role only while one is at work (percent, stalled): a
+          waiting, parked, queued or planning run has no active role. */}
+      <RunProgressCard run={run} activity={activity ?? run.current_activity ?? null} />
 
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
           parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
