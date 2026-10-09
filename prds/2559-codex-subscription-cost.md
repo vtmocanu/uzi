@@ -1,6 +1,6 @@
 # PRD #2559: API-equivalent cost for Codex subscription runs
 
-**Status**: Implemented and reviewed; full agent gate verification unresolved. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
+**Status**: Implemented and reviewed; PR publication authorized, M1 validation pending at the final PR head. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
 
 Planning facts were read at `main` `140b5c767` (after #2552, which rewrote the aggregate disclosure wording).
 
@@ -103,6 +103,14 @@ it is **not an actual-provider end-to-end cost test**. The implementation and
 documentation have passed fixed-commit reviewer/tester coverage. M1 is not
 marked complete and this PRD stays active because the full agent gate is red.
 
+On 2026-10-09, the human authorized finishing implementation and opening the
+PR with this local verification gap disclosed. This does not waive acceptance
+or merging: M1 validation remains pending until GitHub CI's required agent
+test jobs pass on the final PR head. The landing session enforces that
+condition. Recovery code and the failing tests are unchanged by this task.
+Do not mark this PRD complete or move it to `prds/done/` before that condition
+is satisfied.
+
 - [x] Unit A (`ea707` + fix `192413`): producer pricing coverage has literal
   $1.278 = $0.293 low-tier + $0.985 high-tier in
   `agent/test/codex-cost-accounting.test.ts`; lead terminal coverage has
@@ -142,13 +150,26 @@ marked complete and this PRD stays active because the full agent gate is red.
 - [ ] Passing full `task gate:agent` and final M1 completion. Three completed
   full runs (`7ML8PD`, `ELKW5e`, `JlKdkk`) each reported 11,226 passes,
   one failure, three skips and no cancellations, then exited 201. They failed
-  different assertions in unchanged plan-replay/cancellation test files;
-  cost tests passed in all three. The failed cases passed focused BASE/HEAD
+  different assertions in unchanged plan-replay/cancellation test files:
+  - `7ML8PD` (`task gate:agent`, default test concurrency):
+    `worker shutdown mid-revision, reclaimed with worker-side resume_lineage_break`
+    in `agent/test/runner-gate-verdict-interruption.test.ts:675`.
+  - `ELKW5e` (`task gate:agent`, `UZI_AGENT_TEST_CONCURRENCY=2`):
+    `explicit close cancels startup; request signal cancels active pass`
+    in `agent/test/codex-pr-description-eval.test.ts:279`.
+  - `JlKdkk` (`task gate:agent`, `UZI_AGENT_TEST_CONCURRENCY=4`,
+    `UV_THREADPOOL_SIZE=16`):
+    `a stub (Codex-shaped) executor never re-presents: its first gate waits for the replayed backlog, and a replayed approve goes stale at it (finding 6; round 4 finding 1)`
+    in `agent/test/runner-gate-verdict-interruption.test.ts:1538`.
+
+  Cost tests passed in all three. The failed cases passed focused BASE/HEAD
   comparisons. All 72 plan-replay tests and all 14 evaluator tests also passed
   on BASE. A typechecked baseline delayed-exit fixture reproduced the
   evaluator's double-exit assertion, but natural baseline failure was not
-  reproduced and causes of the full-suite failures remain unconfirmed. The
-  independent conformance result above does not replace a green full gate.
+  reproduced and natural causes of the full-suite failures remain unconfirmed.
+  CPU contention is a hypothesis, not an established cause. API, web, repo,
+  isolated live-DB, docs and Codex conformance passed; none marks the full
+  agent gate as passed or substitutes for the required PR-head agent jobs.
 
 ## Risks
 
