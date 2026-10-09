@@ -1420,6 +1420,88 @@ describe("issue #1783 M2 review: checkpoint adoption on a wired resume that seed
   }
 });
 
+
+describe("Unit 2 terminal retained descriptors", { skip: !HAS_PROCFS }, () => {
+  async function retained(iid: number, attempt: boolean) {
+    const owner = randomUUID();
+    const pred = await seedPredecessor(iid, owner, { attempt });
+    await git.reserveRecoveryIteration(bare(), `agent/issue-${iid}`, `issue-${iid}`, { runId: owner, ...pred }, 5);
+    return { owner, pred, journal: readJournal(iid)! };
+  }
+
+  for (const attempt of [true, false]) {
+    it(`terminal retained ${attempt ? "attempt" : "canonical"} detaches custody and permits next issue run`, async () => {
+      const iid = attempt ? 25121 : 25122;
+      const { owner, pred, journal } = await retained(iid, attempt);
+      terminalOwner(owner, iid);
+      const { factory, started } = transientFactory(ctx => {
+        assert.notEqual(ctx.worktreePath, pred.clonePath);
+        assert.ok(parseAttemptPath(ctx.worktreePath, path.join(fx.dataDir, "runner")));
+        assert.notEqual(readJournal(iid)?.runId, owner);
+      });
+      for (let generation = 2; generation <= 3; generation++) {
+        const worker = restartedWorker(factory, { dockerHost: undefined });
+        assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { claim_generation: generation })), false);
+        assert.equal(started(), generation - 1, "actual next executor entry");
+        const protectedRaw = configGetAll(`uzi-retained.${owner}.journal`);
+        assert.equal(protectedRaw.length, 1);
+        assert.deepEqual(JSON.parse(protectedRaw[0]!), { version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal });
+        assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+        if (pred.attemptId) assert.equal(readLedger(iid).get(pred.attemptId)?.state, "reclaimed");
+        const inventory = await worker.git.readInventoryCloneHeads(bare(), owner);
+        assert.equal(inventory.kind, "verified");
+        if (inventory.kind === "verified") assert.ok(inventory.clones.some(c => c.clonePath === pred.clonePath));
+      }
+    });
+  }
+
+  it("live retained owner refuses descriptor detachment", async () => {
+    const iid = 25123;
+    const { owner, journal } = await retained(iid, true);
+    const { factory, started } = transientFactory();
+    await restartedWorker(factory).runner.execute(gitlabClaim(iid));
+    assert.equal(started(), 0);
+    assert.deepEqual(readJournal(iid), journal);
+    assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), []);
+  });
+
+  for (const canonical of [false, true]) {
+    it(canonical ? "unwired canonical writer refuses terminal descriptor detachment" : "retained sibling writer refuses terminal descriptor detachment", async () => {
+      const iid = canonical ? 25125 : 25124;
+      const { owner, pred, journal } = await retained(iid, !canonical);
+      let writerPath = pred.clonePath;
+      if (!canonical) {
+        const siblingId = mintAttemptId(1);
+        const sibling = await git.createOrAttachRunnerClone(bare(), iid + 1, noProofReseed, owner, false, undefined, fixtureSeed(siblingId));
+        // Attribute a same-key predecessor with a real clone and matching ledger.
+        writerPath = `${canonicalFor(iid)}.attempt-${siblingId}`;
+        fs.renameSync(sibling.path, writerPath);
+        execFileSync("git", ["-C", bare(), "config", "--local", "--unset-all", `uzi-attempts.agent/issue-${iid + 1}.entry`], { env: GIT_ENV });
+        execFileSync("git", ["-C", bare(), "config", "--local", "--add", `uzi-attempts.agent/issue-${iid}.entry`,
+          JSON.stringify({ attemptId: siblingId, runId: owner, clonePath: writerPath, state: "live" })], { env: GIT_ENV });
+        journal.retainedSources = [{ runId: owner, clonePath: writerPath, attemptId: siblingId }];
+        execFileSync("git", ["-C", bare(), "config", "--local", `uzi-recovery.agent/issue-${iid}.clone`, JSON.stringify(journal)], { env: GIT_ENV });
+      }
+      terminalOwner(owner, iid);
+      const { factory, started } = transientFactory();
+      const requests: QuiesceRunRequest[] = [];
+      const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+        requests.push(req);
+        if (req.targetPaths?.includes(writerPath)) return {
+          process: { state: "survivors", processes: [], killed: [], detail: "writer still present" },
+          docker: { state: "not_wired", removed: [], detail: "" },
+        };
+        return fastQuiesce(req);
+      };
+      await restartedWorker(factory, { dockerHost: undefined, quiesceRun }).runner.execute(gitlabClaim(iid));
+      assert.ok(requests.some(r => r.targetPaths?.includes(writerPath)), "proof includes writer path");
+      assert.equal(started(), 0);
+      assert.deepEqual(readJournal(iid), journal);
+      assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), []);
+    });
+  }
+});
+
 describe("issue #1783: a planted fresh-attempt path fails typed worker_residue_blocked", () => {
   it("an existing <key>.attempt-<id> path refuses the seed, touches nothing, and classifies as worker_residue_blocked", async () => {
     const iid = 91;

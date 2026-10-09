@@ -713,6 +713,40 @@ unsupported because older workers may drop its recovery fields.
 See the matching [ADR-1197 amendment](1197-transient-recovery-park.md#amendment-2026-10-08--2512-source-bound-retained-recovery)
 and [user recovery guide](../docs/run-recovery-wait.md#bounded-retained-source-recovery).
 
+## Amendment 2026-10-09 — #2512: terminal retained custody
+
+A terminal run's retained recovery journal must not monopolize a branch's active
+slot. After exact terminal ownership validation, the worker validates the full
+journal and every source identity, then proves capture-mode quiescence over the
+primary, retained predecessors, recovery source and recorded successor. This
+also applies to canonical sources on unwired workers.
+
+Detachment compares the full snapshot again after the proof, including recovery
+counters and siblings. Under the bare lock it persists and reads back a
+worker-owned config record, `uzi-retained.<runId>.journal`, containing
+`{version:1,branch,key,journal}`, with the complete original journal. It marks
+every attempt source reclaimed and clears only the matching active slot.
+Interruption at write, readback, ledger append or clear retains active evidence
+or both records for a bounded, idempotent retry. Malformed, duplicate,
+conflicting or unattributed evidence refuses detachment and inventory.
+
+Protected records preserve custody evidence, source paths and recovery pins;
+they grant no seed, discovery or executor authority. Inventory, retention sweep
+and ledger compaction include their sources. Backup validates the exact run's
+full protected descriptor and ledger identities before selecting its current
+clone or a retained predecessor, even after a newer run owns the active slot;
+completed and cancelled runs with protected sources remain eligible. Inconclusive
+evidence fails the backup cycle without replacing the previous latest backup.
+The backup remains a selected-source snapshot, not an atomic archive of all
+siblings, and detachment grants no remote durability or server custody release.
+
+The per-key attempt-mode marker is persisted before releasing the active slot.
+Later runs use fresh attempt paths and model sessions even without Docker;
+a canonical source needs no invented attempt id or on-disk marker. Explicit
+owner discard addresses the exact protected run, deletes only its validated
+pins and descriptor, leaves source bytes intact, and preserves any newer active
+journal and the persistent attempt-mode marker.
+
 ## Amendment 2026-10-09 — #2512: verification resource limit
 
 Human review authorizes a 1 GiB delivered decoded-history limit for reachable

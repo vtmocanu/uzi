@@ -8089,7 +8089,15 @@ export class RunRunner {
     }
     if (!shape) return refuse("path", "path_mismatch"); // (d′)
     diagnostics.pathShape = shape;
-    if (flight.effectiveAttemptPaths ?? this.attemptPaths) {
+    let retained: Awaited<ReturnType<GitCache["terminalRetainedSnapshot"]>>;
+    try {
+      retained = await this.git.terminalRetainedSnapshot(barePath, branch, owner.slug, {
+        runId: ownerRunId, clonePath: journaledPath,
+      });
+    } catch (error) {
+      return refuse("path", "path_error", error);
+    }
+    if (retained || (flight.effectiveAttemptPaths ?? this.attemptPaths)) {
       // The same predecessor-scoped capture-mode proof the C′ capture runs, and the same blocking
       // rule: survivors or unverified leave journal, ledger and path untouched.
       let proof: { outcome: QuiesceRunOutcome; blocked: boolean };
@@ -8097,7 +8105,7 @@ export class RunRunner {
         proof = await this.quiesceRun(flight, flight.executor, {
           mode: "capture",
           site: "orphan_reclaim",
-          targetPaths: [journaledPath],
+          targetPaths: retained?.paths ?? [journaledPath],
           clonePath: journaledPath,
         });
       } catch {
@@ -8110,7 +8118,10 @@ export class RunRunner {
     }
     let disposition: "retained-in-place" | Awaited<ReturnType<GitCache["retireRunnerClone"]>>;
     try {
-      if ((flight.effectiveAttemptPaths ?? this.attemptPaths) && shape === "attempt") {
+      if (retained) {
+        await this.git.detachTerminalRetained(barePath, branch, owner.slug, retained.journal);
+        disposition = "retained-in-place";
+      } else if ((flight.effectiveAttemptPaths ?? this.attemptPaths) && shape === "attempt") {
         // The foreign owner's work is retained IN PLACE (never moved) and was NOT captured, so it
         // may be the only copy: the ledger says `reclaimed`, which the retention sweep never counts
         // or deletes — the attempt-path twin of the foreign quarantine below (discard:false).
@@ -8558,7 +8569,12 @@ export class RunRunner {
     // issue #1783 M2: a Docker-wired worker mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
     if (flight.effectiveAttemptPaths) flight.attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
-    const attemptSeed = this.attemptSeedOptions(claim, flight);
+    let attemptSeed = this.attemptSeedOptions(claim, flight);
+    const refreshAttemptSeed = async () => {
+      flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
+      if (flight.effectiveAttemptPaths && !flight.attemptId) flight.attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
+      attemptSeed = this.attemptSeedOptions(claim, flight);
+    };
     const reseed = this.canonicalReseedOptions(flight);
     try {
       const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
@@ -8587,6 +8603,7 @@ export class RunRunner {
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
         await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
+        await refreshAttemptSeed();
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
@@ -8595,6 +8612,7 @@ export class RunRunner {
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
         await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
+        await refreshAttemptSeed();
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;

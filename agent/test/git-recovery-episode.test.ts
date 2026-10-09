@@ -45,6 +45,103 @@ beforeEach(async () => {
 });
 afterEach(() => fx.cleanup());
 
+
+for (const fault of ["write", "clear", "readback", "ledger"] as const) {
+  test(`terminal descriptor interruption at ${fault} preserves attribution and retries after recreation`, async () => {
+    const { tip } = await ready();
+    const before = journal();
+    const snapshot = await cache.terminalRetainedSnapshot(bare, branch, key, before);
+    assert.ok(snapshot);
+    const seam = cache as unknown as { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
+    const real = seam.runGit.bind(cache);
+    let written = false;
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "config" && args.includes(`uzi-retained.${runId}.journal`)) {
+        if (fault === "write") throw new Error("injected descriptor write failure");
+        const out = await real(cwd, args, ...rest);
+        written = true;
+        return out;
+      }
+      if (fault === "readback" && written && args.includes("--list")) throw new Error("injected readback failure");
+      if (fault === "clear" && args.includes(`uzi-recovery.${branch}.clone`) && args.at(-1) === "") throw new Error("injected clear failure");
+      if (fault === "ledger" && args.includes("--add") && args.some(a => a.includes('"reclaimed"'))) throw new Error("injected ledger failure");
+      return real(cwd, args, ...rest);
+    };
+    await assert.rejects(cache.detachTerminalRetained(bare, branch, key, snapshot.journal), /injected/);
+    assert.deepEqual(journal(), before);
+    assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+    const restarted = recreate();
+    await restarted.detachTerminalRetained(bare, branch, key, snapshot.journal);
+    await recreate().detachTerminalRetained(bare, branch, key, snapshot.journal);
+    assert.equal(git(bare, ["config", `uzi-recovery.${branch}.clone`]), "");
+    assert.deepEqual(JSON.parse(git(bare, ["config", `uzi-retained.${runId}.journal`])).journal, before);
+    assert.equal(await restarted.discoverRetainedRecovery(fx.originPath, branch, key, runId), undefined);
+    assert.equal(await restarted.recoveryAttemptMode(fx.originPath, key), true);
+    assert.equal((await restarted.readInventoryCloneHeads(bare, runId)).kind, "verified");
+    for (const p of snapshot.paths) assert.ok(fs.existsSync(p));
+  });
+}
+
+test("terminal descriptor full snapshot refuses changed counters and changed siblings", async () => {
+  await ready();
+  const snapshot = (await cache.terminalRetainedSnapshot(bare, branch, key, journal()))!;
+  for (const change of ["counter", "siblings"]) {
+    const changed = structuredClone(snapshot.journal);
+    if (change === "counter") changed.recovery!.attempts = 2;
+    else changed.retainedSources = [];
+    writeJournal(changed);
+    await assert.rejects(cache.detachTerminalRetained(bare, branch, key, snapshot.journal), /snapshot changed/);
+    assert.deepEqual(journal(), changed);
+  }
+});
+
+test("protected descriptor conflicts and malformed evidence refuse detachment and inventory", async () => {
+  await ready();
+  const snapshot = (await cache.terminalRetainedSnapshot(bare, branch, key, journal()))!;
+  const envelope = { version: 1, branch, key, journal: snapshot.journal };
+  for (const value of ["{", JSON.stringify({ ...envelope, version: 2 }),
+    JSON.stringify({ ...envelope, journal: { ...snapshot.journal, recovery: { ...snapshot.journal.recovery, attempts: 2 } } }),
+    JSON.stringify({ ...envelope, key: "issue-other" })]) {
+    git(bare, ["config", `uzi-retained.${runId}.journal`, value]);
+    await assert.rejects(cache.detachTerminalRetained(bare, branch, key, snapshot.journal));
+    assert.deepEqual(journal(), snapshot.journal);
+    assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "unknown");
+  }
+  git(bare, ["config", `uzi-retained.${runId}.journal`, JSON.stringify(envelope)]);
+  git(bare, ["config", "--add", `uzi-retained.${runId}.journal`, JSON.stringify(envelope)]);
+  await assert.rejects(cache.detachTerminalRetained(bare, branch, key, snapshot.journal), /invalid protected/);
+  assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "unknown");
+});
+
+test("discard exact detached run preserves newer active ownership and fresh attempt marker", async () => {
+  const { tip } = await ready();
+  const before = journal();
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  const nextRun = "run-next";
+  const next = await recreate().createOrAttachRunnerClone(bare, 2512, noProofReseed, nextRun, false, undefined, {
+    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true,
+  });
+  await cache.markRecoveryCapture(bare, next.path, branch, nextRun, next.attemptId);
+  const active = journal();
+  assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip, "next seed keeps the old recovery pin");
+  const entries = git(bare, ["config", "--get-all", `uzi-attempts.${branch}.entry`]).split("\n").map(raw => JSON.parse(raw));
+  assert.equal(entries.filter(entry => entry.attemptId === aid(2)).at(-1)?.state, "reclaimed", "successor attribution survives seed compaction");
+  const inventory = await recreate().readInventoryCloneHeads(bare, runId);
+  assert.equal(inventory.kind, "verified");
+  if (inventory.kind === "verified") {
+    assert.ok(inventory.clones.some(clone => clone.clonePath === source.clonePath));
+    assert.ok(inventory.clones.some(clone => clone.clonePath === before.clonePath));
+  }
+  await recreate().detachTerminalRetained(bare, branch, key, before);
+  assert.deepEqual(journal(), active);
+  await recreate().discardRetainedRecovery(bare, branch, key, before, true);
+  assert.deepEqual(journal(), active);
+  assert.equal(await cache.recoveryAttemptMode(fx.originPath, key), true);
+  assert.throws(() => git(bare, ["config", `uzi-retained.${runId}.journal`]));
+  assert.throws(() => git(bare, ["rev-parse", "--verify", `refs/uzi-recovery-episode/${runId}/${tip}`]));
+  assert.ok(fs.existsSync(source.clonePath));
+});
+
 test("missing source discovery carries trusted coordinates and first blocker persists exhausted identity", async () => {
   fs.renameSync(source.clonePath, source.clonePath + ".saved");
   await assert.rejects(cache.discoverRetainedRecovery(fx.originPath, branch, key, runId), err => {
