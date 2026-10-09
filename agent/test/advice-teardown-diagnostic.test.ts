@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import cp from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { it } from "node:test";
@@ -10,7 +11,7 @@ import { AdviceTeardownDiagnostic } from "./advice-teardown-diagnostic.js";
 import { recordingLogger } from "./helpers.js";
 
 it("advice diagnostic prints before cleanup and rethrows the original assertion without private fields", async (t) => {
-  const base = await fs.mkdtemp(path.resolve("../.uzi/scratch/advice-diagnostic-"));
+  const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "advice-diagnostic-"));
   const { logger, lines } = recordingLogger();
   const diagnostic = new AdviceTeardownDiagnostic();
   const original = new assert.AssertionError({ message: "private-assertion-sentinel" });

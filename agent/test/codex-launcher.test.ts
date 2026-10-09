@@ -830,7 +830,7 @@ describe("M1 controlled advice disposal ordering probe", () => {
   for (const ordering of ["exit_first", "evidence_first", "unclean"] as const) {
     for (const leaf of ["single_uid", "owner_refusal"] as const) {
       it(ordering + " through actual executor " + leaf, async (t) => {
-        const base = await fs.mkdtemp(path.resolve("../.uzi/scratch/advice-probe-"));
+        const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "advice-probe-"));
         const fake = newFake({ exitBeforeEvidence: ordering === "exit_first", exitCode: ordering === "unclean" ? 1 : 0 });
         const { logger, lines } = recordingLogger();
         const diagnostic = new AdviceTeardownDiagnostic();
