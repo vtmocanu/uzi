@@ -2390,10 +2390,11 @@ milestone the lead did not attribute gets no `NOW` row at all, just its
 plain mark in the `MILESTONES` block. A run with no effective attribution
 keeps the single global `NOW` row unchanged.
 `run get` also prints a `PROGRESS` row for a live run: the server-derived
-estimate, e.g. `≈70% · milestone 3 of 3`, or a flag (waits on you, parked,
-queued, stalled, planning) when a number would mislead (see [Progress
-estimate](./run-activity.md#progress-estimate)). It is omitted once the run
-is terminal. `--json` carries `progress` as an object (`null` for a terminal
+estimate, e.g. `≈70% · milestone 3 of 3`, or a flag when a number would
+mislead: `stalled · since HH:MM` (UTC), `waits on you · plan gate|question|follow-up`,
+`parked · limit wait|pool wait|recovery wait|paused`, `queued` or `planning`
+(see [Progress estimate](./run-activity.md#progress-estimate)). The row is
+omitted when the run has no estimate and once the run is terminal. `--json` carries `progress` as an object (`null` for a terminal
 run), so `--field progress` is a usage error (exit 2) while the run is live
 and prints an empty line once it is terminal, as for `milestones`.
 `--json` carries the full `current_activity` object; `current_activity` is

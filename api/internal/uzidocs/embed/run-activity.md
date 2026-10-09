@@ -469,11 +469,14 @@ mislead:
 
 | Flag | When |
 |---|---|
-| Waits on you | The run is awaiting approval, input or a follow-up |
-| Parked | The run is in a usage-limit, pool or recovery wait, or paused (the surface shows the same park wording it shows elsewhere) |
-| Queued | The run has not started yet |
-| Stalled | The run's health is stalled or looping; shows since when |
-| Planning | The run is planning and has no frozen milestone list yet |
+| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds `since HH:MM`); the TUI board shows only `waits on you` |
+| Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI and TUI board say which: `limit wait`, `pool wait`, `recovery wait` or `paused` (the board abbreviates to `⏸ limit`, `⏸ pool`, `⏸ recov`, `⏸ paused`). On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
+| Queued | The run has not started yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+| Stalled | The run's health is stalled or looping. The web row (`◼ stalled · since HH:MM`, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
+| Planning | The run is planning and has no frozen milestone list yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+
+When there is no estimate at all, the web cell shows `—`, the TUI board cell
+is blank and `uzi run get` omits the row.
 
 **No time remaining or finish time is shown.** The estimate is too
 unreliable to display: in a backtest of completed issue runs, only 59% of
@@ -482,12 +485,15 @@ the estimates fell within 2x of the actual time remaining.
 Where it appears:
 
 - **Web** (dashboard and runs list rows): a Progress cell, `70%` with a thin
-  bar, or the flag.
-- **TUI board**: a `PROG` column after `MILES`. The bar drops first on
-  narrow terminals, leaving the percent or a short flag. Every flag is text,
-  so `NO_COLOR` keeps all of them.
+  bar, or `● waits on you` / `◼ stalled` as above. On the Dashboard the cell
+  is hidden at phone widths; the runs list keeps it.
+- **TUI board**: a `PROG` column after `MILES`, e.g. `70% ▰▰▰▰▰▰▱▱`. The bar
+  drops before the percent on narrow terminals, leaving the percent or a
+  short flag. Every flag is text, so `NO_COLOR` keeps all of them. The board
+  shows no "since" time.
 - **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
-  of 3`. See [the CLI docs](./cli.md#commands).
+  of 3`, `stalled · since 14:05` or `waits on you · plan gate`. The row is
+  omitted when there is no estimate and once the run is terminal. See [the CLI docs](./cli.md#commands).
 
 ## Stopping or narrowing a run
 
