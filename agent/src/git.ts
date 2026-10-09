@@ -4908,7 +4908,11 @@ export class GitCache {
     let cause: InventoryReadCause = "other";
     let physicalFailure = false;
     let ownPhysicalFailure: InventoryReadCause | undefined;
+    const ownRetainedPaths = new Set<string>();
     const inspect = async (journal: RecoveryJournalEntry) => {
+      if (journal.runId === runId) {
+        for (const source of this.recoverySources(journal)) ownRetainedPaths.add(source.clonePath);
+      }
       const failure = await this.recoveryPhysicalFailure(journal);
       if (failure) {
         physicalFailure = true;
@@ -4993,17 +4997,26 @@ export class GitCache {
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
               path.dirname(path.dirname(clone)) !== root) refuse("clone_path_invalid", "unsafe clone path");
-          // After attribution validation, probe outer-to-inner: ENOENT skips this clone
-          // without reading descendants; every existing ancestor must be a non-symlink directory.
+          // Probe outer-to-inner. Only ordinary non-retained absence may skip a clone;
+          // retained sources must still be present after the physical prepass.
           for (const dir of [root, path.dirname(clone)]) {
             let st: Stats;
             try { st = await fs.lstat(dir); }
-            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; cause = "clone_ancestor_invalid"; throw err; }
+            catch (err) {
+              if ((err as NodeJS.ErrnoException).code === "ENOENT" && !ownRetainedPaths.has(clone)) continue clonePaths;
+              cause = "clone_ancestor_invalid"; throw err;
+            }
             if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_ancestor_invalid", "unsafe clone parent");
           }
           let st: Stats;
           try { st = await fs.lstat(clone); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; cause = "git_or_filesystem_error"; throw err; }
+          catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+              if (ownRetainedPaths.has(clone)) refuse("clone_path_invalid", "missing retained clone");
+              continue;
+            }
+            cause = "git_or_filesystem_error"; throw err;
+          }
           if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
           const head = await atFailure("clone_head_unreadable", async () => {
             const gitdir = path.join(clone, ".git");

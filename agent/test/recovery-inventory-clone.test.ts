@@ -409,6 +409,51 @@ async function inventoryFixture(attempt: boolean) {
   }
 }
 
+for (const evidence of ["active", "protected", "overlap"] as const) {
+  for (const missing of ["runner", "parent", "predecessor"] as const) {
+    it(`inventory refuses retained ${missing} disappearing after physical prepass (${evidence})`, async t => {
+      const f = await inventoryFixture(true);
+      const predecessor = f.canonical;
+      const predecessorGit = path.join(predecessor, ".git");
+      const target = missing === "predecessor" ? predecessor : f[missing];
+      const prepasses = evidence === "overlap" ? 2 : 1;
+      let completedPrepasses = 0, removed = false;
+      const original = fs.lstat;
+      try {
+        for (const clone of [f.clone, predecessor]) {
+          await fs.mkdir(path.join(clone, ".git"), { recursive: true });
+          await fs.writeFile(path.join(clone, ".git", "HEAD"), "a".repeat(40));
+        }
+        const journal = { runId: inventoryRun, clonePath: f.clone, attemptId: inventoryAttempt,
+          retainedSources: [{ runId: inventoryRun, clonePath: predecessor }] };
+        if (evidence === "protected") {
+          f.git(["-C", f.bare, "config", "--local", "--unset-all", "uzi-recovery.task.clone"]);
+        } else f.journal(journal);
+        if (evidence !== "active") {
+          f.git(["-C", f.bare, "config", "--local", "uzi-retained." + inventoryRun + ".journal",
+            JSON.stringify({ version: 1, branch: "task", key: "issue-2433", journal })]);
+        }
+        const stub = t.mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
+          const probe = String(args[0]);
+          if (!removed && completedPrepasses === prepasses && probe === target) {
+            removed = true;
+            await fs.rm(target, { recursive: true });
+          }
+          const stat = await original(...args);
+          if (probe === predecessorGit) completedPrepasses++;
+          return stat;
+        }) as typeof fs.lstat);
+        try {
+          assert.deepEqual(await f.read(), { kind: "unknown",
+            cause: missing === "predecessor" ? "clone_path_invalid" : "clone_ancestor_invalid" });
+          assert.equal(removed, true, "source was removed during final traversal");
+          assert.equal(completedPrepasses, prepasses);
+        } finally { stub.mock.restore(); }
+      } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+    });
+  }
+}
+
 function traceInventoryLstat(t: TestContext) {
   const original = fs.lstat;
   const probes: string[] = [];
