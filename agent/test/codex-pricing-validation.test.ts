@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(import.meta.dirname, "../..");
+// Scratch stays inside the repo so the spawned tsx child resolves node_modules;
+// a fresh CI checkout has no .uzi/scratch yet, so create it first.
+async function scratchDir(prefix: string): Promise<string> {
+  await mkdir(resolve(root, ".uzi/scratch"), { recursive: true });
+  return mkdtemp(resolve(root, `.uzi/scratch/${prefix}`));
+}
 
 function changed(path: string[], value: unknown, remove = false): unknown {
   const copy: unknown = structuredClone(table);
@@ -122,7 +128,7 @@ it("keeps canonical metadata and supports optional promo dates and own model key
 });
 
 it("malformed pricing data fails during actual module load", async () => {
-  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-load-"));
+  const scratch = await scratchDir("pricing-load-");
   try {
     for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
       await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
@@ -151,7 +157,7 @@ for (const [name, path] of [
   ["absent optional promotion", [...row, "promo_review_date"]],
 ] as const) {
   it(`valid pricing data loads with ${name}`, async () => {
-    const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-load-"));
+    const scratch = await scratchDir("pricing-load-");
     try {
       for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
         await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
@@ -195,7 +201,7 @@ it("inherited object keys are unknown models", () => {
 it("ExactModelKeys: raw Unicode is checked before module validation", async () => {
   const suite = await readFile(resolve(root, "scripts/pricing-freshness.test.sh"), "utf8");
   const corpus = suite.split("cat <<'UNICODE_FIXTURES'\n")[1]!.split("\nUNICODE_FIXTURES")[0]!;
-  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-unicode-"));
+  const scratch = await scratchDir("pricing-unicode-");
   try {
     for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
       await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
@@ -225,7 +231,7 @@ it("ExactModelKeys: raw Unicode is checked before module validation", async () =
 it("raw UTF8 rejection occurs before replacement decoding at actual module load", async () => {
   const suite = await readFile(resolve(root, "scripts/pricing-freshness.test.sh"), "utf8");
   const corpus = suite.split("cat <<'RAW_UTF8_FIXTURES'\n")[1]!.split("\nRAW_UTF8_FIXTURES")[0]!;
-  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-bytes-"));
+  const scratch = await scratchDir("pricing-bytes-");
   try {
     for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
       await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
@@ -289,7 +295,7 @@ it("direct validator rejects lone Unicode in versions and model keys", () => {
 });
 
 it("priceCodexResponse keeps exact Unicode keys and decoded duplicate last wins", async () => {
-  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-keys-"));
+  const scratch = await scratchDir("pricing-keys-");
   try {
     for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
       await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
