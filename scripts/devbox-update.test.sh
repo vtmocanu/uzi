@@ -19,7 +19,9 @@ check contract '.jobs.validate_tools.permissions == {"contents":"read"} and ((.j
 check contract '[.jobs.validate_tools.steps[] | select((.uses // "") | startswith("actions/checkout@")) | .with["persist-credentials"]] == [false]'
 check contract '[.jobs.validate_tools.steps[] | select((.uses // "") | startswith("DeterminateSystems/nix-installer-action@")) | [.env.OTEL_SDK_DISABLED, .with["diagnostic-endpoint"], .with["github-token"]]] == [["true", "", "${{ github.token }}"]]'
 check contract '[.jobs.validate_tools.steps[] | select(.name == "Relock and validate uxlab") | .["working-directory"]] == ["api/cmd/uzi/uxlab"]'
-check contract '(.jobs.propose.if | contains("always() && !cancelled()")) and (.jobs.propose.if | contains("needs.validate_tools.result"))'
+check contract '.jobs.propose.if == "always() && !cancelled() && inputs.dry_run != true && ((needs.validate.result == '\''success'\'' && needs.validate.outputs.changed == '\''true'\'') ||\n (needs.validate_tools.result == '\''success'\'' && needs.validate_tools.outputs.changed == '\''true'\''))"'
+check contract '.jobs.propose.steps[-1].env.WORKER_VALID == "${{ needs.validate.result == '\''success'\'' && needs.validate.outputs.changed == '\''true'\'' }}"'
+check contract '.jobs.propose.steps[-1].env.UXLAB_VALID == "${{ needs.validate_tools.result == '\''success'\'' && needs.validate_tools.outputs.changed == '\''true'\'' }}"'
 
 check contract '.jobs.validate.permissions == {"contents":"read"}'
 check contract '[.jobs.validate.steps[] | select((.uses // "") | startswith("actions/checkout@")) | .with["persist-credentials"]] == [false]'
@@ -123,12 +125,14 @@ proposal_case() {
     pr)
       [ "$rc" -eq 0 ] && grep -F 'git push origin HEAD:refs/heads/chore/devbox-toolchain-update' "$TMP/$mode/calls" \
         && grep -F 'gh pr create --base main --head chore/devbox-toolchain-update --title chore(deps): refresh devbox toolchain (nixpkgs pin)' "$TMP/$mode/calls" \
-        && ! grep -F 'gh issue create' "$TMP/$mode/calls" ;;
+        && ! grep -F 'gh issue create' "$TMP/$mode/calls" \
+        && grep -F 'main CI re-validates the worker toolchain on merge.' "$TMP/$mode/calls" ;;
     uxlab)
       [ "$rc" -eq 0 ] && grep -F 'git add api/cmd/uzi/uxlab/devbox.lock' "$TMP/$mode/calls" \
         && ! grep -F 'git add agent/devbox-global/devbox.lock' "$TMP/$mode/calls" \
         && grep -F 'Uxlab lock: validated by a successful devbox install.' "$TMP/$mode/calls" \
-        && ! grep -F 'Worker lock: validated' "$TMP/$mode/calls" ;;
+        && ! grep -F 'Worker lock: validated' "$TMP/$mode/calls" \
+        && ! grep -F 'main CI re-validates' "$TMP/$mode/calls" ;;
     both)
       [ "$rc" -eq 0 ] && grep -F 'git add agent/devbox-global/devbox.lock api/cmd/uzi/uxlab/devbox.lock' "$TMP/$mode/calls" ;;
     none)
@@ -155,4 +159,4 @@ check proposal_case uxlab-lease lease
 check proposal_case uxlab-bad-sha invalid
 check proposal_case both-bad-uxlab invalid
 printf 'cases=%s passed=%s\n'  "$cases" "$passed"
-[ "$cases" -eq 37 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -eq 39 ] && [ "$cases" -eq "$passed" ]

@@ -20,11 +20,12 @@
 # agent/devbox-global/assert-toolchain.sh against what devbox actually installed
 # (toolchain-guard.tsv smoke). Uxlab validation installs its dev tools. Only successful
 # validators authorize their own changed lock; the workflow then pushes the branch and
-# try to open a PR. If PR creation is refused (setting off and no PAT), it files a
+# tries to open a PR. If PR creation is refused (setting off and no PAT), it files a
 # tracking ISSUE pointing at the already-pushed, already-validated branch, so the
 # signal is never lost and a human opens the PR (which then triggers CI). Supplying a
 # workflow-scoped PAT as DEVBOX_UPDATE_TOKEN (contents + pull-requests write) makes the
-# PR open directly and run its own CI. main's ci.yml re-validates on merge either way.
+# PR open directly and run its own CI. main CI re-validates the worker lock on merge;
+# uxlab has no validation in ci.yml.
 # This preserves roles-manifest-refresh.yml's PR-or-issue pattern. Validation and
 # proposal use separate runners; only the final trusted proposal step gets write
 # credentials. A manual dry_run validates without proposing anything.
@@ -206,13 +207,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # Install nix (flakes enabled) + the devbox CLI directly, NOT via
-      # jetify-com/devbox-install-action. Given a project-path, that action PRE-INSTALLS the
-      # whole toolchain before our step runs -- redundant with the Docker validate build
-      # below, and it fetches the OLD (pre-update) nixpkgs closure we are about to discard,
-      # which is an extra transient-failure surface (a truncated nixpkgs tarball fetch failed
-      # the first run). Install the CLI ourselves to avoid the action's pre-install.
-      # Devbox may still initialize packages during update; the image is the final guard.
+      # Install the CLI directly, as in the worker job, to avoid pre-installing
+      # the old closure before relocking. This job validates the refreshed uxlab
+      # lock by a successful devbox install; it does not build a worker image.
       - name: Install nix (flakes)
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa  # v23
         env:
@@ -364,8 +361,12 @@ jobs:
           BRANCH="chore/devbox-toolchain-update"
           LABEL="dependencies"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          BODY="$(printf 'Automated weekly devbox lock refresh (#912, #1291).\n\nIncluded locks:\n%s\n\nValidation:\n%s\n\nOnly independently validated changed locks are included. The worker toolchain can include major versions; review its delta when present. main CI re-validates on merge.\n\nRun: %s' \
-            "$(printf '%s\n' "${LOCKS[@]}")" "$(printf '%s\n' "${VALIDATION[@]}")" "$RUN_URL")"
+          MERGE_VALIDATION=""
+          if [ "$WORKER_VALID" = true ]; then
+            MERGE_VALIDATION='main CI re-validates the worker toolchain on merge.'
+          fi
+          BODY="$(printf 'Automated weekly devbox lock refresh (#912, #1291).\n\nIncluded locks:\n%s\n\nValidation:\n%s\n\nOnly independently validated changed locks are included. The worker toolchain can include major versions; review its delta when present.\n%s\n\nRun: %s' \
+            "$(printf '%s\n' "${LOCKS[@]}")" "$(printf '%s\n' "${VALIDATION[@]}")" "$MERGE_VALIDATION" "$RUN_URL")"
 
           # Idempotent label so `gh pr create --label` / `gh issue create --label` work.
           gh label create "${LABEL}" \
