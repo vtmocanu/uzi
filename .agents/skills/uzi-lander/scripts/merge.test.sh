@@ -96,7 +96,10 @@ if [ "\${1:-}" = api ]; then
     exit 0 ;;
   esac
 fi
-if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then printf '%s\n' "\${CHECKS_JSON:-}"; exit "\${CHECKS_RC:-0}"; fi
+if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then
+  if [ "\${CHECKS_REQUIRED_EMPTY:-0}" = 1 ] && [[ " \$* " == *' --required '* ]]; then echo '[]'; exit 0; fi
+  printf '%s\n' "\${CHECKS_JSON:-}"; exit "\${CHECKS_RC:-0}"
+fi
 # main's workflow runs via the Actions API, one paginated query per status: MAIN_RUNS_JSON is
 # the full run list (Actions shape); the stub filters by status and splits it into pages of 2,
 # so a release run past any recency window is still reached. RUNS_FAIL=1 = an unreadable page.
@@ -243,6 +246,7 @@ merge_run() { # label -> rc, output in $WORK/m.<label>
   set -e
 }
 CHECKS_JSON='[]' CHECKS_RC=0; export CHECKS_JSON CHECKS_RC
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
 merge_run empty
 [ "$rc" -eq 2 ] || fail "an empty required-checks list returned rc=$rc, want 2: $(cat "$WORK/m.empty")"
 grep -q "no required checks reported on ${HEAD:0:8}; not merging" "$WORK/m.empty" || fail "empty list not named: $(cat "$WORK/m.empty")"
@@ -252,27 +256,27 @@ merge_run unreadable
 [ "$rc" -eq 2 ] || fail "a failed gh pr checks returned rc=$rc, want 2: $(cat "$WORK/m.unreadable")"
 grep -q 'cannot read the required checks for #42 (gh exit 1)' "$WORK/m.unreadable" || fail "gh failure not named: $(cat "$WORK/m.unreadable")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with unreadable required checks"
-CHECKS_JSON='[{"bucket":"pass"},{"bucket":"fail"}]' CHECKS_RC=1
+CHECKS_JSON='[{"name":"ci","bucket":"pass"},{"name":"other","bucket":"fail"}]' CHECKS_RC=1
 merge_run failing
 [ "$rc" -eq 1 ] || fail "a failing required check returned rc=$rc, want 1: $(cat "$WORK/m.failing")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with a failing required check"
 # A pass with a NON-zero gh exit is a partial read (API failure), not a verdict.
-CHECKS_JSON='[{"bucket":"pass"}]' CHECKS_RC=1
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=1
 merge_run partial
 [ "$rc" -eq 2 ] || fail "a pass list with gh exit 1 returned rc=$rc, want 2: $(cat "$WORK/m.partial")"
 grep -q 'gh pr checks exited 1 with no failing or pending check' "$WORK/m.partial" || fail "partial read not named: $(cat "$WORK/m.partial")"
 [ ! -e "$WORK/merge.log" ] || fail "merged on a partial required-checks read"
 # Only skipping checks: no required gate ran.
-CHECKS_JSON='[{"bucket":"skipping"},{"bucket":"skipping"}]' CHECKS_RC=0
+CHECKS_JSON='[{"name":"ci","bucket":"skipping"},{"name":"other","bucket":"skipping"}]' CHECKS_RC=0
 merge_run skipping
 [ "$rc" -eq 2 ] || fail "skipping-only returned rc=$rc, want 2: $(cat "$WORK/m.skipping")"
 grep -q 'no required check passed' "$WORK/m.skipping" || fail "skipping-only not named: $(cat "$WORK/m.skipping")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with only skipping required checks"
 # Path-filtered checks skip next to a passing one: that still merges.
-CHECKS_JSON='[{"bucket":"pass"},{"bucket":"skipping"}]' CHECKS_RC=0
+CHECKS_JSON='[{"name":"ci","bucket":"pass"},{"name":"other","bucket":"skipping"}]' CHECKS_RC=0
 merge_run passskip
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "pass+skipping did not reach the merge: $(cat "$WORK/m.passskip")"
-CHECKS_JSON='[{"bucket":"pass"}]' CHECKS_RC=0
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
 merge_run green
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
 # A required context the base branch's rules name but the head has not reported is pending:
@@ -298,6 +302,23 @@ merge_run rulesmalformed
 [ "$rc" -eq 2 ] || fail "a malformed required-check rule returned rc=$rc, want 2: $(cat "$WORK/m.rulesmalformed")"
 [ ! -e "$WORK/merge.log" ] || fail "merged on a malformed required-check rule"
 unset CHECKS_JSON CHECKS_RC RULES_JSON
+
+# Readable empty requirements gate ALL checks, including optional failures/skips.
+export CHECKS_REQUIRED_EMPTY=1 CHECKS_RC=0
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"},{"name":"optional","bucket":"skipping"}]'
+merge_run noreq-green
+grep -q -- '--match-head-commit' "$WORK/merge.log" || fail "no-required green did not merge: $(cat "$WORK/m.noreq-green")"
+CHECKS_JSON='[{"name":"ci","bucket":"skipping"}]'; merge_run noreq-skipping
+grep -q -- '--match-head-commit' "$WORK/merge.log" || fail "no-required skipping did not merge"
+for bucket in pending cancel mystery; do
+  CHECKS_JSON="[{\"name\":\"ci\",\"bucket\":\"$bucket\"}]"; merge_run "noreq-$bucket"
+  [ "$rc" -eq 2 ] && [ ! -e "$WORK/merge.log" ] || fail "no-required $bucket was merge-ready"
+done
+CHECKS_JSON='[{"name":"ci","bucket":"fail"}]'; merge_run noreq-fail
+[ "$rc" -eq 1 ] && [ ! -e "$WORK/merge.log" ] || fail "no-required failed check was merge-ready"
+CHECKS_JSON='[]'; merge_run noreq-empty
+[ "$rc" -eq 2 ] && [ ! -e "$WORK/merge.log" ] || fail "no-required zero checks was merge-ready"
+unset CHECKS_REQUIRED_EMPTY CHECKS_JSON CHECKS_RC
 
 # 6. A PR that conflicts with its base gets no pull_request CI, so gh reports no required
 #    checks and exits 1. Name the conflict (exit 3, land-prep), not "cannot read the checks".

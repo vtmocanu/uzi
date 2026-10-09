@@ -12,6 +12,13 @@ mkdir -p "$WORK/bin"
 cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # RULES_OUT is the slurped `gh api --paginate --slurp` reply; RULES_RC its exit status.
+if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
+  printf '%s\n' "$*" > "$CHECKS_CALL"
+  printf '%s' "$CHECKS_OUT"; exit "${CHECKS_RC:-0}"
+fi
+if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
+  printf '%s' "$VIEW_OUT"; exit "${VIEW_RC:-0}"
+fi
 case "$*" in *'--paginate --slurp repos/test/repo/rules/branches/main'*) ;; *) echo "unexpected gh call: $*" >&2; exit 1 ;; esac
 printf '%s\n' "$RULES_OUT"
 exit "${RULES_RC:-0}"
@@ -41,11 +48,33 @@ RULES_OUT="[[$(rule '[{"context":7}]')]]"; bad "non-string context"
 RULES_OUT='[{"type":"deletion"}]'; bad "unslurped page"
 RULES_OUT='{"message":"Not Found"}'; bad "error object"
 RULES_OUT='[]'; bad "no pages"
+RULES_OUT='[[null]]'; bad "null rule"
+RULES_OUT='[[{}]]'; bad "missing rule type"
+RULES_OUT='[[{"type":7}]]'; bad "non-string rule type"
 RULES_OUT="[[$(rule '[{"context":"a"}]')]]"; export RULES_RC=1; bad "gh page fetch failed"
 unset RULES_RC
 
 [ "$(missing_required '["a","b"]' '[{"name":"a","bucket":"pass"}]')" = 1 ] || fail "one absent context not counted"
 [ "$(missing_required '["a"]' '[{"name":"a","bucket":"pending"}]')" = 0 ] || fail "a registered context counted missing"
 [ "$(missing_required '[]' '[]')" = 0 ] || fail "nothing required, yet missing"
+
+HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+export CHECKS_CALL="$WORK/checks-call" CHECKS_OUT='[{"name":"ci","bucket":"pass"}]'
+export VIEW_OUT="{\"headRefOid\":\"$HEAD\",\"baseRefName\":\"main\"}"
+got=$(pr_ci_checks test/repo 42 '[]' "$HEAD" main) || fail "all-checks fallback failed"
+[ "$got" = "$CHECKS_OUT" ] || fail "fallback payload changed"
+grep -qF -- '--required' "$CHECKS_CALL" && fail "none-required queried only required checks"
+got=$(pr_ci_checks test/repo 42 '["ci"]' "$HEAD" main) || fail "required mode failed"
+grep -qF -- '--required' "$CHECKS_CALL" || fail "required-present query changed"
+VIEW_OUT="{\"headRefOid\":\"other\",\"baseRefName\":\"main\"}"
+if got=$(pr_ci_checks test/repo 42 '[]' "$HEAD" main 2>/dev/null); then fail "changed head exposed green checks"; fi
+[ -z "$got" ] || fail "changed head published stale CI data"
+VIEW_OUT="{\"headRefOid\":\"$HEAD\",\"baseRefName\":\"other\"}"
+if got=$(pr_ci_checks test/repo 42 '[]' "$HEAD" main 2>/dev/null); then fail "retargeted base kept old no-required proof"; fi
+VIEW_OUT='{}'
+if got=$(pr_ci_checks test/repo 42 '[]' "$HEAD" main 2>/dev/null); then fail "missing head metadata exposed green checks"; fi
+ci_checks_valid '[{"bucket":"pass"},{"bucket":"skipping"}]' || fail "known buckets rejected"
+if ci_checks_valid '[{"bucket":"mystery"}]'; then fail "unknown bucket accepted"; fi
+if ci_checks_valid '[{}]'; then fail "missing bucket accepted"; fi
 
 echo "PASS required-checks: pages flattened; malformed or unreadable rules are unknown, not none"
