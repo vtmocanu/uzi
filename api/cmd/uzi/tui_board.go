@@ -727,80 +727,84 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 	return " " + m.pal.faint.Render(name+" · "+itoa(it.count))
 }
 
-// boardFooter is the one-line key legend; key letters are tungsten (keyHint), labels faint.
+// boardFooter preserves the unabridged legend for version-readout selection.
 func (m tuiModel) boardFooter() string {
-	parts := []string{m.keyHint("enter/→", "open"), m.keyHint("/", "filter")}
-	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
-	if markedCost {
-		// Keep the cost cue and quit key ahead of hints that may be clipped at narrow widths.
-		parts = append(parts, m.keyHint("q", "quit"), m.pal.faint.Render("+ partial"))
-	}
-	if m.board.admin {
-		parts = append(parts, m.keyHint("a", "my runs"))
-	} else {
-		parts = append(parts, m.keyHint("a", "factory"))
-		// The fold-done toggle is meaningless on the admin board (non-terminal runs only), so
-		// its hint is dropped there rather than offering a no-op.
-		if m.board.hideDone {
-			parts = append(parts, m.keyHint("h", "show done"))
-		} else {
-			parts = append(parts, m.keyHint("h", "fold done"))
-		}
-	}
-	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"))
-	if !markedCost {
-		parts = append(parts, m.keyHint("q", "quit"))
-	}
-	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+	return m.renderFooterHints(m.boardFooterHints(), 0)
 }
 
-// boardFooterLine is the board's footer: the help legend, plus an always-on compact
-// CLI-vs-server version readout right-aligned at the far edge (issue #687, superseding
-// #681's conditional skew sentence). m.showVersion gates the whole readout (the off
-// switches: --quiet / UZI_VERSION_CHECK=0 / the CheckServerVersion seam). The single
-// outer clampVisual(..., m.width) at the renderBoard call site is the only wrap.
+func (m tuiModel) boardFooterHints() []footerHint {
+	parts := []footerHint{m.footerHint("enter/→", "open"), m.footerHint("/", "filter")}
+	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
+	if markedCost {
+		parts = append(parts, m.footerHint("q", "quit"), footerHint{text: m.pal.faint.Render("+ partial")})
+	}
+	if m.board.admin {
+		parts = append(parts, m.footerHint("a", "my runs"))
+	} else {
+		parts = append(parts, m.footerHint("a", "factory"))
+		if m.board.hideDone {
+			parts = append(parts, m.footerHint("h", "show done"))
+		} else {
+			parts = append(parts, m.footerHint("h", "fold done"))
+		}
+	}
+	parts = append(parts, m.footerHint("r", "refresh"), m.footerHint("?", "keys"))
+	if !markedCost {
+		parts = append(parts, m.footerHint("q", "quit"))
+	}
+	return parts
+}
+
+// boardFooterLine chooses the readout against the original legend, then fits
+// structured hints in the suffix budget. Split notes only use leftover space.
 func (m tuiModel) boardFooterLine() string {
-	help := m.boardFooter()
-	if line, ok := m.restartFooter(help); ok {
+	hints := m.boardFooterHints()
+	original := m.boardFooter()
+	if line, ok := m.restartFooterContent(original, hints); ok {
 		return line
 	}
 	if !m.showVersion {
-		return m.withSplitNote(help)
+		return m.withSplitNote(m.fitFooterHints(hints, m.width))
 	}
 	const gap = 1
-	helpW := visualWidth(help)
 	readout := m.versionReadout()
-	if helpW+gap+visualWidth(readout) <= m.width {
-		if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+visualWidth(readout) <= m.width {
-			help = candidate
-		}
-		return padVisual(help, m.width-visualWidth(readout)) + readout
+	if visualWidth(original)+gap+visualWidth(readout) > m.width {
+		readout = m.versionClientOnly()
 	}
-	// Too narrow for the full readout: drop the "<arrow> <server>" suffix and show the
-	// client version alone (still red when behind, so the alarm survives the drop).
-	client := m.versionClientOnly()
-	cw := visualWidth(client)
-	if helpW+gap+cw <= m.width {
-		if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+cw <= m.width {
-			help = candidate
-		}
-		return padVisual(help, m.width-cw) + client
+	// Shed all optional hints before shortening an unusually long client stamp.
+	essentialW := visualWidth(m.renderFooterHints(hints, 6))
+	if m.width >= 80 {
+		readout = clampVisual(readout, max(0, m.width-essentialW-gap))
+	} else {
+		readout = clampVisual(readout, max(0, m.width))
 	}
-	// Still too narrow: give the client version the right edge, let help truncate.
-	left := clampVisual(help, m.width-cw-gap)
-	return padVisual(left, m.width-cw) + client
+	rw := visualWidth(readout)
+	help := m.fitFooterHints(hints, m.width-rw-gap)
+	if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+rw <= m.width {
+		help = candidate
+	}
+	return padVisual(help, max(0, m.width-rw)) + readout
 }
 
-// restartFooter gives the installed-version fact priority over skew and help.
-// At narrow widths the restart action survives even when the full version cannot fit.
+// restartFooter also serves the split caller, whose supplied keys are essential.
 func (m tuiModel) restartFooter(help string) (string, bool) {
+	return m.restartFooterContent(help, nil)
+}
+
+// restartFooterContent reserves essential help before choosing the installed
+// banner. Board hints shed within that budget; split hint selection stays intact.
+func (m tuiModel) restartFooterContent(help string, hints []footerHint) (string, bool) {
 	if !m.showVersion || m.updatePrompt.installedVersion == "" {
 		return "", false
 	}
 	installed := m.renderer.Plain(m.updatePrompt.installedVersion, 256)
 	hint := "v" + strings.TrimPrefix(installed, "v") + " installed, restart uzi to use it"
 	width := max(0, m.width)
-	if visualWidth(hint) > width {
+	essentialW := visualWidth(help)
+	if hints != nil {
+		essentialW = visualWidth(m.renderFooterHints(hints, 6))
+	}
+	if visualWidth(hint)+1+essentialW > width {
 		hint = "restart uzi"
 	}
 	hint = clampVisual(hint, width)
@@ -808,10 +812,14 @@ func (m tuiModel) restartFooter(help string) (string, bool) {
 		hint = m.pal.faint.Render(hint)
 	}
 	hw := visualWidth(hint)
+	budget := max(0, width-hw-1)
+	if hints != nil {
+		help = m.fitFooterHints(hints, budget)
+	}
 	if m.profile == colorprofile.Ascii {
 		help = ansi.Strip(help)
 	}
-	left := clampVisual(help, max(0, width-hw-1))
+	left := clampVisual(help, budget)
 	return padVisual(left, max(0, width-hw)) + hint, true
 }
 

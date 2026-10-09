@@ -101,11 +101,11 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 				renderedFooter := view[strings.LastIndex(view, "\n")+1:]
 				for _, got := range []string{footer, renderedFooter} {
 					if !strings.Contains(got, "+ partial") ||
-						!strings.Contains(got, "enter/→ open") || !strings.Contains(got, "/ filter") ||
+						!strings.Contains(got, "enter/→ open") || !strings.Contains(got, "? keys") ||
 						!strings.Contains(got, "q quit") || !strings.Contains(got, "v0.63.0") {
 						t.Errorf("width %d footer lost cost cue, key hint, or version: %q", width, got)
 					}
-					if !strings.Contains(got, "a factory") {
+					if width >= 100 && (!strings.Contains(got, "a factory") || !strings.Contains(got, "/ filter")) {
 						t.Errorf("width %d footer lost factory hint: %q", width, got)
 					}
 					if width >= 100 && (!strings.Contains(got, "r refresh") || !strings.Contains(got, "? keys")) {
