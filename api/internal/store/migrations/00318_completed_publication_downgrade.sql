@@ -27,7 +27,7 @@ END $$;
 -- +goose StatementEnd
 
 -- +goose Down
--- Restore the guard installed by migration 00315; existing evidence is unchanged.
+-- Restore the guard installed by migration 00316; existing evidence is unchanged.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION completed_publication_run_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
