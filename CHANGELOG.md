@@ -30,20 +30,6 @@ through `[0.52.0]`.)
 - **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
   Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
 
-- **Dedicated cross-check capacity ([#2169](https://github.com/vtmocanu/uzi/issues/2169)).**
-  Plan cross-check children use a separate agent pool (`WORKER_CROSS_CHECK_SLOTS`, default 1, range 0–16), prefer their lead's worker, and retain the plan-stage run-slot fallback only on older workers with an unadvertised cap and no lane capability. Explicit zero disables advertisement/polling without enabling fallback. Cordoned workers may finish their pinned child, subject to maintenance fences; an eligible ephemeral own lane avoids another pod and preserves the parent binding, while active children block lease entry and teardown. Lane claims retain credential, recovery and custody checks, including same-generation lane accounting. Web capacity shows separate runs/cross-checks; owner/admin API DTOs and CLI `RUN SLOTS` / `CROSS-CHECKS` expose both lanes during draining. Hosted `workers.crossCheckSlots` / `UZI_WORKER_CROSS_CHECK_SLOTS` preserve zero and roll workers through the spec hash without raising preset memory. Lead/checker memory remains shared and default-one hosted headroom is unmeasured; hosted acceptance is pending. This enables Claude-lead plan checks on Codex, not the reverse direction or Code cross-check.
-
-- **Guarded recovery records safe inventory-source refusal diagnostics ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
-  Worker logs and authenticated local recovery reasons identify the first failed source check and a bounded inventory-read cause without raw errors or paths. Existing custody and release decisions stay unchanged; the observed automatic hold-release failure still needs live evidence.
-
-- **Codex checkpoints can retry a verified startup timeout without failing completed work ([#2475](https://github.com/vtmocanu/uzi/issues/2475)).**
-  A checkpoint can retry when a child misses its startup deadline, provided disposal and full reap are verified before the original hard deadline. Completed work is preserved; hard deadline expiry, unsafe posture and unverified cleanup remain fatal. Worker logs and failure reasons include bounded launch-failure classifications without raw error summaries.
-
-### Fixed
-
-- **Codex commentary stays live during long tool calls ([#2283](https://github.com/vtmocanu/uzi/issues/2283)).**
-  Assistant commentary is emitted while a tool callback is still running, so the run feed and transcript show it before the tool result. Ordinary tool callbacks remain serial, and cancellation still ends the turn promptly.
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
@@ -100,6 +86,15 @@ through `[0.52.0]`.)
 
 - **Workers reclaim guarded local recovery inventory after its final custody acknowledgment ([#2417](https://github.com/vtmocanu/uzi/issues/2417)).**
   After a covering final acknowledgment, workers remove that generation's local recovery pins, bundles and journals, retrying interrupted cleanup without affecting sibling generations or shared pins. Queued completion and finalization reports can retire on fresh, exact terminal custody authority; bounded live heartbeat retries clear eligible finalize records without a restart, while unknown evidence keeps custody and owner discard alone does not authorize source deletion. The server receipt and selected archive retain their existing retention policy. See [Recovering unpublished work](docs/run-recovery.md#guarded-inventory-and-final-custody-transfer).
+
+- **Dedicated cross-check capacity ([#2169](https://github.com/vtmocanu/uzi/issues/2169)).**
+  Plan cross-check children use a separate agent pool (`WORKER_CROSS_CHECK_SLOTS`, default 1, range 0–16), prefer their lead's worker, and retain the plan-stage run-slot fallback only on older workers with an unadvertised cap and no lane capability. Explicit zero disables advertisement/polling without enabling fallback. Cordoned workers may finish their pinned child, subject to maintenance fences; an eligible ephemeral own lane avoids another pod and preserves the parent binding, while active children block lease entry and teardown. Lane claims retain credential, recovery and custody checks, including same-generation lane accounting. Web capacity shows separate runs/cross-checks; owner/admin API DTOs and CLI `RUN SLOTS` / `CROSS-CHECKS` expose both lanes during draining. Hosted `workers.crossCheckSlots` / `UZI_WORKER_CROSS_CHECK_SLOTS` preserve zero and roll workers through the spec hash without raising preset memory. Lead/checker memory remains shared and default-one hosted headroom is unmeasured; hosted acceptance is pending. This enables Claude-lead plan checks on Codex, not the reverse direction or Code cross-check.
+
+- **Guarded recovery records safe inventory-source refusal diagnostics ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
+  Worker logs and authenticated local recovery reasons identify the first failed source check and a bounded inventory-read cause without raw errors or paths. Existing custody and release decisions stay unchanged; the observed automatic hold-release failure still needs live evidence.
+
+- **Codex checkpoints can retry a verified startup timeout without failing completed work ([#2475](https://github.com/vtmocanu/uzi/issues/2475)).**
+  A checkpoint can retry when a child misses its startup deadline, provided disposal and full reap are verified before the original hard deadline. Completed work is preserved; hard deadline expiry, unsafe posture and unverified cleanup remain fatal. Worker logs and failure reasons include bounded launch-failure classifications without raw error summaries.
 
 ### Added
 
@@ -268,6 +263,9 @@ through `[0.52.0]`.)
 
 - **Removed dispatch labels stay removed ([#2441](https://github.com/vtmocanu/uzi/issues/2441)).**
   GitHub sweep dispatches no longer restore a removed selector label during another label write. Stale board moves and label additions keep removed labels absent while preserving unrelated current labels in the issues cache.
+
+- **Codex commentary stays live during long tool calls ([#2283](https://github.com/vtmocanu/uzi/issues/2283)).**
+  Assistant commentary is emitted while a tool callback is still running, so the run feed and transcript show it before the tool result. Ordinary tool callbacks remain serial, and cancellation still ends the turn promptly.
 
 ## [0.85.2] - 2026-10-05
 
