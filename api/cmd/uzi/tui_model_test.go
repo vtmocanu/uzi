@@ -256,7 +256,7 @@ func TestTUIDetailPlanGateBanner(t *testing.T) {
 }
 
 // M3 S3: awaiting_input gets a DISTINCT banner and NEVER offers y/n — those keys do
-// nothing at a clarification park (which is answered off-TUI).
+// nothing at a clarification park (where the owner answers with i).
 func TestTUIDetailInputBannerIsDistinctAndHasNoYesNo(t *testing.T) {
 	runID := "in-1"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)

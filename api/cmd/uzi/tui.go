@@ -911,11 +911,15 @@ func pollFallbackCmd(runID string, gen uint64) tea.Cmd {
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	n := next.(tuiModel)
+	n.reconcileAnswer()
 	return n.reconcileWorkers(cmd)
 }
 
 func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case answerResultMsg:
+		cmd := m.applyAnswerResult(msg)
+		return m, cmd
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
@@ -1396,7 +1400,8 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case pageBackfill:
-			return m, (&m).applyBackfillPage(msg.msgs, msg.err)
+			cmd := (&m).applyBackfillPage(msg.msgs, msg.err)
+			return m, cmd
 		case pageCatchup:
 			if msg.reqID != m.detail.catchupWaitID {
 				return m, nil // a superseded / stale catch-up reply
@@ -1680,7 +1685,7 @@ func (m tuiModel) filtering() bool {
 		(m.view == viewBoard && m.board.filtering) ||
 		(m.view == viewPulls && m.pulls.filtering) ||
 		(m.view == viewCI && m.ci.filtering) ||
-		(m.view == viewDetail && m.detail.steer.mode == steerTyping)
+		(m.view == viewDetail && (m.detail.steer.mode == steerTyping || m.detail.answer.open))
 }
 
 func (m tuiModel) transcriptWidth() int {

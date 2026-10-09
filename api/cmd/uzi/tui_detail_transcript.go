@@ -468,6 +468,7 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 	}
 	chrome++ // the blank separator line before the body
 	chrome++ // the transcript pane's own title row (the first line of the body column)
+	chrome += len(m.answerNoticeLines())
 	chrome += lineCount(m.detailBanner())
 	chrome += lineCount(m.renderSteerBar())
 	if m.detail.steer.mode == steerIdle {
@@ -477,6 +478,14 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 }
 
 func (m tuiModel) transcriptViewport() int {
+	if m.detail.answer.open {
+		chrome := len(m.detailHeaderLines())
+		if m.transportLine() != "" {
+			chrome++
+		}
+		room := max(2, m.height-chrome)
+		return max(1, room-len(m.answerCardLines(room))-1)
+	}
 	return max(3, m.transcriptBudgetWithoutCard()-len(m.questionCardLines()))
 }
 

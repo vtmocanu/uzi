@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -46,7 +47,8 @@ const (
 // detailState is one run's live view: the lane rail plus the selected lane's
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
-	runID string
+	answer answerState
+	runID  string
 	// gen is this detail session's generation (stamped from tuiModel.detailGen on each drill-in
 	// from the board; the `--run` start session keeps 0). Every run/page command captures it
 	// and every reply is checked against it, because exitToBoard cannot cancel a command in
@@ -491,6 +493,9 @@ func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
+	if nm, cmd, handled := m.answerKey(k); handled {
+		return nm, cmd
+	}
 	// The overlay and the steer bar get first refusal, in that order: while either is
 	// in an input/confirm mode it must swallow keys that would otherwise be pane
 	// navigation, or typing "l" into a follow-up would move pane focus underneath it.
@@ -773,6 +778,9 @@ func (m tuiModel) detailHeaderLines() []string {
 }
 
 func (m tuiModel) renderDetail() string {
+	if m.detail.answer.open {
+		return m.renderAnswerDetail()
+	}
 	d := &m.detail
 	var sb strings.Builder
 
@@ -896,6 +904,9 @@ func (m tuiModel) renderDetail() string {
 	if b := m.detailBanner(); b != "" {
 		sb.WriteString(b + "\n")
 	}
+	for _, line := range m.answerNoticeLines() {
+		sb.WriteString(line + "\n")
+	}
 	// Steer status (queue indicator, notice, typing input, confirm box, or the read-only
 	// reason) renders above the footer when present. When the bar is mid-input it owns the
 	// key hints, so the single combined footer is drawn only when the bar is idle (M4).
@@ -1002,7 +1013,7 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 // detailBanner is the S3 attention-band treatment: awaiting_approval gets the PLAN GATE band with
 // the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
 // awaiting_input gets a DISTINCT needs-input band that never offers y/n — those keys do nothing
-// at a clarification park, which is answered off-TUI (run answer / web / Slack); awaiting_followup
+// at a clarification park, where the owner answers with i; awaiting_followup
 // (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
 // user's next follow-up, which is NOT a y/n prompt — the owner sends a follow-up (the `f` key) or
 // stops the run. All bands show for owner and non-owner alike; the inline y/n keys are
@@ -1014,6 +1025,14 @@ func (m tuiModel) detailBanner() string {
 	case "awaiting_approval":
 		return m.attentionBanner("⚑ PLAN GATE", "the crew is waiting on your approval", owner)
 	case "awaiting_input":
+		if m.detail.steer.access == steerAllowed {
+			if frame, open := m.openQuestionFrame(); open {
+				if p, ok := parseAnswerableQuestion(frame.Payload); ok {
+					return m.attentionBanner("✎ NEEDS INPUT", fmt.Sprintf("the agent asked %d questions; answer with i", len(p.Questions)), false)
+				}
+				return m.attentionBanner("✎ NEEDS INPUT", "cannot answer this payload here; use the web or Slack", false)
+			}
+		}
 		return m.attentionBanner("✎ NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", false)
 	case "awaiting_followup":
 		// The "with f" hint is owner-only: the `f` steer key is gated to the run owner
