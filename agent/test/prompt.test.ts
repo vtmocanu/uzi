@@ -29,9 +29,12 @@ import {
   renderFollowUpBlock,
   REPO_SUBAGENT_UNTRUSTED_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
+  LEAD_GATE_SEQUENCING_APPEND,
 } from "../src/prompt.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import { assembleAgents } from "../src/agents.js";
 import type {
+  AgentTemplate,
   IssueCommentsSnapshot,
   MemoryEntry,
   ReviewCommentSnapshot,
@@ -1291,12 +1294,18 @@ describe("buildLeadSystemPrompt", () => {
         LEAD_GUARDRAIL_APPEND,
         FINDINGS_NUDGE_APPEND,
         SECRET_FIXTURE_HYGIENE_APPEND,
+        LEAD_GATE_SEQUENCING_APPEND,
         PRD_LIFECYCLE_APPEND,
       ].join("\n\n"),
     );
     assert.strictEqual(
       buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append,
-      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND].join("\n\n"),
+      [
+        LEAD_GUARDRAIL_APPEND,
+        FINDINGS_NUDGE_APPEND,
+        SECRET_FIXTURE_HYGIENE_APPEND,
+        LEAD_GATE_SEQUENCING_APPEND,
+      ].join("\n\n"),
     );
   });
 
@@ -1337,7 +1346,12 @@ describe("buildLeadSystemPrompt", () => {
     assert.strictEqual(buildLeadSystemPrompt("   ").append, buildLeadSystemPrompt(undefined).append);
     assert.strictEqual(
       buildLeadSystemPrompt("   ", { kind: "ci_fix" }).append,
-      [LEAD_GUARDRAIL_APPEND, FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND].join("\n\n"),
+      [
+        LEAD_GUARDRAIL_APPEND,
+        FINDINGS_NUDGE_APPEND,
+        SECRET_FIXTURE_HYGIENE_APPEND,
+        LEAD_GATE_SEQUENCING_APPEND,
+      ].join("\n\n"),
     );
   });
 
@@ -2424,5 +2438,69 @@ describe("M3 captured issue evidence", () => {
     const header = p.split("\n").find((line) => line.startsWith("[1] @"));
     assert.equal(header, `[1] @${"a".repeat(199)}\u{1f680} at ${"\u{1f680}".repeat(200)}:`);
     assert.ok(p.includes("\nELIGIBLE-BODY\n"));
+  });
+});
+
+describe("issue #2593: lead gate-sequencing append", () => {
+  const flat = LEAD_GATE_SEQUENCING_APPEND.replace(/\s+/g, " ");
+  const kinds = ["issue", "mr_rework", "ci_fix", "self_improve", "judge"] as const;
+
+  it("reaches the lead on both harnesses and with no harness, across run kinds", () => {
+    for (const kind of kinds) {
+      for (const harness of ["claude", "codex", undefined] as const) {
+        const { append } = buildLeadSystemPrompt("LEAD BODY", { kind, harness });
+        assert.ok(append.includes(LEAD_GATE_SEQUENCING_APPEND), `${kind}/${harness ?? "none"}`);
+      }
+    }
+  });
+
+  it("sits ahead of the untrusted repo-instructions fence", () => {
+    const repoInstructions = buildRepoInstructionsContext("x");
+    const { append } = buildLeadSystemPrompt("LEAD BODY", { kind: "issue", repoInstructions });
+    const at = append.indexOf(LEAD_GATE_SEQUENCING_APPEND);
+    const fence = append.indexOf("<untrusted_repo_instructions_");
+    assert.ok(at >= 0 && fence >= 0);
+    assert.ok(at < fence);
+  });
+
+  it("limits its precedence to when the gate runs relative to review", () => {
+    assert.ok(flat.includes("when the integration gate runs relative to review"));
+    assert.ok(flat.includes("no precedence over any other template instruction"));
+  });
+
+  it("still applies when a customized body keeps the older always-overlap wording", () => {
+    const body =
+      "run the integration gate over that commit, overlapped with the read-only wave you just dispatched, never serialized ahead of it";
+    const { append } = buildLeadSystemPrompt(body, { kind: "issue" });
+    assert.ok(append.includes(body));
+    assert.ok(append.includes("once review invalidates a candidate whose full gate is costly"));
+  });
+
+  it("states the overlap default, the exception, and the triage steps", () => {
+    for (const phrase of [
+      "By default, run the integration gate over a landed commit overlapped with its read-only review wave",
+      "once review invalidates a candidate whose full gate is costly",
+      "then repeat the full gate",
+      "Deferring the gate changes when it runs, not whether it blocks",
+      "Identify the smallest useful reproducer before repeating the full gate",
+      "only when the failure cannot be reproduced with a narrower selection",
+      "rerun full validation when a fix, a relevant environment change, or a necessary diagnostic invalidates or requires rechecking the earlier result. Record the reason",
+      "remains a reported failed check, with its base evidence",
+    ]) {
+      assert.ok(flat.includes(phrase), phrase);
+    }
+  });
+
+  it("is not added to subagent prompts", () => {
+    const tester: AgentTemplate = {
+      name: "tester",
+      description: "runs the gate",
+      prompt_body: "Run the gate.",
+      tools: ["Read", "Bash"],
+    };
+    const def = assembleAgents([tester]).subagents.tester;
+    assert.ok(def, "tester assembled");
+    assert.ok(!def.prompt.includes(LEAD_GATE_SEQUENCING_APPEND));
+    assert.ok(!def.prompt.includes("Integration-gate sequencing and failed-gate triage"));
   });
 });
