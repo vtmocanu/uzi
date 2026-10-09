@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/runprogress"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -225,6 +226,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// MilestoneChecklist / MilestoneBadge. Both blocks are conditional so a run with no
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
+	if row := progressRow(r); row != nil {
+		rows = append(rows, row)
+	}
 	rows = append(rows, milestoneRows(r)...)
 	// The NOW row(s). PRD #1353 M5 makes LIVE LANES the authoritative live display: when the run has
 	// at least one in-progress milestone with ≥1 lane in MilestonesLive, milestoneLaneRows emits the
@@ -854,6 +858,92 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 	rows = append(rows, []string{"MILESTONES", summary})
 	rows = append(rows, perMilestone...)
 	return rows
+}
+
+// progressRow renders the PROGRESS row of `uzi run get` (PRD #2602), the CLI twin of the web
+// progress cell and the TUI board PROG column. It reads the server-derived RunDTO.Progress and
+// returns nil when it is absent (a terminal run, or an older server), so those runs render
+// byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
+// in the frozen order, else `N of M done`; the pct is clamped to 0..100), `stalled · since 16:41`
+// (health_since, UTC like the other since clauses), `waits on you · plan gate|question|follow-up`
+// by status, `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`. A
+// non-empty MaybeBlockedByRunID appends ` · may be blocked by <id8>` to any of them, and alone
+// (`may be blocked by <id8>`) for a none, unknown or pct-less percent state, like the TUI block.
+// Only the closed state enum, the integer counts, server timestamps and the cleaned, shortened
+// blocked-by id are drawn; the active milestone id is used for its position and never printed.
+func progressRow(r apitypes.RunDTO) []string {
+	p := r.Progress
+	if p == nil {
+		return nil
+	}
+	row := func(v string) []string {
+		// The hint comes from untrusted question text server-side, so the id is cleaned
+		// and shortened before it is printed.
+		if p.MaybeBlockedByRunID != nil && *p.MaybeBlockedByRunID != "" {
+			hint := "may be blocked by " + shortRunID(cellText(*p.MaybeBlockedByRunID))
+			if v == "" {
+				v = hint
+			} else {
+				v += " · " + hint
+			}
+		}
+		if v == "" {
+			return nil
+		}
+		return []string{"PROGRESS", v}
+	}
+	switch p.State {
+	case runprogress.StatePercent:
+		if p.Pct == nil {
+			return row("")
+		}
+		out := fmt.Sprintf("≈%d%%", min(max(*p.Pct, 0), 100))
+		if p.ActiveMilestoneID != "" {
+			for i, m := range r.Milestones {
+				if m.ID == p.ActiveMilestoneID {
+					return row(fmt.Sprintf("%s · milestone %d of %d", out, i+1, p.MilestoneTotal))
+				}
+			}
+		}
+		return row(fmt.Sprintf("%s · %d of %d done", out, p.MilestoneDone, p.MilestoneTotal))
+	case runprogress.StateStalled:
+		if r.HealthSince != nil {
+			return row("stalled · since " + r.HealthSince.UTC().Format("15:04"))
+		}
+		return row("stalled")
+	case runprogress.StateWaiting:
+		switch r.Status {
+		case "awaiting_approval":
+			return row("waits on you · plan gate")
+		case "awaiting_input":
+			return row("waits on you · question")
+		case "awaiting_followup":
+			return row("waits on you · follow-up")
+		}
+		return row("waits on you")
+	case runprogress.StateParked:
+		return row("parked · " + progressParkWord(r.Status))
+	case runprogress.StateQueued:
+		return row("queued")
+	case runprogress.StatePlanning:
+		return row("planning")
+	}
+	// none and any state this build does not know draw only the blocked-by hint, when set.
+	return row("")
+}
+
+// progressParkWord is the CLI's full park wording; the 8-col board abbreviations
+// (progParkWord) stay board-local. The HOLD row already names a pause's reason.
+func progressParkWord(status string) string {
+	switch status {
+	case "limit_wait":
+		return "limit wait"
+	case "pool_wait":
+		return "pool wait"
+	case "recovery_wait":
+		return "recovery wait"
+	}
+	return "paused"
 }
 
 // nowRow renders the NOW line of `uzi run get` (PRD #1064 M5, D7): the run's

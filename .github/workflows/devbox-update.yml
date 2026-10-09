@@ -15,8 +15,8 @@
 # HOW IT VALIDATES WITHOUT A PAT, AND WHY A PR CAN FALL BACK TO AN ISSUE. A PR opened
 # with the default GITHUB_TOKEN does NOT trigger other workflows (GitHub's recursion
 # guard), and opening a PR with GITHUB_TOKEN at all requires the repo setting "Allow
-# GitHub Actions to create and approve pull requests". So this job does the validation
-# ITSELF -- it builds the worker base image, whose Dockerfile runs
+# GitHub Actions to create and approve pull requests". This workflow validates
+# in a read-only job -- it builds the worker base image, whose Dockerfile runs
 # agent/devbox-global/assert-toolchain.sh against what devbox actually installed
 # (toolchain-guard.tsv smoke) -- and only on a green build does it push the branch and
 # try to open a PR. If PR creation is refused (setting off and no PAT), it files a
@@ -24,7 +24,9 @@
 # signal is never lost and a human opens the PR (which then triggers CI). Supplying a
 # workflow-scoped PAT as DEVBOX_UPDATE_TOKEN (contents + pull-requests write) makes the
 # PR open directly and run its own CI. main's ci.yml re-validates on merge either way.
-# This mirrors roles-manifest-refresh.yml's credential-less PR-or-issue pattern.
+# This preserves roles-manifest-refresh.yml's PR-or-issue pattern. Validation and
+# proposal use separate runners; only the final trusted proposal step gets write
+# credentials. A manual dry_run validates without proposing anything.
 name: Devbox toolchain update
 
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
@@ -34,19 +36,27 @@ name: Devbox toolchain update
     # (roles-manifest-refresh 06:27, main-guard 05:43, e2e 01:17) to dodge scheduler
     # contention. Weekly keeps each bump's delta small so a major shows up isolated.
     - cron: "41 6 * * 1"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate the lock update without proposing a PR or issue
+        type: boolean
+        default: false
 
 permissions:
-  contents: write  # push the update branch
-  pull-requests: write  # open the PR
-  issues: write  # the tracking-issue fallback
+  contents: read
 
 concurrency:
   group: devbox-update
   cancel-in-progress: false
 
 jobs:
-  update:
+  validate:
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.delta.outputs.changed }}
+      lock_sha: ${{ steps.lock.outputs.sha }}
     runs-on: ubuntu-latest
     # A healthy run is a devbox re-lock plus one worker-image build; this only bounds a
     # pathological hang (the cold base build with a fresh nixpkgs closure is minutes).
@@ -55,16 +65,10 @@ jobs:
       - name: Checkout uzi
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          # Full history. The branch-clobber guard below diffs
-          # main...chore/devbox-toolchain-update (three-dot), which needs a merge base; a
-          # shallow checkout (default depth 1) has none, so that diff fails and the guard
-          # fail-closes on EVERY run once the branch exists, never updating it (observed on
-          # run 33485168333: "no merge base" -> stuck). fetch-depth 0 gives the merge base.
+          # The proposal job fetches its own full history for the branch-clobber
+          # guard. This separate checkout is only for generation and validation.
           fetch-depth: 0
-          # The PAT (if set) is what lets the bump PR trigger its own CI; else the
-          # built-in token, which can still push and open a PR where the repo setting
-          # allows it, and otherwise the issue fallback runs.
-          token: ${{ secrets.DEVBOX_UPDATE_TOKEN || github.token }}
+          persist-credentials: false
 
       # Install nix (flakes enabled) + the devbox CLI directly, NOT via
       # jetify-com/devbox-install-action. Given a project-path, that action PRE-INSTALLS the
@@ -75,6 +79,15 @@ jobs:
       # re-locks, and the real toolchain install + validation happens in the base-image build.
       - name: Install nix (flakes)
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa  # v23
+        env:
+          # Keep repository/run metadata out of third-party telemetry. The
+          # action and installer use separate channels, so disable both.
+          OTEL_SDK_DISABLED: "true"
+        with:
+          diagnostic-endpoint: ""
+          # Authenticated GitHub flake fetches avoid shared-IP rate limits.
+          # This job's token is read-only, so nix.conf gains no write credential.
+          github-token: ${{ github.token }}
 
       # The pinned devbox release BINARY (not the self-updating launcher), sha256-verified,
       # matching agent/templates/base/Dockerfile's ARG DEVBOX_VERSION so the lock is
@@ -160,15 +173,72 @@ jobs:
             UZI_SRC_SHA=${{ github.sha }}
           tags: uzi-agent-base:devbox-update
 
-      # Reached only when the lock changed AND the validation build was green (a failed
-      # build fails its step, skipping this one). Pushes the bot branch and opens a PR;
-      # if PR creation is refused, files/refreshes a tracking issue instead.
-      - name: Propose the validated bump (PR, else tracking issue)
+      - name: Digest the validated lock
         if: steps.delta.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.DEVBOX_UPDATE_TOKEN || github.token }}
+        id: lock
         run: |
           set -euo pipefail
+          sha="$(sha256sum agent/devbox-global/devbox.lock | awk '{print $1}')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer only the validated lock
+        if: steps.delta.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: validated-devbox-lock
+          path: agent/devbox-global/devbox.lock
+          if-no-files-found: error
+          retention-days: 1
+
+  # No third-party actions or validation commands run with this job's write token.
+  # Only this final trusted shell step receives credentials and consumes lock DATA.
+  propose:
+    needs: validate
+    if: needs.validate.outputs.changed == 'true' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # push the update branch
+      pull-requests: write  # open the PR
+      issues: write  # the tracking-issue fallback
+      actions: read  # download this run's validated lock artifact
+    steps:
+      - name: Propose the validated bump (PR, else tracking issue)
+        env:
+          GH_TOKEN: ${{ secrets.DEVBOX_UPDATE_TOKEN || github.token }}
+          # Artifact access uses the built-in job token even when the proposal
+          # PAT has only contents/PR scope; job actions:read does not scope a PAT.
+          ARTIFACT_TOKEN: ${{ github.token }}
+          LOCK_SHA: ${{ needs.validate.outputs.lock_sha }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$(mktemp -d "${RUNNER_TEMP}/devbox-lock.XXXXXX")"
+          trap 'rm -rf "$artifact_dir"' EXIT
+          GH_TOKEN="$ARTIFACT_TOKEN" gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name validated-devbox-lock --dir "$artifact_dir"
+          # Treat the artifact as data only: exactly one regular lock, no links or
+          # extra paths, and a digest supplied separately by the validation job.
+          lock_artifact="$artifact_dir/devbox.lock"
+          [ -f "$lock_artifact" ] && [ ! -L "$lock_artifact" ] \
+            || { echo "Missing or linked validated lockfile." >&2; exit 1; }
+          [ "$(find "$artifact_dir" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] \
+            || { echo "Unexpected validated artifact contents." >&2; exit 1; }
+          [[ "$LOCK_SHA" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "Invalid validated lock digest." >&2; exit 1; }
+          printf '%s  %s\n' "$LOCK_SHA" "$lock_artifact" | sha256sum -c -
+
+          # No checkout action runs in this write-scoped job. Fetch the exact
+          # source revision validated above, without persisted credentials.
+          git init
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout --detach "$GITHUB_SHA"
+          cp "$lock_artifact" agent/devbox-global/devbox.lock
+          # Git reads the token only when network authentication is needed; this
+          # env-scoped helper persists no credential in the checkout or artifact.
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper
+          export GIT_CONFIG_VALUE_0='!f() { printf "%s\n" "username=x-access-token" "password=$GH_TOKEN"; }; f'
+
           BRANCH="chore/devbox-toolchain-update"
           LABEL="dependencies"
           LOCK="agent/devbox-global/devbox.lock"

@@ -232,6 +232,10 @@ var d7UntrustedFields = []string{
 	"outboxBlockedText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
 	"runWorkerName",
+	// PRD #2602 run progress strings (tui_detail_progress.go renderProgress): the active milestone id,
+	// the phase and the blocked-by run id derive from untrusted repo/agent/question text and are
+	// drawn only through renderer.Plain. The hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.
+	"ActiveMilestoneID", "Phase", "MaybeBlockedByRunID",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

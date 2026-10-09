@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/runprogress"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -436,6 +437,16 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.MilestonesInProgress = inProgress
 	}
+	// PRD #2602: the progress estimate, from the row-only inputs decoded above. Phase is
+	// filled by the callers that also set CurrentActivity.
+	frozenIDs := make([]string, 0, len(dto.Milestones))
+	for _, m := range dto.Milestones {
+		frozenIDs = append(frozenIDs, m.ID)
+	}
+	dto.Progress = runprogress.Derive(runprogress.Input{
+		Kind: r.Kind, Status: r.Status, Health: r.Health, IsPlanning: dto.IsPlanning,
+		FrozenIDs: frozenIDs, Completed: dto.MilestonesCompleted, InProgress: dto.MilestonesInProgress,
+	})
 	// PRD #1224: the validated per-milestone agent attribution. Degrades to nil on a decode
 	// error (the stored value is the already-validated subset), same as the id arrays above.
 	if agents, err := workersvc.DecodeMilestoneAgents(r.MilestonesAgents); err != nil {
@@ -756,4 +767,13 @@ func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 		dto.Evidence = &evidence
 	}
 	return dto
+}
+
+// setProgressPhase fills Progress.Phase from the run's current-activity role (PRD
+// #2602). It runs after CurrentActivity is overlaid, since runToDTO has no activity;
+// a nil Progress (terminal run) or nil CurrentActivity leaves the phase empty.
+func setProgressPhase(dto *apitypes.RunDTO) {
+	if dto.Progress != nil && dto.CurrentActivity != nil {
+		dto.Progress.Phase = runprogress.Phase(dto.CurrentActivity.Agent)
+	}
 }
