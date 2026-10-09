@@ -326,6 +326,8 @@ export interface RegisterRequest {
    *  pre-#42 worker omits it and the column stays NULL. Distinct from the chat
    *  lane's own concurrency (WORKER_CHAT_SESSIONS). */
   max_concurrent_runs?: number;
+  /** Dedicated cross-check lane cap [0,16]. Explicit zero forbids legacy fallback. */
+  max_cross_check_slots?: number;
   /** The capabilities this worker self-reports as REACHABLE realities (PRD #83 Q1).
    *  An ARRAY (not a `docker` bool) so #84 can grow the capability vocabulary without
    *  another wire change; #83 only ever puts `["docker"]` here (a daemon is reachable,

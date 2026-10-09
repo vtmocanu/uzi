@@ -16,6 +16,7 @@
 // supervisor); everything here is unit-testable with fakes.
 
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
+import { CheckpointChildStartupTimeoutError } from "../harness.js";
 import type {
   BoundaryPermit,
   BoundaryProcessHandle,
@@ -32,7 +33,7 @@ import type {
 } from "../harness.js";
 import type { CaptureSettlement, ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
 import { safeErrorName } from "./registry.js";
-import { SupervisedChildExitTimeoutError } from "./launcher.js";
+import { CodexLaunchError, SupervisedChildExitTimeoutError, classifyCodexLaunchFailure, watchStartupCleanup, type StartupCleanupAuthorization } from "./launcher.js";
 
 /** Which OS identity a boundary action runs as. `worker_pat` is a PAT-bearing
  *  (credentialed) action (e.g. `git push`); `command` is the credential-free
@@ -58,6 +59,7 @@ export interface SpawnedBoundaryProcess extends Omit<BoundaryProcessHandle, "com
 export type SpawnBoundaryProcessSeam = (
   request: BoundaryProcessRequest,
   deadlineMs: number,
+  startupCleanup?: StartupCleanupAuthorization,
 ) => Promise<SpawnedBoundaryProcess>;
 
 /** The registry-bound seams `withBoundary` drives. Kept injectable so the facade is
@@ -571,14 +573,28 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       throw new TrustedExecutionRefusal(error.message);
     }
     const childDeadlineAt = Date.now() + Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt));
+    const startupCleanup: StartupCleanupAuthorization | undefined = request.recoverableTimeout
+      ? Object.freeze({ hardDeadlineAt: this.currentDeadlineAt, attempt: Object.freeze({}) })
+      : undefined;
+    const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
     let launched: SpawnedBoundaryProcess;
     try {
-      launched = await this.seams.spawnProcess(request, Math.max(1, childDeadlineAt - Date.now()));
-    } catch {
+      const launch = this.seams.spawnProcess(request, Math.max(1, childDeadlineAt - Date.now()), startupCleanup);
+      this.pendingActions.push(launch.then(() => undefined, () => undefined));
+      launched = await launch;
+    } catch (cause) {
+      // The seam settles only after its owned cleanup; keep the reservation until then.
       this.registry.cancelReservation(reservation.reservation);
-      const error: HarnessError = { category: "tool", message: "boundary process spawn failed" };
-      this.registry.poison(error);
-      throw new TrustedExecutionRefusal(error.message);
+      if (request.recoverableTimeout && !permit.signal.aborted &&
+        remainingMs(this.currentDeadlineAt) > 0 && verifiedStartupCleanup(cause)) {
+        // The launcher and cache have already settled the authentic rejection.
+        // This recovery result carries no authority to certify another cleanup.
+        throw new CheckpointChildStartupTimeoutError(cause);
+      }
+      const classification = classifyCodexLaunchFailure(cause);
+      const error = new CodexLaunchError(classification, "unconfirmed", cause);
+      this.registry.poison({ category: classification === "started_deadline" ? "timeout" : "tool", message: error.message });
+      throw error;
     }
     const registered = this.registry.registerRoot(reservation.reservation, launched.root);
     if (!registered.ok) {

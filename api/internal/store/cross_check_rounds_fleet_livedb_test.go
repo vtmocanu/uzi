@@ -64,10 +64,12 @@ func TestPlanCrossCheckRoundTwoFleetPeerDeferralLiveDB(t *testing.T) {
 				claim := func(worker uuid.UUID, caps []string) (store.Run, error) {
 					return fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
 						WorkerID: pgU(worker), UserID: fx.userID,
-						AffinityCutoff:  planCrossCheckTime(now.Add(-2 * time.Minute)),
-						SpreadCutoff:    planCrossCheckTime(now.Add(-time.Minute)),
-						HeartbeatCutoff: planCrossCheckTime(now.Add(-time.Minute)),
-						WorkerCaps:      []string{}, WorkerProtocolCaps: caps, CapabilityAware: path != "kill-switch",
+						CrossCheckEvaluatedAt:    planCrossCheckTime(now),
+						CrossCheckAffinityCutoff: planCrossCheckTime(now.Add(-2 * time.Minute)),
+						AffinityCutoff:           planCrossCheckTime(now.Add(-2 * time.Minute)),
+						SpreadCutoff:             planCrossCheckTime(now.Add(-time.Minute)),
+						HeartbeatCutoff:          planCrossCheckTime(now.Add(-time.Minute)),
+						WorkerCaps:               []string{}, WorkerProtocolCaps: caps, CapabilityAware: path != "kill-switch",
 					})
 				}
 				got, err := claim(a, aCaps)

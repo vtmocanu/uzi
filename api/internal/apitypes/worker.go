@@ -46,12 +46,18 @@ type WorkerDTO struct {
 	// the worker holds ANY active run, chat included — so a lone active chat still
 	// reads as busy even though active_runs (run-lane only) is 0.
 	Busy bool `json:"busy"`
-	// ActiveRuns is the worker's live count of active RUN-lane runs (chat excluded —
-	// chat has its own session budget); MaxConcurrentRuns is its advertised slot cap
-	// (null when unadvertised). Together they drive the "N/M runs" saturation badge
+	// ActiveRuns counts active run-lane claims, including released claims and legacy
+	// cross-check children, but excluding chat and durable cross-check-lane claims.
+	// MaxConcurrentRuns is its advertised slot cap (null when unadvertised).
+	// Together they drive the "N/M runs" saturation badge
 	// (PRD #42).
 	ActiveRuns        int  `json:"active_runs"`
 	MaxConcurrentRuns *int `json:"max_concurrent_runs"`
+	// ActiveCrossChecks counts active claims with the durable cross-check lane
+	// marker, including released claims. Legacy run-lane children remain in ActiveRuns.
+	// A nil cap is unadvertised; explicit zero means the lane is disabled.
+	ActiveCrossChecks  int  `json:"active_cross_checks"`
+	MaxCrossCheckSlots *int `json:"max_cross_check_slots"`
 	// ReportedRuns is what this worker SAYS it is executing, from its latest active-run
 	// snapshot (PRD #1390 M2c): one entry per run in the worker_active_runs table, each with
 	// the run id, the phase the worker sees it in, and the generation it was claimed at. It is

@@ -77,7 +77,7 @@ func TestCheckerAssemblyRefusalFinishesExactClaimLiveDB(t *testing.T) {
 			original := mustRun(t, env, f.runID)
 			leadID := uuid.New()
 			env.exec("INSERT INTO runs (id,user_id,repo_id,worker_id,issue_iid,issue_title,issue_description,status,harness,auto_approve,plan_cross_check_required,claim_generation) VALUES ($1,$2,$3,$4,42,'title','body','running','claude',true,true,1)", leadID, f.userID, original.RepoID, f.workerID)
-			env.exec("UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,report_only=true,budget_wall_seconds=1800,status='claimed' WHERE id=$1", f.runID, leadID)
+			env.exec("UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,report_only=true,budget_wall_seconds=1800,status='claimed',claim_generation=1 WHERE id=$1", f.runID, leadID)
 			if scenario == "encoded envelope" {
 				c := PlanCrossCheckCandidate{PlanMd: strings.Repeat("<", 256*1024), Milestones: json.RawMessage("[]"), SizeClass: "s", BaseCommit: strings.Repeat("a", 40)}
 				digest, err := c.Digest()

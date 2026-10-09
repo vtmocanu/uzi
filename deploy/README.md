@@ -380,6 +380,30 @@ one). It polls the api outbound, listens on nothing, and materializes each hoste
 worker's Deployment + Secret + PVCs into the `uzi-workers` namespace, which contains
 nothing else by design.
 
+### Cross-check capacity
+
+`workers.crossCheckSlots` defaults to 1 for persistent and ephemeral hosted
+workers. The chart renders the controller's `UZI_WORKER_CROSS_CHECK_SLOTS`,
+which is passed through `RenderConfig` into pod `WORKER_CROSS_CHECK_SLOTS`.
+The controller accepts integers 0–16 and refuses invalid input. Explicit
+`workers.crossCheckSlots: 0` renders quoted `"0"` unconditionally, disabling
+the lane; it does not use the run-cap zero-to-default behavior. Compose
+instead exposes `WORKER_CROSS_CHECK_SLOTS` directly (default 1).
+
+Changing the slot count changes the desired spec hash and uses the existing
+worker roll process. It does not increase preset CPU or memory. A compatible
+worker can check its own Claude lead's plan on Codex without an additional
+pod when its lane has space; otherwise existing capability-gap/saturation
+provisioning and caps apply. A cordoned worker may finish its pinned checker,
+subject to maintenance fences. Active children block ephemeral lease entry,
+teardown and reaping, and keep their parent's lease binding.
+
+Hosted acceptance is pending: default-one memory headroom with a lead and
+Codex checker has not been measured. See
+[worker sizing and isolation](../docs/worker-setup.md#cross-check-slots) and
+[PRD #2169's acceptance checklist](../prds/2169-cross-check-lane.md#acceptance-hosted-k8s-maintainer-owned).
+An offline Helm render is not a hosted deployment test.
+
 ### Turning it on
 
 **Order matters, and step 1 is not optional.** Enabling hosting without the

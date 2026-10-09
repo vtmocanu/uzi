@@ -74,7 +74,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), reportedRunsCell(w), largestRunCell(w), outboxCell(w),
+					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), workerSlots(w), workerCrossCheckSlots(w), reportedRunsCell(w), largestRunCell(w), outboxCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -100,7 +100,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// LARGEST RUN is PRD #1809 M6 (D8): the HOME size of the worker's largest run, so one
 			// run growing toward filling the data volume is visible before it does. "-" when the
 			// worker reports no run sizes; also before OUTBOX.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 
@@ -259,10 +259,8 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // `offline (draining)` is a real, reachable state (Decision 5) — the annotation is a
 // suffix on whatever status the control plane reports, not a replacement for it.
 //
-// The (draining) vs (cordoned) split mirrors the web pill and keys on active_runs, NOT
-// on busy: a chat-only cordoned worker is `busy` with zero in-flight runs and must read
-// `(cordoned)`, so the discriminator is "does it still have runs to finish", i.e.
-// ActiveRuns > 0, not whether it happens to be busy.
+// The draining/cordoned split counts outstanding run and cross-check claims.
+// A chat-only cordoned worker remains cordoned despite Busy being true.
 //
 // (ephemeral) marks an auto-provisioned, run-bound throwaway hosted worker (PRD #529):
 // it is created for one unplaceable run and torn down when that run finishes. The marker
@@ -274,7 +272,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // `online (quarantined)`. The suffix is the fixed text from quarantineMark, never the
 // worker's reported cause.
 //
-// Every field this reads except the quarantine one (Status, DrainingSince, ActiveRuns,
+// Every field this reads except the quarantine one (Status, DrainingSince, ActiveRuns, ActiveCrossChecks,
 // Ephemeral) is control-plane-owned (Decision 1), so those need no scrub. The quarantine
 // field is worker self-report, so this reads ONLY whether it is present, never its
 // content; the cause is never put in a table cell. The only renderer of the cause text is
@@ -284,7 +282,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 func statusCell(w apitypes.WorkerDTO) string {
 	s := w.Status
 	if w.DrainingSince != nil {
-		if w.ActiveRuns > 0 {
+		if w.ActiveRuns > 0 || w.ActiveCrossChecks > 0 {
 			s += " (draining)"
 		} else {
 			s += " (cordoned)"

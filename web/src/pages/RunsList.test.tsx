@@ -197,7 +197,7 @@ describe("RunsList — the admin fleet list carries no format characters (#124)"
         {
           id: "w1", name: "prod\u202Ebox\u200B", status: "online", owner_email: "someone@else.test",
           disk_pressure_volumes: [], cleanup_pending: false,
-          kind: "external", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null,
+          kind: "external", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null, active_cross_checks: 0, max_cross_check_slots: null,
           template_declared: null, template_reported: null, version: null, last_heartbeat_at: null,
           created_at: "2026-01-01T00:00:00Z",
         },
@@ -223,11 +223,44 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
 
   const adminWorker = (over: Record<string, unknown>) => ({
     id: "w1", name: "prodbox", status: "online", owner_email: "someone@else.test",
-    kind: "hosted", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null,
+    kind: "hosted", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null, active_cross_checks: 0, max_cross_check_slots: null,
     template_declared: null, template_reported: null, version: null, last_heartbeat_at: null,
     created_at: "2026-01-01T00:00:00Z", draining_since: null,
     disk_pressure_volumes: [], cleanup_pending: false,
     ...over,
+  });
+
+  it("shows separate cap-one badges and drains dedicated cross-checks", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [adminWorker({
+        busy: true, active_runs: 1, max_concurrent_runs: 1,
+        active_cross_checks: 1, max_cross_check_slots: 1,
+        draining_since: "2026-01-02T00:00:00Z",
+      })],
+    } as never);
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("draining")).toBeTruthy();
+  });
+
+  it("keeps cross-check-only workers draining", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [adminWorker({
+        active_runs: 0, active_cross_checks: 1, max_cross_check_slots: 1,
+        draining_since: "2026-01-02T00:00:00Z",
+      })],
+    } as never);
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("draining")).toBeTruthy();
   });
 
   it("shows the cordoned pill for a drained worker holding no runs", async () => {

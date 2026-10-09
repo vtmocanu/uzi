@@ -526,6 +526,9 @@ type RenderConfig struct {
 	MemoryGuardRearmMs          int64
 	MemoryGuardResponseBudgetMs int64
 	MemoryGuardMaxInterventions int64
+	// CrossCheckSlots is rendered as WORKER_CROSS_CHECK_SLOTS without a fallback:
+	// zero disables cross-checks. config.Load supplies the production default 1.
+	CrossCheckSlots int
 	// APICAPEM is the api's CA, relayed to workers through the per-worker Secret this
 	// controller already creates — no new RBAC verb, so Decision 1's Secrets line
 	// stays verbatim. Empty means the worker verifies against the system roots.
@@ -909,6 +912,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		{Name: "UZI_WORKER_TOKEN_FILE", Value: cfg.tokenPath()},
 		{Name: "UZI_DATA_DIR", Value: dataMountPath},
 		{Name: "WORKER_MAX_CONCURRENT_RUNS", Value: strconv.Itoa(maxConcurrentRuns)},
+		{Name: "WORKER_CROSS_CHECK_SLOTS", Value: strconv.Itoa(cfg.CrossCheckSlots)},
 	}
 	env = append(env, corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_ENABLED", Value: strconv.FormatBool(cfg.MemoryGuardEnabled)})
 	if cfg.MemoryGuardEnabled {

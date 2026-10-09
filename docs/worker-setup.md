@@ -314,7 +314,7 @@ worker.
 
 **What it blocks.** While quarantined the worker:
 
-- claims nothing, on the run and the chat lanes;
+- claims nothing, on the run, cross-check and chat lanes;
 - starts no git child that carries the forge token;
 - starts no new Claude or Codex provider turn.
 
@@ -564,14 +564,16 @@ earlier push applied.
 
 ## Concurrent runs
 
-By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`
+By default a worker executes one run-lane run at a time, alongside its separate
+cross-check and chat lanes. Set `WORKER_MAX_CONCURRENT_RUNS`
 above 1 (see [configuration.md](./configuration.md)) to let it run several runs
 concurrently, each in its own slot. A slot is roughly one SDK CLI process, its git
 operations, and any devbox tool provisioning it triggers — size the cap to what the
 host can actually run at once; the worker still honors a value above the soft
-ceiling of 8, but warns at boot that it probably shouldn't. The cap is worker-side
-only: it's reported at registration so **Settings → Workers** can show `active/cap`,
-but the server never enforces it.
+ceiling of 8, but warns at boot that it probably shouldn't. The worker bounds
+its run pool and reports the cap at registration for
+**Settings → Workers**. The API also uses the advertised cap when admitting
+legacy plan checkers on the run lane; dedicated checkers have their own cap.
 
 A run parked at the plan-approval gate holds its slot for the whole wait, up to
 `WORKER_PLAN_APPROVAL_TIMEOUT` (default 24h) — approve your plans, since an
@@ -626,14 +628,58 @@ below.
 controller-managed k8s worker (see [Hosted workers](./hosted-workers.md)) the cap
 comes from the chart value `workers.maxConcurrentRuns` (default 1), which the
 controller renders into the pod's `WORKER_MAX_CONCURRENT_RUNS` env for you. Raising
-it is an operator action — it needs a new controller/chart release to take effect,
-since hosted workers only roll on release — and the operator must size the preset
-to hold that many concurrent runs. It's the same knob described above, and raising
+it is an operator action: update the controller/chart configuration and size
+the preset to hold that many concurrent runs. Desired spec changes use the
+existing worker roll process. It's the same knob described above, and raising
 it opts into the same intra-user residuals just covered. An ephemeral (run-bound)
-hosted worker is always recorded with a cap of 1, whatever it advertises, since it
-only ever runs the one run it was created for. Its `/data` volume also has its own
+hosted worker is recorded with a run cap of 1, whatever it advertises, since
+its run lane serves its bound run (or an eligible lease follow-up). Its separate
+cross-check lane can serve that run's plan checker. Its `/data` volume also has its own
 operator-set size, 20Gi by default, rather than its size preset's (see
 [Type and size](./hosted-workers.md#type-and-size)).
+
+## Cross-check slots
+
+Set `WORKER_CROSS_CHECK_SLOTS` to the number of concurrent plan checkers this
+worker can hold, independently of `WORKER_MAX_CONCURRENT_RUNS` and
+`WORKER_CHAT_SESSIONS`. The default is 1; accepted values are 0–16. Invalid
+worker values fall back to 1. Zero disables lane advertisement and polling;
+it does not turn checks into ordinary run-slot work. The worker registers
+its slot count even when zero.
+
+A Claude lead can hold its run slot while its read-only Codex checker uses
+a cross-check slot on the same worker. The worker must support the required
+Codex harness/model. The reverse direction and Code cross-check are not
+shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
+own-worker preference, the 2-minute default fallback grace and mixed-image
+rollout behavior. Cordoning permits the worker's own pinned child to finish;
+quarantine and maintenance fencing still block claims. Shutdown and draining
+include the cross-check pool.
+
+**Settings → Workers** shows separate capacity, for example `1/1 runs` and
+`1/1 cross-checks`. A live checker remains visible even if re-registration
+makes its advertised cap zero or unknown. Fleet run-slot totals still describe
+the run lane. An ephemeral worker keeps its parent binding when checking that
+parent, including through legacy run-slot fallback; an active child blocks
+lease entry, teardown and reaping.
+
+**Size the shared memory budget.** The lead and checker share the container's
+memory and CPU limits; an OOM can interrupt both. The default of one checker
+has unmeasured hosted memory headroom; no pod preset grows with this setting.
+The checker uses read-only tools and required Landlock confinement rooted at
+its checkout, with explicit private writable directories
+([confinement limits](./cross-check.md#3-read-the-evidence-and-decide)).
+Those controls do not prove network isolation or eliminate same-uid process
+residuals. The worker/runner uid split depends on the startup profile; hosted
+workers do not acquire it merely by enabling a checker lane. See
+[proc-hardening](./proc-hardening.md).
+
+For hosted workers, use chart `workers.crossCheckSlots` (default 1), relayed
+through controller `UZI_WORKER_CROSS_CHECK_SLOTS` to the pod's
+`WORKER_CROSS_CHECK_SLOTS`. The controller rejects invalid values outside
+0–16. An explicit zero is preserved. Changing slots changes the desired pod
+spec hash and triggers the existing roll process; it does not raise memory
+limits. See the [operator runbook](../deploy/README.md#cross-check-capacity).
 
 ## Multiple workers, removing a worker
 

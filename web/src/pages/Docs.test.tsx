@@ -19,9 +19,9 @@ function setAuth(isAdmin: boolean) {
 // among the `audience: user` pages, and only in its body (not title/summary).
 const BODY_ONLY_TERM = "UZI_WORKER_TOKEN";
 
-// An `audience: operator` body-only term: "reverse proxy" lives in
-// configuration.md (operator) and no `audience: user` page.
-const OPERATOR_BODY_TERM = "reverse proxy";
+// An `audience: operator` body-only term: `API_TLS_ADDR` lives only in
+// configuration.md (not title/summary), and no `audience: user` page.
+const OPERATOR_BODY_TERM = "API_TLS_ADDR";
 
 beforeEach(() => setAuth(false));
 

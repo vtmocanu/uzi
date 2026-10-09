@@ -14,8 +14,10 @@ import (
 func planCrossCheckClaimParams(f *awaitingInputFixture) store.ClaimRunParams {
 	return store.ClaimRunParams{WorkerID: pgU(f.workerID), UserID: f.userID,
 		HeartbeatCutoff: planCrossCheckTime(time.Now().Add(-time.Minute)), AffinityCutoff: planCrossCheckTime(time.Now().Add(-time.Hour)),
-		SpreadCutoff:       planCrossCheckTime(time.Now().Add(-time.Minute)),
-		WorkerProtocolCaps: []string{"codex_harness_v1", "codex_runtime_v2", "cross_check_v1", "codex_custom_model_v1"}}
+		SpreadCutoff:             planCrossCheckTime(time.Now().Add(-time.Minute)),
+		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute)),
+		WorkerProtocolCaps:       []string{"codex_harness_v1", "codex_runtime_v2", "cross_check_v1", "codex_custom_model_v1"}}
 }
 
 // Polling has a context deadline and returns early if the contender completes.

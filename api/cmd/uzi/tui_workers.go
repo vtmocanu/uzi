@@ -216,7 +216,7 @@ func workerState(r workerRow) string {
 		return "offline"
 	case w.CustodyDecisionsNeeded != nil && *w.CustodyDecisionsNeeded > 0:
 		return "holding"
-	case w.DrainingSince != nil && w.ActiveRuns > 0:
+	case w.DrainingSince != nil && (w.ActiveRuns > 0 || w.ActiveCrossChecks > 0):
 		return "draining"
 	case w.DrainingSince != nil:
 		return "cordoned"
@@ -338,10 +338,10 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	}
 	if w.DrainingSince != nil {
 		text := "◌ cordoned"
-		if w.ActiveRuns > 0 {
-			text = fmt.Sprintf("◐ draining, %d run left", w.ActiveRuns)
+		if w.ActiveRuns > 0 || w.ActiveCrossChecks > 0 {
+			text = fmt.Sprintf("◐ draining, %d runs, %d cross-checks left", w.ActiveRuns, w.ActiveCrossChecks)
 		}
-		add(1, text, text+" · claims nothing new")
+		add(1, text, text+" · only pinned work may claim")
 	}
 	if w.UpgradeStatus == "outdated" {
 		add(1, "↑ outdated", "↑ outdated "+renderer.Plain(t.workerVersion, 200)+" · target "+renderer.Plain(t.upgradeTarget, 200))
@@ -359,7 +359,7 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 		text := "· lease " + workerDuration(w.EphemeralLeaseExpiresAt.Sub(now)) + " left"
 		add(2, text, text+" · ephemeral lease held for follow-up")
 	}
-	if w.Busy && w.ActiveRuns == 0 {
+	if w.Busy && w.ActiveRuns == 0 && w.ActiveCrossChecks == 0 {
 		add(2, "· chat active", "· chat active (run lane occupancy is zero)")
 	}
 	slices.SortStableFunc(items, func(a, b attnItem) int { return a.severity - b.severity })
@@ -519,16 +519,30 @@ func workerSlots(w apitypes.WorkerDTO) string {
 	}
 	return itoa(w.ActiveRuns) + "/" + cap
 }
+func workerCrossCheckSlots(w apitypes.WorkerDTO) string {
+	cap := "?"
+	if w.MaxCrossCheckSlots != nil {
+		cap = itoa(*w.MaxCrossCheckSlots)
+	}
+	return itoa(w.ActiveCrossChecks) + "/" + cap
+}
 func (m tuiModel) workersSummary(width int) string {
 	if m.workers.admin != m.board.admin || len(m.workers.rows) == 0 {
 		return ""
 	}
 	n, online, used, cap, unknown, attention, holding, draining, cordoned := len(m.workers.rows), 0, 0, 0, 0, 0, 0, 0, 0
+	crossUsed, crossCap, crossUnknown := 0, 0, 0
 	now := time.Now()
 	for _, r := range m.workers.rows {
 		if r.w.Status == "online" {
 			online++
 			used += r.w.ActiveRuns
+			crossUsed += r.w.ActiveCrossChecks
+			if r.w.MaxCrossCheckSlots == nil {
+				crossUnknown++
+			} else {
+				crossCap += *r.w.MaxCrossCheckSlots
+			}
 			if r.w.MaxConcurrentRuns == nil {
 				unknown++
 			} else {
@@ -559,11 +573,23 @@ func (m tuiModel) workersSummary(width int) string {
 		if showOnline && online > 0 {
 			parts = append(parts, fmt.Sprintf("%d online", online))
 		}
-		slots := paintSeg(m.pal.tungsten, nil, false, itoa(used)) + fmt.Sprintf("/%d slots in use", cap)
+		slots := paintSeg(m.pal.tungsten, nil, false, itoa(used)) + fmt.Sprintf("/%d run slots in use", cap)
 		if showUnknown && unknown > 0 {
 			slots += m.pal.faint.Render(fmt.Sprintf(" +%d ?cap", unknown))
 		}
+		if !showCount {
+			slots = fmt.Sprintf("%d/%d runs", used, cap)
+		}
 		parts = append(parts, slots)
+		crossDenom := itoa(crossCap)
+		if crossUnknown > 0 {
+			crossDenom = "?"
+		}
+		cross := fmt.Sprintf("%d/%s cross-checks", crossUsed, crossDenom)
+		if !showCount {
+			cross = fmt.Sprintf("%d/%s checks", crossUsed, crossDenom)
+		}
+		parts = append(parts, cross)
 		if showAdmission {
 			if holding > 0 {
 				parts = append(parts, paintSeg(m.pal.amber, nil, false, fmt.Sprintf("%d holding", holding)))
@@ -705,9 +731,9 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 		}
 		columns.version = max(columns.version, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
 	}
-	// Cursor, name, state, kind, runs, resource cells, heartbeat, ten separators,
+	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
 	// and one attention glyph; factory scope adds owner plus its separator.
-	fixed := 1 + 13 + 10 + 9 + 4 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 11
+	fixed := 1 + 13 + 10 + 9 + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
 	if m.board.admin {
 		fixed += 8
 	}
@@ -732,7 +758,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
 	state := workerState(r)
-	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 4, nil))
+	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
 	if width >= 120 {
 		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color
@@ -834,7 +860,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if width >= 120 && m.board.admin {
 		cols = append(cols, padVisual("OWNER", 7))
 	}
-	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 4))
+	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 5), padVisual("CHECKS", 6))
 	if width >= 120 {
 		cols = append(cols, padVisual("CPU", workerCPUWidth), padVisual("MEM", columns.memory), padVisual("DISK (worst)", workerDiskWidth), padVisual("VERSION", columns.version), padVisual("HB", 3))
 	}

@@ -126,6 +126,7 @@ func main() {
 		MemoryGuardRearmMs:          cfg.WorkerMemoryGuardRearmMs,
 		MemoryGuardResponseBudgetMs: cfg.WorkerMemoryGuardResponseBudgetMs,
 		MemoryGuardMaxInterventions: cfg.WorkerMemoryGuardMaxInterventions,
+		CrossCheckSlots:             cfg.WorkerCrossCheckSlots,
 		// The Codex uid-split worker profile (PRD #1493 M1): when on, the worker + seed-nix
 		// containers start as root with a short capability set so the image entrypoint can
 		// establish the split. CommandSandbox rides the worker env only when it is not the

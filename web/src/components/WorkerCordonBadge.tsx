@@ -5,11 +5,11 @@ import type { Worker } from "../lib/api";
  *
  * A dashed-border NEUTRAL pill, deliberately NOT a solid BadgeTone, so it can't be
  * confused with the amber `outdated`/run badges — a cordon is a normal operational
- * state (the worker finishes its in-flight runs and claims nothing new), not an alert.
+ * state (the worker finishes its runs and their pinned cross-checks), not an alert.
  *
  * Keyed on `draining_since` (hosted-only by construction — every non-null write is
  * WHERE kind='hosted', so no `kind` check is needed), NEVER on `upgrade_status`/`busy`/
- * `kind`: draining is orthogonal to those. The label splits on `active_runs`, not `busy`
+ * `kind`: draining is orthogonal to those. The label splits on `active_runs` and `active_cross_checks`, not `busy`
  * — a chat-only cordoned worker is busy:true with active_runs:0 and must read `cordoned`.
  *
  * It must NOT enter needsAttention/Fleet counts — a cordon is a normal state, not an
@@ -18,10 +18,10 @@ import type { Worker } from "../lib/api";
  */
 export function WorkerCordonBadge({ worker }: { worker: Worker }) {
   if (!worker.draining_since) return null;
-  const draining = worker.active_runs > 0;
+  const draining = worker.active_runs > 0 || worker.active_cross_checks > 0;
   const label = draining ? "draining" : "cordoned";
   const title = draining
-    ? "Cordoned — finishing its current runs, not claiming new ones."
+    ? "Cordoned — finishing its current runs and cross-checks, not claiming new runs."
     : "Cordoned — not claiming new runs.";
   return (
     <span

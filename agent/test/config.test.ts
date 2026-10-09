@@ -11,6 +11,24 @@ const baseEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   ...over,
 });
 
+describe("cross-check lane config", () => {
+  it("defaults to one and accepts explicit zero through sixteen independently of run/chat caps", () => {
+    assert.equal(loadConfig(baseEnv()).crossCheckSlots, 1);
+    for (const slots of [0, 1, 16]) {
+      const config = loadConfig(baseEnv({ WORKER_CROSS_CHECK_SLOTS: String(slots),
+        WORKER_MAX_CONCURRENT_RUNS: "3", WORKER_CHAT_SESSIONS: "4" }));
+      assert.equal(config.crossCheckSlots, slots);
+      assert.equal(config.maxConcurrentRuns, 3);
+      assert.equal(config.chatSessions, 4);
+    }
+  });
+  it("falls back for blank, negative, fractional, non-finite and over-limit values", () => {
+    for (const value of ["", " ", "-1", "1.5", "17", "NaN", "Infinity", "bad"]) {
+      assert.equal(loadConfig(baseEnv({ WORKER_CROSS_CHECK_SLOTS: value })).crossCheckSlots, 1, value);
+    }
+  });
+});
+
 describe("loadConfig workerTemplate (PRD #18)", () => {
   it("defaults to base when UZI_WORKER_TEMPLATE is unset", () => {
     assert.strictEqual(loadConfig(baseEnv()).workerTemplate, "base");

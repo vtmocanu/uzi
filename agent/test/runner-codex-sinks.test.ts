@@ -33,7 +33,14 @@ import {
 } from "../src/codex/registry.js";
 import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
 import type { BoundaryProcessRequest, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
-import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
+import {
+  SupervisedChildExitTimeoutError, launchCodexEffectRoot, CodexLaunchError,
+  hasVerifiedStartupCleanup, type StartupCleanupAuthorization, type SupervisorProcess,
+} from "../src/codex/launcher.js";
+import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { COMMAND_UID, WORKER_UID } from "../src/runner-uid.js";
+import { RejectedStartupTransport } from "./codex-rejected-startup-fixture.js";
+import type { Logger } from "../src/log.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { GitLabClient } from "../src/forge.js";
 import type { SummaryRunner } from "../src/summary-runner.js";
@@ -248,7 +255,11 @@ function codexRig(
     /** Delay before each permit-held process spawn: reproduces suite load deterministically. */
     processSpawnDelayMs?: number;
     /** Replace one test-owned boundary process, leaving every other Git child real. */
-    boundaryProcess?: (request: BoundaryProcessRequest) => SpawnedBoundaryProcess | undefined;
+    boundaryProcess?: (
+      request: BoundaryProcessRequest,
+      startupMs: number,
+      startupCleanup?: StartupCleanupAuthorization,
+    ) => SpawnedBoundaryProcess | undefined | Promise<SpawnedBoundaryProcess | undefined>;
     /** Issue #1766: while this answers true, refreshCodex/releaseCodex throw the api's real typed
      *  409 `vault_locked` RequestError (a locked owner vault after authorization). */
     vaultLocked?: () => boolean;
@@ -303,10 +314,12 @@ function codexRig(
     },
     reconcile,
     undefined,
-    async (request) => {
+    async (request, startupMs, startupCleanup) => {
       processSpawns += 1;
       processArgv.push(request.argv);
-      const injected = opts.boundaryProcess?.(request);
+      const injected = opts.boundaryProcess
+        ? await opts.boundaryProcess(request, startupMs, startupCleanup)
+        : undefined;
       if (injected) return injected;
       const [command, ...args] = request.argv;
       if (!command) throw new Error("empty test process argv");
@@ -3731,4 +3744,400 @@ describe("M2 existing completion hold deferral control", () => {
     assert.equal(calls.length, 0);
     assert.equal(api.completionPermitRequests.length, 0);
   });
+});
+
+describe("RunRunner M2 fatal rejected startup", () => {
+  const cases = [
+    { mode: "unconfirmed", classification: "started_deadline", sink: "milestone_checkpoint" },
+    { mode: "hard", classification: "started_deadline", sink: "done_checkpoint" },
+    { mode: "posture", classification: "posture", sink: "milestone_checkpoint" },
+    { mode: "protocol", classification: "protocol_evidence", sink: "done_checkpoint" },
+    { mode: "exit", classification: "supervisor_exit", sink: "milestone_checkpoint" },
+    { mode: "errno", classification: "spawn_EAGAIN", sink: "done_checkpoint" },
+  ] as const;
+  for (const [index, scenario] of cases.entries()) {
+    it(`${scenario.mode}: real launcher classification survives soft expiry in logs and failed state`, async () => {
+      const { gitlab } = fakeGitlab();
+      const { github } = fakeGitHub();
+      const { logger, lines } = recordingLogger();
+      const gitLog = git as unknown as { log: Logger };
+      const originalGitLog = gitLog.log;
+      gitLog.log = logger;
+      const hard = manualDeadline("checkpoint");
+      const privatePath = "/private/fatal-startup-fixture/provider-cache";
+      const provider = ["glpat-", "fatalFixtureBody12345"].join("");
+      const evidence = "fatal-private-evidence-marker";
+      const rawDiagnostic = [privatePath, provider, evidence, "x".repeat(2048)].join(" ");
+      let armedTarget = false;
+      let injections = 0;
+      let softCallback: (() => void) | undefined;
+      let softFired = 0;
+      let transport: RejectedStartupTransport | undefined;
+      let launchError: unknown;
+      let setupFailure: unknown;
+      let checkpointReturned = false;
+      const fireSoft = (): void => {
+        assert.ok(softCallback, "soft callback is armed after the target spawn begins");
+        softFired += 1;
+        softCallback();
+      };
+      const rig = codexRig({
+        armDeadline: hard.armDeadline,
+        boundaryProcess: async (request, startupMs, startupCleanup) => {
+          if (!armedTarget || injections || request.identity !== "worker_pat" ||
+            !request.argv.includes("fetch") || !request.argv.includes("origin")) return undefined;
+          injections += 1;
+          assert.equal(request.recoverableTimeout, true);
+          assert.ok(startupCleanup);
+          assert.ok(startupCleanup.hardDeadlineAt - Date.now() > 40_000);
+          const authorization = startupCleanup;
+          transport = new RejectedStartupTransport(request.identity);
+          const child = transport;
+          const spawnError = Object.assign(new Error(rawDiagnostic), { code: "EAGAIN" });
+          const spawner = boundaryProcessSpawnerForTest("required", (spec, launchMs, forwarded) => {
+            assert.equal(forwarded, authorization, "original hard authorization is forwarded unchanged");
+            assert.equal(launchMs, startupMs);
+            return launchCodexEffectRoot(spec, {
+              env: { UZI_UID_SPLIT: "1" },
+              resolveWorkerUid: () => WORKER_UID, resolveCommandUid: () => COMMAND_UID,
+              startupCleanup: forwarded, deadlines: { started: launchMs },
+              spawnSupervisor: () => {
+                if (scenario.mode === "errno") {
+                  queueMicrotask(fireSoft);
+                  throw spawnError;
+                }
+                if (scenario.mode === "posture" || scenario.mode === "protocol" || scenario.mode === "exit") {
+                  queueMicrotask(() => {
+                    fireSoft();
+                    if (scenario.mode === "posture") child.unsafeStarted(rawDiagnostic);
+                    if (scenario.mode === "protocol") child.malformedEvidence(rawDiagnostic);
+                    if (scenario.mode === "exit") child.exitBeforeStarted(rawDiagnostic);
+                  });
+                }
+                return child as unknown as SupervisorProcess;
+              },
+            });
+          });
+          const result = spawner(request, startupMs, startupCleanup).then(
+            () => ({ error: undefined }), (error: unknown) => ({ error }),
+          );
+          if (scenario.mode === "unconfirmed" || scenario.mode === "hard") {
+            await child.disposeRequested;
+            assert.equal(rig.registry.pendingLaunchCount(), 1);
+            fireSoft();
+            if (scenario.mode === "hard") {
+              // Event-gated permit abort; the launcher's absolute authorization stays unchanged.
+              hard.fire();
+              child.releaseVerifiedCleanup();
+            } else {
+              child.releaseUnconfirmedCleanup();
+            }
+          }
+          const { error } = await result;
+          launchError = error;
+          assert.ok(error instanceof CodexLaunchError, "rejection is minted by the production launcher");
+          assert.equal(error.classification, scenario.classification);
+          if (scenario.mode === "hard") {
+            assert.equal(error.cleanupStatus, "verified");
+            assert.equal(hasVerifiedStartupCleanup(error, authorization), true);
+            child.assertClosed();
+          } else {
+            assert.equal(error.cleanupStatus, "unconfirmed");
+            assert.equal(hasVerifiedStartupCleanup(error, authorization), false);
+          }
+          if (scenario.mode === "errno") assert.equal(error.cause, spawnError);
+          if (scenario.mode === "posture" || scenario.mode === "protocol") {
+            assert.ok(String(error.cause).includes(evidence), "private raw cause remains authentic");
+          }
+          throw error;
+        },
+      });
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        try {
+          commitInTree(ctx.worktreePath, "M1.txt", "fatal startup checkpoint\n");
+          await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+          fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+          commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+          armedTarget = true;
+        } catch (error) { setupFailure = error; throw error; }
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: scenario.sink });
+        checkpointReturned = true;
+        return { branch: ctx.branch };
+      });
+      const claim = gitlabClaim(247560 + index, {
+        repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+      });
+      const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
+        github, codexBoundaryDeadlineMs: 60_000, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
+        checkpointTestHooks: {
+          softDeadlineMs: 10_000,
+          armSoftDeadline: (fire, ms) => {
+            softCallback = fire;
+            return { deadlineAt: Date.now() + ms, cancel: () => { softCallback = undefined; } };
+          },
+        },
+      });
+      try { await runner.execute(claim); }
+      finally { gitLog.log = originalGitLog; transport?.destroy(); }
+      assert.equal(setupFailure, undefined);
+      assert.equal(injections, 1);
+      assert.ok(launchError instanceof CodexLaunchError);
+      assert.equal(softFired, 1, "actual soft callback fired after spawn");
+      assert.equal(hard.fired(), scenario.mode === "hard" ? 1 : 0);
+      assert.equal(checkpointReturned, false, "fatal rejection cannot become a soft skip");
+      assert.equal(rig.registry.isPoisoned(), true);
+      assert.ok(statuses(claim.run_id).includes("failed"));
+      assert.ok(!statuses(claim.run_id).includes("completed"));
+      const failed = api.states.filter((state) => state.runId === claim.run_id && state.body.status === "failed");
+      assert.ok(failed.length > 0);
+      for (const state of failed) {
+        const reason = String(state.body.failure_reason);
+        assert.ok(reason.includes(scenario.classification), reason);
+        assert.ok(reason.length <= 512, "Runner MAX_FAILURE_REASON_LEN");
+      }
+      const diagnostic = lines.find((line) => (line as { msg?: string }).msg === "codex boundary failed") as
+        { detail?: string } | undefined;
+      assert.ok(diagnostic?.detail, JSON.stringify(lines));
+      assert.ok(diagnostic.detail.includes(scenario.classification));
+      assert.ok(diagnostic.detail.length <= 500, "CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS");
+      const published = JSON.stringify({ logs: lines, failed });
+      for (const sentinel of [privatePath, provider, evidence]) assert.ok(!published.includes(sentinel), sentinel);
+    });
+  }
+});
+
+describe("RunRunner M2 positive rejected startup acceptance", () => {
+  const cases = [
+    { target: "fetch", fire: true, sink: "milestone_checkpoint" },
+    { target: "fetch", fire: false, sink: "milestone_checkpoint" },
+    { target: "pack", fire: true, sink: "milestone_checkpoint" },
+    { target: "pack", fire: false, sink: "milestone_checkpoint" },
+    { target: "pack", fire: false, sink: "done_checkpoint" },
+    { target: "owed", fire: false, sink: "milestone_checkpoint" },
+  ] as const;
+  for (const [index, scenario] of cases.entries()) {
+    it(`${scenario.target} ${scenario.sink}: verified rejected startup with soft callback ${scenario.fire ? "fired" : "pending"}`, async () => {
+      const { gitlab } = fakeGitlab();
+      const { github } = fakeGitHub();
+      const { logger, lines } = recordingLogger();
+      const gitLog = git as unknown as { log: Logger };
+      const originalGitLog = gitLog.log;
+      gitLog.log = logger;
+      let softCallback: (() => void) | undefined;
+      let softFired = false;
+      let injections = 0;
+      let armedTarget = false;
+      let owedActive = false;
+      let uploads = 0;
+      let acks = 0;
+      let firstReturned = false;
+      let retryReturned = false;
+      let turnFailure: unknown;
+      let transport: RejectedStartupTransport | undefined;
+      const events: string[] = [];
+      const publishedStates: Array<{ lastPublishedTip?: string; checkpointFloor?: string }> = [];
+      type PublicationState = {
+        lastPublishedTip?: string; checkpointFloor?: string;
+        lastCheckpointRefTip?: string; landedCheckpoint?: boolean;
+      };
+      type FlightObservation = PublicationState & { batcher: { flush: () => Promise<void> } };
+      let observedFlight: FlightObservation | undefined;
+      let lockFailure: unknown;
+      const snapshot = (): PublicationState => {
+        assert.ok(observedFlight, "the Runner checkpoint owns the observed flight");
+        return {
+          lastPublishedTip: observedFlight.lastPublishedTip,
+          checkpointFloor: observedFlight.checkpointFloor,
+          lastCheckpointRefTip: observedFlight.lastCheckpointRefTip,
+          landedCheckpoint: observedFlight.landedCheckpoint,
+        };
+      };
+      const rig = codexRig({
+        boundaryProcess: async (request, startupMs, startupCleanup) => {
+          if (!armedTarget || injections !== 0) return undefined;
+          const selected = scenario.target === "fetch"
+            ? request.identity === "worker_pat" && request.argv.includes("fetch") && request.argv.includes("origin")
+            : scenario.target === "pack"
+              ? request.argv.includes("pack-objects")
+              : owedActive && request.argv.includes("for-each-ref");
+          if (!selected) return undefined;
+          injections += 1;
+          assert.equal(request.recoverableTimeout, true);
+          assert.ok(startupCleanup);
+          assert.ok(startupMs > 0 && startupMs <= request.timeoutMs!);
+          assert.ok(startupCleanup.hardDeadlineAt - Date.now() > 40_000,
+            "startup uses the soft residual, with ample original hard budget for cleanup");
+          const seamAuthorization = startupCleanup;
+          const hardDeadlineAt = startupCleanup.hardDeadlineAt;
+          const attempt = startupCleanup.attempt;
+          transport = new RejectedStartupTransport(request.identity);
+          const childTransport = transport;
+          const spawner = boundaryProcessSpawnerForTest("required", (spec, launchMs, authorization) => {
+            assert.equal(launchMs, startupMs, "spawner forwards the exact safety startup budget");
+            assert.equal(authorization, seamAuthorization, "spawner preserves the exact attempt object");
+            assert.equal(authorization!.attempt, attempt);
+            assert.equal(authorization!.hardDeadlineAt, hardDeadlineAt, "hard deadline is never rebased");
+            assert.equal(spec.identity, request.identity);
+            // Wait the entire safety-provided residual (~10s minus preflight Git).
+            // The real launcher owns the started timer; no started frame exists before dispose.
+            return launchCodexEffectRoot(spec, {
+              env: { UZI_UID_SPLIT: "1" },
+              resolveWorkerUid: () => WORKER_UID, resolveCommandUid: () => COMMAND_UID,
+              startupCleanup: authorization, deadlines: { started: launchMs },
+              spawnSupervisor: () => childTransport as unknown as SupervisorProcess,
+            });
+          });
+          const launch = spawner(request, startupMs, startupCleanup);
+          // Observe rejection immediately to avoid an unhandled promise if a test assertion fails.
+          const result = launch.then(
+            () => ({ error: undefined }),
+            (error: unknown) => ({ error }),
+          );
+          await childTransport.disposeRequested;
+          events.push("cleanup_held");
+          assert.equal(rig.registry.pendingLaunchCount(), 1,
+            "the reservation remains held while real rejected-startup cleanup is pending");
+          assert.equal(rig.registry.isPoisoned(), false);
+          assert.equal(firstReturned, false);
+          assert.ok(!events.includes("lock_release"), "the bare lock cannot release during cleanup");
+          assert.ok(softCallback, "the manual soft callback is still armed");
+          if (scenario.fire) { softFired = true; softCallback(); }
+          assert.equal(softFired, scenario.fire);
+          childTransport.releaseVerifiedCleanup();
+          const { error } = await result;
+          assert.ok(error instanceof CodexLaunchError, "the real launcher rejects rather than returning a handle");
+          assert.equal(error.classification, "started_deadline");
+          assert.equal(error.cleanupStatus, "verified");
+          assert.equal(hasVerifiedStartupCleanup(error, seamAuthorization), true);
+          childTransport.assertClosed();
+          events.push("verified_rejection");
+          throw error;
+        },
+      });
+      const originalScope = git.withBoundaryProcessSpawner;
+      git.withBoundaryProcessSpawner = ((spawner, signal, action, hooks) =>
+        originalScope.call(git, spawner, signal, action, {
+          ...hooks,
+          beforeLockRelease: async (key) => {
+            await hooks?.beforeLockRelease?.(key);
+            if (injections && !events.includes("lock_release")) {
+              try {
+                transport!.assertClosed();
+                assert.ok(events.includes("verified_rejection"));
+                assert.equal(rig.registry.pendingLaunchCount(), 0);
+                assert.equal(rig.registry.isPoisoned(), false);
+                events.push("lock_release");
+              } catch (error) { lockFailure = error; throw error; }
+            }
+          },
+        })) as typeof git.withBoundaryProcessSpawner;
+      const originalReconcile = git.reconcileOwedCandidates;
+      git.reconcileOwedCandidates = async (...args) => {
+        owedActive = acks > 0;
+        try { return await originalReconcile.apply(git, args); }
+        finally { owedActive = false; }
+      };
+      const originalPublish = client.publishCheckpoint;
+      client.publishCheckpoint = (async (_runId: string, _tip: string, pack: Readable) => {
+        uploads += 1;
+        await drain(pack);
+        acks += 1;
+        return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/positive-startup" } };
+      }) as typeof client.publishCheckpoint;
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        try {
+          commitInTree(ctx.worktreePath, "M1.txt", "actual rejected startup cleanup\n");
+          const committedTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { env: GIT_ENV }).toString().trim();
+          await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+          const before = snapshot();
+          fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+          commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+          armedTarget = true;
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: scenario.sink });
+          firstReturned = true;
+          assert.equal(injections, 1);
+          transport!.assertClosed();
+          assert.deepEqual(events, scenario.target === "pack"
+            ? ["cleanup_held", "verified_rejection"]
+            : ["cleanup_held", "verified_rejection", "lock_release"]);
+          assert.equal(rig.registry.pendingLaunchCount(), 0);
+          assert.equal(rig.registry.isPoisoned(), false);
+          assert.equal(softFired, scenario.fire, "pending recovery does not depend on firing the soft callback");
+          assert.equal(softCallback, undefined, "checkpoint cancels its manual callback");
+          assert.ok(api.states.some((state) => state.runId === ctx.runId && state.body.status === "running" &&
+            state.body.milestones_completed?.includes("m1")), "local milestone completion remains reported");
+          if (scenario.target === "owed") {
+            assert.equal(acks, 1, "broker publication stays confirmed after later owed-Git startup recovery");
+            assert.equal(uploads, 1);
+            assert.equal(publishedStates.length, 1);
+            assert.ok(snapshot().lastCheckpointRefTip);
+            assert.equal(snapshot().landedCheckpoint, true);
+            assert.ok(lines.some((line) => (line as { msg?: string }).msg === "owed reconciliation failed; extra pins retained"));
+          } else {
+            assert.equal(uploads, 0, "no rejected-startup pack reaches the broker");
+            assert.equal(acks, 0);
+            assert.deepEqual(publishedStates, []);
+            assert.deepEqual(snapshot(), before, "unpublished floor and publication bookkeeping stay unchanged");
+            assert.ok(lines.some((line) => (line as { msg?: string }).msg === "checkpoint publish skipped: soft deadline"),
+              "Runner records the soft-skip outcome");
+            await observedFlight!.batcher.flush();
+            assert.ok(feedTexts(ctx.runId).some((line) => line.includes("checkpoint publish skipped: soft deadline")));
+            assert.ok(!feedTexts(ctx.runId).some((line) => /checkpoint publishing recovered|published to origin/.test(line)));
+            await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: scenario.sink });
+            retryReturned = true;
+            assert.equal(uploads, 1, "only the successful retry uploads a pack");
+            assert.equal(acks, 1);
+            assert.equal(publishedStates.length, 1);
+            assert.equal(execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { env: GIT_ENV }).toString().trim(), committedTip,
+              "retry publishes the same committed work without a new commit");
+          }
+          assert.ok(lines.some((line) => {
+            const entry = line as { msg?: string; classification?: string; cleanup?: string };
+            return entry.msg === "checkpoint child startup timeout recovered" &&
+              entry.classification === "started_deadline" && entry.cleanup === "verified";
+          }), "worker Git logger records the fixed recovery classification");
+          return { branch: ctx.branch };
+        } catch (error) { turnFailure = error; throw error; }
+      });
+      const claim = gitlabClaim(247500 + index, {
+        repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+      });
+      const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
+        github, codexBoundaryDeadlineMs: 60_000, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
+        checkpointTestHooks: {
+          softDeadlineMs: 10_000,
+          armSoftDeadline: (fire, ms) => {
+            softCallback = fire;
+            return { deadlineAt: Date.now() + ms, cancel: () => { softCallback = undefined; } };
+          },
+          afterUnpinnedPublish: (state) => publishedStates.push(state),
+        },
+      });
+      // Observe bookkeeping without replacing any publication or recovery behavior.
+      const runnerSeam = runner as unknown as {
+        runGatedSink: <T>(flight: FlightObservation, action: () => Promise<T>) => Promise<T>;
+      };
+      const originalSink = runnerSeam.runGatedSink;
+      runnerSeam.runGatedSink = <T>(flight: FlightObservation, action: () => Promise<T>): Promise<T> => {
+        observedFlight = flight;
+        return originalSink.call(runner, flight, action) as Promise<T>;
+      };
+      try { await runner.execute(claim); }
+      finally {
+        git.withBoundaryProcessSpawner = originalScope;
+        git.reconcileOwedCandidates = originalReconcile;
+        client.publishCheckpoint = originalPublish;
+        gitLog.log = originalGitLog;
+        transport?.destroy();
+      }
+      assert.equal(lockFailure, undefined, `lock-release assertion: ${String(lockFailure)}`);
+      assert.equal(turnFailure, undefined, `executor assertions: ${String(turnFailure)}`);
+      assert.equal(firstReturned, true, `checkpoint returned after verified cleanup: ${String(turnFailure)}`);
+      assert.equal(retryReturned, scenario.target !== "owed", `retry result: ${String(turnFailure)}`);
+      assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify({ states: api.states, logs: lines.filter((line) => (line as { level?: string }).level === "error") }));
+      assert.ok(!statuses(claim.run_id).includes("failed"));
+      assert.equal(rig.registry.isPoisoned(), false);
+      assert.equal(rig.registry.pendingLaunchCount(), 0);
+    });
+  }
 });

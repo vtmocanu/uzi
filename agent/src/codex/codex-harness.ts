@@ -410,6 +410,72 @@ const CHILD_TOOL_OUTPUT_OMITTED = "[output not shown: subagent output cap reache
 /** The output synthesized for a child tool still open when its dispatch was closed. */
 const CHILD_TOOL_UNCONFIRMED = "tool result not confirmed: delegation closed";
 
+/** Count raw normalized JSON exactly, without recursion or a serialized copy. Traversal
+ * stops as soon as the remaining queue budget is exceeded; no input is projected or changed.
+ * Only JSON values (and optional undefined fields) occur in transport notifications. */
+function boundedJsonBytes(value: unknown, limit: number): number {
+  type Container = { value: Record<string, unknown> | unknown[]; keys: string[] | undefined; index: number; emitted: boolean };
+  const stack: Container[] = [];
+  const ancestors = new Set<object>();
+  let bytes = 0;
+  const stringBytes = (text: string): void => {
+    bytes += 2;
+    for (let i = 0; i < text.length && bytes <= limit; i++) {
+      const code = text.charCodeAt(i);
+      if (code === 34 || code === 92 || code === 8 || code === 9 || code === 10 || code === 12 || code === 13) bytes += 2;
+      else if (code < 32) bytes += 6;
+      else if (code < 128) bytes++;
+      else if (code < 2048) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else if (code >= 0xd800 && code <= 0xdfff) bytes += 6;
+      else bytes += 3;
+    }
+  };
+  let current = value;
+  for (;;) {
+    if (current !== null && typeof current === "object") {
+      if (ancestors.has(current)) throw new TypeError("cyclic notification JSON");
+      ancestors.add(current);
+      const array = Array.isArray(current);
+      stack.push({ value: current as Record<string, unknown> | unknown[], keys: array ? undefined : Object.keys(current), index: 0, emitted: false });
+      bytes += 2; // Container delimiters.
+    } else if (typeof current === "string") stringBytes(current);
+    else if (current === undefined || current === null) bytes += 4; // Undefined array entries serialize as null.
+    else if (typeof current === "number" || typeof current === "boolean") bytes += JSON.stringify(current).length;
+    else throw new TypeError("non-JSON notification value");
+    if (bytes > limit) return bytes;
+
+    let found = false;
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      const length = frame.keys ? frame.keys.length : (frame.value as unknown[]).length;
+      if (frame.index === length) {
+        ancestors.delete(frame.value);
+        stack.pop();
+        continue;
+      }
+      const index = frame.index++;
+      if (frame.keys) {
+        const key = frame.keys[index]!;
+        current = (frame.value as Record<string, unknown>)[key];
+        if (current === undefined) continue; // Optional object fields are omitted.
+        if (frame.emitted) bytes++;
+        frame.emitted = true;
+        stringBytes(key);
+        bytes++;
+      } else {
+        if (index > 0) bytes++;
+        current = (frame.value as unknown[])[index];
+      }
+      found = true;
+      break;
+    }
+    if (!found || bytes > limit) return bytes;
+  }
+}
+
 // --- the harness --------------------------------------------------------------
 
 export class CodexHarness implements RunHarness {
@@ -471,7 +537,8 @@ export class CodexHarness implements RunHarness {
   // turn ended (abort/stop) can never leak a frame into a later turn's stream.
   private readonly scrubProjected: ProjectionScrub;
   private readonly idNonce: string;
-  private outbox: HarnessEvent[] = [];
+  private readinessOrdinal = 0;
+  private outbox: { event: HarnessEvent; ready: number }[] = [];
   private wakeOutbox?: () => void;
   private turnOrdinal = 0;
   private liveProjectionTurn?: number;
@@ -503,7 +570,6 @@ export class CodexHarness implements RunHarness {
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
   private turnClosed = false;
-  private terminalEmitted = false;
   private stopRequested = false;
   // PRD #1534: the classification captured from the active turn's final non-retrying
   // provider method:"error" frame, folded into the terminal at decode. Reset per turn.
@@ -862,7 +928,6 @@ export class CodexHarness implements RunHarness {
     const rendered = this.render(request);
     this.activePolicyAdmission = admitPolicyTurn(request.phase);
     this.turnClosed = false;
-    this.terminalEmitted = false;
     this.activeTurnId = undefined;
     this.stopRequested = false;
     this.stopTurn = undefined;
@@ -966,7 +1031,7 @@ export class CodexHarness implements RunHarness {
    *  turn's stream is no longer live (a late callback settling after its turn ended). */
   private emitProjected(ev: HarnessEvent, ordinal: number): void {
     if (ordinal !== this.liveProjectionTurn) return;
-    this.outbox.push(ev);
+    this.outbox.push({ event: ev, ready: ++this.readinessOrdinal });
     const wake = this.wakeOutbox;
     this.wakeOutbox = undefined;
     wake?.();
@@ -993,7 +1058,7 @@ export class CodexHarness implements RunHarness {
 
   /** Yield every queued projected event, including any queued while a yield was pending. */
   private *drainOutbox(): Generator<HarnessEvent> {
-    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev;
+    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev.event;
   }
 
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
@@ -1017,6 +1082,19 @@ export class CodexHarness implements RunHarness {
       onAbort = (): void => resolve("aborted");
       request.signal.addEventListener("abort", onAbort, { once: true });
     });
+
+    const deferred: { note: CodexNotification; bytes: number }[] = [];
+    let deferredBytes = 0;
+    const refuse = (transport: CodexTransport, note: CodexNotification): void => {
+      if (note.kind === "activity" && note.requestId !== undefined)
+        this.safeRespond(transport, note.requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
+    };
+    const refuseDeferred = (): void => {
+      const transport = this.transport;
+      if (transport) for (const entry of deferred) refuse(transport, entry.note);
+      deferred.length = 0;
+      deferredBytes = 0;
+    };
 
     try {
       // startTurn returns a lazy iterable. A stop may arrive before its first next();
@@ -1076,49 +1154,103 @@ export class CodexHarness implements RunHarness {
         yield { kind: "initialized", model: this.currentModel, sessionId: this.threadId };
       }
 
-      // 4. Consume the notification stream, mapping each raw frame to ONE neutral event.
-      //    Every return path below first drains the projection outbox (issue #1583), so a
-      //    projected tool frame queued before the stream ends is never silently lost.
+      // One reader, one serial request mapping, and a bounded FIFO. Readiness is stamped
+      // at handoff, including while the consumer is suspended at a yield.
+      type ReadState = { promise: Promise<void>; source: Promise<IteratorResult<CodexNotification>>;
+        ready?: number; step?: IteratorResult<CodexNotification>; error?: unknown; failed?: boolean };
+      type Mapping = { promise: Promise<void>; ready?: number; event?: HarnessEvent; error?: unknown; failed?: boolean };
+      let read: ReadState | undefined;
+      let mapping: Mapping | undefined;
+      let terminal: CodexNotification | undefined;
+      let terminalSeen = false;
+      const beginMapping = (note: CodexNotification): void => {
+        const state: Mapping = { promise: Promise.resolve() };
+        state.promise = this.mapNote(transport, note, request.signal).then(
+          event => { state.event = event; state.ready = ++this.readinessOrdinal; },
+          error => { state.error = error; state.failed = true; state.ready = ++this.readinessOrdinal; },
+        );
+        mapping = state;
+      };
       for (;;) {
-        if (this.turnClosed) {
+        if (this.turnClosed || request.signal.aborted || this.stopRequested) {
+          this.endTurnOnStop();
+          refuseDeferred();
           this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
           yield* this.drainOutbox();
           return;
         }
-        const notePromise = this.pendingNote ?? notes.next();
-        this.pendingNote = notePromise;
-        let step: IteratorResult<CodexNotification> | "aborted" | "outbox";
-        try {
-          // An outbox wake drains + yields the queued frames and re-races the SAME pending
-          // note (still held in `pendingNote`), so no provider notification is ever dropped.
-          for (;;) {
-            step = await Promise.race([notePromise, abortPromise, this.outboxReady()]);
-            if (step !== "outbox") break;
+        // A retained read can fail while the consumer is suspended at a yield.
+        // Keep normal readiness/drain ordering, but never admit a queued callback
+        // once EOF or failure is already known.
+        const readEnded = read?.ready !== undefined && (read.failed || read.step?.done);
+        if (!mapping && deferred.length > 0 && !readEnded) {
+          const entry = deferred.shift()!;
+          deferredBytes -= entry.bytes;
+          beginMapping(entry.note);
+        }
+        if (!read && !terminalSeen) {
+          const source = this.pendingNote ?? notes.next();
+          this.pendingNote = source;
+          const state: ReadState = { source, promise: Promise.resolve() };
+          state.promise = source.then(
+            step => { state.step = step; state.ready = ++this.readinessOrdinal; },
+            error => { state.error = error; state.failed = true; state.ready = ++this.readinessOrdinal; },
+          );
+          read = state;
+        }
+        if (terminal && !mapping && deferred.length === 0) {
+          beginMapping(terminal);
+          terminal = undefined;
+          // The active terminal is mapped without starting another notification read.
+        }
+        const readReady = read?.ready ?? Infinity;
+        const outboxReady = this.outbox[0]?.ready ?? Infinity;
+        const mappedReady = mapping?.ready ?? Infinity;
+        if (outboxReady < readReady && outboxReady < mappedReady) {
+          yield this.outbox.shift()!.event;
+          continue;
+        }
+        if (mappedReady < readReady) {
+          const completed = mapping!;
+          mapping = undefined;
+          if (completed.failed) {
+            refuseDeferred();
+            yield* this.closeDispatchesOnFailure(ordinal);
+            throw completed.error;
+          }
+          const mapped = completed.event!;
+          if (mapped.kind === "turn_finished") {
+            this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
             yield* this.drainOutbox();
           }
-        } catch (error) {
-          if (this.pendingNote === notePromise) this.pendingNote = undefined;
-          yield* this.closeDispatchesOnFailure(ordinal);
-          throw error;
-        }
-        if (step === "aborted") {
-          // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly. A bound
-          // delegation still open gets a synthesized, unconfirmed lead completion first.
-          this.endTurnOnStop();
-          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
-          yield* this.drainOutbox();
-          return;
-        }
-        if (this.pendingNote === notePromise) this.pendingNote = undefined;
-        if (step.done) {
-          // A deliberate close or an already-emitted terminal ends cleanly. Otherwise
-          // this is Codex's own unexpected EOF → a protocol throw (rule 9), never a
-          // fabricated success.
-          if (this.terminalEmitted || this.turnClosed) {
-            this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
+          yield mapped;
+          if (mapped.kind === "turn_finished") {
+            if (this.pendingToolCalls.size > 0)
+              await Promise.race([Promise.allSettled(this.pendingToolCalls), abortPromise]);
             yield* this.drainOutbox();
             return;
           }
+          continue;
+        }
+        if (readReady === Infinity) {
+          await Promise.race([
+            abortPromise, this.outboxReady(),
+            ...(read ? [read.promise] : []),
+            ...(mapping ? [mapping.promise] : []),
+          ]);
+          continue;
+        }
+        const consumed = read!;
+        read = undefined;
+        if (this.pendingNote === consumed.source) this.pendingNote = undefined;
+        if (consumed.failed) {
+          refuseDeferred();
+          yield* this.closeDispatchesOnFailure(ordinal);
+          throw consumed.error;
+        }
+        const step = consumed.step!;
+        if (step.done) {
+          refuseDeferred();
           yield* this.closeDispatchesOnFailure(ordinal);
           throw new CodexHarnessError({
             category: "protocol",
@@ -1162,57 +1294,44 @@ export class CodexHarness implements RunHarness {
             }
           }
         }
-        // The broker-callback await (mapNote → routeToolCall → broker.handleToolCall) is
-        // itself raced against the owner abort — WITHOUT this, a never-settling broker seam
-        // (a model-selected long-running shell) leaves the turn un-cancellable, falsifying
-        // rule 9. On abort while a callback is pending we STOP awaiting it and end the
-        // stream promptly; the pending effect's process cleanup is the registry's reap job
-        // at the safety boundary, and a late broker reply is guarded in routeToolCall so it
-        // never throws into a closed transport. The happy path is unchanged: a callback
-        // that settles normally still replies via transport.respond after the broker settles.
-        //
-        // mapNote is invoked EXACTLY ONCE per note (so a callback is brokered and replied
-        // once); an outbox wake (issue #1583: a projected `started` frame queued while the
-        // broker effect is still running) drains + yields the queue and re-races that SAME
-        // promise. The outbox is drained again before `mapped` itself is yielded, so a
-        // callback's started/finished pair always precedes the note's own event.
-        const mappedPromise = this.mapNote(transport, step.value, request.signal);
-        let mapped: HarnessEvent | "aborted" | "outbox";
-        try {
-          for (;;) {
-            mapped = await Promise.race([mappedPromise, abortPromise, this.outboxReady()]);
-            if (mapped !== "outbox") break;
-            yield* this.drainOutbox();
+        if (step.value.kind === "turn_completed" &&
+            step.value.threadId === this.threadId && step.value.turnId === this.activeTurnId) {
+          terminalSeen = true;
+          terminal = step.value;
+          continue;
+        }
+        if (step.value.kind === "activity" && step.value.requestId !== undefined) {
+          if (mapping || deferred.length > 0) {
+            let bytes: number;
+            try {
+              bytes = deferred.length >= 4096 ? Infinity : boundedJsonBytes(step.value, 64 * 1024 * 1024 - deferredBytes);
+            } catch {
+              // This request is not yet in deferred: refuse it explicitly before
+              // failing siblings; routeToolCall still owns the active callback's reply.
+              refuse(transport, step.value);
+              refuseDeferred();
+              yield* this.closeDispatchesOnFailure(ordinal);
+              throw new CodexHarnessError({ category: "protocol", message: "codex deferred request accounting failed" });
+            }
+            // Bound before admission. Overflow refuses this request and all queued siblings;
+            // the already-dispatched callback retains routeToolCall's sole reply ownership.
+            if (deferred.length >= 4096 || bytes > 64 * 1024 * 1024 - deferredBytes) {
+              refuse(transport, step.value);
+              refuseDeferred();
+              yield* this.closeDispatchesOnFailure(ordinal);
+              throw new CodexHarnessError({ category: "protocol", message: "codex deferred request queue overflow" });
+            }
+            deferred.push({ note: step.value, bytes });
+            deferredBytes += bytes;
+          } else {
+            beginMapping(step.value);
           }
-        } catch (error) {
-          yield* this.closeDispatchesOnFailure(ordinal);
-          throw error;
+          continue;
         }
-        if (mapped === "aborted") {
-          this.endTurnOnStop();
-          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
-          yield* this.drainOutbox();
-          return;
-        }
-        // The owner stops consuming at `turn_finished`, so a bound delegation still open here
-        // gets its (unconfirmed) lead completion BEFORE the terminal, never after it.
-        if (mapped.kind === "turn_finished") this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
-        yield* this.drainOutbox();
-        yield mapped;
-        if (mapped.kind === "turn_finished") {
-          // Flush any concurrently-running delegation callbacks: each drives a child turn
-          // that settles (and replies) before this resolves, so the parent spawn_agent
-          // callback has responded by the time the root turn stream closes. A wedged
-          // child self-bounds via its own per-child deadline (delegation.ts), so this
-          // await is finite. The non-delegation path has an empty set and never waits.
-          if (this.pendingToolCalls.size > 0) await Promise.allSettled(this.pendingToolCalls);
-          // Every dispatch of this turn was closed above, so a delegation settling here projects
-          // no completion; this drain only keeps the "drain before return" invariant.
-          yield* this.drainOutbox();
-          return; // close the iterator after the terminal
-        }
+        yield await this.mapNote(transport, step.value, request.signal);
       }
     } finally {
+      refuseDeferred();
       // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
       // A later epoch must not baseline that work away as history of this same claim.
       if (attemptedResumedRoot !== undefined && !this.accountant.hasBaseline(attemptedResumedRoot))
@@ -1431,7 +1550,7 @@ export class CodexHarness implements RunHarness {
       }
       case "turn_completed": {
         // The harness serves ONLY the ACTIVE root turn. A terminal for a stale turn id or
-        // a child/foreign thread is liveness ONLY — it must never latch `terminalEmitted`
+        // a child/foreign thread is liveness ONLY — it must never end the active stream
         // or emit `turn_finished`, or a stale/child completion could end the root turn.
         // Keeping the loop waiting also means a later clean EOF without the REAL terminal
         // still protocol-throws (unexpected-EOF), never a fabricated success.
@@ -1443,7 +1562,6 @@ export class CodexHarness implements RunHarness {
         // protocol poison throws here instead of allowing the terminal through.
         await this.appServerAuth?.drainInterceptedRequests();
         const terminal = this.decodeTerminal(note);
-        this.terminalEmitted = true;
         return { kind: "turn_finished", terminal, sessionId: note.threadId };
       }
       case "activity": {
@@ -1569,9 +1687,8 @@ export class CodexHarness implements RunHarness {
     // never be read. It runs in the background, tracked in `pendingToolCalls`, and the
     // turn stream flushes it before ending; the broker's own delegate seam guarantees the
     // child settles before this callback (the parent spawn_agent) resolves. A delegation is
-    // never a workflow signal, so it emits NO signals frame. EVERY OTHER callback is awaited
-    // inline exactly as before, so the non-delegation path is byte-identical (the abort race
-    // in runTurn still bounds a wedged inline callback).
+    // never a workflow signal, so it emits NO signals frame. runTurn serializes other
+    // request mappings locally while its sole reader continues consuming commentary.
     //
     // Issue #1583: the delegation is recorded as a pending dispatch. The lead dispatch frame is
     // emitted only once its child actually starts (bindChildDispatch), and its lead completion

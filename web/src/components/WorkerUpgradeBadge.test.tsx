@@ -30,6 +30,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,
+    active_cross_checks: 0,
+    max_cross_check_slots: null,
     template_declared: null,
     template_reported: null,
     version: "0.11.0",

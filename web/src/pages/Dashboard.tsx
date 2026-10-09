@@ -25,6 +25,7 @@ import { UsageCard, type UsageWindow } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
 import { HealthOverviewCard } from "../components/HealthOverviewCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
@@ -349,6 +350,7 @@ export function Dashboard() {
                       {w.status}
                     </Badge>
                     <WorkerCordonBadge worker={w} />
+                    <WorkerRunBadge worker={w} />
                     <span className="truncate text-sm font-medium text-fg">{w.name}</span>
                   </div>
                   <WorkerStatLine worker={w} />

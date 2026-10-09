@@ -2278,12 +2278,17 @@ export interface Worker {
   capabilities?: string[];
   busy: boolean; // derived: holds ANY run of ANY kind, so a chat-only worker is busy:true with active_runs:0 — NOT active_runs > 0
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
-  // worker's claimed/running/awaiting_approval runs (busy is derived from it);
+  // worker's claimed/running/awaiting_approval run-lane work, excluding chat and
+  // dedicated cross-checks; busy covers every lane.
   // max_concurrent_runs is the worker's advertised slot cap, null when it advertises
   // none (an older image, or before the M2 agent sends it). Together they drive the
   // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
   active_runs: number;
   max_concurrent_runs: number | null;
+  // Dedicated lane only; legacy cross-checks still count toward active_runs.
+  active_cross_checks: number;
+  // null: older worker, 0: disabled, positive: advertised dedicated capacity.
+  max_cross_check_slots: number | null;
   // reported_runs (PRD #1390 M2c): what this worker SAYS it is executing, from its latest
   // active-run snapshot — one entry per run, each with the phase the worker sees it in and the
   // generation it was claimed at. The api ALWAYS sends the key: the list/patch handlers overlay

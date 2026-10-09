@@ -125,6 +125,14 @@ The Workers page's **Ephemeral workers → Docker-capable** preference adds
 Docker when auto-provisioning for repositories your admin allows; see
 [the triggers, scope and warm-reuse policy](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability).
 
+An eligible worker can finish its own pinned plan checker while cordoned,
+subject to maintenance fences. Plan checkers have separate capacity; see
+[Cross-check slots](./worker-setup.md#cross-check-slots). An ephemeral worker
+can check its bound lead on the same pod without provisioning an extra pod
+when the lane is eligible and has space. Active children block lease entry,
+teardown and reaping; checking the parent preserves its binding, including
+legacy run-slot fallback.
+
 ## Ephemeral worker lease
 
 When an ephemeral worker finishes its run it is not removed at once. It stays
@@ -237,8 +245,9 @@ Deliverables belong in git, published checkpoints, or captured work.
 
 DinD maintenance waits for every run to finish (`completed`, `failed`, or
 `cancelled`); parked, paused, approval, input, and follow-up waits block
-cleanup. A pending drain refuses new run/chat work while letting this
-worker's own parked runs resume to finish. It then fences claims and
+cleanup. A pending drain refuses unrelated new run, chat and cross-check
+work while letting this worker's own parked runs and pinned plan checkers
+finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
 override bypasses this DinD gate. The legacy `/nix`+ `/data` recycle and

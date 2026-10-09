@@ -98,6 +98,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     hosted_size: null,
     active_runs: 0,
     max_concurrent_runs: null,
+    active_cross_checks: 0,
+    max_cross_check_slots: null,
     template_declared: null,
     template_reported: "base",
     version: "0.4.2",
@@ -1841,5 +1843,32 @@ describe("WorkersSettings pending outcomes (#1994)", () => {
     await screen.findByText("live-box");
     expect(screen.getByText("busy")).toBeTruthy();
     expect(screen.queryByText(/pending outcome/)).toBeNull();
+  });
+});
+
+describe("WorkersSettings dedicated cross-check capacity", () => {
+  it("shows separate cap-one badges and drains cross-check-only work", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({
+      name: "lane-worker", busy: true, active_runs: 1, max_concurrent_runs: 1,
+      active_cross_checks: 1, max_cross_check_slots: 1,
+      draining_since: "2026-08-21T12:00:00Z",
+    })] });
+    renderPage();
+    await screen.findByText("lane-worker");
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("draining")).toBeTruthy();
+  });
+
+  it("keeps a cross-check-only worker draining", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({
+      name: "lane-worker", busy: true, active_runs: 0, max_concurrent_runs: 1,
+      active_cross_checks: 1, max_cross_check_slots: 1,
+      draining_since: "2026-08-21T12:00:00Z",
+    })] });
+    renderPage();
+    await screen.findByText("lane-worker");
+    expect(screen.getByText("0/1 runs")).toBeTruthy();
+    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("draining")).toBeTruthy();
   });
 });

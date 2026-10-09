@@ -870,7 +870,7 @@ var workerDTOKeys = []string{
 	// worker's self-report and its template-derived caps, v1 vocabulary {docker, jvm}).
 	// Read-only display for the workers UI.
 	"capabilities",
-	"max_concurrent_runs",
+	"max_concurrent_runs", "active_cross_checks", "max_cross_check_slots",
 	// PRD #1390 M2c: what this worker SAYS it is executing (its worker_active_runs snapshot),
 	// each entry a {run_id, phase, claim_generation}. ALWAYS a JSON array, never null — the
 	// list/patch overlay reads it from the DB and the builders seed it to []. Display-only.

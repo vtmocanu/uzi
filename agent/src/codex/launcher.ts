@@ -59,7 +59,7 @@ import {
 } from "./config.js";
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
-import { assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
+import { ResidueQuarantinedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -226,6 +226,8 @@ export interface LauncherDeps {
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
+  /** Boundary checkpoint only: identity and absolute budget survive every wrapper. */
+  readonly startupCleanup?: StartupCleanupAuthorization;
   /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
    * only a credential-free literal loopback URL and disables WebSockets; production
    * leaves this absent and therefore emits the fixed vendor config byte-for-byte. */
@@ -265,6 +267,78 @@ export type ObservationOutcome =
     readonly processes: ReadonlyArray<ObservationIdentity & { readonly ppid: number; readonly rss: number }>;
   }
   | { readonly event: "observe"; readonly id: number; readonly state: "unavailable"; readonly reason: ObservationReason };
+
+/** Scan bounded evidence without constructing process rows. The scan is linear in
+ * the retained line (at most MAX_EVIDENCE_LINE_BYTES); excess entries/depth flag
+ * oversize while scanning continues to find reordered headers. Partial prefixes
+ * retain only headers already read, never a guessed request ID. */
+function preflightObservation(line: string): { event?: string; id?: number; valid: boolean; oversize: boolean } {
+  const result: { event?: string; id?: number; valid: boolean; oversize: boolean } = { valid: false, oversize: false };
+  type Frame = { object: boolean; state: "first" | "key" | "colon" | "value" | "after"; processes: boolean; key?: string };
+  const stack: Frame[] = [];
+  const token = /"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\[\],:]/y;
+  let offset = 0;
+  let started = false;
+  let entries = 0;
+  // Each token consumes input; syntax failure ends this scan, not sibling records.
+  while (offset < line.length) {
+    while (/[ \t\r\n]/.test(line[offset] ?? "") && offset < line.length) offset++;
+    if (offset === line.length) break;
+    token.lastIndex = offset;
+    const match = token.exec(line);
+    if (!match) return result;
+    const word = match[0];
+    offset = token.lastIndex;
+    const frame = stack.at(-1);
+    if (!frame) {
+      if (started || word !== "{") return result;
+      started = true;
+      stack.push({ object: true, state: "first", processes: false });
+      continue;
+    }
+    const closing = frame.object ? "}" : "]";
+    if (word === closing && (frame.state === "first" || frame.state === "after")) {
+      stack.pop();
+      continue;
+    }
+    if (frame.state === "after") {
+      if (word !== ",") return result;
+      frame.state = frame.object ? "key" : "value";
+      continue;
+    }
+    if (frame.object && (frame.state === "first" || frame.state === "key")) {
+      if (!word.startsWith('"')) return result;
+      // Decode only top-level keys, including escaped event/id/processes keys.
+      if (stack.length === 1) frame.key = JSON.parse(word) as string;
+      frame.state = "colon";
+      continue;
+    }
+    if (frame.state === "colon") {
+      if (word !== ":") return result;
+      frame.state = "value";
+      continue;
+    }
+    if (frame.state !== "value" && !(frame.state === "first" && !frame.object)) return result;
+    if (word === "," || word === ":" || word === "}" || word === "]") return result;
+    if (frame.processes && !frame.object && ++entries > 256) result.oversize = true;
+    const top = stack.length === 1;
+    if (top && frame.key === "event") {
+      result.event = word.startsWith('"') ? JSON.parse(word) as string : undefined;
+    }
+    if (top && frame.key === "id") {
+      const id = Number(word);
+      result.id = Number.isSafeInteger(id) && id > 0 && /^[ \t\r\n,}]/.test(line[offset] ?? "") ? id : undefined;
+    }
+    frame.state = "after";
+    if (word === "{" || word === "[") {
+      const processes = frame.processes || (top && frame.key === "processes");
+      stack.push({ object: word === "{", state: "first", processes });
+      if (stack.length > 32) result.oversize = true;
+    }
+  }
+  result.valid = started && stack.length === 0;
+  return result;
+}
 
 function validObservation(value: Record<string, unknown>, started: StartedEvidence): ObservationOutcome | undefined {
   const identity = (v: unknown): v is ObservationIdentity => {
@@ -318,7 +392,7 @@ export interface DisposeEvidence {
   readonly reason?: string;
   readonly killed?: readonly number[];
   readonly reaped?: readonly number[];
-  readonly children?: readonly number[];
+  readonly children?: readonly ObservationIdentity[];
   /** Present only for a root launched with a cleanup token: the outcome of the
    *  supervisor removing `/tmp/uzi-codex-command-<token>` after a confirmed drain.
    *  `reason` is "" when removed, otherwise one of the fixed words mismatch, owner,
@@ -703,6 +777,80 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
   return env;
 }
 
+/** Supplied only by the boundary owner, once per launch attempt. */
+export interface StartupCleanupAuthorization {
+  readonly hardDeadlineAt: number;
+  readonly attempt: object;
+}
+
+export type CodexLaunchFailureClassification =
+  | "started_deadline" | "supervisor_exit" | "posture" | "protocol_evidence"
+  | "output_limit" | "spawn_ENOENT" | "spawn_EACCES" | "spawn_EPERM"
+  | "spawn_EAGAIN" | "spawn_ENOMEM" | "profile_quarantine" | "unknown";
+
+const launchClassifications = new WeakMap<object, CodexLaunchFailureClassification>();
+const startupCleanupProofs = new WeakMap<object, { authorization: StartupCleanupAuthorization; serial: number }>();
+let startupCleanupSerial = 0;
+const usedStartupAttempts = new WeakSet<object>();
+
+/** Safe public diagnostic; the original error stays in cause, never in message. */
+export class CodexLaunchError extends Error {
+  readonly classification: CodexLaunchFailureClassification;
+  readonly cleanupStatus: "verified" | "unconfirmed";
+  constructor(
+    classification: CodexLaunchFailureClassification,
+    cleanupStatus: "verified" | "unconfirmed",
+    cause: unknown,
+    readonly cleanupCause?: unknown,
+  ) {
+    const allowed: readonly string[] = ["started_deadline", "supervisor_exit", "posture", "protocol_evidence",
+      "output_limit", "spawn_ENOENT", "spawn_EACCES", "spawn_EPERM", "spawn_EAGAIN", "spawn_ENOMEM",
+      "profile_quarantine", "unknown"];
+    const safeClassification = allowed.includes(classification) ? classification : "unknown";
+    const safeCleanup = cleanupStatus === "verified" ? "verified" : "unconfirmed";
+    super(`codex launch failed: ${safeClassification}; cleanup ${safeCleanup}`, { cause });
+    this.classification = safeClassification;
+    this.cleanupStatus = safeCleanup;
+    this.name = "CodexLaunchError";
+  }
+}
+
+/** Only a launcher-minted certificate for this exact rejected attempt is authority. */
+export function hasVerifiedStartupCleanup(error: unknown, authorization?: StartupCleanupAuthorization): boolean {
+  return authorization !== undefined && error instanceof CodexLaunchError &&
+    startupCleanupProofs.get(error)?.authorization === authorization && Date.now() < authorization.hardDeadlineAt;
+}
+
+/** Capture before calling a launch seam: an earlier genuine error cannot be replayed
+ * even if a custom consumer reuses the same authorization object. This observes
+ * certificates; it cannot mint them. */
+export function watchStartupCleanup(authorization?: StartupCleanupAuthorization): (error: unknown) => boolean {
+  const before = startupCleanupSerial;
+  return (error) => hasVerifiedStartupCleanup(error, authorization) &&
+    (startupCleanupProofs.get(error as object)?.serial ?? 0) > before;
+}
+
+function spawnFailureClassification(error: unknown): CodexLaunchFailureClassification {
+  const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+  switch (code) {
+    case "ENOENT": return "spawn_ENOENT";
+    case "EACCES": return "spawn_EACCES";
+    case "EPERM": return "spawn_EPERM";
+    case "EAGAIN": return "spawn_EAGAIN";
+    case "ENOMEM": return "spawn_ENOMEM";
+    default: return "unknown";
+  }
+}
+
+export function classifyCodexLaunchFailure(error: unknown): CodexLaunchFailureClassification {
+  if (typeof error === "object" && error !== null) {
+    const known = launchClassifications.get(error);
+    if (known) return known;
+  }
+  if (error instanceof CodexUnsupportedProfileError || error instanceof ResidueQuarantinedError) return "profile_quarantine";
+  return "unknown";
+}
+
 /** A supervisor-owned child exit deadline, distinct from a boundary abort or a
  * supervisor failure. Only checkpoint publication may recover after a clean reap. */
 export class SupervisedChildExitTimeoutError extends Error {
@@ -879,6 +1027,17 @@ export async function launchCodexEffectRoot(
   spec: CodexEffectLaunchSpec,
   deps: LauncherDeps = {},
 ): Promise<CodexRootHandle> {
+  try {
+    return await launchEffectRoot(spec, deps);
+  } catch (cause) {
+    if (cause instanceof CodexLaunchError && launchClassifications.has(cause)) throw cause;
+    const error = new CodexLaunchError(classifyCodexLaunchFailure(cause), "unconfirmed", cause);
+    launchClassifications.set(error, error.classification);
+    throw error;
+  }
+}
+
+async function launchEffectRoot(spec: CodexEffectLaunchSpec, deps: LauncherDeps): Promise<CodexRootHandle> {
   const profileEnv = deps.env ?? process.env;
   if (!uidSplitActive(profileEnv)) {
     throw new CodexUnsupportedProfileError("Codex effect roots require the A1 uid split; refusing to launch");
@@ -911,14 +1070,29 @@ export async function launchCodexEffectRoot(
   // issue #2213: an effect root whose env carries the forge credential (a boundary git) starts
   // nothing once quarantined; synchronous, immediately before the spawn.
   assertNoCredentialedGitWhileQuarantined(spec.env);
-  const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
-    cwd: spec.cwd,
-    // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither
-    // identity here is the runner uid the reaper scans, so the mark would only spread the nonce.
-    env: { ...spec.env },
-    stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
-  });
-  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command");
+  if (deps.startupCleanup) {
+    const { attempt, hardDeadlineAt } = deps.startupCleanup;
+    if (typeof attempt !== "object" || attempt === null || usedStartupAttempts.has(attempt) ||
+      !Number.isFinite(hardDeadlineAt) || Date.now() >= hardDeadlineAt) {
+      throw new CodexLaunchError("unknown", "unconfirmed", undefined);
+    }
+    usedStartupAttempts.add(attempt);
+  }
+  let child: SupervisorProcess;
+  try {
+    child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
+      cwd: spec.cwd,
+      // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither
+      // identity here is the runner uid the reaper scans, so the mark would only spread the nonce.
+      env: { ...spec.env },
+      stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
+    });
+  } catch (cause) {
+    const error = new CodexLaunchError(spawnFailureClassification(cause), "unconfirmed", cause);
+    launchClassifications.set(error, error.classification);
+    throw error;
+  }
+  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup);
 }
 
 async function createHandle(
@@ -926,6 +1100,7 @@ async function createHandle(
   expectedUid: number,
   deadlines: LauncherDeadlines,
   kind: CodexRootKind,
+  startupCleanup?: StartupCleanupAuthorization,
 ): Promise<CodexRootHandle> {
   const control = asWritable(child.stdio[3], "control");
   const evidence = asReadable(child.stdio[4], "evidence");
@@ -943,6 +1118,9 @@ async function createHandle(
   let lastDrained: DisposeEvidence | undefined;
   let abnormalTmpCleanup: TmpCleanupEvidence | undefined;
   let lineCount = 0;
+  let abandoningStartup = false;
+  let startupCleanupInFlight = false;
+  const transportEnds: Promise<void>[] = [];
 
   let resolveStarted!: (e: StartedEvidence) => void;
   let rejectStarted!: (err: Error) => void;
@@ -956,10 +1134,15 @@ async function createHandle(
   void childExitPromise.catch(() => undefined);
   let resolveExit!: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => { resolveExit = resolve; });
+  let resolveClose!: () => void;
+  const closePromise = new Promise<void>((resolve) => { resolveClose = resolve; });
+  let resolveEvidenceEnd!: () => void;
+  const evidenceEndPromise = new Promise<void>((resolve) => { resolveEvidenceEnd = resolve; });
   let resolveFailed!: (err: Error) => void;
   const whenFailed = new Promise<Error>((resolve) => { resolveFailed = resolve; });
 
-  function fail(err: Error): void {
+  function fail(err: Error, classification: CodexLaunchFailureClassification = "protocol_evidence"): void {
+    launchClassifications.set(err, classification);
     if (!failure) {
       failure = err;
       resolveFailed(err);
@@ -975,7 +1158,7 @@ async function createHandle(
     try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* primary failure already recorded */ }
   }
 
-  let observation: { id: number; resolve: (outcome: ObservationOutcome) => void; timer: ReturnType<typeof setTimeout> } | undefined;
+  let observation: { id: number; resolve: (outcome: ObservationOutcome) => void; timer: ReturnType<typeof setTimeout>; timedOut?: boolean } | undefined;
   let observationIdentity: { supervisor: string; root: string } | undefined;
   const unavailable = (id: number, reason: ObservationReason): ObservationOutcome => ({ event: "observe", id, state: "unavailable", reason });
   function settleObservation(outcome: ObservationOutcome): void {
@@ -986,6 +1169,13 @@ async function createHandle(
     current.resolve(outcome);
   }
   const stopLines = readBoundedRecords(evidence, MAX_EVIDENCE_LINE_BYTES, (line) => {
+    const header = preflightObservation(line);
+    if (header.event === "observe" && (!header.valid || header.oversize)) {
+      if (observation && header.id === observation.id) {
+        settleObservation(unavailable(observation.id, header.oversize ? "oversize" : "stale"));
+      }
+      return;
+    }
     let value: unknown;
     try { value = JSON.parse(line); } catch { fail(new TrustedExecutionRefusal("malformed evidence line (not JSON)")); return; }
     const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
@@ -997,9 +1187,9 @@ async function createHandle(
   }, (why, prefix) => {
     // Oversized observation records are discarded through the next newline.
     // Only the bounded prefix is inspected; no oversized text is materialized.
-    if (why === "oversized line" && /^\s*\{\s*"event"\s*:\s*"observe"[,}]/.test(prefix)) {
-      const replyId = /^\s*\{\s*"event"\s*:\s*"observe"\s*,\s*"id"\s*:\s*([0-9]+)(?=\s*[,}])/.exec(prefix);
-      if (observation && replyId && Number(replyId[1]) === observation.id) {
+    const header = why === "oversized line" ? preflightObservation(prefix) : undefined;
+    if (header?.event === "observe") {
+      if (observation && header.id === observation.id) {
         settleObservation(unavailable(observation.id, "oversize"));
       }
       return;
@@ -1007,7 +1197,8 @@ async function createHandle(
     fail(new TrustedExecutionRefusal(why === "oversized line" ? `oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)` : `evidence ${why}`));
   });
   evidence.on("end", () => {
-    if (failure || cleanDisposed || exited) return;
+    resolveEvidenceEnd();
+    if (failure || cleanDisposed || exited || abandoningStartup) return;
     if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
   });
   control.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`control stream error: ${err.message}`, { cause: err })));
@@ -1035,17 +1226,19 @@ async function createHandle(
             `supervisor reported an unsafe start posture (pid=${String(ev.supervisorPid)} expectedPid=${String(child.pid)}, `
             + `subreaper=${String(ev.subreaper)}, nondumpable=${String(ev.nondumpable)}, liveCapsZero=${String(ev.liveCapsZero)}, `
             + `capBoundingSet=${String(ev.capBoundingSet)}, noNewPrivs=${String(ev.noNewPrivs)}, uid=${String(ev.uid)} expected ${expectedUid})`,
-          ));
+          ), "posture");
           return;
         }
+        if (startedEvent) { fail(new TrustedExecutionRefusal("duplicate started evidence")); return; }
         startedEvent = ev;
         resolveStarted(ev);
         return;
       }
       case "observe": {
-        // One outstanding request, no tombstone set: every other request ID is
-        // ignored, including timed-out replies and duplicate replies.
+        // A timeout settles the caller but retains the single wire-request fence.
+        // Only its matching reply releases it; other IDs cannot settle a new caller.
         if (!observation || record.id !== observation.id) return;
+        if (observation.timedOut) { settleObservation(unavailable(observation.id, "timeout")); return; }
         const outcome = startedEvent && !("tmpCleanup" in record) ? validObservation(record, startedEvent) : undefined;
         if (!outcome) { settleObservation(unavailable(observation.id, "stale")); return; }
         if (outcome.state === "complete") {
@@ -1060,9 +1253,41 @@ async function createHandle(
       }
       case "snapshot":
       case "dispose": {
+        if (record.event === "dispose") {
+          const pids = (v: unknown): boolean => Array.isArray(v) && v.length <= 65536 &&
+            v.every((pid) => Number.isSafeInteger(pid) && pid > 0);
+          const identities = (v: unknown): boolean => {
+            if (!Array.isArray(v) || v.length > 65536) return false;
+            const seen = new Set<number>();
+            return v.every((child: unknown) => {
+              if (typeof child !== "object" || child === null || Array.isArray(child)) return false;
+              const identity = child as Record<string, unknown>;
+              if (Object.keys(identity).length !== 2 || !Number.isSafeInteger(identity.pid) ||
+                Number(identity.pid) <= 0 || seen.has(Number(identity.pid)) ||
+                typeof identity.startTime !== "string" || !/^[1-9][0-9]{0,19}$/.test(identity.startTime) ||
+                BigInt(identity.startTime) > 18446744073709551615n) return false;
+              seen.add(Number(identity.pid));
+              return true;
+            });
+          };
+          const allowed = ["event", "id", "state", "authority", "reason", "killed", "reaped", "children", "tmpCleanup"];
+          if (!Number.isSafeInteger(record.id) || Number(record.id) <= 0 ||
+            !pids(record.killed) || !pids(record.reaped) ||
+            Object.keys(record).some((key) => !allowed.includes(key)) ||
+            (record.state === "drained"
+              ? record.authority !== "ECHILD+__WALL" || "reason" in record || "children" in record
+              : record.state !== "unconfirmed" || !identities(record.children) ||
+                (record.reason !== "deadline" && record.reason !== "echild-contradicted" && record.reason !== "enumeration") ||
+                (record.reason === "enumeration" && (record.children as unknown[]).length !== 0) || "authority" in record)) {
+            fail(new TrustedExecutionRefusal("malformed dispose evidence or missing required authority"));
+            return;
+          }
+        }
         const id = record.id;
         const waiter = typeof id === "number" ? pending.get(id) : undefined;
-        if (waiter && typeof id === "number") { pending.delete(id); waiter.resolve(record as unknown as SnapshotEvidence | DisposeEvidence); }
+        if (!waiter || typeof id !== "number") { fail(new TrustedExecutionRefusal("unmatched supervisor response")); return; }
+        pending.delete(id);
+        waiter.resolve(record as unknown as SnapshotEvidence | DisposeEvidence);
         return;
       }
       case "child_exit": {
@@ -1099,11 +1324,12 @@ async function createHandle(
     // still be buffered and read AFTER this event — Node's `exit` can precede the final
     // pipe read). A spontaneous exit with no dispose pending is a failure.
     if (!disposeInFlight && !cleanDisposed) {
-      fail(new TrustedExecutionRefusal(`supervisor exited (code=${String(code)}, signal=${String(signal)}) without confirmed disposal`));
+      fail(new TrustedExecutionRefusal("supervisor exited without confirmed disposal"), "supervisor_exit");
     }
   });
-  child.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`supervisor process error: ${err.message}`, { cause: err })));
+  child.on("error", (err: Error) => fail(new TrustedExecutionRefusal("supervisor process error", { cause: err }), spawnFailureClassification(err)));
   child.once("close", () => {
+    resolveClose();
     if (pending.size > 0) fail(new TrustedExecutionRefusal("supervisor channels closed with an unanswered control request"));
   });
 
@@ -1126,9 +1352,14 @@ async function createHandle(
     if (observation) return Promise.resolve(unavailable(observation.id, "busy"));
     const id = nextId++;
     if (failure || exited || control.destroyed || control.writableEnded) return Promise.resolve(unavailable(id, "transport"));
+    if (control.writableNeedDrain) return Promise.resolve(unavailable(id, "busy"));
     const budget = Number.isFinite(timeoutMs) ? Math.max(0, Math.min(10000, timeoutMs)) : 0;
     return new Promise((resolve) => {
-      const timer = setTimeout(() => settleObservation(unavailable(id, "timeout")), budget);
+      const timer = setTimeout(() => {
+        if (!observation || observation.id !== id) return;
+        observation.timedOut = true;
+        resolve(unavailable(id, "timeout"));
+      }, budget);
       observation = { id, resolve, timer };
       if (!writeControl({ op: "observe", id, timeoutMs: Math.floor(budget) })) settleObservation(unavailable(id, "transport"));
     });
@@ -1176,12 +1407,12 @@ async function createHandle(
   }
 
   async function disposeOnce(timeoutMs = 2000): Promise<DisposeOutcome> {
-    if (cleanDisposed && lastDrained) return { clean: true, event: lastDrained };
     if (failure) return { clean: false, reason: failure.message };
+    if (cleanDisposed && lastDrained) return { clean: true, event: lastDrained };
     if (exited) return { clean: false, reason: `supervisor already exited (code=${String(exitInfo?.code)})` };
     if (control.destroyed) return { clean: false, reason: "control channel unavailable; disposal unconfirmed" };
     disposeInFlight = true;
-    const deadlineAt = Date.now() + Math.max(0, timeoutMs);
+    const deadlineAt = Math.min(Date.now() + Math.max(0, timeoutMs), startupCleanup?.hardDeadlineAt ?? Infinity);
     const remaining = (): number => Math.max(0, Math.ceil(deadlineAt - Date.now()));
     try {
       const id = nextId++;
@@ -1215,8 +1446,18 @@ async function createHandle(
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error), event: disposeEv };
       }
-      if (exit.code !== 0) {
-        return { clean: false, reason: `supervisor exited non-zero (code=${String(exit.code)}, signal=${String(exit.signal)}) after a drained report`, event: disposeEv };
+      if (exit.code !== 0 || exit.signal !== null) {
+        fail(new TrustedExecutionRefusal("supervisor exited non-zero after a drained report"), "supervisor_exit");
+        return { clean: false, reason: "supervisor exited non-zero after a drained report", event: disposeEv };
+      }
+      try {
+        await withDeadline(Promise.all([closePromise, evidenceEndPromise, ...transportEnds]), remaining(), "supervisor channels close");
+      } catch {
+        return { clean: false, reason: "supervisor channels close unconfirmed", event: disposeEv };
+      }
+      if (failure || !startedEvent || !evidence.readableEnded || remaining() <= 0 ||
+        (startupCleanupInFlight && (!child.stdout?.readableEnded || !child.stderr?.readableEnded))) {
+        return { clean: false, reason: "final disposal evidence unconfirmed", event: disposeEv };
       }
       cleanDisposed = true;
       lastDrained = disposeEv;
@@ -1230,11 +1471,61 @@ async function createHandle(
   // the control channel so the supervisor runs its own bounded abnormal cleanup — we
   // NEVER process-group kill.
   try {
-    startedEvent = await withDeadline(startedPromise, deadlines.started, "started");
+    startedEvent = await withDeadline(startedPromise,
+      startupCleanup ? Math.min(deadlines.started, Math.max(0, startupCleanup.hardDeadlineAt - Date.now())) : deadlines.started,
+      "started", () => {
+        const error = new CodexLaunchError("started_deadline", "unconfirmed", undefined);
+        launchClassifications.set(error, "started_deadline");
+        return error;
+      });
   } catch (error) {
-    try { if (!control.destroyed) control.end(); } catch { /* cleanup error is separate from the primary failure */ }
-    stopLines();
-    throw error;
+    let verified = false;
+    let cleanupFailure: unknown;
+    const classification = classifyCodexLaunchFailure(error);
+    if (startupCleanup && classification === "started_deadline" && !failure &&
+      Date.now() < startupCleanup.hardDeadlineAt) {
+      // The rejected launch owns these drains until settlement. Count actual bytes
+      // independently; retain none. One overflow destroys both transports and forbids proof.
+      startupCleanupInFlight = true;
+      const maxBytes = 64 * 1024 * 1024;
+      for (const stream of [child.stdout, child.stderr]) {
+        if (!stream) { fail(new TrustedExecutionRefusal("startup cleanup transport unavailable")); continue; }
+        transportEnds.push(new Promise<void>((resolve) => {
+          if (stream.readableEnded) { resolve(); return; }
+          stream.once("end", resolve);
+          stream.once("close", () => {
+            if (!stream.readableEnded) fail(new TrustedExecutionRefusal("startup cleanup transport closed before EOF"));
+            resolve();
+          });
+        }));
+        let bytes = 0;
+        stream?.on("data", (chunk: Buffer | string) => {
+          bytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+          if (bytes > maxBytes) {
+            fail(new TrustedExecutionRefusal("startup cleanup output limit exceeded"), "output_limit");
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+          }
+        });
+        stream?.on("error", (cause: Error) => fail(new TrustedExecutionRefusal("startup cleanup transport failed", { cause })));
+        stream?.resume();
+      }
+      const outcome = await dispose(startupCleanup.hardDeadlineAt - Date.now());
+      if (!outcome.clean) cleanupFailure = failure ?? new TrustedExecutionRefusal("startup cleanup unconfirmed");
+      verified = outcome.clean && !failure && startedEvent !== undefined && Date.now() < startupCleanup.hardDeadlineAt;
+    }
+    try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* best effort */ }
+    if (!verified) {
+      abandoningStartup = true;
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      stopLines();
+    }
+    const rejected = new CodexLaunchError(failure ? classifyCodexLaunchFailure(failure) : classification,
+      verified ? "verified" : "unconfirmed", error, failure !== error ? failure ?? cleanupFailure : undefined);
+    launchClassifications.set(rejected, rejected.classification);
+    if (verified && startupCleanup) startupCleanupProofs.set(rejected, { authorization: startupCleanup, serial: ++startupCleanupSerial });
+    throw rejected;
   }
 
   const started = startedEvent;

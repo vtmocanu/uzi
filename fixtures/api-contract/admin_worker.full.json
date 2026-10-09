@@ -13,6 +13,8 @@
   "busy": true,
   "active_runs": 1,
   "max_concurrent_runs": 1,
+  "active_cross_checks": 1,
+  "max_cross_check_slots": 1,
   "reported_runs": [
     {
       "run_id": "x",

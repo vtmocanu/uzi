@@ -149,14 +149,18 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
 			}
 			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, workerID, releasedCaps)
 			countParams := store.CountOnlineWorkersClaimableForRunParams{RunID: runID,
-				HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}}
+				CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+				CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute)),
+				HeartbeatCutoff:          pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}}
 			count, err := fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, countParams)
 			if err != nil || count.Claimable != 0 {
 				t.Fatalf("released worker placement count=%d err=%v, want 0", count.Claimable, err)
 			}
 			params := store.ClaimRunParams{WorkerID: pgU(workerID), UserID: fx.userID,
-				AffinityCutoff:  pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
-				HeartbeatCutoff: countParams.HeartbeatCutoff, SpreadCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+				CrossCheckEvaluatedAt:    countParams.CrossCheckEvaluatedAt,
+				CrossCheckAffinityCutoff: countParams.CrossCheckAffinityCutoff,
+				AffinityCutoff:           pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+				HeartbeatCutoff:          countParams.HeartbeatCutoff, SpreadCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
 				WorkerProtocolCaps: releasedCaps, CapabilityAware: false}
 			if _, err := fx.q.ClaimRun(fx.ctx, params); !errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("released worker claimed cross-check lane with ordinary capability matching off: %v", err)

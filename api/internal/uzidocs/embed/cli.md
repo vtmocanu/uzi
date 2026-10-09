@@ -2108,6 +2108,22 @@ Workers page states that divergence when it exists.
 `-` is not a problem to fix. It is what a locally built image and an unstamped control
 plane both look like, which is most of a development setup.
 
+### Worker lane capacity
+
+`uzi worker list` and `uzi admin workers` show `RUN SLOTS` and
+`CROSS-CHECKS` separately, for example `1/1` and `1/1` for a lead and its
+checker on the same worker. An unadvertised cap reads `?` (including
+`0/?` when idle); an explicit disabled cap reads `0/0` when idle. Existing active
+checkers remain counted if the cap becomes zero or unknown after registration.
+The worker TUI and detail view also show both lanes, including during draining.
+Fleet run-slot totals remain run-lane totals.
+
+`--json` carries `active_runs` / `max_concurrent_runs` and
+`active_cross_checks` / `max_cross_check_slots` on both owner and admin
+worker DTOs. Dedicated checker occupancy is separate from run load; legacy
+plan checks claimed on ordinary slots still count as runs. Chat counts in
+neither lane. See [Cross-check slots](./worker-setup.md#cross-check-slots).
+
 ### Disk usage and checkpoint durability
 
 `uzi worker list` and `uzi admin workers` (the cross-user list) both carry a
@@ -2121,7 +2137,8 @@ worker, or no fresh report yet). The run id and cache bytes behind it ride
 `fleet.rundisk` [admin health](admin-health.md#the-checks) check's action
 points an admin at.
 
-The `RUNS` column of `uzi worker list` and `uzi admin workers` does not count
+The `RUNS` custody column of `uzi worker list` and `uzi admin workers` is
+separate from `RUN SLOTS` / `CROSS-CHECKS`. It does not count
 a run whose outcome the worker holds journaled but has not delivered to the api
 (a pending outcome) as running. Those show as `N pending outcome(s) (oldest
 <age>)` instead, so a worker stuck holding outcomes is visible at a glance.

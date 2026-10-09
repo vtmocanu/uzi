@@ -121,11 +121,14 @@ func (e interlockLiveDB) seedHeartbeatWorker(t *testing.T, protocolCaps []string
 // curated set, a recent heartbeat cutoff, capability_aware false so only the protocol clauses gate).
 func (e interlockLiveDB) claimableForRun(t *testing.T, runID uuid.UUID) int64 {
 	t.Helper()
+	now := time.Now()
 	n, err := e.q.CountOnlineWorkersClaimableForRun(e.ctx, store.CountOnlineWorkersClaimableForRunParams{
-		RunID:              runID,
-		HeartbeatCutoff:    pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
-		CapabilityAware:    false,
-		CodexCuratedModels: codexCuratedModelsSlice(),
+		RunID:                    runID,
+		HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
+		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+		CapabilityAware:          false,
+		CodexCuratedModels:       codexCuratedModelsSlice(),
 	})
 	if err != nil {
 		t.Fatalf("CountOnlineWorkersClaimableForRun: %v", err)

@@ -16,6 +16,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,
+    active_cross_checks: 0,
+    max_cross_check_slots: null,
     template_declared: null,
     template_reported: null,
     version: "0.11.0",
@@ -59,7 +61,7 @@ describe("WorkerCordonBadge", () => {
     expect(screen.getByText("cordoned")).toBeTruthy();
   });
 
-  describe("splits the label on active_runs, not busy", () => {
+  describe("splits the label on run and dedicated cross-check load, not busy", () => {
     it("reads 'draining' while it still holds runs", () => {
       render(<WorkerCordonBadge worker={aWorker({ draining_since: "2026-08-21T12:00:00Z", active_runs: 1 })} />);
       expect(screen.getByText("draining")).toBeTruthy();
@@ -85,7 +87,21 @@ describe("WorkerCordonBadge", () => {
     });
   });
 
-  describe("carries the Decision-4 title copy verbatim", () => {
+  it("keeps draining until the last dedicated cross-check finishes", () => {
+    const worker = aWorker({
+      draining_since: "2026-08-21T12:00:00Z", busy: true,
+      active_runs: 0, active_cross_checks: 1, max_cross_check_slots: 1,
+    });
+    const { rerender } = render(<WorkerCordonBadge worker={worker} />);
+    expect(screen.getByText("draining").title).toBe(
+      "Cordoned — finishing its current runs and cross-checks, not claiming new runs.",
+    );
+    rerender(<WorkerCordonBadge worker={{ ...worker, busy: false, active_cross_checks: 0 }} />);
+    expect(screen.getByText("cordoned")).toBeTruthy();
+    expect(screen.queryByText("draining")).toBeNull();
+  });
+
+  describe("carries the cordon title copy", () => {
     // jsdom reads the title ATTRIBUTE, which a browser/screenshot pass structurally
     // cannot: a native `title` tooltip is invisible until hover, so its VALUE — em dash
     // and all — is only ever checkable here, never in a visual pass (mirrors
@@ -93,7 +109,7 @@ describe("WorkerCordonBadge", () => {
     it("says it is finishing its current runs while draining", () => {
       render(<WorkerCordonBadge worker={aWorker({ draining_since: "2026-08-21T12:00:00Z", active_runs: 2 })} />);
       expect(screen.getByText("draining").getAttribute("title")).toBe(
-        "Cordoned — finishing its current runs, not claiming new ones.",
+        "Cordoned — finishing its current runs and cross-checks, not claiming new runs.",
       );
     });
 

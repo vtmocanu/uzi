@@ -24,7 +24,7 @@ func TestWorkersDemoFleet(t *testing.T) {
 		t.Fatal("demo healthy busy worker needs retained source and no owner decisions")
 	}
 	m := workersScene(true, "workers-list-120")
-	want := "workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 7 need attention"
+	want := "workers · 9 · 8 online · 5/12 run slots in use +1 ?cap · 0/? cross-checks · 1 holding · 1 draining · 7 need attention"
 	if got := stripANSI(m.workersSummary(120)); got != want {
 		t.Fatalf("summary %q", got)
 	}
@@ -91,9 +91,9 @@ func TestWorkersLegendHelpAndVersionBudget(t *testing.T) {
 	}
 	line := stripANSI(m.workerRowLine(r, true, 120, m.workerTableWidths(m.workers.rows, 120), time.Now()))
 	// Wide glyphs must fit the capped eighteen-column version cell, including its marker.
-	versionCell := strings.Repeat("界", 8) + "…✕"
+	versionCell := strings.Repeat("界", 7) + "…✕"
 	at := strings.Index(line, versionCell)
-	if at < 0 || visualWidth(line[:at]) != 86 || strings.Contains(line, strings.Repeat("界", 9)) {
+	if at < 0 || visualWidth(line[:at]) != 94 || strings.Contains(line, strings.Repeat("界", 9)) {
 		t.Fatalf("version cell moved or exceeded its visual budget: %q", line)
 	}
 	if strings.Contains(stripANSI(m.renderWorkers()), "fixed visual cue") {
@@ -210,7 +210,7 @@ func TestWorkersScenesContentAndBounds(t *testing.T) {
 			t.Run(name+map[bool]string{true: "/dark", false: "/light"}[dark], func(t *testing.T) {
 				m := workersScene(dark, name)
 				frame := stripANSI(m.View().Content)
-				for _, want := range []string{"workers", "slots in use", "need attention"} {
+				for _, want := range []string{"workers", "runs", "checks", "need attention"} {
 					if !strings.Contains(frame, want) {
 						t.Errorf("missing %q\n%s", want, frame)
 					}
@@ -716,9 +716,9 @@ func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
 		used, cap int
 		want      string
 	}{
-		{"unknown cap first", 1, 2, "workers · 2 · 2 online · 1/2 slots in use · 1 holding · 1 need attention"},
-		{"admission next", 12345, 12345, "workers · 2 · 2 online · 12345/12345 slots in use · 1 need attention"},
-		{"online last", 1234567890, 1234567890, "workers · 1234567890/1234567890 slots in use · 1 need attention"},
+		{"unknown cap first", 1, 2, "workers · 2 · 2 online · 1/2 run slots in use · 0/? cross-checks · 1 holding · 1 need attention"},
+		{"admission next", 12345, 12345, "workers · 2 · 2 online · 12345/12345 run slots in use · 0/? cross-checks · 1 need attention"},
+		{"online last", 1234567890, 1234567890, "workers · 1234567890/1234567890 runs · 0/? checks · 1 need attention"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := workersScene(true, "workers-list-80")

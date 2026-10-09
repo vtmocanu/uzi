@@ -126,6 +126,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		Busy:                 busy,
 		ActiveRuns:           activeRuns,
 		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
+		MaxCrossCheckSlots:   intPtrValue(w.MaxCrossCheckSlots),
 		// Seed reported_runs to a non-nil [] (PRD #1390 M2c): the DB overlay only runs on the
 		// list/patch surfaces, so this keeps every OTHER WorkerDTO producer (register, heartbeat,
 		// create, hosted-provision) marshaling an array rather than null.
@@ -194,6 +195,8 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		Busy:                     w.Busy,
 		ActiveRuns:               int(w.ActiveRuns),
 		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
+		ActiveCrossChecks:        int(w.ActiveCrossChecks),
+		MaxCrossCheckSlots:       intPtrValue(w.MaxCrossCheckSlots),
 		// Seeded to [] (PRD #1390 M2c); ListWorkers overlays the real snapshot rows after.
 		ReportedRuns:             []apitypes.WorkerReportedRunDTO{},
 		RunDisk:                  []apitypes.WorkerRunDiskDTO{},
@@ -339,6 +342,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 // per-user path does when its signal is nil.
 func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", cpVersion, pinnedWorkerVersion, now, apiStartedAt)
+	dto.ActiveCrossChecks = int(row.ActiveCrossChecks)
 	sig := rollSignalFromAdminRow(row)
 	if sig == nil {
 		return dto

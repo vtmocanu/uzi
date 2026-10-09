@@ -159,6 +159,13 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 	if reread.MaintenanceFenced {
 		return store.Run{}, false, nil
 	}
+	params.WorkerProtocolCaps = reread.ProtocolCapabilities
+	params.WorkerCaps = reread.Capabilities
+	params.WorkerIsolatedLane = reread.IsolatedLane
+	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
+	params.IsEphemeral = reread.Ephemeral
+	params.EphemeralRunID = reread.EphemeralRunID
+	params.IsDockerWorker = reread.DockerEnabled.Valid && reread.DockerEnabled.Bool
 	leased := s.ephemeralLease > 0 && reread.Ephemeral && reread.LeaseSince.Valid &&
 		reread.LeaseRepoID.Valid && reread.LeaseBranch.Valid
 	if !leased {
@@ -175,7 +182,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 	params.LeaseSince = reread.LeaseSince
 	params.LeaseRepoID = reread.LeaseRepoID
 	params.LeaseBranch = reread.LeaseBranch
-	params.ClaimantDraining = reread.DrainingSince.Valid
+	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
 	params.EphemeralRunID = reread.EphemeralRunID
 	at, err := s.claimLeaseAt(ctx, qtx)
 	if err != nil {
@@ -197,7 +204,9 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 		}
 		return store.Run{}, false, err
 	}
-	if run.ID != uuid.UUID(reread.EphemeralRunID.Bytes) {
+	// An own-parent child serves the existing binding on either the dedicated lane
+	// or the legacy run lane; only a lease follow-up rebinds the worker.
+	if run.ID != uuid.UUID(reread.EphemeralRunID.Bytes) && (run.Kind != "cross_check" || run.TargetRunID != reread.EphemeralRunID) {
 		if s.leaseClaimWindow != nil {
 			s.leaseClaimWindow()
 		}
@@ -241,6 +250,11 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	if params.Lane == "cross_check" {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+			return nil, err
+		}
+	}
 	qtx := store.New(tx)
 	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {

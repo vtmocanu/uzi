@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { workerRunBadge } from "./workerRuns";
+import { workerRunBadge, workerCrossCheckBadge } from "./workerRuns";
 
 type BadgeInput = Parameters<typeof workerRunBadge>[0];
 
 function w(over: Partial<BadgeInput> = {}): BadgeInput {
-  return { busy: false, active_runs: 0, max_concurrent_runs: null, ...over };
+  return { busy: false, active_runs: 0, max_concurrent_runs: null, max_cross_check_slots: null, ...over };
 }
 
 describe("workerRunBadge", () => {
@@ -54,6 +54,38 @@ describe("workerRunBadge", () => {
       label: "2/2 runs",
       tone: "warning",
       title: "Running 2 concurrent runs",
+    });
+  });
+});
+
+describe("dedicated cross-check capacity", () => {
+  it("shows cap-one runs when the dedicated lane is enabled", () => {
+    expect(workerRunBadge(w({ busy: true, active_runs: 1, max_concurrent_runs: 1, max_cross_check_slots: 1 }))?.label).toBe("1/1 runs");
+  });
+
+  it("uses live run count for an unknown run cap with an enabled lane", () => {
+    expect(workerRunBadge(w({ active_runs: 1, max_cross_check_slots: 1 }))?.label).toBe("1/1 runs");
+    expect(workerRunBadge(w({ busy: true, max_cross_check_slots: 1 }))).toBeNull();
+  });
+
+  it.each([null, 0, undefined])("hides disabled or unknown cross-check capacity %s", (cap) => {
+    expect(workerCrossCheckBadge({ active_cross_checks: 0, max_cross_check_slots: cap as number | null })).toBeNull();
+  });
+
+  it.each([null, 0])("keeps running checks visible after cap changes to %s", (cap) => {
+    expect(workerCrossCheckBadge({ active_cross_checks: 1, max_cross_check_slots: cap })?.label)
+      .toBe(`1/${cap ?? "?"} cross-checks`);
+  });
+
+  it("shows idle dedicated capacity in a neutral tone", () => {
+    expect(workerCrossCheckBadge({ active_cross_checks: 0, max_cross_check_slots: 1 })).toEqual({
+      label: "0/1 cross-checks", tone: "neutral", title: "Running 0 of 1 cross-check slots",
+    });
+  });
+
+  it("keeps dedicated load separate from run load", () => {
+    expect(workerCrossCheckBadge({ active_cross_checks: 2, max_cross_check_slots: 3 })).toEqual({
+      label: "2/3 cross-checks", tone: "warning", title: "Running 2 of 3 cross-check slots",
     });
   });
 });

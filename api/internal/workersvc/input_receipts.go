@@ -51,7 +51,7 @@ type InputReceiptResult struct {
 func receiptInactiveReason(run store.LockRunForInputReceiptRow, wkr store.Worker, generation int64) string {
 	switch {
 	case !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID || run.ClaimGeneration != generation,
-		terminalStatuses[run.Status], run.Status == "queued":
+		terminalStatuses[run.Status], run.Status == "queued", run.Kind == "cross_check" && run.ClaimGeneration == 0:
 		return ReceiptStale
 	case run.ClaimReleasedAt.Valid:
 		return ReceiptReleased
@@ -292,7 +292,7 @@ func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
 		return InputReceiptResult{}, ErrRunNotOwned
 	}
-	if !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID || run.ClaimGeneration != generation {
+	if !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID || run.ClaimGeneration != generation || (run.Kind == "cross_check" && run.ClaimGeneration == 0) {
 		return InputReceiptResult{Inputs: []InputDTO{}, Active: false, Reason: ReceiptStale}, nil
 	}
 	stamped, err := q.IncludeRunInputRows(ctx, store.IncludeRunInputRowsParams{RunID: runID, Ids: ids})

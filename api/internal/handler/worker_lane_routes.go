@@ -99,7 +99,7 @@ func laneWorkerRouteGuard(next http.Handler) http.Handler {
 			httpx.Error(w, http.StatusForbidden, "this route is not available to an isolated-lane worker")
 			return
 		}
-		if r.Method == http.MethodPost && path == "/runs/claim" && r.URL.Query().Get("lane") == "chat" {
+		if r.Method == http.MethodPost && path == "/runs/claim" && (r.URL.Query().Get("lane") == "chat" || r.URL.Query().Get("lane") == "cross_check") {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

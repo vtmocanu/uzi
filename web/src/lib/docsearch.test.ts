@@ -195,12 +195,12 @@ describe("searchIndex — mixed title-token + body-token snippet", () => {
 
 // searchDocs binds the pure core to the REAL bundled corpus, which is role-aware
 // (issue #75 M1): an operator-doc body term is searchable only in the admin
-// corpus. "reverse proxy" lives in configuration.md (audience: operator) and no
+// corpus. "API_TLS_ADDR" lives in configuration.md (audience: operator) and no
 // `audience: user` page.
 describe("searchDocs — role-aware corpus", () => {
   it("finds an operator-only body term for an admin but not a non-admin", () => {
-    const asAdmin = searchDocs("reverse proxy", true).map((r) => r.doc.slug);
+    const asAdmin = searchDocs("API_TLS_ADDR", true).map((r) => r.doc.slug);
     expect(asAdmin).toContain("configuration");
-    expect(searchDocs("reverse proxy", false).map((r) => r.doc.slug)).not.toContain("configuration");
+    expect(searchDocs("API_TLS_ADDR", false).map((r) => r.doc.slug)).not.toContain("configuration");
   });
 });

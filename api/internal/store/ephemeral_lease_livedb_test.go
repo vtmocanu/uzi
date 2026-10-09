@@ -772,8 +772,11 @@ func TestLeaseClockNowLiveDB(t *testing.T) {
 // provisioningFixture opts the fixture user in and returns the ids each provisioning trigger lists.
 func listedUnplaceable(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) map[uuid.UUID]bool {
 	fx.t.Helper()
-	rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
-		EphemeralLease: iv, MaxPerUser: maxPerUser, MaxRows: 50})
+	rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+		BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
+		EphemeralLease:        iv, MaxPerUser: maxPerUser, MaxRows: 50,
+		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute))})
 	if err != nil {
 		fx.t.Fatalf("ListUnplaceableQueuedRunsForEphemeral: %v", err)
 	}
@@ -786,8 +789,11 @@ func listedUnplaceable(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) m
 
 func listedSaturation(fx *fleetFixture, maxPerUser int32, iv pgtype.Interval) map[uuid.UUID]bool {
 	fx.t.Helper()
-	rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
-		SaturationDelay: leaseInterval(0), EphemeralLease: iv, MaxPerUser: maxPerUser, MaxRows: 50})
+	rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+		BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
+		SaturationDelay:       leaseInterval(0), EphemeralLease: iv, MaxPerUser: maxPerUser, MaxRows: 50,
+		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute))})
 	if err != nil {
 		fx.t.Fatalf("ListSaturationQueuedRunsForEphemeral: %v", err)
 	}
@@ -815,10 +821,12 @@ func listedIsolated(fx *fleetFixture, maxPerUser int32) map[uuid.UUID]bool {
 func claimableCount(fx *fleetFixture, run uuid.UUID, iv pgtype.Interval) int64 {
 	fx.t.Helper()
 	n, err := fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, store.CountOnlineWorkersClaimableForRunParams{
-		RunID:               run,
-		HeartbeatCutoff:     pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
-		DockerRepoAllowlist: []uuid.UUID{fx.repoID},
-		EphemeralLease:      iv,
+		RunID:                    run,
+		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute)),
+		HeartbeatCutoff:          pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
+		DockerRepoAllowlist:      []uuid.UUID{fx.repoID},
+		EphemeralLease:           iv,
 	})
 	if err != nil {
 		fx.t.Fatalf("CountOnlineWorkersClaimableForRun: %v", err)

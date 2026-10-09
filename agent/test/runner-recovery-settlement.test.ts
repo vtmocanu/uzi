@@ -760,6 +760,7 @@ describe("RunRunner — settlement promotion on every terminal path (issue #1582
  *  call's signal aborts (the "hanging settle" case). */
 class FakeLiveSettleClient extends FakeSettleClient {
   liveCalls: Array<{ runId: string; holdId: string; req: RecoveryLiveSettleRequest }> = [];
+  liveSignals: Array<AbortSignal | undefined> = [];
   liveAnswer: (holdId: string) => RecoverySettleResponse | Error | "hang" = () => new Error("no live answer configured");
   async settleRecoveryHoldLive(
     runId: string,
@@ -768,6 +769,7 @@ class FakeLiveSettleClient extends FakeSettleClient {
     signal?: AbortSignal,
   ): Promise<RecoverySettleResponse> {
     this.liveCalls.push({ runId, holdId, req });
+    this.liveSignals.push(signal);
     const a = this.liveAnswer(holdId);
     if (a === "hang") {
       return new Promise((_resolve, reject) => {
@@ -1161,17 +1163,22 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       await r.settlement.put(adoptedRecord(r, HOLD_A));
       r.settleClient.liveAnswer = () => "hang";
       const flight = liveFlight();
-      const t0 = Date.now();
       assert.equal(await publish(r, flight, PUBLISHED_OK), true);
-      assert.ok(Date.now() - t0 < 1_000, "the publish returned without waiting on the settle");
       await Promise.all(r.observed);
       // The send is (or will shortly be) in flight and hangs; the run is not waiting on it.
       for (let i = 0; i < 100 && r.settleClient.liveCalls.length === 0; i++) await new Promise((res) => setTimeout(res, 10));
       assert.equal(r.settleClient.liveCalls.length, 1, "the live settle was sent in the background");
-      const t1 = Date.now();
+      assert.equal(r.settled.length, 1, "the live settlement promise was captured");
+      let settlementCompleted = false;
+      const completion = r.settled[0]!.then(() => { settlementCompleted = true; });
+      await Promise.resolve();
+      assert.equal(settlementCompleted, false, "the publish returned while the live settlement remained pending");
       flight.cancel.abort();
-      await Promise.all(r.settled);
-      assert.ok(Date.now() - t1 < 1_000, "the flight's cancel signal ends the hanging settle");
+      const rpcSignal = r.settleClient.liveSignals[0];
+      assert.ok(rpcSignal?.aborted, "the flight cancellation aborts the live RPC signal");
+      assert.equal(rpcSignal.reason, flight.cancel.signal.reason, "the live RPC carries the flight cancellation reason");
+      await completion;
+      assert.equal(settlementCompleted, true, "the flight's cancel signal ends the hanging settle");
       const [rec] = await r.settlement.listRun(RUN_ID);
       assert.deepEqual(
         [rec!.state, rec!.live?.sent, rec!.live?.attempts],

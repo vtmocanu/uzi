@@ -261,6 +261,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	for _, item := range attention {
 		lines = append(lines, "  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnDetail, width)))
 	}
+	lines = append(lines, "", m.pal.title.Render("capacity"), "  "+workerSlots(w)+" runs · "+workerCrossCheckSlots(w)+" cross-checks")
 	lines = append(lines, "", m.pal.title.Render("reported runs")+m.pal.faint.Render("  api active_runs ")+itoa(w.ActiveRuns)+m.pal.faint.Render(" / cap ")+strings.Split(workerSlots(w), "/")[1]+m.pal.faint.Render(" (run lane)"))
 	selected := 0
 	if len(w.ReportedRuns) == 0 {

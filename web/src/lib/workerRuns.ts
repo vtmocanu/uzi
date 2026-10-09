@@ -1,36 +1,25 @@
-// Pure, framework-free worker run-load badge logic (PRD #42 Decision 10). Kept out
-// of WorkersSettings.tsx / RunsList.tsx so the "N/M runs" mapping is unit-tested in
-// isolation (workerRuns.test.ts), the same split runBadge.ts / pipelineBadge.ts use.
-
+// Shared capacity badge logic for the run and dedicated cross-check lanes.
 import type { Worker } from "./api";
 import type { BadgeTone } from "./runBadge";
 
-// WorkerRunBadge is the resolved run-load pill for a worker row, or null when the
-// worker is idle and advertises no cap above 1 (render nothing, as before PRD #42).
 export interface WorkerRunBadge {
   label: string;
   tone: BadgeTone;
   title: string;
 }
 
-// workerRunBadge decides how a worker's active-run load renders. Below the
-// concurrency threshold — at most one active run AND no advertised cap above 1 — it
-// stays exactly the legacy rendering: a "busy" pill when it holds a run, nothing when
-// idle. Once the worker runs more than one run OR advertises a cap above 1, it shows
-// the "N/M runs" count so saturation is visible. M is the advertised cap; when the
-// worker advertises none (an older image, or before the M2 agent sends it) it falls
-// back to the active count, so the badge never shows a meaningless "N/null".
+// Lane-aware workers show run capacity even at cap one. Older workers keep the
+// legacy busy pill below the concurrency threshold; unknown caps use live load.
 export function workerRunBadge(
-  w: Pick<Worker, "busy" | "active_runs" | "max_concurrent_runs">,
+  w: Pick<Worker, "busy" | "active_runs" | "max_concurrent_runs" | "max_cross_check_slots">,
 ): WorkerRunBadge | null {
   const cap = w.max_concurrent_runs;
   const active = w.active_runs;
-  if (active > 1 || (cap != null && cap > 1)) {
+  const laneOn = w.max_cross_check_slots != null && w.max_cross_check_slots > 0;
+  if (active > 1 || (cap != null && cap > 1) || (laneOn && (cap != null || active > 0))) {
     const denom = cap ?? active;
     return {
       label: `${active}/${denom} runs`,
-      // Amber only while actually running; an idle worker advertising a cap (e.g.
-      // "0/2 runs") reads as calm capacity, not a warning.
       tone: active > 0 ? "warning" : "neutral",
       title:
         cap != null
@@ -38,6 +27,21 @@ export function workerRunBadge(
           : `Running ${active} concurrent runs`,
     };
   }
-  if (w.busy) return { label: "busy", tone: "warning", title: "Holds an active run" };
+  if (w.busy && !laneOn) return { label: "busy", tone: "warning", title: "Holds an active run" };
   return null;
+}
+
+export function workerCrossCheckBadge(
+  w: Pick<Worker, "active_cross_checks" | "max_cross_check_slots">,
+): WorkerRunBadge | null {
+  const cap = w.max_cross_check_slots;
+  const active = w.active_cross_checks;
+  if ((cap == null || cap <= 0) && active === 0) return null;
+  return {
+    label: `${active}/${cap ?? "?"} cross-checks`,
+    tone: active > 0 ? "warning" : "neutral",
+    title: cap == null
+      ? `Running ${active} cross-checks; slot capacity is unadvertised`
+      : `Running ${active} of ${cap} cross-check slots`,
+  };
 }

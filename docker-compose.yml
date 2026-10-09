@@ -377,6 +377,8 @@ services:
       WORKER_MEMORY_GUARD_REARM_MS: ${WORKER_MEMORY_GUARD_REARM_MS:-}
       WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS: ${WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS:-}
       WORKER_MEMORY_GUARD_MAX_INTERVENTIONS: ${WORKER_MEMORY_GUARD_MAX_INTERVENTIONS:-}
+      # Per-worker cross-check slots (0 disables cross-checks); accepted range 0..16.
+      WORKER_CROSS_CHECK_SLOTS: ${WORKER_CROSS_CHECK_SLOTS:-1}
       # PRD #83 M2: the DinD sidecar socket the worker probes. Unset by DEFAULT (empty):
       # a plain `--profile agent` worker then does ONE fast probe of the default path and
       # NEVER blocks. When you run `--profile agent-docker`, SET this (to

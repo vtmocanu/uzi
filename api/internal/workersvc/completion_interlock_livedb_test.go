@@ -152,15 +152,17 @@ func (e interlockLiveDB) runStatus(t *testing.T, runID uuid.UUID) string {
 func (e interlockLiveDB) claimParams(workerID uuid.UUID, protocolCaps []string, capAware bool) store.ClaimRunParams {
 	now := time.Now()
 	return store.ClaimRunParams{
-		WorkerID:              pgtype.UUID{Bytes: workerID, Valid: true},
-		UserID:                e.userID,
-		HeartbeatCutoff:       pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
-		AffinityCutoff:        pgtype.Timestamptz{Time: now.Add(-25 * time.Minute), Valid: true},
-		SpreadCutoff:          pgtype.Timestamptz{Time: now.Add(-9 * time.Second), Valid: true},
-		BackgroundGraceCutoff: pgtype.Timestamptz{Time: now.Add(-15 * time.Minute), Valid: true},
-		WorkerCaps:            []string{},
-		CapabilityAware:       capAware,
-		WorkerProtocolCaps:    protocolCaps,
+		WorkerID:                 pgtype.UUID{Bytes: workerID, Valid: true},
+		UserID:                   e.userID,
+		HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
+		AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-25 * time.Minute), Valid: true},
+		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+		SpreadCutoff:             pgtype.Timestamptz{Time: now.Add(-9 * time.Second), Valid: true},
+		BackgroundGraceCutoff:    pgtype.Timestamptz{Time: now.Add(-15 * time.Minute), Valid: true},
+		WorkerCaps:               []string{},
+		CapabilityAware:          capAware,
+		WorkerProtocolCaps:       protocolCaps,
 		// PRD #1551 M4 (D6): the curated Codex vocabulary, EXACTLY as production passes it
 		// (codexCuratedModelsSlice). It is load-bearing here, not decorative: the custom-Codex
 		// clause's `effective_root = ANY(@codex_curated_models)` relies on a NON-empty array so a

@@ -67,6 +67,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     hosted_size: null,
     active_runs: 0,
     max_concurrent_runs: null,
+    active_cross_checks: 0,
+    max_cross_check_slots: null,
     template_declared: null,
     template_reported: "base",
     version: "0.11.99",

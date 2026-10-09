@@ -14,6 +14,7 @@ import { RUN_KINDS, type RunKind } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
+import { CheckpointChildStartupTimeoutError } from "./harness.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
@@ -312,8 +313,11 @@ class GitBoundaryAbortError extends Error {
 /** A checkpoint publication used its cooperative budget. The caller may skip
  * only after every started child has settled under the held permit. */
 export class CheckpointSoftDeadlineError extends Error {
-  constructor() {
-    super("checkpoint publication soft deadline exceeded");
+  constructor(cause?: CheckpointChildStartupTimeoutError) {
+    super(cause === undefined
+      ? "checkpoint publication soft deadline exceeded"
+      : "checkpoint publication soft deadline exceeded (started_deadline; cleanup verified)",
+    cause === undefined ? undefined : { cause });
     this.name = "AbortError";
   }
 }
@@ -7616,6 +7620,13 @@ export class GitCache {
       return new GitBoundaryAbortError(message, cause);
     }
     if (cause instanceof CheckpointSoftDeadlineError) return cause;
+    if (cause instanceof CheckpointChildStartupTimeoutError) {
+      if (scope?.softDeadlineAt === undefined) return cause;
+      this.log.warn("checkpoint child startup timeout recovered", {
+        classification: "started_deadline", cleanup: "verified",
+      });
+      return new CheckpointSoftDeadlineError(cause);
+    }
     if (scope?.softSignal?.aborted) return new CheckpointSoftDeadlineError();
     if (cause instanceof GitBoundaryAbortError) return cause;
     // Foreign AbortError messages can carry remote text. Preserve the abort type and
@@ -7661,10 +7672,15 @@ export class GitCache {
     // spawn, so this check is early; TickSpawner.spawnWith and launchCodexEffectRoot repeat it
     // synchronously immediately before their own spawn call.
     assertNoCredentialedGitWhileQuarantined(options.env);
-    const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
-      ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
-      ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
-    });
+    let process: BoundaryProcessHandle;
+    try {
+      process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
+        ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
+        ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
+      });
+    } catch (cause) {
+      throw this.boundaryAbortError(cause) ?? cause;
+    }
     process.stdin?.on("error", () => undefined);
     process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
@@ -7855,14 +7871,19 @@ export class GitCache {
       const childTimeout = remainingSoft === undefined
         ? opts.timeoutMs
         : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
-      const process = await boundary.spawn({
-        argv: [GIT_BIN, ...withDir(cwd, args)],
-        cwd,
-        env,
-        identity: "worker_pat",
-        ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
-        ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
-      });
+      let process: BoundaryProcessHandle;
+      try {
+        process = await boundary.spawn({
+          argv: [GIT_BIN, ...withDir(cwd, args)],
+          cwd,
+          env,
+          identity: "worker_pat",
+          ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
+          ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
+        });
+      } catch (cause) {
+        throw this.boundaryAbortError(cause) ?? cause;
+      }
       if (!process.stdout) throw new Error("supervised git process has no stdout");
       const stderrCap = opts.stderrMaxBytes ?? GIT_MAX_BUFFER;
       const stderrChunks: Buffer[] = [];

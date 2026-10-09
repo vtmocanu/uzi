@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -255,6 +256,8 @@ func TestCrossCheckRoundsPinsFleetPlacementLiveDB(t *testing.T) {
 				env.exec("UPDATE workers SET maintenance_fenced=true WHERE id=$1", w.ID)
 			case "round2 maintenance requested":
 				env.exec("UPDATE workers SET maintenance_phase='requested' WHERE id=$1", w.ID)
+				// Test refusal of new foreign work, rather than draining this worker's pinned child.
+				env.exec("UPDATE runs SET worker_id=NULL WHERE id=$1 AND status='queued'", uuid.UUID(cc.CheckerRunID.Bytes))
 			case "round2 runtime missing":
 				caps = []string{capability.CrossCheckV1, capability.CrossCheckRoundsV1, capability.CrossCheckPinsV1, capability.CodexCustomModelV1, capability.CodexHarnessV1}
 			}
@@ -265,8 +268,11 @@ func TestCrossCheckRoundsPinsFleetPlacementLiveDB(t *testing.T) {
 			if n := e.claimableForRun(t, child); n != tc.want {
 				t.Fatalf("claimable=%d want=%d", n, tc.want)
 			}
+			now := time.Now()
 			unplaceable, err := env.q.ListUnplaceableQueuedRunsForEphemeral(env.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
-				CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000})
+				CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+				CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+				CodexCuratedModels:       codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -281,7 +287,9 @@ func TestCrossCheckRoundsPinsFleetPlacementLiveDB(t *testing.T) {
 			// distinct from saturation even for the combined protocol requirements.
 			env.exec("UPDATE workers SET max_concurrent_runs=1 WHERE id=$1", w.ID)
 			saturated, err := env.q.ListSaturationQueuedRunsForEphemeral(env.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
-				CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true}, SaturationDelay: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000})
+				CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+				CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+				CodexCuratedModels:       codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true}, SaturationDelay: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000})
 			if err != nil {
 				t.Fatal(err)
 			}

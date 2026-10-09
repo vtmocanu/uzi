@@ -329,6 +329,57 @@ for (const memoryGuard of [undefined, { enabled: false as const }, settings]) {
   });
 }
 
+test("memory-enabled worker advertises both protocols and joins the cross-check loop on shutdown", async () => {
+  const cfg = config();
+  cfg.crossCheckSlots = 1;
+  const entered = deferred();
+  const release = deferred();
+  let advertised: string[] = [];
+  let slots: number | undefined;
+  let checks = 0;
+  const f = rig({
+    register: async (_name: string, _template: string, _max: number, _caps: string[],
+      caps: string[], _snapshot: unknown, capacity: number) => {
+      advertised = caps;
+      slots = capacity;
+      return { worker_id: workerId };
+    },
+    claimCrossCheck: async () => {
+      checks++;
+      entered.resolve();
+      await release.promise;
+      return null;
+    },
+  });
+  const controller = new AbortController();
+  const worker = build(cfg, f.client, f.memory);
+  let settled = false;
+  const done = worker.run(controller.signal).finally(() => { settled = true; });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bounded = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("cross-check loop did not enter within 2s")), 2000);
+  });
+  try {
+    await Promise.race([entered.promise, bounded]);
+    assert.equal(slots, 1);
+    assert.ok(advertised.includes("worker_memory_pressure_v1"));
+    assert.ok(advertised.includes("cross_check_lane_v1"));
+    controller.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(f.client.memoryIncarnation, undefined);
+    assert.equal(settled, false, "shutdown joins the in-flight cross-check claim");
+    release.resolve();
+    await Promise.race([done, bounded]);
+    assert.equal(checks, 1, "one boot gate starts one cross-check loop");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    controller.abort();
+    release.resolve();
+    await done;
+    await f.memory.stop();
+  }
+});
+
 test("revocation during register prevents its late response from restoring client memory authority", async (t) => {
   const gate = deferred();
   t.mock.method(globalThis, "fetch", async () => {
