@@ -324,7 +324,7 @@ hosted workers, no Slack). Neither is ever folded into, or displayed as, `ok`.
 
 ### Codex price coverage
 
-`pricing.codex` ([PRD #2560](../prds/2560-pricing-freshness.md)) is a
+`pricing.codex` ([PRD #2560](../prds/done/2560-pricing-freshness.md)) is a
 read-only coverage check, not a rate fetch or price-freshness verification.
 It looks at Codex `run_usage` rows whose `updated_at` is within the last
 seven days, including the cutoff. That timestamp is the last usage fold,

@@ -1,6 +1,6 @@
 # PRD #2560: Price-table freshness reminders and Codex price coverage
 
-**Status**: Implementation complete; final repository gate on the completion records is pending after commit; the weekly maintainer-local workflow remains out of scope and unshipped. Child 2 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2559 (API-equivalent cost for Codex subscription runs); they overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`.
+**Status**: Complete (in-scope M1 and M2). The weekly maintainer-local workflow remains out of scope and unshipped. Child 2 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2559 (API-equivalent cost for Codex subscription runs); they overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`.
 
 Planning facts were read at `main` `140b5c767`. External facts were checked by the maintainer on 2026-10-09 and are recorded here, because the implementing worker has no open-web access.
 
@@ -125,8 +125,8 @@ Acceptance: example 4; `uzi admin health --all` lists the check; `task gate:api`
 ## Completion and verification record
 
 All functional work in M1 and M2 is complete. The following direct evidence
-was supplied and verified by the lead; full gates were not rerun for the final
-serial documentation unit.
+was supplied and verified by the lead. The final documentation unit also
+passed repository, docs and embedded-mirror checks at `5b00e197`.
 
 - [x] M1 completed at `2c5bc9e9`: canonical JSON and API mirror, validation,
   sync and byte-equality guard, coverage helpers, freshness nudge and docs.
@@ -161,10 +161,10 @@ serial documentation unit.
   failed as expected.
 - [x] Final M2 documentation and records cover operator behavior, price-update
   guidance, instance scope, the human coverage decision and the Unreleased
-  entry; the PRD will move to prds/done after final validation.
-- [ ] **Pending lead validation:** the final repository gate on these records
-  after commit. M1 repository validation passed; it is not evidence that this
-  final M2 records gate has run.
+  entry; the completed PRD is filed under prds/done.
+- [x] Final M2 records validation at `5b00e197`: `task gate:repo`,
+  `task check-docs:web` and uncached `TestEmbeddedDocsMatchSource` passed
+  (log suffixes bFjUKo, FpLdCp and wGWunB, each EXIT=0).
 - [ ] **Out of scope, unshipped:** weekly maintainer-local workflow follow-up,
   including its bot-owned issue lifecycle. No workflow file was changed.
   The other exclusions above remain out of scope.

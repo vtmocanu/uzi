@@ -2211,7 +2211,7 @@ release price table. `codexprice.PricedModels` filters the usage query and
 A ten-minute per-replica cache covers successful reads and failures. Workers price from their own copy; a roll or worker image tag
 override can produce accepted temporary skew. This read-only check fetches
 no rates and does not explain individual run costs. See
-[PRD #2560](prds/2560-pricing-freshness.md) for the decisions and
+[PRD #2560](prds/done/2560-pricing-freshness.md) for the decisions and
 [Codex price coverage](docs/admin-health.md#codex-price-coverage) for the
 observation window, evidence bounds and failure behavior.
 
