@@ -2,6 +2,7 @@ package codexprice
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"reflect"
@@ -248,6 +249,85 @@ func TestExactModelKeysRawUnicode(t *testing.T) {
 			_, err := loadPricing([]byte(strings.ReplaceAll(fields[2], "@ROW@", string(rowBytes))))
 			if (err == nil) != (fields[1] == "accept") {
 				t.Fatalf("%s: %v", fields[1], err)
+			}
+		})
+	}
+}
+
+func TestRawUTF8Rejection(t *testing.T) {
+	suite, err := os.ReadFile("../../../scripts/pricing-freshness.test.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus := strings.Split(strings.Split(string(suite), "cat <<'RAW_UTF8_FIXTURES'\n")[1], "\nRAW_UTF8_FIXTURES")[0]
+	var canonical map[string]any
+	if err := json.Unmarshal(canonicalBytes, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	row := canonical["models"].(map[string]any)["gpt-6-astra"].(map[string]any)
+	rowBytes, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row["promo_review_date"] = "2026-01-01"
+	expiredBytes, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := table
+	t.Cleanup(func() { table = original })
+	// Fixed corpus and four placements; failures are reported independently.
+	for _, line := range strings.Split(corpus, "\n") {
+		fields := strings.Split(line, "|")
+		t.Run(fields[0], func(t *testing.T) {
+			raw, err := hex.DecodeString(fields[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefix := `{"version":"fixture","input_tier_threshold_tokens":1,`
+			placements := [][2]string{
+				{`"models":{"`, `":` + string(rowBytes) + `,"�":` + string(expiredBytes) + "}}"},
+				{`"models":{"�":` + string(expiredBytes) + `,"`, `":` + string(rowBytes) + "}}"},
+				{`"version":"`, `","version":"fixture","models":{"model":` + string(rowBytes) + "}}"},
+				{`"models":{"discard":{"text":"`, `"}},"models":{"model":` + string(rowBytes) + "}}"},
+			}
+			for i, placement := range placements {
+				data := append([]byte(prefix+placement[0]), raw...)
+				data = append(data, []byte(placement[1])...)
+				loaded, err := loadPricing(data)
+				if fields[1] == "reject" {
+					if err == nil || !strings.Contains(err.Error(), "UTF-8") {
+						t.Errorf("raw UTF8 rejection placement %d: %v", i, err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					table = loaded
+					if i < 2 {
+						want := Priced
+						if string(raw) == "�" && i == 0 {
+							want = PromoExpired
+						}
+						if Coverage(string(raw), time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) != want {
+							t.Errorf("lost exact key %x", raw)
+						}
+						replacementWant := PromoExpired
+						if string(raw) == "�" && i == 1 {
+							replacementWant = Priced
+						}
+						if Coverage("�", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) != replacementWant {
+							t.Error("lost legitimate UFFFD coverage")
+						}
+						wantCount := 2
+						if string(raw) == "�" {
+							wantCount = 1
+						}
+						if len(loaded) != wantCount {
+							t.Errorf("unexpected keys: %v", loaded)
+						}
+					}
+				}
 			}
 		})
 	}

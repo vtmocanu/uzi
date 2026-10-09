@@ -179,7 +179,7 @@ for (const [name, path] of [
   });
 }
 import { priceCodexResponse } from "../src/codex/codex-pricing.js";
-import { validateCodexPricing } from "../src/codex/codex-pricing-validation.js";
+import { validateCodexPricing, validateCodexPricingBytes } from "../src/codex/codex-pricing-validation.js";
 import table from "../src/codex/codex-pricing.json" with { type: "json" };
 
 it("inherited object keys are unknown models", () => {
@@ -215,6 +215,61 @@ it("ExactModelKeys: raw Unicode is checked before module validation", async () =
       else {
         assert.notEqual(child.status, 0, name);
         if (name !== "two values") assert.match(child.stderr, /CodexPricingValidationError/, name);
+      }
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+it("raw UTF8 rejection occurs before replacement decoding at actual module load", async () => {
+  const suite = await readFile(resolve(root, "scripts/pricing-freshness.test.sh"), "utf8");
+  const corpus = suite.split("cat <<'RAW_UTF8_FIXTURES'\n")[1]!.split("\nRAW_UTF8_FIXTURES")[0]!;
+  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-bytes-"));
+  try {
+    for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
+      await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
+    }
+    await writeFile(resolve(scratch, "package.json"), '{"type":"module"}');
+    const row = JSON.stringify({ ...table.models["gpt-6-astra"], low: { ...table.models["gpt-6-astra"]!.low, output: 2 } });
+    const replacementRow = JSON.stringify({ ...table.models["gpt-6-astra"], low: { ...table.models["gpt-6-astra"]!.low, output: 1 } });
+    const prefix = '{"version":"fixture","input_tier_threshold_tokens":1,';
+    // Fixed corpus and four independent placements; each load has a 10-second cap.
+    // A failed assertion stops the test, with scratch removed by finally.
+    for (const line of corpus.split("\n")) {
+      const [name, verdict, hex] = line.split("|");
+      const bytes = Buffer.from(hex!, "hex");
+      const placements = [
+        ['"models":{"', '":' + row + ',"�":' + replacementRow + '}}'],
+        ['"models":{"�":' + replacementRow + ',"', '":' + row + '}}'],
+        ['"version":"', '","version":"fixture","models":{"model":' + row + '}}'],
+        ['"models":{"discard":{"text":"', '"}},"models":{"model":' + row + '}}'],
+      ];
+      for (const [index, [before, after]] of placements.entries()) {
+        const raw = Buffer.concat([Buffer.from(prefix + before), bytes, Buffer.from(after!)]);
+        if (verdict === "accept") assert.doesNotThrow(() => validateCodexPricingBytes(raw), name);
+        else assert.throws(() => validateCodexPricingBytes(raw), /CodexPricingValidationError: table:.*UTF-8/, name);
+        await writeFile(resolve(scratch, "codex-pricing.json"), raw);
+        const key = bytes.toString("utf8");
+        const expectations = index < 2
+          ? [[key, key === "�" && index === 0 ? 1 : 2], ["�", key === "�" && index === 1 ? 2 : 1]]
+          : [["model", 2]];
+        await writeFile(resolve(scratch, "check.ts"), [
+          'import assert from "node:assert/strict";',
+          'import { priceCodexResponse } from "./codex-pricing.js";',
+          'const usage = {inputTokens:0,cachedInputTokens:0,cacheWriteInputTokens:0,outputTokens:1000000,reasoningOutputTokens:0,totalTokens:1000000};',
+          'for (const [key, expected] of ' + JSON.stringify(expectations) + ') {',
+          'assert.equal(priceCodexResponse(key, usage, new Date("2026-01-01")), expected); }',
+        ].join("\n"));
+        const child = spawnSync(process.execPath, ["--import", "tsx", resolve(scratch, "check.ts")], {
+          cwd: resolve(root, "agent"), encoding: "utf8", timeout: 10000,
+        });
+        assert.equal(child.error, undefined, name);
+        if (verdict === "accept") assert.equal(child.status, 0, name + child.stderr);
+        else {
+          assert.notEqual(child.status, 0, "raw UTF8 rejection: " + name);
+          assert.match(child.stderr, /CodexPricingValidationError: table:.*UTF-8/, name);
+        }
       }
     }
   } finally {

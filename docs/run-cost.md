@@ -153,10 +153,11 @@ rates, model rows or pricing rules change and `AnthropicPriceFetchedAt`
 when the official pages are checked. Moving data into JSON does not
 re-verify it: the recorded dates retain their original provenance.
 
-Codex pricing requires every JSON string to contain well-formed Unicode,
-rejecting unpaired surrogate escapes even in overwritten values before
-decoding; schema validation then checks final decoded values, with ordinary
-duplicate fields retaining last-key-wins semantics.
+Codex pricing requires valid UTF-8 bytes and every JSON string to contain
+well-formed Unicode, rejecting malformed byte sequences and unpaired
+surrogate escapes even in overwritten values before replacement decoding.
+Schema validation then checks final decoded values, with ordinary duplicate
+fields retaining last-key-wins semantics.
 
 After a Codex edit, run `task codex-pricing:sync` and include both JSON files
 in the change. Run `task nudge:pricing` to review freshness, or

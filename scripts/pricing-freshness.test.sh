@@ -117,6 +117,66 @@ overwritten bad row|accept|{"version":"fixture","input_tier_threshold_tokens":1,
 overwritten row overflow|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":{"output":1e400},"model":@ROW@}}
 UNICODE_FIXTURES
 }
+# Shared byte corpus: hex is printable source; consumers assemble raw bytes in scratch.
+raw_utf8_fixtures() {
+  cat <<'RAW_UTF8_FIXTURES'
+ff|reject|ff
+overlong two|reject|c0af
+overlong three|reject|e080af
+overlong four|reject|f08080af
+surrogate|reject|eda080
+out of range f4|reject|f4908080
+out of range f5|reject|f5808080
+stray 80|reject|80
+stray bf|reject|bf
+truncated two|reject|c2
+truncated three|reject|e282
+truncated four|reject|f09f98
+ASCII|accept|41
+80|accept|c280
+7ff|accept|dfbf
+800|accept|e0a080
+d7ff|accept|ed9fbf
+e000|accept|ee8080
+10000|accept|f0908080
+10ffff|accept|f48fbfbf
+emoji|accept|f09f9880
+UFFFD|accept|efbfbd
+RAW_UTF8_FIXTURES
+}
+# Four placements per byte sequence; finite corpus, first failure stops the suite.
+base
+byte_row=$(jq -c '.models.model' "$scratch/base.json")
+expired_row=$(jq -c '.models.model + {promo_review_date:"2026-01-01"}' "$scratch/base.json")
+while IFS='|' read -r name verdict hex; do
+  bytes=
+  for ((i=0; i<${#hex}; i+=2)); do bytes+="\\x${hex:i:2}"; done
+  for placement in first last version subtree; do
+    {
+      printf '{"version":"fixture","input_tier_threshold_tokens":1,'
+      case "$placement" in
+        first) printf '"models":{"%b":%s,"�":%s}}' "$bytes" "$byte_row" "$expired_row" ;;
+        last) printf '"models":{"�":%s,"%b":%s}}' "$expired_row" "$bytes" "$byte_row" ;;
+        version) printf '"version":"%b","version":"fixture","models":{"model":%s}}' "$bytes" "$byte_row" ;;
+        subtree) printf '"models":{"discard":{"text":"%b"}},"models":{"model":%s}}' "$bytes" "$byte_row" ;;
+      esac
+    } >"$UZI_PRICING_TEST_CODEX_PATH"
+    for mode in text json; do
+      args=(--today 2026-01-01)
+      [[ "$mode" == text ]] || args+=(--json)
+      if [[ "$verdict" == reject ]]; then
+        bad "${args[@]}"
+        grep -qF 'UTF-8' "$scratch/err" || die "raw UTF8 rejection: $name/$placement/$mode"
+      else
+        ok "${args[@]}"
+        if [[ "$placement" == first && "$mode" == json ]]; then
+          jq -e '.[] | select(.subject == "�" and .reason == "promotional review date passed")' "$scratch/out" >/dev/null ||
+            die "legitimate UFFFD promotion lost: $name"
+        fi
+      fi
+    done
+  done
+done < <(raw_utf8_fixtures)
 # Exercise the documented Task command under the repo's default output mode.
 base
 anthropic 2026-02-01 https://example.com/anthropic
@@ -313,6 +373,13 @@ bad --today --json
 bad --json extra
 UZI_PRICING_TEST_CODEX_PATH="$scratch/missing" bad --json
 UZI_PRICING_TEST_ANTHROPIC_PATH="$scratch/missing" bad --json
+# A present but failing od must fail closed before jq, in both output modes.
+base
+mkdir -p "$scratch/bin"
+printf '#!/bin/sh\nexit 1\n' >"$scratch/bin/od"
+chmod +x "$scratch/bin/od"
+PATH="$root/$scratch/bin:$PATH" bad --today 2026-01-01
+PATH="$root/$scratch/bin:$PATH" bad --today 2026-01-01 --json
 # UTC normalization applies to date math under arbitrary caller timezones.
 for zone in UTC Pacific/Honolulu Pacific/Kiritimati; do
   TZ="$zone" ok --today 2026-02-01 --json

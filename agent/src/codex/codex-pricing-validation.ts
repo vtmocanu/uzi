@@ -81,8 +81,19 @@ function unicode(value: string, path: string): void {
   }
 }
 
+/** Reject malformed bytes before any decoder can replace them or collapse model keys. */
+export function validateCodexPricingBytes(bytes: Uint8Array): void {
+  let raw: string;
+  try {
+    raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    fail("table", "expected valid UTF-8 bytes");
+  }
+  validateCodexPricingJSONStrings(raw);
+}
+
 /** Pricing-local lexical check: native JSON parsing still owns syntax and duplicates. */
-export function validateCodexPricingJSONStrings(raw: string): void {
+function validateCodexPricingJSONStrings(raw: string): void {
   for (const match of raw.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
     // Consume escaped backslashes/quotes as units, and valid surrogate pairs together.
     for (const escape of match[0].matchAll(/\\u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}|\\(?:u[0-9a-fA-F]{4}|.)/g)) {

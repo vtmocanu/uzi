@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 //go:embed codex-pricing.json
@@ -65,6 +66,9 @@ func mustLoadPricing(data []byte) map[string]*time.Time {
 // policy. UseNumber retains overflow numbers for validation, including when an
 // invalid earlier value is overwritten during decoding.
 func loadPricing(data []byte) (map[string]*time.Time, error) {
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("table: expected valid UTF-8 bytes")
+	}
 	if err := validateJSONStrings(data); err != nil {
 		return nil, err
 	}

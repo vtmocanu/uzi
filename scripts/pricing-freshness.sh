@@ -5,6 +5,8 @@ export TZ=UTC
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fail() { printf 'pricing-freshness: %s\n' "$*" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+command -v od >/dev/null 2>&1 || fail "od is required"
+command -v awk >/dev/null 2>&1 || fail "awk is required"
 today=$(date -u +%Y-%m-%d) || fail "cannot read UTC date"
 json=false
 while (( $# )); do
@@ -21,6 +23,38 @@ done
 codex=${UZI_PRICING_TEST_CODEX_PATH:-$root/agent/src/codex/codex-pricing.json}
 anthropic=${UZI_PRICING_TEST_ANTHROPIC_PATH:-$root/api/internal/anthropicprice/anthropicprice.go}
 [[ -r "$codex" && -r "$anthropic" ]] || fail "pricing source is unreadable"
+# jq raw input replaces malformed bytes. Check decimal bytes before invoking jq.
+# The FSM keeps at most three pending continuations; one failure rejects the file.
+# pipefail also rejects an od read/instrument failure, with no findings printed.
+if ! od -A n -t u1 -v < "$codex" | LC_ALL=C awk '
+  {
+    for (i=1; i<=NF; i++) {
+      b=$i
+      if (remaining) {
+        if (b < minimum || b > maximum) { bad=1; exit 1 }
+        remaining--
+        minimum=128; maximum=191
+      } else if (b <= 127) {
+        continue
+      } else {
+        minimum=128; maximum=191
+        if (b >= 194 && b <= 223) remaining=1
+        else if (b >= 224 && b <= 239) {
+          remaining=2
+          if (b == 224) minimum=160
+          if (b == 237) maximum=159
+        } else if (b >= 240 && b <= 244) {
+          remaining=3
+          if (b == 240) minimum=144
+          if (b == 244) maximum=143
+        } else { bad=1; exit 1 }
+      }
+    }
+  }
+  END { if (bad || remaining) exit 1 }
+'; then
+  fail "expected valid UTF-8 bytes (od/awk byte validation failed)"
+fi
 # Count anchored declarations, including malformed ones, before extracting values.
 metadata=$(awk '
   /^[[:space:]]*const[[:space:]]+AnthropicPrice(FetchedAt|SourceURL)([[:space:]]|=|$)/ {
