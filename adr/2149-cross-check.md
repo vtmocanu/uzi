@@ -99,7 +99,7 @@ Validated usage/preparation/reconciliation must successfully release the actual 
 
 ### Opposite family, derived and guarded
 
-The checker is always the opposite family of its lead (`claude` lead, `codex` child; `codex` lead, `claude` child), derived server-side from the lead's harness and never chosen by the caller. There is no fallback across families: a same-family checker would defeat the second opinion. Migration 00313 widens `runs_kind_shape` so a `cross_check` run may carry `claude` as well as `codex`. That the child differs from its lead is a cross-table fact a `CHECK` cannot state, so `CreatePlanCrossCheckChild` and `InsertPlanCrossCheck` are guarded writes that refuse a same-family or unknown-family pair.
+The checker is always the opposite family of its lead (`claude` lead, `codex` child; `codex` lead, `claude` child), derived server-side from the lead's harness and never chosen by the caller. There is no fallback across families: a same-family checker would defeat the second opinion. Migration 00314 widens `runs_kind_shape` so a `cross_check` run may carry `claude` as well as `codex`. That the child differs from its lead is a cross-table fact a `CHECK` cannot state, so `CreatePlanCrossCheckChild` and `InsertPlanCrossCheck` are guarded writes that refuse a same-family or unknown-family pair.
 
 ### Single-family custody
 
@@ -115,7 +115,7 @@ Every Claude `cross_check` claim takes the lead lock before the child lock, incl
 
 ### Rollout boundary
 
-`cross_check_codex_lead_v1` is advertised by new workers unconditionally and is required to claim a Claude child (all claim, placement, health and provisioning copies) and for a Codex lead's submit. Roll the api and migration first. A new worker on an old api has its Codex-lead submit refused, so that lead takes the human gate; a Codex lead on an older worker keeps the `codex_lead_unsupported` park. Migration 00313's Down deletes Claude checker runs (history is kept with `checker_run_id` NULL); run it with the new api stopped. The plan-gate Codex executor consumes automatic rounds without spending its human revision budget and implements only the acknowledged checked plan.
+`cross_check_codex_lead_v1` is advertised by new workers unconditionally and is required to claim a Claude child (all claim, placement, health and provisioning copies) and for a Codex lead's submit. Roll the api and migration first. A new worker on an old api has its Codex-lead submit refused, so that lead takes the human gate; a Codex lead on an older worker keeps the `codex_lead_unsupported` park. Migration 00314's Down deletes Claude checker runs (history is kept with `checker_run_id` NULL); run it with the new api stopped. The plan-gate Codex executor consumes automatic rounds without spending its human revision budget and implements only the acknowledged checked plan.
 
 ### Not shipped
 

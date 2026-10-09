@@ -145,7 +145,7 @@ tool-path policy and the [architecture](../ARCHITECTURE.md#plan-cross-check).
 
 Deploy the api and its migration before the workers. A new worker on an older
 api has its Codex-lead submit refused, so those runs go to the human gate until
-the api is upgraded. Migration 00313 allows Claude checker runs; its Down
+the api is upgraded. Migration 00314 allows Claude checker runs; its Down
 deletes Claude checker runs but keeps the check history, with the checker run
 link empty. Run the Down only with the new api stopped. With ephemeral workers
 off, the settings toggle warns when no online worker can run the checker,
