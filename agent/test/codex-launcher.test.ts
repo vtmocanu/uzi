@@ -833,7 +833,7 @@ describe("M1 controlled advice disposal ordering probe", () => {
         const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "advice-probe-"));
         const fake = newFake({ exitBeforeEvidence: ordering === "exit_first", exitCode: ordering === "unclean" ? 1 : 0 });
         const { logger, lines } = recordingLogger();
-        const diagnostic = new AdviceTeardownDiagnostic();
+        const diagnostic = new AdviceTeardownDiagnostic((line) => t.diagnostic(line));
         const originalOpen = fs.open.bind(fs);
         let owned = "";
         let shared = false;

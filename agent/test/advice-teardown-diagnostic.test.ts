@@ -89,3 +89,28 @@ it("advice diagnostic bounds evidence and observes pipe events without reading t
     for (const stream of child.stdio) stream?.destroy();
   }
 });
+
+it("advice diagnostic uses the test-owned sink before rethrowing, and passing bodies stay silent", async () => {
+  const printed: string[] = [];
+  const diagnostic = new AdviceTeardownDiagnostic((line) => printed.push(line));
+  await diagnostic.run(async () => {});
+  assert.equal(printed.length, 0);
+  const original = new assert.AssertionError({ message: "controlled failure" });
+  await assert.rejects(diagnostic.run(async () => { throw original; }), (error) => {
+    assert.equal(printed.length, 1, "snapshot emitted while the failing body is still owned");
+    return error === original;
+  });
+  assert.ok(printed[0]!.startsWith("advice-teardown-diagnostic "));
+});
+
+it("advice diagnostic bounds the producer sink and preserves assertions when the sink fails", async (t) => {
+  const printed: string[] = [];
+  const diagnostic = new AdviceTeardownDiagnostic((line) => printed.push(line));
+  t.mock.method(diagnostic, "snapshot", async () => ({ data: "private-" + "é".repeat(20000) }));
+  const original = new assert.AssertionError({ message: "controlled failure" });
+  await assert.rejects(diagnostic.run(async () => { throw original; }), (error) => error === original);
+  assert.deepEqual(printed, ['advice-teardown-diagnostic {"snapshot":"oversized"}']);
+  assert.ok(Buffer.byteLength(printed[0]!) <= 16384);
+  const broken = new AdviceTeardownDiagnostic(() => { throw new Error("sink failure"); });
+  await assert.rejects(broken.run(async () => { throw original; }), (error) => error === original);
+});

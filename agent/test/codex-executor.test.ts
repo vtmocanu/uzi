@@ -7626,7 +7626,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
 
   describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
 describe("production advice data teardown (#2324)", () => {
-  it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async () => {
+  it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async (t) => {
     const { runnerTeardownFixture, uidScript, seedRunnerRacedTree } = await import("./runner-teardown-fixtures.js");
     const { startSwapRacer } = await import("./swap-racer.js");
     const { assertOutsideFiles } = await import("./residual-fixtures.js");
@@ -7661,10 +7661,10 @@ describe("production advice data teardown (#2324)", () => {
         await handle.dispose().catch(() => undefined);
       }
       await assertOutsideFiles(victim, swaps);
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("unclean advice disposal retains runner data after the supervisor is killed", async () => {
+  it("unclean advice disposal retains runner data after the supervisor is killed", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
     const { default: cp } = await import("node:child_process");
     const { syncBuiltinESMExports } = await import("node:module");
@@ -7731,10 +7731,10 @@ describe("production advice data teardown (#2324)", () => {
         }
         await handle?.dispose().catch(() => undefined);
       }
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("ordinary advice ownedDataRoot removes private runner-only content without leaking", async () => {
+  it("ordinary advice ownedDataRoot removes private runner-only content without leaking", async (t) => {
     const { runnerTeardownFixture, writePrivateRunnerFile, assertGone } = await import("./runner-teardown-fixtures.js");
     await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
@@ -7761,10 +7761,10 @@ describe("production advice data teardown (#2324)", () => {
         preflight.mock.restore(); syncBuiltinESMExports();
         await handle.dispose().catch(() => undefined);
       }
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice data owner refusal warns, retains content and still removes cwd", async () => {
+  it("advice data owner refusal warns, retains content and still removes cwd", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
     await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
@@ -7782,10 +7782,10 @@ describe("production advice data teardown (#2324)", () => {
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed" && /not owned/.test(String(rec(line).error))));
       } catch (error) { await diagnostic.failure(error); throw error; } finally { await handle.dispose().catch(() => undefined); }
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice data symlink refusal retains the link and outside content", async () => {
+  it("advice data symlink refusal retains the link and outside content", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
     await runnerTeardownFixture(async (root, victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
@@ -7803,10 +7803,10 @@ describe("production advice data teardown (#2324)", () => {
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"));
       } catch (error) { await diagnostic.failure(error); throw error; } finally { await handle.dispose().catch(() => undefined); }
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice data identity refusal retains both roots and still cleans cwd", async () => {
+  it("advice data identity refusal retains both roots and still cleans cwd", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
     await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
@@ -7842,10 +7842,10 @@ describe("production advice data teardown (#2324)", () => {
         pin.mock.restore(); preflight.mock.restore(); syncBuiltinESMExports();
         await handle.dispose().catch(() => undefined);
       }
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice disposal single-uid removes the actual worker-owned data root", async () => {
+  it("advice disposal single-uid removes the actual worker-owned data root", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
     await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
@@ -7866,7 +7866,7 @@ describe("production advice data teardown (#2324)", () => {
         await assertGone(handle.cwd);
         assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
       } catch (error) { await diagnostic.failure(error); throw error; } finally { process.env.UZI_UID_SPLIT = "1"; await handle.dispose().catch(() => undefined); }
-    }, true);
+    }, true, (line) => t.diagnostic(line));
   });
 });
 

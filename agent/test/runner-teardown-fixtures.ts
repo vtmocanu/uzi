@@ -14,9 +14,10 @@ export function uidScript(wrap: CommandWrapper, script: string, ...args: string[
   assert.equal(result.status, 0, result.stderr?.toString() || result.error?.message);
 }
 
-export async function runnerTeardownFixture(body: (root: string, victim: string, diagnostic: AdviceTeardownDiagnostic) => Promise<void>, diagnoseAdvice = false): Promise<void> {
+export async function runnerTeardownFixture(body: (root: string, victim: string, diagnostic: AdviceTeardownDiagnostic) => Promise<void>,
+  diagnoseAdvice = false, output?: (line: string) => void): Promise<void> {
   const saved = process.env.UZI_UID_SPLIT;
-  const diagnostic = new AdviceTeardownDiagnostic();
+  const diagnostic = new AdviceTeardownDiagnostic(output);
   process.env.UZI_UID_SPLIT = "1";
   try {
     await residualTestFixture(async (root, victim) => {

@@ -7,6 +7,7 @@ import type { Readable } from "node:stream";
 const EVENTS = new Set(["started", "snapshot", "dispose", "child_exit", "abnormal"]);
 const STATES = new Set(["drained", "unconfirmed"]);
 const CLASSIFICATIONS = new Set(["failure", "not_clean"]);
+const MAX_OUTPUT_BYTES = 16384;
 const REASONS = new Set([
   "thrown_or_unavailable", "drain_unconfirmed", "drain_deadline", "drain_contradicted",
   "supervisor_exit_nonzero", "supervisor_exit_unconfirmed", "control_unavailable",
@@ -27,6 +28,13 @@ export class AdviceTeardownDiagnostic {
   private originalFailure: unknown;
   private truncated = false;
   private listeners: (() => void)[] = [];
+
+  constructor(private readonly output?: (line: string) => void) {}
+
+  private print(line: string): void {
+    if (this.output) this.output(line);
+    else console.error(line);
+  }
 
   private record(event: string, fields: Record<string, unknown> = {}): void {
     const ordinal = ++this.sequence;
@@ -138,9 +146,13 @@ export class AdviceTeardownDiagnostic {
     if (this.printed) return;
     this.printed = true;
     this.originalFailure = error;
-    try { console.error("advice-teardown-diagnostic " + JSON.stringify(await this.snapshot())); }
+    try {
+      const line = "advice-teardown-diagnostic " + JSON.stringify(await this.snapshot());
+      this.print(Buffer.byteLength(line) <= MAX_OUTPUT_BYTES ? line
+        : 'advice-teardown-diagnostic {"snapshot":"oversized"}');
+    }
     catch {
-      try { console.error('advice-teardown-diagnostic {"snapshot":"unavailable"}'); } catch { /* Preserve the assertion even if printing fails. */ }
+      try { this.print('advice-teardown-diagnostic {"snapshot":"unavailable"}'); } catch { /* Preserve the assertion even if printing fails. */ }
     }
   }
 

@@ -258,5 +258,17 @@ Decision: M2 is **exempted and not attempted**, not completed. Its controlled-RE
 entry condition was not met. M1 and M3 deliver the approved diagnostics-only
 scope; this exemption does not assert a verified fix or issue acceptance.
 The completion interlock repeated after this human decision, so publication
-remains blocked by the unresolved contract mismatch. No further completion
-signal is made while that mismatch persists.
+was blocked by the unresolved contract mismatch at that point. Publication
+subsequently completed in PR #2583, which merged the diagnostics-only delivery.
+
+The next main run, [37943529532](https://github.com/vtmocanu/uzi/actions/runs/37943529532),
+failed the owner-refusal leaf again. Node 24.21.0's JUnit reporter omitted the
+helper's console error output, so the snapshot did not reach the job log.
+Diagnosed leaves now emit through their active test context; Node stores that
+diagnostic as an XML comment immediately after its test case. The lane checker
+preserves those comments and prints exact-prefix diagnostics only for failing
+required leaves, with control characters removed and a total limit of eight
+lines and 16 KiB. The producer also limits each emitted snapshot to 16 KiB.
+A controlled failing helper on the real Node 24 reporter proves transport;
+passing leaves remain silent. This repairs diagnostic visibility, not the
+unproven disposal cause, and does not replace the privileged lane's evidence.
