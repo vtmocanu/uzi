@@ -1,0 +1,58 @@
+# Weekly pricing freshness reminder (PRD #2560 follow-up, epic #2558).
+#
+# Runs the advisory `task nudge:pricing` and keeps ONE tracking issue in step with
+# its findings: Codex rows verified more than 30 days ago, Codex promotional rows
+# due within 14 days or past their review date, and the Anthropic table fetched
+# more than 30 days ago. scripts/pricing-freshness-issue.sh owns the issue: found by
+# the `pricing-freshness` label AND its bot-owned body marker (a human issue that
+# only carries the label is never edited), body rewritten only when the findings
+# change, closed with a comment when they clear, reopened when they recur.
+#
+# Advisory only: it never fails on findings and never changes a rate. A human
+# verifies against the official pages (docs/run-cost.md, "Updating prices").
+# The issue carries repository pricing metadata only.
+
+name: Pricing Freshness
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  schedule:
+    # 06:47 UTC Mondays, off the top of the hour and distinct from
+    # roles-manifest-refresh.yml (06:27) and devbox-update.yml (06:41).
+    - cron: "47 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: pricing-freshness
+  cancel-in-progress: false
+
+jobs:
+  nudge:
+    runs-on: ubuntu-latest
+    # A healthy run is seconds; this only bounds a hang.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout uzi
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-task
+
+      - name: Collect pricing findings
+        run: |
+          set -euo pipefail
+          # Exit 2 is a broken instrument (unreadable or invalid pricing data): fail
+          # the job loudly rather than closing the issue on an empty result.
+          task nudge:pricing -- --json > "${RUNNER_TEMP}/findings.json"
+          jq -e 'type == "array"' "${RUNNER_TEMP}/findings.json" > /dev/null
+
+      - name: Sync the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/pricing-freshness-issue.sh "${RUNNER_TEMP}/findings.json"
