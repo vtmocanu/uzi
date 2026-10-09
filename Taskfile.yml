@@ -286,6 +286,9 @@ tasks:
       - task: lint:shell
       - task: lint:yaml
       - task: check:skill-triage-render
+      # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
+      - task: test:web-docker-fixtures
+      - task: check:web-docker-fixtures
       - task: lint:formula
       # Workflow linting (actionlint + zizmor). Grouped with the other lint:* checks;
       # like them it fail-open SKIPs when its tools are absent on a laptop and is
@@ -1237,6 +1240,19 @@ tasks:
       # never standing up the stack, so docs/dev-conventions.md:79 (run-e2e.sh is not a
       # gate recipe) stays true. `task e2e:registry-doc` is the writer. See the header.
       - ./scripts/check-e2e-registry-doc.sh
+
+  test:web-docker-fixtures:
+    desc: hermetic exit-code contract for check:web-docker-fixtures (throwaway git repos, no network), tally-guarded
+    cmds:
+      - ./scripts/check-web-docker-fixtures.test.sh
+
+  check:web-docker-fixtures:
+    desc: every fixtures/ path a web source statically imports is copied into web/Dockerfile and web/Dockerfile.mock
+    cmds:
+      # The web image builds copy only an explicit fixtures/ list, then type-check the
+      # tests in `npm run build`; an uncopied static import passes gate:web and breaks
+      # build-web and the KinD smoke only (#2602). Exit 2 = instrument broken.
+      - ./scripts/check-web-docker-fixtures.sh
 
   check:no-binary-text:
     desc: no NEW text-extension source file is git-binary or carries control bytes, with a canary proving the detector fired
