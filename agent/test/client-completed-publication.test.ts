@@ -15,6 +15,7 @@ let response: Record<string, unknown>;
 let claim: Record<string, unknown>;
 let holds: Record<string, unknown>[];
 let sent: Record<string, unknown>[];
+let fetchedPaths: string[];
 let workerId: string;
 let registrationFails: boolean;
 let holdsResponse: (() => Response) | undefined;
@@ -26,11 +27,13 @@ beforeEach(() => {
     issue_iid: 7, repo: { ...makeClaim().repo, id: receipt.repo_id, forge_type: "gitlab" } };
   holds = [{ hold_id: receipt.hold_id, generation: 1, inventory_guarded: true, has_available_capture: false }];
   sent = [];
+  fetchedPaths = [];
   workerId = receipt.worker_id;
   registrationFails = false;
   holdsResponse = undefined;
   mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const path = new URL(String(input)).pathname;
+    fetchedPaths.push(path);
     if (path.endsWith("/register")) {
       if (registrationFails) return new Response("unauthorized", { status: 401 });
       return Response.json({ worker_id: workerId, protocol_features: features });
@@ -57,6 +60,19 @@ it("accepts the literal shared ancestor receipt without inventing archive author
   assert.notEqual(ack.completedPublicationReceipt?.observed_branch_head, fixture.request.completion_final_head);
   assert.equal("coverage_digest" in ack.completedPublicationReceipt!, false);
   assert.deepEqual(sent[0], fixture.request);
+});
+
+it("accepts exact stored terminal replay after fresh registration without claim or hold fetches", async () => {
+  const original = Object.freeze(structuredClone(fixture.request)) as StateRequest;
+  const snapshot = structuredClone(original);
+  const registration = await client.register("fresh-replay-worker");
+  assert.equal(registration.worker_id, receipt.worker_id);
+  const ack = await client.reportState(RUN, original);
+  assert.deepEqual(ack.completedPublicationReceipt, receipt);
+  assert.deepEqual(sent, [snapshot], "replay sends the exact original terminal body");
+  assert.deepEqual(original, snapshot, "replay preserves the persisted original body");
+  assert.deepEqual(fetchedPaths, ["/api/worker/register", `/api/worker/runs/${RUN}/state`],
+    "fresh replay needs registration and state ACK only");
 });
 
 for (const [field, value] of [
