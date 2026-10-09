@@ -111,6 +111,7 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
           : {}),
         checkpoint: async (o) => { events.push(o.reap ? "checkpoint:reap" : "checkpoint"); },
         secretRemediationGate: async () => { events.push("gate"); return decisions.shift()!; },
+        codeCrossCheckGate: async () => { events.push("code"); return { action: "proceed" }; },
       });
       if (interlocked) ctx.kind = "issue";
       const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
@@ -121,6 +122,8 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
       assert.strictEqual(events[0], "gate", "the gate runs before any done checkpoint on the done turn");
       assert.deepStrictEqual(events.slice(0, 2), ["gate", "gate"], "remediate produced no checkpoint before the second gate");
       if (interlocked) assert.strictEqual(attempts, 1, "the completion attempt runs once, after proceed");
+      assert.deepEqual(events, interlocked ? ["gate", "gate", "checkpoint:reap", "attempt", "code"] : ["gate", "gate", "code"],
+        "code gate follows the secret gate and successful interlock without another checkpoint");
     });
 
     it(`${label}: fail stops with no done checkpoint and no completion attempt`, async () => {
@@ -136,6 +139,7 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
         recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
         checkpoint: async (o) => { checkpoints.push(o); },
         secretRemediationGate: async () => ({ action: "fail" }),
+        codeCrossCheckGate: async () => { assert.fail("code gate after secret failure"); },
       });
       const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
       assert.strictEqual(result.branch, "agent/issue-5", "the run returns a result, no throw");
@@ -152,17 +156,105 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
         [signalDone(), resultSuccess()],
       ]);
       let gates = 0;
+      let codeGates = 0;
       const outcome: FollowUpOutcome = { kind: "ended", reason };
       const ctx = makeCtx({
         interactive: true,
         awaitFollowUp: async () => outcome,
         secretRemediationGate: async () => { gates++; return { action: "fail" }; },
+        codeCrossCheckGate: async () => { codeGates++; return { action: "proceed" }; },
       });
       const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
       assert.strictEqual(result.branch, "agent/issue-5");
       assert.strictEqual(gates, 0);
+      assert.strictEqual(codeGates, 1, "only idle/stopped finalization checks code");
     });
   }
+
+  for (const interlocked of [false, true]) {
+    it(`code advisory wait exceeds local wall allowance without a wall park: ${interlocked ? "interlocked" : "legacy"}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      let gates = 0;
+      const ctx = makeCtx({
+        kind: "issue", config: { run_timeout_seconds: 0.2 },
+        completionInterlock: interlocked,
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        parkForWall: async () => { assert.fail("advisory wait must not arm wall park"); },
+        codeCrossCheckGate: async () => {
+          gates++;
+          await new Promise<void>((resolve) => setTimeout(resolve, 300));
+          return { action: "proceed" };
+        },
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.equal(gates, 1);
+      assert.equal(result.walled, undefined);
+      assert.equal(result.branch, ctx.branch);
+    });
+  }
+
+  it("unmet completion attempts do not call code until the successful done exit", async () => {
+    const { queryFn, prompts } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const events: string[] = [];
+    let attempts = 0;
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "issue", completionInterlock: true,
+      checkpoint: async () => { events.push("checkpoint"); },
+      recordCompletionAttempt: async () => {
+        events.push("attempt");
+        return { unmet: ++attempts === 1 ? ["M1"] : [], attemptCount: attempts };
+      },
+      codeCrossCheckGate: async () => { events.push("code"); return { action: "proceed" }; },
+    }));
+    assert.equal(prompts.length, 3);
+    assert.deepEqual(events, ["checkpoint", "attempt", "checkpoint", "attempt", "code"]);
+  });
+
+  for (const reason of ["idle", "stopped", "cancelled"] as const) {
+    it(`interactive multiple follow-ups check code only at finalization: ${reason}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+        [signalDone(), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      let parks = 0;
+      let code = 0;
+      const operation = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        kind: "task", interactive: true,
+        awaitFollowUp: async () => {
+          assert.equal(code, 0);
+          if (++parks <= 2) return { kind: "followup", id: parks, body: "next task" };
+          return { kind: "ended", reason };
+        },
+        codeCrossCheckGate: async () => { code++; return { action: "proceed" }; },
+      }));
+      if (reason === "cancelled") await assert.rejects(operation, /cancel/i);
+      else await operation;
+      assert.equal(parks, 3);
+      assert.equal(code, reason === "cancelled" ? 0 : 1);
+    });
+  }
+
+  it("SDK completion forwards report-only metadata to the code gate", async () => {
+    const done = signalDone();
+    (done as unknown as { message: { content: { input: unknown }[] } }).message.content[0]!.input = { report_only: true };
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [done, resultSuccess()]]);
+    let reportOnly: boolean | undefined;
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "issue",
+      codeCrossCheckGate: async (completion) => { reportOnly = completion.reportOnly; return { action: "proceed" }; },
+    }));
+    assert.equal(reportOnly, true);
+    assert.equal(result.reportOnly, true);
+  });
 
   it("an absent gate seam leaves the done path unchanged", async () => {
     const { queryFn, prompts } = fakeTurns([

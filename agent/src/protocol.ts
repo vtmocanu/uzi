@@ -1200,10 +1200,20 @@ export interface ClaimPlanCrossCheck {
   planning_diff: string;
 }
 
+export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+  stage: "code";
+  head_commit: string;
+  code_context: unknown;
+  guidance_snapshot: string;
+  /** Worker-produced bounded evidence, never accepted from the server. */
+  code_diff?: string;
+  planning_diff?: string;
+}
+
 export interface ClaimResponse {
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
-  cross_check?: ClaimPlanCrossCheck;
+  cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */

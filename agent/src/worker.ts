@@ -137,7 +137,7 @@ export class Worker {
     },
     private readonly dindMaintenance?: DindMaintenanceController,
     private readonly terminalRejections?: TerminalRejectionCoordinator,
-    private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute">,
+    private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute"> & Partial<Pick<CrossCheckRunner, "snapshotBootCodeSnapshots" | "cleanupBootCodeSnapshots">>,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -327,6 +327,12 @@ export class Worker {
     // A runner stub without the method (older test doubles) simply has nothing to snapshot.
     const bootRecoveries =
       typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
+    let bootCodeSnapshots: Awaited<ReturnType<CrossCheckRunner["snapshotBootCodeSnapshots"]>> = [];
+    try {
+      bootCodeSnapshots = structuredClone(await this.crossCheckRunner?.snapshotBootCodeSnapshots?.() ?? []);
+    } catch {
+      this.log.warn("code snapshot boot discovery failed; snapshots retained");
+    }
     let heartbeat = Promise.resolve();
     let rejections = Promise.resolve();
     let registered = false;
@@ -376,6 +382,11 @@ export class Worker {
     // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
     // background above. The heartbeat promise is created once and awaited alongside the claim loops.
     await this.resolveBootTerminals(signal);
+    try {
+      await this.crossCheckRunner?.cleanupBootCodeSnapshots?.(bootCodeSnapshots, signal);
+    } catch {
+      this.log.warn("code snapshot boot cleanup failed; snapshots retained");
+    }
     // issue #1582 M2: ONLY after the boot pending-terminal gate, start the ancestry-settlement loop
     // alongside the claim loops (it never gates them): an immediate sweep of every due
     // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
@@ -760,7 +771,10 @@ export class Worker {
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
-        if (this.config.crossCheckSlots > 0) protocolCapabilities.push("cross_check_lane_v1");
+        if (this.config.crossCheckSlots > 0) {
+          protocolCapabilities.push("cross_check_lane_v1");
+          if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
+        }
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,

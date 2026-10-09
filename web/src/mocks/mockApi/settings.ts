@@ -1017,6 +1017,14 @@ export const settingsApi = {
   },
 
   // ── Plan cross-check consent (PRD #2149 M1) ─────────────────────────────────
+  setCodeCrossCheckEnabled: async (code: boolean) => {
+    const u = requireSession();
+    if (code && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {
+      throw new ApiError(400, "both Claude and Codex credentials must be usable");
+    }
+    u.code_cross_check_enabled = code;
+    return delay({ user: { ...u } }, 200);
+  },
   setPlanCrossCheckEnabled: async (plan: boolean) => {
     const u = requireSession();
     if (plan && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {

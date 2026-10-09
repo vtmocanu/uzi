@@ -3190,7 +3190,7 @@ export class SdkExecutor implements Executor {
             //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
             //    reap:true is the same reap-before-git ordering the done/interactive-park paths
             //    use; the session transcript survives on disk so the SAME session resumes.
-            await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
             // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
             //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
             //    fingerprint is unresolvable — then head is null too, which the server accepts).
@@ -3216,7 +3216,10 @@ export class SdkExecutor implements Executor {
             completionAttempted = true;
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
-            if (unmet.length === 0) break;
+            if (unmet.length === 0) {
+              await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly });
+              break;
+            }
             // 5. Unmet non-empty. The completion fingerprint (sorted unmet ids, head, worktree)
             //    is DISTINCT from the #281 prose fingerprint but shares STALL_LIMIT. An identical
             //    fingerprint across consecutive attempts advances the streak; any change resets it
@@ -3311,6 +3314,7 @@ export class SdkExecutor implements Executor {
             turn.done = false;
             continue;
           }
+          await ctx.codeCrossCheckGate?.({ interlocked: false, reportOnly: declaredReportOnly });
           // Issue #1514: the loop-top scope gate only fires on a further iteration, so a lead that
           // finishes its last permitted milestone and calls signal_done in the same turn exits
           // here. Latch the cap now so the run delivers non-closing. Legacy exit only: the

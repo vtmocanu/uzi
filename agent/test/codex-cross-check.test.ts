@@ -135,13 +135,51 @@ function rig(options: {
  const log = { ...recorded.logger, addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
  const checker = new CodexCrossCheck(client, log, deps);
  return { logs: recorded.lines, get releases() { return releases; }, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
-  run: (signal = new AbortController().signal) => {
+  run: (signal = new AbortController().signal, cleanupConfirmed?: () => void) => {
    const c = options.claim ?? claim(options.subscription);
    if (options.round !== undefined) c.cross_check!.round = options.round;
    return checker.run(c, "/checkout", "/owned", signal, async (payload) => {
     usage.push(payload); if (options.failUsage && payload.event === "result") throw new Error("usage failed");
-   });
+   }, cleanupConfirmed);
   } };
+}
+
+function codeClaim(): ClaimResponse {
+ const c = claim();
+ c.cross_check = {
+  ...c.cross_check!, stage: "code", round: 1, head_commit: "b".repeat(40),
+  candidate_digest: "c".repeat(64), code_context: { context: "untrusted code context" },
+  guidance_snapshot: "", code_diff: "untrusted diff",
+ };
+ return c;
+}
+
+it("code checker uses the confined provider and file broker and returns only findings", async () => {
+ const c = codeClaim();
+ const text = JSON.stringify({ findings: [{ id: "F1", severity: "minor", path: "anchor.ts", line: 1,
+  title: "checked finding", detail: "read evidence" }] });
+ const r = rig({ claim: c, notes: (emit) => r.terminal(emit, text) });
+ assert.equal(await r.run(), text);
+ const thread = r.requests.find((frame) => frame.method === "thread/start")!;
+ assert.match(thread.params!.developerInstructions, /code cross-checker/);
+ assert.equal(thread.params!.approvalPolicy, "never");
+ assert.equal(thread.params!.config.shell_tool, false);
+ assert.deepEqual(r.ops, ["stat"]);
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+ const input = r.requests.find((frame) => frame.method === "turn/start")!.params!.input[0].text;
+ assert.match(input, /<committed_diff_[a-f0-9]{32}>/);
+ assert.match(input, /<code_context_[a-f0-9]{32}>/);
+});
+
+for (const text of [
+ 'prose {"findings":[]}', '{"findings":[]} trailing', '{"findings":[]}{"findings":[]}',
+ '{"findings":[],"verdict":"approve"}', '{"findings":[{"id":"non ascii é"}]}',
+]) {
+ it("code checker rejects malformed single-object output: " + text, async () => {
+  const r = rig({ claim: codeClaim(), notes: (emit) => r.terminal(emit, text) });
+  await assert.rejects(r.run(), /invalid code checker findings/);
+  assert.deepEqual(r.disposed, ["provider", "fileop"]);
+ });
 }
 
 for (const pinned of [false, true]) {
@@ -634,5 +672,21 @@ for (const ids of [{ threadId: "foreign", id: "turn" }, { threadId: "thread", id
   const r = rig({ claim: pinnedClaim(), notes: (emit) => failedTerminal(emit, capturedError, ids.threadId, ids.id) });
   await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError) && /foreign/.test(e.message));
   assertOneAttempt(r);
+ });
+}
+
+for (const mode of ["success", "model-error", "unclean"] as const) {
+ it("CODE native cleanup confirmation: " + mode, async () => {
+  const r = rig({ claim: codeClaim(), clean: mode !== "unclean", notes: (emit) => {
+   if (mode === "model-error") emit({ method: "error", params: { message: "model failed" } });
+   else r.terminal(emit, '{"findings":[]}');
+  } });
+  let confirmed = 0;
+  const work = r.run(undefined, () => {
+   assert.deepEqual(r.disposed, ["provider", "fileop"]);
+   confirmed++;
+  });
+  if (mode === "success") await work; else await assert.rejects(work);
+  assert.equal(confirmed, mode === "unclean" ? 0 : 1);
  });
 }

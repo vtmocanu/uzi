@@ -46,6 +46,63 @@ import { lookupAttributes, type PathAttributes } from "./pr-size.js";
 
 const execFileAsync = promisify(execFile);
 
+// Use an absolute end assertion: JavaScript's $ also accepts a trailing newline.
+const codePattern = (pattern: RegExp): { test(value: unknown): boolean } => ({
+  test: value => typeof value === "string" && pattern.test(value),
+});
+const CODE_ID = codePattern(/^[A-Za-z0-9_-]{1,128}(?![\s\S])/);
+const CODE_SHA = codePattern(/^[a-f0-9]{40}(?![\s\S])/);
+const CODE_UUID = codePattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
+const CODE_READER_KEY = codePattern(/^cross-check-[A-Za-z0-9_-]{1,128}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
+const CODE_MAX_READERS = 128;
+type LocalMetadataDirectory = "uzi-owed" | "uzi-code-snapshots";
+const codeGeneration = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
+const codeTerminal = (value: string): boolean => ["completed", "failed", "cancelled"].includes(value);
+
+export interface CodeSnapshotReaderProof {
+  childId: string;
+  childGeneration: number;
+  terminalStatus: "completed" | "failed" | "cancelled";
+  cleanupConfirmed: true;
+}
+export interface CodeSnapshotFreshReceipt {
+  leadId: string;
+  head: string;
+  pinGeneration: number;
+  receiptId: string;
+}
+interface CodeSnapshotMetadata {
+  version: 1;
+  leadId: string;
+  head: string;
+  pinGeneration: number;
+  receiptId: string;
+  latestChild: { childId: string; childGeneration: number } | null;
+  readers: Array<{ readerKey: string; childId: string; childGeneration: number; state: "OPEN" | "CLOSED" }>;
+}
+export interface CodeSnapshotBootCandidate {
+  barePath: string;
+  leadId: string;
+  head: string;
+  metadataToken: string;
+  metadata: CodeSnapshotMetadata;
+}
+export interface CodeSnapshotRetirementProof {
+  sealedOutcome: {
+    persisted: true;
+    sealed: true;
+    stage: "code";
+    leadId: string;
+    head: string;
+    pinGeneration: number;
+    outcome: "completed" | "failed";
+  };
+  child?: { childId: string; childGeneration: number; terminalStatus: "completed" | "failed" | "cancelled" };
+  freshNoReader?: { receipt: CodeSnapshotFreshReceipt; serverAtomicallyTerminalNoChild: true };
+  bootCandidate?: CodeSnapshotBootCandidate;
+  leadDisposition?: "terminal" | "foreign";
+}
+
 /** A child's stdout re-exposed so its end waits for the exit status. Node ends a child's
  *  stdout BEFORE `close`, so a consumer of the raw stream reads a clean (possibly empty)
  *  EOF from a failed child and a later destroy(err) is a no-op (issue #1739 follow-up: an
@@ -1481,6 +1538,9 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  // Fresh no-child authority exists only in the GitCache invocation that created the pin.
+  // At capacity, pinning still works but returns no retirement receipt (retention).
+  private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
@@ -2002,14 +2062,33 @@ export class GitCache {
   }
 
   /** A report-only checker owns a fresh clone and selects only the immutable candidate SHA. */
-  async runnerCloneAtCommit(barePath: string, baseCommit: string, runId: string): Promise<string> {
-    if (!/^[a-f0-9]{40}$/.test(baseCommit) || !/^[a-zA-Z0-9_-]+$/.test(runId)) {
+  async runnerCloneAtCommit(barePath: string, baseCommit: string, runId: string, codeLeadRunId?: string, childGeneration = 0): Promise<string> {
+    if (!CODE_SHA.test(baseCommit) || !CODE_ID.test(runId) || !codeGeneration(childGeneration)) {
       throw new Error("invalid exact-commit checker identity");
     }
-    return this.withLock(barePath, async () => {
+    if (codeLeadRunId !== undefined) await this.assertOwedBare(barePath);
+    const clone = async (): Promise<string> => {
+      const key = `cross-check-${runId}-${randomUUID()}`;
       const resolved = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseCommit}^{commit}`])).trim();
       if (resolved !== baseCommit) throw new Error("checker base commit unavailable");
-      const key = `cross-check-${runId}-${randomUUID()}`;
+      if (codeLeadRunId !== undefined) {
+        if (!CODE_ID.test(codeLeadRunId) || !CODE_UUID.test(runId)) throw new Error("invalid code snapshot reader identity");
+        const tip = (await this.runGit(barePath, ["rev-parse", "--verify", `refs/uzi-cross-check/${codeLeadRunId}`])).trim();
+        if (tip !== baseCommit) throw new Error("code snapshot ref moved");
+        const metadata = await this.readCodeSnapshotMetadata(barePath, codeLeadRunId);
+        if (!metadata || metadata.head !== baseCommit) throw new Error("code snapshot metadata unavailable");
+        const latest = metadata.latestChild;
+        if (latest && (childGeneration < latest.childGeneration ||
+            (childGeneration === latest.childGeneration && runId !== latest.childId))) {
+          throw new Error("code snapshot child generation conflicts");
+        }
+        if (metadata.readers.length >= CODE_MAX_READERS) throw new Error("code snapshot reader limit");
+        metadata.latestChild = { childId: runId, childGeneration };
+        metadata.readers.push({ readerKey: key, childId: runId, childGeneration, state: "OPEN" });
+        // Durable OPEN precedes even mkdir/clone. Failed launches retain their OPEN entry.
+        await this.writeCodeSnapshotMetadata(barePath, metadata);
+        this.codeSnapshotFreshReceipts.delete(metadata.receiptId);
+      }
       const clonePath = this.runnerClonePath(barePath, key);
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
       try {
@@ -2025,7 +2104,9 @@ export class GitCache {
           this.log.warn("checker clone cleanup failed", { error: gitErrorMessage(cleanup) }));
         throw err;
       }
-    });
+    };
+    return this.withLock(barePath, () => codeLeadRunId === undefined
+      ? clone() : this.withCodeSnapshotFence(barePath, codeLeadRunId, clone));
   }
 
   /**
@@ -3931,6 +4012,247 @@ export class GitCache {
    * same posture `refs/uzi-runner` / `refs/uzi-archive` rely on to survive gc), so the anchored
    * object stays reachable through bundle production even after the tracking ref moves.
    */
+  /** Local-only code snapshot. The caller supplies the literal head it imported from its quiescent clone. */
+  async pinCodeSnapshot(barePath: string, runId: string, head: string, defaultCommit: string, pin = true, pinGeneration = 0): Promise<{ head_commit: string; base_commit: string; freshReceipt?: CodeSnapshotFreshReceipt }> {
+    if (!CODE_ID.test(runId) || !CODE_SHA.test(head) || !CODE_SHA.test(defaultCommit) || !codeGeneration(pinGeneration))
+      throw new Error("invalid code snapshot identity");
+    await this.assertOwedBare(barePath);
+    const operation = async (): Promise<{ head_commit: string; base_commit: string; freshReceipt?: CodeSnapshotFreshReceipt }> => {
+      for (const commit of [head, defaultCommit]) {
+        if ((await this.runGit(barePath, ["rev-parse", "--verify", `${commit}^{commit}`])).trim() !== commit)
+          throw new Error("code snapshot object unavailable");
+      }
+      const base = (await this.runGit(barePath, ["merge-base", defaultCommit, head])).trim();
+      if (!CODE_SHA.test(base) || (await this.runGit(barePath, ["rev-parse", "--verify", `${base}^{commit}`])).trim() !== base)
+        throw new Error("code snapshot merge base unavailable");
+      if (!pin) return { head_commit: head, base_commit: base };
+      const ref = `refs/uzi-cross-check/${runId}`;
+      const existing = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", "-q", ref])).trim();
+      if (existing !== "" && existing !== head) throw new Error("code snapshot ref moved");
+      const old = await this.readCodeSnapshotMetadata(barePath, runId);
+      if (old || existing !== "") {
+        if (!old || existing !== head || old.head !== head || old.pinGeneration !== pinGeneration)
+          throw new Error("code snapshot identity unavailable or changed");
+        return { head_commit: head, base_commit: base };
+      }
+      const receiptId = randomUUID();
+      // Metadata first: an interrupted create can never acquire fresh-empty authority later.
+      await this.writeCodeSnapshotMetadata(barePath, {
+        version: 1, leadId: runId, head, pinGeneration, receiptId, latestChild: null, readers: [],
+      });
+      await this.runGit(barePath, ["update-ref", ref, head, ""]);
+      if (this.codeSnapshotFreshReceipts.size >= 256) return { head_commit: head, base_commit: base };
+      this.codeSnapshotFreshReceipts.add(receiptId);
+      return { head_commit: head, base_commit: base,
+        freshReceipt: { leadId: runId, head, pinGeneration, receiptId } };
+    };
+    return this.withLock(barePath, () => pin
+      ? this.withCodeSnapshotFence(barePath, runId, operation) : operation());
+  }
+
+  async codeSnapshotTip(barePath: string, runId: string): Promise<string> {
+    if (!CODE_ID.test(runId)) throw new Error("invalid code snapshot owner");
+    return this.withLock(barePath, async () => (await this.runGit(barePath,
+      ["rev-parse", "--verify", `refs/uzi-cross-check/${runId}^{commit}`])).trim());
+  }
+
+  /** Cooperating CODE writers attempt once, without waiting or reaping another fence.
+   * Any failure retains this fence; no sibling lead is blocked by its pathname.
+   * The owned private bare excludes repo actors; hostile same-UID replacement is unsupported. */
+  private async withCodeSnapshotFence<T>(barePath: string, leadId: string, fn: () => Promise<T>): Promise<T> {
+    if (!CODE_ID.test(leadId)) throw new Error("invalid code snapshot fence owner");
+    const dir = await this.ensureOwedDirectory(barePath, "uzi-code-snapshots");
+    const name = path.join(dir, `code-snapshot-${leadId}.fence`);
+    // Exclusive creation is cross-process authority. Existing, busy and stale all fail closed.
+    const file = await fs.open(name, fsConstants.O_WRONLY | fsConstants.O_CREAT |
+      fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    try {
+      const held = await file.stat();
+      const safe = (st: Stats): boolean => st.isFile() && st.uid === process.getuid?.() &&
+        (st.mode & 0o077) === 0;
+      if (!safe(held)) throw new Error("unsafe code snapshot fence");
+      await file.sync();
+      const directory = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      try {
+        await directory.sync();
+        const result = await fn();
+        const current = await fs.lstat(name);
+        if (!safe(current) || current.dev !== held.dev || current.ino !== held.ino)
+          throw new Error("code snapshot fence replaced");
+        await fs.unlink(name);
+        await directory.sync();
+        return result;
+      } finally { await directory.close(); }
+    } finally { await file.close(); }
+  }
+
+  private codeSnapshotName(leadId: string): string {
+    return `code-snapshot-${leadId}.json`;
+  }
+
+  private codeSnapshotToken(metadata: CodeSnapshotMetadata): string {
+    return createHash("sha256").update(JSON.stringify(metadata)).digest("hex");
+  }
+
+  private async readCodeSnapshotMetadata(barePath: string, leadId: string): Promise<CodeSnapshotMetadata | undefined> {
+    const raw = await this.readOwedFile(barePath, this.codeSnapshotName(leadId), "uzi-code-snapshots");
+    if (raw === undefined) return undefined;
+    const m = raw as CodeSnapshotMetadata;
+    const keys = (v: object): string => Object.keys(v).sort().join(",");
+    if (!m || keys(m) !== "head,latestChild,leadId,pinGeneration,readers,receiptId,version" ||
+        m.version !== 1 || m.leadId !== leadId || !CODE_ID.test(m.leadId) || !CODE_SHA.test(m.head) ||
+        !codeGeneration(m.pinGeneration) || !CODE_UUID.test(m.receiptId) ||
+        !Array.isArray(m.readers) || m.readers.length > CODE_MAX_READERS ||
+        (m.latestChild !== null && (!m.latestChild || keys(m.latestChild) !== "childGeneration,childId" ||
+          !CODE_UUID.test(m.latestChild.childId) || !codeGeneration(m.latestChild.childGeneration)))) {
+      throw new Error("invalid code snapshot metadata");
+    }
+    const seen = new Set<string>();
+    for (const r of m.readers) {
+      if (!r || keys(r) !== "childGeneration,childId,readerKey,state" ||
+          !CODE_UUID.test(r.childId) || !codeGeneration(r.childGeneration) ||
+          !CODE_READER_KEY.test(r.readerKey) || !r.readerKey.startsWith(`cross-check-${r.childId}-`) ||
+          !["OPEN", "CLOSED"].includes(r.state) || seen.has(r.readerKey) || !m.latestChild ||
+          r.childGeneration > m.latestChild.childGeneration ||
+          (r.childGeneration === m.latestChild.childGeneration && r.childId !== m.latestChild.childId)) {
+        throw new Error("invalid code snapshot reader history");
+      }
+      seen.add(r.readerKey);
+    }
+    if ((m.latestChild === null) !== (m.readers.length === 0) ||
+        (m.latestChild && !m.readers.some(r => r.childId === m.latestChild!.childId &&
+          r.childGeneration === m.latestChild!.childGeneration))) throw new Error("missing code snapshot reader history");
+    return m;
+  }
+
+  private async writeCodeSnapshotMetadata(barePath: string, metadata: CodeSnapshotMetadata): Promise<void> {
+    if (metadata.readers.length > CODE_MAX_READERS || Buffer.byteLength(JSON.stringify(metadata)) + 1 > 65536)
+      throw new Error("code snapshot metadata limit");
+    await this.writeOwedFile(barePath, this.codeSnapshotName(metadata.leadId), metadata, "uzi-code-snapshots");
+  }
+
+  /** Caller proves cleanup of this exact reader and exact server child terminality separately. */
+  async closeCodeSnapshotReader(barePath: string, leadId: string, checkoutOrKey: string,
+    proof: CodeSnapshotReaderProof): Promise<void> {
+    const evidence = proof && structuredClone(proof);
+    if (!CODE_ID.test(leadId) || !evidence || evidence.cleanupConfirmed !== true ||
+        !CODE_UUID.test(evidence.childId) || !codeGeneration(evidence.childGeneration) || !codeTerminal(evidence.terminalStatus))
+      throw new Error("code snapshot reader close proof required");
+    const readerKey = path.basename(checkoutOrKey);
+    if (!CODE_READER_KEY.test(readerKey) ||
+        (checkoutOrKey !== readerKey && checkoutOrKey !== this.runnerClonePath(barePath, readerKey)))
+      throw new Error("invalid code snapshot checkout identity");
+    await this.assertOwedBare(barePath);
+    await this.withLock(barePath, () => this.withCodeSnapshotFence(barePath, leadId, async () => {
+      const m = await this.readCodeSnapshotMetadata(barePath, leadId);
+      const r = m?.readers.find(entry => entry.readerKey === readerKey &&
+        entry.childId === evidence.childId && entry.childGeneration === evidence.childGeneration);
+      if (!m || !r) throw new Error("code snapshot reader proof mismatch");
+      r.state = "CLOSED";
+      await this.writeCodeSnapshotMetadata(barePath, m);
+    }));
+  }
+
+  /** No proof is retention. Boot tokens are observations, revalidated against disk under the bare lock. */
+  async deleteCodeSnapshot(barePath: string, runId: string, head: string,
+    proof?: CodeSnapshotRetirementProof): Promise<void> {
+    if (!CODE_ID.test(runId) || !CODE_SHA.test(head)) throw new Error("invalid code snapshot identity");
+    if (!proof) throw new Error("code snapshot retirement proof required");
+    // Snapshot caller evidence before awaiting: it must not change during the final CAS.
+    const evidence = structuredClone(proof);
+    await this.assertOwedBare(barePath);
+    await this.withLock(barePath, () => this.withCodeSnapshotFence(barePath, runId, async () => {
+      const m = await this.readCodeSnapshotMetadata(barePath, runId);
+      const outcome = evidence.sealedOutcome;
+      if (!m || m.head !== head || !outcome || outcome.persisted !== true || outcome.sealed !== true || outcome.stage !== "code" ||
+          outcome.leadId !== runId || outcome.head !== head || outcome.pinGeneration !== m.pinGeneration ||
+          !["completed", "failed"].includes(outcome.outcome) || m.readers.some(r => r.state !== "CLOSED"))
+        throw new Error("code snapshot retirement evidence incomplete");
+      const token = this.codeSnapshotToken(m);
+      const boot = evidence.bootCandidate;
+      if (boot && (boot.barePath !== barePath || boot.leadId !== runId || boot.head !== head ||
+          boot.metadataToken !== token || !["terminal", "foreign"].includes(evidence.leadDisposition ?? "")))
+        throw new Error("code snapshot boot evidence changed");
+      if (m.latestChild) {
+        const child = evidence.child;
+        if (evidence.freshNoReader || !child || child.childId !== m.latestChild.childId ||
+            child.childGeneration !== m.latestChild.childGeneration || !codeTerminal(child.terminalStatus))
+          throw new Error("code snapshot latest child proof required");
+      } else {
+        const fresh = evidence.freshNoReader;
+        const receipt = fresh?.receipt;
+        if (boot || evidence.child || !fresh || fresh.serverAtomicallyTerminalNoChild !== true ||
+            !receipt || receipt.leadId !== runId || receipt.head !== head ||
+            receipt.pinGeneration !== m.pinGeneration || receipt.receiptId !== m.receiptId ||
+            !this.codeSnapshotFreshReceipts.has(receipt.receiptId) || m.readers.length !== 0)
+          throw new Error("code snapshot fresh no-reader receipt required");
+      }
+      const tip = (await this.runGit(barePath, ["rev-parse", "--verify", `refs/uzi-cross-check/${runId}`])).trim();
+      const current = await this.readCodeSnapshotMetadata(barePath, runId);
+      if (!current || this.codeSnapshotToken(current) !== token || tip !== head)
+        throw new Error("code snapshot changed before retirement");
+      await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-cross-check/${runId}`, head]);
+      await this.removeOwedFile(barePath, this.codeSnapshotName(runId), false, "uzi-code-snapshots");
+      this.codeSnapshotFreshReceipts.delete(m.receiptId);
+    }));
+  }
+
+  /** A closed-reader observation for one known lead, freshly read from the owned bare. */
+  async codeSnapshotCandidate(barePath: string, leadId: string): Promise<CodeSnapshotBootCandidate | undefined> {
+    if (!CODE_ID.test(leadId)) throw new Error("invalid code snapshot owner");
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const metadata = await this.readCodeSnapshotMetadata(barePath, leadId);
+      if (!metadata || metadata.readers.some(r => r.state !== "CLOSED")) return undefined;
+      const head = (await this.runGit(barePath, ["rev-parse", "--verify", `refs/uzi-cross-check/${leadId}`])).trim();
+      if (head !== metadata.head) throw new Error("code snapshot ref moved");
+      return { barePath, leadId, head, metadataToken: this.codeSnapshotToken(metadata), metadata };
+    });
+  }
+
+  /** At most 256 known bares and 256 refs per bare, no retries; each git call uses GIT_TIMEOUT_MS.
+   * An unreadable bare is retained and does not block sibling discovery. */
+  async discoverCodeSnapshots(): Promise<CodeSnapshotBootCandidate[]> {
+    const result: CodeSnapshotBootCandidate[] = [];
+    let directory: Awaited<ReturnType<typeof fs.opendir>>;
+    try { directory = await fs.opendir(this.reposRoot); }
+    catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw cause;
+    }
+    let count = 0;
+    for await (const entry of directory) {
+      if (++count > 256) break;
+      const barePath = path.join(path.resolve(this.reposRoot), entry.name);
+      try {
+        await this.assertOwedBare(barePath);
+        await this.withLock(barePath, async () => {
+          const output = await this.runGit(barePath,
+            ["for-each-ref", "--count=257", "--format=%(refname) %(objectname)", "refs/uzi-cross-check/"]);
+          if (Buffer.byteLength(output) > 65536) return;
+          const lines = output.split("\n").filter(Boolean);
+          if (lines.length > 256) return;
+          for (const line of lines) {
+            const parts = line.split(" ");
+            const leadId = parts[0]?.slice("refs/uzi-cross-check/".length);
+            if (parts.length !== 2 || !parts[0]?.startsWith("refs/uzi-cross-check/") ||
+                !leadId || !CODE_ID.test(leadId) || !CODE_SHA.test(parts[1]!)) continue;
+            try {
+              const metadata = await this.readCodeSnapshotMetadata(barePath, leadId);
+              if (!metadata || metadata.head !== parts[1] || metadata.readers.some(r => r.state === "OPEN")) continue;
+              result.push({ barePath, leadId, head: metadata.head, metadataToken: this.codeSnapshotToken(metadata), metadata });
+            } catch { /* Unknown or malformed metadata retains this exact ref. */ }
+          }
+        });
+      } catch (cause) {
+        this.log.warn("code snapshot boot discovery retained unsafe or unreadable bare", {
+          bare: barePath, error: gitErrorMessage(cause),
+        });
+      }
+    }
+    return result;
+  }
+
   async anchorRecoveryHead(
     barePath: string,
     runId: string,
@@ -8304,13 +8626,15 @@ export class GitCache {
     }
   }
 
-  private owedDirectory(barePath: string): string { return path.join(barePath, "uzi-owed"); }
+  private owedDirectory(barePath: string, directoryName: LocalMetadataDirectory = "uzi-owed"): string {
+    return path.join(barePath, directoryName);
+  }
   private receiptName(branch: string): string {
     return createHash("sha256").update(branch).digest("hex");
   }
 
-  private async ensureOwedDirectory(barePath: string): Promise<string> {
-    const dir = this.owedDirectory(barePath);
+  private async ensureOwedDirectory(barePath: string, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<string> {
+    const dir = this.owedDirectory(barePath, directoryName);
     try {
       await fs.mkdir(dir, { mode: 0o700 });
       const parent = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
@@ -8326,8 +8650,8 @@ export class GitCache {
   }
 
   /** ENOENT alone means absent. Bounded regular-file no-follow read, worker ownership required. */
-  private async readOwedFile(barePath: string, name: string): Promise<unknown | undefined> {
-    const dir = this.owedDirectory(barePath);
+  private async readOwedFile(barePath: string, name: string, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<unknown | undefined> {
+    const dir = this.owedDirectory(barePath, directoryName);
     try {
       const st = await fs.lstat(dir);
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
@@ -8357,8 +8681,8 @@ export class GitCache {
   }
 
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
-  private async writeOwedFile(barePath: string, name: string, value: unknown): Promise<void> {
-    const dir = await this.ensureOwedDirectory(barePath);
+  private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<void> {
+    const dir = await this.ensureOwedDirectory(barePath, directoryName);
     const temp = path.join(dir, `.tmp-${randomUUID()}`);
     const file = await fs.open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT |
       fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
@@ -8368,18 +8692,18 @@ export class GitCache {
     } finally { await file.close(); }
     try {
       // Read an existing destination to reject symlinks, FIFOs and foreign-owned files.
-      await this.readOwedFile(barePath, name);
+      await this.readOwedFile(barePath, name, directoryName);
       await fs.rename(temp, path.join(dir, name));
       const directory = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
       try { await directory.sync(); } finally { await directory.close(); }
-      if (JSON.stringify(await this.readOwedFile(barePath, name)) !== JSON.stringify(value)) {
+      if (JSON.stringify(await this.readOwedFile(barePath, name, directoryName)) !== JSON.stringify(value)) {
         throw new Error("owed metadata readback mismatch");
       }
     } finally { await fs.rm(temp, { force: true }); }
   }
 
-  private async removeOwedFile(barePath: string, name: string, allowMissing = false): Promise<void> {
-    const dir = this.owedDirectory(barePath);
+  private async removeOwedFile(barePath: string, name: string, allowMissing = false, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<void> {
+    const dir = this.owedDirectory(barePath, directoryName);
     try { await fs.unlink(path.join(dir, name)); }
     catch (err) {
       if (allowMissing && (err as NodeJS.ErrnoException).code === "ENOENT") return;

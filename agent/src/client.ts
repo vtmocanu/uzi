@@ -96,6 +96,8 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding } from "./code-cross-check-contract.js";
+
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -1382,6 +1384,11 @@ export class WorkerClient {
       throw new Error("guarded generation cannot downgrade its claim assertion");
     }
     if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
+    // Legacy lane envelopes may omit the candidate; CrossCheckRunner refuses those
+    // before opening a reader. A present candidate always uses stage-specific validation.
+    if (claim?.kind === "cross_check" && claim.cross_check !== undefined) {
+      claim.cross_check = decodeCrossCheckClaim(claim.cross_check);
+    }
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
     // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -1537,6 +1544,25 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
+  async codeCrossCheckStatus(runId: string, generation: number, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    return decodeCodeCrossCheckStatus(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/code/latest?claim_generation=${generation}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal));
+  }
+
+  async submitCodeCrossCheck(runId: string, generation: number,
+    snapshot: { head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
+    signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
+      { stage: "code", claim_generation: generation, ...snapshot }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+  }
+
+  async reportCodeCrossCheckVerdict(runId: string, generation: number,
+    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[] }, signal?: AbortSignal): Promise<void> {
+    decodeCodeFindings(result.findings);
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
+      { claim_generation: generation, ...result }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
   async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal, round = 1): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
@@ -2028,6 +2054,11 @@ export class WorkerClient {
    *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
+  async getCodeSnapshotCleanup(leadId: string, signal?: AbortSignal): Promise<CodeSnapshotCleanup> {
+    return decodeCodeSnapshotCleanup(await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${leadId}/ownership?purpose=code_snapshot`, 3000, 16 * 1024, signal));
+  }
+
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
     // Bound actual streamed bytes before ownership can authorize recovery retirement.
     return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024)) as RunOwnershipResponse;

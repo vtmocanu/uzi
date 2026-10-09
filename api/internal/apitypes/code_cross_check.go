@@ -23,4 +23,5 @@ type CodeCrossCheck struct {
 	InterruptedAt       *time.Time      `json:"interrupted_at"`
 	FinalizedAt         *time.Time      `json:"finalized_at"`
 	DeadlineAt          time.Time       `json:"deadline_at"`
+	Usage               *UsageDTO       `json:"usage,omitempty"`
 }

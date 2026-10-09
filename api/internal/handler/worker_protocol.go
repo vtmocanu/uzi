@@ -1620,6 +1620,10 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, cleanup := r.URL.Query()["purpose"]; cleanup {
+		h.workerCodeSnapshotCleanup(w, r, wkr, runID)
+		return
+	}
 	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {

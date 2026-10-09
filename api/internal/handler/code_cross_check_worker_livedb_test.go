@@ -102,6 +102,28 @@ func TestCodeCrossCheckStageDiscriminationLiveDB(t *testing.T) {
 	if status != "running" || settled {
 		t.Fatal("code route approved or parked lead")
 	}
+	checked, err := h.q.GetRunByID(t.Context(), other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noUsage apitypes.RunDTO
+	h.overlayPlanCrossCheckSummary(t.Context(), owner, checked, &noUsage)
+	if noUsage.CodeCrossCheckSummary == nil || noUsage.CodeCrossCheckSummary.Usage != nil {
+		t.Fatal("missing child usage invented a cost")
+	}
+	cliMustExec(t, pool, `INSERT INTO run_usage(run_id,model,input_tokens,cache_read_tokens,cache_creation_tokens,output_tokens,cost_usd,harness,cost_status) VALUES($1,'code-cost',10,20,30,40,1.25,'codex','metered')`, child)
+	var withUsage apitypes.RunDTO
+	h.overlayPlanCrossCheckSummary(t.Context(), owner, checked, &withUsage)
+	if withUsage.CodeCrossCheckSummary == nil || withUsage.CodeCrossCheckSummary.Usage == nil ||
+		withUsage.CodeCrossCheckSummary.Usage.CostUSD != 1.25 || withUsage.CodeCrossCheckSummary.Usage.CostStatus != "metered" ||
+		withUsage.CodeCrossCheckSummary.Usage.InputTokens != 10 {
+		t.Fatalf("recorded checker usage missing: %+v", withUsage.CodeCrossCheckSummary)
+	}
+	var nonOwnerUsage apitypes.RunDTO
+	h.overlayPlanCrossCheckSummary(t.Context(), uuid.New(), checked, &nonOwnerUsage)
+	if nonOwnerUsage.CodeCrossCheckSummary != nil {
+		t.Fatal("checker usage exposed to non-owner")
+	}
 	run, err := h.q.GetRunByID(t.Context(), lead)
 	if err != nil {
 		t.Fatal(err)

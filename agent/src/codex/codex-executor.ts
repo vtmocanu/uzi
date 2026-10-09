@@ -2760,6 +2760,7 @@ export class CodexExecutor implements Executor {
       // Issue #1674 (PRD #265 M1 parity): the latched signal_done declaration, so the terminating
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
+      let declaredReportOnly = false;
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
@@ -2793,6 +2794,7 @@ export class CodexExecutor implements Executor {
         ...(completionHeld ? { completionHeld } : {}),
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
+        ...(isIssueRun && declaredReportOnly ? { reportOnly: true } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
@@ -3035,6 +3037,7 @@ export class CodexExecutor implements Executor {
           continue;
         }
         if (result.done) {
+          if (isIssueRun && result.reportOnly) declaredReportOnly = true;
           // Issue #1932: consult the secret-remediation gate BEFORE the persist/done checkpoint
           // publishes the branch. `remediate` re-prompts the SAME live epoch (no persist, no
           // recreate); `fail` stops (the runner already recorded the blocked state).
@@ -3047,6 +3050,7 @@ export class CodexExecutor implements Executor {
             if (secretDecision?.action === "fail") break;
           }
           if (!interlockedIssue) {
+            await ctx.codeCrossCheckGate?.({ interlocked: false, reportOnly: declaredReportOnly });
             // Issue #1514: same done-exit scope cap as sdk-executor's legacy done exit.
             if (isIssueRun) {
               const cap = scopeCapAtDone({
@@ -3077,7 +3081,10 @@ export class CodexExecutor implements Executor {
             declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
           });
           completionAttempted = true;
-          if (unmet.length === 0) break;
+          if (unmet.length === 0) {
+            await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly });
+            break;
+          }
           const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
           completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
           lastCompletionFingerprint = fingerprint;

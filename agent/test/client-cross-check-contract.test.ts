@@ -1,7 +1,86 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { WorkerClient, RequestError, isStrictDecodeError, isTransient, type PlanCrossCheckCandidate } from "../src/client.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, makeClaim } from "./helpers.js";
+
+it("cleanup metadata rejects ordinary ownership and nonexact identities", async (t) => {
+  const lead = "11111111-1111-4111-8111-111111111111";
+  const valid = { protocol: "code_snapshot_cleanup_v1", lead_run_id: lead,
+    head_commit: "a".repeat(40), outcome: "completed", lead_status: "running",
+    owned_by_worker: true, checker_run_id: "22222222-2222-4222-8222-222222222222",
+    checker_claim_generation: 1, checker_status: "completed" };
+  t.mock.method(globalThis, "fetch", async (url: Parameters<typeof fetch>[0]) => {
+    assert.match(String(url), /ownership\?purpose=code_snapshot/);
+    return Response.json(valid);
+  });
+  assert.deepEqual(await client().getCodeSnapshotCleanup(lead), valid);
+  for (const body of [{ status: "completed", claim_generation: 1 },
+    { ...valid, extra: true }, { ...valid, head_commit: valid.head_commit + "\\n" },
+    { ...valid, checker_claim_generation: 0 }]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(body));
+    await assert.rejects(client().getCodeSnapshotCleanup(lead), /invalid code snapshot cleanup/);
+  }
+});
+
+it("legacy plan claims and statuses decode without code-stage fields", async (t) => {
+  const legacy = makeClaim({ kind: "cross_check", cross_check: { stage: "plan", lead_run_id: "lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "legacy plan", milestones: [], required_capabilities: [], required_tools: [],
+    size_class: "s", base_commit: "a".repeat(40), planning_diff: "" } });
+  t.mock.method(globalThis, "fetch", async () => Response.json(legacy, { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+  const decoded = await client().claimCrossCheck();
+  assert.equal(decoded?.cross_check?.stage, "plan");
+  assert.equal(decoded?.code_cross_check_required, undefined);
+  assert.equal(decoded?.cross_check && "head_commit" in decoded.cross_check, false);
+  t.mock.method(globalThis, "fetch", async () => Response.json(wire()));
+  const status = await client().planCrossCheckStatus("lead", 3);
+  assert.equal(status.result, "candidate");
+  assert.equal("head_commit" in status, false);
+});
+
+it("production dedicated claim client discriminates stages and retains plan requirements", async (t) => {
+  const plan = makeClaim({ kind: "cross_check", cross_check: { stage: "plan", lead_run_id: "lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "plan", milestones: [], required_capabilities: [], required_tools: [],
+    size_class: "s", base_commit: "a".repeat(40), planning_diff: "" } });
+  for (const cross_check of [
+    { ...plan.cross_check, stage: "unknown" },
+    { ...plan.cross_check, planning_diff: undefined },
+    { ...plan.cross_check, milestones: undefined },
+    { ...plan.cross_check, stage: "code", head_commit: "bad", code_context: {} },
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...plan, cross_check },
+      { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+    await assert.rejects(client().claimCrossCheck(), /invalid cross-check claim/);
+  }
+  t.mock.method(globalThis, "fetch", async () => Response.json({ ...plan, cross_check: {
+    ...plan.cross_check, stage: "code", head_commit: "d".repeat(40), code_context: {},
+    planning_diff: undefined, guidance_snapshot: undefined,
+  } }, { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+  assert.equal((await client().claimCrossCheck())?.cross_check?.stage, "code");
+});
+
+it("production code verdict client rejects duplicate IDs, non-ASCII IDs and actual UTF-8 bounds before HTTP", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({}));
+  const finding = { id: "F1", severity: "major" as const, path: "source.ts", line: 1, title: "defect", detail: "" };
+  const valid = { ...finding, detail: "é".repeat(900) };
+  const c = client();
+  await c.reportCodeCrossCheckVerdict("child", 1, { outcome: "completed", findings: [valid] });
+  assert.equal(fetch.mock.callCount(), 1);
+  for (const findings of [
+    [finding, finding],
+    [{ ...finding, id: "é" }],
+    [{ ...finding, id: "valid_ID\n" }],
+    [{ ...finding, id: "valid_ID\r" }],
+    [{ ...finding, id: "control\u0000" }],
+    [{ ...finding, id: "ansi\u001b[31m" }],
+    [{ ...finding, id: "bidi\u202e" }],
+    [{ ...finding, detail: "é".repeat(1024) }],
+    Array.from({ length: 21 }, (_, i) => ({ ...finding, id: String(i) })),
+    Array.from({ length: 20 }, (_, i) => ({ ...valid, id: String(i) })),
+  ]) await assert.rejects(c.reportCodeCrossCheckVerdict("child", 1, { outcome: "completed", findings }), /invalid code/);
+  assert.equal(fetch.mock.callCount(), 1, "invalid output never reaches HTTP");
+});
 
 const candidate: PlanCrossCheckCandidate = { plan_md: "plan", planning_diff: "", milestones: [],
   required_capabilities: [], required_tools: [], size_class: "s", base_commit: "a".repeat(40) };

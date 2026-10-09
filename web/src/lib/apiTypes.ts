@@ -3498,6 +3498,7 @@ export interface PlanCrossCheckFinding {
 }
 
 export interface CodeCrossCheckSummary {
+  usage?: RunUsage | null;
   stage: string;
   round: number;
   candidate_generation: number;

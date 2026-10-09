@@ -7,7 +7,11 @@ import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import type { CrossCheckRunner } from "../src/cross-check-runner.js";
+import { CrossCheckRunner } from "../src/cross-check-runner.js";
+import { GitCache } from "../src/git.js";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { makeFixture } from "./fixture-repo.js";
 import type { StatsCollector } from "../src/stats.js";
 import type { DiskPressureController } from "../src/disk-reclaim.js";
 import type { DindMaintenanceController } from "../src/dind-maintenance.js";
@@ -17,7 +21,7 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { ActiveSnapshot, ClaimResponse } from "../src/protocol.js";
 import { latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
-import { recordingLogger } from "./helpers.js";
+import { recordingLogger, makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 
 resetResidueQuarantineAfterEach();
 const tick = (ms = 2) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -161,6 +165,108 @@ it("cross-check cap is independent of a full run slot, snapshots see both, and s
   assert.equal(h.state.protected, 0);
   assert.equal(h.state.admissions, 0);
   assert.equal(h.gate.inFlightClaims(), 0);
+});
+
+it("code child dispatch uses the dedicated pool through settlement, reader cleanup and cancellation", async (t) => {
+  const h = build(1);
+  const fx = makeFixture({ "source.txt": "committed code\n" });
+  const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  const bare = await git.ensureClone(fx.originPath, "");
+  const head = execFileSync("git", ["-C", bare, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const leadIds: string[] = [randomUUID(), randomUUID()];
+  const childIds = [randomUUID(), randomUUID()];
+  for (const lead of leadIds) await git.pinCodeSnapshot(bare, lead, head, head);
+  const releaseLead = deferred();
+  const firstTurn = deferred();
+  const cleanupStarted = deferred();
+  const cleanupRelease = deferred();
+  let runClaims = 0;
+  let codeClaims = 0;
+  let modelCalls = 0;
+  const states = new Map<string, string>();
+  const verdicts: string[] = [];
+  const actualClient = {
+    reportState: async (id: string, body: { status: string }) => {
+      states.set(id, body.status);
+      return { applied: true };
+    },
+    getInputs: async () => ({ inputs: [] }),
+    postMessages: async () => {},
+    getCodeSnapshotCleanup: async (lead: string) => {
+      const childId = childIds[leadIds.indexOf(lead)]!;
+      const status = states.get(childId);
+      return { protocol: "code_snapshot_cleanup_v1", lead_run_id: lead, head_commit: head,
+        outcome: status === "completed" ? "completed" : "failed", lead_status: "running",
+        owned_by_worker: true, checker_run_id: childId, checker_claim_generation: 2,
+        checker_status: status };
+    },
+    reportCodeCrossCheckVerdict: async (id: string) => { verdicts.push(id); },
+  } as unknown as WorkerClient;
+  const child = (n: number) => makeClaim({
+    run_id: childIds[n - 1]!, kind: "cross_check", claim_generation: 2,
+    repo: { id: "repo", url: "https://example.com/repo", clone_url: fx.originPath },
+    secrets: { forge_pat: "", codex: { auth_mode: "api_key", access_token: "fixture-access", capability: "fixture-cap" } },
+    cross_check: { stage: "code", lead_run_id: leadIds[n - 1]!, round: 1, head_commit: head, base_commit: head,
+      candidate_digest: "a".repeat(64), deadline_at: new Date(Date.now() + 30000).toISOString(),
+      plan_md: "", milestones: [], required_capabilities: [], required_tools: [], size_class: "",
+      code_context: {}, guidance_snapshot: "" },
+  });
+  t.mock.method(git, "ensureClone", async () => { assert.fail("code dispatch cannot fetch origin"); });
+  const remove = git.removeRunnerClone.bind(git);
+  t.mock.method(git, "removeRunnerClone", async (checkout: string) => {
+    if (states.get(childIds[0]!) === "completed" && codeClaims === 1) {
+      assert.equal(await git.codeSnapshotTip(bare, leadIds[0]!), head);
+      cleanupStarted.resolve();
+      await cleanupRelease.promise;
+    }
+    await remove(checkout);
+  });
+  const checker = new CrossCheckRunner(actualClient, git, nullLogger(), {
+    homeRoot: fx.dataDir, pollMs: 2, activeRuns: h.registry,
+    model: { run: async (_c, checkout, _home, signal, _usage, cleanupConfirmed) => {
+      try {
+        assert.equal(execFileSync("git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
+        if (++modelCalls === 1) { await firstTurn.promise; return '{"findings":[]}'; }
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        signal.throwIfAborted();
+        return '{"findings":[]}';
+      } finally { cleanupConfirmed?.(); }
+    } },
+  });
+  h.runner.execute = async () => { await releaseLead.promise; };
+  h.client.claimRun = async () => claim("ordinary-" + ++runClaims, "issue");
+  h.client.claimCrossCheck = async () => ++codeClaims <= 2 ? child(codeClaims) : null;
+  h.checker.execute = (c, signal) => checker.execute(c, signal);
+  const done = h.worker.run(h.controller.signal);
+  try {
+    await until(() => modelCalls === 1 && runClaims === 1);
+    await tick(10);
+    assert.equal(codeClaims, 1, "no overclaim while model reads");
+    firstTurn.resolve();
+    await cleanupStarted.promise;
+    await tick(10);
+    assert.equal(codeClaims, 1, "slot includes reader cleanup after terminal settlement");
+    cleanupRelease.resolve();
+    await until(() => modelCalls === 2);
+    await assert.rejects(git.codeSnapshotTip(bare, leadIds[0]!));
+    assert.equal(runClaims, 1, "code lane does not occupy or free ordinary slots");
+    assert.equal(await git.codeSnapshotTip(bare, leadIds[1]!), head, "live cancelled reader still owns pin");
+  } finally {
+    firstTurn.resolve(); cleanupRelease.resolve(); releaseLead.resolve();
+    h.controller.abort();
+    await done;
+    try {
+      await assert.rejects(git.codeSnapshotTip(bare, leadIds[1]!), "cancelled child releases pin after cleanup");
+    } finally { fx.cleanup(); }
+  }
+  assert.deepEqual(verdicts, childIds);
+  assert.equal(states.get(childIds[1]!), "failed");
+  assert.equal(h.state.protected, 0);
+  assert.equal(h.state.admissions, 0);
+  assert.equal(h.worker.isIdle(), true);
 });
 
 it("a checker alone makes the worker busy, and freeing its slot admits the queued checker", async () => {

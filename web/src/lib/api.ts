@@ -535,6 +535,8 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  setCodeCrossCheckEnabled: (code: boolean) =>
+    request<{ user: User; warning?: string }>("PUT", "/me/cross-check", { code }),
   setPlanCrossCheckEnabled: (plan: boolean) =>
     request<{ user: User; warning?: string }>("PUT", "/me/cross-check", { plan }),
   // Flip the current user's CI-autofix opt-in (PRD #71). Session identity only —

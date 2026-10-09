@@ -490,6 +490,8 @@ export interface RunContext {
    * Absent on the stub/test executors (treated as `proceed`).
    */
   secretRemediationGate?(): Promise<SecretRemediationDecision>;
+  /** Advisory U2 gate, only at an actual finalizing done exit; it never requests repairs. */
+  codeCrossCheckGate?(completion: { interlocked: boolean; reportOnly?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }): Promise<{ action: "proceed" }>;
   /**
    * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
    * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a

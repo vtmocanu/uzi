@@ -61,6 +61,21 @@ export function RunDefaults() {
   const [crossCheckError, setCrossCheckError] = useState("");
   const [crossCheckWarning, setCrossCheckWarning] = useState("");
 
+  const toggleCodeCrossCheck = async (code: boolean) => {
+    setCrossCheckError("");
+    setCrossCheckWarning("");
+    setCrossCheckBusy(true);
+    try {
+      const response = await api.setCodeCrossCheckEnabled(code);
+      await refresh();
+      setCrossCheckWarning(response.warning ?? "");
+    } catch (err) {
+      setCrossCheckError(errorMessage(err, "Failed to update code cross-check"));
+    } finally {
+      setCrossCheckBusy(false);
+    }
+  };
+
   const togglePlanCrossCheck = async (plan: boolean) => {
     setCrossCheckError("");
     setCrossCheckWarning("");
@@ -584,6 +599,15 @@ export function RunDefaults() {
           />
           <span className="text-fg">Plan cross-check · Required before implementation</span>
         </label>
+        <label className="flex items-center gap-3 text-sm">
+          <input type="checkbox" className="h-4 w-4 accent-brand"
+            aria-describedby="code-cross-check-help"
+            checked={user?.code_cross_check_enabled ?? false}
+            disabled={crossCheckBusy}
+            onChange={(e) => toggleCodeCrossCheck(e.target.checked)} />
+          <span className="text-fg">Code cross-check · Advisory before publication</span>
+        </label>
+        <p id="code-cross-check-help" className="text-sm text-muted">Adds the other model family's findings to the merge request; never blocks it</p>
         {committedSettings && <CrossCheckDefaults settings={committedSettings} />}
       </Card>
 
