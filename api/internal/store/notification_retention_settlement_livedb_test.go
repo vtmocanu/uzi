@@ -219,6 +219,9 @@ func TestNotificationDeliveryRetentionSettlementLiveDB(t *testing.T) {
 	// A stamp signal precedes pruning; wait for the retained IDs AND the last stamp.
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	// Fail on retained rows before the fixture's database context expires.
+	retentionTimeout := time.NewTimer(5 * time.Second)
+	defer retentionTimeout.Stop()
 	for {
 		ids := f.readIDs(t, f.user)
 		var delivered bool
@@ -230,8 +233,10 @@ func TestNotificationDeliveryRetentionSettlementLiveDB(t *testing.T) {
 		}
 		select {
 		case <-ticker.C:
-		case <-f.ctx.Done():
+		case <-retentionTimeout.C:
 			t.Fatalf("retention did not converge: %v", ids)
+		case <-f.ctx.Done():
+			t.Fatalf("fixture expired before retention converged: %v", ids)
 		}
 	}
 	cancel()
