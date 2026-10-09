@@ -416,6 +416,7 @@ tasks:
       - task: test:semgrep-gate
       # Hermetic fixture tests only; aging real prices is advisory and never gates.
       - task: test:pricing-freshness
+      - task: test:pricing-freshness-issue
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -3103,6 +3104,11 @@ tasks:
     desc: hermetic pricing freshness CLI schema and calendar tests
     cmds:
       - bash scripts/pricing-freshness.test.sh
+
+  test:pricing-freshness-issue:
+    desc: hermetic test of the weekly pricing freshness tracking-issue sync (stub gh)
+    cmds:
+      - bash scripts/pricing-freshness-issue.test.sh
 
   # Explicit writer only; the codexprice mirror test detects drift in gates.
   codex-pricing:sync:
