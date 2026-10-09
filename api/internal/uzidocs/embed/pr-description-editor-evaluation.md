@@ -1,3 +1,8 @@
+---
+title: PR description editor evaluation
+audience: contributor
+---
+
 # PR description editor evaluation
 
 Milestone B compares the editor's baseline and revised system prompts against five frozen inputs in [the fixture directory](../fixtures/pr-description-editor/). The baseline is the exact DELIVERY_SYSTEM_PROMPT string from commit 57585dd6, without a trailing newline; its SHA-256 is 2891a46208957ff7f2f706de2c6d6730e697d99775b0aed52ebffd4a75d7bdfc. The evaluator checks that hash before each pass. Both modes use the same DeliveryContext, model, code availability, lead verification stamped at a 40-character SHA, completion and body context. Each request gets production fence nonces.
