@@ -1,6 +1,6 @@
 # PRD #2559: API-equivalent cost for Codex subscription runs
 
-**Status**: Implemented and reviewed; PR publication authorized, M1 validation pending at the final PR head. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
+**Status**: Implemented and reviewed; M1 complete for publication under the owner's M1.c1 waiver. This PRD remains active; passing agent CI on the final PR head is required before merge. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
 
 Planning facts were read at `main` `140b5c767` (after #2552, which rewrote the aggregate disclosure wording).
 
@@ -94,22 +94,24 @@ Blocked by: none.
 
 Both agent producers, the type cleanup, every reader and mock above, docs/ADR/spec/changelog, and the tests, in one slice: after it, a new subscription run shows a dollar figure everywhere and a stored `subscription` row reads "no estimate" everywhere.
 
-Acceptance: examples 1 to 6 hold in tests; `task gate:agent`, `task gate:web`, `task gate:api`, `task gate:repo` green; `task check-docs:web` green; `TestEmbeddedDocsMatchSource` green after `task docs:sync`.
+Acceptance: examples 1 to 6 hold in tests; `task gate:agent`, `task gate:web`, `task gate:api`, `task gate:repo` green; `task check-docs:web` green; `TestEmbeddedDocsMatchSource` green after `task docs:sync`. The human owner's publication-only waiver of the local agent-gate criterion (M1.c1) is recorded below; that gate has not passed locally. Required final-head agent CI remains a merge condition.
 
 ## Verification checklist (2026-10-09)
 
 Evidence below composes producer, persistence, aggregate and renderer tests;
 it is **not an actual-provider end-to-end cost test**. The implementation and
-documentation have passed fixed-commit reviewer/tester coverage. M1 is not
-marked complete and this PRD stays active because the full agent gate is red.
+documentation have passed fixed-commit reviewer/tester coverage. The local
+full agent gate has not passed.
 
-On 2026-10-09, the human authorized finishing implementation and opening the
-PR with this local verification gap disclosed. This does not waive acceptance
-or merging: M1 validation remains pending until GitHub CI's required agent
-test jobs pass on the final PR head. The landing session enforces that
-condition. Recovery code and the failing tests are unchanged by this task.
-Do not mark this PRD complete or move it to `prds/done/` before that condition
-is satisfied.
+On 2026-10-09, the human owner authorized waiving M1's full local
+`task gate:agent` criterion (M1.c1) so M1 can complete for PR publication.
+This supersedes the earlier decision to keep M1 pending before publication;
+it does not waive the merge condition. GitHub CI's required agent test jobs
+must pass on the final PR head, enforced by the landing session. If the
+completion interlock blocks on M1.c1, the owner will record its accept
+decision. Recovery code and the failing tests are unchanged by this task;
+no further agent-gate investigation is authorized. Keep this PRD active and
+do not move it to `prds/done/` while final-head agent CI remains unresolved.
 
 - [x] Unit A (`ea707` + fix `192413`): producer pricing coverage has literal
   $1.278 = $0.293 low-tier + $0.985 high-tier in
@@ -147,7 +149,11 @@ is satisfied.
   passed, zero skips/cancellations; its required Claude/U, Codex/U and Codex/P
   completeness matrix passed. This checks conformance, not a real-provider
   cost run.
-- [ ] Passing full `task gate:agent` and final M1 completion. Three completed
+- [x] M1 complete for publication under the human owner's M1.c1 waiver;
+  this is acceptance of the documented local verification gap, not a test pass.
+- [ ] GitHub CI's required agent test jobs pass on the final PR head before merge.
+- [ ] Passing full local `task gate:agent` (M1.c1 waived for publication).
+  Three completed
   full runs (`7ML8PD`, `ELKW5e`, `JlKdkk`) each reported 11,226 passes,
   one failure, three skips and no cancellations, then exited 201. They failed
   different assertions in unchanged plan-replay/cancellation test files:
