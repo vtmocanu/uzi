@@ -1277,6 +1277,8 @@ export interface ClaimResponse {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** Independent code-check consent snapshot. Absent on older APIs means disabled. */
+  code_cross_check_required?: boolean;
   /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's
    *  checked-plan submission. Absent on older servers, so a Codex lead parks as
    *  codex_lead_unsupported instead of submitting to an api that would refuse it. */

@@ -14,6 +14,7 @@ type UserDTO struct {
 	// (PRD #19 M3, Decision 4). Default false; toggled from the user's Settings page.
 	AutopilotEnabled      bool `json:"autopilot_enabled"`
 	PlanCrossCheckEnabled bool `json:"plan_cross_check_enabled"`
+	CodeCrossCheckEnabled bool `json:"code_cross_check_enabled"`
 	// WaitOnLimit is the user's DEFAULT for the usage-limit park (PRD #35
 	// Decision 7): whether a NEW run parks until their Anthropic window reopens
 	// rather than failing. Default false.

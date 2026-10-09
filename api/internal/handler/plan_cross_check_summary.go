@@ -2,9 +2,11 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -19,7 +21,21 @@ func (h *Handler) overlayPlanCrossCheckSummary(ctx context.Context, viewerID uui
 	if err != nil {
 		// Do not log query error text: a malformed legacy row can contain prose.
 		slog.Warn("resolve plan cross-check summary", "run_id", run.ID)
+	} else {
+		dto.PlanCrossCheckSummary = summary
+	}
+	// Old plan-only responses and consent-off runs need no code lookup.
+	if !run.CodeCrossCheckRequired {
 		return
 	}
-	dto.PlanCrossCheckSummary = summary
+	cc, err := h.q.GetCodeCrossCheckForOwner(ctx, store.GetCodeCrossCheckForOwnerParams{LeadRunID: run.ID, UserID: viewerID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return
+	}
+	if err != nil {
+		slog.Warn("resolve code cross-check summary", "run_id", run.ID)
+		return
+	}
+	response := codeCrossCheckResponse(cc)
+	dto.CodeCrossCheckSummary = &response
 }

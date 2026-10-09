@@ -16,6 +16,8 @@ export interface User {
   autopilot_enabled: boolean;
   // Per-user consent for the required plan cross-check on new auto-approved runs.
   plan_cross_check_enabled?: boolean;
+  /** Independent advisory code-check consent; absent on older APIs means disabled. */
+  code_cross_check_enabled?: boolean;
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
@@ -2808,12 +2810,16 @@ export interface Run {
   issue_input_reason?: string | null;
   /** The run's snapshot of the owner's plan cross-check setting. */
   plan_cross_check_required: boolean;
+  /** Independent creation-time code-check consent snapshot. */
+  code_cross_check_required?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
   plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
   plan_cross_check_summary?: PlanCrossCheckSummary;
+  /** Owner-only persisted code evidence, independent of plan approval. */
+  code_cross_check_summary?: CodeCrossCheckSummary;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
    *  judge_rerun, resume, cross_check). A NOT NULL server column (DEFAULT 'manual'), so it is
@@ -3489,6 +3495,25 @@ export interface PlanCrossCheckFinding {
   severity: string;
   summary: string;
   rationale: string;
+}
+
+export interface CodeCrossCheckSummary {
+  stage: string;
+  round: number;
+  candidate_generation: number;
+  base_commit: string | null;
+  head_commit: string | null;
+  candidate_digest: string;
+  checker_run_id: string | null;
+  checker_harness: string | null;
+  checker_model: string | null;
+  checker_effort: string | null;
+  outcome: string;
+  reason_class: string | null;
+  findings: unknown;
+  interrupted_at: string | null;
+  finalized_at: string | null;
+  deadline_at: string;
 }
 
 export interface PlanCrossCheckSummary {

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,11 +14,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 type planCrossCheckRequest struct {
+	HeadCommit      string `json:"head_commit"`
+	ReasonClass     string `json:"reason_class"`
 	Round           *int32 `json:"round"`
 	Stage           string `json:"stage"`
 	ClaimGeneration *int64 `json:"claim_generation"`
@@ -25,16 +29,46 @@ type planCrossCheckRequest struct {
 }
 
 type crossCheckVerdictRequest struct {
-	ClaimGeneration *int64 `json:"claim_generation"`
-	Verdict         string `json:"verdict"`
-	ReasonClass     string `json:"reason_class"`
-	Summary         string `json:"summary"`
+	codeFields      bool
+	planFields      bool
+	ClaimGeneration *int64                            `json:"claim_generation"`
+	Outcome         string                            `json:"outcome"`
+	Findings        []workersvc.CodeCrossCheckFinding `json:"findings"`
+	Verdict         string                            `json:"verdict"`
+	ReasonClass     string                            `json:"reason_class"`
+	Summary         string                            `json:"summary"`
 	Items           []struct {
 		File      string `json:"file"`
 		Severity  string `json:"severity"`
 		Summary   string `json:"summary"`
 		Rationale string `json:"rationale"`
 	} `json:"items"`
+}
+
+func (req *crossCheckVerdictRequest) UnmarshalJSON(raw []byte) error {
+	type wire crossCheckVerdictRequest
+	var decoded wire
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*req = crossCheckVerdictRequest(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{"outcome", "findings"} {
+		if _, ok := fields[key]; ok {
+			req.codeFields = true
+		}
+	}
+	for _, key := range []string{"verdict", "summary", "items"} {
+		if _, ok := fields[key]; ok {
+			req.planFields = true
+		}
+	}
+	return nil
 }
 
 func crossCheckError(w http.ResponseWriter, err error) {
@@ -74,7 +108,31 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		}
 		return
 	}
-	if req.Stage != "plan" || req.ClaimGeneration == nil {
+	if req.Stage == "code" && req.ClaimGeneration != nil {
+		if (req.Round != nil && *req.Round != 1) || req.PlanMd != "" || req.SizeClass != "" ||
+			len(req.Milestones) != 0 || req.PlanningDiff != "" || len(req.RequiredCapabilities) != 0 || len(req.RequiredTools) != 0 {
+			httpx.ErrorReason(w, http.StatusBadRequest, "invalid code cross-check request", "candidate_invalid")
+			return
+		}
+		var cc store.CrossCheck
+		var err error
+		if req.ReasonClass != "" {
+			if req.BaseCommit != "" || req.HeadCommit != "" || (req.ReasonClass != "snapshot_failed" && req.ReasonClass != "worker_unsupported") {
+				httpx.Error(w, http.StatusBadRequest, "invalid pre-snapshot failure")
+				return
+			}
+			cc, err = h.wsvc.RecordCodeCrossCheckFailure(r.Context(), worker, id, *req.ClaimGeneration, "", "", req.ReasonClass)
+		} else {
+			cc, err = h.wsvc.SubmitCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.BaseCommit, req.HeadCommit)
+		}
+		if err != nil {
+			crossCheckError(w, err)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, codeCrossCheckResponse(cc))
+		return
+	}
+	if req.Stage != "plan" || req.ClaimGeneration == nil || req.HeadCommit != "" || req.ReasonClass != "" {
 		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check request", "candidate_invalid")
 		return
 	}
@@ -160,7 +218,33 @@ func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req crossCheckVerdictRequest
-	if httpx.DecodeJSONStrict(r, &req) != nil || req.ClaimGeneration == nil || len(req.Items) > 20 || len(req.Summary) > 4*1024 ||
+	if httpx.DecodeJSONStrictBounded(r, &req, 64<<10) != nil || req.ClaimGeneration == nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid cross-check verdict")
+		return
+	}
+	if req.codeFields && req.planFields || (!req.codeFields && req.Verdict != "approve" && req.Verdict != "revise" && req.Verdict != "block" && req.Verdict != "failed") {
+		httpx.Error(w, http.StatusBadRequest, "invalid cross-check verdict")
+		return
+	}
+	persisted, lookupErr := h.q.GetCrossCheckByChild(r.Context(), pgconv.UUID(id))
+	if lookupErr != nil {
+		httpx.Error(w, http.StatusConflict, "cross-check refused")
+		return
+	}
+	if persisted.Stage == "code" {
+		if req.planFields || !req.codeFields {
+			httpx.Error(w, http.StatusBadRequest, "invalid code cross-check verdict")
+			return
+		}
+		_, err := h.wsvc.DecideCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.Outcome, req.ReasonClass, req.Findings)
+		if err != nil {
+			crossCheckError(w, err)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		return
+	}
+	if req.codeFields || len(req.Items) > 20 || len(req.Summary) > 4*1024 ||
 		(req.Verdict != "approve" && req.Verdict != "revise" && req.Verdict != "block" && req.Verdict != "failed") {
 		httpx.Error(w, http.StatusBadRequest, "invalid cross-check verdict")
 		return

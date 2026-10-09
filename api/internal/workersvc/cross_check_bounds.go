@@ -47,6 +47,8 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 	}
 	_, err = crossCheckCandidateInput(store.CrossCheck{
 		Stage: input.Stage, Round: input.Round, LeadRunID: leadID,
+		HeadCommit:  pgtype.Text{String: input.HeadCommit, Valid: input.HeadCommit != ""},
+		CodeContext: input.CodeContext, GuidanceSnapshot: pgtype.Text{String: input.GuidanceSnapshot, Valid: true},
 		PlanMd: pgtype.Text{String: input.PlanMd, Valid: true}, Milestones: input.Milestones,
 		RequiredCapabilities: input.RequiredCapabilities, RequiredTools: input.RequiredTools,
 		SizeClass:       pgtype.Text{String: input.SizeClass, Valid: true},

@@ -399,6 +399,7 @@ type Config struct {
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
 	PlanCrossCheckMaxRevisions int32
+	CodeCrossCheckTimeout      time.Duration // independent code checker wall-clock budget
 	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget
 	RunTimeout                 time.Duration // base wall clock before a running run parks at budget_exhausted
 	RunWallCeiling             time.Duration // server-enforced ceiling on scaled and handoff wall budgets
@@ -1082,6 +1083,17 @@ func Load() (Config, error) {
 	}
 	if cfg.PlanCrossCheckTimeout <= 0 || cfg.PlanCrossCheckTimeout > 2*time.Hour || cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
 		return Config{}, fmt.Errorf("PLAN_CROSS_CHECK_TIMEOUT must be positive, at most 2h, and below RUN_TIMEOUT")
+	}
+	cfg.CodeCrossCheckTimeout = 30 * time.Minute
+	if raw, present := os.LookupEnv("CODE_CROSS_CHECK_TIMEOUT"); present {
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("CODE_CROSS_CHECK_TIMEOUT: %w", err)
+		}
+		cfg.CodeCrossCheckTimeout = value
+	}
+	if cfg.CodeCrossCheckTimeout <= 0 || cfg.CodeCrossCheckTimeout > 2*time.Hour {
+		return Config{}, fmt.Errorf("CODE_CROSS_CHECK_TIMEOUT must be positive and at most 2h")
 	}
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
 	// PRD #517 M5: the interactive-task park's worker-side idle backstop, delivered on

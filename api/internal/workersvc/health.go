@@ -1152,6 +1152,16 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if run, rerr := s.q.GetRunByID(ctx, r.ID); rerr != nil {
 		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
 	} else if run.PlanCrossCheckRequired || run.Kind == "cross_check" {
+		// Code children have strict local affinity, even after the plan grace.
+		// Use their persisted stage before interpreting the plan protocol query.
+		if run.Kind == "cross_check" {
+			if q, ok := s.q.(*store.Queries); ok {
+				cc, err := q.GetCrossCheckByChild(ctx, pgconv.UUID(run.ID))
+				if err == nil && cc.Stage == "code" {
+					return reasonNoCrossCheckWorker
+				}
+			}
+		}
 		requiredProtocol := capability.CrossCheckV1
 		protocolAvailable := true
 		if run.Kind == "cross_check" {

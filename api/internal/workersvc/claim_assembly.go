@@ -686,6 +686,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		PlanMd:                   textPtr(run.PlanMd),
 		AutoApprove:              run.AutoApprove,
 		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
+		CodeCrossCheckRequired:   run.CodeCrossCheckRequired,
 		PlanCrossCheckCodexLead:  planCrossCheckCodexLeadSupported(run),
 		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false

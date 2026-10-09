@@ -230,6 +230,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		AutoApprove:               r.AutoApprove,
 		AutoApproveBlockedReasons: nonNilStrings(r.AutoApproveBlockedReasons),
 		IssueInputReason:          textPtrValue(r.IssueInputReason.Valid, r.IssueInputReason.String),
+		CodeCrossCheckRequired:    r.CodeCrossCheckRequired,
 		PlanCrossCheckRequired:    r.PlanCrossCheckRequired,
 		PlanCrossCheckGateReason:  textPtrValue(r.PlanCrossCheckGateReason.Valid, r.PlanCrossCheckGateReason.String),
 		PlanCrossCheckDiffRefusal: textPtrValue(r.PlanCrossCheckDiffRefusal.Valid && r.PlanCrossCheckGateReason.String == "planning_diff_refused", r.PlanCrossCheckDiffRefusal.String),

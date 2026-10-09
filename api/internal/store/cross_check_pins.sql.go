@@ -33,7 +33,7 @@ LEFT JOIN LATERAL (
 WHERE child.id = $1 AND child.user_id = $2
   AND child.worker_id = $3 AND child.claim_generation = $4
   AND child.status = 'claimed' AND child.claim_released_at IS NULL
-  AND cc.verdict = 'pending' AND now() < cc.deadline_at
+  AND ((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND now() < cc.deadline_at
 `
 
 type GetCrossCheckPinSnapshotParams struct {

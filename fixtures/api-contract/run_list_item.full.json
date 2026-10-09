@@ -34,6 +34,7 @@
     "x"
   ],
   "issue_input_reason": "x",
+  "code_cross_check_required": true,
   "plan_cross_check_required": true,
   "plan_cross_check_gate_reason": "x",
   "plan_cross_check_diff_refusal": "x",
@@ -66,6 +67,24 @@
       "cost_status": "x"
     },
     "historical": true
+  },
+  "code_cross_check_summary": {
+    "stage": "x",
+    "round": 1,
+    "candidate_generation": 1,
+    "base_commit": "x",
+    "head_commit": "x",
+    "candidate_digest": "x",
+    "checker_run_id": "x",
+    "checker_harness": "x",
+    "checker_model": "x",
+    "checker_effort": "x",
+    "outcome": "x",
+    "reason_class": "x",
+    "findings": {},
+    "interrupted_at": "2020-01-02T03:04:05Z",
+    "finalized_at": "2020-01-02T03:04:05Z",
+    "deadline_at": "2020-01-02T03:04:05Z"
   },
   "trigger_source": "x",
   "milestones": [

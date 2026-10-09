@@ -55,4 +55,4 @@ LEFT JOIN LATERAL (
 WHERE child.id = @child_id AND child.user_id = @user_id
   AND child.worker_id = @worker_id AND child.claim_generation = @claim_generation
   AND child.status = 'claimed' AND child.claim_released_at IS NULL
-  AND cc.verdict = 'pending' AND now() < cc.deadline_at;
+  AND ((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND now() < cc.deadline_at;

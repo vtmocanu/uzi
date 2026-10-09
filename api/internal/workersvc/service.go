@@ -1357,6 +1357,7 @@ type Params struct {
 	PlanCrossCheckMaxRevisions int32
 	// Presence distinguishes an explicitly disabled budget from an unwired service.
 	PlanCrossCheckMaxRevisionsSet bool
+	CodeCrossCheckTimeout         time.Duration
 	PlanCrossCheckTimeout         time.Duration
 	RunTimeout                    time.Duration
 	RunWallCeiling                time.Duration

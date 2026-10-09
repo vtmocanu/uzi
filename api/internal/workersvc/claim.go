@@ -71,6 +71,7 @@ type ClaimPayload struct {
 	AutoApprove bool `json:"auto_approve"`
 	// PlanCrossCheckRequired is frozen on the run at creation and re-delivered on every claim.
 	PlanCrossCheckRequired bool `json:"plan_cross_check_required,omitempty"`
+	CodeCrossCheckRequired bool `json:"code_cross_check_required,omitempty"`
 	// PlanCrossCheckCodexLead is an additive api-capability signal (PRD #2460 rework): this
 	// api accepts a Codex lead's checked-plan submission. It is deliberately redundant with
 	// secrets.codex + plan_cross_check_required. Older apis never send it, so a new worker
