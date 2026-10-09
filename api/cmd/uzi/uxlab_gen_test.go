@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -100,32 +101,47 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-stalled":               func(d bool) string { return detailStalled(d, now) },
 		"detail-awaiting-approval":     func(d bool) string { return detailAwaitingApproval(d, now) },
 		"detail-awaiting-input":        func(d bool) string { return detailAwaitingInput(d, now) },
-		"detail-limit-wait":            func(d bool) string { return detailLimitWait(d, now) },
-		"detail-degraded":              func(d bool) string { return detailDegraded(d, now) },
-		"detail-steer-typing":          func(d bool) string { return detailSteerTyping(d, now) },
-		"detail-steer-confirm":         func(d bool) string { return detailSteerConfirm(d, now) },
-		"detail-steer-queue":           func(d bool) string { return detailSteerQueue(d, now) },
-		"review-overlay":               func(d bool) string { return reviewOverlay(d, now) },
-		"review-pending":               func(d bool) string { return reviewPending(d, now) },
-		"pulls-populated":              func(d bool) string { return pullsPopulated(d, now) },
-		"pulls-empty":                  func(d bool) string { return pullsEmpty(d, now) },
-		"ci-populated":                 func(d bool) string { return ciPopulated(d, now) },
-		"ci-unsupported":               func(d bool) string { return ciUnsupported(d, now) },
-		"pr-live":                      func(d bool) string { return prLive(d, now) },
-		"pr-changes-requested":         func(d bool) string { return prChangesRequested(d, now) },
-		"pr-failing":                   func(d bool) string { return prFailing(d, now) },
-		"cirun-running":                func(d bool) string { return ciRunRunning(d, now) },
-		"cirun-failing":                func(d bool) string { return ciRunFailing(d, now) },
-		"help":                         helpFrame,
-		"quit":                         quitFrame,
-		"split-floor-focus":            func(d bool) string { return splitScene(d, now, "floor") },
-		"split-ci-focus":               func(d bool) string { return splitScene(d, now, "ci") },
-		"split-pulls-focus":            func(d bool) string { return splitScene(d, now, "pulls") },
-		"split-min":                    func(d bool) string { return splitScene(d, now, "min") },
-		"split-80col":                  func(d bool) string { return splitScene(d, now, "80col") },
-		"split-needs-you-unfocused":    func(d bool) string { return splitScene(d, now, "needs-you") },
-		"split-ci-empty":               func(d bool) string { return splitScene(d, now, "ci-empty") },
-		"split-filtering":              func(d bool) string { return splitScene(d, now, "filtering") },
+		"detail-awaiting-input-collapsed": func(d bool) string {
+			return detailInputScene(d, now, "collapsed").View().Content
+		},
+		"detail-awaiting-input-24row": func(d bool) string {
+			return detailInputScene(d, now, "24row").View().Content
+		},
+		"detail-awaiting-input-24row-collapsed": func(d bool) string {
+			return detailInputScene(d, now, "24row-collapsed").View().Content
+		},
+		"detail-awaiting-input-single": func(d bool) string {
+			return detailInputScene(d, now, "single").View().Content
+		},
+		"detail-answer-transcript": func(d bool) string {
+			return detailInputScene(d, now, "answer").View().Content
+		},
+		"detail-limit-wait":         func(d bool) string { return detailLimitWait(d, now) },
+		"detail-degraded":           func(d bool) string { return detailDegraded(d, now) },
+		"detail-steer-typing":       func(d bool) string { return detailSteerTyping(d, now) },
+		"detail-steer-confirm":      func(d bool) string { return detailSteerConfirm(d, now) },
+		"detail-steer-queue":        func(d bool) string { return detailSteerQueue(d, now) },
+		"review-overlay":            func(d bool) string { return reviewOverlay(d, now) },
+		"review-pending":            func(d bool) string { return reviewPending(d, now) },
+		"pulls-populated":           func(d bool) string { return pullsPopulated(d, now) },
+		"pulls-empty":               func(d bool) string { return pullsEmpty(d, now) },
+		"ci-populated":              func(d bool) string { return ciPopulated(d, now) },
+		"ci-unsupported":            func(d bool) string { return ciUnsupported(d, now) },
+		"pr-live":                   func(d bool) string { return prLive(d, now) },
+		"pr-changes-requested":      func(d bool) string { return prChangesRequested(d, now) },
+		"pr-failing":                func(d bool) string { return prFailing(d, now) },
+		"cirun-running":             func(d bool) string { return ciRunRunning(d, now) },
+		"cirun-failing":             func(d bool) string { return ciRunFailing(d, now) },
+		"help":                      helpFrame,
+		"quit":                      quitFrame,
+		"split-floor-focus":         func(d bool) string { return splitScene(d, now, "floor") },
+		"split-ci-focus":            func(d bool) string { return splitScene(d, now, "ci") },
+		"split-pulls-focus":         func(d bool) string { return splitScene(d, now, "pulls") },
+		"split-min":                 func(d bool) string { return splitScene(d, now, "min") },
+		"split-80col":               func(d bool) string { return splitScene(d, now, "80col") },
+		"split-needs-you-unfocused": func(d bool) string { return splitScene(d, now, "needs-you") },
+		"split-ci-empty":            func(d bool) string { return splitScene(d, now, "ci-empty") },
+		"split-filtering":           func(d bool) string { return splitScene(d, now, "filtering") },
 	}
 
 	for _, name := range append(append([]string{}, workerSceneNames...), workerDetailSceneNames...) {
@@ -840,19 +856,67 @@ func detailAwaitingApproval(dark bool, now time.Time) string {
 	return m.View().Content
 }
 
+// These are real question payloads: the pinned card and transcript share the
+// production decoder, including the full option descriptions and overflow.
+const uxHistoryCapQuestion = `{
+	"header": "History cap",
+	"question": "Security review found that full Git integrity checking can decompress unbounded objects. May the replacement verifier retain and fail a run when decoded prerequisite history exceeds 1 GiB, even if its thin archive is under 64 MiB?",
+	"options": [
+		{"label": "Allow 1 GiB cap", "description": "Adds a bounded verification limit; over-limit work and custody remain retained."},
+		{"label": "Preserve existing size policy", "description": "Do not add a decoded-history cap that narrows the approved thin-capture success rule."}
+	]
+}`
+
+const uxGitBoundaryQuestion = `{
+	"header": "Git boundary",
+	"question": "May the replacement verifier use a cgroup limit for Git integrity checking, or should it preserve the existing resource boundary?",
+	"options": [
+		{"label": "Stronger resource boundary", "description": "Use a cgroup limit to bound Git integrity checking."},
+		{"label": "Preserve existing boundary", "description": "Keep the existing resource boundary for Git integrity checking."}
+	]
+}`
+
 func detailAwaitingInput(dark bool, now time.Time) string {
+	return detailInputScene(dark, now, "").View().Content
+}
+
+// detailInputScene keeps the populated crew/accounts beside the transcript.
+// The short scenes resize through Update; collapse uses the actual z key path.
+// An answer scene replays an answer DTO without executing an answering command.
+func detailInputScene(dark bool, now time.Time, scene string) tuiModel {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
-		IssueTitle: "Clarify the target branch for the fix",
-		StartedAt:  tp(now.Add(-1 * time.Minute))} // header elapsed WORK time beside the ✎ token
-	msgs := []apitypes.MessageDTO{
-		msgDTO(1, "text", "lead", "", "", "Which branch should the MR target: the default branch, or a release branch? I'll wait for your answer before opening it.", now.Add(-1*time.Minute)),
+		IssueTitle:          "Bound Git integrity verification",
+		StartedAt:           tp(now.Add(-4 * time.Minute)),
+		Milestones:          milestoneList,
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"},
+		Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, OutputTokens: 88_400}}
+	if scene == "answer" {
+		run.Status = "running"
 	}
-	fake := &uzicli.FakeClient{}
-	m := uxModel(fake, detailRunID, dark)
-	m = applyDetail(m, run, msgs)
-	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
+	m := detailBase(dark, run, now, true)
+	if strings.HasPrefix(scene, "24row") {
+		m = step(m, tea.WindowSizeMsg{Width: frameWidth, Height: 24})
+	}
+	questions := uxHistoryCapQuestion
+	if scene != "single" {
+		questions += "," + uxGitBoundaryQuestion
+	}
+	msgs := []apitypes.MessageDTO{
+		{Seq: 6, Kind: "question", Agent: sp("lead"), CreatedAt: now.Add(-time.Minute),
+			Payload: json.RawMessage(`{"question_id":"git-verification","questions":[` + questions + `]}`)},
+	}
+	if scene == "answer" {
+		msgs = append(msgs, apitypes.MessageDTO{
+			Seq: 7, Kind: "answer", CreatedAt: now.Add(-30 * time.Second),
+			Payload: json.RawMessage(`{"question_id":"git-verification","answers":["Allow 1 GiB cap","Stronger resource boundary"]}`),
+		})
+	}
+	m = step(m, detailPageMsg{runID: detailRunID, gen: m.detail.gen, kind: pageCatchup, msgs: msgs})
 	m = withLiveStream(m)
-	return m.View().Content
+	if strings.HasSuffix(scene, "collapsed") {
+		m = key(m, "z")
+	}
+	return m
 }
 
 func detailLimitWait(dark bool, now time.Time) string {
