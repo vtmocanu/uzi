@@ -932,8 +932,11 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 // claim's earlier clock reads to be provably before that expiry. Sleeping for a fixed span after
 // "a lock waiter exists" proves neither: the claim's transaction can begin late, and a pre-expired
 // fixture would let a stale-clock bug pass. So the lease is armed from ONE database clock read, with
-// expiry a known positive window after it, after the claim is observed blocked on the intended
-// statement, and the test then waits on the database's own clock until that expiry has passed.
+// expiry a known positive window after it, and the test waits on the database's own clock until that
+// expiry has passed before releasing the lock. When the claim blocks on the WORKER lock, the arming
+// runs inside the holder's transaction after the claim is observed blocked; when it blocks on a RUN
+// lock (the claim then holds the worker row), the arming runs before the holder and the claim start,
+// and the blocked statement's query_start is asserted to be before the expiry.
 
 // workerLockWindow is how long after arming the lease expires when the claim is blocked on the WORKER
 // lock. The claim's transaction began before the arming (the arming runs inside the lock holder's
