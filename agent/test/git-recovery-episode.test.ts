@@ -113,6 +113,36 @@ test("protected descriptor conflicts and malformed evidence refuse detachment an
   assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "unknown");
 });
 
+test("unrelated protected record missing .git does not block canonical seed", async () => {
+  const { tip } = await ready();
+  const before = journal();
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  assert.equal(git(bare, ["config", `uzi-recovery.${branch}.clone`]), "");
+  const descriptor = git(bare, ["config", `uzi-retained.${runId}.journal`]);
+  const pinRef = `refs/uzi-recovery-episode/${runId}/${tip}`;
+  assert.equal(git(bare, ["rev-parse", pinRef]), tip);
+  const workPath = path.join(source.clonePath, "work.txt");
+  const workBytes = fs.readFileSync(workPath);
+
+  fs.rmSync(path.join(source.clonePath, ".git"), { recursive: true });
+  assert.equal(fs.existsSync(path.join(source.clonePath, ".git")), false);
+  assert.ok(fs.statSync(source.clonePath).isDirectory());
+  assert.deepEqual(fs.readFileSync(workPath), workBytes);
+
+  const nextIid = 2513;
+  const nextKey = "issue-2513";
+  const nextRun = "run-2513";
+  const next = await recreate().createOrAttachRunnerClone(bare, nextIid, noProofReseed, nextRun);
+  assert.equal(next.path, cache.runnerClonePath(bare, nextKey));
+  assert.equal(git(next.path, ["branch", "--show-current"]), "agent/issue-2513");
+  assert.equal(git(next.path, ["rev-parse", "HEAD"]), git(bare, ["rev-parse", "refs/remotes/origin/main"]));
+  assert.equal(fs.readFileSync(path.join(next.path, "README.md"), "utf8"), "# fixture\n");
+  assert.equal(git(bare, ["config", `uzi-retained.${runId}.journal`]), descriptor);
+  assert.equal(git(bare, ["rev-parse", pinRef]), tip);
+  assert.ok(fs.statSync(source.clonePath).isDirectory());
+  assert.deepEqual(fs.readFileSync(workPath), workBytes);
+});
+
 test("discard exact detached run preserves newer active ownership and fresh attempt marker", async () => {
   const { tip } = await ready();
   const before = journal();
