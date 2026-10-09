@@ -83,9 +83,15 @@ func TestGenerateUXLabFrames(t *testing.T) {
 
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
-		"board-populated":              func(d bool) string { return boardPopulated(d, now) },
-		"board-codex":                  func(d bool) string { return boardCodex(d, now) },
-		"board-empty":                  boardEmpty,
+		"board-populated": func(d bool) string { return boardPopulated(d, now) },
+		"board-codex":     func(d bool) string { return boardCodex(d, now) },
+		"board-empty":     boardEmpty,
+		"board-restart-hint": func(d bool) string {
+			m := uxModel(&uzicli.FakeClient{}, "", d)
+			m.showVersion = true
+			m.updatePrompt.installedVersion = "v0.85.0"
+			return m.View().Content
+		},
 		"board-admin":                  boardAdmin,
 		"board-filter":                 func(d bool) string { return boardFilter(d, now) },
 		"board-planning":               func(d bool) string { return boardPlanning(d, now) },

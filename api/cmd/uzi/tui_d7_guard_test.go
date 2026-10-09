@@ -159,6 +159,7 @@ var d7UntrustedFields = []string{
 	// GET /api/version, drawn in the board footer skew banner (boardFooterLine) only inside
 	// cellText(...) before SkewWarning embeds it.
 	"serverVersion",
+	"installedVersion",
 	// The startup update prompt's server-authored release facts (PRD #1251 M1), copied off
 	// buildInfoMsg.latest into the model's updatePrompt sub-struct and drawn in the modal
 	// (renderUpdatePrompt / updateChoiceLabel) only through cellText / renderer.Plain. Like

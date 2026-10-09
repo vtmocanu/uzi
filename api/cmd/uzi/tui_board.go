@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -760,6 +761,9 @@ func (m tuiModel) boardFooter() string {
 // outer clampVisual(..., m.width) at the renderBoard call site is the only wrap.
 func (m tuiModel) boardFooterLine() string {
 	help := m.boardFooter()
+	if line, ok := m.restartFooter(help); ok {
+		return line
+	}
 	if !m.showVersion {
 		return m.withSplitNote(help)
 	}
@@ -785,6 +789,30 @@ func (m tuiModel) boardFooterLine() string {
 	// Still too narrow: give the client version the right edge, let help truncate.
 	left := clampVisual(help, m.width-cw-gap)
 	return padVisual(left, m.width-cw) + client
+}
+
+// restartFooter gives the installed-version fact priority over skew and help.
+// At narrow widths the restart action survives even when the full version cannot fit.
+func (m tuiModel) restartFooter(help string) (string, bool) {
+	if !m.showVersion || m.updatePrompt.installedVersion == "" {
+		return "", false
+	}
+	installed := m.renderer.Plain(m.updatePrompt.installedVersion, 256)
+	hint := "v" + strings.TrimPrefix(installed, "v") + " installed, restart uzi to use it"
+	width := max(0, m.width)
+	if visualWidth(hint) > width {
+		hint = "restart uzi"
+	}
+	hint = clampVisual(hint, width)
+	if m.profile != colorprofile.Ascii {
+		hint = m.pal.faint.Render(hint)
+	}
+	hw := visualWidth(hint)
+	if m.profile == colorprofile.Ascii {
+		help = ansi.Strip(help)
+	}
+	left := clampVisual(help, max(0, width-hw-1))
+	return padVisual(left, max(0, width-hw)) + hint, true
 }
 
 // versionReadout is the compact CLI-vs-server version line. The client version renders
