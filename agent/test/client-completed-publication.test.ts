@@ -15,6 +15,9 @@ let response: Record<string, unknown>;
 let claim: Record<string, unknown>;
 let holds: Record<string, unknown>[];
 let sent: Record<string, unknown>[];
+let workerId: string;
+let registrationFails: boolean;
+let holdsResponse: (() => Response) | undefined;
 
 beforeEach(() => {
   features = [FEATURE, "claim_generation_fence", "recovery_inventory_v1"];
@@ -23,11 +26,17 @@ beforeEach(() => {
     issue_iid: 7, repo: { ...makeClaim().repo, id: receipt.repo_id, forge_type: "gitlab" } };
   holds = [{ hold_id: receipt.hold_id, generation: 1, inventory_guarded: true, has_available_capture: false }];
   sent = [];
+  workerId = receipt.worker_id;
+  registrationFails = false;
+  holdsResponse = undefined;
   mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const path = new URL(String(input)).pathname;
-    if (path.endsWith("/register")) return Response.json({ worker_id: receipt.worker_id, protocol_features: features });
+    if (path.endsWith("/register")) {
+      if (registrationFails) return new Response("unauthorized", { status: 401 });
+      return Response.json({ worker_id: workerId, protocol_features: features });
+    }
     if (path.endsWith("/claim")) return Response.json(claim);
-    if (path.endsWith("/recovery-holds")) return Response.json({ run_id: RUN, holds });
+    if (path.endsWith("/recovery-holds")) return holdsResponse?.() ?? Response.json({ run_id: RUN, holds });
     sent.push(JSON.parse(String(init?.body)));
     return Response.json(response);
   });
@@ -164,6 +173,138 @@ it("refuses duplicate or unguarded observed holds", async () => {
   holds.push({ ...holds[0], hold_id: receipt.owner_id });
   await client.listRecoveryHolds(RUN);
   assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+});
+
+it("retains hold and guarded claim provenance across failed same-worker registration", async () => {
+  await client.register("worker");
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  registrationFails = true;
+  await assert.rejects(client.register("worker"));
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+  registrationFails = false;
+  await client.register("worker");
+  holds = [];
+  await client.listRecoveryHolds(RUN);
+  response.completed_publication_receipt = { ...receipt, hold_id: receipt.owner_id };
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+  response.completed_publication_receipt = { ...receipt, branch: "foreign/branch" };
+  assert.equal((await client.reportState(RUN, { ...fixture.request, branch: "foreign/branch" })).completedPublicationReceipt, undefined);
+});
+
+it("clears provenance only after successful registration as a different worker", async () => {
+  await client.register("worker");
+  claim = { ...claim, inventory_guarded: false };
+  await client.claimRun();
+  holds = [{ ...holds[0], hold_id: receipt.owner_id }];
+  await client.listRecoveryHolds(RUN);
+  workerId = receipt.owner_id;
+  await client.register("other-worker");
+  response = { ...fixture.ack, run: { ...fixture.ack.run, worker_id: workerId },
+    completed_publication_receipt: { ...receipt, worker_id: workerId } };
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, response.completed_publication_receipt);
+});
+
+for (const code of [0, 0x1f, 0x7f, 0x9f, 0xad, 0x600, 0x61c, 0x180e, 0x200b, 0x200c,
+  0x200d, 0x2060, 0x206a, 0x206b, 0x206c, 0x206d, 0x206e, 0x206f, 0xfeff, 0xfff9, 0xe0001, 0xe0020]) {
+  it(`rejects Unicode control/format U+${code.toString(16)} in publication identifiers`, async () => {
+    for (const field of ["branch", "base_url"]) {
+      const value = receipt[field] + String.fromCodePoint(code);
+      response.completed_publication_receipt = { ...receipt, [field]: value };
+      assert.equal((await report({ ...fixture.request, branch: field === "branch" ? value : receipt.branch })).completedPublicationReceipt, undefined);
+    }
+  });
+}
+
+for (const header of [undefined, "1", "2097152"]) {
+  it(`bounds actual streamed recovery-holds bytes with content-length ${header}`, async () => {
+    await client.register("worker");
+    await client.listRecoveryHolds(RUN);
+    const payload = JSON.stringify({ run_id: RUN, holds, padding: "é".repeat(600_000) });
+    holdsResponse = () => new Response(new ReadableStream({
+      start(controller) {
+        const bytes = new TextEncoder().encode(payload);
+        for (let i = 0; i < bytes.length; i += 8192) controller.enqueue(bytes.subarray(i, i + 8192));
+        controller.close();
+      },
+    }), { headers: header === undefined ? {} : { "content-length": header } });
+    await assert.rejects(client.listRecoveryHolds(RUN));
+    assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+  });
+}
+
+it("rejects excessive hold items before caching and retains refusal across empty listing and retry", async () => {
+  await client.register("worker");
+  holds = Array.from({ length: 1025 }, (_, i) => ({ ...holds[0], generation: i + 1 }));
+  await assert.rejects(client.listRecoveryHolds(RUN));
+  holds = [];
+  await client.listRecoveryHolds(RUN);
+  registrationFails = true;
+  await assert.rejects(client.register("worker"));
+  registrationFails = false;
+  await client.register("worker");
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+});
+
+it("bounds accumulated hold and claim bindings without evicting provenance", async () => {
+  await client.register("worker");
+  await client.listRecoveryHolds(RUN);
+  // Each response is below the item and byte caps; the combined persistent budget is 4096.
+  for (let page = 0; page < 4; page++) {
+    holds = Array.from({ length: 1024 }, (_, i) => ({
+      hold_id: receipt.hold_id, generation: page * 1024 + i + 1, inventory_guarded: true,
+    }));
+    await client.listRecoveryHolds(RUN);
+  }
+  claim = { ...claim, claim_generation: 4097 };
+  await client.claimRun();
+  const body = { ...fixture.request, claim_generation: 4097 };
+  response.completed_publication_receipt = { ...receipt, generation: 4097 };
+  assert.equal((await client.reportState(RUN, body)).completedPublicationReceipt, undefined);
+  response.completed_publication_receipt = { ...receipt, hold_id: receipt.owner_id };
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+  await client.register("worker");
+  holds = [];
+  await client.listRecoveryHolds(RUN);
+  assert.equal((await client.reportState(RUN, body)).completedPublicationReceipt, undefined);
+  workerId = receipt.owner_id;
+  await client.register("other-worker");
+  response = { ...fixture.ack, run: { ...fixture.ack.run, worker_id: workerId },
+    completed_publication_receipt: { ...receipt, worker_id: workerId } };
+  assert.ok((await client.reportState(RUN, fixture.request)).completedPublicationReceipt);
+});
+
+it("bounds repeated hold responses without granting an unseen generation", async () => {
+  await client.register("worker");
+  for (let page = 0; page < 5; page++) {
+    holds = Array.from({ length: 1024 }, (_, i) => ({
+      hold_id: receipt.hold_id, generation: page * 1024 + i + 1, inventory_guarded: true,
+    }));
+    await client.listRecoveryHolds(RUN);
+  }
+  response.completed_publication_receipt = { ...receipt, generation: 4097 };
+  assert.equal((await client.reportState(RUN, { ...fixture.request, claim_generation: 4097 })).completedPublicationReceipt, undefined);
+});
+
+it("preserves known unguarded claim across failed same-worker retry", async () => {
+  await client.register("worker");
+  claim = { ...claim, inventory_guarded: false };
+  await client.claimRun();
+  registrationFails = true;
+  await assert.rejects(client.register("worker"));
+  registrationFails = false;
+  await client.register("worker");
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+});
+
+it("bounds repeated claim accumulation without a hold listing", async () => {
+  await client.register("worker");
+  for (let generation = 1; generation <= 4097; generation++) {
+    claim = { ...claim, claim_generation: generation };
+    await client.claimRun();
+  }
+  response.completed_publication_receipt = { ...receipt, generation: 4097 };
+  assert.equal((await client.reportState(RUN, { ...fixture.request, claim_generation: 4097 })).completedPublicationReceipt, undefined);
 });
 
 it("refuses known noneligible or unguarded claims", async () => {

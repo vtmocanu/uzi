@@ -997,9 +997,16 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
     sample.inodesTotal > 0 && sample.inodesUsed <= sample.inodesTotal;
 }
 
+const COMPLETION_HOLDS_MAX_BYTES = 1024 * 1024;
+const COMPLETION_HOLDS_MAX_ITEMS = 1024;
+const COMPLETION_BINDINGS_MAX = 4096;
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
+  // Provenance survives uncertain registration; only a successful changed identity resets it.
+  private completionWorkerId: string | undefined;
+  private completionBindingsSaturated = false;
   // Authenticated observations only; empty later inventories do not erase an observed identity.
   private readonly completionClaims = new Map<string, { repoId?: string; forgeType?: string; branch?: string; eligible: boolean; guarded: boolean }>();
   private readonly completionHolds = new Map<string, string | null>();
@@ -1132,7 +1139,6 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
-    const priorWorkerId = this.registeredWorkerId;
     this.registeredWorkerId = undefined;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
@@ -1193,9 +1199,13 @@ export class WorkerClient {
         ? Math.floor(res.worker_outbox_max_pending)
         : undefined;
     this.registeredWorkerId = terminalUUID(res.worker_id) ? res.worker_id.toLowerCase() : undefined;
-    if (this.registeredWorkerId !== priorWorkerId) {
-      this.completionClaims.clear();
-      this.completionHolds.clear();
+    if (this.registeredWorkerId) {
+      if (this.registeredWorkerId !== this.completionWorkerId) {
+        this.completionClaims.clear();
+        this.completionHolds.clear();
+        this.completionBindingsSaturated = false;
+      }
+      this.completionWorkerId = this.registeredWorkerId;
     }
     return res;
   }
@@ -1411,7 +1421,8 @@ export class WorkerClient {
         ? `agent/issue-${claim.issue_iid}`
         : kind === "self_improve" ? `uzi/self-improve/${claim.run_id.toLowerCase()}`
         : kind === "mr_rework" ? claim.branch ?? undefined : undefined;
-      this.completionClaims.set(`${claim.run_id}:${claim.claim_generation}`, {
+      const key = `${claim.run_id}:${claim.claim_generation}`;
+      if (this.allowCompletionBinding(this.completionClaims.has(key))) this.completionClaims.set(key, {
         repoId: claim.repo?.id, forgeType: claim.repo?.forge_type ?? "gitlab", branch,
         eligible: ["issue", "mr_rework", "self_improve"].includes(kind), guarded: claim.inventory_guarded === true,
       });
@@ -1629,7 +1640,7 @@ export class WorkerClient {
   /** Validate proof only at the authenticated state-report seam. This does not settle local custody. */
   private validateCompletedPublicationReceipt(runId: string, body: StateRequest, fields: Awaited<ReturnType<typeof readRunAck>>): CompletedPublicationReceipt | undefined {
     const value = fields.completedPublicationCandidate;
-    if (!this.registeredWorkerId || !this.hasFeature("recovery_completed_publication_v1") ||
+    if (this.completionBindingsSaturated || !this.registeredWorkerId || !this.hasFeature("recovery_completed_publication_v1") ||
         body.status !== "completed" || fields.status !== "completed" ||
         fields.completedPublicationReason || fields.staleClaim || fields.credentialSwitch ||
         fields.runId !== runId || fields.workerId !== this.registeredWorkerId ||
@@ -1957,18 +1968,41 @@ export class WorkerClient {
     )) as RecoveryReleaseResponse;
   }
 
+  private allowCompletionBinding(known: boolean): boolean {
+    if (this.completionBindingsSaturated) return false;
+    if (!known && this.completionClaims.size + this.completionHolds.size >= COMPLETION_BINDINGS_MAX) {
+      // No eviction: losing an old binding could authorize a foreign receipt. Overflow disables
+      // all completion receipts for this worker identity, including uncached generations.
+      this.completionBindingsSaturated = true;
+      return false;
+    }
+    return true;
+  }
+
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
    *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
-    const response = (await this.getJSON(
-      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`,
-    )) as RecoveryHoldsResponse;
+    let response: RecoveryHoldsResponse;
+    try {
+      response = (await this.getJSON(
+        `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`,
+        undefined, COMPLETION_HOLDS_MAX_BYTES,
+      )) as RecoveryHoldsResponse;
+    } catch (err) {
+      if (err instanceof ResponseBodyOverflowError) this.completionBindingsSaturated = true;
+      throw err;
+    }
+    if (Array.isArray(response?.holds) && response.holds.length > COMPLETION_HOLDS_MAX_ITEMS) {
+      this.completionBindingsSaturated = true;
+      throw new Error("recovery hold inventory exceeds item limit");
+    }
     if (this.registeredWorkerId && response?.run_id === runId && Array.isArray(response.holds)) {
       const seen = new Set<number>();
-      // One pass over the finite returned inventory, no retries; malformed siblings are skipped.
+      // At most COMPLETION_HOLDS_MAX_ITEMS attempts, no retries; malformed siblings are skipped.
       for (const hold of response.holds) {
         if (!isRecord(hold) || !terminalGeneration(hold.generation) || hold.generation <= 0) continue;
         const key = `${runId}:${hold.generation}`;
+        if (!this.allowCompletionBinding(this.completionHolds.has(key))) break;
         const prior = this.completionHolds.get(key);
         const id = terminalUUID(hold.hold_id) && hold.inventory_guarded === true ? hold.hold_id : null;
         this.completionHolds.set(key, seen.has(hold.generation) || (prior !== undefined && prior !== id) ? null : id);
@@ -3523,12 +3557,7 @@ function completionPositiveInteger(value: unknown): value is number {
 }
 function completionSafeIdentifier(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 2048 &&
-    value.trim() === value && !Array.from(value).some(char => {
-      const code = char.codePointAt(0)!;
-      return code <= 32 || (code >= 127 && code <= 159) || code === 0x061c ||
-        code === 0x200e || code === 0x200f || (code >= 0x202a && code <= 0x202e) ||
-        (code >= 0x2066 && code <= 0x2069);
-    });
+    value.trim() === value && !/[\p{Cc}\p{Cf} ]/u.test(value);
 }
 function decodeCompletedPublicationReason(value: unknown): CompletedPublicationReason | undefined {
   switch (value) {
