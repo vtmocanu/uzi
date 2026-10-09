@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Answer agent questions from the TUI ([#2550](https://github.com/vtmocanu/uzi/issues/2550)).**
+  Run owners can press `i` to compose option selections and details, review each answer before sending, and reopen drafts kept in the current TUI session; uncertain delivery blocks resending in that session and points to the web or Slack, which remain the fallback for read-only viewers and unsupported payloads.
+
 ### Fixed
 
 - **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**

@@ -149,6 +149,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
+	for _, scene := range uxAnswerScenes() {
+		scenes[scene.name] = func(dark bool) string { return scene.build(dark, now).model.View().Content }
+	}
+
 	names := make([]string, 0, len(scenes))
 	for n := range scenes {
 		names = append(names, n)
