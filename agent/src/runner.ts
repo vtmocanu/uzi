@@ -4157,6 +4157,11 @@ export class RunRunner {
     const previouslyAttempted = flight.completionSendAttempted ||
       this.attemptedPublicationTerminals.has(this.completionKey(flight.runId, flight.claimGeneration));
     const admitted = preexistingPending || previouslyAttempted || this.selectPublicationCompletion(flight, body);
+    if (!admitted && !preexistingPending && !previouslyAttempted && body.completion_final_head !== undefined) {
+      const ordinary = { ...body };
+      delete ordinary.completion_final_head;
+      body = ordinary;
+    }
     if (!deps) {
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
       // stale ack still THROWS StaleClaimError out of `send` and propagates to executeClaim's catch
@@ -5445,11 +5450,8 @@ export class RunRunner {
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
           body.status === "completed" && typeof finalHead === "string" && /^[0-9a-f]{40}$/.test(finalHead))
         body = { ...body, completion_final_head: finalHead };
-      this.selectPublicationCompletion(flight, body);
-      const eligible = this.eligiblePublicationCompletion(flight, body);
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
-          if (!eligible) await flight.prepareTerminalInventory();
           await batcher.close();
           // Journal write-ahead here too (D3): the deferred Codex sink sends through
           // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
@@ -5464,7 +5466,6 @@ export class RunRunner {
         });
         return;
       }
-      if (!eligible) await flight.prepareTerminalInventory();
       await closeBatcher();
       await journalTerminalReport(body);
       runLog.info(logMessage, fields);

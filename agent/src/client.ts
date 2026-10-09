@@ -1000,19 +1000,22 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 const COMPLETION_HOLDS_MAX_BYTES = 1024 * 1024;
 const COMPLETION_HOLDS_MAX_ITEMS = 1024;
 const COMPLETION_BINDINGS_MAX = 4096;
+const COMPLETION_OBSERVATIONS_MAX = 2048;
+
+type CompletionTicket = { incarnation: number; runId?: string; exclusions: Set<string> };
+type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
-  private completionBindingsSaturated = false;
   private completionInventoryUnreadable = false;
   private unknownClaimsRequireEligible = false;
   private completionIncarnation = 0;
-  private completionEpoch = 0;
-  // Each admitted generation reserves two slots, including a missing counterpart.
-  private readonly completionGenerations = new Set<string>();
+  // Live and temporarily retired identities each reserve both provenance slots.
+  private readonly completionReservations = new Map<string, CompletionReservation>();
+  private readonly completionTickets = new Set<CompletionTicket>();
   private readonly receiptIncarnations = new WeakMap<CompletedPublicationReceipt, number>();
   // Authenticated observations only; empty later inventories do not erase an observed identity.
   private readonly completionClaims = new Map<string, { repoId?: string; forgeType?: string; branch?: string; eligible: boolean; guarded: boolean } | null>();
@@ -1210,10 +1213,10 @@ export class WorkerClient {
       if (this.registeredWorkerId !== this.completionWorkerId) {
         this.completionClaims.clear();
         this.completionHolds.clear();
-        this.completionBindingsSaturated = false;
         this.completionInventoryUnreadable = false;
         this.unknownClaimsRequireEligible = false;
-        this.completionGenerations.clear();
+        this.completionReservations.clear();
+        this.completionTickets.clear();
         this.completionIncarnation++;
       }
       this.completionWorkerId = this.registeredWorkerId;
@@ -1377,90 +1380,92 @@ export class WorkerClient {
 
   private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number, dedicated = false): Promise<ClaimResponse | null> {
     const incarnation = this.completionIncarnation;
-    const epoch = this.completionEpoch;
-    // The same deadline reaches fetch AND its body. Await the real request rather than a race:
-    // admission must remain held until a late transport has definitively stopped.
-    const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
-    deadline.throwIfAborted();
-    const body: ClaimRequest = {};
-    if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
-      body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
-    }
-    const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
-    deadline.throwIfAborted();
-    if (res.status === 204) return null;
-    if (res.status >= 400) throw await this.toError("POST", path, res);
-    const marker = res.headers.get("X-Uzi-Claim-Kind");
-    if (marker !== null && marker !== "cross_check") {
-      await res.body?.cancel();
-      throw new Error("unknown dedicated claim marker");
-    }
-    // Dedicated requests are bounded even without a marker; unmarked ordinary
-    // claims keep their existing decoder.
-    const claim = (dedicated || marker === "cross_check"
-      ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
-      : await res.json()) as ClaimResponse;
-    if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
-      throw new Error("cross-check claim marker and kind disagree");
-    }
-    deadline.throwIfAborted();
-    if (isRecord(claim) && claim.inventory_guarded !== undefined &&
-        (typeof claim.inventory_guarded !== "boolean" ||
-         (claim.inventory_guarded === true &&
-          (!Number.isSafeInteger(claim.claim_generation) || (claim.claim_generation ?? 0) <= 0 ||
-           !this.hasFeature("recovery_inventory_v1"))))) {
-      throw new Error("malformed or contradictory inventory guard claim");
-    }
-    if (this.inventoryGuardedClaims.has(`${claim?.run_id}:${claim?.claim_generation}`) && claim.inventory_guarded !== true) {
-      throw new Error("guarded generation cannot downgrade its claim assertion");
-    }
-    if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
-    // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
-    // same check as the bind / lookup / ack responses). The warning carries the run id only,
-    // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
-    // 200 body returning as it did before this check existed, rather than throwing here.
-    if (isRecord(claim) && claim.pr_description !== undefined) {
-      const pr = decodePrState(claim.pr_description);
-      if (pr === undefined) {
-        delete claim.pr_description;
-        this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
-      } else {
-        claim.pr_description = pr;
+    const ticket = this.beginCompletionObservation();
+    try {
+      // The same deadline reaches fetch AND its body. Await the real request rather than a race:
+      // admission must remain held until a late transport has definitively stopped.
+      const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+      deadline.throwIfAborted();
+      const body: ClaimRequest = {};
+      if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
+        body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
       }
-    }
-    if (incarnation === this.completionIncarnation && isRecord(claim) && terminalUUID(claim.run_id) && terminalGeneration(claim.claim_generation) && claim.claim_generation > 0) {
-      const kind = claim.kind ?? "issue";
-      const branch = kind === "issue" && Number.isSafeInteger(claim.issue_iid) && (claim.issue_iid ?? 0) > 0
-        ? `agent/issue-${claim.issue_iid}`
-        : kind === "self_improve" ? `uzi/self-improve/${claim.run_id.toLowerCase()}`
-        : kind === "mr_rework" ? claim.branch : undefined;
-      const key = `${claim.run_id}:${claim.claim_generation}`;
-      // Retain only bounded primitives. Missing legacy fields keep their fallback; malformed
-      // provenance retains a refusal marker so this generation cannot become an unknown claim.
-      const repo = isRecord(claim.repo) ? claim.repo : undefined;
-      const repoId = repo?.id;
-      const forgeType = repo?.forge_type === undefined ? "gitlab" : repo.forge_type;
-      const valid = (claim.repo === undefined || repo !== undefined) &&
-        (repoId === undefined || (terminalUUID(repoId) && repoId === repoId.toLowerCase())) &&
-        completionForgeType(forgeType) &&
-        (branch === undefined || (completionSafeIdentifier(branch) && Buffer.byteLength(branch, "utf8") <= 2048));
-      const eligible = ["issue", "mr_rework", "self_improve"].includes(kind);
-      const prior = this.completionClaims.get(key);
-      if (!eligible) {
-        if (this.completionClaims.has(key)) this.completionClaims.set(key, null);
-        else this.unknownClaimsRequireEligible = true;
-      } else if (epoch !== this.completionEpoch && !this.completionClaims.has(key)) {
-        this.completionBindingsSaturated = true;
-      } else if (this.allowCompletionBinding(key, epoch)) {
-        const next = {
-          repoId: repoId as string | undefined, forgeType: forgeType as string, branch: branch as string | undefined,
-          eligible: true, guarded: claim.inventory_guarded === true,
-        };
-        this.completionClaims.set(key, !valid || prior === null ||
-          (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(next)) ? null : next);
+      const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
+      deadline.throwIfAborted();
+      if (res.status === 204) return null;
+      if (res.status >= 400) throw await this.toError("POST", path, res);
+      const marker = res.headers.get("X-Uzi-Claim-Kind");
+      if (marker !== null && marker !== "cross_check") {
+        await res.body?.cancel();
+        throw new Error("unknown dedicated claim marker");
       }
-    }
-    return claim;
+      // Dedicated requests are bounded even without a marker; unmarked ordinary
+      // claims keep their existing decoder.
+      const claim = (dedicated || marker === "cross_check"
+        ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
+        : await res.json()) as ClaimResponse;
+      if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
+        throw new Error("cross-check claim marker and kind disagree");
+      }
+      deadline.throwIfAborted();
+      if (isRecord(claim) && claim.inventory_guarded !== undefined &&
+          (typeof claim.inventory_guarded !== "boolean" ||
+           (claim.inventory_guarded === true &&
+            (!Number.isSafeInteger(claim.claim_generation) || (claim.claim_generation ?? 0) <= 0 ||
+             !this.hasFeature("recovery_inventory_v1"))))) {
+        throw new Error("malformed or contradictory inventory guard claim");
+      }
+      if (this.inventoryGuardedClaims.has(`${claim?.run_id}:${claim?.claim_generation}`) && claim.inventory_guarded !== true) {
+        throw new Error("guarded generation cannot downgrade its claim assertion");
+      }
+      if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
+      // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
+      // same check as the bind / lookup / ack responses). The warning carries the run id only,
+      // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
+      // 200 body returning as it did before this check existed, rather than throwing here.
+      if (isRecord(claim) && claim.pr_description !== undefined) {
+        const pr = decodePrState(claim.pr_description);
+        if (pr === undefined) {
+          delete claim.pr_description;
+          this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
+        } else {
+          claim.pr_description = pr;
+        }
+      }
+      if (incarnation === this.completionIncarnation && isRecord(claim) && terminalUUID(claim.run_id) && terminalGeneration(claim.claim_generation) && claim.claim_generation > 0) {
+        const kind = claim.kind ?? "issue";
+        const branch = kind === "issue" && Number.isSafeInteger(claim.issue_iid) && (claim.issue_iid ?? 0) > 0
+          ? `agent/issue-${claim.issue_iid}`
+          : kind === "self_improve" ? `uzi/self-improve/${claim.run_id.toLowerCase()}`
+          : kind === "mr_rework" ? claim.branch : undefined;
+        const key = `${claim.run_id}:${claim.claim_generation}`;
+        // Retain only bounded primitives. Missing legacy fields keep their fallback; malformed
+        // provenance retains a refusal marker so this generation cannot become an unknown claim.
+        const repo = isRecord(claim.repo) ? claim.repo : undefined;
+        const repoId = repo?.id;
+        const forgeType = repo?.forge_type === undefined ? "gitlab" : repo.forge_type;
+        const valid = (claim.repo === undefined || repo !== undefined) &&
+          (repoId === undefined || (terminalUUID(repoId) && repoId === repoId.toLowerCase())) &&
+          completionForgeType(forgeType) &&
+          (branch === undefined || (completionSafeIdentifier(branch) && Buffer.byteLength(branch, "utf8") <= 2048));
+        const eligible = ["issue", "mr_rework", "self_improve"].includes(kind);
+        const prior = this.completionClaims.get(key);
+        if (ticket.exclusions.has(key)) {
+          // This request preceded retirement of this exact identity.
+        } else if (!eligible) {
+          if (this.completionClaims.has(key)) this.completionClaims.set(key, null);
+          else this.unknownClaimsRequireEligible = true;
+        } else if (this.allowCompletionBinding(key)) {
+          const next = {
+            repoId: repoId as string | undefined, forgeType: forgeType as string, branch: branch as string | undefined,
+            eligible: true, guarded: claim.inventory_guarded === true,
+          };
+          this.completionClaims.set(key, !valid || prior === null ||
+            (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(next)) ? null : next);
+        }
+      }
+      return claim;
+    } finally { this.endCompletionObservation(ticket); }
   }
 
   /** Claim the oldest queued CHAT run for this worker's user (the disjoint chat
@@ -1697,13 +1702,13 @@ export class WorkerClient {
     const key = `${runId}:${body.claim_generation}`;
     const claim = this.completionClaims.get(key);
     const hold = this.completionHolds.get(key);
-    if ((this.completionBindingsSaturated && (claim === undefined || hold === undefined)) ||
-        (this.unknownClaimsRequireEligible && claim === undefined) ||
+    if ((this.unknownClaimsRequireEligible && claim === undefined) ||
         claim === null || (claim && (!claim.eligible || !claim.guarded ||
           (claim.repoId !== undefined && claim.repoId !== value.repo_id) ||
           (claim.forgeType !== undefined && claim.forgeType !== value.forge_type) ||
           (claim.branch !== undefined && claim.branch !== value.branch))) ||
         (hold !== undefined && hold !== value.hold_id)) return undefined;
+    if (!this.allowCompletionBinding(key)) return undefined;
     // Copy exactly the contract fields: unknown response fields carry no authority.
     const receipt: CompletedPublicationReceipt = {
       hold_id: value.hold_id as string, run_id: value.run_id as string,
@@ -2012,11 +2017,10 @@ export class WorkerClient {
     const claim = this.completionClaims.get(key);
     const hold = this.completionHolds.get(key);
     if (this.completionInventoryUnreadable ||
-        (this.completionBindingsSaturated && (claim === undefined || hold === undefined)) ||
         (this.unknownClaimsRequireEligible && claim === undefined) ||
         claim === null || (claim && (!claim.eligible || !claim.guarded)) || hold === null) return false;
     // Reserve both provenance slots synchronously, before the runner can await journal installation.
-    return this.allowCompletionBinding(key, this.completionEpoch);
+    return this.allowCompletionBinding(key);
   }
 
   /** Called only with persisted receipt proof after actual terminal resolution/removal. */
@@ -2032,57 +2036,83 @@ export class WorkerClient {
           (claim.branch !== undefined && claim.branch !== receipt.branch)))) return;
     this.completionClaims.delete(key);
     this.completionHolds.delete(key);
-    this.completionGenerations.delete(key);
-    this.completionEpoch++;
+    const reservation = this.completionReservations.get(key);
+    if (!reservation) return;
+    reservation.live = false;
+    // At most 2048 tickets per 2048 identities. A sibling failure never blocks detach.
+    for (const ticket of this.completionTickets) {
+      if (ticket.runId !== undefined && ticket.runId !== receipt.run_id) continue;
+      ticket.exclusions.add(key);
+      reservation.tickets.add(ticket);
+    }
+    if (reservation.tickets.size === 0) this.completionReservations.delete(key);
   }
 
-  private allowCompletionBinding(key: string, epoch: number): boolean {
-    if (this.completionGenerations.has(key)) return true;
-    if (epoch !== this.completionEpoch || this.completionGenerations.size * 2 >= COMPLETION_BINDINGS_MAX) {
-      this.completionBindingsSaturated = true;
-      return false;
-    }
-    this.completionGenerations.add(key);
+  private allowCompletionBinding(key: string): boolean {
+    const prior = this.completionReservations.get(key);
+    if (prior) { prior.live = true; return true; }
+    if (this.completionReservations.size * 2 >= COMPLETION_BINDINGS_MAX) return false;
+    this.completionReservations.set(key, { live: true, tickets: new Set() });
     return true;
+  }
+
+  private beginCompletionObservation(runId?: string): CompletionTicket {
+    if (this.completionTickets.size >= COMPLETION_OBSERVATIONS_MAX)
+      throw new Error("completion observation bookkeeping limit exceeded");
+    const ticket: CompletionTicket = { incarnation: this.completionIncarnation, runId, exclusions: new Set() };
+    this.completionTickets.add(ticket);
+    return ticket;
+  }
+
+  private endCompletionObservation(ticket: CompletionTicket): void {
+    // Registration clears the set; an old incarnation's finally must not detach new work.
+    if (ticket.incarnation !== this.completionIncarnation || !this.completionTickets.delete(ticket)) return;
+    for (const key of ticket.exclusions) {
+      const reservation = this.completionReservations.get(key);
+      if (!reservation) continue;
+      reservation.tickets.delete(ticket);
+      if (!reservation.live && reservation.tickets.size === 0) this.completionReservations.delete(key);
+    }
   }
 
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
    *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
     const incarnation = this.completionIncarnation;
-    const epoch = this.completionEpoch;
-    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`;
-    const res = await this.fetchRaw("GET", path, undefined);
-    if (res.status >= 400) throw await this.toError("GET", path, res);
-    let response: RecoveryHoldsResponse;
+    const ticket = this.beginCompletionObservation(runId);
     try {
-      const text = await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true);
-      response = (text ? JSON.parse(text) : undefined) as RecoveryHoldsResponse;
-    } catch (err) {
-      if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
-      throw err;
-    }
-    if (Array.isArray(response?.holds) && response.holds.length > COMPLETION_HOLDS_MAX_ITEMS) {
-      if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
-      throw new Error("recovery hold inventory exceeds item limit");
-    }
-    if (incarnation !== this.completionIncarnation) return response;
-    if (response?.run_id !== runId || !Array.isArray(response.holds)) this.completionInventoryUnreadable = true;
-    if (this.registeredWorkerId && response?.run_id === runId && Array.isArray(response.holds)) {
-      const seen = new Set<number>();
-      // One bounded pass, no retries; malformed siblings latch hard refusal without blocking siblings.
-      for (const hold of response.holds) {
-        if (!isRecord(hold) || !terminalGeneration(hold.generation) || hold.generation <= 0) { this.completionInventoryUnreadable = true; continue; }
-        const key = `${runId}:${hold.generation}`;
-        if (epoch !== this.completionEpoch && !this.completionHolds.has(key)) { this.completionBindingsSaturated = true; continue; }
-        if (!this.allowCompletionBinding(key, epoch)) continue;
-        const prior = this.completionHolds.get(key);
-        const id = terminalUUID(hold.hold_id) && hold.inventory_guarded === true ? hold.hold_id : null;
-        this.completionHolds.set(key, seen.has(hold.generation) || (prior !== undefined && prior !== id) ? null : id);
-        seen.add(hold.generation);
+      const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`;
+      const res = await this.fetchRaw("GET", path, undefined);
+      if (res.status >= 400) throw await this.toError("GET", path, res);
+      let response: RecoveryHoldsResponse;
+      try {
+        const text = await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true);
+        response = (text ? JSON.parse(text) : undefined) as RecoveryHoldsResponse;
+      } catch (err) {
+        if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
+        throw err;
       }
-    }
-    return response;
+      if (Array.isArray(response?.holds) && response.holds.length > COMPLETION_HOLDS_MAX_ITEMS) {
+        if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
+        throw new Error("recovery hold inventory exceeds item limit");
+      }
+      if (incarnation !== this.completionIncarnation) return response;
+      if (response?.run_id !== runId || !Array.isArray(response.holds)) this.completionInventoryUnreadable = true;
+      if (this.registeredWorkerId && response?.run_id === runId && Array.isArray(response.holds)) {
+        const seen = new Set<number>();
+        // One bounded pass, no retries; malformed siblings latch hard refusal without blocking siblings.
+        for (const hold of response.holds) {
+          if (!isRecord(hold) || !terminalGeneration(hold.generation) || hold.generation <= 0) { this.completionInventoryUnreadable = true; continue; }
+          const key = `${runId}:${hold.generation}`;
+          if (ticket.exclusions.has(key) || !this.allowCompletionBinding(key)) continue;
+          const prior = this.completionHolds.get(key);
+          const id = terminalUUID(hold.hold_id) && hold.inventory_guarded === true ? hold.hold_id : null;
+          this.completionHolds.set(key, seen.has(hold.generation) || (prior !== undefined && prior !== id) ? null : id);
+          seen.add(hold.generation);
+        }
+      }
+      return response;
+    } finally { this.endCompletionObservation(ticket); }
   }
 
   /** settleRecoveryHold asks the api to settle ONE older-generation custody hold on a completed

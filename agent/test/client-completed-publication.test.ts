@@ -352,7 +352,7 @@ for (const [field, value] of [
     assert.equal(ack.applied, true);
     assert.equal(ack.status, "completed");
     assert.equal(ack.completedPublicationReceipt, undefined);
-    assert.equal(Reflect.get(client, "completionBindingsSaturated"), false);
+    assert.equal(client.canStartPublicationCompletion(RUN, 2), true, "malformed incumbent does not block another identity");
   });
 }
 
@@ -366,7 +366,7 @@ it("bounds retained provenance for sixteen oversized claims without saturation",
   assert.equal(bindings.size, 16);
   assert.equal([...bindings.values()].every((value) => value === null), true,
     "oversized claim payloads leave only refusal markers");
-  assert.equal(Reflect.get(client, "completionBindingsSaturated"), false);
+  assert.equal(client.canStartPublicationCompletion(RUN, 17), true, "bounded refusal markers leave identity headroom");
   response.completed_publication_receipt = { ...receipt, generation: 16 };
   const ack = await client.reportState(RUN, { ...fixture.request, claim_generation: 16 });
   assert.equal(ack.applied, true);
@@ -453,6 +453,157 @@ it("refuses known noneligible or unguarded claims", async () => {
     await client.claimRun();
     assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
   }
+});
+
+// Start a real public observation and hold only its authenticated response.
+async function delayedObservation(lane: "claim" | "holds", runId = RUN, signal?: AbortSignal) {
+  let finish!: (value: Response | Promise<Response>) => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const delayed = new Promise<Response>(resolve => { finish = resolve; });
+  const originalFetch = globalThis.fetch;
+  mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith(lane === "claim" ? "/claim" : "/recovery-holds")) {
+      entered();
+      return delayed;
+    }
+    return originalFetch(input, init);
+  });
+  const pending = lane === "claim" ? client.claimRun(undefined, signal) : client.listRecoveryHolds(runId);
+  // Attach the rejection handler immediately, before delivering transport failures.
+  const settled = pending.then(value => ({ value }), error => ({ error }));
+  await started;
+  return { finish, settled };
+}
+
+for (const lane of ["claim", "holds"] as const) {
+  it("retiring A preserves unrelated delayed B " + lane, async () => {
+    await client.register("worker");
+    await client.claimRun();
+    const original = (await client.reportState(RUN, fixture.request)).completedPublicationReceipt!;
+    const runB = receipt.owner_id;
+    const delayed = await delayedObservation(lane, runB);
+    client.releasePublicationCompletion(original);
+    delayed.finish(Response.json(lane === "claim"
+      ? { ...claim, run_id: runB, claim_generation: 2 }
+      : { run_id: runB, holds: [{ ...holds[0], generation: 2 }] }));
+    assert.equal("error" in await delayed.settled, false);
+    assert.equal(client.canStartPublicationCompletion(runB, 2), true);
+    response = { ...fixture.ack, run: { ...fixture.ack.run, id: runB },
+      completed_publication_receipt: { ...receipt, run_id: runB, generation: 2 } };
+    assert.deepEqual((await client.reportState(runB, { ...fixture.request, claim_generation: 2 })).completedPublicationReceipt,
+      response.completed_publication_receipt);
+  });
+
+  for (const outcome of ["success", "http", "transport", "decode", "abort"] as const) {
+    if (lane === "holds" && outcome === "abort") continue; // This public endpoint has no caller signal.
+    it(lane + " retired reservation detaches after " + outcome, async () => {
+      await client.register("worker");
+      await client.claimRun();
+      const original = (await client.reportState(RUN, fixture.request)).completedPublicationReceipt!;
+      const abort = new AbortController();
+      const delayed = await delayedObservation(lane, RUN, abort.signal);
+      client.releasePublicationCompletion(original);
+      for (let slot = 0; slot < 2047; slot++)
+        assert.equal(client.canStartPublicationCompletion(receipt.owner_id, slot + 1), true);
+      assert.equal(client.canStartPublicationCompletion(receipt.owner_id, 2048), false,
+        "retired identity counts against the real combined budget");
+      if (outcome === "abort") abort.abort();
+      if (outcome === "transport") delayed.finish(Promise.reject(new Error("transport failure")));
+      else if (outcome === "http") delayed.finish(new Response("unavailable", { status: 503 }));
+      else if (outcome === "decode") delayed.finish(new Response("{invalid"));
+      else delayed.finish(Response.json(lane === "claim" ? claim : { run_id: RUN, holds }));
+      const result = await delayed.settled;
+      assert.equal("error" in result, outcome !== "success");
+      assert.equal((Reflect.get(client, "completionTickets") as Set<unknown>).size, 0);
+      assert.equal((Reflect.get(client, "completionReservations") as Map<string, unknown>).has(RUN + ":1"), false);
+      assert.equal((Reflect.get(client, lane === "claim" ? "completionClaims" : "completionHolds") as Map<string, unknown>).has(RUN + ":1"), false);
+      if (!(lane === "holds" && outcome === "decode"))
+        assert.equal(client.canStartPublicationCompletion(receipt.owner_id, 2048), true, "drainage reuses the budget");
+    });
+  }
+
+  it(lane + " replay before drainage preserves exclusions across repeated retirement", async () => {
+    await client.register("worker");
+    // Receipt-only replay must reserve the identity too.
+    const first = (await client.reportState(RUN, fixture.request)).completedPublicationReceipt!;
+    const early = await delayedObservation(lane);
+    client.releasePublicationCompletion(first);
+    const replay = (await client.reportState(RUN, fixture.request)).completedPublicationReceipt!;
+    assert.ok(replay);
+    const later = await delayedObservation(lane);
+    client.releasePublicationCompletion(replay);
+    for (let slot = 0; slot < 2047; slot++) assert.equal(client.canStartPublicationCompletion(receipt.owner_id, slot + 1), true);
+    const stale = () => Response.json(lane === "claim"
+      ? { ...claim, repo: { ...(claim.repo as object), id: receipt.owner_id } }
+      : { run_id: RUN, holds: [{ ...holds[0], hold_id: receipt.owner_id }] });
+    early.finish(stale());
+    await early.settled;
+    assert.equal(client.canStartPublicationCompletion(receipt.owner_id, 2048), false, "later exclusion retains one shared reservation");
+    later.finish(stale());
+    await later.settled;
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+    assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt,
+      "neither pre-retirement response recreated a conflict");
+  });
+
+  it(lane + " tickets overflow before fetch and reuse after drainage", async () => {
+    await client.register("worker");
+    let finish!: (response: Response) => void;
+    const delayed = new Promise<Response>(resolve => { finish = resolve; });
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      if (new URL(String(input)).pathname.endsWith(lane === "claim" ? "/claim" : "/recovery-holds")) {
+        fetches++;
+        return (await delayed).clone();
+      }
+      return originalFetch(input, init);
+    });
+    const start = () => lane === "claim" ? client.claimRun() : client.listRecoveryHolds(RUN);
+    const requests = Array.from({ length: 2048 }, start);
+    await assert.rejects(start(), /bookkeeping limit/);
+    assert.equal(fetches, 2048, "overflow makes no transport call");
+    assert.equal((Reflect.get(client, "completionClaims") as Map<string, unknown>).size, 0);
+    assert.equal((Reflect.get(client, "completionHolds") as Map<string, unknown>).size, 0);
+    finish(Response.json(lane === "claim" ? claim : { run_id: RUN, holds }));
+    await Promise.all(requests);
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+    await start();
+    assert.equal(fetches, 2049, "drained ticket slot is reusable");
+  });
+
+  it(lane + " retirement excludes only exact generation", async () => {
+    await client.register("worker");
+    await client.claimRun();
+    const original = (await client.reportState(RUN, fixture.request)).completedPublicationReceipt!;
+    const delayed = await delayedObservation(lane);
+    client.releasePublicationCompletion(original);
+    delayed.finish(Response.json(lane === "claim" ? { ...claim, claim_generation: 2 }
+      : { run_id: RUN, holds: [holds[0], { ...holds[0], generation: 2 }] }));
+    await delayed.settled;
+    assert.equal(client.canStartPublicationCompletion(RUN, 2), true);
+    response = { ...fixture.ack, completed_publication_receipt: { ...receipt, generation: 2 } };
+    assert.ok((await client.reportState(RUN, { ...fixture.request, claim_generation: 2 })).completedPublicationReceipt);
+    assert.equal((Reflect.get(client, lane === "claim" ? "completionClaims" : "completionHolds") as Map<string, unknown>).has(RUN + ":1"), false);
+  });
+}
+
+it("A-B-A delayed claim finally cannot detach a new incarnation ticket", async () => {
+  await client.register("A");
+  const old = await delayedObservation("claim");
+  workerId = receipt.owner_id;
+  await client.register("B");
+  workerId = receipt.worker_id;
+  await client.register("A-again");
+  const current = await delayedObservation("holds");
+  old.finish(Response.json({ ...claim, repo: { ...(claim.repo as object), id: receipt.owner_id } }));
+  await old.settled;
+  assert.equal((Reflect.get(client, "completionTickets") as Set<unknown>).size, 1);
+  current.finish(Response.json({ run_id: RUN, holds }));
+  await current.settled;
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
 });
 
 async function saturateClaims() {

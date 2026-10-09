@@ -358,11 +358,13 @@ it("P1-d: lost ACK original replays at capacity, persists and retires exact body
   } finally { await f.close(); }
 });
 
-it("MR2598 regression 3: separate new attempt at capacity prepares and omits completion disposition", async () => {
-  const f = await fixture();
+for (const mode of ["journal", "none", "reserve"] as const) {
+it("MR2598 regression 3: " + mode + " separate new attempt at capacity prepares and omits completion disposition", async () => {
+  const f = await fixture("issue", mode);
   try {
     await pressure(f);
     f.select(literal.run_id, 4098);
+    f.body.head = literal.final_head; // Keep the exact completion-permit head through fallback.
     const originalBody = structuredClone(f.body);
     await f.terminal();
     assert.deepEqual(f.body, originalBody, "refused admission leaves the caller body immutable");
@@ -372,9 +374,31 @@ it("MR2598 regression 3: separate new attempt at capacity prepares and omits com
     assert.ok(f.sent[0]);
     assert.equal("completion_final_head" in f.sent[0], false,
       "new attempt refused admission sends ordinary completion without disposition");
+    const ordinary = { ...originalBody };
+    delete ordinary.completion_final_head;
+    assert.deepEqual(f.sent[0], ordinary, "ordinary completion retains delivered head and all other fields");
+    assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 4098), false);
     assert.equal(f.sent.some(body => body.status === "failed"), false);
   } finally { await f.close(); }
 });
+}
+
+for (const mode of ["none", "reserve"] as const) {
+  it(mode + " attempted completion stays exact after lost ACK and later saturation", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      f.lose(true);
+      await assert.rejects(f.terminal());
+      const attempted = structuredClone(f.sent[0]);
+      assert.equal(attempted.completion_final_head, literal.final_head);
+      await pressure(f);
+      f.lose(false);
+      await f.terminal();
+      assert.deepEqual(f.sent.at(-1), attempted, "already attempted body never degrades to ordinary completion");
+      assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 1), true);
+    } finally { await f.close(); }
+  });
+}
 
 for (const status of ["completed", "failed"] as const) {
   it(status + " ordering: original durable at first preparation and first provider reap", async t => {
@@ -439,7 +463,8 @@ it("P1-b: delayed pre-retirement inventory cannot recreate a released generation
     }] }));
     await inventory;
     const ack = await f.client.reportState(literal.run_id, wire.request);
-    assert.equal(ack.completedPublicationReceipt, undefined, "skipped old inventory taints unknown provenance");
+    assert.deepEqual(ack.completedPublicationReceipt, f.receipt, "drained old inventory does not poison exact replay");
+    assert.equal(f.client.canStartPublicationCompletion(literal.run_id, 2), true, "unrelated generation remains admissible");
     assert.equal((Reflect.get(f.client, "completionHolds") as Map<string, unknown>).has(literal.run_id + ":1"), false,
       "old response must not recreate the retired binding");
   } finally { await f.close(); }

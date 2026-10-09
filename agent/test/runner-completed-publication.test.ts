@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { mintAttemptId } from "../src/run-quiescence.js";
 import type { RecoveryCoordinator } from "../src/recovery.js";
 import { fixture as codexReapFixture } from "./codex-reap-fixture.js";
 import { Outbox } from "../src/outbox.js";
@@ -29,7 +30,7 @@ function commit(dir: string, name: string): string {
 
 for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
   for (const variant of kind === "self_improve" ? ["receipt", "excluded", "lost-ack"] : kind === "issue" ? ["receipt", "codex", "lost-ack", "capacity", "capacity-codex"] : ["receipt", "lost-ack"]) {
-    for (const host of process.platform === "linux" && (variant === "lost-ack" || variant === "excluded") ? ["native", "darwin"] : ["native"]) {
+    for (const host of process.platform === "linux" && (variant === "lost-ack" || variant === "excluded" || variant === "capacity" || variant === "capacity-codex") ? (variant.startsWith("capacity") ? ["native", "darwin", "darwin-retained"] : ["native", "darwin"]) : ["native"]) {
       const capacity = variant === "capacity" || variant === "capacity-codex";
       const excluded = variant === "excluded" || capacity;
       const lostAck = variant === "lost-ack";
@@ -44,7 +45,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           });
           const branch = kind === "self_improve" ? `uzi/self-improve/${claim.run_id}`
             : kind === "mr_rework" ? "agent/issue-42" : "agent/issue-2507";
-          api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature]);
+          api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature, "terminal_rejection_report"]);
           const registration = await client.register("completion-full-execute", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
           assert.ok(registration.worker_id);
           if (capacity) {
@@ -88,13 +89,31 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             checksum: manifest?.checksum, byte_size: manifest?.byte_size,
             expires_at: new Date(Date.now() + 60_000).toISOString(),
           });
-          client.releaseRecoveryCustody = async () => {
+          const finalInventories: Awaited<ReturnType<typeof git.readInventoryCloneHeads>>[] = [];
+          client.releaseRecoveryCustody = async (runId, generation, evidence, disposition) => {
+            assert.equal(runId, claim.run_id);
+            assert.equal(generation, claim.claim_generation);
+            assert.equal(finalBoundaryAuthorized, true, "FINAL follows source proof after execution tail removal");
+            assert.equal(evidence, undefined);
+            assert.equal(disposition?.kind, "archive");
+            assert.match(disposition!.coverage_digest, /^[0-9a-f]{64}$/);
+            const records = await recovery.inspect(claim.run_id);
+            assert.ok(records.some(record => record.generation === generation &&
+              record.coverageDigest === disposition!.coverage_digest &&
+              record.serverCaptureId === (disposition as { capture_id: string }).capture_id &&
+              record.sourceSha === (disposition as { source_sha: string }).source_sha),
+              "FINAL matches authenticated exact-generation archive coverage");
+            const inventory = await git.readInventoryCloneHeads(await git.ensureClone(fx.originPath), claim.run_id);
+            finalInventories.push(inventory);
+            assert.equal(inventory.kind, "verified");
+            if (process.platform !== "linux" && inventory.kind === "verified") assert.deepEqual(inventory.clones, []);
             finals++;
             assert.equal(serverAuthoritativeHoldReleased, false, "no archive FINAL after completed release");
             open = false;
             return { run_id: claim.run_id, generation: claim.claim_generation!, released: true, holds_released: 1 };
           };
-          let checkpointHead = "", finalHead = "", clone = "", checkpoints = 0;
+          let checkpointHead = "", finalHead = "", clone = "", checkpoints = 0, retainedClone = "";
+          let executeSettled = false, finalBoundaryAuthorized = false;
           client.publishCheckpoint = async (_run, tip, pack) => {
             const chunks: Buffer[] = [];
             for await (const chunk of pack) chunks.push(Buffer.from(chunk));
@@ -136,11 +155,37 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             finalHead = commit(clone, "post-checkpoint.txt");
             fs.writeFileSync(path.join(clone, "deliberate-leftover.txt"), "discard only after safe retirement\n");
             forge.pr.head = finalHead;
+            if (host === "darwin-retained") {
+              const bare = await git.ensureClone(fx.originPath);
+              const attemptId = mintAttemptId(claim.claim_generation!);
+              const siblingBranch = branch + "-retained";
+              const sibling = await git.runnerCloneForBranch(bare, siblingBranch, "retained-source", {
+                beforeFree: async () => { throw new Error("retained source cannot free an incumbent"); },
+              }, claim.run_id, false, undefined, {
+                attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),
+                quiescent: async () => true,
+              });
+              retainedClone = sibling.path;
+              await git.markRecoveryCapture(bare, sibling.path, siblingBranch, claim.run_id, attemptId);
+            }
+            if (capacity && host.startsWith("darwin")) Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
             return { branch: ctx.branch };
           } }, forge.gitlab, "completion-full-execute-key", {
             outbox, checkpointIntervalMs: 1, checkpointTickIntervalMs: 0,
           });
           const recovery = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
+          const boundaryRunner = r as unknown as {
+            withInventorySourceBoundary(context: { runId: string }, action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained">;
+          };
+          const sourceBoundary = boundaryRunner.withInventorySourceBoundary.bind(r);
+          t.mock.method(boundaryRunner, "withInventorySourceBoundary", async (context, action) => {
+            const executionTailPresent = r.isExecuting(context.runId);
+            return sourceBoundary(context, async prove => {
+              assert.equal(executionTailPresent, false, "execution tail cannot authorize FINAL");
+              finalBoundaryAuthorized = true;
+              try { await action(prove); } finally { finalBoundaryAuthorized = false; }
+            });
+          });
           let firstPreparationJournal: Awaited<ReturnType<Outbox["readTerminalJournal"]>>;
           let preparationObserved = false;
           const freezeInventory = recovery.freezeInventory.bind(recovery);
@@ -159,12 +204,20 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           const originalFetch = globalThis.fetch;
           t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
             const url = new URL(input instanceof Request ? input.url : String(input));
+            if (url.origin === new URL(baseUrl).origin && url.pathname.endsWith("/terminal-rejection-custody")) {
+              assert.equal(Number(url.searchParams.get("generation")), claim.claim_generation);
+              return Response.json({ run_id: claim.run_id, worker_id: registration.worker_id,
+                generation: claim.claim_generation, exact_holds: [{ id: literal.hold_id, state: open ? "open" : "released" }],
+                sibling_holds: [], exact_count: 1, sibling_count: 0, complete: true,
+                exact_complete: true, sibling_complete: true, outcome: open ? "retained" : "settled" });
+            }
             const response = await originalFetch(input, init);
             if (url.origin !== new URL(baseUrl).origin || url.pathname !== `/api/worker/runs/${claim.run_id}/state`) return response;
             const body = JSON.parse(String(init?.body)) as StateRequest;
             if (body.status !== "completed") return response;
+            if (capacity && executeSettled) return Response.json({ run: { ...wire.ack.run, id: claim.run_id, worker_id: registration.worker_id } });
             // Provision real clones on the host; simulate Darwin for terminal fallback and retirement.
-            if (host === "darwin") Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+            if (host.startsWith("darwin")) Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
             acknowledgements++;
             if (replaying) {
               assert.ok(storedAck);
@@ -222,6 +275,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             return ack;
           });
           await r.execute(claim);
+          executeSettled = true;
           if (capacity) {
             assert.ok(firstPreparationJournal, "full execute original not journaled before first preparation");
             assert.ok(firstCaptureJournal, "full execute original not journaled before first capture");
@@ -328,10 +382,13 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             assert.ok(uploads > 0);
             // The archive may wait for the still-held execution tail. Re-drive once after execute.
             await r.resumePendingRecoveries();
-            if (linux) assert.ok(finals > 0, "fallback uses archive FINAL after the execution tail settles");
-            else {
+            if (linux || (capacity && host !== "darwin-retained")) {
+              assert.ok(finals > 0, "verified source permits archive FINAL after the execution tail settles");
+              assert.ok(finalInventories.length > 0);
+            } else {
               assert.equal(finals, 0, "non-Linux archive boundary refuses FINAL");
-              assert.ok(fs.existsSync(clone), "non-Linux retains the excluded completing clone");
+              assert.ok(fs.existsSync(retainedClone || clone), "non-Linux retains its physical source");
+              assert.equal(outbox.hasPendingTerminal(claim.run_id, claim.claim_generation!), true);
               const retained = await recovery.inspect(claim.run_id);
               assert.ok(retained.length > 0, "non-Linux retains excluded generation recovery records");
               assert.ok(retained.every(record => record.generation === claim.claim_generation && !record.completionReceipt));
@@ -345,7 +402,12 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
                 "refused new attempt journals ordinary completion before preparation");
               assert.equal("completion_final_head" in firstCaptureJournal!.body, false,
                 "capture retains the same ordinary terminal body");
-              if (linux) {
+              if (host !== "darwin-retained") {
+                await resolvePendingTerminal(r.protectRecoveryTerminalDeps({ outbox, client,
+                  gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }), {
+                  runId: claim.run_id, claimGeneration: claim.claim_generation!,
+                  send: body => client.reportState(claim.run_id, { ...body, claim_generation: claim.claim_generation }),
+                });
                 assert.equal(outbox.hasPendingTerminal(claim.run_id, claim.claim_generation!), false,
                   "real ordinary archive FINAL allows pending terminal retirement");
                 assert.equal(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!), undefined);
