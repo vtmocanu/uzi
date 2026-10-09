@@ -37,6 +37,12 @@ type currentActivityJSON struct {
 	Seq        int32  `json:"seq"`
 }
 
+// progressJSON is the decode target for a RunDTO's progress object (PRD #2602).
+type progressJSON struct {
+	State string `json:"state"`
+	Phase string `json:"phase"`
+}
+
 // TestCurrentActivityDTO exercises PRD #1064 M2's current_activity population glue — the
 // wiring runToDTO deliberately does NOT do (it stays pure), set instead in the handler's
 // list builders and the GET path from the batched LatestToolUseForRuns lookup. It asserts
@@ -88,14 +94,32 @@ func TestCurrentActivityDTO(t *testing.T) {
 			Runs []struct {
 				ID              string               `json:"id"`
 				CurrentActivity *currentActivityJSON `json:"current_activity"`
+				Progress        *progressJSON        `json:"progress"`
 			} `json:"runs"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode body: %v", err)
 		}
 		byID := make(map[string]*currentActivityJSON, len(body.Runs))
+		progByID := make(map[string]*progressJSON, len(body.Runs))
 		for _, r := range body.Runs {
 			byID[r.ID] = r.CurrentActivity
+			progByID[r.ID] = r.Progress
+		}
+
+		// PRD #2602: progress.phase follows the activity role; absent without activity;
+		// a terminal run has no progress at all.
+		if p := progByID[runRead.String()]; p == nil || p.Phase != "implement" {
+			t.Errorf("runRead (coder) progress = %+v, want phase implement", p)
+		}
+		if p := progByID[runAgent.String()]; p == nil || p.Phase != "review" {
+			t.Errorf("runAgent (reviewer) progress = %+v, want phase review", p)
+		}
+		if p := progByID[runNoActivity.String()]; p == nil || p.State != "queued" || p.Phase != "" {
+			t.Errorf("runNoActivity progress = %+v, want state queued with empty phase", p)
+		}
+		if p := progByID[runTerminal.String()]; p != nil {
+			t.Errorf("terminal run progress = %+v, want null", p)
 		}
 
 		// runRead: a Read tool_use → Tool "Read", Detail the file_path, frame agent verbatim.
@@ -154,10 +178,14 @@ func TestCurrentActivityDTO(t *testing.T) {
 		var body struct {
 			Run struct {
 				CurrentActivity *currentActivityJSON `json:"current_activity"`
+				Progress        *progressJSON        `json:"progress"`
 			} `json:"run"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode body: %v", err)
+		}
+		if p := body.Run.Progress; p == nil || p.Phase != "implement" {
+			t.Errorf("GetRun progress = %+v, want phase implement from the coder frame", p)
 		}
 		act := body.Run.CurrentActivity
 		if act == nil {

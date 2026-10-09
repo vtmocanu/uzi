@@ -463,6 +463,10 @@ type Store interface {
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
 	DeleteEphemeralWorkerForRun(ctx context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
+	// Issue #2602: the run-detail blocked-by hint (MaybeBlockedByRun).
+	GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]byte, error)
+	RunQuestionAnswerExists(ctx context.Context, arg store.RunQuestionAnswerExistsParams) (bool, error)
+	GetMaybeBlockingRun(ctx context.Context, arg store.GetMaybeBlockingRunParams) (uuid.UUID, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 
 	// Runs.

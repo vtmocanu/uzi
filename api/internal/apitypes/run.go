@@ -104,6 +104,26 @@ type RunActivity struct {
 	Seq           int32     `json:"seq"`
 }
 
+// RunProgress is the progress estimate carried on RunDTO.Progress (PRD #2602).
+// State is a closed set (percent, waiting, parked, queued, stalled, planning, none);
+// a consumer treats an unknown value as none. Pct is set only when State is percent.
+// MilestoneDone/Total count over the frozen milestone list; ActiveMilestoneID is the
+// first frozen id in progress and not completed ("" when none). Phase is implement,
+// review, validate, or "" and comes from the current_activity role.
+type RunProgress struct {
+	State             string `json:"state"`
+	Pct               *int   `json:"pct"`
+	MilestoneDone     int    `json:"milestone_done"`
+	MilestoneTotal    int    `json:"milestone_total"`
+	ActiveMilestoneID string `json:"active_milestone_id"`
+	Phase             string `json:"phase"`
+	// MaybeBlockedByRunID is set on GetRun only (never on a list read), only while the run
+	// is awaiting_input: a live run of the same owner and repo that the open question
+	// mentions as #<issue>. It is a hint from untrusted question text, not a recorded
+	// dependency, and never names a run the owner could not see.
+	MaybeBlockedByRunID *string `json:"maybe_blocked_by_run_id,omitempty"`
+}
+
 // IsTerminalRunStatus reports whether a run status is one a run never leaves — the
 // server's own terminal set (completed/failed/cancelled). It lives here, alongside
 // the run-status wire shapes, so the handler and other server packages share ONE
@@ -207,10 +227,15 @@ type RunDTO struct {
 	// run is in its pre-approval PLANNING turn (status running, iteration_count 0, no
 	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
 	// status value. A pre-feature api pod omits it; absent reads as not-planning.
-	IsPlanning                bool     `json:"is_planning"`
-	AutoApprove               bool     `json:"auto_approve"`
-	AutoApproveBlockedReasons []string `json:"auto_approve_blocked_reasons"`
-	IssueInputReason          *string  `json:"issue_input_reason"`
+	IsPlanning bool `json:"is_planning"`
+	// Progress is the server-derived progress estimate (PRD #2602): a percent from the
+	// frozen milestone list, or a state flag when a percent would mislead. null for a
+	// terminal run. Derived in runToDTO (runprogress.Derive), never stored; Phase is
+	// filled only where current_activity is. A pre-feature api pod omits it.
+	Progress                  *RunProgress `json:"progress"`
+	AutoApprove               bool         `json:"auto_approve"`
+	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
+	IssueInputReason          *string      `json:"issue_input_reason"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
 	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
