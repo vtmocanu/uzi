@@ -70,6 +70,12 @@ func (n *Notifier) markDelivered(ctx context.Context, ev notifyEvent) {
 	}
 	if err := n.store.MarkNotificationSlackDelivered(ctx, ev.deliveryID); err != nil {
 		n.logf("mark notification delivered", err)
+		return
+	}
+	if _, err := n.store.PruneNotificationsForUser(ctx, store.PruneNotificationsForUserParams{
+		UserID: ev.userID, Keep: n.notificationUserCap, MaxAttempts: notifysvc.MaxSlackAttempts,
+	}); err != nil {
+		n.logf("prune delivered notification", err)
 	}
 }
 
