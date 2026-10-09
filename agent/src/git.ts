@@ -29,7 +29,7 @@ import {
   parseAttemptPath,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
-import { recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
+import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 import { RECOVERY_DECODED_LIMIT, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
@@ -4302,12 +4302,29 @@ export class GitCache {
     if (!journal || !sameRecoverySource(journal, expected)) throw new Error("recovery identity changed");
     if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("invalid recovery key");
     const canonical = this.runnerClonePath(barePath, key);
+    let repair: RecoverySource | undefined;
     for (const source of this.recoverySources(journal)) {
       const shape = this.clonePathShape(source.clonePath, canonical);
-      if (!shape || shape.attemptId !== source.attemptId ||
-          !await this.classifyOwnerClonePath(barePath, branch, key, source.runId, source.clonePath)) {
+      if (!shape || shape.attemptId !== source.attemptId || source.runId !== journal.runId) {
         throw new Error("recovery source does not belong to this key");
       }
+      if (await this.classifyOwnerClonePath(barePath, branch, key, source.runId, source.clonePath)) continue;
+      // Old prepareRecoverySuccessor wrote adopting before its ledger entry. Only
+      // that distinct, not-yet-created successor can recover the missing attribution.
+      if (journal.recovery?.stage !== "adopting" || !journal.recovery.successor ||
+          !sameRecoverySource(source, journal.recovery.successor) ||
+          sameRecoverySource(source, journal) || !source.attemptId) {
+        throw new Error("recovery source does not belong to this key");
+      }
+      // One ledger scan, no retries; malformed evidence or any conflicting
+      // identity (including another branch) refuses repair before any append.
+      for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+        const entry = parseAttemptLedgerEntry(raw);
+        if (!entry || entry.attemptId === source.attemptId || entry.clonePath === source.clonePath) {
+          throw new Error("unreadable or conflicting recovery successor ledger");
+        }
+      }
+      repair = source;
     }
     let missing = false;
     // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
@@ -4319,9 +4336,15 @@ export class GitCache {
           if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe recovery source path");
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          if (repair && sameRecoverySource(source, repair) && dir !== source.clonePath) {
+            throw new Error("unsafe recovery successor ancestor");
+          }
           absent = true;
           break;
         }
+      }
+      if (repair && sameRecoverySource(source, repair) && !absent) {
+        throw new Error("recovery successor already exists without attribution");
       }
       if (absent) {
         if (journal.recovery?.successor && sameRecoverySource(source, journal.recovery.successor) &&
@@ -4331,7 +4354,12 @@ export class GitCache {
       const st = await fs.lstat(path.join(source.clonePath, ".git"));
       if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe recovery source path");
     }
-    if (missing && !allowMissing) throw new RetainedRecoveryBlockedError(barePath, branch, key, journal);
+    if (missing && (!allowMissing || repair)) throw new RetainedRecoveryBlockedError(barePath, branch, key, journal);
+    // checkedRecovery callers hold the bare lock. All siblings and real ancestors
+    // have been validated, and the successor leaf was affirmatively ENOENT.
+    if (repair) await this.appendAttemptLedger(barePath, branch, {
+      attemptId: repair.attemptId!, runId: repair.runId, clonePath: repair.clonePath, state: "live",
+    });
     return journal;
   }
 
@@ -4581,9 +4609,9 @@ export class GitCache {
         runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
         ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
       }));
+      await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
-      await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
       const seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
         { ...opts, recoveryTip: tip });
       const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();
@@ -4727,7 +4755,13 @@ export class GitCache {
           // Retirement clears this key to empty. Like readRecoveryCapture, the
           // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
           if (value === "") continue;
-          const journal = await atFailure("attribution_unreadable", () => this.readRecoveryCapture(barePath, branch, entries));
+          const journal = await (async () => {
+            try { return await this.readRecoveryCapture(barePath, branch, entries); }
+            catch (err) {
+              cause = err instanceof InvalidRecoveryClonePathError ? "clone_path_invalid" : "attribution_unreadable";
+              throw err;
+            }
+          })();
           if (!journal) refuse("attribution_unreadable", "unreadable recovery attribution");
           if (journal.attemptId !== undefined &&
               (parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot))?.attemptId ?? "") !== journal.attemptId) {

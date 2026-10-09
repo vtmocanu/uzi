@@ -23,6 +23,10 @@ export interface RecoveryProgress {
   blocker?: RecoveryBlocker;
 }
 
+export class InvalidRecoveryClonePathError extends Error {
+  constructor() { super("invalid retained recovery clone path"); }
+}
+
 const invalid = (): never => { throw new Error("invalid retained recovery progress"); };
 const object = (v: unknown): Record<string, unknown> => {
   if (!v || typeof v !== "object" || Array.isArray(v)) return invalid();
@@ -35,9 +39,11 @@ const keys = (v: Record<string, unknown>, allowed: string[]): void => {
 export function recoverySource(v: unknown): RecoverySource {
   const o = object(v);
   keys(o, ["runId", "clonePath", "attemptId", "restoreTip"]);
-  if (typeof o.runId !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(o.runId) ||
-      typeof o.clonePath !== "string" || !path.isAbsolute(o.clonePath) ||
-      path.resolve(o.clonePath) !== o.clonePath || [...o.clonePath].some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) invalid();
+  if (typeof o.runId !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(o.runId)) invalid();
+  if (typeof o.clonePath !== "string" || !path.isAbsolute(o.clonePath) ||
+      path.resolve(o.clonePath) !== o.clonePath || [...o.clonePath].some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) {
+    throw new InvalidRecoveryClonePathError();
+  }
   if (o.attemptId !== undefined && (typeof o.attemptId !== "string" || !ATTEMPT_ID_RE.test(o.attemptId))) invalid();
   if (o.restoreTip !== undefined && (typeof o.restoreTip !== "string" || !/^[0-9a-f]{40}$/.test(o.restoreTip))) invalid();
   if (o.attemptId !== undefined && !(o.clonePath as string).endsWith(`.attempt-${o.attemptId}`)) invalid();

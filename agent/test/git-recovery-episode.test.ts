@@ -240,6 +240,75 @@ test("successor handoff preserves predecessor bytes, canonical inventory, pins a
     { settled: true, processedEvents: 1, attemptId: aid(2) }), /cannot complete/);
 });
 
+test("successor ledger precedes adopting journal and crash never seeds a clone", async (t) => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+  const before = journal();
+  const clonePath = source.clonePath + ".attempt-" + aid(2);
+  const internal = cache as unknown as { writeRecovery(...args: unknown[]): Promise<void> };
+  let injected = false;
+  t.mock.method(internal, "writeRecovery", async () => {
+    injected = true;
+    throw new Error("injected journal crash");
+  });
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, 1, aid(2)), /injected journal crash/);
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(clonePath), false);
+  assert.deepEqual(journal(), before);
+  assert.equal(await recreate().classifyOwnerClonePath(bare, branch, key, runId, clonePath), "attempt");
+  assert.deepEqual(JSON.parse(JSON.stringify((await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))!.journal)), before);
+  assert.equal((await recreate().reserveRecoveryIteration(bare, branch, key, source)).attempts, 2);
+});
+
+async function legacyAdopting() {
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+  const successor = { runId, clonePath: source.clonePath + ".attempt-" + aid(2), attemptId: aid(2), restoreTip: tip };
+  writeJournal({ ...journal(), recovery: { ...journal().recovery, successor, stage: "adopting" } });
+  return { successor, tip, before: journal() };
+}
+
+test("absent legacy adopting successor repairs exact attribution before rediscovery", async () => {
+  const { successor, tip, before } = await legacyAdopting();
+  assert.equal(await recreate().classifyOwnerClonePath(bare, branch, key, runId, successor.clonePath), undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify((await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))!.journal)), before);
+  assert.equal(await recreate().classifyOwnerClonePath(bare, branch, key, runId, successor.clonePath), "attempt");
+  assert.deepEqual(JSON.parse(git(bare, ["config", "--get-all", `uzi-attempts.${branch}.entry`])), {
+    attemptId: aid(2), runId, clonePath: successor.clonePath, state: "live",
+  });
+  assert.equal(fs.existsSync(successor.clonePath), false);
+  assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "retained work\n");
+  assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+  assert.equal((await recreate().reserveRecoveryIteration(bare, branch, key, source)).attempts, 2);
+});
+
+for (const invalid of ["existing path", "conflict", "unreadable ledger", "unsafe ancestor", "missing ancestor", "foreign owner", "unsafe sibling"] as const) {
+  test(`legacy adopting successor refuses repair for ${invalid}`, async () => {
+    const { successor, before } = await legacyAdopting();
+    if (invalid === "existing path") fs.cpSync(source.clonePath, successor.clonePath, { recursive: true });
+    if (invalid === "conflict" || invalid === "unreadable ledger") git(bare, ["config", "--add",
+      `uzi-attempts.${branch}.entry`, invalid === "conflict"
+        ? JSON.stringify({ ...successor, restoreTip: undefined, runId: "foreign", state: "live" }) : "{"]);
+    const parent = path.dirname(source.clonePath);
+    if (invalid === "unsafe ancestor" || invalid === "missing ancestor") {
+      fs.renameSync(parent, parent + ".saved");
+      if (invalid === "unsafe ancestor") fs.symlinkSync(parent + ".saved", parent);
+    }
+    if (invalid === "unsafe sibling") {
+      fs.renameSync(source.clonePath, source.clonePath + ".saved");
+      fs.symlinkSync(source.clonePath + ".saved", source.clonePath);
+    }
+    await assert.rejects(recreate().discoverRetainedRecovery(fx.originPath, branch, key,
+      invalid === "foreign owner" ? "foreign" : runId));
+    assert.deepEqual(journal(), before);
+    const entries = git(bare, ["config", "--null", "--list"]).split("\0")
+      .filter(e => e.startsWith(`uzi-attempts.${branch}.entry\n`));
+    assert.equal(entries.length, invalid === "conflict" || invalid === "unreadable ledger" ? 1 : 0);
+  });
+}
+
 test("multiple successor handoffs keep the original episode source, deadline and total budget", async () => {
   const { expected, tip } = await ready();
   const first = journal().recovery;

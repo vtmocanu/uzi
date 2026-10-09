@@ -240,6 +240,36 @@ for (const shape of ["canonical key", "outside root", "unnormalized", "clone fil
   });
 }
 
+for (const site of ["source", "successor", "retained"] as const) {
+  it(`inventory identifies nested invalid clone path in ${site}`, async () => {
+    const f = await inventoryFixture(false);
+    try {
+      const source = { runId: inventoryRun, clonePath: f.clone };
+      const invalid = { ...source, clonePath: f.parent + "/../" + path.basename(f.parent) + "/" + path.basename(f.clone) };
+      f.journal({ ...source, ...(site === "retained" ? { retainedSources: [invalid] } : {
+        recovery: { version: 1, source: site === "source" ? invalid : source,
+          ...(site === "successor" ? { successor: invalid } : {}),
+          attempts: 1, startedAt: 0, deadline: 300_000, backoffMs: 1, stage: "capturing" },
+      }) });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
+    } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
+for (const metadata of ["run id", "progress"] as const) {
+  it(`inventory keeps corrupt nonpath ${metadata} attribution unreadable`, async () => {
+    const f = await inventoryFixture(false);
+    try {
+      const source = { runId: inventoryRun, clonePath: f.clone };
+      f.journal(metadata === "run id" ? { ...source, runId: "invalid run id" } : {
+        ...source, recovery: { version: 1, source, attempts: 4, startedAt: 0,
+          deadline: 300_000, backoffMs: 1, stage: "capturing" },
+      });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "attribution_unreadable" });
+    } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
 it("#2507 clone-leaf IO remains distinct from ancestor and HEAD IO", async t => {
   const f = await inventoryFixture(false);
   try {
