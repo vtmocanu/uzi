@@ -778,6 +778,8 @@ const PERMIT_RETRY_BASE_MS = 1_000;
 const PERMIT_RETRY_MAX_DELAY_MS = 30_000;
 
 export interface ClientOptions {
+  /** Per-instance transport; omitted instances read the current global fetch. */
+  fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   terminalRetrySchedule?: number[];
   /** Total wall time (requests AND backoff) a completion-permit request may spend retrying
@@ -1107,6 +1109,7 @@ export class WorkerClient {
     private readonly log: Logger,
     opts: ClientOptions = {},
   ) {
+    this.transport = opts.fetch;
     this.sleep = opts.sleep ?? sleepReal;
     this.terminalRetrySchedule = opts.terminalRetrySchedule ?? DEFAULT_TERMINAL_RETRY_SCHEDULE;
     this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
@@ -3037,6 +3040,8 @@ export class WorkerClient {
     return text ? JSON.parse(text) : undefined;
   }
 
+  private readonly transport: typeof fetch | undefined;
+
   private async fetchRaw(
     method: "GET" | "POST",
     path: string,
@@ -3063,7 +3068,7 @@ export class WorkerClient {
         : AbortSignal.timeout(timeoutMs),
     };
     if (body !== undefined) init.body = JSON.stringify(body);
-    return fetch(this.baseUrl + path, init);
+    return (this.transport ?? fetch)(this.baseUrl + path, init);
   }
 
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {

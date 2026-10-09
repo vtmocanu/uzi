@@ -84,6 +84,7 @@ import type {
   RawPrDescriptionFields,
 } from "./protocol.js";
 import type { PrSummaryClaim } from "./signals.js";
+import { diagramEvent, type DiagramReason } from "./diagram-diagnostic.js";
 import { parseDeliveryDiagram, type DeliverySummary, type DeliverySummaryClaimView, type DeliverySummaryInput } from "./summary-runner.js";
 
 // ── Seams ──────────────────────────────────────────────────────────────────────────────────
@@ -350,6 +351,23 @@ function leadFields(lead: PrSummaryClaim | undefined): RawPrDescriptionFields | 
   return empty ? null : fields;
 }
 
+/** Shared production assembly: unknown code size stays eligible; known zero code suppresses graphs. */
+export function assembleGeneratedFields(
+  generated: DeliverySummary,
+  lead: PrSummaryClaim | undefined,
+  zeroCode: boolean,
+): RawPrDescriptionFields {
+  const fields: RawPrDescriptionFields = {
+    ...generated,
+    scope_notes: generated.scope_notes.map((n) => ({ ...n })),
+    verification: leadVerification(lead),
+  };
+  const diagram = !zeroCode && parseDeliveryDiagram(generated.diagram);
+  if (diagram) fields.diagram = diagram;
+  else delete fields.diagram;
+  return fields;
+}
+
 const EMPTY_FIELDS: RawPrDescriptionFields = { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] };
 
 const SIZE_LINE_RE = /^\*\*Size:\*\* [^\n]*$/u;
@@ -450,6 +468,7 @@ interface Staged {
   sizeOnly: string;
   /** The hash this version was bound with, once bound. */
   boundHash?: string;
+  diagramRemoval?: { stage: "renderer" | "region_cap"; reason: "mermaid_bytes" | "backtick" | "region_bytes" };
   /** The version has been acknowledged (no further ack for it). */
   acked?: boolean;
 }
@@ -465,8 +484,8 @@ interface Composition {
   skip?: RegionSkip;
   /** The D15 cap replaced the region with its size-only form. */
   capped: boolean;
-  /** The body cap selected the diagram-less region. */
-  diagramless?: boolean;
+  /** Removal selected for this candidate, including its original staged version. */
+  diagramDecision?: { version_id: string; stage: "renderer" | "region_cap" | "body_cap"; reason: DiagramReason };
   /** The amended-D10 scan forced a whole-body non-closing rewrite. */
   interlockRewrite: boolean;
   /** A refresh on a legacy PR (no markers): nothing is written, nothing is acked. */
@@ -515,6 +534,7 @@ export class PrDescriptionPublication {
   /** An api transport failure in this publication. All api routes are advisory. */
   private apiUnreachable = false;
   private readonly memo = new BodyMemo();
+  private readonly diagramDecisions = new Set<string>();
   /** The PR body as last read (or confirmed) from the forge, and the completion block uzi's last
    *  composition expected in it: what `closingRemains` is judged on. */
   private forgeBody: string | undefined;
@@ -569,7 +589,9 @@ export class PrDescriptionPublication {
   /** The body a NEW PR is created with: the region and the completion block, no preserved text
    *  (D15-capped like any other body). */
   initialBody(completion: string): string {
-    return capBody((r) => renderBody(r, completion), this.staged.region, this.staged.sizeOnly, this.staged.diagramLess).body ?? renderBody(this.staged.sizeOnly, completion);
+    const selected = capBody((r) => renderBody(r, completion), this.staged.region, this.staged.sizeOnly, this.staged.diagramLess);
+    this.reportSelection(this.selectionDecision(selected.removal));
+    return selected.body ?? renderBody(this.staged.sizeOnly, completion);
   }
 
   /** @internal prepare()'s staging. */
@@ -603,14 +625,15 @@ export class PrDescriptionPublication {
         source = "generated";
         const zeroCode = facts && !facts.size.size.unavailable &&
           facts.size.size.code.added + facts.size.size.code.deleted === 0;
-        fields = {
-          ...generated,
-          scope_notes: generated.scope_notes.map((n) => ({ ...n })),
-          verification: leadVerification(spec.lead),
-        };
-        const diagram = !zeroCode && parseDeliveryDiagram(generated.diagram);
-        if (diagram) fields.diagram = diagram;
-        else delete fields.diagram;
+        fields = assembleGeneratedFields(generated, spec.lead, !!zeroCode);
+        const parsed = parseDeliveryDiagram(generated.diagram, (reason) => {
+          if (reason !== "absent" && reason !== "valid") {
+            diagramEvent(deps.log, spec.claim, "agent_parser", "dropped", reason, { claim_generation: spec.claimGeneration }, [spec.pat]);
+          }
+        });
+        if (zeroCode && parsed) {
+          diagramEvent(deps.log, spec.claim, "zero_code", "dropped", "zero_code", { claim_generation: spec.claimGeneration }, [spec.pat]);
+        }
       } else if (lead) {
         source = "lead_only";
         fields = lead;
@@ -650,13 +673,32 @@ export class PrDescriptionPublication {
       deps.log.warn("PR description: the snapshot has no merge-base or head; the region is not staged", { run_id: spec.runId });
     }
     const input = { sizeLine, headSha: snapshot.headSha, targetBranch: snapshot.targetBranch };
+    const rendered = renderRegion({ ...input, source: version?.source }, version?.fields);
     return {
       snapshot,
       version,
-      region: renderRegion({ ...input, source: version?.source }, version?.fields).text,
+      diagramRemoval: rendered.diagramRemoval,
+      region: rendered.text,
       diagramLess: renderRegion({ ...input, source: version?.source }, version?.fields, true).text,
       sizeOnly: renderRegion(input).text,
     };
+  }
+
+  /** Capture the selection and original version before restaging replaces it. */
+  private selectionDecision(removal?: "diagramless" | "sizeonly"): Composition["diagramDecision"] {
+    const staged = this.staged;
+    if (!staged.version?.fields.diagram) return undefined;
+    const decision = staged.diagramRemoval ?? (removal ? { stage: "body_cap" as const, reason: removal } : undefined);
+    return decision ? { ...decision, version_id: staged.version.id } : undefined;
+  }
+
+  private reportSelection(decision: Composition["diagramDecision"]): void {
+    if (!decision) return;
+    const key = JSON.stringify([decision.version_id, decision.stage, decision.reason]);
+    if (this.diagramDecisions.has(key)) return;
+    this.diagramDecisions.add(key);
+    diagramEvent(this.deps.log, this.spec.claim, decision.stage, "dropped", decision.reason,
+      { claim_generation: this.spec.claimGeneration, version_id: decision.version_id }, [this.spec.pat]);
   }
 
   /** The editor pass for `snapshot`, under the publication's ONE deadline (D2). Null on any failure. */
@@ -666,9 +708,10 @@ export class PrDescriptionPublication {
     try {
       const previous = this.state?.published_version?.fields ?? null;
       const context = await this.spec.context(snapshot, this.deadline, previous);
-      return await pass.generateDeliverySummary({ claim: this.spec.claim, context, deadlineMs: this.deadline });
-    } catch (e) {
-      log.warn("PR description: the editor pass failed", { run_id: this.spec.runId, error: errMsg(e) });
+      return await pass.generateDeliverySummary({ claim: this.spec.claim, claimGeneration: this.spec.claimGeneration, context, deadlineMs: this.deadline });
+    } catch {
+      diagramEvent(log, this.spec.claim, "editor", "omitted", "pass_failed", { claim_generation: this.spec.claimGeneration }, [this.spec.pat]);
+      log.warn("PR description: the editor pass failed", { run_id: this.spec.runId, reason: "pass_failed" });
       return null;
     }
   }
@@ -865,9 +908,11 @@ export class PrDescriptionPublication {
     let body: string | undefined;
     let region: string | undefined;
     let capped = false;
+    let diagramDecision: Composition["diagramDecision"];
     if (writeRegion) {
       const res = capBody((r) => build(r), staged.region, staged.sizeOnly, staged.diagramLess);
       body = res.body;
+      diagramDecision = res.body === undefined ? undefined : this.selectionDecision(res.removal);
       capped = res.capped;
       region = capped ? staged.sizeOnly : res.diagramless ? staged.diagramLess : staged.region;
     } else {
@@ -889,6 +934,7 @@ export class PrDescriptionPublication {
         body = whole.body ?? renderBody(staged.sizeOnly, wholeCompletion);
         region = whole.capped ? staged.sizeOnly : whole.diagramless ? staged.diagramLess : ownRegion;
         capped = whole.capped;
+        diagramDecision = this.selectionDecision(whole.removal);
         interlockRewrite = true;
         skip = undefined;
       }
@@ -898,6 +944,7 @@ export class PrDescriptionPublication {
       region,
       skip: region === undefined ? skip : undefined,
       capped,
+      diagramDecision,
       interlockRewrite,
       legacyUntouched: false,
       describedSha: describedFor(region !== undefined),
@@ -1022,22 +1069,29 @@ export class PrDescriptionPublication {
     let budgetSkip: RegionSkip | undefined;
     let comp!: Composition;
     let latest = read;
+    let retainedDecision: { region: string; decision: Composition["diagramDecision"] } | undefined;
     for (let round = 0; round < MAX_ROUNDS; round++) {
       // Steps 4-5.
       comp = await this.composeFrom(mrIid, read, budgetSkip === undefined);
+      if (comp.region === retainedDecision?.region) comp.diagramDecision ??= retainedDecision?.decision;
+      retainedDecision = undefined;
       if (comp.legacyUntouched) {
         deps.log.info("PR description: a refresh leaves a PR without uzi markers untouched", { run_id: this.spec.runId });
         return { region: this.staged.region, wrote: false, interlockRewrite: false, closingRemains: false };
       }
+      const selectedDecision = comp.diagramDecision;
+      const selectedRegion = comp.region;
       if (comp.region !== undefined && this.staged.version?.fields.diagram && !comp.region.includes("```mermaid\n")) {
         await this.restageDiagramless();
         comp = await this.composeFrom(mrIid, read, budgetSkip === undefined);
+        if (comp.region === selectedRegion) comp.diagramDecision = selectedDecision;
       }
       if (comp.capped && this.staged.version && this.staged.version.source !== "deterministic_only") {
         // D15: the cap dropped the fields, so the staged version no longer matches what is written.
         // It is still unbound, so it simply stays pending; a deterministic_only version replaces it.
         await this.restage(this.staged.snapshot, true);
         comp = await this.composeFrom(mrIid, read, budgetSkip === undefined);
+        if (comp.region === selectedRegion) comp.diagramDecision = selectedDecision;
       }
       // A stopped publication neither binds nor revalidates; step 8 then writes nothing.
       if (this.stopped) break;
@@ -1065,12 +1119,14 @@ export class PrDescriptionPublication {
         if (this.recomposeLeft) {
           this.recomposeLeft = false;
           const next = await this.composeFrom(mrIid, read, true);
+          if (next.region === comp.region) next.diagramDecision ??= comp.diagramDecision;
           if (next.region !== undefined && comp.region !== undefined && next.region !== comp.region && this.staged.version) {
             // The recompose changed the region (a different D15 cap): the bound version no longer
             // matches what would be written. skipped_snapshot_moved is the outcome that abandons a
             // bound version superseded this way (there is no "abandoned" outcome to send); the
             // replacement is a deterministic_only version, bound and revalidated with a new read.
             await this.ack(mrIid, this.staged, "skipped_snapshot_moved");
+            retainedDecision = { region: next.region, decision: next.diagramDecision };
             if (next.region === this.staged.diagramLess && this.staged.version.fields.diagram) await this.restageDiagramless();
             else await this.restage(this.staged.snapshot, true);
             continue;
@@ -1086,6 +1142,7 @@ export class PrDescriptionPublication {
       }
       break;
     }
+    if (!this.stopped) this.reportSelection(comp.diagramDecision);
     if (budgetSkip === undefined && comp.region === undefined && comp.skip) {
       await this.ack(mrIid, this.staged, comp.skip);
     }

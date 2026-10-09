@@ -11,6 +11,7 @@ import {
   type DeliverySummaryInput,
 } from "../src/summary-runner.js";
 import { buildDeliveryContext, type DeliveryContext, type DeliveryContextGit } from "../src/pr-description-context.js";
+import { diagramIdentity } from "../src/diagram-diagnostic.js";
 import { CODEX_PR_DESCRIPTION_MODEL } from "../src/codex/pr-description-model.js";
 import { makeTextRedactor } from "../src/redact.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -144,6 +145,107 @@ async function deliveryInput(over: Partial<DeliverySummaryInput> = {}): Promise<
   return { claim: claudeClaim, context: await context(), deadlineMs: Date.now() + 60_000, ...over };
 }
 
+describe("diagram diagnostics", () => {
+  it("uses the selected harness and bounds and scrubs model display", () => {
+    assert.deepEqual(diagramIdentity({ ...claudeClaim, secrets: { codex: null } }), { harness: "codex", editor_model: "unknown" });
+    assert.deepEqual(diagramIdentity(claudeClaim), { harness: "claude", editor_model: "haiku" });
+    assert.deepEqual(diagramIdentity(codexClaim), { harness: "codex", editor_model: CODEX_PR_DESCRIPTION_MODEL });
+    assert.equal(diagramIdentity({ ...claudeClaim, summary_model: "sonnet" }).editor_model, "sonnet");
+    assert.equal(diagramIdentity({ ...claudeClaim, summary_model: "haiku", secrets: { anthropic_oauth_token: "haiku" } }).editor_model, "unknown");
+  });
+
+  it("emits no successful parse event and rejects null Codex before model work", async () => {
+    const records: Record<string, unknown>[] = [];
+    const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
+    const diagram = { kind: "sequence", nodes: [{ key: "a", label: "A" }, { key: "b", label: "B" }], edges: [{ from: "a", to: "b" }, { from: "b", to: "a" }] };
+    const r = await runner(claudeQueryFn(JSON.stringify({ summary: "Prose", diagram })), { log });
+    assert.ok((await r.generateDeliverySummary(await deliveryInput()))?.diagram);
+    assert.equal(records.length, 0);
+    const invalid = await runner(forbiddenQueryFn(), { log });
+    assert.equal(await invalid.generateDeliverySummary(await deliveryInput({ claim: { ...claudeClaim, secrets: { codex: null } } })), null);
+    assert.equal(records[0]!.reason, "invalid_codex");
+    assert.equal(records[0]!.outcome, "omitted");
+    assert.equal(records[0]!.harness, "codex");
+    assert.equal(records[0]!.editor_model, "unknown");
+    assert.equal(Object.hasOwn(records[0]!, "claim_generation"), false);
+  });
+  it("distinguishes editor omission and parser rejection before missing prose is erased", async () => {
+    for (const [raw, stage, reason] of [
+      [{ summary: "Prose" }, "editor", "editor_omission"],
+      [{ diagram: { kind: "private response" } }, "agent_parser", "kind"],
+      [{ summary: "Prose", diagram: null }, "agent_parser", "shape"],
+    ] as const) {
+      const records: Record<string, unknown>[] = [];
+      const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
+      const r = await runner(claudeQueryFn(JSON.stringify(raw)), { log });
+      await r.generateDeliverySummary(await deliveryInput({ claimGeneration: 7 }));
+      assert.equal(records[0]!.claim_generation, 7);
+      assert.equal(records[0]!.stage, stage);
+      assert.equal(records[0]!.outcome, stage === "editor" ? "omitted" : "dropped");
+      assert.equal(records[0]!.reason, reason);
+      assert.equal(records[0]!.editor_model, "haiku");
+      assert.equal(records[0]!.harness, "claude");
+      assert.equal(JSON.stringify(records).includes("private response"), false);
+    }
+  });
+
+  it("correlates pass errors without leaking their messages", async () => {
+    const records: Record<string, unknown>[] = [];
+    const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
+    const query = (async function* () {
+      await Promise.reject(new Error("private model response"));
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const r = await runner(query, { log });
+    assert.equal(await r.generateDeliverySummary(await deliveryInput({ claimGeneration: 7 })), null);
+    assert.deepEqual(records.map((record) => [record.stage, record.outcome, record.reason, record.claim_generation]),
+      [["editor", "omitted", "pass_failed", 7]]);
+    assert.equal(JSON.stringify(records).includes("private model response"), false);
+  });
+
+  it("emits fixed rejection classes through model parsing without graph text", async () => {
+    const privateText = "private graph text";
+    const cases: [unknown, string][] = [
+      [privateText, "shape"],
+      [{ ...diagram, nodes: privateText }, "shape"],
+      [{ ...diagram, edges: privateText }, "shape"],
+      [{ ...diagram, kind: privateText }, "kind"],
+      [{ ...diagram, nodes: [] }, "entries"],
+      [{ ...diagram, title: 42 }, "title"],
+      [{ ...diagram, nodes: [privateText, diagram.nodes[1]] }, "node_shape"],
+      [{ ...diagram, nodes: [{ ...diagram.nodes[0], key: privateText }, diagram.nodes[1]] }, "key"],
+      [{ ...diagram, nodes: [{ ...diagram.nodes[0], label: 42 }, diagram.nodes[1]] }, "node_label"],
+      [{ ...diagram, edges: [privateText, diagram.edges[1]] }, "edge_shape"],
+      [{ ...diagram, edges: [{ ...diagram.edges[0], to: privateText }, diagram.edges[1]] }, "endpoints"],
+      [{ ...diagram, edges: [{ ...diagram.edges[0], label: 42 }, diagram.edges[1]] }, "edge_label"],
+      [{ ...diagram, title: "x".repeat(81) + privateText + "@hidden" }, "title"],
+      [{ ...diagram, nodes: [{ ...diagram.nodes[0], label: "x".repeat(61) + privateText + "@hidden" }, diagram.nodes[1]] }, "node_label"],
+      [{ ...diagram, edges: [{ ...diagram.edges[0], label: "x".repeat(61) + privateText + "@hidden" }, diagram.edges[1]] }, "edge_label"],
+    ];
+    for (const [raw, reason] of cases) {
+      const records: Record<string, unknown>[] = [];
+      const log = { ...nullLogger(), info: (message: string, fields?: Record<string, unknown>) => { if (message === "PR description diagram") records.push(fields!); } };
+      const r = await runner(claudeQueryFn(JSON.stringify({ ...good, diagram: raw })), { log });
+      assert.deepEqual(await r.generateDeliverySummary(await deliveryInput({ claimGeneration: 7 })), good);
+      assert.deepEqual(records.map((record) => [record.stage, record.outcome, record.reason, record.claim_generation]),
+        [["agent_parser", "dropped", reason, 7]]);
+      assert.equal(JSON.stringify(records).includes(privateText), false);
+      assert.equal(JSON.stringify(records).includes("@hidden"), false);
+    }
+  });
+
+  it("reports deadline unavailability without calling the model", async () => {
+    const records: Record<string, unknown>[] = [];
+    const log = { ...nullLogger(), info: (_message: string, fields?: Record<string, unknown>) => { records.push(fields!); } };
+    const r = await runner(forbiddenQueryFn(), { log, now: () => 1000 });
+    assert.equal(await r.generateDeliverySummary(await deliveryInput({ deadlineMs: 999, claimGeneration: 7 })), null);
+    assert.equal(records[0]!.claim_generation, 7);
+    assert.equal(records[0]!.stage, "editor");
+    assert.equal(records[0]!.outcome, "omitted");
+    assert.equal(records[0]!.reason, "deadline");
+  });
+});
+
 describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
   it("returns the validated fields on the Claude harness with the claim's summary model", async () => {
     const seen: Seen = { calls: 0 };
@@ -217,8 +319,11 @@ describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
       logged.length = 0;
       const r = await runner(queryFn, { log });
       assert.equal(await r.generateDeliverySummary(await deliveryInput()), null);
-      const warn = logged.find((x) => typeof x === "object" && x !== null && "reason" in x) as Record<string, unknown>;
+      const warn = logged.find((x) => typeof x === "object" && x !== null && "reason" in x && !("stage" in x)) as Record<string, unknown>;
       assert.equal(warn.reason, reason);
+      const diagnostic = logged.find((x) => typeof x === "object" && x !== null && "stage" in x && "reason" in x && x.reason !== "editor_omission") as Record<string, unknown>;
+      assert.equal(diagnostic.outcome, "omitted");
+      assert.equal(diagnostic.reason, reason === "unparseable output" ? "unparseable" : reason === "the model pass failed" ? "pass_failed" : "missing_summary");
       assert.equal(JSON.stringify(logged).includes(MARK), false, `${reason}: ${JSON.stringify(logged)}`);
       if (reason !== "the output had no usable summary") assert.match(String(warn.error_class), /^[A-Za-z]+$/);
     }

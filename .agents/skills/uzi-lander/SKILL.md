@@ -80,6 +80,13 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
 - **Run long local checks from a pinned worktree.** An e2e or Docker check runs in a
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
   land-prep rebases that tree in place, so a check still running there tests a mixed tree.
+- **CI timing is advisory.** Run `S/ci-timing-report.py OWNER/REPO [RUN_ID]` for
+  per-attempt execution, activation/queue delays, reported required-context completion
+  and up to five ordinary successful main comparisons (median needs three).
+  `--input BUNDLE.json` replays saved metadata; `--junit-dir DIR` reads existing
+  reports. It only reads, never reruns or gates CI; missing data stays unknown.
+  Run after post-merge main CI for PRs you land touching tests, harness waits or CI, or when CI feels slow;
+  report the agent-gap line when `rebalance advisory=True`.
 
 ## Buddy
 
@@ -175,7 +182,8 @@ changes it); trust it over a handover's claim.
    `uzi run extend` or `uzi run resume`, which leave no poller running.
    `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
    a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
-   trace tail); do not assume dead or lost, change nothing until you know, then re-arm.
+   trace tail); do not assume dead or lost, change nothing until you know, then launch its
+   `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (a completion question about a milestone
    the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate

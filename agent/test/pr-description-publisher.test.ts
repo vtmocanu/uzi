@@ -29,7 +29,7 @@ import {
 } from "../src/pr-description.js";
 import { PR_DESC_ACK_OUTCOMES, type PrDescriptionSize, type PrDescriptionState } from "../src/protocol.js";
 import type { PrSummaryClaim } from "../src/signals.js";
-import type { DeliverySummary } from "../src/summary-runner.js";
+import type { DeliverySummary, DeliverySummaryInput } from "../src/summary-runner.js";
 import { FakePrDescApi, clientFor } from "./fake-pr-desc-api.js";
 import { nullLogger } from "./helpers.js";
 
@@ -121,13 +121,15 @@ class FakeForge implements PublisherForge {
 class FakePass implements DeliveryPass {
   deadlines = 0;
   readonly calls: number[] = [];
+  readonly generations: (number | undefined)[] = [];
   constructor(private readonly out: DeliverySummary | null) {}
   deliverySummaryDeadline(): number {
     this.deadlines++;
     return 1_000_000;
   }
-  async generateDeliverySummary(input: { deadlineMs: number }): Promise<DeliverySummary | null> {
+  async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
     this.calls.push(input.deadlineMs);
+    this.generations.push(input.claimGeneration);
     return this.out;
   }
 }
@@ -174,21 +176,23 @@ interface Rig {
   emitted: string[];
   publisher: PrDescriptionPublisher;
   pass: FakePass | null;
+  diagnostics: Record<string, unknown>[];
 }
 
 function rig(pass: FakePass | null = new FakePass(SUMMARY)): Rig {
   const forge = new FakeForge();
   const emitted: string[] = [];
+  const diagnostics: Record<string, unknown>[] = [];
   const publisher = new PrDescriptionPublisher({
     forge,
     api: client,
     pass,
-    log: nullLogger(),
+    log: { ...nullLogger(), info: (message, fields) => { if (message === "PR description diagram") diagnostics.push(fields!); } },
     emit: (t) => emitted.push(t),
     sleep: async () => {},
     headLagRetryMs: 0,
   });
-  return { forge, emitted, publisher, pass };
+  return { forge, emitted, publisher, pass, diagnostics };
 }
 
 function apiWith(over: Partial<PublisherApi>): PublisherApi {
@@ -200,6 +204,67 @@ function apiWith(over: Partial<PublisherApi>): PublisherApi {
     ...over,
   };
 }
+
+describe("diagram diagnostics", () => {
+  it("forwards the publication generation to the editor", async () => {
+    const pass = new FakePass(SUMMARY);
+    const r = rig(pass);
+    await r.publisher.prepare(makeSpec({ claimGeneration: 7 }), { headSha: H1, targetBranch: "main" });
+    assert.deepEqual(pass.generations, [7]);
+  });
+
+  it("does not report a provisional cap reversed by the final interlock rewrite", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: () => completion(false) }), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = "Closes #7\n" + "x".repeat(BODY_CAP_CHARS) + "\n" + renderBody(pub.region, completion(false));
+    await pub.publish(MR);
+    assert.match(r.forge.pr.description, /```mermaid/u);
+    assert.deepEqual(r.diagnostics, []);
+  });
+
+  it("rejects explicit null from a custom pass while absence remains eligible", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: null } as unknown as DeliverySummary));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.outcome, d.reason]), [["agent_parser", "dropped", "shape"]]);
+    assert.equal((stages()[0]!.fields as { summary: string }).summary, SUMMARY.summary);
+  });
+
+  it("reports a size-only body choice with explicit metadata", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    pub.initialBody(completion(true) + "x".repeat(BODY_CAP_CHARS));
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.outcome, d.reason]), [["body_cap", "dropped", "sizeonly"]]);
+  });
+  it("reports custom rejection without labels and only suppresses parsed zero-code diagrams", async () => {
+    for (const [diagram, expectedStage] of [[{ ...DIAGRAM, kind: "private response" }, "agent_parser"], [DIAGRAM, "zero_code"]] as const) {
+      const r = rig(new FakePass({ ...SUMMARY, diagram: diagram as typeof DIAGRAM }));
+      await r.publisher.prepare(makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: SIZE_LINE, size: { ...SIZE, code: ZERO } } }) }), { headSha: H1, targetBranch: "main" });
+      assert.equal(r.diagnostics.length, 1);
+      assert.equal(r.diagnostics[0]!.stage, expectedStage);
+      assert.equal(r.diagnostics[0]!.outcome, "dropped");
+      assert.equal(r.diagnostics[0]!.reason, expectedStage === "agent_parser" ? "kind" : "zero_code");
+      assert.equal(JSON.stringify(r.diagnostics).includes("private response"), false);
+      assert.equal(r.diagnostics[0]!.claim_generation, 1);
+    }
+  });
+
+  it("keeps unknown-size diagrams eligible and emits no zero-code suppression", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: null, size: { ...SIZE, unavailable: true, code: ZERO } } }) }), { headSha: H1, targetBranch: "main" });
+    assert.match(pub.region, /```mermaid/u);
+    assert.deepEqual(r.diagnostics, []);
+  });
+
+  it("deduplicates initial-body and ordinary cap selection with the original version", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const c = completion(true) + "x".repeat(BODY_CAP_CHARS - pub.region.length - completion(true).length + 30);
+    pub.initialBody(c);
+    pub.initialBody(c);
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason]), [["body_cap", "diagramless"]]);
+    assert.equal(r.diagnostics[0]!.version_id, [...api.versions.keys()][0]);
+  });
+});
 
 describe("api outage while publishing a PR description", () => {
   it("skips later advisory api calls after staging loses transport, so terminal reporting is not held by retries", async () => {
@@ -345,6 +410,7 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
     assert.ok(parsed.kind === "ok" && parsed.region?.includes(SIZE_TABLE));
     assert.equal(parsed.kind === "ok" && parsed.region?.includes("```mermaid"), false);
     assert.equal(api.state(MR)?.diagram_published, false);
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason, d.version_id]), [["body_cap", "diagramless", [...api.versions.keys()][0]]]);
   });
 
   it("restages when the renderer's 6 KiB cap omits a diagram", async () => {
@@ -352,6 +418,7 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
     const { pub } = await newPr(r);
     assert.ok(!pub.region.includes("```mermaid"));
     assert.ok(pub.region.includes("x".repeat(5850)));
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason, d.version_id]), [["region_cap", "region_bytes", [...api.versions.keys()][0]]]);
     assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
     assert.equal((stages()[1]!.fields as { diagram?: unknown }).diagram, undefined);
     assert.equal(api.calls.find((c) => c.op === "bind")!.body.region_has_diagram, false);
@@ -396,6 +463,7 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
     assert.deepEqual(binds.map((c) => c.body.region_has_diagram), [true, false]);
     assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
     assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "published"]);
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason, d.version_id]), [["body_cap", "diagramless", [...api.versions.keys()][0]]]);
     assert.equal(api.state(MR)?.diagram_published, false);
   });
 

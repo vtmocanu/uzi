@@ -88,14 +88,14 @@ describe("aggregateDisclosure (PRD #1429 D7 mixed aggregate)", () => {
   });
 
   it.each([
-    [1, 0, "Cost excludes 1 Codex subscription run"],
-    [4, 0, "Cost excludes 4 Codex subscription runs"],
-    [0, 1, "Cost excludes 1 unreported run"],
-    [0, 3, "Cost excludes 3 unreported runs"],
-    [1, 1, "Cost excludes 1 Codex subscription run and 1 unreported run"],
-    [2, 1, "Cost excludes 2 Codex subscription runs and 1 unreported run"],
-    [1, 2, "Cost excludes 1 Codex subscription run and 2 unreported runs"],
-    [2, 3, "Cost excludes 2 Codex subscription runs and 3 unreported runs"],
+    [1, 0, "+ 1 Codex sub run"],
+    [4, 0, "+ 4 Codex sub runs"],
+    [0, 1, "+ 1 unreported run"],
+    [0, 3, "+ 3 unreported runs"],
+    [1, 1, "+ 1 Codex sub run and 1 unreported run"],
+    [2, 1, "+ 2 Codex sub runs and 1 unreported run"],
+    [1, 2, "+ 1 Codex sub run and 2 unreported runs"],
+    [2, 3, "+ 2 Codex sub runs and 3 unreported runs"],
   ])("discloses %i subscription and %i unreported runs with independent grammar", (sub, unrep, text) => {
     const d = aggregateDisclosure(sub, unrep);
     expect(d.incomplete).toBe(true);
