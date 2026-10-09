@@ -510,15 +510,8 @@ type answerBody struct {
 
 // questionPayload is the part of a `question` run-message the CLI reads.
 type questionPayload struct {
-	QuestionID string `json:"question_id"`
-	Questions  []struct {
-		Question string `json:"question"`
-		Header   string `json:"header"`
-		Options  []struct {
-			Label       string `json:"label"`
-			Description string `json:"description"`
-		} `json:"options"`
-	} `json:"questions"`
+	QuestionID string           `json:"question_id"`
+	Questions  []answerQuestion `json:"questions"`
 }
 
 // openQuestion reads the run's newest `question` message and returns its payload.

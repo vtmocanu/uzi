@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import answerCorpus from "../../../fixtures/run-question-answer.json";
 import { QuestionPanel, UnreadableQuestion } from "./QuestionPanel";
 import type { OpenQuestion, QuestionPayload } from "../lib/runQuestion";
 
@@ -51,6 +52,59 @@ function open(question: QuestionPayload, ordinal = 1): OpenQuestion {
 function bodyOf(onAnswer: ReturnType<typeof vi.fn>): { question_id: string; answers: string[] } {
   return JSON.parse(onAnswer.mock.calls[0][0] as string);
 }
+
+type AnswerActionFixture = {
+  name: string;
+  payload: { question_id: string; questions: QuestionPayload["questions"] };
+  steps: { question: number; option?: number; text?: string; answers: string[]; ready: boolean }[];
+  answers?: string[];
+  ready?: boolean;
+};
+
+describe("QuestionPanel shared action corpus", () => {
+  const fixtures: AnswerActionFixture[] = answerCorpus.actions;
+  it("requires action cases", () => {
+    expect(fixtures.length).toBeGreaterThan(0);
+  });
+  for (const c of fixtures) {
+    it(c.name, () => {
+      // Exercise the panel's public typed input; parsing is a separate seam.
+      const question: QuestionPayload = {
+        questionId: c.payload.question_id,
+        questions: c.payload.questions,
+      };
+      const onAnswer = vi.fn();
+      render(<QuestionPanel open={open(question)} busy={false} onAnswer={onAnswer} />);
+      const boxes = screen.getAllByRole("textbox");
+      const send = screen.getByRole("button", { name: "Send answer" }) as HTMLButtonElement;
+      const check = (answers: string[], ready: boolean) => {
+        expect(send.disabled).toBe(!ready);
+        onAnswer.mockClear();
+        fireEvent.click(send);
+        if (ready) {
+          expect(onAnswer).toHaveBeenCalledTimes(1);
+          expect(bodyOf(onAnswer)).toEqual({ question_id: c.payload.question_id, answers });
+        } else {
+          expect(onAnswer).not.toHaveBeenCalled();
+        }
+      };
+      if (c.steps.length === 0) check(c.answers!, c.ready!);
+      for (const step of c.steps) {
+        if (step.option !== undefined) {
+          // Locate the shipped option controls by question then option index;
+          // duplicate labels across questions must not conflate their selections.
+          const groupName = question.questions[step.question].header || `Options for question ${step.question + 1}`;
+          const chips = within(screen.getByRole("group", { name: groupName })).getAllByRole("button");
+          fireEvent.click(chips[step.option]);
+        } else {
+          expect(step.text).toBeDefined();
+          fireEvent.change(boxes[step.question], { target: { value: step.text } });
+        }
+        check(step.answers, step.ready);
+      }
+    });
+  }
+});
 
 describe("QuestionPanel", () => {
   // ── web-ux browser findings ────────────────────────────────────────────────
