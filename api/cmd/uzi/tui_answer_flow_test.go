@@ -100,6 +100,174 @@ func answerAssertView(t *testing.T, m tuiModel, markers ...string) {
 	}
 }
 
+func TestAnswerComposerClosedDefersToModals(t *testing.T) {
+	m, f := answerFlowModel(t, answerFlowPayload)
+	m = answerKeys(t, m, "f", "h", "i")
+	if m.detail.steer.input != "hi" || m.detail.answer.open {
+		t.Fatal("answer shortcut intercepted follow-up input")
+	}
+	m, cmd := answerPress(t, m, "enter")
+	if cmd == nil {
+		t.Fatal("missing follow-up command")
+	}
+	m = answerUpdate(t, m, cmd())
+	if f.LastInputBody != "hi" {
+		t.Fatalf("follow-up body %q", f.LastInputBody)
+	}
+	m = answerKeys(t, m, "x", "i")
+	if m.detail.steer.mode != steerIdle || m.detail.steer.pending != "" || m.detail.answer.open {
+		t.Fatal("i failed to cancel destructive confirmation")
+	}
+	m.detail.review.open = true
+	m = answerKeys(t, m, "i")
+	if !m.detail.review.open || m.detail.answer.open {
+		t.Fatal("i escaped review")
+	}
+}
+
+func TestAnswerComposerUncertaintyResolvedByClosure(t *testing.T) {
+	for _, closure := range []string{"answer", "replacement"} {
+		t.Run(closure, func(t *testing.T) {
+			m, f := answerFlowModel(t, answerFlowPayload)
+			f.SubmitRunInputErr = errors.New("connection lost")
+			m = answerReview(t, m)
+			m, cmd := answerPress(t, m, "enter")
+			m = answerUpdate(t, m, cmd())
+			answerAssertView(t, m, "delivery not confirmed")
+			next := `{"question_id":"next","questions":[{"question":"Next?"}]}`
+			if closure == "answer" {
+				m = answerFeed(t, m, 2, "answer", `{"answers":["echo","echo"]}`)
+			} else {
+				m = answerFeed(t, m, 2, "question", next)
+			}
+			if m.detail.answer.answerNotice != "" {
+				t.Fatal("resolved uncertainty notice persisted")
+			}
+			old := m.detail.answer.draft()
+			if !old.closed || !old.uncertain {
+				t.Fatal("closure removed old delivery guard")
+			}
+			m = answerKeys(t, m, "esc", "i", "enter")
+			if !old.closed || len(f.RunVerbCalls) != 1 {
+				t.Fatal("old identity resubmitted")
+			}
+			if closure == "answer" {
+				m = answerFeed(t, m, 3, "question", next)
+			}
+			if m.detail.answer.open {
+				m = answerKeys(t, m, "esc")
+			}
+			m = answerKeys(t, m, "i", "n", "enter")
+			if m.detail.answer.draft().snapshot.QuestionID != "next" || !m.detail.answer.draft().review {
+				t.Fatal("replacement was not independent")
+			}
+			m.detail.answer.answerNotice = "replacement-specific notice"
+			m = answerFeed(t, m, 4, "question", next)
+			if m.detail.answer.answerNotice != "replacement-specific notice" {
+				t.Fatal("cleared replacement notice")
+			}
+		})
+	}
+}
+
+func TestAnswerComposerEditPagingReachability(t *testing.T) {
+	for _, options := range []bool{false, true} {
+		t.Run(fmt.Sprint(options), func(t *testing.T) {
+			q := map[string]any{"question": "QUESTIONBEGIN " + strings.Repeat("explain ", 500) + " REQUIREDTAIL"}
+			if options {
+				q["options"] = []any{map[string]any{"label": "Current", "description": "DESCRIPTIONBEGIN " + strings.Repeat("describe ", 500) + " DESCRIPTIONTAIL"}}
+			}
+			wire, _ := json.Marshal(map[string]any{"question_id": "paging", "questions": []any{q}})
+			m, _ := answerFlowModel(t, string(wire))
+			m = answerUpdate(t, m, tea.WindowSizeMsg{Width: 80, Height: 16})
+			m = answerKeys(t, m, "i")
+			var seen strings.Builder
+			for _, key := range []string{"pgup", "pgdown", "pgup"} {
+				// One-row paging must reach the full prose even with a compact viewport.
+				for range 150 {
+					m = answerKeys(t, m, key)
+					view := stripANSI(m.View().Content)
+					seen.WriteString(view)
+					answerAssertView(t, m, "detail (optional)", "esc cancel", "pgup")
+					if options {
+						answerAssertView(t, m, "Current")
+					}
+					lines := strings.Split(view, "\n")
+					if len(lines) > 16 {
+						t.Fatal("paging overflowed height")
+					}
+					for _, line := range lines {
+						if visualWidth(line) > 80 {
+							t.Fatal("paging overflowed width")
+						}
+					}
+				}
+			}
+			for _, marker := range []string{"QUESTIONBEGIN", "REQUIREDTAIL"} {
+				if !strings.Contains(seen.String(), marker) {
+					t.Fatalf("unreachable %s", marker)
+				}
+			}
+			if options {
+				for _, marker := range []string{"DESCRIPTIONBEGIN", "DESCRIPTIONTAIL"} {
+					if !strings.Contains(seen.String(), marker) {
+						t.Fatalf("unreachable %s", marker)
+					}
+				}
+				m = answerKeys(t, m, "1")
+				answerAssertView(t, m, "› 1 [x] Current")
+			}
+			answerAssertView(t, answerKeys(t, m, "pgup"), "detail (optional)")
+		})
+	}
+}
+
+func TestAnswerComposerVisualInputSuffix(t *testing.T) {
+	for _, text := range []string{
+		strings.Repeat("界", 100) + "Z",
+		strings.Repeat("😀a界", 100) + "😀Z",
+		strings.Repeat("a", 500) + "TAILZ",
+	} {
+		m, _ := answerFlowModel(t, `{"question_id":"suffix","questions":[{"question":"Explain"}]}`)
+		m = answerUpdate(t, m, tea.WindowSizeMsg{Width: 80, Height: 16})
+		m = answerKeys(t, m, "i", text)
+		for _, hostile := range []bool{false, true} {
+			if hostile {
+				m.detail.answer.draft().answerText[0] += "\x1b[31m\x1b]52;c;inject\a\r\x00ENDZ"
+			}
+			raw := m.View().Content
+			assertNoRawControls(t, "input suffix", raw)
+			view := stripANSI(raw)
+			final := "Z"
+			if strings.HasSuffix(text, "😀Z") {
+				final = "😀Z"
+			}
+			if strings.HasSuffix(text, "TAILZ") {
+				final = "TAILZ"
+			}
+			if hostile {
+				final = "ENDZ"
+			}
+			answerAssertView(t, m, final, "detail (optional)", "esc cancel")
+			found := false
+			for _, line := range strings.Split(view, "\n") {
+				if visualWidth(line) > 80 {
+					t.Fatal("input overflowed width")
+				}
+				if strings.Contains(line, "detail (optional)") {
+					found = strings.HasSuffix(line, final)
+				}
+			}
+			if !found {
+				t.Fatalf("final input glyph hidden:\n%s", view)
+			}
+			if len(strings.Split(view, "\n")) > 16 {
+				t.Fatal("input overflowed height")
+			}
+		}
+	}
+}
+
 func TestAnswerComposerOwnerAndMalformed(t *testing.T) {
 	for _, access := range []steerAccess{steerUnknown, steerNotOwner, steerAllowed} {
 		m, _ := answerFlowModel(t, answerFlowPayload)

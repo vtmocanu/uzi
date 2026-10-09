@@ -156,15 +156,19 @@ func composeQuestionAnswers(p questionPayload, selected [][]bool, texts []string
 // structure blocks its indexed selections permanently. Each identity retains its
 // own delivery guard even when a replacement draft becomes active.
 type answerDraft struct {
-	snapshot                                 questionPayload
-	seq                                      int32
-	selected                                 [][]bool
-	answerText                               []string
-	position, option, reviewScroll           int
-	detailFocus, review                      bool
-	pending                                  uint64
-	sent, uncertain, conflict, closed, drift bool
+	snapshot                                   questionPayload
+	seq                                        int32
+	selected                                   [][]bool
+	answerText                                 []string
+	position, option, reviewScroll, editScroll int
+	manualScroll                               bool
+	detailFocus, review                        bool
+	pending                                    uint64
+	sent, uncertain, conflict, closed, drift   bool
 }
+
+const answerUncertainNotice = "delivery not confirmed; answer from the web or Slack if the run does not resume. Resend guard is local to this TUI session."
+
 type answerState struct {
 	drafts       []answerDraft
 	active       int
@@ -214,7 +218,8 @@ func (m *tuiModel) reconcileAnswer() {
 			}
 		}
 	}
-	if d := a.draft(); d != nil && d.closed && (d.sent || a.answerNotice == "sending answer…") {
+	if d := a.draft(); d != nil && d.closed && (d.sent || a.answerNotice == "sending answer…" ||
+		(d.uncertain && a.answerNotice == answerUncertainNotice)) {
 		a.answerNotice = "" // echo won the race, so a late HTTP result cannot restore success
 	}
 }
@@ -279,7 +284,7 @@ func (m tuiModel) answerTooSmall() bool {
 func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 	a := &m.detail.answer
 	if !a.open {
-		if k != keyAnswerQuestion {
+		if k != keyAnswerQuestion || m.detail.steer.mode != steerIdle || m.detail.review.open {
 			return m, nil, false
 		}
 		m.openAnswer()
@@ -302,6 +307,7 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 		switch k {
 		case "shift+tab":
 			d.review, d.position, d.option = false, len(d.snapshot.Questions)-1, 0
+			d.manualScroll, d.editScroll = false, 0
 			d.detailFocus = len(d.snapshot.Questions[d.position].Options) == 0
 		case "up":
 			d.reviewScroll = max(0, d.reviewScroll-1)
@@ -337,7 +343,22 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 	q := d.snapshot.Questions[d.position]
+	// Paging is independent of the picker. Returning to a question or acting on
+	// an option restores automatic focus; free text keeps the chosen prose page.
 	switch k {
+	case "shift+tab", "up", "down":
+		d.manualScroll, d.editScroll = false, 0
+	}
+	switch k {
+	case "pgup", "pgdown":
+		d.manualScroll = true
+		_, limit := m.answerLayout(m.answerRoom())
+		d.editScroll = min(d.editScroll, limit)
+		if k == "pgup" {
+			d.editScroll = max(0, d.editScroll-1)
+		} else {
+			d.editScroll = min(limit, d.editScroll+1)
+		}
 	case "shift+tab":
 		if d.position > 0 {
 			d.position--
@@ -367,6 +388,7 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 				d.reviewScroll = 0
 			} else {
 				d.position++
+				d.manualScroll, d.editScroll = false, 0
 				d.option = 0
 				d.detailFocus = len(d.snapshot.Questions[d.position].Options) == 0
 			}
@@ -378,11 +400,13 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 		}
 	default:
 		if !d.detailFocus && (k == "space" || k == " ") {
+			d.manualScroll, d.editScroll = false, 0
 			d.selected[d.position] = toggleAnswerOption(q, d.selected[d.position], d.option)
 		} else if !d.detailFocus && len(k) == 1 && k[0] >= '1' && k[0] <= '9' {
 			idx := int(k[0] - '1')
 			if idx < len(q.Options) {
 				d.option = idx
+				d.manualScroll, d.editScroll = false, 0
 				d.selected[d.position] = toggleAnswerOption(q, d.selected[d.position], idx)
 			}
 		} else {
@@ -457,7 +481,7 @@ func (m *tuiModel) applyAnswerResult(msg answerResultMsg) tea.Cmd {
 		default:
 			d.uncertain = true
 			if i == a.active && !d.closed {
-				a.answerNotice = "delivery not confirmed; answer from the web or Slack if the run does not resume. Resend guard is local to this TUI session."
+				a.answerNotice = answerUncertainNotice
 			}
 		}
 		return nil
@@ -560,27 +584,46 @@ func (m tuiModel) answerLayout(rows int) ([]string, int) {
 		if d.detailFocus {
 			focus = "› "
 		}
-		input = "┃ " + focus + "detail (optional) › " + m.renderer.Plain(d.answerText[d.position], len([]rune(d.answerText[d.position])))
-		// Keep the insertion end visible for long free text.
-		if visualWidth(input) > w || len([]rune(d.answerText[d.position])) > 200 {
-			budget := min(200, max(1, w-27))
-			runes := []rune(d.answerText[d.position])
-			input = "┃ › detail (optional) › …" + m.renderer.Plain(string(runes[max(0, len(runes)-budget):]), budget)
-		}
-		hints = "┃ ↑↓/1-9 pick · space toggle · tab detail · enter next · shift-tab back · esc cancel"
-		if visualWidth(hints) > w {
-			hints = "┃ ↑↓/1-9 pick space tab ↵next ⇧tab back esc cancel"
-		}
-		if visualWidth(hints) > w {
-			hints = "┃ ↑↓1-9 spc tab ↵next ⇧tabback esc cancel"
-			if visualWidth(hints) > w {
-				hints = "↑↓1-9 spc tab ↵next ⇧tabback esc cancel"
+		prefix := "┃ " + focus + "detail (optional) › "
+		// Select from the full sanitized original before Plain's 200-rune cell
+		// cap. Bound the suffix by actual columns so its insertion end survives.
+		text := strings.Join(strings.Fields(uzicli.CellText(d.answerText[d.position])), " ")
+		runes := []rune(text)
+		if visualWidth(prefix+text) > w || len(runes) > 200 {
+			prefix += "…"
+			budget := max(0, w-visualWidth(prefix))
+			start := len(runes)
+			for start > 0 && len(runes)-start < 200 {
+				if visualWidth(string(runes[start-1:])) > budget {
+					break
+				}
+				start--
 			}
+			text = string(runes[start:])
+		}
+		input = prefix + m.renderer.Plain(text, 200)
+		hints = "┃ ↑↓/1-9 pick · space toggle · tab detail · enter next · shift-tab back · esc cancel · pgup/pgdown"
+		if visualWidth(hints) > w {
+			hints = "┃ ↑↓/1-9 pick space tab ↵next ⇧tab back esc cancel pgup/pgdown"
+		}
+		if visualWidth(hints) > w {
+			hints = "↑↓1-9 spc tab ↵next ⇧tab esc cancel Pg↑↓"
 		}
 	}
 	var bottom []string
 	if input != "" {
 		bottom = append(bottom, clampVisual(input, w))
+		if d.manualScroll {
+			q := d.snapshot.Questions[d.position]
+			if len(q.Options) > 0 {
+				pick := "[ ]"
+				if d.selected[d.position][d.option] {
+					pick = "[x]"
+				}
+				bottom = append(bottom, clampVisual(fmt.Sprintf("┃ › %d %s %s", d.option+1, pick,
+					m.renderer.Plain(q.Options[d.option].Label, 200)), w))
+			}
+		}
 	}
 	if d.drift {
 		bottom = append(bottom, wrap("question changed; this draft is blocked; answer from the web or Slack")...)
@@ -611,6 +654,8 @@ func (m tuiModel) answerLayout(rows int) ([]string, int) {
 	start := 0
 	if d.review {
 		start = min(d.reviewScroll, limit)
+	} else if d.manualScroll {
+		start = min(d.editScroll, limit)
 	} else if focusLine >= available {
 		start = max(0, focusLine-available+1)
 	}
@@ -629,10 +674,7 @@ func (m tuiModel) answerLayout(rows int) ([]string, int) {
 // Composition uses the existing pinned slot. If it cannot coexist with a useful
 // transcript viewport, compact layout reclaims that body without changing scroll.
 func (m tuiModel) renderAnswerDetail() string {
-	var header []string
-	for _, line := range m.detailHeaderLines() {
-		header = append(header, line)
-	}
+	header := m.detailHeaderLines()
 	if line := m.transportLine(); line != "" {
 		header = append(header, clampVisual(line, m.width))
 	}
