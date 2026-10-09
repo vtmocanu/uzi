@@ -37,19 +37,40 @@ export interface PipelineResult {
   error: string | null;
 }
 const ids = ["fallbackchain", "components", "trivial", "truncation", "hostile"] as const;
+// Local fixed assets only; this is independent of either provider's response limit.
+const localAssetMaxBytes = 256 * 1024;
+async function readLocalAsset(file: string, error: "fixture_integrity" | "baseline_integrity"): Promise<string> {
+  try {
+    const handle = await fs.open(file, "r");
+    try {
+      const bytes = Buffer.alloc(localAssetMaxBytes + 1);
+      let used = 0;
+      // At most max+1 bytes and max+1 nonempty reads; any failure stops this asset.
+      while (used < bytes.length) {
+        const { bytesRead } = await handle.read(bytes, used, bytes.length - used, null);
+        if (bytesRead === 0) break;
+        used += bytesRead;
+      }
+      if (used > localAssetMaxBytes) throw new Error(error);
+      return bytes.subarray(0, used).toString("utf8");
+    } finally { await handle.close(); }
+  } catch { throw new Error(error); }
+}
 export async function loadEditorFixtures(checkout: string): Promise<EditorFixture[]> {
   return Promise.all(ids.map(async (id) => {
-    const fixture = JSON.parse(
-      await fs.readFile(path.join(checkout, "fixtures/pr-description-editor", id + ".json"), "utf8"),
-    ) as EditorFixture;
-    if (fixture.id !== id) throw new Error("fixture_integrity");
-    return fixture;
+    try {
+      const fixture = JSON.parse(
+        await readLocalAsset(path.join(checkout, "fixtures/pr-description-editor", id + ".json"), "fixture_integrity"),
+      ) as EditorFixture;
+      if (fixture.id !== id) throw new Error("fixture_integrity");
+      return fixture;
+    } catch { throw new Error("fixture_integrity"); }
   }));
 }
 export async function editorRequest(checkout: string, fixture: EditorFixture, opts: EvalOptions) {
   const dir = path.join(checkout, "fixtures/pr-description-editor");
-  const baseline = await fs.readFile(path.join(dir, "baseline-system-prompt.txt"), "utf8");
-  const hash = (await fs.readFile(path.join(dir, "baseline.sha256"), "utf8")).trim();
+  const baseline = await readLocalAsset(path.join(dir, "baseline-system-prompt.txt"), "baseline_integrity");
+  const hash = (await readLocalAsset(path.join(dir, "baseline.sha256"), "baseline_integrity")).trim();
   if (hash !== "2891a46208957ff7f2f706de2c6d6730e697d99775b0aed52ebffd4a75d7bdfc" ||
       createHash("sha256").update(baseline).digest("hex") !== hash) throw new Error("baseline_integrity");
   return {

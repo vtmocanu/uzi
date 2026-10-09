@@ -202,10 +202,16 @@ test("pass policy error awaits cleanup", async () => {
   await f.removed();
 });
 
-test("timeout cleans up and escalates TERM to KILL", async () => {
+test("active cancellation cleans up and escalates TERM to KILL", async () => {
   const f = await fixture({ hang: true, ignoreTerm: true });
-  await assert.rejects(f.factory.run(request(undefined, 30), policy), /exceeded 30ms/);
-  assert.ok(f.events.indexOf("SIGTERM") < f.events.indexOf("SIGKILL"));
+  const pass = f.factory.run(request(), policy);
+  const rejected = assert.rejects(pass);
+  await f.running;
+  f.controller.abort();
+  await rejected;
+  const term = f.events.indexOf("SIGTERM");
+  const kill = f.events.indexOf("SIGKILL");
+  assert.ok(term >= 0 && kill >= 0 && term < kill);
   await f.removed();
 });
 
@@ -246,13 +252,19 @@ test("transport disposal failure still exits child before removing root", async 
 });
 
 test("startup timeout owns late readiness and awaits removal", async () => {
-  let resolve!: () => void;
+  let resolve: (() => void) | undefined;
   const f = await fixture({ startup: () => new Promise<void>((done) => { resolve = done; }) });
   await assert.rejects(f.factory.run(request(undefined, 30), policy), /exceeded 30ms/);
-  await f.removed();
-  resolve();
+  // The startup deadline may expire during filesystem provisioning, before spawn.
+  if (f.events.includes("spawn")) await f.removed();
+  else {
+    assert.deepEqual(f.events, []);
+    await f.factory.close();
+    await assert.rejects(f.factory.run(request(), policy));
+  }
+  resolve?.();
   await new Promise<void>((done) => setImmediate(done));
-  await f.rootGone();
+  if (f.events.includes("spawn")) await f.rootGone();
 });
 
 test("explicit close cancels startup; request signal cancels active pass", async () => {

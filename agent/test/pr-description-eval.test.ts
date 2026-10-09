@@ -23,6 +23,96 @@ const args = (harness = "claude", mode = "revised", model = "haiku") =>
   ["--harness", harness, "--model", model, "--prompt-mode", mode];
 const env = { CLAUDE_CODE_OAUTH_TOKEN: ["fixture-", "oauth-no-authority"].join(""), OPENAI_API_KEY: ["sk-", "fixture-no-authority"].join("") };
 
+async function localAssets(run: (root: string, dir: string) => Promise<void>) {
+  const root = await fs.mkdtemp(path.join(checkout, ".uzi/scratch/eval-input-test-"));
+  const dir = path.join(root, "fixtures/pr-description-editor");
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await fs.cp(path.join(checkout, "fixtures/pr-description-editor"), dir, { recursive: true });
+    await run(root, dir);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+}
+
+test("local fixture cap accepts exactly 256 KiB of UTF-8 bytes and rejects the next byte", async () => {
+  await localAssets(async (root, dir) => {
+    const f = await fixture();
+    // Multibyte content makes character-count guards fail this boundary control.
+    f.bodyPrefix = "界".repeat(80_000);
+    const json = JSON.stringify(f);
+    const exact = json + " ".repeat(256 * 1024 - Buffer.byteLength(json));
+    assert.equal(Buffer.byteLength(exact), 256 * 1024);
+    assert.ok(exact.length < Buffer.byteLength(exact));
+    const file = path.join(dir, "fallbackchain.json");
+    await fs.writeFile(file, exact);
+    assert.deepEqual((await loadEditorFixtures(root))[0], f);
+    await fs.appendFile(file, " ");
+    await assert.rejects(loadEditorFixtures(root), { message: "fixture_integrity" });
+  });
+});
+
+test("fixed hash asset accepts the byte boundary; all seven assets refuse overflow before a provider or helper", async () => {
+  await localAssets(async (root, dir) => {
+    const hashFile = path.join(dir, "baseline.sha256");
+    const hash = (await fs.readFile(hashFile, "utf8")).trim();
+    await fs.writeFile(hashFile, hash + " ".repeat(256 * 1024 - Buffer.byteLength(hash)));
+    const f = await fixture();
+    assert.equal((await editorRequest(root, f, { harness: "claude", model: "haiku", promptMode: "baseline" })).systemPrompt,
+      await fs.readFile(path.join(dir, "baseline-system-prompt.txt"), "utf8"));
+  });
+  const files = ["fallbackchain.json", "components.json", "trivial.json", "truncation.json", "hostile.json",
+    "baseline-system-prompt.txt", "baseline.sha256"];
+  for (const file of files) {
+    await localAssets(async (root, dir) => {
+      const sentinel = "private-local-input";
+      const baseline = file.startsWith("baseline");
+      const original = await fs.readFile(path.join(dir, file), "utf8");
+      const oversized = !baseline
+        ? JSON.stringify({ ...JSON.parse(original), bodyPrefix: sentinel + "界".repeat(90_000) })
+        : file === "baseline.sha256"
+          ? original + " ".repeat(256 * 1024)
+          : original + sentinel + "界".repeat(90_000);
+      await fs.writeFile(path.join(dir, file), oversized);
+      if (baseline) {
+        await assert.rejects(editorRequest(root, await fixture(), { harness: "codex", model: "gpt-6-sol", promptMode: "revised" }),
+          { message: "baseline_integrity" });
+      } else await assert.rejects(loadEditorFixtures(root), { message: "fixture_integrity" });
+      for (const harness of ["claude", "codex"]) {
+        const rows: string[] = [];
+        let providers = 0;
+        const signals = new EventEmitter();
+        const rc = await runEvalCli(args(harness), {
+          checkout: root, env, signals, write: (row) => rows.push(row),
+          pass: async () => { providers++; return response(); },
+          queryFn: (async function* () { providers++; yield { type: "result", subtype: "success", is_error: false }; }) as SdkQueryFn,
+          codexFactory: () => { providers++; throw new Error("unexpected factory"); },
+        });
+        assert.equal(rc, 1);
+        assert.equal(providers, 0); // No response reaches evaluateEditorResponse or its Go helper.
+        if (!baseline) assert.deepEqual(rows, ['{"error":"startup_failed"}']);
+        else {
+          assert.equal(rows.length, 5);
+          assert.ok(rows.every((row) => JSON.parse(row).error === "provider_failed"));
+        }
+        assert.ok(rows.every((row) => !row.includes(sentinel) && !row.includes(root) && !row.includes(file)));
+        for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) assert.equal(signals.listenerCount(name), 0);
+      }
+    });
+  }
+});
+
+test("loader selects only the fixed files and rejects a mismatched requested ID", async () => {
+  await localAssets(async (root, dir) => {
+    await fs.writeFile(path.join(dir, "unexpected.json"), "invalid extra asset");
+    const loaded = await loadEditorFixtures(root);
+    assert.deepEqual(loaded, await loadEditorFixtures(checkout));
+    const file = path.join(dir, "fallbackchain.json");
+    await fs.writeFile(file, JSON.stringify({ ...loaded[0], id: "components" }));
+    await assert.rejects(loadEditorFixtures(root), { message: "fixture_integrity" });
+    await fs.writeFile(file, "private invalid JSON");
+    await assert.rejects(loadEditorFixtures(root), { message: "fixture_integrity" });
+  });
+});
+
 test("baseline asset pins the verified 57585dd6 prompt hash without requiring Git history", async () => {
   // Verbatim source comparison was performed before the prompt change; the pinned
   // digest verifies that asset in exports and shallow CI checkouts as well.
