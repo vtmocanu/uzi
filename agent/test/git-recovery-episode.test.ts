@@ -1,4 +1,4 @@
-import { beforeEach, afterEach, test } from "node:test";
+import { beforeEach, afterEach, test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -495,8 +495,11 @@ test("recovery abort settles the active supervised child before releasing the ba
   let cancelled = false, settled = false;
   const started = new Promise<void>(resolve => { spawned = resolve; });
   const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
-  const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 1_000,
+  const reason = new Error("lifecycle stopped");
+  let producerEntered = false;
+  const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 240_000,
     () => cache.withBoundaryProcessSpawner(async () => {
+      producerEntered = true;
       spawned();
       return {
         stdout: Readable.from([]), stderr: Readable.from([]), stdin: null,
@@ -509,11 +512,19 @@ test("recovery abort settles the active supervised child before releasing the ba
       };
     }, new AbortController().signal,
     () => cache.withBareLock(bare, () => cache.verifyRecoveryClosure(bare, git(source.clonePath, ["rev-parse", "HEAD"])))));
-  await started;
-  stop.abort(new Error("lifecycle stopped"));
-  const observer = cache.withBareLock(bare, async () => { assert.equal(settled, true); });
-  await assert.rejects(operation, /lifecycle stopped/);
-  await observer;
+  const outcome = operation.then(value => value, error => error);
+  let observer: Promise<void> | undefined;
+  try {
+    await requireProducerEntry(started, outcome);
+    assert.equal(producerEntered, true);
+    stop.abort(reason);
+    observer = cache.withBareLock(bare, async () => { assert.equal(settled, true); });
+    assert.equal(await outcome, reason);
+    await observer;
+  } finally {
+    stop.abort(new Error("fixture cleanup"));
+    await Promise.allSettled([operation, outcome, ...(producerEntered ? [completed] : []), ...(observer ? [observer] : [])]);
+  }
   assert.equal(cancelled, true);
   assert.deepEqual(journal(), before);
 });
@@ -521,11 +532,11 @@ test("recovery abort settles the active supervised child before releasing the ba
 test("already expired recovery scope admits no local work", async () => {
   let admitted = false;
   await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() - 1,
-    async () => { admitted = true; }), /deadline exhausted/);
+    async () => { admitted = true; }), { message: "recovery deadline exhausted" });
   assert.equal(admitted, false);
 });
 
-test("recovery deadline cancels a queued mutation without later changing its charged journal", async () => {
+test("recovery deadline cancels a queued mutation without later changing its charged journal", async (t) => {
   await cache.reserveRecoveryIteration(bare, branch, key, source);
   const before = journal();
   let release!: () => void, acquired!: () => void;
@@ -535,11 +546,29 @@ test("recovery deadline cancels a queued mutation without later changing its cha
     await new Promise<void>(resolve => { release = resolve; });
   });
   await held;
-  const expired = cache.withRecoveryOperation(new AbortController().signal, Date.now() + 30,
-    () => cache.reserveRecoveryIteration(bare, branch, key, source));
-  await assert.rejects(expired, /abort|deadline/);
-  release();
-  await holder;
+  const expire = controlledDeadline(t);
+  const stop = new AbortController();
+  let entered = false, deadlineReason: unknown;
+  const expired = cache.withRecoveryOperation(stop.signal, Date.now() + 240_000, signal => {
+    signal.addEventListener("abort", () => { deadlineReason = signal.reason; }, { once: true });
+    entered = true;
+    const reservation = cache.reserveRecoveryIteration(bare, branch, key, source);
+    queueMicrotask(expire);
+    return reservation;
+  });
+  const outcome = expired.then(value => value, error => error);
+  try {
+    const result = await outcome;
+    assert.equal(entered, true, "queued reservation entered before expiry");
+    assert.ok(result instanceof Error);
+    assert.equal(result.message, "permit-held git lock wait aborted: boundary deadline exceeded");
+    assert.ok(deadlineReason instanceof Error);
+    assert.equal(deadlineReason.message, "recovery deadline exhausted");
+  } finally {
+    stop.abort(new Error("fixture cleanup"));
+    release();
+    await Promise.allSettled([holder, expired, outcome]);
+  }
   await cache.withBareLock(bare, async () => {});
   assert.deepEqual(journal(), before);
 });
@@ -931,8 +960,62 @@ test("production oversized declared loose object is refused before any content p
   await assert.rejects(cache.verifyRecoveryClosure(bare, tip), RecoveryClosureLimitError);
   assert.equal(contents, 0);
 });
+
+/** Entry is required: an already observed rejection must fail promptly, rather than hang. */
+async function requireProducerEntry(started: Promise<void>, outcome: Promise<unknown>): Promise<void> {
+  const entered = await Promise.race([started.then(() => true), outcome.then(() => false)]);
+  assert.equal(entered, true, "verification ended before producer entry");
+}
+
+/** Keep the original deadline; fire its timer only after the producer seam is reached. */
+function controlledDeadline(t: TestContext): () => void {
+  const realSetTimeout = globalThis.setTimeout;
+  let fire: (() => void) | undefined;
+  t.mock.method(globalThis, "setTimeout", (callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    if (delay !== undefined && delay > 200_000 && delay <= 300_000) fire ??= () => callback(...args);
+    return realSetTimeout(callback, delay, ...args);
+  });
+  return () => { assert.ok(fire, "recovery deadline timer was armed"); fire(); };
+}
+
+test("preentry rejection fails the entry assertion promptly", async () => {
+  const stop = new AbortController();
+  const reason = new Error("fixture rejects before spawning");
+  stop.abort(reason);
+  let entered!: () => void, producers = 0;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 30_000,
+    () => cache.withBoundaryProcessSpawner(async () => {
+      producers++;
+      entered();
+      throw new Error("must not spawn");
+    }, stop.signal, () => cache.verifyRecoveryClosure(bare, git(source.clonePath, ["rev-parse", "HEAD"]))));
+  const outcome = operation.then(value => value, error => error);
+  const entryCheck = requireProducerEntry(started, outcome);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const observed = Promise.race([entryCheck, new Promise<never>((_resolve, reject) => {
+      watchdog = setTimeout(() => reject(new Error("entry observer did not notice operation rejection")), 1_000);
+    })]);
+    await assert.rejects(observed, error => {
+      assert.ok(error instanceof assert.AssertionError);
+      assert.equal(error.actual, false);
+      assert.equal(error.expected, true);
+      assert.ok(error.message.startsWith("verification ended before producer entry"));
+      return true;
+    });
+    assert.equal(await outcome, reason);
+    assert.equal(producers, 0);
+  } finally {
+    if (watchdog) clearTimeout(watchdog);
+    stop.abort(new Error("fixture cleanup"));
+    entered();
+    await Promise.allSettled([operation, outcome, entryCheck]);
+  }
+});
+
 for (const stopAt of ["abort", "timeout"] as const) {
-  test("actual streaming Git child " + stopAt + " settles before proof releases the lock", async () => {
+  test("actual streaming Git child " + stopAt + " settles before proof releases the lock", async (t) => {
     await cache.reserveRecoveryIteration(bare, branch, key, source);
     const before = journal();
     const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
@@ -941,7 +1024,10 @@ for (const stopAt of ["abort", "timeout"] as const) {
     let streamed!: () => void;
     const started = new Promise<void>(resolve => { streamed = resolve; });
     let cancelled = false, settled = false, decoded = 0;
-    const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 3000,
+    const expire = controlledDeadline(t);
+    const reason = new Error("interrupted actual stream");
+    const producers: Promise<unknown>[] = [];
+    const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 240_000,
       () => cache.withBoundaryProcessSpawner(async request => {
         const [executable, ...args] = request.argv;
         const child = spawn(executable!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
@@ -950,6 +1036,7 @@ for (const stopAt of ["abort", "timeout"] as const) {
           child.once("error", reject);
           child.once("close", code => { if (batch) settled = true; resolve({ code: code ?? -1 }); });
         });
+        producers.push(completed);
         // Keep only the content producer's stdin open after delivering its real OID list.
         const stdin = batch ? new Writable({
           write(chunk, _encoding, callback) { child.stdin.write(chunk, callback); },
@@ -965,12 +1052,20 @@ for (const stopAt of ["abort", "timeout"] as const) {
       }, new AbortController().signal,
       () => cache.withBareLock(bare, () => cache.verifyRecoveryClosure(bare, tip))));
     const outcome = operation.then(value => value, error => error);
-    await started;
-    if (stopAt === "abort") stop.abort(new Error("interrupted actual stream"));
-    const observer = cache.withBareLock(bare, async () => assert.equal(settled, true));
-    const result = await outcome;
-    await observer;
-    assert.match(String(result), /interrupted actual stream|deadline exhausted/);
+    let observer: Promise<void> | undefined;
+    try {
+      await requireProducerEntry(started, outcome);
+      if (stopAt === "abort") stop.abort(reason);
+      else expire();
+      observer = cache.withBareLock(bare, async () => assert.equal(settled, true));
+      const result = await outcome;
+      await observer;
+      if (stopAt === "abort") assert.equal(result, reason);
+      else { assert.ok(result instanceof Error); assert.equal(result.message, "recovery deadline exhausted"); }
+    } finally {
+      stop.abort(new Error("fixture cleanup"));
+      await Promise.allSettled([operation, outcome, ...producers, ...(observer ? [observer] : [])]);
+    }
     assert.ok(decoded > 0, "actual Git content reached the parser");
     assert.equal(cancelled, true);
     assert.equal(settled, true);
@@ -980,7 +1075,7 @@ for (const stopAt of ["abort", "timeout"] as const) {
 }
 
 for (const stopAt of ["parser", "abort", "timeout"] as const) {
-  test(stopAt + " during raw verification settles supervised producer before lock release", async () => {
+  test(stopAt + " during raw verification settles supervised producer before lock release", async (t) => {
     const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
     const raw = Buffer.from("blob 1\0x");
     const oid = createHash("sha1").update(raw).digest("hex");
@@ -995,8 +1090,12 @@ for (const stopAt of ["parser", "abort", "timeout"] as const) {
     const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
     const stdout = new PassThrough();
     let cancelled = false, settled = false;
-    const operation = cache.withRecoveryOperation(stop.signal, Date.now() + (stopAt === "timeout" ? 50 : 1000),
+    const expire = controlledDeadline(t);
+    const reason = new Error("interrupted verification");
+    let producerEntered = false;
+    const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 240_000,
       () => cache.withBoundaryProcessSpawner(async () => {
+        producerEntered = true;
         entered();
         if (stopAt === "parser") stdout.end(`${oid} blob 1\nx\n`);
         return { stdout, stderr: Readable.from([]), stdin: null, completed,
@@ -1010,13 +1109,22 @@ for (const stopAt of ["parser", "abort", "timeout"] as const) {
       }, new AbortController().signal, () => cache.withBareLock(bare, () => cache.verifyRecoveryClosure(bare, tip))));
     // Install the rejection observer before timeout/abort can fire.
     const outcome = operation.then(value => value, error => error);
-    await started;
-    if (stopAt === "abort") stop.abort(new Error("interrupted verification"));
-    const observer = cache.withBareLock(bare, async () => assert.equal(settled, true));
-    const result = await outcome;
-    await observer;
-    assert.equal(cancelled, true);
-    if (stopAt === "parser") assert.equal(result, false);
-    else assert.match(String(result), /interrupted verification|deadline exhausted/);
+    let observer: Promise<void> | undefined;
+    try {
+      await requireProducerEntry(started, outcome);
+      assert.equal(producerEntered, true);
+      if (stopAt === "abort") stop.abort(reason);
+      if (stopAt === "timeout") expire();
+      observer = cache.withBareLock(bare, async () => assert.equal(settled, true));
+      const result = await outcome;
+      await observer;
+      assert.equal(cancelled, true);
+      if (stopAt === "parser") assert.equal(result, false);
+      else if (stopAt === "abort") assert.equal(result, reason);
+      else { assert.ok(result instanceof Error); assert.equal(result.message, "recovery deadline exhausted"); }
+    } finally {
+      stop.abort(new Error("fixture cleanup"));
+      await Promise.allSettled([operation, outcome, ...(producerEntered ? [completed] : []), ...(observer ? [observer] : [])]);
+    }
   });
 }

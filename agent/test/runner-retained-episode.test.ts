@@ -1,4 +1,4 @@
-import { it, afterEach } from "node:test";
+import { it, afterEach, type TestContext } from "node:test";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -15,6 +15,29 @@ import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
+
+/** Preserve the persisted clock and drive only the already armed deadline timer. */
+function episodeDeadline(t: TestContext, deadline: number, setupDelay = 0): () => void {
+  const realNow = Date.now;
+  const realSetTimeout = globalThis.setTimeout;
+  let now: number | undefined = setupDelay ? realNow() + setupDelay : undefined;
+  t.mock.method(Date, "now", () => now ?? realNow());
+  const callbacks: (() => void)[] = [];
+  t.mock.method(globalThis, "setTimeout", (callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    if (delay !== undefined && delay > 200_000 && delay <= 300_000) callbacks.push(() => callback(...args));
+    return realSetTimeout(callback, delay, ...args);
+  });
+  return () => {
+    assert.ok(callbacks.length > 0, "persisted recovery deadline timer was armed");
+    now = deadline;
+    for (const fire of callbacks.splice(0)) fire();
+  };
+}
+
+async function requireEpisodeEntry(entry: Promise<void>, execution: Promise<unknown>): Promise<void> {
+  const entered = await Promise.race([entry.then(() => true), execution.then(() => false, () => false)]);
+  assert.equal(entered, true, "runner ended before the recovery seam");
+}
 
 for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-generation FINAL", "tampered physical journal", "unreadable physical journal", "incomplete coverage", "absent journal", "legacy journal", "shutdown during FINAL read", "fence during FINAL read"] as const) {
   it(`successor terminal retirement requires ${authority}`, async () => {
@@ -420,17 +443,19 @@ for (const stage of ["reservation", "discovery"] as const) {
     fs.writeFileSync(sessionArtifact, "predecessor session evidence\n");
     let models = 0, settled = false;
     const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab);
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     const execution = r.execute(claim).finally(() => { settled = true; });
     try {
-      await entry;
+      await requireEpisodeEntry(entry, execution);
       (r as any).activeRuns.get(claim.run_id).cancel.abort();
-      await Promise.race([execution, new Promise<void>(resolve => setTimeout(resolve, 250))]);
+      await Promise.race([execution, new Promise<void>(resolve => { watchdog = setTimeout(resolve, 250); })]);
       assert.equal(settled, true, "cancelled flight must settle while the lock is still held");
       assert.deepEqual(readJournal(bare, clone.branch), before);
     } finally {
+      if (watchdog) clearTimeout(watchdog);
+      (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
       release();
-      await holder;
-      await execution;
+      await Promise.allSettled([holder, execution]);
     }
     await git.withBareLock(bare, async () => {});
     assert.deepEqual(readJournal(bare, clone.branch), before);
@@ -449,20 +474,29 @@ it("lifecycle cancellation settles the actual attempt-mode child without discove
   let started!: () => void, finish!: (value: { code: number }) => void;
   const entry = new Promise<void>(resolve => { started = resolve; });
   const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
-  let cancelled = false, settledChild = false, models = 0, discoveries = 0;
+  let cancelled = false, settledChild = false, models = 0, discoveries = 0, producerEntered = false;
+  const stop = new AbortController();
   const discover = git.discoverRetainedRecovery.bind(git);
   git.discoverRetainedRecovery = async (...args) => { discoveries++; return discover(...args); };
   const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab);
   const execution = git.withBoundaryProcessSpawner(async () => {
+    producerEntered = true;
     started();
     return {
       stdout: Readable.from([]), stderr: Readable.from([]), stdin: null, completed,
       cancel: async () => { cancelled = true; settledChild = true; finish({ code: -1 }); },
     };
-  }, new AbortController().signal, () => r.execute(claim));
-  await entry;
-  (r as any).activeRuns.get(claim.run_id).cancel.abort();
-  await execution;
+  }, stop.signal, () => r.execute(claim));
+  try {
+    await requireEpisodeEntry(entry, execution);
+    assert.equal(producerEntered, true);
+    (r as any).activeRuns.get(claim.run_id).cancel.abort();
+    await execution;
+  } finally {
+    stop.abort(new Error("fixture cleanup"));
+    (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
+    await Promise.allSettled([execution, ...(producerEntered ? [completed] : [])]);
+  }
   assert.equal(cancelled, true);
   assert.equal(settledChild, true);
   assert.equal(discoveries, 0);
@@ -472,50 +506,68 @@ it("lifecycle cancellation settles the actual attempt-mode child without discove
   assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
 });
 
-it("queued reservation deadline admits no proof or later charge and bounds finalization lock waits", async () => {
-  const { claim, bare, clone, key } = await seed();
-  await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
-  const before = readJournal(bare, clone.branch);
-  before.recovery.startedAt = Date.now() - 299_000;
-  before.recovery.deadline = before.recovery.startedAt + 300_000;
-  command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
-  client.protocolFeatures = ["claim_generation_fence"];
-  git.recoveryAttemptMode = async () => false;
-  git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
-  let release!: () => void, acquired!: () => void, entered!: () => void;
-  const held = new Promise<void>(resolve => { acquired = resolve; });
-  const entry = new Promise<void>(resolve => { entered = resolve; });
-  const holder = git.withBareLock(bare, async () => {
-    acquired();
-    await new Promise<void>(resolve => { release = resolve; });
-  });
-  await held;
-  const reserve = git.reserveRecoveryIteration.bind(git);
-  git.reserveRecoveryIteration = async (...args) => { entered(); return reserve(...args); };
-  let models = 0, proofs = 0, reads = 0, settled = false;
-  client.getRunOwnership = async () => { reads++; throw new Error("must not read"); };
-  const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
-    fakeGitlab().gitlab, undefined, nullLogger(), { codexBoundaryDeadlineMs: 100 });
-  (r as any).quiesceRun = async () => { proofs++; throw new Error("must not prove"); };
-  const execution = r.execute(claim).finally(() => { settled = true; });
-  try {
-    await entry;
-    await Promise.race([execution, new Promise<void>(resolve => setTimeout(resolve, 2_000))]);
-    assert.equal(settled, true, "deadline and bookkeeping must finish before unlock");
+for (const setupDelay of [0, 5_000]) {
+  it(`queued reservation deadline admits no proof or later charge and bounds finalization lock waits (setup delay ${setupDelay}ms)`, async (t) => {
+    const { claim, bare, clone, key } = await seed();
+    await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
+    const before = readJournal(bare, clone.branch);
+    before.recovery.startedAt = Date.now() - 60_000;
+    before.recovery.deadline = before.recovery.startedAt + 300_000;
+    command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
+    client.protocolFeatures = ["claim_generation_fence"];
+    git.recoveryAttemptMode = async () => false;
+    git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+    let release!: () => void, acquired!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { acquired = resolve; });
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    const holder = git.withBareLock(bare, async () => {
+      acquired();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await held;
+    const expire = episodeDeadline(t, before.recovery.deadline, setupDelay);
+    let deadlineAborted = false;
+    const reserve = git.reserveRecoveryIteration.bind(git);
+    git.reserveRecoveryIteration = async (...args) => {
+      const scope = (git as any).recoveryOperations.getStore();
+      scope.signal.addEventListener("abort", () => {
+        assert.equal(scope.signal.reason.message, "recovery deadline exhausted");
+        deadlineAborted = true;
+      }, { once: true });
+      entered();
+      const reservation = reserve(...args);
+      queueMicrotask(expire);
+      return reservation;
+    };
+    let models = 0, proofs = 0, reads = 0, settled = false;
+    client.getRunOwnership = async () => { reads++; throw new Error("must not read"); };
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, nullLogger(), { codexBoundaryDeadlineMs: 100 });
+    (r as any).quiesceRun = async () => { proofs++; throw new Error("must not prove"); };
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const execution = r.execute(claim).finally(() => { settled = true; });
+    try {
+      await requireEpisodeEntry(entry, execution);
+      await Promise.race([execution, new Promise<void>(resolve => { watchdog = setTimeout(resolve, 2_000); })]);
+      assert.equal(settled, true, "deadline and bookkeeping must finish before unlock");
+      assert.deepEqual(readJournal(bare, clone.branch), before);
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+      (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
+      release();
+      await Promise.allSettled([holder, execution]);
+    }
+    await git.withBareLock(bare, async () => {});
     assert.deepEqual(readJournal(bare, clone.branch), before);
-  } finally {
-    release();
-    await holder;
-    await execution;
-  }
-  await git.withBareLock(bare, async () => {});
-  assert.deepEqual(readJournal(bare, clone.branch), before);
-  assert.equal(models, 0);
-  assert.equal(proofs, 0);
-  assert.equal(reads, 0);
-  assert.ok(api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
-  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
-});
+    assert.equal(models, 0);
+    assert.equal(proofs, 0);
+    assert.equal(reads, 0);
+    assert.equal(deadlineAborted, true, "queued reservation entered and its deadline aborted the wait");
+    assert.ok(api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  });
+
+}
 
 for (const disposition of ["stale_claim", "released"]) {
   it(`missing source terminal refusal (${disposition}) preserves custody and replacement state`, async () => {
@@ -703,73 +755,93 @@ it("ownership read outages consume all three durable attempts without source mut
   assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
 });
 
-it("persisted deadline interrupts a blocked ownership read and keeps the charged budget", async () => {
-  const { claim, bare, clone, key } = await seed();
-  await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
-  const old = readJournal(bare, clone.branch);
-  const startedAt = Date.now() - 299_700;
-  old.recovery.startedAt = startedAt;
-  old.recovery.deadline = startedAt + 300_000;
-  command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(old));
-  claim.inventory_guarded = true;
-  const feature = client.hasFeature.bind(client);
-  client.hasFeature = name => name === "recovery_inventory_v1" || feature(name);
-  const outbox = new Outbox({
-    root: path.join(fx.dataDir, "deadline-outbox"), log: nullLogger(),
-    runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000,
-  });
-  await outbox.init();
-  let reads = 0, interrupted = false, models = 0, lateReads = 0, lateWork = 0, releases = 0;
-  const authority = client.hasRecoveryRetirementAuthority.bind(client);
-  client.hasRecoveryRetirementAuthority = async (...args) => {
-    if (Date.now() >= old.recovery.deadline) lateWork++;
-    return authority(...args);
-  };
-  client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
-  const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
-    fakeGitlab().gitlab, "fixture-journal-key", nullLogger(), { recoveryRetryMs: 1, outbox });
-  for (const method of ["quiesceRun", "transferRestorePointToTrustedBare"] as const) {
-    const original = (r as any)[method].bind(r);
-    (r as any)[method] = async (...args: unknown[]) => {
-      if (Date.now() >= old.recovery.deadline) lateWork++;
-      return original(...args);
-    };
-  }
-  const report = client.reportState.bind(client);
-  client.reportState = async (...args) => {
-    if (args[1].status === "failed") {
-      assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
-      assert.equal(readJournal(bare, clone.branch).recovery.stage, "blocked");
-    }
-    return report(...args);
-  };
-  client.getRunOwnership = async (_run, signal) => {
-    if (Date.now() >= old.recovery.deadline) lateReads++;
-    if (++reads !== 1) {
-      await new Promise(resolve => setTimeout(resolve, 600));
-      return { status: "running", claim_generation: 2 };
-    }
-    assert.ok(signal);
-    await new Promise<void>((_resolve, reject) => {
-      signal!.addEventListener("abort", () => { interrupted = true; reject(signal!.reason); }, { once: true });
-      if (signal!.aborted) { interrupted = true; reject(signal!.reason); }
+for (const setupDelay of [0, 5_000]) {
+  it(`persisted deadline interrupts a blocked ownership read and keeps the charged budget (setup delay ${setupDelay}ms)`, async (t) => {
+    const { claim, bare, clone, key } = await seed();
+    await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
+    const old = readJournal(bare, clone.branch);
+    const startedAt = Date.now() - 60_000;
+    old.recovery.startedAt = startedAt;
+    old.recovery.deadline = startedAt + 300_000;
+    command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(old));
+    const expire = episodeDeadline(t, old.recovery.deadline, setupDelay);
+    let entered!: () => void;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    claim.inventory_guarded = true;
+    const feature = client.hasFeature.bind(client);
+    client.hasFeature = name => name === "recovery_inventory_v1" || feature(name);
+    const outbox = new Outbox({
+      root: path.join(fx.dataDir, "deadline-outbox"), log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000,
     });
-    throw new Error("unreachable");
-  };
-  const timers = process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
-  await r.execute(claim);
-  assert.ok(process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length <= timers);
-  assert.ok(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!));
-  assert.equal(lateReads, 0);
-  assert.equal(reads, 1);
-  assert.equal(lateWork, 0);
-  assert.equal(releases, 0);
-  assert.equal(interrupted, true);
-  assert.equal(models, 0);
-  assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2);
-  assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
-  assert.ok(api.states.some(s => s.body.status === "failed"));
-});
+    await outbox.init();
+    let reads = 0, interrupted = false, models = 0, lateReads = 0, lateWork = 0, releases = 0;
+    const authority = client.hasRecoveryRetirementAuthority.bind(client);
+    client.hasRecoveryRetirementAuthority = async (...args) => {
+      if (Date.now() >= old.recovery.deadline) lateWork++;
+      return authority(...args);
+    };
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, "fixture-journal-key", nullLogger(), { recoveryRetryMs: 1, outbox });
+    for (const method of ["quiesceRun", "transferRestorePointToTrustedBare"] as const) {
+      const original = (r as any)[method].bind(r);
+      (r as any)[method] = async (...args: unknown[]) => {
+        if (Date.now() >= old.recovery.deadline) lateWork++;
+        return original(...args);
+      };
+    }
+    const report = client.reportState.bind(client);
+    client.reportState = async (...args) => {
+      if (args[1].status === "failed") {
+        assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
+        assert.equal(readJournal(bare, clone.branch).recovery.stage, "blocked");
+      }
+      return report(...args);
+    };
+    client.getRunOwnership = async (_run, signal) => {
+      if (Date.now() >= old.recovery.deadline) lateReads++;
+      if (++reads !== 1) {
+        await new Promise(resolve => setTimeout(resolve, 600));
+        return { status: "running", claim_generation: 2 };
+      }
+      assert.ok(signal);
+      assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2, "ownership read entered the charged iteration");
+      entered();
+      await new Promise<void>((_resolve, reject) => {
+        signal!.addEventListener("abort", () => {
+          assert.equal(signal!.reason.message, "recovery deadline exhausted");
+          interrupted = true; reject(signal!.reason);
+        }, { once: true });
+        queueMicrotask(expire);
+        if (signal!.aborted) { interrupted = true; reject(signal!.reason); }
+      });
+      throw new Error("unreachable");
+    };
+    const timers = process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
+    const execution = r.execute(claim);
+    try {
+      await requireEpisodeEntry(entry, execution);
+      await execution;
+    } finally {
+      (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
+      await Promise.allSettled([execution]);
+    }
+    assert.ok(process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length <= timers);
+    assert.ok(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!));
+    assert.equal(lateReads, 0);
+    assert.equal(reads, 1);
+    assert.equal(lateWork, 0);
+    assert.equal(releases, 0);
+    assert.equal(interrupted, true);
+    assert.equal(models, 0);
+    assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2);
+    assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
+    assert.equal(readJournal(bare, clone.branch).recovery.startedAt, startedAt);
+    assert.equal(readJournal(bare, clone.branch).recovery.deadline, old.recovery.deadline);
+    assert.ok(api.states.some(s => s.body.status === "failed"));
+  });
+}
 
 it("late blocker finalization cannot change a replacement episode on the same source", async () => {
   const { claim, bare, clone, key } = await seed();
@@ -970,59 +1042,87 @@ it("real production declared overflow blocks runner with decoded_history_limit a
 });
 
 for (const failure of ["cap", "timeout", "interruption"] as const) {
-  it("closure verification " + failure + " keeps all source custody and never admits a model", async () => {
-    const { claim, bare, clone, key } = await seed();
-    let releases = 0, models = 0, verified = 0;
-    const log = recordingLogger();
-    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain"); };
-    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
-      fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
-    git.verifyRecoveryClosure = async () => {
-      verified++;
-      if (failure === "cap") throw new RecoveryClosureLimitError();
-      if (failure === "interruption") {
-        (r as any).activeRuns.get(claim.run_id).cancel.abort();
+  for (const setupDelay of failure === "timeout" ? [0, 5_000] : [0]) {
+    it(`closure verification ${failure} keeps all source custody and never admits a model (setup delay ${setupDelay}ms)`, async (t) => {
+      const { claim, bare, clone, key } = await seed();
+      let releases = 0, models = 0, verified = 0;
+      const log = recordingLogger();
+      client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain"); };
+      const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+        fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
+      let expire!: () => void, entered!: () => void;
+      let persisted: any;
+      let deadlineAborted = false;
+      const entry = new Promise<void>(resolve => { entered = resolve; });
+      git.verifyRecoveryClosure = async () => {
+        verified++;
+        entered();
+        if (failure === "cap") throw new RecoveryClosureLimitError();
+        if (failure === "interruption") {
+          (r as any).activeRuns.get(claim.run_id).cancel.abort();
+          const scope = (git as any).recoveryOperations.getStore();
+          scope.signal.throwIfAborted();
+          throw new Error("fixture interruption");
+        }
+        // A persisted original deadline bounds this blocked verifier, without refreshing it.
         const scope = (git as any).recoveryOperations.getStore();
-        scope.signal.throwIfAborted();
-        throw new Error("fixture interruption");
+        assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2, "verifier entered the charged iteration");
+        await new Promise<void>((_resolve, reject) => {
+          const aborted = () => {
+            assert.equal(scope.signal.reason.message, "recovery deadline exhausted");
+            deadlineAborted = true;
+            reject(scope.signal.reason);
+          };
+          scope.signal.addEventListener("abort", aborted, { once: true });
+          if (scope.signal.aborted) aborted();
+          queueMicrotask(expire);
+        });
+        return false;
+      };
+      if (failure === "timeout") {
+        await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
+        const before = readJournal(bare, clone.branch);
+        before.recovery.startedAt = Date.now() - 60_000;
+        before.recovery.deadline = before.recovery.startedAt + 300_000;
+        command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
+        persisted = before.recovery;
+        expire = episodeDeadline(t, persisted.deadline, setupDelay);
       }
-      // A persisted original deadline bounds this blocked verifier, without refreshing it.
-      const scope = (git as any).recoveryOperations.getStore();
-      await new Promise<void>((_resolve, reject) => {
-        const aborted = () => reject(scope.signal.reason);
-        scope.signal.addEventListener("abort", aborted, { once: true });
-        if (scope.signal.aborted) aborted();
-      });
-      return false;
-    };
-    if (failure === "timeout") {
-      await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
-      const before = readJournal(bare, clone.branch);
-      before.recovery.startedAt = Date.now() - 297_000;
-      before.recovery.deadline = before.recovery.startedAt + 300_000;
-      command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
-    }
-    await r.execute(claim);
-    assert.equal(verified, 1);
-    assert.equal(models, 0);
-    assert.equal(releases, 0);
-    const journal = readJournal(bare, clone.branch);
-    assert.equal(journal.clonePath, clone.path);
-    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
-    assert.equal(command(bare, "for-each-ref", "--format=%(refname)", "refs/uzi-recovery-episode/" + claim.run_id), "");
-    assert.equal(journal.recovery.restoreTip, undefined);
-    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
-    if (failure === "interruption") {
-      assert.equal(journal.recovery.stage, "capturing");
-    } else {
-      assert.equal(journal.recovery.stage, "blocked");
-      assert.equal(journal.recovery.blocker, failure === "cap" ? "decoded_history_limit" : "budget_exhausted");
-      assert.ok(api.states.some(s => s.body.status === "failed"));
-    }
-    if (failure === "cap") {
-      assert.ok(api.states.some(s => s.body.failure_reason?.includes("1 GiB decoded verification limit")));
-      assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 GiB decoded verification limit")));
-      assert.equal(journal.recovery.attempts, 1);
-    }
-  });
+      const execution = r.execute(claim);
+      try {
+        await requireEpisodeEntry(entry, execution);
+        await execution;
+      } finally {
+        (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
+        await Promise.allSettled([execution]);
+      }
+      assert.equal(verified, 1);
+      assert.equal(models, 0);
+      assert.equal(releases, 0);
+      const journal = readJournal(bare, clone.branch);
+      assert.equal(journal.clonePath, clone.path);
+      assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+      assert.equal(command(bare, "for-each-ref", "--format=%(refname)", "refs/uzi-recovery-episode/" + claim.run_id), "");
+      assert.equal(journal.recovery.restoreTip, undefined);
+      assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+      if (failure === "interruption") {
+        assert.equal(journal.recovery.stage, "capturing");
+      } else {
+        assert.equal(journal.recovery.stage, "blocked");
+        assert.equal(journal.recovery.blocker, failure === "cap" ? "decoded_history_limit" : "budget_exhausted");
+        assert.ok(api.states.some(s => s.body.status === "failed"));
+      }
+      if (failure === "timeout") {
+        assert.equal(deadlineAborted, true);
+        assert.equal(journal.recovery.attempts, 2);
+        assert.equal(journal.recovery.startedAt, persisted.startedAt);
+        assert.equal(journal.recovery.deadline, persisted.deadline);
+      }
+      if (failure === "cap") {
+        assert.ok(api.states.some(s => s.body.failure_reason?.includes("1 GiB decoded verification limit")));
+        assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 GiB decoded verification limit")));
+        assert.equal(journal.recovery.attempts, 1);
+      }
+    });
+  }
 }
