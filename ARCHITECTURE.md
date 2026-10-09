@@ -1356,7 +1356,8 @@ chain in the diagram above, with no intervening `running`.
   No capture, WIP, freeze or clean-source proof is needed for this receipt,
   even with existing available/thin/needs-action captures; archive retention
   is unchanged. Healthy custody release needs no heartbeat prerequisite.
-  The worker persists the fixed original completion before preparation.
+  When its existing outbox can journal the terminal report, the worker persists
+  the fixed original completion before preparation.
   A valid receipt skips preparation and is saved/read back in an existing
   MAC-authenticated generation recovery record before protected report
   retirement. Other responses use original capture fallback; lost ACK plus

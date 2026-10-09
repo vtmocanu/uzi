@@ -363,8 +363,8 @@ ancestry or identity drift keeps custody open with a bounded reason.
 Replaying the exact original completion returns the stored receipt without
 depending on current forge or mutable run state.
 
-The worker saves the original completion before archive preparation. A valid
-receipt skips that preparation and must be persisted and read back in an
+When its existing outbox can journal the terminal report, the worker saves
+the original completion before archive preparation. A valid receipt skips that preparation and must be persisted and read back in an
 existing authenticated generation recovery record before protected report
 retirement. Without a valid receipt, including a refusal, unknown ACK or a
 mixed-version or excluded-kind response, the existing capture path remains

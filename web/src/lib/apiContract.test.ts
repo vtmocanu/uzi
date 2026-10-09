@@ -1206,7 +1206,8 @@ it("recovery publication receipt matches the Go contract and permits older serve
   const withoutMR: NonNullable<RecoveryCustodyHold["completed_publication_receipt"]> = {
     ...full.completed_publication_receipt!, mr_iid: null,
   };
-  expect(withoutMR.mr_iid).toBeNull();
+  // This assignment checks nullable MR compatibility at compile time.
+  void withoutMR;
 });
 
 // ── RecoveryCustodyAggregate (PRD #1349 M1) ──────────────────────────────────
