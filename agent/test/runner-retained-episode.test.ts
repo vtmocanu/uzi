@@ -7,6 +7,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, createHmac } from "node:crypto";
 import { PendingRecoveryCaptureError } from "../src/git.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
+import { MessageBatcher } from "../src/batcher.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
 import { deflateSync } from "node:zlib";
 import { Readable } from "node:stream";
@@ -392,6 +393,7 @@ it("retained recovery credential switch rejects unverified evidence and retains 
 type RetainedSwitchOptions = {
   ack?: "lost" | "statusless" | "stale" | "idempotent";
   deadline?: boolean;
+  drainDeadline?: boolean;
   proofTerminal?: "shutdown" | "fence" | "cancel";
   terminal?: "shutdown" | "fence" | "cancel";
   mismatch?: "pending" | "ownership";
@@ -451,6 +453,24 @@ it("retained recovery credential switch during discovery keeps unknown custody",
 });
 it("retained recovery credential switch completes bounded ownership verification on deadline", async () => {
   await retainedSwitchRegression("ownership", false, { deadline: true });
+});
+it("retained recovery credential switch aborts drain at its operation deadline", async t => {
+  let drains = 0;
+  let drainSignal: AbortSignal | undefined;
+  t.mock.method(MessageBatcher.prototype, "close", async (signal?: AbortSignal) => {
+    drains++;
+    drainSignal = signal;
+    // Missing propagation must fail promptly instead of hanging the regression.
+    if (!signal) return;
+    await new Promise<void>(resolve => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  });
+  await retainedSwitchRegression("ownership", false, { drainDeadline: true });
+  assert.ok(drainSignal, "drain receives the independent operation signal");
+  assert.equal(drainSignal.aborted, true, "drain settled only after deadline abort");
+  assert.equal(drains, 1, "outer cleanup joins the bounded drain rather than draining again");
 });
 for (const proofTerminal of ["shutdown", "fence", "cancel"] as const) {
   it(`retained recovery credential switch honors ${proofTerminal} during verification`, async () => {
@@ -530,6 +550,7 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
       };
     }
     if (options.deadline) (r as any).codexBoundaryDeadlineMs = 50;
+    if (options.drainDeadline) (r as any).codexBoundaryDeadlineMs = 1_000;
     if (options.cancelOnly) {
       const live = new AbortController();
       flight.steering.lifecycleSignal = () => live.signal;
@@ -560,6 +581,7 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   };
   const discover = git.discoverRetainedRecovery.bind(git);
   git.discoverRetainedRecovery = async (...args) => {
+    if (options.drainDeadline && injected) return undefined;
     const retained = await discover(...args);
     if (seam === "discovery" && !injected) await trip();
     return retained;
@@ -598,11 +620,11 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   assert.equal(releases, 0);
   const reports = api.states.filter(s => s.body.status === "credential_switch" || s.body.status === "credential_switch_failed");
   assert.deepEqual(reports.map(s => [s.body.status, s.body.claim_generation]),
-    options.terminal || options.mismatch || options.deadline || options.proofTerminal || options.interruption ? [] :
+    options.terminal || options.mismatch || options.deadline || options.drainDeadline || options.proofTerminal || options.interruption ? [] :
       [[verified ? "credential_switch" : "credential_switch_failed", 2]]);
   assert.equal(api.states.some(s => s.body.status === "failed"), options.terminal === "cancel");
   if (options.deadline || options.proofTerminal) assert.equal(proofInterrupted, true, "verification await was interrupted");
-  if (!options.terminal && !options.mismatch && !options.deadline && !options.proofTerminal && !options.interruption) {
+  if (!options.terminal && !options.mismatch && !options.deadline && !options.drainDeadline && !options.proofTerminal && !options.interruption) {
     const disposition = log.lines.find(line => (line as { msg: string }).msg ===
       "retained credential switch stopped; all local work and custody retained") as { confirmed: boolean } | undefined;
     if (options.ack === "lost" || options.ack === "stale") assert.equal(disposition, undefined);

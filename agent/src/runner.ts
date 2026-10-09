@@ -15249,7 +15249,8 @@ export class RunRunner {
             await check();
             const record = records.find(record => record.runId === flight.runId && record.generation === generation &&
               record.branch === branch && record.inventoryGuarded === true && record.coverageDigest &&
-              record.coverageContext?.generation === generation && record.coverageContext.runId === flight.runId &&
+              record.coverageContext !== undefined && record.coverageContext.generation === generation &&
+              record.coverageContext.runId === flight.runId &&
               record.coverageContext.branch === branch && record.coverageContext.barePath === retained.barePath &&
               record.sourceSha === tip);
             if (!record) throw new Error("retained credential switch existing guarded capture unavailable");
@@ -15293,7 +15294,7 @@ export class RunRunner {
           runLog.warn("retained credential switch verification failed; custody retained", { error: errMessage(error) });
         }
         await check();
-        await flight.batcher.close();
+        await flight.batcher.close(signal);
         await check();
         if (verified) {
           try { await finalProof!(); }
