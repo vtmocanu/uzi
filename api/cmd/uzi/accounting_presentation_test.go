@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -121,6 +122,34 @@ func TestAccountingModelPresentation(t *testing.T) {
 					t.Errorf("baseline badge=%q", got)
 				}
 				baseline := m.View().Content
+				flush := func(content string) string {
+					var output bytes.Buffer
+					writer := colorprofile.Writer{Forward: &output, Profile: profile}
+					if _, err := writer.WriteString(content); err != nil {
+						t.Fatal(err)
+					}
+					return output.String()
+				}
+				flushedBaseline := flush(baseline)
+				for _, want := range []string{"⇡ loading earlier", "ordinary status", "ordinary text", "Bash"} {
+					if !strings.Contains(stripANSI(flushedBaseline), want) {
+						t.Errorf("terminal profile lost plain cue %q", want)
+					}
+				}
+				if profile == colorprofile.TrueColor && !strings.Contains(flushedBaseline, "38;2;") {
+					t.Error("TrueColor positive control emitted no foreground colors")
+				}
+				// Ascii may retain non-color attributes such as bold; NoTTY strips all SGR.
+				if profile == colorprofile.Ascii {
+					for _, color := range []string{"38;2;", "48;2;", "38;5;", "48;5;"} {
+						if strings.Contains(flushedBaseline, color) {
+							t.Errorf("Ascii terminal retained color sequence %q", color)
+						}
+					}
+				}
+				if profile == colorprofile.NoTTY && strings.Contains(flushedBaseline, "\x1b[") {
+					t.Error("NoTTY terminal retained SGR styles")
+				}
 				views := map[string]string{}
 				for i, lane := range m.detail.lanes {
 					m.detail.laneIdx = i
@@ -139,6 +168,9 @@ func TestAccountingModelPresentation(t *testing.T) {
 				}
 				if m.View().Content != baseline {
 					t.Error("accounting changed real model View")
+				}
+				if flush(m.View().Content) != flushedBaseline {
+					t.Error("accounting changed flushed terminal output")
 				}
 				if len(m.detail.frames) != 5 || m.detail.lowSeq != 9 || m.detail.highSeq != 13 || len(m.detail.seen) != 5 {
 					t.Errorf("raw state lost: %+v", frameSeqs(m))
@@ -358,12 +390,12 @@ func TestAccountingUXLabScene(t *testing.T) {
 				if out == "" {
 					t.Fatal("dedicated scene generation requires UZI_UXLAB_OUT_DIR")
 				}
-				if err := os.MkdirAll(out, 0o755); err != nil {
+				if err := os.MkdirAll(out, 0o750); err != nil {
 					t.Fatal(err)
-				} //nolint:gosec // G301: generated development frames only
-				if err := os.WriteFile(filepath.Join(out, "detail-accounting-backfill-"+name+".ansi"), []byte(frame), 0o644); err != nil {
+				}
+				if err := os.WriteFile(filepath.Join(out, "detail-accounting-backfill-"+name+".ansi"), []byte(frame), 0o600); err != nil {
 					t.Fatal(err)
-				} //nolint:gosec // G306: generated development frames only
+				}
 			}
 		})
 	}
