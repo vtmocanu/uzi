@@ -1,6 +1,6 @@
 # ADR-2555: Persist Codex response attribution separately from activity
 
-**Status**: Accepted; agent and web implementation, CLI/TUI presentation follows in milestone m3
+**Status**: Accepted (implemented, issue #2555)
 **Date**: 2026-10-09
 **Issue**: [#2555](https://github.com/vtmocanu/uzi/issues/2555)
 
@@ -90,15 +90,23 @@ which includes parks.
 
 ## CLI/TUI presentation contract
 
-The approved CLI/TUI implementation follows in milestone m3. Human run logs omit these
-accounting statuses; JSON logs retain the complete records. TUI lanes, transcript,
-counts, recency and active-speaker presentation exclude them. Raw received frames,
-dedup state, sequence bounds, pagination and follow cursors remain complete, including
-accounting-only pages. Transports, question lookup and plan freshness are unchanged.
+Human run logs omit these accounting statuses after the whole-DTO JSON branch, so
+JSON logs retain the complete records. The shared Go-local predicate requires kind
+status and the exact top-level event string. TUI rebuild filters before real and ALL
+lanes; active-lane selection and rail activity use the same filter. Transcript caches,
+counts, suffixes, context and recency consume the filtered lanes. Empty/loading checks
+use visible lanes, so an accounting-only loaded page has the normal empty presentation.
+
+Raw received frames, dedup state, sequence bounds, pagination and follow cursors remain
+complete, including accounting-only pages. Human log cursors advance from the highest
+received sequence, even when nothing renders. Transports, question lookup, plan freshness
+and the demo's raw sequence allocation are unchanged.
 
 The backfill badge uses the count-free phrase "⇡ loading earlier". Raw sequence-derived
 held/total counts cannot describe visible transcript entries once accounting statuses
-are hidden. Deterministic View tests and fresh light/dark renders verify this boundary.
+are hidden. Deterministic Update/View tests cover this boundary, including light/dark TrueColor and
+Ascii/NoTTY profiles. The shipped offline generator includes a lead/child accounting
+scene with the loading badge for fresh visual review.
 
 ## Consequences
 

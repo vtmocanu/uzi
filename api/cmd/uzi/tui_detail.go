@@ -412,13 +412,14 @@ func (d *detailState) rebuild() {
 	if d.laneIdx >= 0 && d.laneIdx < len(d.lanes) {
 		selKey = d.lanes[d.laneIdx].Key
 	}
-	d.lanes = buildLanes(d.frames)
+	visible := presentationFrames(d.frames)
+	d.lanes = buildLanes(visible)
 	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is the
 	// firehose and the individual lanes follow for isolating one. On the FIRST build there is no
 	// prior selection (selKey ""), so the restore below is skipped and the default index 0 lands on
 	// the firehose — the intended opening view for a multi-lane run.
 	if len(d.lanes) >= 2 {
-		d.lanes = append([]agentLane{allLane(d.frames)}, d.lanes...)
+		d.lanes = append([]agentLane{allLane(visible)}, d.lanes...)
 	}
 	if selKey != "" {
 		for i, l := range d.lanes {

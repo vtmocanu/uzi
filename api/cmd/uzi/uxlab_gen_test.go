@@ -92,6 +92,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-revising":               func(d bool) string { return boardRevising(d, now) },
 		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
+		"detail-accounting-backfill":   func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
 		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
 		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
 		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
@@ -628,6 +629,19 @@ func laneMsgs(now time.Time) []apitypes.MessageDTO {
 		// slice order without sorting, matching production's always-ascending seq.
 		leadCtxMsg(5, 124000, 200000, 62, now.Add(-30*time.Second)),
 	}
+}
+
+// detailAccountingBackfill drives retained lead/child accounting through the real
+// model while history is loading. Only the lead and implementation lanes should appear.
+func detailAccountingBackfill(dark bool, now time.Time) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	msgs := []apitypes.MessageDTO{
+		msgDTO(10, "text", "lead", "", "", "Reviewing the implementation.", now.Add(-time.Minute)),
+		msgDTO(11, "text", "coder", "implementation", "implementation", "Running focused tests.", now.Add(-10*time.Second)),
+		accountingMsg(12, "lead", "", now),
+		accountingMsg(13, "coder", "accounting-only-child", now),
+	}
+	return applyDetail(m, apitypes.RunDTO{ID: detailRunID, Status: "running", Health: "ok", IssueTitle: "Codex accounting stays behind the transcript"}, msgs)
 }
 
 func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiModel {
