@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **Label sweep help includes bot-assignment eligibility.**
   The schedule modal clarifies that selector candidates can fire with the configured eligibility label or assignment to the uzi bot.
 
+- **Review author checks can use slower shared repository evidence ([#2427](https://github.com/vtmocanu/uzi/issues/2427)).**
+  Shared evidence uses the remaining 30-second assessment time while author-specific requests retain their original 5-second child deadline. GitHub can finish from shared results after child expiry; Forgejo's permission fallback keeps the expired child and returns unknown, while a later author with a fresh child can succeed. Failed or incomplete evidence still fails closed, and fairness remains conditional.
+
 - **Interactive author assessments leave room for run creation ([#2372](https://github.com/vtmocanu/uzi/issues/2372)).**
   Manual issue starts and on-demand MR rework use a five-second total author-assessment budget, preserving fail-closed unknown handling and the live parent for persistence; background assessments retain thirty seconds.
 
