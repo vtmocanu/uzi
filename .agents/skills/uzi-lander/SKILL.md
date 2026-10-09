@@ -175,7 +175,8 @@ changes it); trust it over a handover's claim.
    `uzi run extend` or `uzi run resume`, which leave no poller running.
    `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
    a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
-   trace tail); do not assume dead or lost, change nothing until you know, then re-arm.
+   trace tail); do not assume dead or lost, change nothing until you know, then launch its
+   `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (a completion question about a milestone
    the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate

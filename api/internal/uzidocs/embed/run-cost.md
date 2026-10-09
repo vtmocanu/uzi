@@ -75,8 +75,9 @@ out instead: a headline of "Subscription" or "Unavailable" (in place of a
 dollar figure), a sub-label like "subscription usage · no metered cost" or
 "tokens only · cost unavailable", and a dense table cell of `sub` or `n/a`.
 An aggregate (Self usage, Admin usage) totals only the metered subset and
-discloses what it left out, e.g. "Cost excludes 2 Codex subscription runs
-and 1 unreported run".
+discloses what it left out, e.g. "+ 2 Codex sub runs and 1 unreported run". A tooltip explains that
+Codex subscription runs report no per-run cost and unreported runs have
+unavailable cost. The per-user table ranks by total tokens, matching Share.
 
 ## Estimated tail of an interrupted session
 

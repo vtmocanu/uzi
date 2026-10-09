@@ -83,14 +83,6 @@ function summaryCost(usd: number): string {
   }).format(value);
 }
 
-// Compact copy is derived from counts, independent of the full disclosure's wording.
-function shortCostDisclosure(subscriptionCount: number, unreportedCount: number): string {
-  const parts: string[] = [];
-  if (subscriptionCount > 0) parts.push(`${subscriptionCount} subscription run${subscriptionCount === 1 ? "" : "s"}`);
-  if (unreportedCount > 0) parts.push(`${unreportedCount} unreported run${unreportedCount === 1 ? "" : "s"}`);
-  return parts.length > 0 ? `excl. ${parts.join(" and ")}` : "";
-}
-
 // PRD #1293: outcomes use the selected window and failed / finished denominator.
 // Issue #1418: remove the needs_landing hatch because an aggregate cannot know
 // whether recoverable work was landed later. It is a descriptive note, not backlog.
@@ -185,7 +177,6 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
   const subscriptionCount = window === "lifetime" ? usage.lifetime_subscription_run_count : usage.last7_subscription_run_count;
   const unreportedCount = window === "lifetime" ? usage.lifetime_unreported_run_count : usage.last7_unreported_run_count;
   const disclosure = aggregateDisclosure(subscriptionCount, unreportedCount);
-  const shortDisclosure = shortCostDisclosure(subscriptionCount, unreportedCount);
   const delta = lifetime.finished > 0 && outcomes.finished > 0
     ? (outcomes.failed / outcomes.finished - lifetime.failed / lifetime.finished) * 100 : null;
   const deltaText = delta == null ? "" : `${delta < 0 ? "−" : delta > 0 ? "+" : ""}${Math.abs(delta).toFixed(1)} pp vs all-time ${failRate(lifetime)}`;
@@ -197,7 +188,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
           <div className="min-w-0">
             <h4 className="text-xs text-muted">Metered cost</h4>
             <p className="mt-1 whitespace-nowrap font-mono text-[22px] font-semibold lg:text-[26px] tabular-nums tracking-tight text-brand">{summaryCost(selected.cost)}</p>
-            {disclosure.incomplete && <p className="mt-1 truncate whitespace-nowrap text-[11px] leading-relaxed text-muted" title={disclosure.text}>{shortDisclosure}</p>}
+            {disclosure.incomplete && <p className="mt-1 truncate whitespace-nowrap text-[11px] leading-relaxed text-muted" title={disclosure.title}>{disclosure.text}</p>}
           </div>
           <div className="min-w-0">
             <h4 className="text-xs text-muted">Failed runs rate</h4>
@@ -333,7 +324,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
     selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
     subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
     unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
-  })).sort((a, b) => b.b.cost - a.b.cost || b.b.out - a.b.out ||
+  })).sort((a, b) => b.b.total - a.b.total || b.b.cost - a.b.cost || b.b.out - a.b.out ||
     (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
   const shares = tokenShares(rows.map((r) => r.b.total), factory.total);
   const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
@@ -363,7 +354,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
             </thead>
             <tbody>
               {rows.map((u, i) => {
-                // Share is by total tokens (not cost) — matches the mock's percentages.
+                // Rank and Share both use total tokens, including subscription runs.
                 // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
                 const pct = shares[i];
                 // PRD #1429 D7: this user's selected cost_usd is their metered subset —
@@ -384,7 +375,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                     <Td cost>
                       {formatCost(u.b.cost)}
                       {rowDisclosure.incomplete && (
-                        <div className="whitespace-nowrap text-[9px] font-normal text-faint">{rowDisclosure.text}</div>
+                        <div className="whitespace-nowrap text-[9px] font-normal text-faint" title={rowDisclosure.title}>{rowDisclosure.text}</div>
                       )}
                     </Td>
                     <Td>
@@ -418,7 +409,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                 <Td total cost>
                   {formatCost(factory.cost)}
                   {factoryDisclosure.incomplete && (
-                    <div className="whitespace-nowrap text-[9px] font-normal text-faint">{factoryDisclosure.text}</div>
+                    <div className="whitespace-nowrap text-[9px] font-normal text-faint" title={factoryDisclosure.title}>{factoryDisclosure.text}</div>
                   )}
                 </Td>
                 <Td total> </Td>

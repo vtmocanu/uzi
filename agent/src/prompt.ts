@@ -365,7 +365,11 @@ export const CODEX_LONG_COMMAND_APPEND = [
  * lifetime guidance in CODEX_LONG_COMMAND_APPEND. Verified
  * against the CLI bundled with the Agent SDK: a Bash call past its timeout is
  * auto-backgrounded (`timedOutAfterMs`), only a standalone `sleep N` is blocked, and each
- * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. The
+ * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. Since
+ * SDK 0.3.285, an explicitly backgrounded command is stopped at its requested background
+ * timeout (default 1800000 ms, max 7200000 ms). An auto-backgrounded command receives the
+ * default background deadline from that transition, so the long-command start explicitly
+ * carries 7200000. The
  * exit status goes to a sidecar `.rc` file written even when the command fails, so gate output
  * cannot fake completion, and the paths are literal because shell variables do not persist
  * between Bash calls.
@@ -374,9 +378,11 @@ export const CODEX_LONG_COMMAND_APPEND = [
  */
 export const CLAUDE_LONG_COMMAND_APPEND = [
   "On this harness the Bash tool times out after two minutes by default and then moves the",
-  "command to the background. Give a command that may run longer an explicit `timeout` (at",
-  "most 600000 ms). If it may run longer than that, pick a fresh name and start it with",
-  "`run_in_background` as `s=\"$(git rev-parse --show-toplevel)/.uzi/scratch\"; rc=0; <command> >",
+  "command to the background, where it is stopped 30 minutes later. Give a foreground command",
+  "that may run longer an explicit `timeout` (at most 600000 ms). If it may run longer than",
+  "that, pick a fresh name and start it with `run_in_background: true` and `timeout` 7200000",
+  "(on a background command `timeout` is how long it may keep running: a smaller value stops it",
+  "early, and nothing runs longer than two hours) as `s=\"$(git rev-parse --show-toplevel)/.uzi/scratch\"; rc=0; <command> >",
   "\"$s/<name>.log\" 2>&1 || rc=$?; echo \"$rc\" > \"$s/<name>.rc\"` (the paths are anchored at the",
   "worktree root, so a directory change between calls cannot move them). Shell variables do not",
   "carry between Bash calls, so wait with foreground calls, each with `timeout` 600000, that",

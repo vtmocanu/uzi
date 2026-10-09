@@ -78,8 +78,8 @@ const ISOLATED_DISALLOWED_TOOLS: readonly string[] = [
 const RUN_SECRETS_DIR = "/run/uzi-secrets";
 
 /**
- * The built-in agents and skills the pinned CLI (claude-agent-sdk 0.3.284, CLI 2.1.284)
- * still reports in its init frame with `agents: {}`, `skills: []`, `settingSources: []`,
+ * The built-in agents and skills the CLI reports in its init frame (seen on claude-agent-sdk
+ * 0.3.284, CLI 2.1.284) with `agents: {}`, `skills: []`, `settingSources: []`,
  * CLAUDE_CODE_DISABLE_BUNDLED_SKILLS and CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS set:
  * captured from a real session (test/fixtures/isolated-init-frame.json). They cannot be
  * turned off, and they are unreachable here: agents need the Agent/Task tool and skills

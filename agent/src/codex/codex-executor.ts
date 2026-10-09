@@ -179,6 +179,8 @@ import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
+import { makePrDescriptionEvalLaunch, type PrDescriptionEvalLaunchTestSeams } from "./pr-description-eval-launch.js";
+import type { AdviceRequest, AdviceResultPolicy } from "../harness.js";
 import {
   createCodexAppServerAuth,
   type CodexAppServerAuthConfig,
@@ -1026,6 +1028,47 @@ export async function makeCodexAdviceHarness(
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken));
   return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, log });
+}
+
+/** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
+ * abort via the passed signal, then await close. run always awaits cleanup.
+ * The real harness is exposed for AdviceHarness consumers; those must await close too.
+ */
+export function makePrDescriptionEvalCodexFactory(options: {
+  checkoutPath: string;
+  apiKey: string;
+  signal?: AbortSignal;
+  testSeams?: PrDescriptionEvalLaunchTestSeams;
+}) {
+  if (!options.apiKey) throw new Error("evaluator requires a caller-provided API key");
+  const owner = makePrDescriptionEvalLaunch(options.checkoutPath, options.signal, options.testSeams);
+  const silent: Logger = {
+    debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
+    child() { return silent; },
+  };
+  const auth = createCodexAppServerAuth({ mode: "api_key", apiKey: options.apiKey });
+  const harness = new CodexAdviceHarness({
+    launchRoot: owner.launchRoot, provider: CODEX_PRODUCTION_PROVIDER,
+    appServerAuth: auth, log: silent,
+  });
+  const close = (): Promise<void> => {
+    auth.closeAdmissionAndCancel();
+    return owner.close();
+  };
+  return {
+    harness,
+    signal: owner.signal,
+    close,
+    async run(request: AdviceRequest, policy: AdviceResultPolicy) {
+      try {
+        return await harness.run({
+          ...request, signal: AbortSignal.any([request.signal, owner.signal]),
+        }, policy);
+      } finally {
+        await close();
+      }
+    },
+  };
 }
 
 /** Build the advice lane's app-server auth config from the released initial token. Subscription

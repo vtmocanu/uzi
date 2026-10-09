@@ -82,8 +82,8 @@ it("demo renders selected-window cost exclusions and seven-day per-user totals",
     createElement(UsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {} }),
   ));
   const personal = within(getByRole("region", { name: "Your usage" }));
-  expect(personal.getByText("excl. 2 subscription runs").getAttribute("title")).toBe("Cost excludes 2 Codex subscription runs");
+  expect(personal.getByText("+ 2 Codex sub runs").getAttribute("title")).toBe("Codex subscription runs: no per-run cost reported");
   expect(getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
   const totalRow = getByText("uzi total").closest("tr")!;
-  expect(within(totalRow).getByText("Cost excludes 5 Codex subscription runs")).toBeTruthy();
+  expect(within(totalRow).getByText("+ 5 Codex sub runs")).toBeTruthy();
 });
