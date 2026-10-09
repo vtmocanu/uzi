@@ -1380,7 +1380,7 @@ it("issue2416 live FINAL success that forgets the generation reports uploaded, n
   } finally { await f.close(); }
 });
 
-for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "attention"] as const) {
+for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "attention", "quota"] as const) {
   it(`issue2416 retained FINAL reconciliation preserves retry classification ${variant}`, async () => {
     const f = await fixture(false, os.tmpdir(), true);
     try {
@@ -1388,7 +1388,9 @@ for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "att
       f.log.warn = message => { warnings.push(message); };
       const record = await f.freeze();
       assert.ok(record);
-      f.state.finalError = variant === "5xx"
+      f.state.finalError = variant === "quota"
+        ? new RequestError("POST", "/api/worker/runs/run-1/recovery/release", 507, JSON.stringify({ reason: "quota" }))
+        : variant === "5xx"
         ? new RequestError("POST", "/api/worker/runs/run-1/recovery/release", 503, "service unavailable")
         : variant === "timeout" ? new DOMException("FINAL timed out", "TimeoutError")
         : new Error("network unavailable");
@@ -1406,7 +1408,7 @@ for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "att
       };
       const outcome = await f.capture(record);
       assert.equal(reconciliations, 1, "the receipt endpoint is reached after FINAL fails");
-      const expected = variant === "attention" ? reason : "upload_transient";
+      const expected = variant === "attention" ? reason : variant === "quota" ? "storage_quota_exceeded" : "upload_transient";
       assert.equal(outcome.reason, expected);
       const before = (await f.coordinator.inspect("run-1"))[0]!;
       assert.equal(before.state, "uploaded");
@@ -1462,6 +1464,81 @@ for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "att
         assert.deepEqual(f.state.candidates, pins);
         assert.equal(f.state.pinDeletes, 0);
       }
+    } finally { await f.close(); }
+  });
+}
+
+for (const phase of ["reserve-count", "upload"] as const) {
+  it(`U1 guarded ${phase} quota retains source and bytes through live and restart refusals`, async () => {
+    const f = await fixture();
+    try {
+      const quota = new RequestError("POST", "/api/worker/recovery", 507, JSON.stringify({ reason: "quota" }));
+      let refused = true;
+      let uploadAttempts = 0;
+      const upload = f.client.uploadRecoveryBundle;
+      f.client.uploadRecoveryBundle = async (run, id, manifest, stream) => {
+        uploadAttempts++;
+        if (refused && phase === "upload") {
+          for await (const chunk of stream) assert.ok(chunk);
+          throw quota;
+        }
+        return upload(run, id, manifest, stream);
+      };
+      if (phase === "reserve-count") f.state.reserveError = quota;
+      const record = await f.freeze();
+      assert.ok(record);
+      assert.equal((await f.capture(record)).reason, "storage_quota_exceeded");
+      const before = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(before.state, "needs_action");
+      assert.equal(before.reason, "storage_quota_exceeded");
+      assert.equal(before.serverCaptureId, phase === "reserve-count" ? undefined : "server-1");
+      const bytes = await fs.readFile(before.bundlePath!);
+      const pins = structuredClone(f.state.candidates);
+      const retained = async (coordinator: RecoveryCoordinator) => {
+        assert.deepEqual((await coordinator.inspect("run-1"))[0], before);
+        assert.deepEqual(await fs.readFile(before.bundlePath!), bytes);
+        assert.deepEqual(f.state.candidates, pins);
+        assert.equal(f.state.produced, 1);
+        assert.equal(f.state.pinDeletes, 0);
+        assert.equal(f.finals.length, 0);
+        assert.equal(await coordinator.inventoryCleanupState("run-1", 7), "pending");
+      };
+      const attempts = () => phase === "reserve-count" ? f.reserves() : uploadAttempts;
+      const live = () => f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      await live();
+      assert.equal(attempts(), 2, "guarded quota is eligible for live retry");
+      await retained(f.coordinator);
+      f.state.now += 60_000 - 1;
+      await live();
+      assert.equal(attempts(), 2, "quota keeps transient backoff");
+      f.state.now++;
+      await live();
+      assert.equal(attempts(), 3);
+      await retained(f.coordinator);
+      f.state.now += 120_000 - 1;
+      await live();
+      assert.equal(attempts(), 3, "repeated quota doubles backoff");
+
+      const restarted = f.make();
+      await restarted.resumePending();
+      assert.equal(attempts(), 4, "restart retries without reproducing");
+      await retained(restarted);
+      refused = false;
+      f.state.reserveError = undefined;
+      await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const after = (await restarted.inspect("run-1"))[0]!;
+      assert.equal(after.state, "uploaded");
+      assert.equal(after.reason, undefined);
+      assert.equal(after.finalAcknowledged, true);
+      assert.equal(after.serverCaptureId, "server-1");
+      for (const key of ["captureId", "sourceSha", "bundlePath", "checksum", "byteSize", "chunkCount", "coverageDigest", "generation"] as const) {
+        assert.equal(after[key], before[key], key);
+      }
+      assert.deepEqual(await fs.readFile(after.bundlePath!), bytes);
+      assert.equal(f.state.produced, 1);
+      assert.equal(f.captures.size, 1, "count refusals allocate no server capture");
+      assert.equal(new Set(f.reserveKeys).size, 1, "every reserve reuses the original identity");
+      assert.equal(f.finals.length, 1, "only successful upload permits FINAL");
     } finally { await f.close(); }
   });
 }
