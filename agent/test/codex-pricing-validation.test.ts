@@ -146,6 +146,38 @@ it("malformed pricing data fails during actual module load", async () => {
     await rm(scratch, { recursive: true, force: true });
   }
 });
+for (const [name, path] of [
+  ["absent Sol row", row],
+  ["absent optional promotion", [...row, "promo_review_date"]],
+] as const) {
+  it(`valid pricing data loads with ${name}`, async () => {
+    const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-load-"));
+    try {
+      for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
+        await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
+      }
+      await writeFile(resolve(scratch, "package.json"), '{"type":"module"}');
+      await writeFile(resolve(scratch, "codex-pricing.json"), JSON.stringify(changed([...path], undefined, true)));
+      await writeFile(resolve(scratch, "check.ts"), `
+        import assert from "node:assert/strict";
+        import { SOL_PROMO_REVIEW_DATE, priceCodexResponse } from "./codex-pricing.js";
+        assert.equal(SOL_PROMO_REVIEW_DATE, undefined);
+        assert.equal(priceCodexResponse("gpt-6-astra", {
+          inputTokens: 1000, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+          outputTokens: 200, reasoningOutputTokens: 0, totalTokens: 1200,
+        }, new Date("2027-01-01T00:00:00Z")), 0.02);
+      `);
+      // Each independent module load is capped at 10 seconds; a failure fails its test.
+      const child = spawnSync(process.execPath, ["--import", "tsx", resolve(scratch, "check.ts")], {
+        cwd: resolve(root, "agent"), encoding: "utf8", timeout: 10000,
+      });
+      assert.equal(child.error, undefined);
+      assert.equal(child.status, 0, child.stdout + child.stderr);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+}
 import { priceCodexResponse } from "../src/codex/codex-pricing.js";
 import { validateCodexPricing } from "../src/codex/codex-pricing-validation.js";
 import table from "../src/codex/codex-pricing.json" with { type: "json" };

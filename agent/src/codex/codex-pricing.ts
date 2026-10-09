@@ -49,7 +49,7 @@ export const CODEX_INPUT_TIER_THRESHOLD_TOKENS = validatedTable.input_tier_thres
  * date, `gpt-5.6-sol` api-key cost becomes `unreported` until a maintainer re-verifies and
  * re-versions the row. `gpt-6-astra` is unaffected.
  */
-export const SOL_PROMO_REVIEW_DATE = TABLE["gpt-5.6-sol"]!.promo_review_date!;
+export const SOL_PROMO_REVIEW_DATE = TABLE["gpt-5.6-sol"]?.promo_review_date;
 
 /** True once `now` is on or after the UTC calendar date `reviewDate` (`YYYY-MM-DD`). The boundary
  *  is that date's UTC midnight, so any instant on the review date itself is on-or-after it. */
