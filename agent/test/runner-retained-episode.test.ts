@@ -16,7 +16,7 @@ import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness,
 
 installHarness();
 
-for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-generation FINAL", "tampered physical journal", "unreadable physical journal", "incomplete coverage", "absent journal", "legacy journal"] as const) {
+for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-generation FINAL", "tampered physical journal", "unreadable physical journal", "incomplete coverage", "absent journal", "legacy journal", "shutdown during FINAL read", "fence during FINAL read"] as const) {
   it(`successor terminal retirement requires ${authority}`, async () => {
     const { claim, bare, clone, key } = await seed();
     claim.inventory_guarded = true;
@@ -40,6 +40,7 @@ for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-gene
     let models = 0, successor = "", retirements = 0, terminalPreparations = 0, generationSettlements = 0;
     let descriptor: unknown;
     let settlingGeneration = false, guardedGenerationSettlements = 0;
+    let terminalSteering: any;
     const retirementLog = recordingLogger();
     const retainedHome = path.join(homeDir, claim.run_id);
     fs.mkdirSync(retainedHome, { recursive: true });
@@ -100,6 +101,7 @@ for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-gene
     const settle = (r as any).settleRecoveryGeneration.bind(r);
     (r as any).settleRecoveryGeneration = async (...args: any[]) => {
       generationSettlements++;
+      terminalSteering = args[1].steering;
       assert.equal(args[1].retainedLocalCustody, false);
       assert.equal(args[1].keepGuardedInventoryOpen, false);
       assert.deepEqual(args[1].completedRetainedSuccessor, descriptor);
@@ -118,6 +120,23 @@ for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-gene
       }
       return settleInventory(...args);
     };
+    const interruptedFinal = authority === "shutdown during FINAL read" || authority === "fence during FINAL read";
+    let interruptionInjected = false;
+    if (interruptedFinal) {
+      const recovery = (r as any).recovery;
+      const cleanupState = recovery.inventoryCleanupState.bind(recovery);
+      recovery.inventoryCleanupState = async (...args: any[]) => {
+        const state = await cleanupState(...args);
+        const rows = command(bare, "config", "--get-all", `uzi-attempts.${clone.branch}.entry`).split("\n").map(raw => JSON.parse(raw));
+        if (!interruptionInjected && rows.filter(row => row.clonePath === successor).at(-1)?.state === "retired") {
+          assert.equal(state, "acknowledged");
+          if (authority === "shutdown during FINAL read") (r as any).shuttingDownGlobal = true;
+          else terminalSteering.claimFence = () => ({ kind: "superseded" });
+          interruptionInjected = true;
+        }
+        return state;
+      };
+    }
     const retire = git.retireRunnerClone.bind(git);
     git.retireRunnerClone = async (...args) => {
       retirements++;
@@ -126,26 +145,33 @@ for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-gene
       return retire(...args);
     };
     await r.execute(claim);
+    const movedSuccessor = authority === "covering FINAL" || interruptedFinal;
+    if (interruptedFinal) {
+      assert.equal(interruptionInjected, true, "lifecycle changed inside the awaited physical FINAL read");
+      const held = fs.readdirSync(path.join(fx.dataDir, "runner-quarantine"));
+      assert.equal(held.length, 1, "interrupted FINAL read retains the moved successor");
+      assert.ok(fs.existsSync(path.join(fx.dataDir, "runner-quarantine", held[0]!)));
+    }
     assert.equal(models, 1);
     assert.ok(successor);
-    assert.equal(fs.existsSync(successor), authority !== "covering FINAL",
+    assert.equal(fs.existsSync(successor), !movedSuccessor,
       `successor retention for ${authority}; retirement calls: ${retirements}`);
     assert.ok(terminalPreparations >= 1, "completed successor reaches terminal inventory preparation");
     assert.equal(generationSettlements, 1, "completed successor reaches its generation settlement");
     assert.equal(guardedGenerationSettlements, 1, "its exact terminal generation actually settles guarded inventory");
-    assert.equal(retirements, authority === "covering FINAL" ? 1 : 0);
+    assert.equal(retirements, movedSuccessor ? 1 : 0);
     if (authority === "covering FINAL") {
       assert.equal(await (r as any).recovery.inventoryCleanupState(claim.run_id, 2), "acknowledged",
         "terminal retirement retains physical FINAL evidence for this generation");
     }
     const journal = readJournal(bare, clone.branch);
-    assert.equal(journal.clonePath, authority === "covering FINAL" ? clone.path : successor);
+    assert.equal(journal.clonePath, movedSuccessor ? clone.path : successor);
     const ledger = command(bare, "config", "--get-all", `uzi-attempts.${clone.branch}.entry`).split("\n").map(raw => JSON.parse(raw));
-    assert.equal(ledger.filter(entry => entry.clonePath === successor).at(-1).state, authority === "covering FINAL" ? "retired" : "live");
+    assert.equal(ledger.filter(entry => entry.clonePath === successor).at(-1).state, movedSuccessor ? "retired" : "live");
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
     assert.equal(fs.readFileSync(path.join(retainedHome, "session"), "utf8"), "predecessor session");
     assert.ok(command(bare, "for-each-ref", "--format=%(refname)", "refs/uzi-recovery-episode/" + claim.run_id));
-    if (authority === "covering FINAL") {
+    if (movedSuccessor) {
       const fresh = new (git.constructor as typeof import("../src/git.js").GitCache)(fx.dataDir, nullLogger());
       assert.equal((await fresh.discoverRetainedRecovery(fx.originPath, clone.branch, key, claim.run_id))?.journal.clonePath, clone.path);
     }

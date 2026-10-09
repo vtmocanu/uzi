@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { Outbox } from "../src/outbox.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -113,6 +114,44 @@ describe("verified successor retirement", () => {
       assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "retired");
       assert.equal(fs.readdirSync(holdingRoot()).length, 0);
       assert.equal(fs.readdirSync(runnerRoot()).filter(name => name.startsWith(".retire-")).length, 0);
+      await assertPredecessors(s, true);
+    });
+  }
+
+  for (const exdev of [false, true]) {
+    it(`physical terminal custody during FINAL read retains moved successor (EXDEV=${exdev})`, async (t) => {
+      const s = await seedCompleted();
+      const outboxRoot = path.join(fx.dataDir, "terminal-race-outbox");
+      const outbox = new Outbox({ root: outboxRoot, log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+      await outbox.init();
+      t.mock.method(git, "hasPhysicalTerminalProtection", (runId: string) => outbox.hasPhysicalTerminalProtection(runId));
+      const rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+        if (exdev && String(from) === s.expected.clonePath && String(to).startsWith(holdingRoot())) {
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        }
+        return rename(from, to);
+      });
+      let injected = false;
+      s.opts.verifiedSuccessor.acknowledged = async () => {
+        if (s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state === "retired") {
+          fs.mkdirSync(path.join(outboxRoot, s.owner), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(path.join(outboxRoot, s.owner, "terminal-2.json"), "{}");
+          injected = true;
+        }
+        return true;
+      };
+      await assert.rejects(s.retire(), /verified successor FINAL authority unavailable/);
+      assert.equal(injected, true);
+      assert.equal(await outbox.hasPhysicalTerminalProtection(s.owner), true);
+      assert.equal(fs.existsSync(s.expected.clonePath), false);
+      const held = fs.readdirSync(holdingRoot());
+      assert.equal(held.length, exdev ? 0 : 1);
+      if (!exdev) assert.equal(fs.readFileSync(path.join(holdingRoot(), held[0]!, "predecessor.txt"), "utf8"), "successor bytes\n");
+      const scratches = fs.readdirSync(runnerRoot()).filter(name => name.startsWith(".retire-"));
+      assert.equal(scratches.length, exdev ? 1 : 0);
+      if (exdev) assert.equal(fs.readFileSync(path.join(runnerRoot(), scratches[0]!, "clone", "predecessor.txt"), "utf8"), "successor bytes\n");
       await assertPredecessors(s, true);
     });
   }

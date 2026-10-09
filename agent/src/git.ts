@@ -6122,6 +6122,9 @@ export class GitCache {
       if (opts.verifiedSuccessor && await opts.verifiedSuccessor.acknowledged() !== true) {
         throw new Error("verified successor FINAL authority unavailable");
       }
+      if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
+        throw new Error("verified successor FINAL authority unavailable");
+      }
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     };
     if (holding && opts.discard && !protectedNow) {

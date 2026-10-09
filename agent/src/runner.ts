@@ -3807,7 +3807,10 @@ export class RunRunner {
         const acknowledged = async () => {
           if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
               residueQuarantine() !== undefined) return false;
-          return await this.recovery.inventoryCleanupState(runId, flight.claimGeneration) === "acknowledged";
+          const state = await this.recovery.inventoryCleanupState(runId, flight.claimGeneration);
+          if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
+              residueQuarantine() !== undefined) return false;
+          return state === "acknowledged";
         };
         try {
           if (await acknowledged()) {
