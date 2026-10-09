@@ -95,7 +95,7 @@ set -o pipefail
 source .agents/skills/uzi-lander/scripts/lib/sanitize.sh
 gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assignees,body --limit 400 \
   | jq -r --arg bot "$BOT_LOGIN" "$UNTRUSTED_JQ"'
-    def park: ["brainstorm","Later","In Progress","Human Review","wontfix","duplicate","invalid"];
+    def park: ["brainstorm","Later","In Progress","Human Review","wontfix","duplicate","invalid","acceptance","local"];
     def names: [.labels[].name];
     def has($l): (names | index($l)) != null;
     def selector: (has("bug") or has("Planned") or has("on-deck"));
