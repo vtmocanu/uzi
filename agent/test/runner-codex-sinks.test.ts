@@ -3746,6 +3746,31 @@ describe("M2 existing completion hold deferral control", () => {
   });
 });
 
+function manualStartedDeadline() {
+  let callback: (() => void) | undefined;
+  let cancelled = 0;
+  let armed!: (ms: number) => void;
+  const installed = new Promise<number>(resolve => { armed = resolve; });
+  return {
+    installed,
+    arm: (fire: () => void, ms: number) => {
+      assert.equal(callback, undefined, "one owned startup timer");
+      callback = fire;
+      armed(ms);
+      return () => { cancelled += 1; callback = undefined; };
+    },
+    expire: () => {
+      assert.ok(callback, "real launcher armed its startup callback");
+      callback();
+      assert.equal(callback, undefined, "expiry cancelled the injected timer");
+    },
+    assertCancelled: () => {
+      assert.equal(cancelled, 1, "startup timer cancelled exactly once");
+      assert.equal(callback, undefined);
+    },
+  };
+}
+
 describe("RunRunner M2 fatal rejected startup", () => {
   const cases = [
     { mode: "unconfirmed", classification: "started_deadline", sink: "milestone_checkpoint" },
@@ -3776,6 +3801,8 @@ describe("RunRunner M2 fatal rejected startup", () => {
       let launchError: unknown;
       let setupFailure: unknown;
       let checkpointReturned = false;
+      const startupTimer = scenario.mode === "unconfirmed" || scenario.mode === "hard"
+        ? manualStartedDeadline() : undefined;
       const fireSoft = (): void => {
         assert.ok(softCallback, "soft callback is armed after the target spawn begins");
         softFired += 1;
@@ -3801,6 +3828,7 @@ describe("RunRunner M2 fatal rejected startup", () => {
               env: { UZI_UID_SPLIT: "1" },
               resolveWorkerUid: () => WORKER_UID, resolveCommandUid: () => COMMAND_UID,
               startupCleanup: forwarded, deadlines: { started: launchMs },
+              ...(startupTimer ? { armStartedDeadlineForTest: startupTimer.arm } : {}),
               spawnSupervisor: () => {
                 if (scenario.mode === "errno") {
                   queueMicrotask(fireSoft);
@@ -3822,6 +3850,11 @@ describe("RunRunner M2 fatal rejected startup", () => {
             () => ({ error: undefined }), (error: unknown) => ({ error }),
           );
           if (scenario.mode === "unconfirmed" || scenario.mode === "hard") {
+            assert.ok(startupTimer);
+            assert.equal(await startupTimer.installed, startupMs, "exact supplied startup residual");
+            startupTimer.expire();
+            await new Promise<void>(resolve => setImmediate(resolve));
+            assert.ok(child.events.includes("dispose"), "startup expiry must request disposal before cleanup");
             await child.disposeRequested;
             assert.equal(rig.registry.pendingLaunchCount(), 1);
             fireSoft();
@@ -3880,6 +3913,7 @@ describe("RunRunner M2 fatal rejected startup", () => {
       try { await runner.execute(claim); }
       finally { gitLog.log = originalGitLog; transport?.destroy(); }
       assert.equal(setupFailure, undefined);
+      startupTimer?.assertCancelled();
       assert.equal(injections, 1);
       assert.ok(launchError instanceof CodexLaunchError);
       assert.equal(softFired, 1, "actual soft callback fired after spawn");
@@ -3943,6 +3977,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
       type FlightObservation = PublicationState & { batcher: { flush: () => Promise<void> } };
       let observedFlight: FlightObservation | undefined;
       let lockFailure: unknown;
+      const startupTimer = manualStartedDeadline();
       const snapshot = (): PublicationState => {
         assert.ok(observedFlight, "the Runner checkpoint owns the observed flight");
         return {
@@ -3978,22 +4013,28 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
             assert.equal(authorization!.attempt, attempt);
             assert.equal(authorization!.hardDeadlineAt, hardDeadlineAt, "hard deadline is never rebased");
             assert.equal(spec.identity, request.identity);
-            // Wait the entire safety-provided residual (~10s minus preflight Git).
-            // The real launcher owns the started timer; no started frame exists before dispose.
+            // Drive the real startup expiry after arming, retaining its exact supplied residual.
             return launchCodexEffectRoot(spec, {
               env: { UZI_UID_SPLIT: "1" },
               resolveWorkerUid: () => WORKER_UID, resolveCommandUid: () => COMMAND_UID,
               startupCleanup: authorization, deadlines: { started: launchMs },
+              armStartedDeadlineForTest: startupTimer.arm,
               spawnSupervisor: () => childTransport as unknown as SupervisorProcess,
             });
           });
           const launch = spawner(request, startupMs, startupCleanup);
           // Observe rejection immediately to avoid an unhandled promise if a test assertion fails.
+          let launchSettled = false;
           const result = launch.then(
-            () => ({ error: undefined }),
-            (error: unknown) => ({ error }),
+            () => { launchSettled = true; return { error: undefined }; },
+            (error: unknown) => { launchSettled = true; return { error }; },
           );
+          assert.equal(await startupTimer.installed, startupMs, "exact supplied startup residual");
+          startupTimer.expire();
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.ok(childTransport.events.includes("dispose"), "startup expiry must request disposal before cleanup");
           await childTransport.disposeRequested;
+          assert.equal(launchSettled, false, "launcher must remain pending while cleanup is held");
           events.push("cleanup_held");
           assert.equal(rig.registry.pendingLaunchCount(), 1,
             "the reservation remains held while real rejected-startup cleanup is pending");
@@ -4130,8 +4171,9 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
         gitLog.log = originalGitLog;
         transport?.destroy();
       }
-      assert.equal(lockFailure, undefined, `lock-release assertion: ${String(lockFailure)}`);
       assert.equal(turnFailure, undefined, `executor assertions: ${String(turnFailure)}`);
+      assert.equal(lockFailure, undefined, `lock-release assertion: ${String(lockFailure)}`);
+      startupTimer.assertCancelled();
       assert.equal(firstReturned, true, `checkpoint returned after verified cleanup: ${String(turnFailure)}`);
       assert.equal(retryReturned, scenario.target !== "owed", `retry result: ${String(turnFailure)}`);
       assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify({ states: api.states, logs: lines.filter((line) => (line as { level?: string }).level === "error") }));

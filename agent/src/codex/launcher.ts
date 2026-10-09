@@ -223,6 +223,8 @@ export interface LauncherDeps {
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
+  /** Trusted tests only; arms the started await without altering its supplied budget or clock. */
+  readonly armStartedDeadlineForTest?: (fire: () => void, ms: number) => () => void;
   /** Boundary checkpoint only: identity and absolute budget survive every wrapper. */
   readonly startupCleanup?: StartupCleanupAuthorization;
   /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
@@ -725,7 +727,29 @@ export class SupervisedChildExitTimeoutError extends Error {
   }
 }
 
-function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error): Promise<T> {
+function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error,
+  armForTest?: LauncherDeps["armStartedDeadlineForTest"]): Promise<T> {
+  if (armForTest) {
+    return new Promise<T>((resolve, reject) => {
+      let done = false;
+      let cancel = () => {};
+      const settle = (action: () => void): void => {
+        if (done) return;
+        done = true;
+        cancel();
+        action();
+      };
+      cancel = armForTest(() => settle(() => reject(timeoutError?.() ??
+        new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`))), ms);
+      // A trusted arm may fire synchronously before returning its cancellation handle.
+      if (done) cancel();
+      p.then(
+        value => settle(() => resolve(value)),
+        (error: unknown) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))),
+      );
+    });
+  }
+  // Keep the production timer path unchanged, including unref and native cancellation.
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(timeoutError?.() ?? new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`)), ms);
     if (typeof timer.unref === "function") timer.unref();
@@ -862,7 +886,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
-  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
+  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind,
+    undefined, deps.armStartedDeadlineForTest);
   return withOwnedTreeCleanup(
     handle,
     { uid, kind: spec.kind, root: spec.ownedDataRoot },
@@ -957,7 +982,8 @@ async function launchEffectRoot(spec: CodexEffectLaunchSpec, deps: LauncherDeps)
     launchClassifications.set(error, error.classification);
     throw error;
   }
-  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup);
+  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup,
+    deps.armStartedDeadlineForTest);
 }
 
 async function createHandle(
@@ -966,6 +992,7 @@ async function createHandle(
   deadlines: LauncherDeadlines,
   kind: CodexRootKind,
   startupCleanup?: StartupCleanupAuthorization,
+  armStartedDeadlineForTest?: LauncherDeps["armStartedDeadlineForTest"],
 ): Promise<CodexRootHandle> {
   const control = asWritable(child.stdio[3], "control");
   const evidence = asReadable(child.stdio[4], "evidence");
@@ -1264,7 +1291,7 @@ async function createHandle(
         const error = new CodexLaunchError("started_deadline", "unconfirmed", undefined);
         launchClassifications.set(error, "started_deadline");
         return error;
-      });
+      }, armStartedDeadlineForTest);
   } catch (error) {
     let verified = false;
     let cleanupFailure: unknown;

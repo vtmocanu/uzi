@@ -5064,6 +5064,7 @@ async function defaultLaunchProviderRoot(
   redactDiagnostic?: (s: string) => string,
   launch: typeof launchCodexRoot = launchCodexRoot,
 ): Promise<CodexLaunchRootResult> {
+  // Keep deadline arming native here; test timer dependencies never come from claims or config.
   const launcherDeps: LauncherDeps = {
     ...(openAIBaseUrlForTest === undefined ? {} : { appServerAuthOpenAIBaseUrlForTest: openAIBaseUrlForTest }),
     ...(redactDiagnostic === undefined ? {} : { redactDiagnostic }),
