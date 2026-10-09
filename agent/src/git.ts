@@ -4468,11 +4468,17 @@ export class GitCache {
   /** Store only a bounded worker reason code, never provider output or exception text. */
   async blockRecoveryEpisode(
     barePath: string, branch: string, key: string, expected: RecoverySource,
-    reason: RecoveryBlocker,
+    reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts">,
+    guard?: () => void,
   ): Promise<void> {
     if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
+      guard?.();
+      if (expectedEpisode && (!journal.recovery ||
+          journal.recovery.startedAt !== expectedEpisode.startedAt ||
+          journal.recovery.deadline !== expectedEpisode.deadline ||
+          journal.recovery.attempts !== expectedEpisode.attempts)) throw new Error("recovery episode changed");
       if (journal.recovery?.stage === "blocked") return;
       const now = Date.now();
       // Without an episode only a proven missing source can create the terminal record.
@@ -4491,7 +4497,8 @@ export class GitCache {
       };
       await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
       await this.writeRecovery(barePath, branch, { ...journal,
-        recovery: { ...recovery, stage: "blocked", blocker: reason } });
+        recovery: { ...recovery, stage: "blocked", blocker: reason } }, guard);
+      guard?.();
     });
   }
 

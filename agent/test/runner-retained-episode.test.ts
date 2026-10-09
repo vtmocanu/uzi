@@ -2,9 +2,10 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import type { ExecutorFactory } from "../src/runner.js";
+import { Outbox } from "../src/outbox.js";
 import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -130,6 +131,24 @@ it("lost exact ownership stops the retained retry without a terminal or a park",
   assert.ok(fs.existsSync(clone.path));
 });
 
+it("typed exact ownership 404 stops after one charge without touching the source", async () => {
+  const { claim, bare, clone } = await seed();
+  const before = fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8");
+  api.setOwnershipNotOwned(claim.run_id);
+  let fetches = 0, models = 0, captures = 0;
+  git.ensureClone = async () => { fetches++; throw new Error("must not refresh"); };
+  git.recordRecoveryCapture = async () => { captures++; throw new Error("must not capture"); };
+  const { gitlab } = fakeGitlab();
+  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  assert.equal(readJournal(bare, clone.branch).recovery.attempts, 1);
+  assert.equal(fetches, 0);
+  assert.equal(models, 0);
+  assert.equal(captures, 0);
+  assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), before);
+});
+
 it("corrupt owned journal fails with custody while preserving the exact corrupt bytes", async () => {
   const { claim, bare, clone } = await seed();
   const corrupt = '{"runId":"broken"';
@@ -167,9 +186,14 @@ it("ownership read outages consume all three durable attempts without source mut
     gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
   assert.equal(models, 0);
   assert.equal(fetches, 0);
-  assert.equal(readJournal(bare, clone.branch).recovery.attempts, 3);
+  const exhausted = readJournal(bare, clone.branch).recovery;
+  assert.equal(exhausted.attempts, 3);
+  assert.equal(exhausted.stage, "blocked");
+  assert.equal(exhausted.blocker, "budget_exhausted");
   assert.ok(fs.existsSync(clone.path));
-  assert.equal(api.states.some(s => s.body.status === "failed"), false);
+  assert.equal(api.states.some(s => s.body.status === "failed"), true,
+    "the fenced terminal endpoint ends exhaustion even while ownership reads are unavailable");
+  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
 });
 
 it("persisted deadline interrupts a blocked ownership read and keeps the charged budget", async () => {
@@ -180,9 +204,44 @@ it("persisted deadline interrupts a blocked ownership read and keeps the charged
   old.recovery.startedAt = startedAt;
   old.recovery.deadline = startedAt + 300_000;
   command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(old));
-  let reads = 0, interrupted = false, models = 0;
+  claim.inventory_guarded = true;
+  const feature = client.hasFeature.bind(client);
+  client.hasFeature = name => name === "recovery_inventory_v1" || feature(name);
+  const outbox = new Outbox({
+    root: path.join(fx.dataDir, "deadline-outbox"), log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000,
+  });
+  await outbox.init();
+  let reads = 0, interrupted = false, models = 0, lateReads = 0, lateWork = 0, releases = 0;
+  const authority = client.hasRecoveryRetirementAuthority.bind(client);
+  client.hasRecoveryRetirementAuthority = async (...args) => {
+    if (Date.now() >= old.recovery.deadline) lateWork++;
+    return authority(...args);
+  };
+  client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+  const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    fakeGitlab().gitlab, "fixture-journal-key", nullLogger(), { recoveryRetryMs: 1, outbox });
+  for (const method of ["quiesceRun", "transferRestorePointToTrustedBare"] as const) {
+    const original = (r as any)[method].bind(r);
+    (r as any)[method] = async (...args: unknown[]) => {
+      if (Date.now() >= old.recovery.deadline) lateWork++;
+      return original(...args);
+    };
+  }
+  const report = client.reportState.bind(client);
+  client.reportState = async (...args) => {
+    if (args[1].status === "failed") {
+      assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
+      assert.equal(readJournal(bare, clone.branch).recovery.stage, "blocked");
+    }
+    return report(...args);
+  };
   client.getRunOwnership = async (_run, signal) => {
-    if (++reads !== 1) return { status: "running", claim_generation: 2 };
+    if (Date.now() >= old.recovery.deadline) lateReads++;
+    if (++reads !== 1) {
+      await new Promise(resolve => setTimeout(resolve, 600));
+      return { status: "running", claim_generation: 2 };
+    }
     assert.ok(signal);
     await new Promise<void>((_resolve, reject) => {
       signal!.addEventListener("abort", () => { interrupted = true; reject(signal!.reason); }, { once: true });
@@ -190,14 +249,32 @@ it("persisted deadline interrupts a blocked ownership read and keeps the charged
     });
     throw new Error("unreachable");
   };
-  const { gitlab } = fakeGitlab();
-  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
-    gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  const timers = process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
+  await r.execute(claim);
+  assert.ok(process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length <= timers);
+  assert.ok(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!));
+  assert.equal(lateReads, 0);
+  assert.equal(reads, 1);
+  assert.equal(lateWork, 0);
+  assert.equal(releases, 0);
   assert.equal(interrupted, true);
   assert.equal(models, 0);
   assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2);
   assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
   assert.ok(api.states.some(s => s.body.status === "failed"));
+});
+
+it("late blocker finalization cannot change a replacement episode on the same source", async () => {
+  const { claim, bare, clone, key } = await seed();
+  const expected = { runId: claim.run_id, clonePath: clone.path };
+  const old = await git.reserveRecoveryIteration(bare, clone.branch, key, expected, 1);
+  const replacement = readJournal(bare, clone.branch);
+  replacement.recovery.startedAt += 1;
+  replacement.recovery.deadline += 1;
+  command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(replacement));
+  await assert.rejects(git.blockRecoveryEpisode(bare, clone.branch, key, expected, "budget_exhausted", old),
+    /recovery episode changed/);
+  assert.deepEqual(readJournal(bare, clone.branch), replacement);
 });
 
 it("capture-closing executor is replaced before actual resumed model execution", async () => {
@@ -225,6 +302,65 @@ it("capture-closing executor is replaced before actual resumed model execution",
   assert.equal(models, 1);
   assert.equal(readJournal(bare, clone.branch).recovery.stage, "ready-for-model");
 });
+
+for (const rejects of [false, true]) {
+  it(`unclean predecessor disposal after adoption blocks both sources (rejects=${rejects})`, async () => {
+    const { claim, bare, clone } = await seed();
+    let created = 0, models = 0, disposed = 0;
+    const make: ExecutorFactory = runId => {
+      created++;
+      return { homeDir: path.join(homeDir, runId), executor: {
+        sandboxesCommands: true,
+        settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+        safety: {
+          kind: "codex",
+          withBoundary: async (request, action) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(new Error("fixture boundary expired")), request.deadlineMs);
+            try {
+              return await action({ epoch: 1, boundary: request.boundary, signal: controller.signal } as any);
+            } finally { clearTimeout(timer); }
+          },
+          spawnBoundaryProcess: async (_permit, request) => {
+            const [executable, ...args] = request.argv;
+            const child = spawn(executable!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+            const completed = new Promise<{ code: number }>((resolve, reject) => {
+              child.once("error", reject);
+              child.once("exit", code => resolve({ code: code ?? 1 }));
+            });
+            return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
+              cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; },
+              completed };
+          },
+          dispose: async () => {
+            disposed++;
+            if (rejects) throw new Error("disposal rejected");
+            return { kind: "incomplete", errors: [{ category: "protocol", message: "fixture undrained" }] };
+          },
+        },
+        run: async () => { models++; throw new Error("must not model"); },
+      } };
+    };
+    const timers = process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
+    await runnerWith(make, fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length <= timers);
+    assert.equal(created, 1);
+    assert.equal(models, 0);
+    assert.ok(disposed > 0);
+    const journal = readJournal(bare, clone.branch);
+    assert.notEqual(journal.clonePath, clone.path);
+    assert.equal(journal.recovery.stage, "blocked");
+    assert.equal(journal.recovery.blocker, "quiescence_failed");
+    assert.equal(journal.recovery.attempts, 1);
+    assert.ok(journal.retainedSources.some((s: any) => s.clonePath === clone.path));
+    for (const source of [clone.path, journal.clonePath]) {
+      assert.ok(fs.existsSync(source));
+      assert.equal(fs.readFileSync(path.join(source, "retained.txt"), "utf8"), "only local dirty work\n");
+    }
+    assert.ok(api.states.some(s => s.body.status === "failed"));
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  });
+}
 
 it("verified guarded thin fallback permits local adoption despite unknown upload and keeps every source", async () => {
   const { claim, bare, clone } = await seed(2512, true);
@@ -273,7 +409,14 @@ it("verified guarded thin fallback permits local adoption despite unknown upload
   assert.ok(publications > 0);
   assert.equal(releases, 0);
   const records = await r.snapshotBootRecoveries();
-  assert.ok(records.some(record => record.selfContained === false && record.prerequisiteShas!.length > 0));
+  const thin = records.find(record => record.selfContained === false && record.prerequisiteShas!.length > 0);
+  assert.ok(thin);
+  const localProof = (r as unknown as { recovery: { verifiedLocalCapture: (
+    record: typeof thin, signal?: AbortSignal,
+  ) => Promise<unknown> } }).recovery;
+  assert.equal(await localProof.verifiedLocalCapture(thin, AbortSignal.abort()), undefined,
+    "cancelled local integrity proof cannot grant adoption authority");
+  assert.ok(fs.existsSync(thin.bundlePath!), "cancellation retains the archive bytes");
   const journal = readJournal(bare, clone.branch);
   assert.equal(journal.recovery, undefined);
   assert.ok(fs.existsSync(clone.path));

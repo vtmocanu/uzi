@@ -1496,6 +1496,7 @@ interface ActiveRun {
   cancel: AbortController;
   steering: SteeringChannel;
   shuttingDown: boolean;
+  retainedLocalCustody?: () => boolean;
 }
 
 /** Where a scratch publication refusal was caught, logged as `site`. */
@@ -3920,6 +3921,7 @@ export class RunRunner {
    *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
   async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
+    if (this.activeRuns.get(runId)?.retainedLocalCustody?.()) return true;
     try {
       const state = await this.recovery.inventoryCleanupState(runId, generation);
       if (state === "acknowledged") return false;
@@ -7721,6 +7723,7 @@ export class RunRunner {
       keepGuardedInventoryOpen: false,
       terminalInventoryQuiesced: false,
       prepareTerminalInventory: async () => {
+        if (flight.retainedLocalCustody) return;
         flight.terminalInventoryQuiesced = false;
         if (!this.recovery.enabled || !isCodePublishingKind(flight.runKind) || claim.inventory_guarded !== true || !flight.barePath || !flight.branch) return;
         try {
@@ -8286,7 +8289,7 @@ export class RunRunner {
   private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const { runLog, reportState, steering, batcher, cancel } = flight;
     const runId = claim.run_id;
-    const active: ActiveRun = (flight.active = { cancel, steering, shuttingDown: false });
+    const active: ActiveRun = (flight.active = { cancel, steering, shuttingDown: false, retainedLocalCustody: () => flight.retainedLocalCustody === true });
     this.activeRuns.set(runId, active);
     if (this.shuttingDownGlobal) {
       active.shuttingDown = true;
@@ -15040,15 +15043,24 @@ export class RunRunner {
     return AbortSignal.any([flight.cancel.signal, flight.steering.lifecycleSignal(), this.shutdownSignal.signal]);
   }
 
-  private async requireRetainedOwnership(flight: RunFlight, deadline?: number, signal = this.retainedLifecycleSignal(flight)): Promise<void> {
+  private async requireRetainedOwnership(flight: RunFlight, deadline = Date.now() + this.codexBoundaryDeadlineMs, signal = this.retainedLifecycleSignal(flight)): Promise<void> {
     if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted ||
         flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined) {
       throw new RetainedRecoveryStop();
     }
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
-    const own = await withForgeRetry(() => this.client.getRunOwnership(flight.runId, signal), {
-      signal, log: flight.runLog, schedule: [],
-    });
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()));
+    const boundedSignal = AbortSignal.any([signal, timeout.signal]);
+    let own;
+    try {
+      own = await withForgeRetry(() => this.client.getRunOwnership(flight.runId, boundedSignal), {
+        signal: boundedSignal, log: flight.runLog, schedule: [],
+      });
+    } catch (error) {
+      if (isRunOwnershipLost(error, flight.runId)) throw new RetainedRecoveryStop();
+      throw error;
+    } finally { clearTimeout(timer); }
     if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted ||
         flight.active?.shuttingDown || flight.steering.claimFence() !== undefined ||
         own?.status !== "running" || own.claim_generation !== flight.claimGeneration) {
@@ -15074,15 +15086,30 @@ export class RunRunner {
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
     let blocker: import("./recovery-progress.js").RecoveryBlocker = source.recovery?.blocker ?? "capture_failed";
+    let expectedSource = source;
+    let episode = source.recovery;
+    const finalize = new Error("retained recovery requires finalization");
     const fail = async (): Promise<never> => {
-      try { await this.requireRetainedOwnership(flight); } catch { throw new RetainedRecoveryStop(); }
+      this.retainedLifecycleGuard(flight);
+      // This is monotone episode bookkeeping followed by an exact-generation terminal
+      // report, not recovery authority. A new ownership GET could fail independently
+      // of the fenced state endpoint and leave an exhausted claim cycling again.
+      if (episode && Date.now() >= episode.deadline) blocker = "budget_exhausted";
       let persistence = "";
-      try { await this.git.blockRecoveryEpisode(bare, branch, key, source, blocker); }
+      try {
+        await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+          async () => {
+            this.retainedLifecycleGuard(flight);
+            await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode,
+              () => this.retainedLifecycleGuard(flight));
+            this.retainedLifecycleGuard(flight);
+          });
+      }
       catch (error) {
         flight.runLog.warn("retained recovery blocker could not be persisted", { error: sanitizeForLog(errMessage(error)) });
         persistence = "; blocker persistence unavailable";
       }
-      try { await this.requireRetainedOwnership(flight); } catch { throw new RetainedRecoveryStop(); }
+      this.retainedLifecycleGuard(flight);
       const reason = `Retained recovery blocked: ${blocker.replaceAll("_", " ")}${persistence}; local work and custody retained`;
       await this.reportGenericFailure(claim, flight,
         blocker === "quiescence_failed" ? new RunResidueBlockedError(reason) : new Error(reason),
@@ -15102,6 +15129,7 @@ export class RunRunner {
         await fail();
       }
       const iteration = reservation!;
+      episode = iteration;
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), iteration.deadline, async signal => {
           const check = () => this.requireRetainedOwnership(flight, iteration.deadline, signal);
@@ -15109,12 +15137,12 @@ export class RunRunner {
           // Prove the predecessor quiescent before credentialed forge refresh or disk reclamation.
           const settlement = await this.settleForCredentialCapture(flight.executor, Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
           await check();
-          if (settlement.kind !== "observed_empty") { blocker = "quiescence_failed"; await fail(); }
+          if (settlement.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           const proof = await this.quiesceRun(flight, flight.executor, {
             mode: "capture", site: "predecessor_capture", targetPaths: [source.clonePath], propagateControl: true,
           });
           await check();
-          if (proof.blocked) { blocker = "quiescence_failed"; await fail(); }
+          if (proof.blocked) { blocker = "quiescence_failed"; throw finalize; }
           // Retained forge/disk failures are charged to this reservation, never to a park.
           await this.preflightDataVolume(claim, flight, signal);
           await check();
@@ -15132,9 +15160,9 @@ export class RunRunner {
               credentialFree: true, beforeMutation: check, signal,
             });
           await check();
-          if (captured.residueBlocked) { blocker = "quiescence_failed"; await fail(); }
+          if (captured.residueBlocked) { blocker = "quiescence_failed"; throw finalize; }
           if (!captured.verified) {
-            if (flight.owedLimitStop) { blocker = "preservation_failed"; await fail(); }
+            if (flight.owedLimitStop) { blocker = "preservation_failed"; throw finalize; }
             throw new Error("retained local capture is unverified");
           }
           let tip = resumed ? resumedTip : await this.git.revParse(bare, `refs/uzi-runner/${branch}`);
@@ -15145,29 +15173,29 @@ export class RunRunner {
           // Upload ambiguity is separate from positively journaled local bundle facts.
           if (claim.inventory_guarded === true && this.recovery.enabled) {
             const options = await this.owedOptions(flight, bare, branch);
-            if (options.context.generation === null) { blocker = "preservation_failed"; return fail(); }
+            if (options.context.generation === null) { blocker = "preservation_failed"; throw finalize; }
             await check();
             const record = await this.recovery.freezeInventory({
               context: options.context, currentSha: tip, originalSourceSha: tip, locallyQuiescent: true,
               defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(bare) || "main",
             });
             await check();
-            if (!record) { blocker = "preservation_failed"; await fail(); }
+            if (!record) { blocker = "preservation_failed"; throw finalize; }
             const outcome = await this.recovery.captureAndUpload({
               record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
               signal,
             });
             await check();
-            const local = await this.recovery.verifiedLocalCapture(record!);
-            if (outcome.reason === "oversized") { blocker = "oversize"; await fail(); }
+            const local = await this.recovery.verifiedLocalCapture(record!, signal);
+            if (outcome.reason === "oversized") { blocker = "oversize"; throw finalize; }
             if (!local?.bundlePath || !local.checksum || !Array.isArray(local.prerequisiteShas)) {
               if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
-              blocker = "prerequisites_unavailable"; await fail();
+              blocker = "prerequisites_unavailable"; throw finalize;
             }
             tip = local!.sourceSha;
             for (const prerequisite of local!.prerequisiteShas!) {
               if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
-                blocker = "prerequisites_unavailable"; await fail();
+                blocker = "prerequisites_unavailable"; throw finalize;
               }
               await check();
             }
@@ -15179,7 +15207,7 @@ export class RunRunner {
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
           const successor = await this.git.prepareRecoverySuccessor(bare, branch, key, source,
             iteration.attempts, attemptId, { selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true });
-          await check();
+          expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
           flight.runnerClone = successor;
           flight.worktreePath = successor.path;
           flight.attemptId = attemptId;
@@ -15191,11 +15219,14 @@ export class RunRunner {
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
           this.liveAttempts.add(attempt);
+          await check();
           // Capture boundaries may have closed the Codex executor. A new factory instance owns
           // model admission; the predecessor executor never runs the resumed model.
           if (claim.secrets.codex || flight.executor.safety || flight.executor.settleForCredentialFreeCapture) {
-            await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
+            blocker = "quiescence_failed";
+            const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await check();
+            if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
             flight.executor = this.makeExecutor(claim.run_id, claim.secrets.codex).executor;
           }
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
@@ -15206,12 +15237,15 @@ export class RunRunner {
       } catch (error) {
         if (error instanceof RetainedRecoveryStop) throw error;
         this.retainedLifecycleGuard(flight);
+        if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
+        if (error === finalize || blocker === "quiescence_failed") await fail();
         if (error instanceof RunResidueBlockedError || error instanceof ResidueQuarantinedError) {
           blocker = "quiescence_failed";
           await fail();
         }
-        try { await this.requireRetainedOwnership(flight); }
+        try { await this.requireRetainedOwnership(flight, iteration.deadline); }
         catch (ownershipError) { if (ownershipError instanceof RetainedRecoveryStop) throw ownershipError; }
+        if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
         if (blocker === "adoption_failed") await fail();
         if (iteration.attempts >= 3 || Date.now() >= iteration.deadline) {
           blocker = "budget_exhausted";

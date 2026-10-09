@@ -556,14 +556,15 @@ export type UploadFailureClass =
 
 /** Recompute the size, SHA-256 and chunk count of the journaled bundle file and compare them with
  *  the journaled facts. False on a mismatch or an unreadable file. */
-async function verifyJournaledBytes(record: RecoveryRecord): Promise<boolean> {
+async function verifyJournaledBytes(record: RecoveryRecord, signal?: AbortSignal): Promise<boolean> {
   if (!hasJournaledBundle(record)) return false;
   try {
     const hash = createHash("sha256");
     let size = 0;
-    for await (const chunk of createReadStream(record.bundlePath)) {
+    for await (const chunk of createReadStream(record.bundlePath, { signal })) {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
       size += buf.length;
+      if (size > record.byteSize) return false;
       hash.update(buf);
     }
     return (
@@ -1384,11 +1385,11 @@ export class RecoveryCoordinator {
    */
   /** Positive local capture proof for claim-local adoption, independent of upload/final ACK.
    * This proof grants no cleanup or custody-release authority. */
-  async verifiedLocalCapture(record: RecoveryRecord): Promise<RecoveryRecord | undefined> {
+  async verifiedLocalCapture(record: RecoveryRecord, signal?: AbortSignal): Promise<RecoveryRecord | undefined> {
     const latest = await this.readLatest(record);
     if (latest.kind !== "ok") return undefined;
     const local = latest.record;
-    if (!hasJournaledBundle(local) || !await verifyJournaledBytes(local)) return undefined;
+    if (!hasJournaledBundle(local) || !await verifyJournaledBytes(local, signal)) return undefined;
     const header = await readRecoveryBundleHeader(local.bundlePath, local.sourceSha);
     if (header.selfContained !== local.selfContained ||
         canonicalJson(header.prerequisiteShas) !== canonicalJson(local.prerequisiteShas)) return undefined;

@@ -619,6 +619,10 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       assert.equal(fs.readFileSync(path.join(journalBefore.clonePath, "SAME.txt"), "utf8"), "same-worker work\n");
       // The known source is lost; cached objects alone do not authorize reseeding.
       fs.rmSync(path.join(dataDir, "runner"), { recursive: true, force: true });
+      // A remains suspended with its manual tick stopped, modeling abrupt source loss.
+      // Its shutdown is deferred to teardown so graceful retirement cannot erase the journal.
+      const claimB = { ...claim, claim_generation: 2, last_seq: api.messages(claim.run_id).at(-1)?.seq ?? 0 };
+      api.setOwnershipStatus(claim.run_id, "running", 2);
       let modelRan = false;
       const { logger, lines } = recordingLogger();
       const runnerB = mkRunner(
@@ -630,16 +634,26 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         { checkpointTickIntervalMs: 0 },
         logger,
       );
-      await runnerB.execute(claim);
+      await runnerB.execute(claimB);
       assert.equal(modelRan, false, "a missing known source prevents model execution");
       assert.equal(fs.existsSync(path.join(dataDir, "runner")), false, "the re-claim did not reseed");
       assert.equal(refOr(bare, `refs/uzi-runner/${branch}`), sha, "cached work remains pinned");
       assert.equal(gitIn(bare, ["show", `${sha}:SAME.txt`]), "same-worker work");
-      assert.deepEqual(JSON.parse(gitIn(bare, ["config", `uzi-recovery.${branch}.clone`])), journalBefore,
-        "trusted attribution is unchanged");
+      const journalAfter = JSON.parse(gitIn(bare, ["config", `uzi-recovery.${branch}.clone`]));
+      const { recovery, ...identity } = journalAfter;
+      assert.deepEqual(identity, journalBefore, "source identity and pins remain attributed");
+      assert.equal(recovery.stage, "blocked");
+      assert.equal(recovery.blocker, "source_missing");
+      assert.equal(recovery.attempts, 3, "missing source exhausts the durable budget");
+      assert.equal(recovery.deadline - recovery.startedAt, 300_000);
+      assert.equal(recovery.backoffMs, 0);
+      assert.equal(recovery.source.runId, claim.run_id);
+      assert.equal(recovery.source.clonePath, journalBefore.clonePath);
+      assert.equal(await g.recoveryAttemptMode(fx.originPath, `issue-${iid}`), true);
+      assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "recovery_wait"), false);
       assert.equal(finalStatus(claim.run_id), "failed");
       assert.ok((lines as Array<Record<string, unknown>>).some(line =>
-        line.msg === "run failed" && line.error === "known recovery source is missing; nothing seeded"),
+        line.msg === "run failed" && line.error === "Retained recovery blocked: required source is missing; local work and custody retained"),
       "the exact missing-source failure is visible");
     } finally {
       pub.restore();
