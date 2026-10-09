@@ -63,8 +63,12 @@ func ResolveCrossCheck(harness string, model, effort, workerModel, workerEffort,
 		if harness == "codex" {
 			fallback := DefaultCodexModel
 			r.Model = &fallback
-		} else {
-			r.Model = templateModel
+		} else if templateModel != nil {
+			// The lead template can carry a Codex model for a Codex lead; never hand one to the
+			// Claude SDK. A non-Claude template model falls back to the SDK default (nil).
+			if m, err := ValidateFamilyModel("claude", *templateModel); err == nil {
+				r.Model = &m
+			}
 		}
 	}
 	if model != nil {
