@@ -42,8 +42,8 @@
 # (status, health, health_reason, health_since, worker, worker_status, heartbeat age) and
 # exits 4. The stop means "investigate": stalled health does not prove the run is dead and a
 # stale heartbeat does not prove work was lost.
-# An exit-4 stop ends coverage, so it also prints REARM=<command>: the same watch, re-launched
-# with WATCH_ATTENTION_ACK set to the observed health episode. Investigate, then run that line
+# An exit-4 stop ends coverage, so it also prints REARM=<command>: the same watch (arguments and
+# effective WATCH_* settings), re-launched with WATCH_ATTENTION_ACK set to the observed health episode. Investigate, then run that line
 # in the background; never leave a watched run unpolled. WATCH_ATTENTION_ACK is a comma list of
 # `<health>@<health_since>` episodes whose health signal is ignored (a run that stays stalled in
 # the SAME episode, e.g. a long test suite, then stops only on the stop set, a NEW non-ok episode,
@@ -147,7 +147,8 @@ while [ "$i" -lt "$MAX" ]; do
           printf 'NOTE investigate only: stalled health does not prove the run is dead and a stale heartbeat does not prove work was lost; this poller changed nothing\n'
           ack="$ATTN_ACK"
           if [ -n "$ATTN_EPISODE" ]; then ack="${ack:+$ack,}$ATTN_EPISODE"; fi
-          printf 'REARM=WATCH_ATTENTION_ACK=%q %q %q %q %q %q %q\n' "$ack" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ"
+          printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q\n' \
+            "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ"
           printf 'NOTE coverage ended: after investigating, run the REARM line in the background (a stale heartbeat is never acked and stops again)\n'
           exit 4
         fi
