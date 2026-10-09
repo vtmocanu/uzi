@@ -117,6 +117,11 @@ type RunProgress struct {
 	MilestoneTotal    int    `json:"milestone_total"`
 	ActiveMilestoneID string `json:"active_milestone_id"`
 	Phase             string `json:"phase"`
+	// MaybeBlockedByRunID is set on GetRun only (never on a list read), only while the run
+	// is awaiting_input: a live run of the same owner and repo that the open question
+	// mentions as #<issue>. It is a hint from untrusted question text, not a recorded
+	// dependency, and never names a run the owner could not see.
+	MaybeBlockedByRunID *string `json:"maybe_blocked_by_run_id,omitempty"`
 }
 
 // IsTerminalRunStatus reports whether a run status is one a run never leaves — the

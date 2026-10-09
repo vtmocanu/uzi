@@ -2619,6 +2619,9 @@ export interface RunProgress {
   milestone_total: number;
   active_milestone_id: string;
   phase: "implement" | "review" | "validate" | "";
+  // GetRun only, while awaiting_input: a live run of the same owner and repo the open
+  // question mentions as #<issue>. A hint from untrusted text, not a recorded dependency.
+  maybe_blocked_by_run_id?: string;
 }
 
 // Milestone is one item of a milestone-structured run (PRD #122): a stable id and a
