@@ -38,6 +38,8 @@ through `[0.52.0]`.)
 - **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
   Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
 
+- Checkpoint and park-bridge scratch publication refusals now name bounded kind and step codes in the feed, deduped per pair.
+
 ### Changed
 
 - **The lead defers a costly full gate after review invalidates a candidate ([#2593](https://github.com/vtmocanu/uzi/issues/2593)).**
