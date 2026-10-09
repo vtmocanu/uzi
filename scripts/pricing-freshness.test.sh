@@ -3,6 +3,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+mkdir -p .uzi/scratch
 scratch=$(mktemp -d .uzi/scratch/pricing-test.XXXXXX)
 trap 'rm -rf "$scratch"' EXIT
 export UZI_PRICING_TEST_CODEX_PATH="$scratch/codex.json"
@@ -47,6 +48,125 @@ expected() {
   jq -c . "$scratch/out" >"$scratch/actual"
   cmp "$scratch/expected" "$scratch/actual" || die "findings mismatch"
 }
+# Shared raw corpus is read by the TS module-load and Go loader regressions too.
+# Invalid JSON strings are generated only in scratch, never as tracked data files.
+unicode_fixtures() {
+  cat <<'UNICODE_FIXTURES'
+version \ud800|reject|{"version":"\ud800","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \ud800|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800":@ROW@}}
+replacement collision \ud800|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800":@ROW@,"\ufffd":@ROW@}}
+replacement collision \ud800|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\ud800":@ROW@}}
+version \udc00|reject|{"version":"\udc00","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \udc00|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\udc00":@ROW@}}
+replacement collision \udc00|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\udc00":@ROW@,"\ufffd":@ROW@}}
+replacement collision \udc00|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\udc00":@ROW@}}
+version \udfff|reject|{"version":"\udfff","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \udfff|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\udfff":@ROW@}}
+replacement collision \udfff|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\udfff":@ROW@,"\ufffd":@ROW@}}
+replacement collision \udfff|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\udfff":@ROW@}}
+version \uD800\uDBFF|reject|{"version":"\uD800\uDBFF","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \uD800\uDBFF|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\uD800\uDBFF":@ROW@}}
+replacement collision \uD800\uDBFF|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\uD800\uDBFF":@ROW@,"\ufffd":@ROW@}}
+replacement collision \uD800\uDBFF|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\uD800\uDBFF":@ROW@}}
+version \udc00\ud800|reject|{"version":"\udc00\ud800","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \udc00\ud800|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\udc00\ud800":@ROW@}}
+replacement collision \udc00\ud800|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\udc00\ud800":@ROW@,"\ufffd":@ROW@}}
+replacement collision \udc00\ud800|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\udc00\ud800":@ROW@}}
+version \ud800text|reject|{"version":"\ud800text","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \ud800text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800text":@ROW@}}
+replacement collision \ud800text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800text":@ROW@,"\ufffd":@ROW@}}
+replacement collision \ud800text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\ud800text":@ROW@}}
+version \ud800\\text|reject|{"version":"\ud800\\text","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \ud800\\text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800\\text":@ROW@}}
+replacement collision \ud800\\text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800\\text":@ROW@,"\ufffd":@ROW@}}
+replacement collision \ud800\\text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\ud800\\text":@ROW@}}
+version \ud800\"text|reject|{"version":"\ud800\"text","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+key \ud800\"text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800\"text":@ROW@}}
+replacement collision \ud800\"text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800\"text":@ROW@,"\ufffd":@ROW@}}
+replacement collision \ud800\"text|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@,"\ud800\"text":@ROW@}}
+overwritten version high|reject|{"version":"\ud800","version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+overwritten version low|reject|{"version":"\udc00","version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+overwritten subtree|reject|{"models":{"discard":{"text":"\ud800"}},"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+valid \\ud800|accept|{"version":"\\ud800","input_tier_threshold_tokens":1,"models":{"\\ud800":@ROW@}}
+valid \\udc00|accept|{"version":"\\udc00","input_tier_threshold_tokens":1,"models":{"\\udc00":@ROW@}}
+valid �|accept|{"version":"�","input_tier_threshold_tokens":1,"models":{"�":@ROW@}}
+valid \ufffd|accept|{"version":"\ufffd","input_tier_threshold_tokens":1,"models":{"\ufffd":@ROW@}}
+valid \uD800\uDC00|accept|{"version":"\uD800\uDC00","input_tier_threshold_tokens":1,"models":{"\uD800\uDC00":@ROW@}}
+valid \uDBFF\uDFFF|accept|{"version":"\uDBFF\uDFFF","input_tier_threshold_tokens":1,"models":{"\uDBFF\uDFFF":@ROW@}}
+valid 𐀀|accept|{"version":"𐀀","input_tier_threshold_tokens":1,"models":{"𐀀":@ROW@}}
+valid é|accept|{"version":"é","input_tier_threshold_tokens":1,"models":{"é":@ROW@}}
+valid e\u0301|accept|{"version":"e\u0301","input_tier_threshold_tokens":1,"models":{"e\u0301":@ROW@}}
+astral escaped duplicate|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"𐀀":null,"\ud800\udc00":@ROW@}}
+astral literal duplicate|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800\udc00":null,"𐀀":@ROW@}}
+distinct normalization|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"é":@ROW@,"e\u0301":@ROW@}}
+overwritten null|accept|{"version":null,"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+overwritten bad subtree|accept|{"models":{"bad":{"extra":1}},"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+overwritten overflow|accept|{"input_tier_threshold_tokens":1e400,"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+final null|reject|{"version":"fixture","version":null,"input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+final bad row|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@,"model":null}}
+final overflow|reject|{"version":"fixture","input_tier_threshold_tokens":1,"input_tier_threshold_tokens":1e400,"models":{"model":@ROW@}}
+two values|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}} {"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+version UFFFD first \ud800|reject|{"version":"\ufffd","version":"\ud800","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+version UFFFD last \ud800|reject|{"version":"\ud800","version":"\ufffd","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+version UFFFD first \udc00|reject|{"version":"\ufffd","version":"\udc00","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+version UFFFD last \udc00|reject|{"version":"\udc00","version":"\ufffd","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+overwritten subtree low|reject|{"models":{"discard":{"text":"\udc00"}},"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":@ROW@}}
+pair separated by escaped backslash|reject|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"\ud800\\udc00":@ROW@}}
+valid escaped quote then backslash u|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"quote\"\\ud800":@ROW@}}
+overwritten bad row|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":{"extra":1},"model":@ROW@}}
+overwritten row overflow|accept|{"version":"fixture","input_tier_threshold_tokens":1,"models":{"model":{"output":1e400},"model":@ROW@}}
+UNICODE_FIXTURES
+}
+# Exercise the documented Task command under the repo's default output mode.
+base
+anthropic 2026-02-01 https://example.com/anthropic
+rc=0
+task nudge:pricing -- --today 2026-02-01 --json >"$scratch/out" 2>"$scratch/err" || rc=$?
+[[ "$rc" == 0 && ! -s "$scratch/err" ]] || die "Task JSON command failed"
+jq -e 'type == "array"' "$scratch/out" >/dev/null || die "Task stdout must be a plain JSON array"
+expected model 2026-01-01 "verified more than 30 days ago" https://example.com/pricing
+checks=$((checks + 1))
+rc=0
+task nudge:pricing -- --today invalid --json >"$scratch/out" 2>"$scratch/err" || rc=$?
+[[ "$rc" != 0 && ! -s "$scratch/out" && -s "$scratch/err" ]] || die "Task invalid input must fail with stderr and empty stdout"
+checks=$((checks + 1))
+
+# Generate decoded controls in files, including NUL, which Bash variables cannot hold.
+# The fixed corpus bounds this loop; any failure stops the suite.
+for codes in 10 13 13,10 9 0 {0..31}; do
+  base
+  jq -cn --arg codes "$codes" '$codes | split(",") | map(tonumber) | implode' >"$scratch/control.json"
+  jq --slurpfile control "$scratch/control.json" \
+    '.models.model.sources = ["https://example.com/pricing" + $control[0]]' \
+    "$scratch/base.json" >"$UZI_PRICING_TEST_CODEX_PATH"
+  jq -e --slurpfile control "$scratch/control.json" \
+    '.models.model.sources[0] | index($control[0]) != null' \
+    "$UZI_PRICING_TEST_CODEX_PATH" >/dev/null || die "missing decoded control $codes"
+  if [[ "$codes" == 10 ]]; then
+    jq -e '.models.model.sources[0] | index("\n") != null and index("\\n") == null' \
+      "$UZI_PRICING_TEST_CODEX_PATH" >/dev/null || die "fixture must contain decoded LF"
+  fi
+  bad --today 2026-01-01
+  bad --today 2026-01-01 --json
+  cp "$scratch/base.json" "$UZI_PRICING_TEST_CODEX_PATH"
+  {
+    printf 'const AnthropicPriceFetchedAt = "2026-01-01"\nconst AnthropicPriceSourceURL = "https://example.com/anthropic'
+    jq -jr . "$scratch/control.json"
+    printf '"\n'
+  } >"$UZI_PRICING_TEST_ANTHROPIC_PATH"
+  bad --today 2026-01-01
+  bad --today 2026-01-01 --json
+done
+base
+fixture_row=$(jq -c '.models.model' "$scratch/base.json")
+while IFS='|' read -r name verdict raw; do
+  printf '%s\n' "${raw//@ROW@/$fixture_row}" >"$UZI_PRICING_TEST_CODEX_PATH"
+  if [[ "$verdict" == accept ]]; then
+    empty_json 2026-01-01
+  else
+    bad --today 2026-01-01 --json
+  fi
+done < <(unicode_fixtures)
 base
 empty_json 2026-01-31
 ok --today 2026-01-31
@@ -85,9 +205,11 @@ printf '%s\n' '[["a","verified more than 30 days ago"],["a","promotional review 
 cmp "$scratch/actual" "$scratch/expected" || die "deterministic finding order"
 ok --today 2026-02-01
 [[ $(wc -l <"$scratch/out") == 4 ]] || die "one text line per finding"
-change '.models = {"line\\nbreak": .models.model}'
+change '.models = {"line\nbreak": .models.model}'
+jq -e '(.models | keys[0]) == "line\nbreak"' "$UZI_PRICING_TEST_CODEX_PATH" >/dev/null || die "fixture must contain actual newline"
 ok --today 2026-02-01
 [[ $(wc -l <"$scratch/out") == 2 ]] || die "escaped subject must stay on one line"
+[[ $(head -n 1 "$scratch/out") == 'line\nbreak | 2026-01-01 | verified more than 30 days ago | https://example.com/pricing' ]] || die "newline subject must render as escaped text"
 base
 for mutation in \
   'null' '[]' '.extra=1' 'del(.version)' '.version=null' '.version=""' \

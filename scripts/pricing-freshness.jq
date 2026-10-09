@@ -1,4 +1,10 @@
 # Match codex-pricing-validation.ts and codexprice.go on final decoded values.
+# Scan raw string tokens before fromjson can replace unpaired surrogate escapes.
+# Escaped quotes/backslashes are consumed as units, valid pairs together.
+def unicode_strings:
+  all(scan("\"(?:[^\"\\\\]|\\\\.)*\"");
+    all(scan("\\\\u[dD][89aAbB][0-9a-fA-F]{2}\\\\u[dD][c-fC-F][0-9a-fA-F]{2}|\\\\(?:u[0-9a-fA-F]{4}|.)");
+      length != 6 or (test("^\\\\u[dD][89a-fA-F]") | not)));
 def require($ok; $why): if $ok then . else error($why) end;
 def fields($required; $optional):
   require(type == "object"; "expected object")
@@ -19,7 +25,7 @@ def day:
   | $seconds / 86400;
 def source:
   require(type == "string"; "expected source string")
-  | require(test("^[\\x21-\\x7e]+$"); "expected ASCII HTTPS URL")
+  | require((test("[^\\x21-\\x7e]") | not); "expected ASCII HTTPS URL")
   | require(test("^https://([^/:?#]+)(?::([0-9]+))?([/?#][A-Za-z0-9._~!$&'()*+,;=:@/?#%+-]*)?$"); "expected HTTPS URL")
   | capture("^https://(?<host>[^/:?#]+)(?::(?<port>[0-9]+))?(?<suffix>[/?#][A-Za-z0-9._~!$&'()*+,;=:@/?#%+-]*)?$") as $url
   | require(($url.host | length) <= 253; "host too long")
@@ -53,8 +59,8 @@ def table:
 def finding($subject; $date; $reason; $sources):
   {subject: $subject, date: $date, reason: $reason, sources: $sources};
 
-require(length == 1; "expected exactly one JSON value")
-| .[0] | table as $table
+require(unicode_strings; "JSON strings must contain well-formed Unicode")
+| fromjson | table as $table
 | ($today | day) as $now
 | ($anthropic_date | day) as $fetched
 | ($anthropic_source | source) as $source

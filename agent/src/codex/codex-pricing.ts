@@ -20,10 +20,12 @@
 // Standard and leave every unknown model `unreported`. A future protocol that surfaces the tier
 // must gate a non-Standard tier (Batch/Flex/Fast) to `unreported` here.
 
+import { readFileSync } from "node:fs";
 import type { CodexUsageBreakdown } from "./transport.js";
 import table from "./codex-pricing.json" with { type: "json" };
-import { validateCodexPricing } from "./codex-pricing-validation.js";
+import { validateCodexPricing, validateCodexPricingJSONStrings } from "./codex-pricing-validation.js";
 
+validateCodexPricingJSONStrings(readFileSync(new URL("./codex-pricing.json", import.meta.url), "utf8"));
 const validatedTable = validateCodexPricing(table);
 const TABLE = validatedTable.models;
 

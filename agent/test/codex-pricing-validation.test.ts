@@ -191,3 +191,76 @@ it("inherited object keys are unknown models", () => {
     assert.equal(priceCodexResponse(model, usage, new Date("2026-01-01")), undefined);
   }
 });
+
+it("ExactModelKeys: raw Unicode is checked before module validation", async () => {
+  const suite = await readFile(resolve(root, "scripts/pricing-freshness.test.sh"), "utf8");
+  const corpus = suite.split("cat <<'UNICODE_FIXTURES'\n")[1]!.split("\nUNICODE_FIXTURES")[0]!;
+  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-unicode-"));
+  try {
+    for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
+      await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
+    }
+    await writeFile(resolve(scratch, "package.json"), '{"type":"module"}');
+    // One independent module load per fixture, each capped at 10 seconds.
+    // An assertion failure stops this test; finally removes its scratch.
+    for (const line of corpus.split("\n")) {
+      const [name, verdict, template] = line.split("|");
+      const raw = template!.replaceAll("@ROW@", JSON.stringify(table.models["gpt-6-astra"]));
+      await writeFile(resolve(scratch, "codex-pricing.json"), raw);
+      const child = spawnSync(process.execPath, ["--import", "tsx", resolve(scratch, "codex-pricing.ts")], {
+        cwd: resolve(root, "agent"), encoding: "utf8", timeout: 10000,
+      });
+      assert.equal(child.error, undefined, name);
+      if (verdict === "accept") assert.equal(child.status, 0, name + child.stderr);
+      else {
+        assert.notEqual(child.status, 0, name);
+        if (name !== "two values") assert.match(child.stderr, /CodexPricingValidationError/, name);
+      }
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+it("direct validator rejects lone Unicode in versions and model keys", () => {
+  for (const value of ["\ud800", "\udc00"]) {
+    rejects(changed(["version"], value), "version");
+    rejects(changed(["models"], { [value]: table.models["gpt-6-astra"] }), "models");
+  }
+  for (const value of ["�", "\ud800\udc00", "\udbff\udfff"]) {
+    assert.doesNotThrow(() => validateCodexPricing(changed(["version"], value)));
+    assert.doesNotThrow(() => validateCodexPricing(changed(["models"], { [value]: table.models["gpt-6-astra"] })));
+  }
+});
+
+it("priceCodexResponse keeps exact Unicode keys and decoded duplicate last wins", async () => {
+  const scratch = await mkdtemp(resolve(root, ".uzi/scratch/pricing-keys-"));
+  try {
+    for (const name of ["codex-pricing.ts", "codex-pricing-validation.ts"]) {
+      await writeFile(resolve(scratch, name), await readFile(resolve(root, "agent/src/codex", name)));
+    }
+    await writeFile(resolve(scratch, "package.json"), '{"type":"module"}');
+    const row = (output: number) => JSON.stringify({
+      ...table.models["gpt-6-astra"], low: { ...table.models["gpt-6-astra"]!.low, output },
+    });
+    const raw = '{"version":"fixture","input_tier_threshold_tokens":1,"models":{' +
+      '"�":' + row(1) + ',"𐀀":' + row(99) + ',"\\ud800\\udc00":' + row(2) +
+      ',"é":' + row(3) + ',"e\\u0301":' + row(4) + ',"\\udbff\\udfff":' + row(5) + '}}';
+    await writeFile(resolve(scratch, "codex-pricing.json"), raw);
+    const expectations = [["�", 1], ["𐀀", 2], ["é", 3], ["e\u0301", 4], ["\udbff\udfff", 5], ["unknown", null]];
+    await writeFile(resolve(scratch, "check.ts"), [
+      'import assert from "node:assert/strict";',
+      'import { priceCodexResponse } from "./codex-pricing.js";',
+      'const usage = {inputTokens:0,cachedInputTokens:0,cacheWriteInputTokens:0,outputTokens:1000000,reasoningOutputTokens:0,totalTokens:1000000};',
+      'for (const [model, expected] of ' + JSON.stringify(expectations) + ') {',
+      'assert.equal(priceCodexResponse(model, usage, new Date("2026-01-01")), expected ?? undefined); }',
+    ].join("\n"));
+    const child = spawnSync(process.execPath, ["--import", "tsx", resolve(scratch, "check.ts")], {
+      cwd: resolve(root, "agent"), encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 0, child.stdout + child.stderr);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});

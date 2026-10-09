@@ -3154,6 +3154,9 @@ tasks:
   # Deliberately absent from gates: only test:pricing-freshness is a gate member.
   nudge:pricing:
     desc: 'pricing freshness NUDGE - recorded verification and promotional review dates (never gates)'
+    # Pass findings through unchanged, including machine-readable --json output.
+    silent: true
+    interactive: true
     cmds:
       - bash scripts/pricing-freshness.sh {{.CLI_ARGS}}
 

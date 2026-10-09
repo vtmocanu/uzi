@@ -223,3 +223,70 @@ func TestPricedModelsEmptyAndEarliestPromo(t *testing.T) {
 		t.Fatalf("earliest promo: %s", got)
 	}
 }
+
+func TestExactModelKeysRawUnicode(t *testing.T) {
+	suite, err := os.ReadFile("../../../scripts/pricing-freshness.test.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.SplitN(string(suite), "cat <<'UNICODE_FIXTURES'\n", 2)
+	if len(parts) != 2 {
+		t.Fatal("missing shared raw corpus")
+	}
+	corpus := strings.SplitN(parts[1], "\nUNICODE_FIXTURES", 2)[0]
+	var canonical map[string]any
+	if err := json.Unmarshal(canonicalBytes, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	rowBytes, err := json.Marshal(canonical["models"].(map[string]any)["gpt-6-astra"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(corpus, "\n") {
+		fields := strings.SplitN(line, "|", 3)
+		t.Run(fields[0], func(t *testing.T) {
+			_, err := loadPricing([]byte(strings.ReplaceAll(fields[2], "@ROW@", string(rowBytes))))
+			if (err == nil) != (fields[1] == "accept") {
+				t.Fatalf("%s: %v", fields[1], err)
+			}
+		})
+	}
+}
+
+func TestCoverageExactUnicodeKeys(t *testing.T) {
+	original := table
+	t.Cleanup(func() { table = original })
+	var canonical map[string]any
+	if err := json.Unmarshal(canonicalBytes, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	row := canonical["models"].(map[string]any)["gpt-6-astra"].(map[string]any)
+	rowBytes, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row["promo_review_date"] = "2026-01-01"
+	expiredBytes, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"version":"fixture","input_tier_threshold_tokens":1,"models":{"�":` + string(expiredBytes) +
+		`,"𐀀":` + string(expiredBytes) + `,"\ud800\udc00":` + string(rowBytes) +
+		`,"é":` + string(expiredBytes) + `,"e\u0301":` + string(rowBytes) +
+		`,"\udbff\udfff":` + string(expiredBytes) + "}}"
+	table, err = loadPricing([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		model string
+		want  Status
+	}{
+		{"�", PromoExpired}, {"𐀀", Priced}, {"é", PromoExpired}, {"e\\u0301", NoPrice},
+		{"e\u0301", Priced}, {"\U0010ffff", PromoExpired}, {"unknown", NoPrice},
+	} {
+		if got := Coverage(tc.model, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); got != tc.want {
+			t.Errorf("%q = %s, want %s", tc.model, got, tc.want)
+		}
+	}
+}

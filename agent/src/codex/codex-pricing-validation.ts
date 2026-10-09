@@ -75,11 +75,31 @@ function source(value: unknown, path: string): void {
   if (/%(?![0-9A-Fa-f]{2})/.test(match[3] ?? "")) fail(path, "invalid percent escape");
 }
 
+function unicode(value: string, path: string): void {
+  if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value)) {
+    fail(path, "expected well-formed Unicode");
+  }
+}
+
+/** Pricing-local lexical check: native JSON parsing still owns syntax and duplicates. */
+export function validateCodexPricingJSONStrings(raw: string): void {
+  for (const match of raw.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
+    // Consume escaped backslashes/quotes as units, and valid surrogate pairs together.
+    for (const escape of match[0].matchAll(/\\u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}|\\(?:u[0-9a-fA-F]{4}|.)/g)) {
+      if (escape[0].length === 6 && /^\\u[dD][89a-fA-F]/.test(escape[0])) {
+        fail("table", "JSON strings must contain well-formed Unicode");
+      }
+    }
+    unicode(match[0], "table");
+  }
+}
+
 /** Validate parsed JSON once at the production module's load boundary. Duplicate keys follow JSON.parse's last-key-wins policy. */
 export function validateCodexPricing(value: unknown): PricingTable {
   const table = object(value, "table");
   fields(table, "table", ["version", "input_tier_threshold_tokens", "models"]);
   if (typeof table.version !== "string" || table.version.length === 0) fail("version", "expected nonempty string");
+  unicode(table.version, "version");
   const threshold = table.input_tier_threshold_tokens;
   if (typeof threshold !== "number" || !Number.isFinite(threshold) || !Number.isInteger(threshold) || threshold <= 0) {
     fail("input_tier_threshold_tokens", "expected positive finite integer");
@@ -88,6 +108,7 @@ export function validateCodexPricing(value: unknown): PricingTable {
   if (Object.keys(models).length === 0) fail("models", "expected nonempty object");
   for (const [model, value] of Object.entries(models)) {
     if (model.length === 0) fail("models", "expected nonempty model identifier");
+    unicode(model, "models");
     const path = `models.${model}`;
     const row = object(value, path);
     fields(row, path, ["verified_at", "sources", "low", "high"], ["promo_review_date"]);

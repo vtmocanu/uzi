@@ -41,7 +41,7 @@ metadata=$(awk '
 anthropic_date=${metadata%%$'\n'*}
 anthropic_source=${metadata#*$'\n'}
 # Capture before printing: no partial findings or success-shaped JSON on failure.
-output=$(jq -es --arg today "$today" --arg anthropic_date "$anthropic_date" \
+output=$(jq -eRs --arg today "$today" --arg anthropic_date "$anthropic_date" \
   --arg anthropic_source "$anthropic_source" \
   -f "$root/scripts/pricing-freshness.jq" "$codex") || fail "invalid pricing metadata"
 if [[ "$json" == true ]]; then

@@ -153,15 +153,20 @@ rates, model rows or pricing rules change and `AnthropicPriceFetchedAt`
 when the official pages are checked. Moving data into JSON does not
 re-verify it: the recorded dates retain their original provenance.
 
+Codex pricing requires every JSON string to contain well-formed Unicode,
+rejecting unpaired surrogate escapes even in overwritten values before
+decoding; schema validation then checks final decoded values, with ordinary
+duplicate fields retaining last-key-wins semantics.
+
 After a Codex edit, run `task codex-pricing:sync` and include both JSON files
 in the change. Run `task nudge:pricing` to review freshness, or
-`task --output interleaved nudge:pricing -- --today 2026-11-07 --json`
-for a deterministic UTC date and findings array without Task's global
-output prefixes. The nudge reports verification/fetch dates more
-than 30 days old and promotional reviews within 14 days or already passed.
-It exits 0 whether or not there are findings; invalid sources, schema or
-arguments exit 2. It fetches no prices and changes no rates. Aging alone
-does not disable pricing; existing promotional expiry behavior remains.
+`task nudge:pricing -- --today 2026-11-07 --json`
+for a deterministic UTC date and plain JSON findings array. The nudge
+reports verification/fetch dates more than 30 days old and promotional reviews within 14 days or already passed.
+The script exits 0 whether or not there are findings; invalid sources,
+schema or arguments make the script exit 2. Task propagates command failure
+using its own status (currently 201). It fetches no prices and changes no
+rates. Aging alone does not disable pricing; existing promotional expiry behavior remains.
 Only the hermetic script tests run in the repository gate.
 
 The planned M2 Health check will warn about recent Codex usage on models

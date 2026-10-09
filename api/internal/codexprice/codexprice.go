@@ -65,6 +65,9 @@ func mustLoadPricing(data []byte) map[string]*time.Time {
 // policy. UseNumber retains overflow numbers for validation, including when an
 // invalid earlier value is overwritten during decoding.
 func loadPricing(data []byte) (map[string]*time.Time, error) {
+	if err := validateJSONStrings(data); err != nil {
+		return nil, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	var value any
@@ -140,6 +143,42 @@ func loadPricing(data []byte) (map[string]*time.Time, error) {
 		models[model] = review
 	}
 	return models, nil
+}
+
+// validateJSONStrings checks escape lexemes before encoding/json can replace them.
+// This is a pricing-local scan; the native decoder still owns all JSON syntax.
+func validateJSONStrings(data []byte) error {
+	inString := false
+	for i := 0; i < len(data); i++ {
+		if data[i] == '"' {
+			inString = !inString
+			continue
+		}
+		if !inString || data[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(data) || data[i] != 'u' || i+4 >= len(data) {
+			continue
+		}
+		unit, err := strconv.ParseUint(string(data[i+1:i+5]), 16, 16)
+		if err != nil {
+			continue // Native JSON decoding rejects malformed escapes.
+		}
+		i += 4
+		if unit < 0xd800 || unit > 0xdfff {
+			continue
+		}
+		if unit <= 0xdbff && i+6 < len(data) && data[i+1] == '\\' && data[i+2] == 'u' {
+			low, err := strconv.ParseUint(string(data[i+3:i+7]), 16, 16)
+			if err == nil && low >= 0xdc00 && low <= 0xdfff {
+				i += 6
+				continue
+			}
+		}
+		return fmt.Errorf("table: JSON strings must contain well-formed Unicode")
+	}
+	return nil
 }
 
 func object(value any, path string, required []string, optional ...string) (map[string]any, error) {
