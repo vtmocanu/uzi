@@ -40,8 +40,11 @@ through `[0.52.0]`.)
 - **Run usage distinguishes unknown metrics and estimates agent attribution ([#2555](https://github.com/vtmocanu/uzi/issues/2555)).**
   Codex reports processing duration and per-agent input usage; absent duration or turns display as —. Repeated Claude usage records count once per lane, Codex responses retain distinct identities, and the estimated per-agent table omits output attribution. Accounting records stay out of the web activity feed, TUI and human run logs; JSON logs and pagination/follow cursors retain them. The TUI loading badge omits sequence-derived counts. Run token and cost totals remain unchanged.
 
+- **Codex subscription runs record API-equivalent cost for comparison ([#2559](https://github.com/vtmocanu/uzi/issues/2559)).**
+  Codex prices either auth mode per response with uzi's pinned Standard table, retaining fail-closed handling of unknown, expired or incomplete pricing evidence; Claude keeps its SDK-computed figure. The cost is a comparison, not a bill, and subscription users may consume purchased credits. Legacy subscription rows show no estimate with tokens retained, not zero dollars; unreported runs show no per-run dollars even when a partial is stored. Self/Admin totals retain recorded partials and disclose runs without estimates and unreported runs; same-key status conflicts zero that row only. Dashboard cost is labelled API-equivalent and Claude tails read "Estimated, not in the total". No historical backfill, price/freshness, auth, capacity, SQL, schema, DTO or wire change.
+
 - **Usage ranks users by total tokens**
-  The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
+  The per-user table now matches token Share, including Codex subscription usage. Cards and rows disclose runs without a cost estimate and unreported runs with explanatory tooltips; incomplete cost totals retain recorded partials.
 
 - **Claude Agent SDK 0.3.287; long worker commands keep running up to two hours ([#2551](https://github.com/vtmocanu/uzi/pull/2551)).**
   From SDK 0.3.285 a backgrounded Bash command is stopped at its `timeout` (default 30 minutes, maximum two hours) in addition to being stopped when the turn ends. Claude agents are now told to start a command expected to outlast the 10-minute foreground limit in the background with the two-hour `timeout`; a command still stopped at the limit writes no exit-status file and its result is reported unverified, as before.

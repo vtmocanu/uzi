@@ -92,8 +92,11 @@ labels; unknown or inconsistent verdict/reason pairs show unavailable.
 
 Findings use hardened Markdown, capped at 16,384 source characters across
 20 items, with a notice when truncated. Metadata is bounded and sanitized;
-missing model/effort is unreported, missing cost unavailable, and subscription
-usage is labelled separately from metered spend. New plan cross-check events
+missing model/effort is unreported, missing or unreported cost unavailable,
+and legacy `subscription` usage shows **No estimate**. Priced Codex checks
+in either auth mode show API-equivalent cost, not a bill; see
+[run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+New plan cross-check events
 refresh detail; a failed refresh waits for a later new event rather than
 retrying indefinitely.
 

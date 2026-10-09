@@ -118,8 +118,11 @@ findings, checker-run link, recorded model/effort, each field's source
 stay unknown; later settings changes do not rewrite historical evidence.
 Unknown or inconsistent outcomes show **Outcome unavailable**. Findings use
 hardened Markdown with a display cap of 16,384 source characters and 20 items;
-omitted text is disclosed. Missing cost shows unavailable; subscription usage
-is labelled separately from metered spend. After a human revision,
+omitted text is disclosed. Missing or unreported cost shows unavailable;
+legacy `subscription` usage shows **No estimate**. Priced Codex checks use
+uzi's pinned Standard table in either auth mode: API-equivalent cost is a
+comparison, not a bill. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+After a human revision,
 **Earlier-plan evidence** does not certify the current plan. Approve, request
 changes or reject the plan shown at the current gate; the original check stays
 as history, without an automatic new checker round.

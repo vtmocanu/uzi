@@ -522,8 +522,13 @@ The source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`:
   origins cannot latch signals; Claude's existing replay projections remain.
 - Preserve Claude's init/error/result payloads, including unknown accounting
   members and explicit undefined keys before JSON serialization, through an
-  opaque uzi wire projection alongside normalized usage. Subscription cost is
-  not metered zero; API-key cost remains unreported until its source is defined.
+  opaque uzi wire projection alongside normalized usage. Current Codex cost
+  uses uzi's pinned Standard price table for either credential mode when
+  response evidence prices cleanly; unknown, expired or incomplete evidence
+  remains unreported. `metered` is API-equivalent cost, not proof of a charge.
+  Legacy `subscription` means no estimate recorded, not metered zero. See
+  [PRD #2559](../prds/2559-codex-subscription-cost.md) for the cost-only
+  supersession; auth and capacity semantics remain unchanged.
 - For run turns, preserve first-wins local timeout/cancel, then distinct iterator throws, then
   terminal failure authority; terminal accounting is emitted before failure.
   Deferred failure materialization preserves runtime subtype truthiness and

@@ -285,9 +285,11 @@ separate decision.
   `models[]`. Filled in `GetRun` beside the metered `Usage`.
 - CLI: `uzi run get --json` emits it; the human view adds an `EST. TAIL` row beside
   COST.
-- Web: the run page shows an "Estimated, not metered" block apart from the metered
+- Web: the run page shows an "Estimated, not in the total" block apart from the metered
   total: tokens, the cost or "cost unknown", the price-table version and the coverage
-  reasons.
+  reasons. The current wording distinguishes this separate tail from recorded
+  API-equivalent cost; it changes no fold or aggregate boundary (see
+  [PRD #2559](../prds/2559-codex-subscription-cost.md)).
 
 ## D11 — Per-run caps, atomic, with one lock order
 

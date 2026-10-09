@@ -171,15 +171,23 @@ uzi version
 Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 `--context <name>`/`-c <name>`.
 
+Cost is a recorded **API-equivalent** comparison, not a bill: Claude uses
+its SDK figure and Codex uzi's pinned Standard table for either auth mode.
+Subscription users may consume purchased credits. `uzi run get` marks
+priced cost API-equivalent; legacy `subscription` reads `no estimate`,
+unreported reads `cost unavailable`, and neither shows per-run dollars even
+when a partial cost is stored. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+
 A few worth knowing:
 
 - **`uzi admin usage --window lifetime|last_7_days` selects the human report's
   window (default `lifetime`).** The factory summary and per-user rows use
-  the same window for usage-bearing runs, tokens, metered cost, outcomes and
+  the same window for usage-bearing runs, tokens, API-equivalent cost, outcomes and
   recoverable failures. Failure rate is failed runs divided by finished runs,
   including runs without usage; `RUNS` counts runs with usage. Cost shows
-  `$0.00` for metered zero and discloses subscription/unreported run counts
-  whose costs are excluded. Recoverable work may already have been landed.
+  `$0.00` for metered zero and discloses runs without a cost estimate and
+  unreported runs. Incomplete totals include recorded partial costs.
+  Recoverable work may already have been landed.
   `--json` returns the complete API response with both windows and additive
   per-user seven-day fields; the flag selects only the human report. Invalid
   window values are rejected before a request, including with `--json`.
@@ -1379,8 +1387,9 @@ A newer release is available.
   activity docs](./run-activity.md#milestones-and-the-now-line) describe for
   web and CLI. On your own board only, a right-aligned **COST** cell follows the micro-bar: `$N` in
   whole dollars (no cents, to keep the column width stable), `<$1` for a
-  real sub-dollar cost, `—` for a subscription-auth run the SDK prices at
-  $0, and a blank cell for a run with no recorded usage; it too is hidden on
+  real sub-dollar cost, `$0` for metered zero, `n/a` for a legacy
+  `subscription` or unreported run, and a blank cell for no recorded usage;
+  it too is hidden on
   a narrow terminal, dropping right after the micro-bar does so the title is
   never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
@@ -1397,7 +1406,8 @@ A newer release is available.
   board, `$N 7d` is the rounded `Last7Days.CostUSD` from the server's
   `GET /api/usage` response, covering the last seven days even when runs
   are outside the visible list window. A `+` after the dollar amount means
-  subscription or unreported run costs are excluded from that amount;
+  the total is incomplete: legacy runs have no estimate, and unreported
+  runs may contribute recorded partial costs;
   `$0+ 7d` can therefore appear. The cost segment is hidden while the
   initial fetch is pending, after a failed fetch, or when a fully metered
   total rounds to zero. It never appears on the admin/factory board. Each
@@ -1430,8 +1440,9 @@ A newer release is available.
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
   for what a lane's dot means. The header's status tag folds in the run's
   cost beside the elapsed time — e.g. `● running · 41m · $9.55` (with cents,
-  since a single run's precision matters); `—` for a subscription-auth run
-  the SDK prices at $0, and nothing shown for a run with no recorded usage.
+  since a single run's precision matters); metered zero reads `$0.00`,
+  legacy `subscription` and unreported runs read `n/a`, and nothing is shown
+  for a run with no recorded usage.
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
@@ -2324,7 +2335,8 @@ unrecognized sources show `unknown`. JSON summary fields
 records. Settings changes do not rewrite this recorded evidence. A human
 revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
 warning that the check does not certify the current plan. Missing cost stays
-unavailable; subscription usage is distinguished from metered spend.
+unavailable; legacy `subscription` usage reads `no estimate`. Priced Codex
+checks in either auth mode show API-equivalent cost, not a bill.
 
 The human view bounds findings to 20 items and sends displayed text through
 `Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for

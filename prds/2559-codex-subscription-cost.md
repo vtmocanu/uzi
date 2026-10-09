@@ -1,14 +1,14 @@
 # PRD #2559: API-equivalent cost for Codex subscription runs
 
-**Status**: Draft. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
+**Status**: Approved; implementation and documentation in progress, final verification pending. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
 
 Planning facts were read at `main` `140b5c767` (after #2552, which rewrote the aggregate disclosure wording).
 
 ## Problem
 
-A Codex run on a ChatGPT subscription login shows no cost anywhere: the run page headline reads "Subscription", table cells read `sub`, `uzi run get` prints `subscription`, the judge says "no per-token dollar figure applies", and the Self/Admin usage totals leave these runs out with a "+ N Codex sub runs" disclosure. A Claude run on a subscription token, by contrast, shows a dollar figure on every surface: the Claude SDK prices token usage client-side from a price table bundled in the SDK, and uzi folds that `total_cost_usd` as `metered` (`deriveUsageCost`, `api/internal/workersvc/usage_fold.go`, Claude arm).
+Before this change, a Codex run on a ChatGPT subscription login showed no cost anywhere: the run page headline read "Subscription", table cells read `sub`, `uzi run get` printed `subscription`, the judge said "no per-token dollar figure applies", and the Self/Admin usage totals left these runs out with a "+ N Codex sub runs" disclosure. A Claude run on a subscription token, by contrast, showed a dollar figure on every surface: the Claude SDK prices token usage client-side from a price table bundled in the SDK, and uzi folds that `total_cost_usd` as `metered` (`deriveUsageCost`, `api/internal/workersvc/usage_fold.go`, Claude arm).
 
-So an owner comparing harnesses sees Claude runs cost dollars and Codex runs cost nothing, and cannot compare the two harnesses' spend on the same work.
+So an owner comparing harnesses saw Claude runs cost dollars and Codex runs cost nothing, and could not compare the two harnesses' spend on the same work.
 
 ## Outcome
 
@@ -16,14 +16,14 @@ A new Codex subscription run is priced exactly like a Codex API-key run: each up
 
 `metered` is redefined, in docs, comments and user-facing copy, as **a recorded API-equivalent cost** for both harnesses, not proof of a charge.
 
-Rows stored with `cost_status = 'subscription'` (runs recorded before this change, and runs on workers not yet rolled to it) render as "no cost estimate recorded": tokens shown, no dollar figure, never `$0`, excluded from dollar totals.
+Rows stored with `cost_status = 'subscription'` (runs recorded before this change, and runs on workers not yet rolled to it) render as "no cost estimate recorded": tokens shown, no dollar figure, never `$0`. These rows have no estimate to add to dollar totals. Distinct priced rows on the same run retain their partial costs in aggregates even when the run rolls up as `unreported`; no per-run reader shows that partial as dollars. Aggregates disclose the incomplete total and count the run as unreported (maintainer decision (2026-10-09)). The figure compares work, not a bill; subscription users may consume purchased credits.
 
 Acceptance examples:
 
 1. A Codex subscription run, model `gpt-6.1-sol`, every response priced and reconciled. The posted `modelUsage["gpt-6.1-sol"]` has `costStatus: "metered"` and a numeric `costUSD`; `uzi run get --json` has `usage.cost_status == "metered"`; the run page headline is a dollar figure with an "API-equivalent" sub-label; the run counts in the Self usage dollar total and not in its disclosure.
 2. The same run on a model absent from the table (for example `gpt-5.5`), or a `gpt-5.6-sol` run on or after its promotional review date (2026-11-21). `cost_status == "unreported"`, tokens retained, every surface reads "Unavailable"/`n/a`, never `$0`.
 3. A Codex run stored with `cost_status = 'subscription'`. The run page reads "No estimate" with a sub-label "no cost estimate recorded"; table cells and the TUI read `n/a`; `uzi run get` prints `no estimate`; the judge line says no cost estimate was recorded; aggregates exclude it and disclose it as "+ N runs without a cost estimate".
-4. A run whose earlier legs folded `subscription` (old worker) and later legs folded `metered` (new worker). The existing conflict rule makes it `unreported`; no partial figure.
+4. A run whose earlier leg folded `subscription` (old worker) and later leg folded `metered` (new worker) under distinct session/epoch keys, even on the same model, rolls up as `unreported`. Tokens and the priced leg's partial cost remain stored; Self/Admin lifetime and recent aggregates include the partial and count the run as unreported. Per-run readers show unavailable cost without dollars. A status conflict on the same `(run_id, session_id, model, lineage_epoch)` key instead zeros that row alone; distinct priced rows remain intact (maintainer decision (2026-10-09)).
 5. A Codex API-key run: pricing unchanged; only its sub-label wording changes.
 6. A plan cross-check checker run on a Codex subscription login: its posted `modelUsage` entries are `metered` with `costUSD`, and the cross-check panel shows a dollar figure.
 
@@ -41,26 +41,26 @@ Acceptance examples:
 
 ### Agent producers
 
-- `CodexUsageAccountant.aggregateByModel(pricing)` (`agent/src/codex/token-accounting.ts`): `priceApiKey` gates per-response pricing on `authMode === "api_key"`, and the emit loop returns `costStatus: "subscription"` for a subscription run. Change both so any present pricing context prices: same evidence-completeness check, per-thread reconciliation, per-response `priceCodexResponse` and dominance. Keep: `pricing` omitted gives `unreported`; globally incomplete resume accounting still returns `undefined`.
-- `deriveCodexRunCost(entries, authMode)`: remove the subscription short-circuit and the now-unused `authMode` parameter (`agent/tsconfig.json` sets `noUnusedParameters`); update its caller at `codex-harness.ts` (`decodeTerminal`) and keep the call-site guard `this.authMode === undefined` gives `unreported`.
+- `CodexUsageAccountant.aggregateByModel(pricing)` (`agent/src/codex/token-accounting.ts`): present pricing context now prices either auth mode, replacing the old API-key gate and subscription emit branch. Preserve the evidence-completeness check, per-thread reconciliation, per-response `priceCodexResponse` and dominance. Keep: `pricing` omitted gives `unreported`; globally incomplete resume accounting still returns `undefined`.
+- `deriveCodexRunCost(entries)` now has no subscription short-circuit or `authMode` parameter (`agent/tsconfig.json` sets `noUnusedParameters`). Its caller at `codex-harness.ts` (`decodeTerminal`) retains the guard: `this.authMode === undefined` gives `unreported`.
 - `agent/src/codex/cross-check.ts` calls `accountant.aggregateByModel({ authMode: binding.authMode, ... })` directly; it inherits the change and needs its own test.
-- Remove the `subscription` member from `CodexCostStatus` (`token-accounting.ts`) and from `HarnessCost` (`agent/src/harness.ts`) once nothing produces it; knip does not see dead union members, so do it by hand. `authMode` stays threaded everywhere else.
+- The producer-side `subscription` member is removed from `CodexCostStatus` (`token-accounting.ts`) and `HarnessCost` (`agent/src/harness.ts`); knip does not see dead union members. The server/wire legacy status remains. `authMode` stays threaded everywhere else.
 - The server folds only the per-model markers (`resolveCostStatusMarker` / `deriveUsageCost`, `usage_fold.go`); `metrics.cost` has no server reader. The per-model `modelUsage` entry is the contract that matters.
 
 ### Server fold
 
-- No logic change. `deriveUsageCost` already honours a Codex `metered` marker with a present, finite, in-range `costUSD`, and still maps `subscription` to `subscription`/`$0` for old workers. Update its doc comment ("that credential mode has no per-token charge").
-- Keep the `UpsertRunUsage` status-conflict rule (`api/internal/store/queries/runtime.sql`) and the mixed-status rule in `run_usage_totals`; example 4 depends on them.
+- No logic change. `deriveUsageCost` already honours a Codex `metered` marker with a present, finite, in-range `costUSD`, and still maps legacy `subscription` to that status with numeric zero storage for old workers. Its comment describes no estimate recorded, rather than no per-token charge.
+- Keep the `UpsertRunUsage` same-key status-conflict rule (`api/internal/store/queries/runtime.sql`): conflicting statuses resolve to `unreported` and zero that row's cost. Keep the mixed-status rule in `run_usage_totals`: distinct legacy and metered rows make the run `unreported` while retaining the priced subtotal. Self/Admin queries include that subtotal and count the run as unreported. Example 4 depends on both boundaries; SQL, schema and DTOs stay unchanged (maintainer decision (2026-10-09)).
 - Rollout orders: new workers with an old api are safe (the old fold already accepts a Codex `metered` marker). A new api with old workers stores new subscription runs as `subscription` until the fleet rolls (worker image pinned separately via `workers.image.tag`; a cordoned drain can take up to 24h); they render "no cost estimate recorded", which is true. This is why that wording carries no time claim.
 
 ### Readers and copy
 
 Legacy `subscription` wording becomes "no estimate"; `metered` copy says API-equivalent. Shared helper first, then every caller that appends its own text:
 
-- Web helper `web/src/lib/costStatus.ts`: `costHeadline` ("Subscription" to "No estimate"), `costSubLabel` (subscription: "no cost estimate recorded"; metered: "API-equivalent · Claude SDK" for claude, "API-equivalent · uzi price table" for codex, "API-equivalent" otherwise), `costCellText` ("sub" to "n/a"), `aggregateDisclosure` (text "+ N run(s) without a cost estimate", title "Runs without a cost estimate: tokens only").
+- Web helper `web/src/lib/costStatus.ts`: `costHeadline` ("Subscription" to "No estimate"), `costSubLabel` (subscription: "no cost estimate recorded"; metered: "API-equivalent · Claude SDK" for claude, "API-equivalent · uzi price table" for codex, "API-equivalent" otherwise), `costCellText` ("sub" to "n/a"), `aggregateDisclosure` (text "+ N run(s) without a cost estimate", title "Runs without a cost estimate: tokens only"). Unreported disclosure states "cost incomplete; recorded partial costs included"; aggregates preserve the stored partial subtotal.
 - Web callers: `web/src/components/RunUsage.tsx` (also rename the Claude tail label "Estimated, not metered" to "Estimated, not in the total", since metered now means estimated), `web/src/components/UsageCards.tsx` (heading "Metered cost" to "Cost (API-equivalent)"), `web/src/pages/RunsList.tsx` (hard-coded "subscription" literal near line 461), `web/src/components/PlanCrossCheck.tsx` (the " · subscription usage" suffix), `web/src/pages/runView/JudgePanel.tsx` (judge's own usage strip), `web/src/components/RunEvent.tsx` (comment).
 - Web mock data: `web/src/mocks/data/judge.ts` (a Claude judge mock stored as `subscription`, already wrong since Claude is always metered: make it `metered`), `web/src/mocks/data/runs.ts` (cross-check usage mock), `web/src/mocks/mockApi/runs.ts` (aggregate counts); keep at least one mock row with `subscription` so the legacy rendering stays visible in mock mode.
-- CLI/TUI: `api/cmd/uzi/tui_cost.go`, `tui_board_rows.go`, `tui_board.go`, `tui_detail.go`, `tui_detail_meters.go`, `plan_cross_check_render.go` (reuses `costDetailCell`), `admin.go` (`adminUsageCost`, which prints `subscription/unreported costs excluded: subscription_runs=`), and `uzi run get`'s COST row.
+- CLI/TUI: `api/cmd/uzi/tui_cost.go`, `tui_board_rows.go`, `tui_board.go`, `tui_detail.go`, `tui_detail_meters.go`, `plan_cross_check_render.go` (reuses `costDetailCell`), `admin.go` (`adminUsageCost`, which discloses runs without an estimate and unreported runs, with recorded partial costs included), and `uzi run get`'s COST row.
 - Judge: `agent/src/judge-runner.ts` `renderTargetCostLine`: metered line says "(API-equivalent)" instead of "(metered)"; subscription line says no cost estimate was recorded.
 - Comments: `web/src/lib/apiTypes.ts` (CostStatus and the SelfUsage cost_status doc), `agent/src/protocol.ts` (target cost status), `api/internal/apitypes/usage.go`.
 - `api/internal/workersvc/plan_cross_check_summary.go` keeps its status fold unchanged (no wording).
@@ -68,10 +68,10 @@ Legacy `subscription` wording becomes "no estimate"; `metered` copy says API-equ
 ### Docs and records
 
 - `docs/run-cost.md` "Metered, subscription, and unreported cost": `metered` means a recorded API-equivalent cost (Claude: SDK-computed; Codex: uzi's pinned Standard table, either credential mode); `subscription` is a legacy status meaning no estimate was recorded; subscription users may still consume purchased credits beyond included usage, so the figure is a comparison, not a bill. Update the disclosure examples to the new strings.
-- `docs/cli.md`, `docs/cross-check.md`, `docs/run-activity.md`, `docs/worker-model.md`: align wording. `task docs:sync`, commit the mirror.
-- `adr/1106-codex-harness.md` lines 524-525 wrongly say API-key cost "remains unreported": correct to the current behaviour.
-- `specs/human.md` line 339 ("subscription and unreported runs are disclosed separately from cost"): update to the new meaning, tagged `(AI-synced YYYY-MM-DD)`.
-- This supersedes `prds/done/1332-codex-routing-foundation.md` line 115 (subscription usage keeps a neutral subscription cost); say so in the Decision Log, not by editing the done PRD.
+- `docs/cli.md`, `docs/cross-check.md`, `docs/run-activity.md`, `docs/worker-model.md`: align wording; `task docs:sync` updates the embedded mirrors.
+- `adr/1106-codex-harness.md`: correct the obsolete API-key "remains unreported" claim; align pertinent current tail presentation wording in `adr/2014-run-usage-estimated-tail.md` without changing its accounting boundary.
+- `specs/human.md` cost decision: update the API-equivalent meaning and maintainer-attributed partial preservation, tagged `(AI-synced 2026-10-09)`.
+- Record cost-only supersessions of PRD #1332's neutral-subscription-cost decision and active PRD #1551's line 110 rule (subscription always reports `subscription` regardless of a price row) in this Decision Log. Leave those PRDs and their non-cost requirements unchanged.
 - `CHANGELOG.md` `[Unreleased]` line.
 
 ## Testing decisions
@@ -82,7 +82,7 @@ Red-before/green-after is required for each changed behaviour; unchanged-behavio
 - Agent, harness terminal test: a subscription terminal's `usage.wire.modelUsage[model]` has `costStatus: "metered"` and `costUSD` (primary assertion); `metrics.cost.kind == "metered"` secondary; missing auth context gives `unreported`.
 - Agent, cross-check test: a subscription checker's posted `modelUsage` entries are `metered` with `costUSD`.
 - Agent, judge `renderTargetCostLine` tests updated to the new lines.
-- Server: a live-DB fold test for example 4 (one `subscription` leg then one `metered` leg on one run gives `unreported`, cost 0), in an existing `workersvc` `*LiveDB` file. A `deriveUsageCost` case for a Codex `metered` marker is an unchanged-behaviour control.
+- Server: `TestUsageFoldPricedSubscriptionAndLegacyLegsLiveDB` in `api/internal/workersvc/usage_fold_cost_marker_livedb_test.go` covers example 4 with distinct same-model session/epoch legs: `unreported`, partial cost $0.00291 and tokens retained. Assert literal Self/Admin lifetime/recent totals and counts, legacy-only zero storage and old-worker unreported behavior. Existing store controls in `api/internal/store/harness_cost_status_livedb_test.go` cover same-key conflict suppression and distinct-model partial preservation ($0.07 intact). A Codex `metered` marker case is an unchanged-behaviour control. This preserves partial subtotals per maintainer decision (2026-10-09), not a new SQL rule.
 - Web: `costStatus` tests (headline, sub-label, cell, disclosure), `UsageCards.test.tsx`, `PlanCrossCheck`, `JudgePanel`, `RunsList` render tests; keep every "never `$0` for a non-metered row" assertion.
 - CLI/TUI: update `plan_cross_check_test.go`, `run_render_harness_cost_test.go`, `uxlab_gen_test.go`, `tui_usage_test.go`, `admin_usage_window_test.go` to the new wording.
 
@@ -96,17 +96,57 @@ Both agent producers, the type cleanup, every reader and mock above, docs/ADR/sp
 
 Acceptance: examples 1 to 6 hold in tests; `task gate:agent`, `task gate:web`, `task gate:api`, `task gate:repo` green; `task check-docs:web` green; `TestEmbeddedDocsMatchSource` green after `task docs:sync`.
 
+## Verification checklist (2026-10-09)
+
+Evidence below composes producer, persistence, aggregate and renderer tests;
+it is **not an actual-provider end-to-end test**. Final verification is still
+pending; M1 is not marked complete and this PRD stays active.
+
+- [x] Unit A (`ea707` + fix `192413`): producer pricing coverage has literal
+  $1.278 = $0.293 low-tier + $0.985 high-tier in
+  `agent/test/codex-cost-accounting.test.ts`; lead terminal coverage has
+  $0.013 in `agent/test/codex-harness.test.ts`; checker coverage has
+  `gpt-6.1-sol` input 300/cache-read 600/cache-write 100/output 200 =
+  $0.00291 in `agent/test/codex-cross-check.test.ts`. Unknown models,
+  expired promotional rows and bad buckets fail closed with tokens retained.
+- [x] Unit B (`cbb62` + fix `59edd`): shared renderer helper, RunUsage,
+  UsageCards, RunsList, JudgePanel and PlanCrossCheck cover status suppression
+  and DTO-matching mocks, including a $0.61 mixed partial aggregate. Supplied
+  full web gate log `jfMj3U`: EXIT=0.
+- [x] Unit C (`4b6bac`): supplied API gate log `FkNRt8`: EXIT=0.
+  `TestCostReadersAPIEstimate` and `TestSpendBasisFitsRail` in
+  `api/cmd/uzi/api_equivalent_cost_test.go` preserve true zero and suppress
+  per-run dollars for non-metered statuses.
+- [x] Isolated throwaway Docker/Postgres log `z9K0G1`: both
+  `TestUsageFoldPricedSubscriptionAndLegacyLegsLiveDB` and the existing
+  `TestUsageFoldHonorsCodexCostMarkerLiveDB` passed, exit 0, zero skips. The new
+  test persists metered $0.002910; distinct same-model legacy/new session and
+  epoch rows total `unreported` with $0.00291 and retained tokens.
+  Self/Admin lifetime/recent literal totals are $0.00582 with asserted counts;
+  legacy-only zero and old-worker unreported controls pass. Existing store
+  same-key/distinct-model controls were reviewer-confirmed PASS with the
+  $0.07 partial intact.
+- [x] UnitD: `task docs:sync` exited 0 (mkdir/remove/copy of top-level
+  Markdown mirrors); `task check-docs:web` log `6V3g1R` exited 0 (74 docs,
+  house-style length warnings only); focused `TestEmbeddedDocsMatchSource`
+  log `hxp1z9` exited 0. Owned current cost assertions were checked against
+  producer, renderer, same-key upsert and run/aggregate fold boundaries.
+- [ ] Remaining final verification, including a passing full agent gate and
+  outstanding final acceptance checks. The full agent gate failed one
+  plan-revision recovery assertion; focused runs passed on both base and head,
+  so the failure remains unexplained. No full agent gate pass is claimed.
+
 ## Risks
 
-- **Model-id match.** A subscription run is priced only when its recorded model id exactly matches a table key; otherwise it moves from "Subscription" to "Unavailable". Checked before filing: the last 12 Codex runs on the hosted instance recorded only `gpt-6.1-sol` (26 per-model entries), which the table prices.
+- **Model-id match.** A subscription run is priced only when its recorded model id exactly matches a table key; otherwise it reads "Unavailable". Checked before filing: the last 12 Codex runs on the hosted instance recorded only `gpt-6.1-sol` (26 per-model entries), which the table prices.
 - **Rollout skew.** Covered under Server fold; neither order shows a wrong figure.
 
 ## Decision Log
 
-- **D1. Store the estimate as `metered`, not a new column or status.** Claude subscription runs already store an SDK-computed API-equivalent figure as `metered`; matching it is the smallest change and every surface already renders it. Rejected: a nullable `estimated_cost_usd` column with `subscription` kept (new schema, DTO fields and render path on every surface, and inconsistent with Claude). Supersedes the neutral-subscription-cost rule in the PRD #1332 record.
+- **D1. Store the estimate as `metered`, not a new column or status.** Claude subscription runs already store an SDK-computed API-equivalent figure as `metered`; matching it is the smallest change and existing metered readers render it. Rejected: a nullable `estimated_cost_usd` column with `subscription` kept (new schema, DTO fields and render path on every surface, and inconsistent with Claude). Cost-only supersession of [PRD #1332](done/1332-codex-routing-foundation.md)'s neutral-subscription-cost decision and [PRD #1551](1551-per-harness-worker-model-defaults.md)'s line 110 subscription-always-`subscription` rule regardless of a price row. Their auth, model, effort, capacity and other requirements are unchanged; neither record is edited here.
 - **D2. Price per response on the worker, not at read time.** The >272K tier changes all four rates for a whole response, so stored per-model totals cannot reproduce the figure.
 - **D3. Keep every fail-closed rule.** Unknown model, passed promotional date, malformed cache split, unreconciled thread, missing auth context and incomplete resume accounting stay `unreported`. Rejected: the Claude SDK's default-rate fallback for unknown models.
-- **D4. Stored `subscription` rows read "no cost estimate recorded", excluded from dollar totals.** No time claim, because rows from not-yet-rolled workers are also `subscription`. Rejected: hiding them; `$0`; "recorded before estimates" (false during a roll).
-- **D5. Mixed legacy/new legs fold to `unreported`.** The existing conflict rule already does it; a partial figure would understate the run.
+- **D4. Stored `subscription` rows read "no cost estimate recorded", contributing no dollar estimate.** Distinct priced rows on a mixed run remain in aggregates under D5. No time claim, because rows from not-yet-rolled workers are also `subscription`. Rejected: hiding them; `$0`; "recorded before estimates" (false during a roll).
+- **D5. Mixed legacy/new legs fold to `unreported`; aggregates preserve recorded partials (maintainer decision (2026-10-09)).** Distinct fold keys retain their metered rows, including same-model legs under distinct session/epoch keys. The run's cost is unavailable on per-run readers; Self/Admin totals include its recorded partial and count it as unreported, disclosing incompleteness. Same-key status conflicts zero that row only. No SQL, schema or DTO change; do not discard valid partial evidence or present it as a complete run estimate.
 - **D6. No wire contract change.** Historical rows keep `subscription` and old workers still send it until the fleet rolls.
 - **D7. User-facing copy says "API-equivalent".** Redefining `metered` without changing copy that implies a charge ("your OpenAI credential", "Metered cost", "Estimated, not metered", the judge's "(metered)") would mislead. The judge line feeds cost-efficiency recommendations, so it states the basis explicitly.

@@ -57,27 +57,45 @@ usage pages, `uzi run get`'s COST row, and the TUI. `uzi run list` shows no
 cost at all (its columns are ID, KIND, STATUS, AGE, HARNESS, TITLE); reach
 for `uzi run get <id>` or the TUI for a run's cost from the CLI.
 
-A Claude run is always `metered`: the SDK reports a dollar figure per
-call, folded exactly as described above. A Codex run's status instead
-follows the credential mode the run is bound to: a **subscription** Codex
-login has no per-token charge at all, so every one of its runs is
-`subscription`, cost pinned to $0. An OpenAI **API key** run is `metered`
-from OpenAI's own price table only when every observed response prices
-cleanly; it falls back to `unreported` whenever that evidence is
-incomplete — no price row for the model (e.g. an unrecognized custom Codex
-model), or no, unreconciled, or malformed usage evidence for one of its
-responses — so a partial or uncertain read is never presented as a real
-metered dollar figure.
+`metered` means a **recorded API-equivalent cost**, not proof of a charge.
+Claude uses the SDK-computed figure, folded as described above. Codex uses
+uzi's pinned Standard price table in either credential mode (ChatGPT
+subscription or OpenAI API key), pricing each response separately. A model
+without a price row, an expired promotional row, or missing, unreconciled or
+malformed response usage makes the affected model `unreported`; tokens
+remain. Standard is an estimation policy: the app-server does not report
+the service tier. These figures compare work across harnesses, **not a
+bill**; subscription users may also consume purchased credits beyond
+included usage.
 
-The UI never renders a non-metered run as a bare "$0" or dash, since that
-would be ambiguous with a real zero-cost metered call. It spells the status
-out instead: a headline of "Subscription" or "Unavailable" (in place of a
-dollar figure), a sub-label like "subscription usage · no metered cost" or
-"tokens only · cost unavailable", and a dense table cell of `sub` or `n/a`.
-An aggregate (Self usage, Admin usage) totals only the metered subset and
-discloses what it left out, e.g. "+ 2 Codex sub runs and 1 unreported run". A tooltip explains that
-Codex subscription runs report no per-run cost and unreported runs have
-unavailable cost. The per-user table ranks by total tokens, matching Share.
+The legacy `subscription` status means **no cost estimate was recorded**.
+It can come from a historical run or a worker not yet rolled to the new
+pricing behavior. Its tokens remain, but its numeric zero is a storage
+placeholder, not a dollar estimate. Older runs are not backfilled: stored
+per-model totals lack the per-response evidence needed for the >272K tier.
+
+The UI shows metered zero as **$0.00**. A metered sub-label is
+"API-equivalent · Claude SDK", "API-equivalent · uzi price table" for Codex,
+or "API-equivalent" when the harness is unspecified. Legacy rows show
+"No estimate" with "no cost estimate recorded"; unreported rows show
+"Unavailable" with "tokens only · cost unavailable". Both use `n/a` in
+dense cells and show no per-run dollar figure, even if an unreported run
+has a stored partial cost.
+
+Self and Admin usage retain recorded partial dollars from incomplete runs,
+and disclose incompleteness, e.g. "+ 2 runs without a cost estimate and
+1 unreported run". The tooltip says "Runs without a cost estimate: tokens
+only" and "Unreported runs: cost incomplete; recorded partial costs
+included". The dashboard heading is "Cost (API-equivalent)"; the per-user
+table ranks by total tokens, matching Share.
+
+Distinct legacy and metered fold rows make the run `unreported` while
+preserving its priced rows in aggregates and counting it as an unreported
+run. A status conflict on the same fold key instead zeros that row; other
+priced rows survive. This preserves the existing SQL, schema and wire
+contract. Partial subtotal preservation is the **maintainer decision
+(2026-10-09)**; it does not make the incomplete run's cost a complete
+estimate.
 
 ## Estimated tail of an interrupted session
 
@@ -86,7 +104,7 @@ session is parked, stopped or crashes mid-turn, the model calls made after
 the last result frame are covered by no result, so the metered total
 silently leaves them out. uzi records those calls and shows them as an
 **estimated tail**, apart from the metered total: the run page's "Estimated,
-not metered" block and `uzi run get`'s EST. TAIL row (`uzi run get --json`
+not in the total" block and `uzi run get`'s EST. TAIL row (`uzi run get --json`
 carries it as `usage_estimated_tail`). The design is in
 `adr/2014-run-usage-estimated-tail.md`.
 
