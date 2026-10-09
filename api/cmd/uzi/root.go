@@ -2,15 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -47,7 +44,7 @@ func realGit(dir string, args ...string) (string, error) {
 // update prompt). It has two modes, matching how the TUI uses the seam:
 //
 //   - foreground == false: a QUIET detection probe (`brew --prefix --installed <formula>` for both formulas).
-//     up to 64 KiB of combined stdout+stderr is captured for at most 10 seconds,
+//     stdout is captured, with a shared 64 KiB stdout+stderr budget for at most 10 seconds,
 //     and no output reaches the terminal — a `brew: command not found` here just means
 //     "unknown ownership", not an error the user should see.
 //   - foreground == true: the selected formula upgrade, run AFTER the TUI has exited
@@ -59,74 +56,15 @@ func realGit(dir string, args ...string) (string, error) {
 // brew.
 func realBrew(foreground bool, args ...string) (string, error) {
 	if foreground {
-		cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew seam; args are internal `upgrade uzi-cli` or `upgrade uzi-cli-rc` literals.
+		cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew seam; args are allowlisted `upgrade vtmocanu/tap/uzi-cli` or `upgrade vtmocanu/tap/uzi-cli-rc` literals.
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return "", cmd.Run()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "brew", args...) //nolint:gosec // G204: internal `--prefix --installed <formula>` probe; formula is one of two literals.
-	cmd.WaitDelay = time.Second
-	out := cappedBrewOutput{cancel: cancel}
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-	if out.didOverflow() {
-		return "", errBrewProbeOverflow
-	}
-	if ctx.Err() != nil {
-		return "", ctx.Err()
-	}
-	return out.String(), err
+	return quietProcess(runProcess, "brew", args, nil)
 }
 
 var errBrewProbeOverflow = errors.New("brew probe output exceeds 64 KiB")
-
-// cappedBrewOutput accepts at most 64 KiB across both process output streams.
-type cappedBrewOutput struct {
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	cancel   context.CancelFunc
-	overflow bool
-}
-
-func (b *cappedBrewOutput) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.overflow {
-		return 0, errBrewProbeOverflow
-	}
-	const limit = 64 * 1024
-	remaining := limit - b.buf.Len()
-	if len(p) > remaining {
-		_, _ = b.buf.Write(p[:remaining])
-		b.overflow = true
-		if b.cancel != nil {
-			b.cancel()
-		}
-		return remaining, errBrewProbeOverflow
-	}
-	return b.buf.Write(p)
-}
-
-func (b *cappedBrewOutput) didOverflow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.overflow
-}
-
-func (b *cappedBrewOutput) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func (b *cappedBrewOutput) Len() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Len()
-}
 
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"
 // (the brew formula does this). It equals the uzi v* tag the binary was built
@@ -171,6 +109,9 @@ type Env struct {
 	// exercises the prompt), read through the brew() accessor which then reports unknown ownership.
 	Brew       func(foreground bool, args ...string) (string, error)
 	Executable func() (string, error)
+	// InstalledVersion probes the formula-owned executable quietly. A nil seam
+	// reports verification failure; tests inject a fake without launching processes.
+	InstalledVersion func(formula string) (string, error)
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -222,6 +163,7 @@ func DefaultEnv() Env {
 		Git:                realGit,
 		Brew:               realBrew,
 		Executable:         os.Executable,
+		InstalledVersion:   realInstalledVersion,
 		Store:              store,
 		Getenv:             os.Getenv,
 		AutoUpgradeSkill:   true,

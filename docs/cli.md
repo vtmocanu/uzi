@@ -1402,10 +1402,11 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ### Startup: an available update
 
 At startup, `uzi tui` checks for a newer release in the running CLI's channel
-and, if one exists, shows a modal on top of the board. A stable
-`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks the newer
-of the latest stable and latest release candidate, while staying on its opt-in
-formula. A stable install looks like this:
+and, when an upgrade is still needed, shows a modal on top of the board. If the
+formula-owned installed CLI already meets the offered release, it shows a restart
+hint instead. A stable `uzi-cli` install checks stable releases; an `uzi-cli-rc`
+install checks the newer of the latest stable and latest release candidate, while
+staying on its opt-in formula. A stable install needing an upgrade looks like this:
 
 ```
 ▲ Update available
@@ -1413,18 +1414,25 @@ uzi 0.83.0  →  0.85.0
 
 A newer release is available.
 
-▸ Update now  (brew upgrade uzi-cli)
+▸ Update now  (brew upgrade vtmocanu/tap/uzi-cli)
   Not now
   Don't remind me for 0.85.0
 ```
 
 - **A Homebrew install** gets the "Update now" action for the formula that owns
-  the running binary: `brew upgrade uzi-cli` for stable or
-  `brew upgrade uzi-cli-rc` for the RC channel, even when it currently runs a stable
-  version. Choosing it exits the TUI and runs the command in the foreground, so the source-build output and any failure stay
-  visible, then tells you to rerun
-  `uzi tui`. It never upgrades silently in the background while the TUI keeps
-  running. For an eligible **stamped** binary whose formula ownership cannot be
+  the running binary: `brew upgrade vtmocanu/tap/uzi-cli` for stable or
+  `brew upgrade vtmocanu/tap/uzi-cli-rc` for the RC channel, even when it currently
+  runs a stable version. These tap-qualified targets select uzi's stable and opt-in
+  RC formulae. Choosing it exits the TUI and runs Homebrew in the foreground, so
+  the source-build output and any failure stay visible. It does not force a tap
+  refresh: Homebrew inherits `HOMEBREW_AUTO_UPDATE_SECS` and
+  `HOMEBREW_NO_AUTO_UPDATE` from your environment. A zero exit from Homebrew is
+  not yet success: uzi verifies that the formula-owned installed CLI is at least
+  the offered version. If it is older, the command exits nonzero with
+  `Installed CLI is vY; requested vX was not reached. Try again later.`
+  (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
+  On verified success it tells you to rerun `uzi tui`; there is no automatic re-exec.
+  For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
   choose the information channel.
@@ -1441,6 +1449,15 @@ A newer release is available.
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
   per `uzi tui` invocation either way.
+- **An update installed outside the TUI** is detected after ownership is resolved,
+  on each successful five-minute build-info poll while a newer release is offered.
+  The local check runs even with the modal open, after "Not now", or for a dismissed
+  version; the existing modal gates still apply. If the formula-owned installed CLI
+  already meets or exceeds the offer, the modal closes and the footer shows the
+  actual version: `v<installed> installed, restart uzi to use it` (a narrow terminal
+  may shorten the hint). The running process keeps its old version until you restart
+  uzi yourself. Unknown ownership remains notes-only and runs no installed-CLI subprocess;
+  `UZI_VERSION_CHECK=0` and `--quiet` suppress these checks too.
 - **This is a third axis**, distinct from `version`'s own `update … available`
   row and from the CLI-vs-server skew banner above: it compares this CLI
   binary against the latest *published* release, not the CLI against the
@@ -2853,7 +2870,7 @@ So every command now compares its own version against the server's and prints
 one line to **stderr** when it is behind:
 
 ```
-uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
+uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli
 ```
 
 A CLI owned by the RC formula names that formula even when it runs a stable
@@ -2862,7 +2879,7 @@ version. Ownership is resolved from the executable's Homebrew path without runni
 For example:
 
 ```
-uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc
+uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli-rc
 ```
 
 - **stderr, never stdout.** `--json` output stays byte-exact and parseable.

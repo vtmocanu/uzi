@@ -25,14 +25,15 @@ import (
 // poller's automatic watcher and the on-demand rework endpoint, so they cannot drift.
 //
 // The work is bounded and fair. One tick makes at most issueinput.MaxDistinctAuthors lookups
-// inside issueinput.AssessmentTimeout, each under a per-lookup timeout, and the authors whose
+// inside issueinput.AssessmentTimeout (30s). Author-specific calls use a 5s per-lookup timeout;
+// shared repository evidence uses the remaining assessment deadline. The authors whose
 // answer is still needed wait in a per-(repo, ref) FIFO queue (mr_review_author_queue) so a
 // flood of unanswerable authors cannot starve the one that matters: whoever was attempted goes
 // to the back, whoever was not reached keeps its place at the front.
 
 const (
-	// DefaultReviewLookupTimeout bounds one author lookup, so a single hanging forge call
-	// costs one slot of the tick instead of the whole assessment deadline.
+	// DefaultReviewLookupTimeout bounds author-specific calls to 5s. Shared repository
+	// evidence uses the remaining 30s assessment deadline.
 	DefaultReviewLookupTimeout = 5 * time.Second
 	// reviewVerdictTTL is how long a not-eligible answer is trusted before it is asked again.
 	reviewVerdictTTL = 6 * time.Hour
@@ -174,8 +175,9 @@ const (
 	classNotEligible
 )
 
-// timeoutLookup bounds each lookup with its own deadline. The child context keeps the
-// values of the assessment context (forge.BeginAuthorAssessment's evidence cache).
+// timeoutLookup bounds author-specific calls with their own deadline (5s by default).
+// The child preserves forge.BeginAuthorAssessment's evidence cache, whose shared reads
+// use the remaining assessment deadline (30s by default).
 type timeoutLookup struct {
 	inner issueinput.AuthorLookup
 	d     time.Duration

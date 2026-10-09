@@ -66,9 +66,17 @@ The instance update signal and the `uzi-cli` TUI prompt use GitHub's
 as an available update. Separately, the api checks the published releases list
 for the newest `vX.Y.Z-rc.N` and makes it available to the TUI. An
 `uzi-cli-rc` install compares against the newer of the latest stable and latest
-candidate and upgrades with `brew upgrade uzi-cli-rc`, staying on its opt-in channel
+candidate and upgrades with `brew upgrade vtmocanu/tap/uzi-cli-rc`, staying on its opt-in channel
 even when stable is newest. An unknown owner running an RC build uses the same
-selection but gets release notes without a Homebrew action.
+selection but gets release notes without a Homebrew action or installed-CLI subprocess.
+Stable installs use `brew upgrade vtmocanu/tap/uzi-cli`; both upgrade targets are
+qualified to the uzi tap. The foreground upgrade inherits Homebrew's auto-update
+settings rather than forcing a refresh, and uzi verifies the formula-owned installed
+CLI against the offered version before reporting success. A TUI still running after
+an external upgrade closes its modal once that check meets the offer and shows the
+actual installed version with a restart hint; it does not re-exec automatically.
+See [the TUI update prompt](cli.md#startup-an-available-update) for verification
+failures, polling and opt-outs.
 The check clears its cached RC fact when no candidate remains in the published
 release list, as happens after stable promotion prunes superseded RC entries.
 
@@ -91,6 +99,24 @@ Both are seeded from environment/helm at first boot only (`UZI_RELEASE_CHECK_ENA
 cadence, default `6h`) — see [Configuration](configuration.md). That seeding never
 overwrites a value an admin has already set: flipping a toggle off in the UI survives
 a redeploy even if the env var is still `true`.
+
+## Scheduled checks after startup
+
+The configured cadence (`release_check_interval`, seeded from
+`UZI_RELEASE_CHECK_INTERVAL`) defaults to `6h`, with a one-minute settings minimum.
+At api startup, the scheduler reads the persisted RFC3339 `release_checked_at`
+once to choose the initial delay:
+
+- Missing, unreadable, malformed or overdue timestamp: wait one minute.
+- Recent timestamp: wait the greater of the remaining configured interval and one minute.
+- Future timestamp: wait the full configured interval.
+
+After each scheduled attempt, it rereads the configured interval and waits that
+full interval, regardless of success, failure, a disabled check or a recovered
+panic. The persisted timestamp affects startup scheduling only. If the runner
+receives a nonpositive interval, its defensive fallback is one hour; this is
+separate from the settings minimum and the normal `6h` default. Disabled checks
+retain the master opt-out and make no release-check request.
 
 ## Rate limits and the optional token
 

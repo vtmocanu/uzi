@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 - **Label sweep help includes bot-assignment eligibility.**
   The schedule modal clarifies that selector candidates can fire with the configured eligibility label or assignment to the uzi bot.
 
+- **Review author checks can use slower shared repository evidence ([#2427](https://github.com/vtmocanu/uzi/issues/2427)).**
+  Shared evidence uses the remaining assessment time (30 seconds in the background watcher, 5 seconds for on-demand rework after #2372) while author-specific requests retain their original 5-second child deadline. GitHub can finish from shared results after child expiry; Forgejo's permission fallback keeps the expired child and returns unknown, while a later author with a fresh child can succeed. Failed or incomplete evidence still fails closed, and fairness remains conditional.
+
 - **Interactive author assessments leave room for run creation ([#2372](https://github.com/vtmocanu/uzi/issues/2372)).**
   Manual issue starts and on-demand MR rework use a five-second total author-assessment budget, preserving fail-closed unknown handling and the live parent for persistence; background assessments retain thirty seconds.
 
@@ -48,6 +51,9 @@ through `[0.52.0]`.)
   With worker and API support, completion commits before the API verifies the fixed final commit against the run's recorded branch and MR, releasing only the exact completing-generation hold and returning a replayable receipt; no new archive is required, and existing archives retain their normal policy. CLI recovery shows the receipt or bounded refusal reason separately from archive availability. Physical cleanup still requires authenticated receipt persistence, quiescence, exact source attribution and execution/adoption exclusion, retaining sibling, shared, unknown or quarantined evidence. Failed, cancelled, parked and other run kinds keep their existing rules, and older completed holds are not backfilled.
 
 - Checkpoint and park-bridge scratch publication refusals now name bounded kind and step codes in the feed, deduped per pair.
+
+- **CLI updates verify the installed version and tell you when to restart ([#2496](https://github.com/vtmocanu/uzi/issues/2496)).**
+  Homebrew upgrades use tap-qualified stable or RC targets and inherit your auto-update settings; a zero Homebrew exit succeeds only when the formula-owned CLI reaches the offered version. The TUI detects external upgrades on successful five-minute build-info polls, closes the update modal and shows the actual installed version with a restart hint, without automatic re-exec. Server release checks use the persisted checked-at timestamp to schedule their first attempt after startup, then wait the full configured interval after each attempt; existing opt-outs remain in effect.
 
 ### Changed
 
