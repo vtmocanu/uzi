@@ -175,9 +175,11 @@ then stays pending; this is narrow and overlaps the scalar-mark limitation under
 
 Verifying an author costs a forge call, and one MR can attract many
 outsiders. Each poll tick therefore makes a bounded number of lookups (at
-most 200 authors in a 30 second assessment, each lookup cut off after 5
-seconds), and the authors still waiting for an answer sit in a per-MR FIFO
-queue. Authors who were tried and came back unknown or not eligible go to the
+most 200 authors in a 30 second assessment). Author-specific identity and
+permission requests keep one 5 second child deadline per lookup; shared
+repository evidence uses the remaining assessment context and can consume the
+remaining assessment time. The authors still waiting for an answer sit in a
+per-MR FIFO queue. Authors who were tried and came back unknown or not eligible go to the
 back; authors not reached keep their place; an eligible answer keeps its
 place. A new author joins behind those already waiting. A not-eligible answer
 is cached for 6 hours (per repository), so the same outsider isn't looked up
@@ -192,8 +194,8 @@ ahead of a waiting author *X* in the queue that are not eligible (not-eligible
 or permission-unknown) when *X* arrives, *A*t the number of lookups actually
 attempted on tick *t* (this is logged; only *A*t up to 200 is guaranteed), and
 *E*t the number of eligible authors ahead of *X*. A tick **counts** when the
-shared eligibility evidence answered within the per-lookup timeout and *A*t -
-*E*t is at least 1. *X* is looked up on the first counted tick *k* where the
+required shared eligibility evidence answered within the remaining assessment
+time and *A*t - *E*t is at least 1. *X* is looked up on the first counted tick *k* where the
 running sum of (*A*t - *E*t) reaches *R*0 + 1. With a constant *p* = *A*t -
 *E*t that is ceil((*R*0 + 1) / *p*) counted ticks. For example, with 2
 not-eligible authors ahead and 2 lookups per tick, *X* is looked up on tick 2.
@@ -202,14 +204,21 @@ place at the front.
 
 The bound assumes:
 
-- *X*'s own lookup answers within the per-lookup timeout on the counted tick.
-  Otherwise *X* becomes permission-unknown, goes to the back of the queue, and
-  the bound restarts from *X*'s new position;
+- *X*'s author-specific requests answer within the original per-lookup child
+  deadline and its verdict arrives within the remaining assessment time on the
+  counted tick. Otherwise *X* becomes permission-unknown, goes to the back of
+  the queue, and the bound restarts from *X*'s new position;
 - forge calls honor cancellation, and queue writes succeed;
-- the shared eligibility evidence is available within the per-lookup timeout.
-  That condition applies to GitHub, where one repository-wide collaborator
-  list serves every lookup. GitLab lookups are per-user calls with no shared
-  evidence, so only each lookup's own timeout matters there;
+- required shared eligibility evidence is available within the remaining
+  assessment time. GitHub's repository-wide collaborator list and Forgejo's
+  shared repository, ownership and direct-collaborator evidence use that
+  deadline. GitHub can finish from shared results after the author's child
+  deadline expires. Forgejo's author-specific permission fallback retains the
+  original child context: an expired child yields permission-unknown, while a
+  later author with a fresh child can succeed. Shared reads still honor
+  assessment cancellation and existing pagination checks; a listing is not
+  guaranteed to succeed. GitLab lookups are per-user calls with no shared
+  evidence; each is bounded by its child timeout and the assessment deadline;
 - the connection token's rate limit, shared with every other MR on it, isn't
   exhausted;
 - other MRs don't touch this MR's queue. They share only the verdict cache,

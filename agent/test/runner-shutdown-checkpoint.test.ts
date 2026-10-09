@@ -627,7 +627,7 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
     try {
       const { feed, lines } = await shutdownOnce(1597_15);
       assert.ok(feed.includes(notPublished("scratch_publication_refused")), JSON.stringify(feed));
-      assert.ok(feed.includes("checkpoint publish failed: scratch_publication_refused"));
+      assert.ok(feed.includes("checkpoint publish failed: scratch_publication_refused (exec_failed)"));
       assert.equal(loggedOutcome(lines), "scratch_publication_refused");
       assert.ok(!feed.some((text) => text.includes("remote credential")));
     } finally {

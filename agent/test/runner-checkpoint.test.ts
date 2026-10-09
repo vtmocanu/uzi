@@ -7,7 +7,7 @@ import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
 import type { OwedCandidateContext } from "../src/git.js";
-import { ScratchPublicationError } from "../src/git.js";
+import { ScratchPublicationError, type ScratchPublicationKind, type ScratchPublicationStep } from "../src/git.js";
 import type { PublishResult } from "../src/protocol.js";
 import {
   api,
@@ -1421,7 +1421,163 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
     assert.equal(publishes, 0);
     assert.equal(flight.lastCheckpointRefTip, "CONFIRMED");
     assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPTED");
-    assert.deepEqual(emitted, ["checkpoint publish failed: scratch_publication_refused"]);
+    assert.deepEqual(emitted, ["checkpoint publish failed: scratch_publication_refused (exec_failed)"]);
+  });
+
+  it("M1 allowlists every refusal kind and step, and normalizes hostile metadata before feed and dedupe", async () => {
+    const { gitlab } = fakeGitlab();
+    const flight = makeFlight({ lastCheckpointRefTip: "CONFIRMED", lastAttemptedCheckpointRefTip: "ATTEMPTED" });
+    const feed: string[] = [];
+    flight.batcher.emit = (m) => feed.push((m as { payload: { text: string } }).payload.text);
+    const kinds: ScratchPublicationKind[] = [
+      "tip_unavailable", "shallow_history", "missing_objects", "object_walk_failed",
+      "exec_failed", "scratch_present", "floor_unverified", "checkpoint_range",
+      "remote_changed_during_refresh", "remote_candidate_diverged",
+      "new_remote_candidate_diverged", "remote_branch_advanced",
+    ];
+    const steps: Array<ScratchPublicationStep | undefined> = [
+      "resolve_tip", "shallow_check", "object_walk", "scratch_walk", "floor_refresh", "checkpoint_floor", undefined,
+    ];
+    const originalPack = git.checkpointPack.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let refusal = new ScratchPublicationError("untrusted remote text");
+    let uploads = 0;
+    git.checkpointPack = async () => { throw refusal; };
+    client.publishCheckpoint = async () => { uploads++; throw new Error("unexpected upload"); };
+    const subject = runner(noopExec, gitlab) as unknown as {
+      publishCheckpointOutcome: (f: unknown, b: string, name: string) => Promise<unknown>;
+    };
+    try {
+      for (const kind of kinds) for (const step of steps) {
+        refusal = new ScratchPublicationError("untrusted remote text", new Error("credential text"), { kind, step });
+        const pair = `${kind}${step === undefined ? "" : ` at ${step}`}`;
+        const before = feed.length;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          assert.deepEqual(await subject.publishCheckpointOutcome(flight, "bare", "branch"), {
+            published: false, reason: "scratch_publication_refused",
+          });
+        }
+        assert.equal(feed.length, before + 1, `distinct pair ${pair}, repeated once`);
+        assert.equal(feed.at(-1), `checkpoint publish failed: scratch_publication_refused (${pair})`);
+        assert.ok(flight.reportedPublishOutcomes.has(`scratch_publication_refused:${pair}`));
+      }
+      // No coercion: even prototype names and objects with hostile stringification are unknown.
+      const hostile: unknown[] = ["remote secret\ntext", "constructor", "__proto__", "toString", "", undefined, null, 42, false,
+        { toString() { throw new Error("must not coerce metadata"); } }, ["scratch_present"], Symbol("secret")];
+      for (const value of hostile) {
+        refusal = new ScratchPublicationError("untrusted remote text", undefined, {
+          kind: value as ScratchPublicationKind, step: value as ScratchPublicationStep,
+        });
+        // The constructor defaults null/undefined kinds; exercise malformed runtime fields too.
+        Object.defineProperty(refusal, "kind", { value });
+        flight.reportedPublishOutcomes.delete("scratch_publication_refused:other");
+        const before = feed.length;
+        await subject.publishCheckpointOutcome(flight, "bare", "branch");
+        assert.equal(feed.length, before + 1, "each malformed runtime pair emits its normalized code");
+        assert.equal(feed.at(-1), "checkpoint publish failed: scratch_publication_refused (other)");
+        assert.ok(flight.reportedPublishOutcomes.has("scratch_publication_refused:other"));
+      }
+      assert.equal(flight.reportedPublishOutcomes.size, kinds.length * steps.length + 1, "unknown pairs share one normalized key");
+      refusal = new ScratchPublicationError("secret", undefined, { kind: "scratch_present", step: "constructor" as ScratchPublicationStep });
+      await subject.publishCheckpointOutcome(flight, "bare", "branch");
+      assert.equal(feed.length, kinds.length * steps.length + hostile.length, "invalid step equals absent step");
+      refusal = new ScratchPublicationError("secret", undefined, { kind: "constructor" as ScratchPublicationKind, step: "floor_refresh" });
+      await subject.publishCheckpointOutcome(flight, "bare", "branch");
+      assert.equal(feed.at(-1), "checkpoint publish failed: scratch_publication_refused (other at floor_refresh)");
+      assert.equal(uploads, 0);
+      assert.equal(flight.lastCheckpointRefTip, "CONFIRMED");
+      assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPTED");
+    } finally {
+      git.checkpointPack = originalPack;
+      client.publishCheckpoint = originalPublish;
+    }
+  });
+
+  it("M1 snapshots changing runtime accessors before checkpoint feed and dedupe allowlists", async () => {
+    const { gitlab } = fakeGitlab();
+    const subject = runner(noopExec, gitlab) as unknown as {
+      publishCheckpointOutcome: (f: unknown, b: string, name: string) => Promise<unknown>;
+    };
+    const originalPack = git.checkpointPack.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let uploads = 0;
+    client.publishCheckpoint = async () => { uploads++; throw new Error("unexpected upload"); };
+    try {
+      for (const changing of ["kind", "step", "both"]) {
+        const flight = makeFlight();
+        const feed: string[] = [];
+        flight.batcher.emit = (m) => feed.push((m as { payload: { text: string } }).payload.text);
+        const hostile = "hostile remote metadata";
+        let kindReads = 0;
+        let stepReads = 0;
+        const refusal = new ScratchPublicationError("remote text");
+        // logScratchPublicationRefused reads first; the diagnostic must snapshot the second read.
+        Object.defineProperties(refusal, {
+          kind: { get() {
+            kindReads++;
+            return kindReads <= 2 || changing === "step" ? "floor_unverified" : hostile;
+          } },
+          step: { get() {
+            stepReads++;
+            return stepReads <= 2 || changing === "kind" ? "floor_refresh" : hostile;
+          } },
+        });
+        git.checkpointPack = async () => { throw refusal; };
+        assert.deepEqual(await subject.publishCheckpointOutcome(flight, "bare", "branch"), {
+          published: false, reason: "scratch_publication_refused",
+        });
+        assert.deepEqual(feed, [
+          "checkpoint publish failed: scratch_publication_refused (floor_unverified at floor_refresh)",
+        ], changing);
+        assert.deepEqual([...flight.reportedPublishOutcomes], [
+          "scratch_publication_refused:floor_unverified at floor_refresh",
+        ], changing);
+        assert.ok(!JSON.stringify([feed, [...flight.reportedPublishOutcomes]]).includes(hostile), changing);
+        assert.equal(kindReads, 2, `${changing}: kind read once by log and once by diagnostic`);
+        assert.equal(stepReads, 2, `${changing}: step read once by log and once by diagnostic`);
+      }
+      assert.equal(uploads, 0);
+    } finally {
+      git.checkpointPack = originalPack;
+      client.publishCheckpoint = originalPublish;
+    }
+  });
+
+  it("M1 shares refusal dedupe across bridge and publish and resets only after confirmed success", async () => {
+    const { gitlab } = fakeGitlab();
+    const flight = makeFlight();
+    const feed: string[] = [];
+    flight.batcher.emit = (m) => feed.push((m as { payload: { text: string } }).payload.text);
+    const subject = runner(noopExec, gitlab) as unknown as {
+      bridgeBareTrackingRefIfDivergent: () => Promise<unknown>;
+      bridgeParkSinkBestEffort: (b: string, name: string, f: unknown, log: Logger, sink: string) => Promise<unknown>;
+      publishCheckpointOutcome: (f: unknown, b: string, name: string) => Promise<unknown>;
+    };
+    const refusal = new ScratchPublicationError("remote text", undefined, { kind: "floor_unverified", step: "floor_refresh" });
+    subject.bridgeBareTrackingRefIfDivergent = async () => { throw refusal; };
+    const originalPack = git.checkpointPack.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    git.checkpointPack = async () => { throw refusal; };
+    try {
+      assert.deepEqual(await subject.bridgeParkSinkBestEffort("bare", "branch", flight, flight.runLog, "park"), { kind: "failed" });
+      await subject.publishCheckpointOutcome(flight, "bare", "branch");
+      const expected = "checkpoint publish failed: scratch_publication_refused (floor_unverified at floor_refresh)";
+      assert.deepEqual(feed, [expected], "same pair across catch sites shares a key");
+      const restorePack = spyCheckpointPack({});
+      const restorePublish = spyPublishFixed({ result: { ok: true, body: { published: false, skipped: "busy" } } });
+      try {
+        await subject.publishCheckpointOutcome(flight, "bare", "branch");
+        assert.ok(flight.reportedPublishOutcomes.has("scratch_publication_refused:floor_unverified at floor_refresh"), "unconfirmed skip retains refusal dedupe");
+        client.publishCheckpoint = async () => ({ ok: true, body: { published: true, ref: "ref" } });
+        assert.deepEqual(await subject.publishCheckpointOutcome(flight, "bare", "branch"), { published: true });
+      } finally { restorePublish(); restorePack(); }
+      assert.equal(flight.reportedPublishOutcomes.size, 0, "confirmed success clears dedupe");
+      await subject.publishCheckpointOutcome(flight, "bare", "branch");
+      assert.equal(feed.filter((line) => line === expected).length, 2, "refusal recurs after confirmed success");
+    } finally {
+      git.checkpointPack = originalPack;
+      client.publishCheckpoint = originalPublish;
+    }
   });
 
   it("(d) accepted-publish + lost-response + new-milestone: the next overlay chains from the ATTEMPTED tip, not the stale confirmed tip", async () => {

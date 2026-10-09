@@ -473,8 +473,9 @@ type tuiModel struct {
 	// hand-off on exit. Assigned from Env in newTUICmd's RunE on the real path; left nil on
 	// the --demo / direct-construction test paths, where the update prompt never runs. Read
 	// nil-safely — a nil brew reports unknown ownership and never upgrades.
-	brew       func(foreground bool, args ...string) (string, error)
-	executable func() (string, error)
+	brew             func(foreground bool, args ...string) (string, error)
+	executable       func() (string, error)
+	installedVersion func(string) (string, error)
 
 	// store and serverURL back the update prompt's per-version "don't remind me" dismissal
 	// (PRD #1251 M1), threaded from newTUICmd's RunE like client/showVersion. store is the
@@ -1009,7 +1010,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tea.RequestBackgroundColor, themeTickCmd())
 
 	case skewTickMsg:
-		if m.quitting || m.updatePrompt.showing {
+		if m.quitting {
 			return m, skewTickCmd()
 		}
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
@@ -1328,14 +1329,20 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// The asynchronous owner probe resolves before channel selection and latching.
-		return m, (&m).maybeShowUpdatePrompt(msg.latest, msg.latestRC)
+		cmd := m.maybeShowUpdatePrompt(msg.latest, msg.latestRC)
+		return m, cmd
+
+	case installedVersionMsg:
+		cmd := m.applyInstalledVersion(msg)
+		return m, cmd
 
 	case brewInfoMsg:
 		// Resolve the owner first, then compare only the matching release channel.
 		m.updatePrompt.owner = msg.owner
 		m.updatePrompt.brewKnown = true
 		m.updatePrompt.brewPending = false
-		return m, (&m).maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC)
+		cmd := m.maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC)
+		return m, cmd
 
 	case detailRunMsg:
 		// Drop a load that resolved for a run the user has since navigated away from:
@@ -1859,6 +1866,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// dismissal degrades to session-only.
 			m.brew = env.Brew
 			m.executable = env.Executable
+			m.installedVersion = env.InstalledVersion
 			m.store = env.Store
 			if s, serr := resolveSettings(env, gf); serr == nil {
 				m.serverURL = s.URL
@@ -1873,7 +1881,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// than running brew in the background, so the from-source compile output and any failure
 			// are visible and the running process is not left stale. Run it in the foreground now.
 			if fm, ok := final.(tuiModel); ok && fm.updatePrompt.pendingUpgrade {
-				return runPendingUpgrade(env, fm.updatePrompt.upgradeArgv)
+				return runPendingUpgrade(env, fm.updatePrompt.upgradeArgv, fm.updatePrompt.offeredTarget)
 			}
 			return nil
 		},

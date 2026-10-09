@@ -6,16 +6,13 @@ import (
 	"time"
 )
 
-// releaseCheckRunnerFloor is the minimum interval the Runner will ever sleep. It
-// guards against a non-positive or otherwise nonsensical value leaking through so a
-// bad read can never make the loop hammer github.com. (settings.Cache already floors
-// the stored value at 1m; this is the Runner's own belt-and-braces default.)
+// releaseCheckRunnerFloor is the fallback cadence for non-positive intervals.
+// settings.Cache separately floors stored values at one minute.
 const releaseCheckRunnerFloor = time.Hour
 
-// flooredInterval clamps a configured interval UP to releaseCheckRunnerFloor, so a zero or
-// negative reading can never make Start busy-loop on a 0-length timer. A positive value at
-// or above the floor passes through unchanged. Extracted from Start so the flooring branch
-// is exercised directly by a unit test rather than only through a live loop.
+// flooredInterval substitutes an hour for non-positive readings to prevent a busy
+// loop. Every positive interval passes through unchanged; settings.Cache applies
+// its own one-minute floor to stored values.
 func flooredInterval(d time.Duration) time.Duration {
 	if d <= 0 {
 		return releaseCheckRunnerFloor
@@ -30,18 +27,18 @@ type updateChecker interface {
 	CheckForUpdate(ctx context.Context) (Result, error)
 }
 
-// Runner is the interval trigger for the upstream-release check (PRD #836 M2),
-// mirroring agentsource.Runner. It sleeps ReleaseCheckInterval() and then runs one
-// CheckForUpdate — recovering from any panic and logging (never crashing the process)
-// on error. It is boot-safe: main.go starts it as a non-blocking background goroutine
-// BEFORE the listener starts, and the first tick only fires after one interval, so a
-// first check against an unreachable github.com never delays boot. The master enable
-// gate is read INSIDE CheckForUpdate (which short-circuits to "disabled" with no
-// egress), so the Runner itself needs only the interval.
+// Runner schedules upstream-release checks. The initial wait uses the persisted
+// checked-at timestamp with a positive boot delay, so an overdue check runs soon
+// without blocking startup. Later waits use the full interval after each attempt.
+// CheckForUpdate owns the enable gate and short-circuits disabled checks without
+// egress; tick recovers panics and logs errors.
 type Runner struct {
-	check    updateChecker
-	settings SettingsReader
-	logger   *slog.Logger
+	check     updateChecker
+	settings  SettingsReader
+	logger    *slog.Logger
+	now       func() time.Time
+	bootDelay time.Duration
+	wait      func(context.Context, time.Duration) bool
 }
 
 // NewRunner builds the interval trigger around a Reconciler.
@@ -49,23 +46,59 @@ func NewRunner(rec *Reconciler, set SettingsReader, logger *slog.Logger) *Runner
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Runner{check: rec, settings: set, logger: logger}
+	return &Runner{check: rec, settings: set, logger: logger, now: time.Now, bootDelay: time.Minute, wait: waitForReleaseCheck}
 }
 
-// Start loops until ctx is cancelled: read the configured interval (floored), sleep it
-// via a timer, then run one panic-recovered check. It never panics the process. On ctx
-// cancellation it stops the timer and returns.
+// Start reads checked-at exactly once. After each completed attempt, including a
+// disabled, failed or panicking check, it rereads the interval and waits it in full.
+// Cancellation interrupts either wait and is passed through to the check.
 func (rn *Runner) Start(ctx context.Context) {
+	wait := rn.wait
+	if wait == nil {
+		wait = waitForReleaseCheck
+	}
+	now := rn.now
+	if now == nil {
+		now = time.Now
+	}
+	bootDelay := rn.bootDelay
+	if bootDelay <= 0 {
+		bootDelay = time.Minute
+	}
+	configured, _ := rn.settings.ReleaseCheckInterval(ctx)
+	interval := flooredInterval(configured)
+	checkedAt, err := rn.settings.ReleaseCheckedAt(ctx)
+	delay := bootDelay
+	if checked, parseErr := time.Parse(time.RFC3339, checkedAt); err == nil && parseErr == nil {
+		age := now().Sub(checked)
+		if age < 0 {
+			delay = interval
+		} else if age < interval {
+			delay = max(interval-age, bootDelay)
+		}
+	}
 	for {
-		configured, _ := rn.settings.ReleaseCheckInterval(ctx)
-		timer := time.NewTimer(flooredInterval(configured))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !wait(ctx, delay) || ctx.Err() != nil {
 			return
-		case <-timer.C:
 		}
 		rn.tick(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		configured, _ = rn.settings.ReleaseCheckInterval(ctx)
+		delay = flooredInterval(configured)
+	}
+}
+
+// waitForReleaseCheck reports whether the timer elapsed before cancellation.
+func waitForReleaseCheck(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
 	}
 }
 
@@ -74,22 +107,26 @@ func (rn *Runner) Start(ctx context.Context) {
 // (and returns a nil error today), so tick logs the recorded status/message rather than
 // treating a "disabled"/"error" outcome as fatal. A token is never logged.
 func (rn *Runner) tick(ctx context.Context) {
+	logger := rn.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	defer func() {
 		if p := recover(); p != nil {
-			rn.logger.Error("releasecheck: check panic recovered", "panic", p)
+			logger.Error("releasecheck: check panic recovered", "panic", p)
 		}
 	}()
 	res, err := rn.check.CheckForUpdate(ctx)
 	if err != nil {
-		rn.logger.Error("releasecheck: check", "error", err)
+		logger.Error("releasecheck: check", "error", err)
 		return
 	}
 	switch res.Status {
 	case statusOK:
-		rn.logger.Info("releasecheck: checked", "status", res.Status, "latest_tag", res.Facts.LatestTag)
+		logger.Info("releasecheck: checked", "status", res.Status, "latest_tag", res.Facts.LatestTag)
 	case statusError:
-		rn.logger.Warn("releasecheck: check reported error", "message", res.Message)
+		logger.Warn("releasecheck: check reported error", "message", res.Message)
 	default:
-		rn.logger.Debug("releasecheck: checked", "status", res.Status)
+		logger.Debug("releasecheck: checked", "status", res.Status)
 	}
 }

@@ -84,6 +84,7 @@ see [Named contexts](#named-contexts) below.
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
 uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
+uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
@@ -676,6 +677,92 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
+- **`run plan <run-id>` prints the latest plan Markdown verbatim.** It
+  appends no newline and does no terminal rendering or sanitation, even on a
+  TTY. `--version N` selects the Nth `plan` message in ascending `seq`
+  order, starting at 1. An integer outside `1..K` is a usage error
+  (`ExitUsage`, exit 2): `run has K plan version(s)`. A run with no plan
+  is not found (`ExitNotFound`, exit 4): `run has no plan`.
+  These version numbers count feed plans; they are not the approval
+  `gate_revision`. This read-only command changes no gate decisions; use
+  `--expected-gate-revision` on a verdict as described above.
+
+  **`--diff` compares a feedback revision with its immediate predecessor.**
+  For selected plan P, only the immediately preceding plan Q can be the
+  base, and at least one `plan_feedback` F must satisfy
+  `Q.seq < F.seq < P.seq`. Human and automatic feedback both qualify.
+  There is no backtracking to an older plan: a re-presentation without
+  intervening feedback has no base. Pending feedback after P creates no
+  new base and does not change an existing one. After two feedback rounds,
+  v3 compares with v2, not v1; selecting an earlier version uses only that
+  version's adjacent feedback interval.
+
+  The unified text diff has `--- vB` / `+++ vN` headers and
+  `@@ -start,count +start,count @@` hunks with up to three context lines
+  on each side. Comparison normalizes only trailing CR/LF characters;
+  meaningful spaces and interior text (including interior CR) are preserved.
+
+  - No base: stdout is the original plan, stderr says
+    `no revision base (no feedback preceded this version)`, exit 0.
+  - Identical after stripping trailing CR/LF: stdout is an empty diff,
+    stderr says
+    `This revision is identical to v{B}. Your requested changes were not applied.`,
+    exit 0.
+  - Either original side exceeds `200 * 1024` UTF-8 bytes: `--diff`
+    returns `ExitUsage` (exit 2), with empty stdout and
+    `plan too large to compare (limit 200 KiB)` through the standard CLI
+    error report on stderr. This cap also applies without a base;
+    without `--diff`, oversized plans print normally.
+
+  **`--json` emits one object** with `version`, `base_version` (number
+  or `null`), `plan_md`, `diff` (string or `null`) and
+  `identical_after_feedback` (boolean). `plan_md` preserves the original
+  Markdown string. Base and identical status are derived even without
+  `--diff`; `diff` is `null` unless `--diff` has a base, and `""`
+  for an identical comparison. With `--json --diff` and no base, stdout
+  contains only the object with `diff: null`; the no-base note remains
+  on stderr. Comparison notes and warnings never enter JSON stdout.
+
+  For a run `r` whose v1 is `alpha\nold\nomega\n`, followed by feedback
+  and v2 `alpha\nnew\nomega\n`:
+
+  ```sh
+  uzi run plan r                 # latest (v2)
+  uzi run plan r --version 1     # original (v1)
+  ```
+
+  Latest stdout (the stored string ends with a newline):
+
+  ```text
+  alpha
+  new
+  omega
+  ```
+
+  `uzi run plan r --version 2 --diff` prints:
+
+  ```diff
+  --- v1
+  +++ v2
+  @@ -1,3 +1,3 @@
+   alpha
+  -old
+  +new
+   omega
+  ```
+
+  `uzi run plan r --version 2 --diff --json` prints:
+
+  ```json
+  {"version":2,"base_version":1,"plan_md":"alpha\nnew\nomega\n","diff":"--- v1\n+++ v2\n@@ -1,3 +1,3 @@\n alpha\n-old\n+new\n omega\n","identical_after_feedback":false}
+  ```
+
+  In the web plan panel, **Show changes since vB** starts collapsed and
+  reveals line changes with added/removed counts. It uses the same feedback
+  base rule, but comparison is offered only when the newest feed plan text
+  exactly matches the displayed `run.plan_md`. Either side over 200 KiB
+  shows **Plan too large to compare**; an identical revision shows the
+  warning even while changes are collapsed.
 - **A message's content is under `payload`, not `body` or `content`.** Each
   `--json` line carries the text under `payload` (raw per-kind JSON); there is no
   `body`/`content` field, so reading either returns empty — indistinguishable from
@@ -1315,10 +1402,11 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ### Startup: an available update
 
 At startup, `uzi tui` checks for a newer release in the running CLI's channel
-and, if one exists, shows a modal on top of the board. A stable
-`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks the newer
-of the latest stable and latest release candidate, while staying on its opt-in
-formula. A stable install looks like this:
+and, when an upgrade is still needed, shows a modal on top of the board. If the
+formula-owned installed CLI already meets the offered release, it shows a restart
+hint instead. A stable `uzi-cli` install checks stable releases; an `uzi-cli-rc`
+install checks the newer of the latest stable and latest release candidate, while
+staying on its opt-in formula. A stable install needing an upgrade looks like this:
 
 ```
 ▲ Update available
@@ -1326,18 +1414,25 @@ uzi 0.83.0  →  0.85.0
 
 A newer release is available.
 
-▸ Update now  (brew upgrade uzi-cli)
+▸ Update now  (brew upgrade vtmocanu/tap/uzi-cli)
   Not now
   Don't remind me for 0.85.0
 ```
 
 - **A Homebrew install** gets the "Update now" action for the formula that owns
-  the running binary: `brew upgrade uzi-cli` for stable or
-  `brew upgrade uzi-cli-rc` for the RC channel, even when it currently runs a stable
-  version. Choosing it exits the TUI and runs the command in the foreground, so the source-build output and any failure stay
-  visible, then tells you to rerun
-  `uzi tui`. It never upgrades silently in the background while the TUI keeps
-  running. For an eligible **stamped** binary whose formula ownership cannot be
+  the running binary: `brew upgrade vtmocanu/tap/uzi-cli` for stable or
+  `brew upgrade vtmocanu/tap/uzi-cli-rc` for the RC channel, even when it currently
+  runs a stable version. These tap-qualified targets select uzi's stable and opt-in
+  RC formulae. Choosing it exits the TUI and runs Homebrew in the foreground, so
+  the source-build output and any failure stay visible. It does not force a tap
+  refresh: Homebrew inherits `HOMEBREW_AUTO_UPDATE_SECS` and
+  `HOMEBREW_NO_AUTO_UPDATE` from your environment. A zero exit from Homebrew is
+  not yet success: uzi verifies that the formula-owned installed CLI is at least
+  the offered version. If it is older, the command exits nonzero with
+  `Installed CLI is vY; requested vX was not reached. Try again later.`
+  (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
+  On verified success it tells you to rerun `uzi tui`; there is no automatic re-exec.
+  For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
   choose the information channel.
@@ -1354,6 +1449,15 @@ A newer release is available.
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
   per `uzi tui` invocation either way.
+- **An update installed outside the TUI** is detected after ownership is resolved,
+  on each successful five-minute build-info poll while a newer release is offered.
+  The local check runs even with the modal open, after "Not now", or for a dismissed
+  version; the existing modal gates still apply. If the formula-owned installed CLI
+  already meets or exceeds the offer, the modal closes and the footer shows the
+  actual version: `v<installed> installed, restart uzi to use it` (a narrow terminal
+  may shorten the hint). The running process keeps its old version until you restart
+  uzi yourself. Unknown ownership remains notes-only and runs no installed-CLI subprocess;
+  `UZI_VERSION_CHECK=0` and `--quiet` suppress these checks too.
 - **This is a third axis**, distinct from `version`'s own `update … available`
   row and from the CLI-vs-server skew banner above: it compares this CLI
   binary against the latest *published* release, not the CLI against the
@@ -2766,7 +2870,7 @@ So every command now compares its own version against the server's and prints
 one line to **stderr** when it is behind:
 
 ```
-uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
+uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli
 ```
 
 A CLI owned by the RC formula names that formula even when it runs a stable
@@ -2775,7 +2879,7 @@ version. Ownership is resolved from the executable's Homebrew path without runni
 For example:
 
 ```
-uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc
+uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli-rc
 ```
 
 - **stderr, never stdout.** `--json` output stays byte-exact and parseable.

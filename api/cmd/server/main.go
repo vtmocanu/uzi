@@ -1327,12 +1327,11 @@ func run() error {
 		agentSourceRunner.Start(ctx)
 	}()
 
-	// Upstream-release-check interval Runner (PRD #836 M2), wired exactly like the
-	// agent-source Runner: a panic-recovered background goroutine that sleeps
-	// ReleaseCheckInterval per tick and calls CheckForUpdate. The master enable gate is
-	// read inside CheckForUpdate (short-circuits to "disabled" with no egress), and the
-	// first tick only fires after one interval, so this never delays boot or calls
-	// github.com when the feature is off.
+	// Upstream-release-check Runner (PRD #836 M2): a panic-recovered background
+	// goroutine whose initial wait uses the persisted checked-at timestamp, with a
+	// one-minute boot delay for overdue checks. Later attempts wait a full interval.
+	// CheckForUpdate owns the master enable gate (disabled means no egress), so
+	// scheduling never delays boot or calls github.com when the feature is off.
 	releaseRec := releasecheck.NewReconciler(q, settingsCache, time.Now, slog.Default())
 	releaseRunner := releasecheck.NewRunner(releaseRec, settingsCache, slog.Default())
 	bgWG.Add(1)

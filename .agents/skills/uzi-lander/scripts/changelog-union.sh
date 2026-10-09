@@ -93,12 +93,14 @@ SEP_AWK='
 SENTINEL='<!-- changelog-union:join -->'
 
 # fold_resolve: the release-fold resolution, tried when the union refuses. A rebase conflict
-# where the base cut a release (folding its [Unreleased] body into a new `## [x.y.z]` section)
+# where the base cut a release (folding its [Unreleased] body into a `## [x.y.z]` section, new or,
+# under RC-first, the stable-keyed one an earlier candidate created)
 # while the branch added bullets under [Unreleased]. It works on COMPLETE bullet blocks (a
 # `- ` line plus its indented continuation lines) read from the three index stages of FILE
 # (1 ancestor, 2 ours = the base, 3 theirs = the branch), never from marker fragments, and
 # PROVES the fold first: every block the ancestor held under [Unreleased] is, verbatim, in a
-# released section of ours and not in ours' [Unreleased], and theirs still holds it unedited.
+# released section of ours that holds it more often than the ancestor did, and not in ours'
+# [Unreleased], and theirs still holds it unedited.
 # The branch additions (theirs' [Unreleased] blocks the ancestor lacked) are then inserted
 # into ours' [Unreleased] under their `### Heading` (created, when absent, in the order
 # Added, Changed, Deprecated, Removed, Fixed, Security; any other heading goes last).
@@ -139,7 +141,7 @@ fold_resolve() {
           isu = (s ~ /^## \[Unreleased\]/)
           if (isu) { nu[f]++; ustart[f] = i; uend[f] = N[f] }
           h = ""; sec = ""; if (match(s, /^## \[[^]]+\]/)) sec = substr(s, 4, RLENGTH - 3)   # the [version] identifier, never the date
-          if (f == 1 && sec != "") ancsec[sec] = 1; continue
+          continue
         }
         if (s ~ /^### /) { flush(f); h = trim(s); continue }
         if (s ~ /^- /) { flush(f); cur = s; curu = isu; curh = h; cursec = sec; continue }
@@ -171,21 +173,25 @@ fold_resolve() {
         acnt[key]++
       }
       if (na == 0) die("the ancestor [Unreleased] holds no bullet block, so there is no fold to prove")
+      # A fold target is a release section, keyed by its [version] (never the date), that holds
+      # a block MORE often in the base than in the ancestor: a new version, or an RC-first
+      # stable-keyed section an rc.N cut folded into again.
+      for (k = 1; k <= nb[1]; k++) if (!BU[1, k] && BS[1, k] != "") arel[BS[1, k] K BH[1, k] K BT[1, k]]++
       for (k = 1; k <= nb[2]; k++) {
         if (BU[2, k]) ou[BT[2, k]] = 1
         else {
           orl[BT[2, k]] = 1
-          # only a release section whose [version] is NEWLY introduced in the base (a date edit of an existing one does not count) can be the fold target
-          if (BS[2, k] != "" && !(BS[2, k] in ancsec)) nrc[BH[2, k] K BT[2, k]]++
+          if (BS[2, k] != "") brel[BS[2, k] K BH[2, k] K BT[2, k]]++
         }
       }
+      for (key in brel) if (brel[key] > arel[key]) nrc[substr(key, index(key, K) + 1)] += brel[key] - arel[key]
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
         if (BH[3, k] == "") die("a heading-less bullet under [Unreleased] of the branch")
         tcnt[BH[3, k] K BT[3, k]]++
       }
       for (k = 1; k <= na; k++) {
         key = AK[k]; t = substr(key, index(key, K) + 1)
-        if (nrc[key] < acnt[key]) die("no NEW release section of the base holds the ancestor bullet under the same ### subsection, as often as the ancestor had it (fold unproven): " title(t))
+        if (nrc[key] < acnt[key]) die("no release section of the base gained the ancestor bullet under the same ### subsection, as often as the ancestor had it (fold unproven): " title(t))
         if (t in ou) die("the ancestor bullet is still under the base [Unreleased] (no fold): " title(t))
         if (tcnt[key] < acnt[key]) die("the branch edited, moved or deleted an ancestor [Unreleased] bullet (or one of its copies): " title(t))
       }

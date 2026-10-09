@@ -8,7 +8,8 @@
 // and preserve the exact 1-arg onApprove contract.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { PlanPanel, derivePlanRevision } from "./PlanPanel";
+import cases from "../../../../fixtures/plan-revision/cases.json";
+import { PlanPanel, derivePlanDiffBase, derivePlanRevision } from "./PlanPanel";
 import { act } from "react";
 import { api, ApiError, type AgentSelectionInput, type Run, type RunMessage, type SecretMeta } from "../../lib/api";
 
@@ -656,5 +657,165 @@ describe("PlanPanel — verdicts bound to the gate revision (PRD #1795 M4)", () 
     expect(h.onReject.mock.calls[0]).toHaveLength(1);
     // No notice without a refusal (paired with the positive notice case above).
     expect(screen.queryByText(/was not applied/)).toBeNull();
+  });
+});
+
+describe("plan revision comparisons", () => {
+  function msg(seq: number, kind: string, payload: unknown): RunMessage {
+    return { seq, kind, payload, agent: "lead", agent_instance: null, agent_label: null, created_at: "2026-01-01T00:00:00Z" };
+  }
+  function feed(base: string, target: string) {
+    return [msg(1, "plan", { plan_md: base }), msg(2, "plan_feedback", {}), msg(3, "plan", { plan_md: target })];
+  }
+  function panel(text: string, messages: RunMessage[]) {
+    return <PlanPanel run={run({ plan_md: text, harness: "codex" })} messages={messages}
+      busy={false} canSteer={false} onApprove={vi.fn()} onReject={vi.fn()} />;
+  }
+  it("includes every required canonical branch", () => {
+    expect(cases.map((c) => c.name)).toEqual(expect.arrayContaining([
+      "one-line edit", "pending feedback", "re-presentation", "two rounds",
+      "earlier version with later feedback", "identical revise", "feedback is not reused",
+      "no predecessor", "automatic feedback", "unsorted feed", "trailing CR/LF equality",
+      "meaningful trailing spaces", "pending feedback preserves existing base",
+      "earlier revision keeps its own base",
+    ]));
+  });
+  it.each(cases)("$name matches the shared canonical base and equality", (c) => {
+    const messages = c.messages.map((m) => msg(m.seq, m.kind, m.payload));
+    const original = [...messages];
+    const result = derivePlanDiffBase(messages, c.target_seq);
+    expect(messages).toEqual(original);
+    if (c.expected.base_version === null) {
+      expect(result).toBeNull();
+    } else {
+      expect(result?.base).toEqual({
+        text: c.expected.base_plan_md,
+        version: c.expected.base_version,
+        seq: [...messages].filter((m) => m.kind === "plan" && m.seq < c.target_seq).sort((a,b) => b.seq-a.seq)[0].seq,
+      });
+      expect(result?.target).toEqual({ text: c.expected.plan_md, seq: c.target_seq, version: c.expected.version });
+      expect(result!.base.text.replace(/[\r\n]+$/, "") === result!.target.text.replace(/[\r\n]+$/, ""))
+        .toBe(c.expected.identical_after_feedback);
+    }
+    // The UI only compares the newest plan, irrespective of a historical selection.
+    const latest = [...messages].filter((m) => m.kind === "plan").sort((a,b) => b.seq-a.seq)[0];
+    render(panel((latest.payload as { plan_md: string }).plan_md, messages));
+    const current = derivePlanDiffBase(messages);
+    expect(screen.queryByText(/This revision is identical/)!==null).toBe(
+      current !== null && current.base.text.replace(/[\r\n]+$/, "") === current.target.text.replace(/[\r\n]+$/, ""),
+    );
+  });
+  it("rejects absent targets and invalid string payloads without backtracking", () => {
+    expect(derivePlanDiffBase(feed("a", "b"), 99)).toBeNull();
+    for (const payload of [null, {}, { plan_md: 3 }]) {
+      const messages = feed("a", "b");
+      messages[0] = msg(1, "plan", payload);
+      expect(derivePlanDiffBase(messages)).toBeNull();
+      messages[0] = msg(1, "plan", { plan_md: "a" });
+      messages[2] = msg(3, "plan", payload);
+      expect(derivePlanDiffBase(messages)).toBeNull();
+    }
+    expect(derivePlanDiffBase([msg(1,"plan",{plan_md:"a"}),msg(1,"plan_feedback",{}),msg(2,"plan",{plan_md:"b"})])).toBeNull();
+    expect(derivePlanDiffBase([msg(1,"plan",{plan_md:"a"}),msg(2,"plan_feedback",{}),msg(2,"plan",{plan_md:"b"})])).toBeNull();
+  });
+  it("defaults off, toggles counts/colors and resets on a new or unavailable target", () => {
+    const { rerender, container } = render(panel("new\n", feed("old\n", "new\n")));
+    const button = screen.getByRole("button", { name: "Show changes since v1" });
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("+1 / -1 lines")).toBeNull();
+    fireEvent.click(button);
+    expect(screen.getByText("+1 / -1 lines")).toBeTruthy();
+    expect([...container.querySelectorAll("span.block")].some((s) => s.className.includes("text-ok") && s.textContent?.includes("new"))).toBe(true);
+    expect([...container.querySelectorAll("span.block")].some((s) => s.className.includes("text-danger") && s.textContent?.includes("old"))).toBe(true);
+    fireEvent.click(button);
+    expect(screen.queryByText("+1 / -1 lines")).toBeNull();
+    fireEvent.click(button);
+    rerender(panel("third", [...feed("old\n", "new\n"), msg(4,"plan_feedback",{}), msg(5,"plan",{plan_md:"third"})]));
+    expect(screen.getByRole("button", {name:"Show changes since v2"}).getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(screen.getByRole("button", {name:"Show changes since v2"}));
+    rerender(panel("disagreement", feed("old", "new")));
+    expect(screen.queryByRole("button", {name:/Show changes/})).toBeNull();
+    expect(screen.queryByText(/This revision is identical/)).toBeNull();
+    rerender(panel("new", feed("old", "new")));
+    expect(screen.getByRole("button", {name:/Show changes/}).getAttribute("aria-expanded")).toBe("false");
+    rerender(panel("new", [msg(1,"plan",{plan_md:"new"})]));
+    expect(screen.queryByRole("button", {name:/Show changes/})).toBeNull();
+  });
+  it.each(["base", "target"])("caps original UTF8 bytes on %s at strictly over 200 KiB", (side) => {
+    const limit = "é".repeat(100 * 1024);
+    const make = (text: string) => side === "base" ? panel("other",feed(text,"other")) : panel(text,feed("other",text));
+    const { rerender } = render(make(limit));
+    expect(screen.queryByText("Plan too large to compare")).toBeNull();
+    expect(screen.getByRole("button",{name:/Show changes/})).toBeTruthy();
+    rerender(make(limit + "\n"));
+    expect(screen.getByText("Plan too large to compare")).toBeTruthy();
+    expect(screen.queryByRole("button",{name:/Show changes/})).toBeNull();
+    expect(screen.queryByText(/\+\d+ \/ -\d+ lines/)).toBeNull();
+  });
+  it("counts empty plans as zero lines and preserves spaces/interior CR", () => {
+    const { rerender, container } = render(panel("x",feed("","x")));
+    fireEvent.click(screen.getByRole("button",{name:/Show changes/}));
+    expect(screen.getByText("+1 / -0 lines")).toBeTruthy();
+    rerender(panel("a \r\nb",feed("a\nb","a \r\nb")));
+    fireEvent.click(screen.getByRole("button",{name:/Show changes/}));
+    expect(container.textContent).toContain("U+000D");
+    expect(screen.getByText("+1 / -1 lines")).toBeTruthy();
+    expect(screen.queryByText(/This revision is identical/)).toBeNull();
+  });
+  it.each([["", "\r\n"], ["\n\r", ""]])("treats CR/LF-only text as zero lines (%j -> %j)", (base, target) => {
+    render(panel(target, feed(base, target)));
+    expect(screen.getByText("This revision is identical to v1. Your requested changes were not applied.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Show changes/ }));
+    expect(screen.getByText("+0 / -0 lines")).toBeTruthy();
+  });
+  it("diffs malicious text as plain text and reveals controls without sanitizing counts/equality", () => {
+    const target = "<img src=x onerror=alert(1)>\u202E\n";
+    const { container } = render(panel(target,feed("<img src=x onerror=alert(1)>\n",target)));
+    expect(screen.queryByText(/This revision is identical/)).toBeNull();
+    fireEvent.click(screen.getByRole("button",{name:/Show changes/}));
+    const rows = [...container.querySelectorAll("span.block")];
+    expect(rows.some((r) => r.textContent?.includes("<img src=x onerror=alert(1)>"))).toBe(true);
+    expect(rows.some((r) => r.textContent?.includes("hidden character U+202E"))).toBe(true);
+    for (const row of rows) {
+      expect(row.querySelector("img")).toBeNull();
+      expect(row.textContent).not.toContain("\u202E");
+    }
+    expect(screen.getByText("+1 / -1 lines")).toBeTruthy();
+  });
+});
+
+describe("plan comparison boundaries", () => {
+  function msg(seq: number, kind: string, payload: unknown): RunMessage {
+    return { seq, kind, payload, agent: "lead", agent_instance: null, agent_label: null, created_at: "2026-01-01T00:00:00Z" };
+  }
+  function panel(text: string, base: string) {
+    return <PlanPanel run={run({plan_md:text,harness:"codex"})} messages={[
+      msg(1,"plan",{plan_md:base}),msg(2,"plan_feedback",{}),msg(3,"plan",{plan_md:text}),
+    ]} busy={false} canSteer={false} onApprove={vi.fn()} onReject={vi.fn()} />;
+  }
+  it.each(["base","target"])("accepts exactly 200 KiB ASCII and rejects one more byte on %s", (side) => {
+    const limit = "x".repeat(200 * 1024);
+    const make = (text: string) => side === "base" ? panel("other",text) : panel(text,"other");
+    const { rerender } = render(make(limit));
+    expect(screen.getByRole("button",{name:/Show changes/})).toBeTruthy();
+    rerender(make(limit+"x"));
+    expect(screen.getByText("Plan too large to compare")).toBeTruthy();
+  });
+  it("does not use an older target that matches the screen", () => {
+    render(<PlanPanel run={run({plan_md:"second",harness:"codex"})} messages={[
+      msg(1,"plan",{plan_md:"first"}),msg(2,"plan_feedback",{}),
+      msg(3,"plan",{plan_md:"second"}),msg(4,"plan_feedback",{}),msg(5,"plan",{plan_md:"third"}),
+    ]} busy={false} canSteer={false} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByRole("button",{name:/Show changes/})).toBeNull();
+  });
+  it("warns while collapsed, normalizes trailing CR/LF only, and leaves Markdown readable", () => {
+    const { container } = render(panel("# Readable\nsame\n\r","# Readable\nsame\r\n\n"));
+    const mainPlan = container.querySelector(".max-h-96") as HTMLElement;
+    expect(within(mainPlan).getByRole("heading",{name:"Readable"})).toBeTruthy();
+    expect(screen.getByText("This revision is identical to v1. Your requested changes were not applied.")).toBeTruthy();
+    const button = screen.getByRole("button",{name:/Show changes/});
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(button);
+    expect(screen.getByText("+0 / -0 lines")).toBeTruthy();
   });
 });
