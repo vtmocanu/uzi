@@ -307,6 +307,129 @@ it("bounds repeated claim accumulation without a hold listing", async () => {
   assert.equal((await client.reportState(RUN, { ...fixture.request, claim_generation: 4097 })).completedPublicationReceipt, undefined);
 });
 
+// Inspect retained values as well as the public ACK: a refusal alone would not detect
+// oversized strings or raw payload objects retained by completionClaims.
+for (const [field, value] of [
+  ["repo_id", "r".repeat(1_048_576)], ["repo_id", { payload: "r".repeat(4096) }],
+  ["repo_id", null], ["repo_id", 7], ["repo_id", "not-a-uuid"],
+  ["forge_type", "f".repeat(1_048_576)], ["forge_type", { toString: null }],
+  ["forge_type", null], ["forge_type", ["gitlab"]], ["forge_type", "unsupported"],
+  ["branch", "b".repeat(1_048_576)], ["branch", "b".repeat(2049)],
+  ["branch", "é".repeat(1025)], ["branch", { payload: "b".repeat(4096) }],
+  ["branch", null], ["branch", 7], ["branch", "review/unsafe\u202e"],
+  ["repo", null], ["repo", ["invalid"]],
+] as const) {
+  it(`retains bounded refusal marker for malformed claim provenance ${field} ${typeof value}`, async () => {
+    const repo = { ...(claim.repo as Record<string, unknown>) };
+    claim = { ...claim, kind: "mr_rework", branch: receipt.branch };
+    if (field === "repo_id") repo.id = value;
+    else if (field === "forge_type") repo.forge_type = value;
+    else if (field === "branch") claim.branch = value;
+    claim.repo = field === "repo" ? value : repo;
+    await client.register("worker");
+    const returned = await client.claimRun();
+    assert.deepEqual(returned, claim, "claimRun keeps its existing returned payload");
+    const bindings = Reflect.get(client, "completionClaims") as Map<string, unknown>;
+    assert.equal(bindings.has(`${RUN}:1`), true, "invalid provenance must not become unknown");
+    assert.equal(bindings.get(`${RUN}:1`), null, "retain only a small refusal marker");
+    const ack = await client.reportState(RUN, fixture.request);
+    assert.equal(ack.applied, true);
+    assert.equal(ack.status, "completed");
+    assert.equal(ack.completedPublicationReceipt, undefined);
+    assert.equal(Reflect.get(client, "completionBindingsSaturated"), false);
+  });
+}
+
+it("bounds retained provenance for sixteen oversized claims without saturation", async () => {
+  await client.register("worker");
+  for (let generation = 1; generation <= 16; generation++) {
+    claim = { ...claim, kind: "mr_rework", claim_generation: generation, branch: "b".repeat(1_048_576) };
+    await client.claimRun();
+  }
+  const bindings = Reflect.get(client, "completionClaims") as Map<string, unknown>;
+  assert.equal(bindings.size, 16);
+  assert.equal([...bindings.values()].every((value) => value === null), true,
+    "oversized claim payloads leave only refusal markers");
+  assert.equal(Reflect.get(client, "completionBindingsSaturated"), false);
+  response.completed_publication_receipt = { ...receipt, generation: 16 };
+  const ack = await client.reportState(RUN, { ...fixture.request, claim_generation: 16 });
+  assert.equal(ack.applied, true);
+  assert.equal(ack.status, "completed");
+  assert.equal(ack.completedPublicationReceipt, undefined);
+});
+
+it("retains malformed provenance refusal across a valid same-generation claim retry", async () => {
+  await client.register("worker");
+  claim = { ...claim, repo: null };
+  await client.claimRun();
+  claim = { ...claim, repo: { ...makeClaim().repo, id: receipt.repo_id, forge_type: "gitlab" } };
+  await client.claimRun();
+  await client.register("worker");
+  const ack = await client.reportState(RUN, fixture.request);
+  assert.equal(ack.applied, true);
+  assert.equal(ack.status, "completed");
+  assert.equal(ack.completedPublicationReceipt, undefined);
+});
+
+it("copies only validated primitive provenance from an otherwise large valid claim", async () => {
+  claim = { ...claim, kind: "mr_rework", branch: receipt.branch,
+    repo: { ...(claim.repo as Record<string, unknown>), extra: { payload: "x".repeat(4096) } } };
+  await client.register("worker");
+  await client.claimRun();
+  const bindings = Reflect.get(client, "completionClaims") as Map<string, unknown>;
+  assert.deepEqual(bindings.get(`${RUN}:1`), {
+    repoId: receipt.repo_id, forgeType: "gitlab", branch: receipt.branch, eligible: true, guarded: true,
+  });
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
+});
+
+it("refuses malformed claim provenance at the ACK even with valid receipt and known hold", async () => {
+  claim = { ...claim, kind: "mr_rework", branch: { payload: "oversized provenance" } };
+  await client.register("worker");
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  const ack = await client.reportState(RUN, fixture.request);
+  assert.equal(ack.applied, true);
+  assert.equal(ack.status, "completed");
+  assert.equal(ack.completedPublicationReceipt, undefined);
+});
+
+for (const branch of ["b".repeat(2048), "é".repeat(1024)]) {
+  it(`accepts bounded primitive claim provenance at the 2048-byte branch boundary ${branch.length}`, async () => {
+    claim = { ...claim, kind: "mr_rework", branch };
+    response.completed_publication_receipt = { ...receipt, branch };
+    await client.register("worker");
+    await client.claimRun();
+    assert.deepEqual((await client.reportState(RUN, { ...fixture.request, branch })).completedPublicationReceipt,
+      response.completed_publication_receipt);
+  });
+}
+
+for (const missing of ["repo", "repo_id", "forge_type", "branch", "kind"] as const) {
+  it(`preserves safe legacy claim fallback with absent ${missing}`, async () => {
+    const repo = { ...(claim.repo as Record<string, unknown>) };
+    claim = { ...claim, kind: "mr_rework", branch: receipt.branch };
+    if (missing === "repo_id") delete repo.id;
+    if (missing === "forge_type") delete repo.forge_type;
+    claim.repo = repo;
+    if (missing === "repo" || missing === "branch" || missing === "kind") delete claim[missing];
+    await client.register("worker");
+    await client.claimRun();
+    assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
+  });
+}
+
+it("ignores malformed optional receipt forge object with null toString without failing completed ACK", async () => {
+  response.completed_publication_receipt = { ...receipt, forge_type: { toString: null } };
+  await client.register("worker");
+  await client.claimRun();
+  const ack = await client.reportState(RUN, fixture.request);
+  assert.equal(ack.applied, true);
+  assert.equal(ack.status, "completed");
+  assert.equal(ack.completedPublicationReceipt, undefined);
+  assert.deepEqual(sent[0], fixture.request);
+});
+
 it("refuses known noneligible or unguarded claims", async () => {
   for (const changes of [{ inventory_guarded: false }, { kind: "ci_fix" }]) {
     claim = { ...claim, ...changes };

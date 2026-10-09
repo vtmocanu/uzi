@@ -1008,7 +1008,7 @@ export class WorkerClient {
   private completionWorkerId: string | undefined;
   private completionBindingsSaturated = false;
   // Authenticated observations only; empty later inventories do not erase an observed identity.
-  private readonly completionClaims = new Map<string, { repoId?: string; forgeType?: string; branch?: string; eligible: boolean; guarded: boolean }>();
+  private readonly completionClaims = new Map<string, { repoId?: string; forgeType?: string; branch?: string; eligible: boolean; guarded: boolean } | null>();
   private readonly completionHolds = new Map<string, string | null>();
   private readonly inventoryGuardedClaims = new Set<string>();
   private readonly settledInventoryGuardedClaims = new Set<string>();
@@ -1420,12 +1420,22 @@ export class WorkerClient {
       const branch = kind === "issue" && Number.isSafeInteger(claim.issue_iid) && (claim.issue_iid ?? 0) > 0
         ? `agent/issue-${claim.issue_iid}`
         : kind === "self_improve" ? `uzi/self-improve/${claim.run_id.toLowerCase()}`
-        : kind === "mr_rework" ? claim.branch ?? undefined : undefined;
+        : kind === "mr_rework" ? claim.branch : undefined;
       const key = `${claim.run_id}:${claim.claim_generation}`;
-      if (this.allowCompletionBinding(this.completionClaims.has(key))) this.completionClaims.set(key, {
-        repoId: claim.repo?.id, forgeType: claim.repo?.forge_type ?? "gitlab", branch,
-        eligible: ["issue", "mr_rework", "self_improve"].includes(kind), guarded: claim.inventory_guarded === true,
-      });
+      // Retain only bounded primitives. Missing legacy fields keep their fallback; malformed
+      // provenance retains a refusal marker so this generation cannot become an unknown claim.
+      const repo = isRecord(claim.repo) ? claim.repo : undefined;
+      const repoId = repo?.id;
+      const forgeType = repo?.forge_type === undefined ? "gitlab" : repo.forge_type;
+      const valid = (claim.repo === undefined || repo !== undefined) &&
+        (repoId === undefined || (terminalUUID(repoId) && repoId === repoId.toLowerCase())) &&
+        completionForgeType(forgeType) &&
+        (branch === undefined || (completionSafeIdentifier(branch) && Buffer.byteLength(branch, "utf8") <= 2048));
+      if (this.allowCompletionBinding(this.completionClaims.has(key))) this.completionClaims.set(key,
+        !valid || this.completionClaims.get(key) === null ? null : {
+          repoId: repoId as string | undefined, forgeType: forgeType as string, branch: branch as string | undefined,
+          eligible: ["issue", "mr_rework", "self_improve"].includes(kind), guarded: claim.inventory_guarded === true,
+        });
     }
     return claim;
   }
@@ -1653,7 +1663,7 @@ export class WorkerClient {
         !completionSHA(value.final_head) || value.final_head !== body.completion_final_head ||
         !completionSHA(value.observed_branch_head) ||
         !completionPositiveInteger(value.project_id) || !completionPositiveInteger(value.mr_iid) ||
-        (typeof value.forge_type !== "string" || !["gitlab", "forgejo", "github"].includes(value.forge_type)) ||
+        !completionForgeType(value.forge_type) ||
         !completionSafeIdentifier(value.branch) || !completionSafeIdentifier(value.base_url) ||
         (body.branch !== undefined && value.branch !== body.branch) ||
         (body.mr_iid !== undefined && value.mr_iid !== body.mr_iid)) return undefined;
@@ -1664,7 +1674,7 @@ export class WorkerClient {
     const key = `${runId}:${body.claim_generation}`;
     const claim = this.completionClaims.get(key);
     const hold = this.completionHolds.get(key);
-    if ((claim && (!claim.eligible || !claim.guarded ||
+    if (claim === null || (claim && (!claim.eligible || !claim.guarded ||
           (claim.repoId !== undefined && claim.repoId !== value.repo_id) ||
           (claim.forgeType !== undefined && claim.forgeType !== value.forge_type) ||
           (claim.branch !== undefined && claim.branch !== value.branch))) ||
@@ -3554,6 +3564,9 @@ function completionSHA(value: unknown): value is string {
 }
 function completionPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+function completionForgeType(value: unknown): value is CompletedPublicationReceipt["forge_type"] {
+  return value === "gitlab" || value === "forgejo" || value === "github";
 }
 function completionSafeIdentifier(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 2048 &&
