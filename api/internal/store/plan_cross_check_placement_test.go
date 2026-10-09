@@ -1,7 +1,9 @@
 package store_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -106,6 +108,32 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestCodeCrossCheckExcludedFromProvisioningLiveDB(t *testing.T) {
+	fx := codeCrossCheckFixture(t)
+	f := fx.f
+	ctx := context.Background()
+	if err := insertCodeFixture(t, fx, codeFixtureHead, codeFixtureBase, "pending", nil); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(ctx, t, f.pool, `UPDATE users SET ephemeral_workers_enabled=true WHERE id=$1`, f.userID)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status='running',claim_released_at=NULL WHERE id=$1`, f.runID)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status_since=now()-interval '1 hour' WHERE id=$1`, fx.checkerID)
+	fleet := &fleetFixture{t: t, ctx: ctx, pool: f.pool, q: f.q, userID: f.userID, repoID: f.repoID}
+	for _, missingProtocol := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing-protocol=%v", missingProtocol), func(t *testing.T) {
+			if missingProtocol {
+				mustExec(ctx, t, f.pool, `UPDATE workers SET protocol_capabilities='{}' WHERE id=$1`, f.workerID)
+			}
+			iv := leaseInterval(leaseTwoHours)
+			if listedUnplaceable(fleet, 1000, iv)[fx.checkerID] ||
+				listedSaturation(fleet, 1000, iv)[fx.checkerID] ||
+				listedIsolated(fleet, 1000)[fx.checkerID] {
+				t.Fatal("CODE child must stay on its own worker without new provisioning")
+			}
+		})
 	}
 }
 

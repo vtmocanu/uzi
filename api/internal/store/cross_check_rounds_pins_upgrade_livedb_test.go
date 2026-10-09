@@ -112,10 +112,26 @@ func TestCrossCheckRoundsPinsUpgradeLiveDB(t *testing.T) {
 	if err = store.MigrateTo(ctx, u.String(), 312); err != nil {
 		t.Fatal(err)
 	}
-	q := store.New(pool)
+	// Read the migration-312 shape, independent of columns added at head.
+	// Evidence retains the entire historical row for the resettlement comparisons.
+	type historicalCheck struct {
+		store.CrossCheck
+		Evidence string
+	}
+	readPlanCrossCheck := func(lead uuid.UUID) (historicalCheck, error) {
+		var cc historicalCheck
+		err := pool.QueryRow(ctx, `SELECT wait_credited, automatic_rounds_enabled,
+   automatic_revision_limit, plan_md, candidate_digest, verdict, round,
+   checker_model_source, checker_effort_source, to_jsonb(cc)::text
+   FROM cross_checks cc WHERE lead_run_id=$1 AND stage='plan'
+   ORDER BY round DESC LIMIT 1`, lead).Scan(&cc.WaitCredited, &cc.AutomaticRoundsEnabled,
+			&cc.AutomaticRevisionLimit, &cc.PlanMd, &cc.CandidateDigest, &cc.Verdict,
+			&cc.Round, &cc.CheckerModelSource, &cc.CheckerEffortSource, &cc.Evidence)
+		return cc, err
+	}
 	for _, s := range rows {
 		t.Run(fmt.Sprintf("decided=%v/source=%v", s.decided, s.source), func(t *testing.T) {
-			cc, e := q.GetPlanCrossCheck(ctx, s.lead)
+			cc, e := readPlanCrossCheck(s.lead)
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -131,7 +147,7 @@ func TestCrossCheckRoundsPinsUpgradeLiveDB(t *testing.T) {
 				t.Fatal("historical snapshot widened")
 			}
 			mustExec(ctx, t, pool, "UPDATE runs SET claim_generation=2 WHERE id=$1", s.lead)
-			settled, e := q.GetPlanCrossCheck(ctx, s.lead)
+			settled, e := readPlanCrossCheck(s.lead)
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -156,7 +172,7 @@ func TestCrossCheckRoundsPinsUpgradeLiveDB(t *testing.T) {
 				}
 			}
 			mustExec(ctx, t, pool, "UPDATE runs SET claim_generation=3 WHERE id=$1", s.lead)
-			after, e := q.GetPlanCrossCheck(ctx, s.lead)
+			after, e := readPlanCrossCheck(s.lead)
 			if e != nil || !reflect.DeepEqual(settled, after) {
 				t.Fatalf("second settlement changed evidence: %v", e)
 			}
@@ -179,7 +195,7 @@ func TestCrossCheckRoundsPinsUpgradeLiveDB(t *testing.T) {
  VALUES($1,'plan',2,1,'second','[]','s',repeat('a',40),$2,$3,'codex','gpt-6-astra','xhigh','pin','pin',
  now()-interval '20 seconds',now()+interval '10 minutes',true,2)`, lead, []byte("second digest"), child)
 	mustExec(ctx, t, pool, "UPDATE runs SET claim_generation=2 WHERE id=$1", lead)
-	settled, e := q.GetPlanCrossCheck(ctx, lead)
+	settled, e := readPlanCrossCheck(lead)
 	if e != nil || settled.Round != 2 || !settled.WaitCredited || settled.CheckerModelSource.String != "pin" ||
 		settled.CheckerEffortSource.String != "pin" || settled.Verdict != "failed" {
 		t.Fatalf("new round 2 settlement: %+v err=%v", settled, e)
@@ -192,7 +208,7 @@ func TestCrossCheckRoundsPinsUpgradeLiveDB(t *testing.T) {
 		t.Fatal(e)
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET claim_generation=3 WHERE id=$1", lead)
-	after, e := q.GetPlanCrossCheck(ctx, lead)
+	after, e := readPlanCrossCheck(lead)
 	if e != nil || !reflect.DeepEqual(settled, after) {
 		t.Fatalf("round 2 resettlement changed evidence: %v", e)
 	}

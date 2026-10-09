@@ -10568,7 +10568,9 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]))
+  -- Orphan PLAN children retain the legacy capability-gap provisioning path;
+  -- the CODE exclusion above keeps known CODE children on their own worker.
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w

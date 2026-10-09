@@ -135,11 +135,9 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 		AND pg_get_triggerdef(oid) LIKE '%settle_exited_plan_cross_check()%'
 		FROM pg_trigger WHERE tgname='runs_settle_exited_plan_cross_check' AND NOT tgisinternal`)
 	assertSQL("docker preference function preserved", `SELECT fn_ephemeral_docker_preference_applies(true,true,$1,'issue',NULL,ARRAY[$1]::uuid[])`, repo)
-	q := store.New(pool)
-	settings, err := q.GetUserByID(ctx, user)
-	if err != nil || !settings.EphemeralDockerEnabled || settings.PlanCrossCheckEnabled {
-		t.Fatalf("generated GetUserByID: %+v, %v", settings, err)
-	}
+	// Keep the settings read at migration 302 independent of head-only columns.
+	assertSQL("historical user settings", `SELECT ephemeral_docker_enabled AND NOT plan_cross_check_enabled
+		FROM users WHERE id=$1`, user)
 	child := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,kind,target_run_id,harness,report_only,budget_wall_seconds,
 		issue_title,issue_description,status) VALUES($1,$2,$3,'cross_check',$4,'codex',true,1800,'checker','candidate','running')`,
