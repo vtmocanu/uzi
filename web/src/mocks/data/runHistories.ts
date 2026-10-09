@@ -350,9 +350,9 @@ function demoRunUsage(r: Run): RunUsage | null {
     cache_read_tokens: round(1_170_000),
     cache_creation_tokens: 0,
     output_tokens: round(48_200),
-    cost_usd: Math.round(187 * scale) / 100,
-    // PRD #1429 M1 (D7): these mock runs are Claude/metered, so a real dollar total shows.
-    cost_status: "metered",
+    // One legacy row has no estimate; the mixed run retains its recorded partial.
+    cost_usd: r.id === "run-closed" ? 0 : r.id === "run-failed" ? 0.61 : Math.round(187 * scale) / 100,
+    cost_status: r.id === "run-closed" ? "subscription" : r.id === "run-failed" ? "unreported" : "metered",
   };
 }
 

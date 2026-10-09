@@ -554,8 +554,8 @@ export const mockRuns: Run[] = [
       findings: { summary: "## Checker findings\n\nKeep notification delivery idempotent.", items: [
         { file: "api/internal/notifier", severity: "warning", summary: "Avoid duplicate emails.", rationale: "A parked run may replay its approval transition." },
       ] },
-      checker_run_id: null, checker_model: "gpt-5.4", checker_effort: "high", checker_model_source: null, checker_effort_source: null,
-      usage: { input_tokens: 1200, output_tokens: 250, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0, cost_status: "subscription" },
+      checker_run_id: null, checker_model: "gpt-6.1-sol", checker_effort: "high", checker_model_source: null, checker_effort_source: null,
+      usage: { input_tokens: 300, output_tokens: 200, cache_read_tokens: 600, cache_creation_tokens: 100, cost_usd: 0.00291, cost_status: "metered" },
       historical: false,
     },
     worker_id: "w-laptop",
@@ -1306,7 +1306,7 @@ export const mockRuns: Run[] = [
     issue_iid: 12,
     issue_title: "Retry the flaky worker heartbeat probe",
     issue_description: "See prds/12-board-run-lifecycle.md.",
-    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
+    harness: "codex", // Legacy worker row: tokens recorded without a cost estimate.
     kind: "issue",
     title: null,
     resume_of_run_id: null,

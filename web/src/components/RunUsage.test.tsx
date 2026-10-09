@@ -52,6 +52,11 @@ function twoPhase(): RunMessage[] {
 }
 
 describe("RunUsagePanel", () => {
+  it("Codex recorded cost states the uzi price-table basis", () => {
+    const view = render(<RunUsagePanel costStatus="metered" harness="codex" usage={deriveRunUsage(twoPhase())} />);
+    expect(view.getByText("API-equivalent · uzi price table")).toBeTruthy();
+    expect(view.getAllByText("$1.26").length).toBeGreaterThan(0);
+  });
   it("renders the strip totals, per-phase deltas, and per-agent attribution", () => {
     const { getByText, getAllByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
 
@@ -272,7 +277,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
 // that (a real reading, e.g. a cache-only call), and "—" is retired from cost display
 // entirely — it used to mean both "no data" and "we chose not to say", indistinguishably.
 describe("RunUsagePanel cost status (PRD #1429 D7)", () => {
-  it("metered: shows the real dollar figure — even a genuine $0.00 — and names the credential", () => {
+  it("metered: shows the real dollar figure — even a genuine $0.00 — and states the API-equivalent basis", () => {
     seq = 0;
     // Note it is `costUSD: 0` on the model entry that matters, not the frame's
     // `total_cost_usd` (issue #195).
@@ -281,23 +286,26 @@ describe("RunUsagePanel cost status (PRD #1429 D7)", () => {
       <RunUsagePanel costStatus="metered" harness="claude" usage={deriveRunUsage(messages)} />,
     );
     // Positive: the real metered figure renders as an actual dollar amount, and the
-    // sub-label names the credential it was spent against.
+    // sub-label names the estimate basis.
     expect(container.textContent).toContain("$0.00");
-    expect(container.textContent).toContain("your Anthropic token");
+    expect(container.textContent).toContain("API-equivalent · Claude SDK");
     // Negative, paired with the above: never the retired ambiguous dash, and never a
     // non-metered label leaking onto a metered run.
     expect(container.textContent).not.toContain("—");
-    expect(container.textContent).not.toContain("Subscription");
+    expect(container.textContent).not.toContain("No estimate");
     expect(container.textContent).not.toContain("Unavailable");
   });
 
   it("subscription: never a dollar figure even with real tokens spent — labelled, not hidden", () => {
     seq = 0;
     const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
-    const { container } = render(<RunUsagePanel costStatus="subscription" usage={deriveRunUsage(messages)} />);
-    // Positive: the run is explicitly labelled as subscription usage...
-    expect(container.textContent).toContain("Subscription");
-    expect(container.textContent).toContain("subscription usage");
+    const usage = deriveRunUsage(messages);
+    usage.total.costUsd = 4.2;
+    const { container, getAllByText } = render(<RunUsagePanel costStatus="subscription" usage={usage} />);
+    expect(getAllByText("n/a").length).toBeGreaterThan(0);
+    // Positive: the legacy row explicitly has no recorded estimate...
+    expect(container.textContent).toContain("No estimate");
+    expect(container.textContent).toContain("no cost estimate recorded");
     // ...and its real tokens are still shown, not hidden alongside the missing dollar.
     expect(container.textContent).toContain("Tokens in");
     // Negative, paired with the above: no dollar figure anywhere in the panel, and
@@ -603,9 +611,9 @@ describe("RunUsageTailBlock", () => {
         <RunUsageTailBlock tail={tail()} />
       </div>,
     );
-    const block = container.querySelector('section[aria-label="Estimated usage, not metered"]')!;
+    const block = container.querySelector('section[aria-label="Estimated usage, not in the total"]')!;
     expect(block).toBeTruthy();
-    expect(getByText("Estimated, not metered")).toBeTruthy();
+    expect(getByText("Estimated, not in the total")).toBeTruthy();
     expect(block.textContent).toContain("~$1.23 estimated");
     expect(block.textContent).toContain("anthropic-standard-2026-10-03");
     // The metered group does not contain the tail block.
@@ -640,7 +648,7 @@ describe("RunUsageTailBlock", () => {
     expect(hidden.container.textContent).toBe("");
     cleanup();
     const shown = render(<RunUsageTailBlock tail={tail({ ...zero, cost_usd: null, cost_status: "unpriced" })} />);
-    expect(shown.container.textContent).toContain("Estimated, not metered");
+    expect(shown.container.textContent).toContain("Estimated, not in the total");
   });
 
   it("explains each coverage reason in words and shows an unknown reason safely", () => {

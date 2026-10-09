@@ -640,14 +640,14 @@ describe("RunsList — cost_status truthfulness (PRD #1429 M4b D7)", () => {
         aRun({
           id: "sub",
           issue_title: "Subscription run",
-          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "subscription" as const },
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 4.2, cost_status: "subscription" as const },
         }),
       ],
     });
     renderRuns();
     await waitFor(() => expect(screen.getByText("Subscription run")).toBeTruthy());
     // Positive: the honest marker is shown, and tokens still render (not hidden).
-    expect(screen.getByText(/subscription/)).toBeTruthy();
+    expect(screen.getByText("cost n/a")).toBeTruthy();
     expect(screen.getByText(/tok/)).toBeTruthy();
     // Negative, paired with the above: never a dollar figure for this run.
     expect(screen.queryByText(/\$/)).toBeNull();

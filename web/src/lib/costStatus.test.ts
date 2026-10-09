@@ -51,18 +51,19 @@ describe("costHeadline / costSubLabel / costCellText", () => {
     const d = costDisplay("metered", 2.5);
     expect(costHeadline(d)).toBe("$2.50");
     expect(costCellText(d)).toBe("$2.50");
-    expect(costSubLabel(d, "claude")).toBe("your Anthropic token");
-    expect(costSubLabel(d, "codex")).toBe("your OpenAI credential");
-    expect(costSubLabel(d)).toBe("your token");
+    expect(costSubLabel(d, "claude")).toBe("API-equivalent · Claude SDK");
+    expect(costSubLabel(d, "codex")).toBe("API-equivalent · uzi price table");
+    expect(costSubLabel(d)).toBe("API-equivalent");
+    expect(costSubLabel(d, "future-harness")).toBe("API-equivalent");
   });
 
   it("subscription never renders a dollar string anywhere, and names itself in the sub-label", () => {
     const d = costDisplay("subscription", 0);
-    expect(costHeadline(d)).toBe("Subscription");
+    expect(costHeadline(d)).toBe("No estimate");
     expect(costHeadline(d)).not.toMatch(/\$/);
-    expect(costCellText(d)).toBe("sub");
+    expect(costCellText(d)).toBe("n/a");
     expect(costCellText(d)).not.toMatch(/\$/);
-    expect(costSubLabel(d)).toMatch(/subscription usage/);
+    expect(costSubLabel(d)).toMatch(/no cost estimate recorded/);
   });
 
   it("unavailable (unreported) never renders a dollar string, and says cost is unavailable", () => {
@@ -88,18 +89,21 @@ describe("aggregateDisclosure (PRD #1429 D7 mixed aggregate)", () => {
   });
 
   it.each([
-    [1, 0, "+ 1 Codex sub run"],
-    [4, 0, "+ 4 Codex sub runs"],
+    [1, 0, "+ 1 run without a cost estimate"],
+    [4, 0, "+ 4 runs without a cost estimate"],
     [0, 1, "+ 1 unreported run"],
     [0, 3, "+ 3 unreported runs"],
-    [1, 1, "+ 1 Codex sub run and 1 unreported run"],
-    [2, 1, "+ 2 Codex sub runs and 1 unreported run"],
-    [1, 2, "+ 1 Codex sub run and 2 unreported runs"],
-    [2, 3, "+ 2 Codex sub runs and 3 unreported runs"],
+    [1, 1, "+ 1 run without a cost estimate and 1 unreported run"],
+    [2, 1, "+ 2 runs without a cost estimate and 1 unreported run"],
+    [1, 2, "+ 1 run without a cost estimate and 2 unreported runs"],
+    [2, 3, "+ 2 runs without a cost estimate and 3 unreported runs"],
   ])("discloses %i subscription and %i unreported runs with independent grammar", (sub, unrep, text) => {
     const d = aggregateDisclosure(sub, unrep);
     expect(d.incomplete).toBe(true);
     expect(d.text).toBe(text);
+    expect(d.title).toBe(sub > 0
+      ? unrep > 0 ? "Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included" : "Runs without a cost estimate: tokens only"
+      : "Unreported runs: cost incomplete; recorded partial costs included");
   });
 
   it("negative/hostile counts never crash and never disclose below zero", () => {

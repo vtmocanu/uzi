@@ -2696,7 +2696,8 @@ export interface CompletionAccepted {
 export type Harness = "claude" | "codex";
 
 // CostStatus is a run's folded cost-observability marker (PRD #1429 M1 / D7): metered rows
-// carry a real dollar cost, subscription/unreported rows do NOT, so a reader keys on this
+// carry a recorded API-equivalent estimate; subscription means no estimate recorded.
+// Unreported run cost is unavailable (aggregates retain recorded partials), so a reader keys on this
 // rather than reading a placeholder cost_usd 0 as a real total. Same forward-compat rule as
 // Harness — render an unrecognised value honestly.
 export type CostStatus = "metered" | "subscription" | "unreported";
@@ -3516,14 +3517,14 @@ export interface RunUsage {
   output_tokens: number;
   cost_usd: number;
   /** The run's folded per-run cost_status (PRD #1429 M1 / D7): render dollars only for
-   *  "metered"; "subscription" is labelled subscription usage; "unreported" shows tokens
+   *  "metered" (recorded API-equivalent); "subscription" means no estimate recorded; "unreported" shows tokens
    *  with cost unavailable. On a PER-RUN bundle (a run's usage) it is the real status; on a
    *  per-WINDOW aggregate (SelfUsage.lifetime/last_7_days) a single status does not apply and
    *  it is "" — the window's truth is the subscription/unreported counts on SelfUsage. */
   cost_status: CostStatus | "";
 }
 
-// UsageTail is the estimated, not metered, usage of an interrupted Claude session (issue
+// UsageTail is the estimated usage outside the recorded total of an interrupted Claude session (issue
 // #2014). cost_usd is null (never 0) when cost_status is "unpriced". coverage_reasons is a
 // closed set today (see lib/usageTail.ts) but a newer server may add one: render unknown
 // reasons honestly.
@@ -3633,7 +3634,8 @@ export interface SelfUsage {
   outcomes: { lifetime: RunOutcomes; last_7_days: RunOutcomes };
   /** PRD #1429 M1 / D7: the per-window subscription/unreported run counts, so a mixed
    *  aggregate can disclose that a non-metered component makes the numeric dollar total
-   *  incomplete rather than presenting a partial sum as complete. Lifetime AND last-seven. */
+   *  incomplete rather than presenting a partial sum as complete. Recorded partial costs from
+   *  unreported runs remain included. Subscription rows have no estimate. Lifetime AND last-seven. */
   lifetime_subscription_run_count: number;
   lifetime_unreported_run_count: number;
   last7_subscription_run_count: number;
