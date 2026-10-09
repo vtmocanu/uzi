@@ -77,9 +77,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
-      # Docker Hub pulls (Dockerfile bases, kindest/node) through mirror.gcr.io.
-      - uses: ./.github/actions/dockerhub-mirror
-
       # Build the api + web images the chart runs. api context is api/ (its own
       # .dockerignore); web context is the repo ROOT so the Dockerfile can bundle
       # docs/ (the root .dockerignore applies). Both tagged :kind, which

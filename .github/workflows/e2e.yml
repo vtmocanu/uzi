@@ -84,10 +84,6 @@ jobs:
           go-version: "1.27"
           check-latest: true
 
-      # Docker Hub pulls (compose images) through mirror.gcr.io; restarts dockerd, so it
-      # runs before the buildx builder container exists.
-      - uses: ./.github/actions/dockerhub-mirror
-
       # A docker-container buildx builder, made current, so the harness's
       # `compose build` can import the agent image's read-only registry layer cache
       # (e2e/docker-compose.e2e.yml `cache_from`). The harness needs these images in
@@ -100,7 +96,9 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
-          driver-opts: default-load=true
+          driver-opts: |
+            default-load=true
+            image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       - name: Run compose E2E (stub executor)
         # Pin the harness rundir to a known path so the upload + issue steps can find
