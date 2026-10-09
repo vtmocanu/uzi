@@ -721,6 +721,10 @@ export class Worker {
           "cross_check_v1",
           "cross_check_rounds_v1",
           "cross_check_pins_v1",
+          // PRD #2460: this image runs a Codex lead's checked plan gate and a Claude plan
+          // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
+          // always present, and the api requires it of a worker claiming a Claude child.
+          "cross_check_codex_lead_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does

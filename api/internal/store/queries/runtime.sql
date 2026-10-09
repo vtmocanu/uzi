@@ -1042,6 +1042,8 @@ WITH claimant AS MATERIALIZED (
            OR 'codex_completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+           OR 'cross_check_codex_lead_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1287,6 +1289,8 @@ WITH claimant AS MATERIALIZED (
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+           OR 'cross_check_codex_lead_v1' = ANY(p.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -9373,6 +9377,8 @@ WHERE run.id = @run_id
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.plan_cross_check_required OR run.kind = 'cross_check')
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude')
+           OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = run.id
@@ -9768,6 +9774,8 @@ WHERE r.status = 'queued'
                  )
         AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -9934,6 +9942,8 @@ WHERE r.status = 'queued'
                  )
         AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -9997,6 +10007,8 @@ WHERE r.status = 'queued'
                  )
         AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10604,26 +10616,34 @@ SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' O
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
                   issue_title, issue_description, required_capabilities, trigger_source, worker_id)
-SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
+SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_harness::text, 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
        COALESCE(repo.required_capabilities, '{}'), 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
-  AND lead.harness = 'claude' AND lead.plan_cross_check_required AND lead.auto_approve
+  -- Guarded write (PRD #2460): the child is always the OPPOSITE family of its lead.
+  AND lead.harness IN ('claude', 'codex') AND lead.harness <> @child_harness::text
+  AND lead.plan_cross_check_required AND lead.auto_approve
   AND COALESCE(octet_length(lead.issue_title), 0) <= 4096
   AND COALESCE(octet_length(lead.issue_description), 0) <= 262144
 RETURNING *;
 
 -- name: InsertPlanCrossCheck :one
+-- checker_harness is read from the child row (one source of truth) and must differ from
+-- the lead's harness (PRD #2460). A miss inserts nothing (pgx.ErrNoRows).
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
     plan_md, milestones, required_capabilities, required_tools, size_class,
     base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, deadline_at, automatic_revision_limit, automatic_rounds_enabled)
-VALUES (@lead_run_id, 'plan', COALESCE(NULLIF(@round::int, 0), 1), @lead_claim_generation,
-    @plan_md, @milestones::jsonb, @required_capabilities::text[], @required_tools::text[],
-    @size_class, @base_commit, @planning_diff, @candidate_digest, @checker_run_id,
-    'codex', @deadline_at::timestamptz, @automatic_revision_limit::int, @automatic_rounds_enabled::boolean)
+SELECT lead.id, 'plan', COALESCE(NULLIF(@round::int, 0), 1), @lead_claim_generation::bigint,
+    sqlc.narg('plan_md')::text, @milestones::jsonb, @required_capabilities::text[], @required_tools::text[],
+    sqlc.narg('size_class')::text, sqlc.narg('base_commit')::text, sqlc.narg('planning_diff')::text, @candidate_digest::bytea, child.id, child.harness,
+    @deadline_at::timestamptz, @automatic_revision_limit::int, @automatic_rounds_enabled::boolean
+FROM runs lead JOIN runs child ON child.id = @checker_run_id::uuid
+WHERE lead.id = @lead_run_id::uuid
+  AND child.kind = 'cross_check' AND child.target_run_id = lead.id AND child.user_id = lead.user_id
+  AND lead.harness IN ('claude', 'codex') AND lead.harness <> child.harness
 RETURNING *;
 
 -- name: GetOwnedPlanCrossCheck :one

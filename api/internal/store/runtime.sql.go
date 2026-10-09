@@ -1055,6 +1055,8 @@ WITH claimant AS MATERIALIZED (
            OR 'codex_completion_interlock_v1' = ANY($14::text[]))
       AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
            OR 'cross_check_v1' = ANY($14::text[]))
+      AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+           OR 'cross_check_codex_lead_v1' = ANY($14::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1300,6 +1302,8 @@ WITH claimant AS MATERIALIZED (
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+           OR 'cross_check_codex_lead_v1' = ANY(p.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -2257,6 +2261,8 @@ WHERE run.id = $8
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.plan_cross_check_required OR run.kind = 'cross_check')
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude')
+           OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = run.id
@@ -3196,14 +3202,16 @@ const createPlanCrossCheckChild = `-- name: CreatePlanCrossCheckChild :one
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
                   issue_title, issue_description, required_capabilities, trigger_source, worker_id)
-SELECT $1, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
-       true, $2::int, now(), true, lead.issue_title, lead.issue_description,
+SELECT $1, lead.user_id, lead.repo_id, 'cross_check', lead.id, $2::text, 2,
+       true, $3::int, now(), true, lead.issue_title, lead.issue_description,
        COALESCE(repo.required_capabilities, '{}'), 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
-WHERE lead.id = $3 AND lead.user_id = $4
-  AND lead.worker_id = $5 AND lead.claim_generation = $6
+WHERE lead.id = $4 AND lead.user_id = $5
+  AND lead.worker_id = $6 AND lead.claim_generation = $7
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
-  AND lead.harness = 'claude' AND lead.plan_cross_check_required AND lead.auto_approve
+  -- Guarded write (PRD #2460): the child is always the OPPOSITE family of its lead.
+  AND lead.harness IN ('claude', 'codex') AND lead.harness <> $2::text
+  AND lead.plan_cross_check_required AND lead.auto_approve
   AND COALESCE(octet_length(lead.issue_title), 0) <= 4096
   AND COALESCE(octet_length(lead.issue_description), 0) <= 262144
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation
@@ -3211,6 +3219,7 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 
 type CreatePlanCrossCheckChildParams struct {
 	ChildID           uuid.UUID   `json:"child_id"`
+	ChildHarness      string      `json:"child_harness"`
 	BudgetWallSeconds int32       `json:"budget_wall_seconds"`
 	LeadRunID         uuid.UUID   `json:"lead_run_id"`
 	UserID            uuid.UUID   `json:"user_id"`
@@ -3221,6 +3230,7 @@ type CreatePlanCrossCheckChildParams struct {
 func (q *Queries) CreatePlanCrossCheckChild(ctx context.Context, arg CreatePlanCrossCheckChildParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createPlanCrossCheckChild,
 		arg.ChildID,
+		arg.ChildHarness,
 		arg.BudgetWallSeconds,
 		arg.LeadRunID,
 		arg.UserID,
@@ -7334,15 +7344,18 @@ const insertPlanCrossCheck = `-- name: InsertPlanCrossCheck :one
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
     plan_md, milestones, required_capabilities, required_tools, size_class,
     base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, deadline_at, automatic_revision_limit, automatic_rounds_enabled)
-VALUES ($1, 'plan', COALESCE(NULLIF($2::int, 0), 1), $3,
-    $4, $5::jsonb, $6::text[], $7::text[],
-    $8, $9, $10, $11, $12,
-    'codex', $13::timestamptz, $14::int, $15::boolean)
+SELECT lead.id, 'plan', COALESCE(NULLIF($1::int, 0), 1), $2::bigint,
+    $3::text, $4::jsonb, $5::text[], $6::text[],
+    $7::text, $8::text, $9::text, $10::bytea, child.id, child.harness,
+    $11::timestamptz, $12::int, $13::boolean
+FROM runs lead JOIN runs child ON child.id = $14::uuid
+WHERE lead.id = $15::uuid
+  AND child.kind = 'cross_check' AND child.target_run_id = lead.id AND child.user_id = lead.user_id
+  AND lead.harness IN ('claude', 'codex') AND lead.harness <> child.harness
 RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited
 `
 
 type InsertPlanCrossCheckParams struct {
-	LeadRunID              uuid.UUID          `json:"lead_run_id"`
 	Round                  int32              `json:"round"`
 	LeadClaimGeneration    int64              `json:"lead_claim_generation"`
 	PlanMd                 pgtype.Text        `json:"plan_md"`
@@ -7353,15 +7366,17 @@ type InsertPlanCrossCheckParams struct {
 	BaseCommit             pgtype.Text        `json:"base_commit"`
 	PlanningDiff           pgtype.Text        `json:"planning_diff"`
 	CandidateDigest        []byte             `json:"candidate_digest"`
-	CheckerRunID           pgtype.UUID        `json:"checker_run_id"`
 	DeadlineAt             pgtype.Timestamptz `json:"deadline_at"`
 	AutomaticRevisionLimit int32              `json:"automatic_revision_limit"`
 	AutomaticRoundsEnabled bool               `json:"automatic_rounds_enabled"`
+	CheckerRunID           uuid.UUID          `json:"checker_run_id"`
+	LeadRunID              uuid.UUID          `json:"lead_run_id"`
 }
 
+// checker_harness is read from the child row (one source of truth) and must differ from
+// the lead's harness (PRD #2460). A miss inserts nothing (pgx.ErrNoRows).
 func (q *Queries) InsertPlanCrossCheck(ctx context.Context, arg InsertPlanCrossCheckParams) (CrossCheck, error) {
 	row := q.db.QueryRow(ctx, insertPlanCrossCheck,
-		arg.LeadRunID,
 		arg.Round,
 		arg.LeadClaimGeneration,
 		arg.PlanMd,
@@ -7372,10 +7387,11 @@ func (q *Queries) InsertPlanCrossCheck(ctx context.Context, arg InsertPlanCrossC
 		arg.BaseCommit,
 		arg.PlanningDiff,
 		arg.CandidateDigest,
-		arg.CheckerRunID,
 		arg.DeadlineAt,
 		arg.AutomaticRevisionLimit,
 		arg.AutomaticRoundsEnabled,
+		arg.CheckerRunID,
+		arg.LeadRunID,
 	)
 	var i CrossCheck
 	err := row.Scan(
@@ -10211,6 +10227,8 @@ WHERE r.status = 'queued'
                  )
         AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10274,6 +10292,8 @@ WHERE r.status = 'queued'
                  )
         AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10508,6 +10528,8 @@ WHERE r.status = 'queued'
                  )
         AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
+             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id

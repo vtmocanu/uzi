@@ -197,6 +197,21 @@ class FakeTransport implements CodexTransport {
   closes = 0;
   threadStartCount = 0;
   turnStartCount = 0;
+  private readonly firstTurnListeners = new Set<() => void>();
+
+  onFirstTurnStart(listener: () => void): () => void {
+    const owner = this.countsFrom ?? this;
+    if (owner.turnStartCount > 0) {
+      listener();
+      return () => {};
+    }
+    owner.firstTurnListeners.add(listener);
+    return () => { owner.firstTurnListeners.delete(listener); };
+  }
+
+  firstTurnListenerCount(): number {
+    return (this.countsFrom ?? this).firstTurnListeners.size;
+  }
   /** When set for a method, request() returns THIS (rejects/pends) instead of the responder. */
   requestOverride?: (c: ResponderCtx, opts?: { signal?: AbortSignal; deadlineMs?: number }) => Promise<unknown> | undefined;
 
@@ -252,7 +267,12 @@ class FakeTransport implements CodexTransport {
       return Promise.resolve({ type: rec(params).type } as T);
     }
     if (method === "thread/start") counts.threadStartCount += 1;
-    if (method === "turn/start") counts.turnStartCount += 1;
+    if (method === "turn/start") {
+      counts.turnStartCount += 1;
+      const listeners = [...counts.firstTurnListeners];
+      counts.firstTurnListeners.clear();
+      for (const listener of listeners) listener();
+    }
     const c: ResponderCtx = {
       transport: this,
       method,
@@ -790,6 +810,75 @@ async function waitFor(cond: () => boolean, label: string, ms = 3000): Promise<v
     await tick();
   }
 }
+
+function armFirstTurnReadiness(transport: FakeTransport, signal: AbortSignal) {
+  let resolveReady!: () => void;
+  let rejectReady!: (reason: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  const removeListener = transport.onFirstTurnStart(resolveReady);
+  const abort = () => rejectReady(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  const dispose = () => {
+    removeListener();
+    signal.removeEventListener("abort", abort);
+  };
+  return {
+    wait: async (execution: Promise<unknown>) => {
+      try {
+        await Promise.race([ready, execution.then(() => {
+          throw new Error("runner execution ended before its first provider turn");
+        })]);
+      } finally { dispose(); }
+    },
+    dispose,
+  };
+}
+
+describe("#2535 first-turn readiness", () => {
+  it("observes the first turn from a successor transport and removes listeners", async () => {
+    const primary = new FakeTransport(() => ({}));
+    const successor = new FakeTransport(() => ({}));
+    successor.countsFrom = primary;
+    const controller = new AbortController();
+    const ready = armFirstTurnReadiness(primary, controller.signal);
+    const waiting = ready.wait(new Promise(() => {}));
+    assert.equal(primary.firstTurnListenerCount(), 1);
+    await successor.request("turn/start");
+    await waiting;
+    assert.equal(primary.firstTurnListenerCount(), 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+
+  it("propagates execution failure before readiness and removes listeners", async () => {
+    const transport = new FakeTransport(() => ({}));
+    const controller = new AbortController();
+    const ready = armFirstTurnReadiness(transport, controller.signal);
+    const failure = new Error("controlled startup failure");
+    await assert.rejects(ready.wait(Promise.reject(failure)), error => error === failure);
+    assert.equal(transport.firstTurnListenerCount(), 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+
+  it("rejects normal execution ending before readiness", async () => {
+    const transport = new FakeTransport(() => ({}));
+    const ready = armFirstTurnReadiness(transport, new AbortController().signal);
+    await assert.rejects(ready.wait(Promise.resolve()), /ended before its first provider turn/);
+    assert.equal(transport.firstTurnListenerCount(), 0);
+  });
+
+  it("uses the caller test signal as its only readiness bound", async () => {
+    const transport = new FakeTransport(() => ({}));
+    const controller = new AbortController();
+    const ready = armFirstTurnReadiness(transport, controller.signal);
+    const waiting = ready.wait(new Promise(() => {}));
+    const failure = new Error("test cancelled");
+    controller.abort(failure);
+    await assert.rejects(waiting, error => error === failure);
+    assert.equal(transport.firstTurnListenerCount(), 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+});
 
 // ================================================================================
 describe("CodexExecutor: dark selection seam (the makeExecutor decision)", () => {
@@ -1974,17 +2063,18 @@ describe("m1 credential-free owner cancel", () => {
     { work: "clean", drain: "root" },
     { work: "dirty", terminal: "statusless" },
     { work: "dirty", terminal: "lost" },
+    { work: "nested-gitignore", readinessDelayMs: 3500 },
     ...["immediate", "statusless", "lost"].flatMap(terminal =>
       ["clean", "dirty"].map(work => ({ work, route: "recovery", terminal }))),
     { work: "dirty", route: "deferred", terminal: "statusless" },
     { work: "clean", route: "deferred", terminal: "immediate" },
     ...["before-cancel", "settle", "inspect", "release-ack"].map(quarantine => ({ work: "clean", quarantine })),
   ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
-    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string }>;
+    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string; readinessDelayMs?: number }>;
   for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
       (scenario.work !== "lossy-path" || process.platform === "linux") &&
       (!scenario.quarantine || process.platform === "linux")))
-    it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
+    it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async (t) => {
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
       const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
@@ -2050,6 +2140,17 @@ describe("m1 credential-free owner cancel", () => {
           released: true, holds_released: 1, retained: scenario.release === "retained" };
       };
       const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      if (scenario.readinessDelayMs) {
+        const attach = git.runnerCloneForBranch.bind(git);
+        let delayed = false;
+        git.runnerCloneForBranch = async (...args) => {
+          if (!delayed) {
+            delayed = true;
+            await new Promise<void>(resolve => setTimeout(resolve, scenario.readinessDelayMs));
+          }
+          return attach(...args);
+        };
+      }
       let clone = "";
       let lifecycle: AbortSignal | undefined;
       let boundaryCalls = 0;
@@ -2199,6 +2300,7 @@ describe("m1 credential-free owner cancel", () => {
           api.overrideStateStatus(claim.run_id, "cancelled");
         }
       });
+      const readiness = armFirstTurnReadiness(rig.transport, t.signal);
       const execution = runner.execute(claim);
       const gitInClone = (...args: string[]) => {
         const result = spawnSync("git", ["-C", clone, ...args], { env: gitEnv(), encoding: "utf8" });
@@ -2206,7 +2308,7 @@ describe("m1 credential-free owner cancel", () => {
         return result.stdout;
       };
       try {
-        await waitFor(() => rig.transport.turnStartCount > 0, "runner provider");
+        await readiness.wait(execution);
         const safety = executor.safety!;
         const boundary = safety.withBoundary.bind(safety);
         safety.withBoundary = async <T>(request: BoundaryRequest, action: (permit: BoundaryPermit) => Promise<T>) => { boundaryCalls++; return boundary(request, action); };
@@ -2438,6 +2540,7 @@ describe("m1 credential-free owner cancel", () => {
         }
         assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
       } finally {
+        readiness.dispose();
         quarantineContinue.resolve();
         try {
           await runner.shutdown();
@@ -4646,6 +4749,56 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
   });
 });
 
+describe("CodexExecutor: m1 response usage", () => {
+  it("emits exactly two lead responses and one child response through ctx.emit before the first terminal", async () => {
+    const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
+    const total = { inputTokens: 200, cachedInputTokens: 60, cacheWriteInputTokens: 40, outputTokens: 80, totalTokens: 280 };
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(tokenUsageUpdated("th-child", "tn-child", last))
+          .push(turnCompleted("completed", "th-child", "tn-child"))
+          .push(signalDone())
+          .push(turnCompleted("completed"));
+        return { turn: { id: "tn-child" } };
+      }
+      return defaultResponder(c);
+    } });
+    rig.transport
+      .push(tokenUsageUpdated("th-1", "tn-1", last))
+      .push(tokenUsageUpdated("th-1", "tn-1", total, last))
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help", description: "[m1] usage" }, "th-1", "tn-1", "m1-child"));
+    const { ctx, emitted } = makeCtx({ agents: [
+      { name: "lead", description: "lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+    ] });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "m1 usage emission");
+    const usage = emitted.filter(m => m.payload.event === "codex_response_usage");
+    assert.equal(usage.length, 3, "the executor stops at its first terminal; every adopted response must already be emitted");
+    assert.equal(new Set(usage.map(m => m.payload.usage_response_id)).size, 3);
+    assert.deepEqual(usage.map(m => [m.agent, m.payload.model]), [
+      ["lead", provider.model], ["lead", provider.model], ["coder", "gpt-5.6-sol"],
+    ]);
+    for (const m of usage) {
+      assert.equal(m.kind, "status");
+      assert.match(String(m.payload.usage_response_id), /^[0-9a-f-]{36}$/);
+      assert.deepEqual(m.payload.usage, {
+        input_tokens: 50, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 40,
+      });
+    }
+    const dispatch = emitted.find(m => m.kind === "tool_use" && m.payload.name === "Agent");
+    assert.ok(dispatch);
+    assert.equal(usage[2]!.agentInstance, dispatch.payload.id);
+    assert.equal(usage[2]!.agentLabel, "[m1] usage");
+    const terminal = emitted.find(m => m.payload.event === "result");
+    assert.ok(terminal);
+    for (const m of usage) assert.ok(emitted.indexOf(m) < emitted.indexOf(terminal));
+    assert.equal(rig.transport.turnStartCount, 2, "one root turn and one child turn");
+  });
+});
+
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
   it("forwards the claim's medium and explicit effort to the actual turn/start wire field", async () => {
     for (const effort of ["medium", "xhigh"] as const) {
@@ -5992,37 +6145,123 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
 // are fail-old/pass-fixed: without the signals frame planResult.plan is undefined and run()
 // throws "produced no plan" before the gate, so a resolving success test can only pass wired.
 describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
-  it("refuses automatic plan revision before feedback or another provider turn", async () => {
-    const rig = makeMultiEpochRig([
-      epochResponder("th-1", "tn-1", (t, th, tn) => {
-        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+  // PRD #2460: a plan thread that submits a fresh plan on every turn, then a recreated implement
+  // epoch that finishes on signal_done. Returns the rig so a test can read each epoch's requests.
+  const planThenImplementRig = () => {
+    const planResponder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `local plan ${c.turnStartCount}` }, "th-plan", turnId, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    return makeMultiEpochRig([
+      planResponder,
+      epochResponder("resumed-plan", "tn-implement", (t, th, tn) => {
+        t.push(toolCall(99, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
       }),
     ]);
-    let gates = 0;
+  };
+  const turnTexts = (rig: ReturnType<typeof planThenImplementRig>, epoch: number): string[] =>
+    rig.epochs[epoch]!.transport.requests.filter((r) => r.method === "turn/start").map((r) => JSON.stringify(r.params));
+  const humanApprove = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+
+  it("PRD #2460: automatic rounds revise the plan thread without spending the human budget, even at plan_max_revisions 0", async () => {
+    const rig = planThenImplementRig();
+    const settled: unknown[] = [];
+    let call = 0;
     const { ctx, emitted } = makeCtx({
       planApproved: false,
       approvedPlan: undefined,
-      gatePlan: async () => {
-        gates++;
-        return { kind: "revise", automatic: true, round: 1, feedback: "checker advice" };
+      config: { plan_max_revisions: 0 },
+      gatePlan: async (_plan, _milestones, _onAwaiting, settles) => {
+        settled.push(settles);
+        call++;
+        return call <= 4
+          ? { kind: "revise", automatic: true, round: call, feedback: `checker advice ${call}`, items: [] }
+          : humanApprove;
       },
     });
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "automatic revision refusal"),
-      /codex cannot consume automatic plan revision/,
-    );
-    assert.equal(gates, 1);
-    assert.equal(rig.epochs.length, 1);
-    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
-    assert.ok(!emitted.some((m) => m.kind === "plan_feedback" || m.kind === "plan_revising"));
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "automatic rounds");
+    const planTurns = turnTexts(rig, 0);
+    assert.equal(planTurns.length, 5, "the initial turn plus four automatic revisions on the plan thread");
+    for (let round = 1; round <= 4; round++) {
+      assert.match(planTurns[round]!, new RegExp(`checker advice ${round}`));
+      assert.match(planTurns[round]!, /automated checker suggested revisions/, "the automatic revision prompt, not the human one");
+    }
+    assert.deepEqual(emitted.filter((m) => m.kind === "plan_feedback").map((m) => m.payload),
+      [1, 2, 3, 4].map((round) => ({ feedback: `checker advice ${round}`, automatic: true, cross_check_round: round })));
+    assert.deepEqual(emitted.filter((m) => m.kind === "plan_revising").map((m) => m.payload),
+      [1, 2, 3, 4].map((round) => ({ automatic: true, cross_check_round: round })));
+    assert.deepEqual(settled.slice(1), [undefined, undefined, undefined, undefined], "automatic rounds settle no input row");
   });
-  it("refuses checked plan approval before provider epoch recreation or implementation", async () => {
-    const rig = makeMultiEpochRig([
-      epochResponder("th-1", "tn-1", (t, th, tn) => {
-        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
-      }),
-    ]);
+
+  it("PRD #2460: a human revise after automatic rounds keeps its full budget, and only human revises spend it", async () => {
+    const rig = planThenImplementRig();
+    const verdicts = [
+      { kind: "revise", automatic: true, round: 1, feedback: "auto 1" },
+      { kind: "revise", automatic: true, round: 2, feedback: "auto 2" },
+      { kind: "revise", feedback: "human 1", inputId: 11 },
+      humanApprove,
+    ];
+    const settled: unknown[] = [];
+    let call = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { plan_max_revisions: 1 },
+      gatePlan: async (_p, _m, _a, settles) => { settled.push(settles); return verdicts[call++] as never; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "human after automatic");
+    assert.deepEqual(emitted.filter((m) => m.kind === "plan_revising").map((m) => m.payload),
+      [{ automatic: true, cross_check_round: 1 }, { automatic: true, cross_check_round: 2 }, { round: 1 }]);
+    assert.deepEqual(settled, [undefined, undefined, undefined, 11], "the human revise settles its own input row");
+
+    // The same budget refuses a SECOND human revise.
+    const capped = planThenImplementRig();
+    const again = [
+      { kind: "revise", automatic: true, round: 1, feedback: "auto 1" },
+      { kind: "revise", feedback: "human 1", inputId: 1 },
+      { kind: "revise", feedback: "human 2", inputId: 2 },
+    ];
+    let n = 0;
+    await assert.rejects(
+      withTimeout(makeExecutor(capped, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        planApproved: false, approvedPlan: undefined, config: { plan_max_revisions: 1 },
+        gatePlan: async () => again[n++] as never,
+      }).ctx), 8000, "second human revise"),
+      /revision budget exhausted/,
+    );
+    assert.equal(turnTexts(capped, 0).length, 3, "no turn runs for the refused human revise");
+  });
+
+  for (const [name, rounds] of [["a repeated round", [1, 1]], ["a round above the bound", [5]], ["a zero round", [0]]] as const) {
+    it(`PRD #2460: ${name} is refused before feedback or another provider turn`, async () => {
+      const rig = planThenImplementRig();
+      let call = 0;
+      const { ctx, emitted } = makeCtx({
+        planApproved: false,
+        approvedPlan: undefined,
+        gatePlan: async () => ({ kind: "revise", automatic: true, round: rounds[call++]!, feedback: "advice" }) as never,
+      });
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, name),
+        /invalid automatic plan revision round/,
+      );
+      assert.equal(turnTexts(rig, 0).length, rounds.length, "the refused round starts no further turn");
+      assert.equal(emitted.filter((m) => m.kind === "plan_feedback").length, rounds.length - 1, "the refused round records no feedback");
+    });
+  }
+
+  it("PRD #2460: a checked approval implements exactly the server contract, which supersedes the local plan", async () => {
+    const rig = planThenImplementRig();
     let iterations = 0;
+    const milestones = [{ id: "m1", title: "Canonical one", nested: { keep: [] } }];
     const { ctx } = makeCtx({
       planApproved: false,
       approvedPlan: undefined,
@@ -6030,17 +6269,46 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       reportIteration: async () => { iterations++; return undefined; },
       gatePlan: async () => ({
         kind: "approve", approval: "cross_check", selection: { status: "absent" },
-        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
-      }),
+        canonical: { plan: "server canonical contract", milestones, candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }) as never,
     });
-    await assert.rejects(
-      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checked approval refusal"),
-      /codex cannot consume checked plan approval/,
-    );
-    assert.equal(iterations, 0);
-    assert.equal(rig.epochs.length, 1);
-    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "checked approval");
+    assert.ok(iterations >= 1, "implementation started");
+    const implement = turnTexts(rig, 1).join("\n");
+    assert.match(implement, /server canonical contract/);
+    assert.match(implement, /supersedes the local plan/);
+    assert.match(implement, /<approved_milestone_contract>/);
+    assert.match(implement, /Canonical one/);
+    assert.match(implement, /\\"keep\\":\[\]/, "nested values and explicit [] are serialized verbatim");
+    assert.doesNotMatch(implement, /local plan 1/, "the lead's local plan is not the implementation instruction");
   });
+
+  for (const [name, canonical, generation] of [
+    ["a stale claim generation", { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 6 }, 7],
+    ["a missing execution generation", { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 }, undefined],
+    ["a malformed digest", { plan: "canonical", milestones: [], candidate_digest: "xyz", claimGeneration: 7 }, 7],
+    ["a blank plan", { plan: "  ", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 }, 7],
+    ["a milestone without an id", { plan: "canonical", milestones: [{ title: "t" }], candidate_digest: "a".repeat(64), claimGeneration: 7 }, 7],
+  ] as const) {
+    it(`PRD #2460: a checked approval with ${name} is refused before provider epoch recreation or implementation`, async () => {
+      const rig = planThenImplementRig();
+      let iterations = 0;
+      const { ctx } = makeCtx({
+        planApproved: false,
+        approvedPlan: undefined,
+        claimGeneration: generation,
+        reportIteration: async () => { iterations++; return undefined; },
+        gatePlan: async () => ({ kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical }) as never,
+      });
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, name),
+        /invalid checked plan approval bundle/,
+      );
+      assert.equal(iterations, 0);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "no implement turn started");
+    });
+  }
   it("(m2-1) a folded submit_plan gates, approval recreates a fresh provider epoch, and a root signal_done on the NEW root resolves { branch }", async () => {
     // m4 change: plan approval now RECREATES the provider epoch (new-root resume), so the plan
     // turn and the implement turn run on DISTINCT provider roots/transports. Each epoch is scripted

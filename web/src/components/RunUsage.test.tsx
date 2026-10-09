@@ -75,7 +75,7 @@ describe("RunUsagePanel", () => {
     expect(getByText("lead")).toBeTruthy();
     expect(getByText("coder")).toBeTruthy();
     expect(getByText("Attributed total")).toBeTruthy();
-    expect(getByText(/may not sum to the run total/)).toBeTruthy();
+    expect(getByText(/Estimated attribution from deduplicated assistant usage/)).toBeTruthy();
   });
 
   it("renders nothing for a run with no usage (pre-feature)", () => {
@@ -164,7 +164,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     );
     // The PRD and the approved mock both place Model right after Agent; without
     // this, moving the column anywhere in the row leaves every other test green.
-    expect(headerTexts(agentTable(container))).toEqual(["Agent", "Model", "In (fresh)", "In (cached)", "Out"]);
+    expect(headerTexts(agentTable(container))).toEqual(["Agent", "Model", "In (fresh)", "In (cached)"]);
   });
 
   it("renders each agent's model and 'N models' on the total row for a mixed run", () => {
@@ -195,8 +195,8 @@ describe("RunUsagePanel model column (PRD #93)", () => {
         // first-seen implementation — it must render the most frequent one.
         usage={deriveRunUsage([
           assistantFrame("coder", 100, "claude-opus-4-8"),
-          assistantFrame("coder", 100, "claude-sonnet-5"),
-          assistantFrame("coder", 100, "claude-sonnet-5"),
+          assistantFrame("coder", 101, "claude-sonnet-5"),
+          assistantFrame("coder", 102, "claude-sonnet-5"),
           resultFrame(),
         ])}
       />,
@@ -677,5 +677,29 @@ describe("RunUsageTailBlock", () => {
     expect(container.textContent).not.toContain("‮");
     expect(container.textContent).not.toContain("\u001b");
     expect(container.textContent).toContain("evilmodel");
+  });
+});
+
+describe("m2 honest usage presentation", () => {
+  it("renders unknown Duration, sublabel and both Turns cells as dashes", () => {
+    const frame = result({ input: 10, cacheRead: 2, output: 3, cost: 0 }, { turns: 0, durationMs: 0 });
+    delete (frame.payload as Record<string, unknown>)["num_turns"];
+    delete (frame.payload as Record<string, unknown>)["duration_ms"];
+    const r = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage([frame])} />);
+    expect(r.getByText("Duration").parentElement?.textContent).toBe("Duration—");
+    expect(r.getByText("1 phase · — turns")).toBeTruthy();
+    const table = r.getByRole("table", { name: "Per-phase usage" }) as HTMLTableElement;
+    expect(columnTexts(table, 1)).toEqual(["—", "—"]);
+  });
+  it("preserves measured zero and removes only per-agent output with exact footer", () => {
+    const frame = result({ input: 10, cacheRead: 2, output: 3, cost: 0 }, { turns: 0, durationMs: 0 });
+    const r = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage([assistantFrame("lead", 1), frame])} />);
+    expect(r.getByText("1 phase · 0 turns")).toBeTruthy();
+    expect(r.getByText("Duration").parentElement?.textContent).toBe("Duration0.0s");
+    const agent = agentTable(r.container);
+    expect(headerTexts(agent)).toEqual(["Agent", "Model", "In (fresh)", "In (cached)"]);
+    expect([...agent.tBodies[0].rows].map(row => row.cells.length)).toEqual([4, 4]);
+    expect(r.getByRole("table", { name: "Per-phase usage" }).textContent).toContain("Out");
+    expect(r.getByText("Estimated attribution from deduplicated assistant usage; identical usage records on the same lane may collapse, and attribution may be incomplete. Output is not attributed.")).toBeTruthy();
   });
 });

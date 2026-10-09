@@ -1623,7 +1623,8 @@ func credentialEpochCell(e apitypes.CredentialEpochDTO) string {
 	return cell + " · " + e.AppliedAt.UTC().Format(time.RFC3339)
 }
 
-// renderMessage prints one run message. In --json mode it emits one compact JSON
+// renderMessage prints one run message, hiding accounting evidence in human mode.
+// In --json mode it emits one compact JSON
 // object per line (NDJSON), so `--follow` streams cleanly and an agent parses it
 // line by line — and since it marshals the DTO whole, `agent_instance` and
 // `agent_label` have been in the JSON output since they were added to MessageDTO
@@ -1636,6 +1637,9 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 			return err
 		}
 		p.Println(string(b))
+		return nil
+	}
+	if isAccountingMessage(m.Kind, m.Payload) {
 		return nil
 	}
 	// %-*s pads to a fixed RUNE width (Go's fmt measures width in runes, not bytes),

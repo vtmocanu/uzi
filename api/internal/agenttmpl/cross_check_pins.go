@@ -63,8 +63,12 @@ func ResolveCrossCheck(harness string, model, effort, workerModel, workerEffort,
 		if harness == "codex" {
 			fallback := DefaultCodexModel
 			r.Model = &fallback
-		} else {
-			r.Model = templateModel
+		} else if templateModel != nil {
+			// Reject known curated Codex IDs in the lead template; invalid values use the SDK
+			// default. Custom IDs remain provider-validated.
+			if m, err := ValidateFamilyModel("claude", *templateModel); err == nil {
+				r.Model = &m
+			}
 		}
 	}
 	if model != nil {

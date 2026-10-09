@@ -1,7 +1,7 @@
 package apitypes
 
 // CrossCheckPinDTO keeps stored pins separate from resolved family defaults.
-// ResolvedModel is null when the inactive Claude cell inherits the SDK model.
+// ResolvedModel is null when the Claude cell inherits the SDK model.
 type CrossCheckPinDTO struct {
 	Stage   string  `json:"stage"`
 	Harness string  `json:"harness"`

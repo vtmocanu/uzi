@@ -70,7 +70,13 @@ type ClaimPayload struct {
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
 	// PlanCrossCheckRequired is frozen on the run at creation and re-delivered on every claim.
-	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required,omitempty"`
+	PlanCrossCheckRequired bool `json:"plan_cross_check_required,omitempty"`
+	// PlanCrossCheckCodexLead is an additive api-capability signal (PRD #2460 rework): this
+	// api accepts a Codex lead's checked-plan submission. It is deliberately redundant with
+	// secrets.codex + plan_cross_check_required. Older apis never send it, so a new worker
+	// without it parks a Codex lead as codex_lead_unsupported instead of submitting. Do not
+	// remove until the minimum supported api sends it.
+	PlanCrossCheckCodexLead  bool    `json:"plan_cross_check_codex_lead,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// OpenMr gates whether the worker opens a merge request for a task run (PRD #400
 	// M2). Meaningful only for kind='task': a task ALWAYS pushes its branch back (the

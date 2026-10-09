@@ -87,7 +87,7 @@ function assistantUsage(
   });
 }
 
-// Like assistantUsage but with a chosen agent_instance, to exercise the live dedup
+// Like assistantUsage but with a chosen agent_instance, to exercise the shared dedup
 // key `(agent_instance, usage)` (issue #237). The base `msg` hard-codes agent_instance
 // null (the lead lane, where two byte-identical calls collapse); a subagent invocation
 // carries a distinct non-null id, so its calls never collapse into another lane's.
@@ -640,7 +640,7 @@ describe("deriveRunUsage", () => {
     expect(byAgent["lead"]).toMatchObject({
       model: "claude-opus-4-8",
       otherModels: 0,
-      modelCounts: { "claude-opus-4-8": 2 },
+      modelCounts: { "claude-opus-4-8": 1 },
     });
     expect(byAgent["coder"]).toMatchObject({ model: "claude-sonnet-5", otherModels: 0 });
     // Mixed run → the total row's distinct set, sorted ascending.
@@ -653,9 +653,9 @@ describe("deriveRunUsage", () => {
     // an implementation that returned the first-seen (or insertion-ordered) entry
     // instead of the most frequent one would answer opus here and fail.
     const d = deriveRunUsage([
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 104, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 105, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 106, output: 10, model: "claude-sonnet-5" }),
     ]);
     expect(d.agents[0]).toMatchObject({
       model: "claude-sonnet-5", // 2 frames beats opus's 1, despite opus being first
@@ -667,8 +667,8 @@ describe("deriveRunUsage", () => {
   it("breaks an equal-frequency model tie lexicographically (deterministic, not frame order)", () => {
     beforeEachReset();
     const d = deriveRunUsage([
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }), // seen FIRST
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 107, output: 10, model: "claude-sonnet-5" }), // seen FIRST
+      assistantUsage("coder", { input: 108, output: 10, model: "claude-opus-4-8" }),
     ]);
     expect(d.agents[0]).toMatchObject({ model: "claude-opus-4-8", otherModels: 1 });
   });
@@ -676,8 +676,8 @@ describe("deriveRunUsage", () => {
   it("leaves the model null for a pre-feature agent (usage frames, no model key)", () => {
     beforeEachReset();
     const d = deriveRunUsage([
-      assistantUsage("lead", { input: 100, output: 10 }),
-      assistantUsage("lead", { input: 100, output: 10 }),
+      assistantUsage("lead", { input: 109, output: 10 }),
+      assistantUsage("lead", { input: 110, output: 10 }),
     ]);
     expect(d.agents[0]).toMatchObject({ model: null, otherModels: 0 });
     expect(d.agents[0].modelCounts).toEqual({}); // toMatchObject({}) would match anything
@@ -687,8 +687,8 @@ describe("deriveRunUsage", () => {
   it("reports a single-model run as one distinct model", () => {
     beforeEachReset();
     const d = deriveRunUsage([
-      assistantUsage("lead", { input: 100, output: 10, model: "claude-opus-4-8" }),
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("lead", { input: 111, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 112, output: 10, model: "claude-opus-4-8" }),
     ]);
     expect(d.agentModels).toEqual(["claude-opus-4-8"]);
   });
@@ -698,7 +698,7 @@ describe("deriveRunUsage", () => {
     const d = deriveRunUsage([
       msg("status", "lead", { event: "init", model: "claude-opus-4-8" }), // the strip's model
       msg("text", "ghost", { text: "…", model: "claude-haiku-9" }), // model without usage
-      assistantUsage("coder", { input: 100, output: 10 }),
+      assistantUsage("coder", { input: 113, output: 10 }),
     ]);
     expect(d.agents.map((a) => a.agent)).toEqual(["coder"]);
     expect(d.agents[0]).toMatchObject({ model: null });
@@ -713,10 +713,10 @@ describe("deriveRunUsage", () => {
   it("counts a model named after an Object.prototype key without inheriting it", () => {
     beforeEachReset();
     const d = deriveRunUsage([
-      assistantUsage("coder", { input: 100, output: 10, model: "constructor" }),
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 114, output: 10, model: "constructor" }),
+      assistantUsage("coder", { input: 115, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 116, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 117, output: 10, model: "claude-sonnet-5" }),
     ]);
     // With a plain `{}` accumulator this count would be `<function constructor>1`
     // (a string), the b[1]-a[1] sort would go NaN, and the primary would be wrong.
@@ -728,7 +728,7 @@ describe("deriveRunUsage", () => {
 
   it("counts a model named __proto__ and leaves Object.prototype unpolluted", () => {
     beforeEachReset();
-    const d = deriveRunUsage([assistantUsage("coder", { input: 100, output: 10, model: "__proto__" })]);
+    const d = deriveRunUsage([assistantUsage("coder", { input: 118, output: 10, model: "__proto__" })]);
     // On a plain `{}` the write is a silent no-op and the count vanishes entirely.
     expect(d.agents[0].modelCounts["__proto__"]).toBe(1);
     expect(Object.keys(d.agents[0].modelCounts)).toEqual(["__proto__"]);
@@ -738,11 +738,9 @@ describe("deriveRunUsage", () => {
     expect(Object.getPrototypeOf(d.agents[0].modelCounts)).toBeNull();
     expect(({} as Record<string, unknown>)["__proto__"]).toBe(Object.prototype);
   });
-
   // ── Issue #237: the LIVE aggregate, DEDUPED by `(agent_instance, usage)` ───────
-  // A separate surface from the confirmed per-agent sum. The dedup collapses byte-
-  // identical calls on one lane; it must NOT leak into `agents`/`agentTotal`, which
-  // keep counting every frame raw.
+  // Live and Claude confirmed attribution share the lane/usage signature.
+  // Identical calls on one lane collapse in both surfaces.
 
   it("dedups two identical (agent_instance, usage) frames into ONE live record, on the lead lane", () => {
     beforeEachReset();
@@ -756,9 +754,9 @@ describe("deriveRunUsage", () => {
     expect(d.liveTotal).toEqual({ fresh: 110, cached: 50 });
     expect(d.liveByAgent).toEqual([{ agent: "lead", fresh: 110, cached: 50 }]);
     expect(d.liveByModel).toEqual([{ model: "claude-opus-4-8", fresh: 110, cached: 50 }]);
-    // The raw confirmed per-agent sum STILL counts BOTH frames — dedup did not leak.
-    expect(d.agents[0]).toMatchObject({ agent: "lead", fresh: 220, cached: 100, out: 10 });
-    expect(d.agentTotal).toEqual({ fresh: 220, cached: 100, out: 10 });
+    // Confirmed attribution uses the same signature and counts once.
+    expect(d.agents[0]).toMatchObject({ agent: "lead", fresh: 110, cached: 50, out: 5 });
+    expect(d.agentTotal).toEqual({ fresh: 110, cached: 50, out: 5 });
   });
 
   it("dedups two identical frames on a SUBAGENT lane too (same non-null agent_instance)", () => {
@@ -771,8 +769,8 @@ describe("deriveRunUsage", () => {
     expect(d.liveTotal).toEqual({ fresh: 200, cached: 20 });
     expect(d.liveByAgent).toEqual([{ agent: "coder", fresh: 200, cached: 20 }]);
     expect(d.liveByModel).toEqual([{ model: "claude-sonnet-5", fresh: 200, cached: 20 }]);
-    // Raw sum still counts both frames.
-    expect(d.agents[0]).toMatchObject({ agent: "coder", fresh: 400, cached: 40, out: 4 });
+    // Confirmed attribution also counts once.
+    expect(d.agents[0]).toMatchObject({ agent: "coder", fresh: 200, cached: 20, out: 2 });
   });
 
   it("does NOT over-dedup: same agent_instance but DIFFERENT usage each counts once", () => {
@@ -1284,5 +1282,101 @@ describe("deriveRunUsage session_cumulative (issue #1562)", () => {
     expect(opus).toMatchObject({ input: 170, cacheCreation: 5_500, cached: 80_000, out: 2_100 });
     expect(opus?.costUsd).toBeCloseTo(2.0, 6);
     expect(d.total.out).toBe(2_100); // NOT 3_800 (the per-leg SUM)
+  });
+});
+
+describe("m2 accounting attribution", () => {
+  const finish = (meta: Record<string, unknown> = {}) => msg("status", "lead", {
+    event: "result", modelUsage: { gpt: { inputTokens: 70, cacheReadInputTokens: 30, outputTokens: 12, costUSD: 0.2 } }, ...meta,
+  });
+  const id1 = "11111111-1111-4111-8111-111111111111";
+  const id2 = "22222222-2222-4222-8222-222222222222";
+  const accounting = (id: unknown) => msg("status", "lead", {
+    event: "codex_response_usage", usage_response_id: id, model: "gpt",
+    usage: { input_tokens: 70, cache_read_input_tokens: 30, cache_creation_input_tokens: 0, output_tokens: 12 },
+  });
+  it.each([undefined, null, "3", NaN, Infinity, -Infinity])("keeps unknown/nonfinite metrics null: %s", (v) => {
+    const d = deriveRunUsage([finish({ num_turns: v, duration_ms: v })]);
+    expect(d.phases[0]).toMatchObject({ turns: null, durationMs: null });
+    expect(d.total).toMatchObject({ turns: null, durationMs: null });
+  });
+  it("propagates mixed unknowns independently and preserves measured zero and empty sums", () => {
+    expect(deriveRunUsage([]).total).toMatchObject({ turns: 0, durationMs: 0 });
+    const zero = finish({ num_turns: 0, duration_ms: 0 });
+    expect(deriveRunUsage([zero]).total).toMatchObject({ turns: 0, durationMs: 0 });
+    expect(deriveRunUsage([zero, finish({ num_turns: 2 })]).total).toMatchObject({ turns: 2, durationMs: null });
+    expect(deriveRunUsage([zero, finish({ duration_ms: 5 })]).total).toMatchObject({ turns: null, durationMs: 5 });
+  });
+  it.each([Number.MAX_VALUE, -Number.MAX_VALUE])("keeps overflowing aggregate metrics unknown: %s", (value) => {
+    const both = deriveRunUsage([finish({ num_turns: value, duration_ms: value }), finish({ num_turns: value, duration_ms: value })]);
+    expect(both.phases).toHaveLength(2);
+    expect(both.phases.map(phase => [phase.turns, phase.durationMs])).toEqual([[value, value], [value, value]]);
+    expect(both.total).toMatchObject({ turns: null, durationMs: null });
+    const durationOnly = deriveRunUsage([finish({ num_turns: 1, duration_ms: value }), finish({ num_turns: 1, duration_ms: value })]);
+    expect(durationOnly.total).toMatchObject({ turns: 2, durationMs: null });
+    const turnsOnly = deriveRunUsage([finish({ num_turns: value, duration_ms: 1 }), finish({ num_turns: value, duration_ms: 1 })]);
+    expect(turnsOnly.total).toMatchObject({ turns: null, durationMs: 2 });
+  });
+  it("deduplicates Claude across legs, keeps lanes, frequencies and latest context", () => {
+    const a = assistantUsageInst("coder", "lane-a", { input: 10, output: 2, model: "z-model" });
+    const b = assistantUsageInst("coder", "lane-b", { input: 10, output: 2, model: "a-model" });
+    const d = deriveRunUsage([a, initFrame(), a, b,
+      assistantUsageInst("coder", "lane-a", { input: 20, output: 3, model: "a-model" })]);
+    expect(d.agentTotal).toEqual({ fresh: 40, cached: 0, out: 7 });
+    expect(d.agents[0]).toMatchObject({ model: "a-model", otherModels: 1, modelCounts: { "z-model": 1, "a-model": 2 } });
+    const lead = assistantUsageCtx("lead", { input: 10, output: 1 }, { used: 10, window: 100, pct: 10 });
+    const newer = { ...lead, payload: { ...(lead.payload as object), context: { used: 20, window: 100, pct: 20 } } };
+    expect(deriveRunUsage([lead, newer]).leadContext).toEqual({ used: 20, window: 100, pct: 20 });
+  });
+  it("counts Codex identities once, distinct identical buckets twice and live once", () => {
+    const a = accounting(id1);
+    const terminal = finish({ modelUsage: { gpt: { inputTokens: 140, cacheReadInputTokens: 60, outputTokens: 24, costUSD: 0.4 } } });
+    const d = deriveRunUsage([a, a, accounting(id2), terminal], { harness: "codex" });
+    expect(d.agentTotal).toEqual({ fresh: 140, cached: 60, out: 24 });
+    expect(d.agents[0].modelCounts).toEqual({ gpt: 2 });
+    expect(d.liveTotal).toEqual({ fresh: 70, cached: 30 });
+    expect(d.total).toMatchObject({ fresh: 140, cached: 60, out: 24, costUsd: 0.4 });
+    expect(d.agentTotal.fresh + d.agentTotal.cached).toBe(d.total.fresh + d.total.cached);
+    expect(deriveRunUsage([a, finish()], { harness: "codex" }).agentTotal).toEqual({ fresh: 70, cached: 30, out: 12 });
+  });
+  it("reconciles lead and child input including cache writes, and leaves a missed response short", () => {
+    const lead = (id: string) => ({ ...accounting(id), payload: {
+      event: "codex_response_usage", usage_response_id: id, model: "gpt",
+      usage: { input_tokens: 60, cache_read_input_tokens: 30, cache_creation_input_tokens: 10, output_tokens: 12 },
+    } });
+    const child = { ...msg("status", "coder", {
+      event: "codex_response_usage", usage_response_id: "33333333-3333-4333-8333-333333333333", model: "gpt-mini",
+      usage: { input_tokens: 25, cache_read_input_tokens: 20, cache_creation_input_tokens: 5, output_tokens: 4 },
+    }), agent_instance: "child" };
+    const terminal = finish({ modelUsage: {
+      gpt: { inputTokens: 120, cacheCreationInputTokens: 20, cacheReadInputTokens: 60, outputTokens: 24, costUSD: 0.4 },
+      "gpt-mini": { inputTokens: 25, cacheCreationInputTokens: 5, cacheReadInputTokens: 20, outputTokens: 4, costUSD: 0.05 },
+    } });
+    const a = lead(id1);
+    const complete = deriveRunUsage([a, a, lead(id2), child, terminal], { harness: "codex" });
+    expect(complete.agentTotal).toEqual({ fresh: 170, cached: 80, out: 28 });
+    expect(complete.total).toMatchObject({ fresh: 170, cached: 80, out: 28 });
+    expect(complete.agentTotal.fresh + complete.agentTotal.cached).toBe(complete.total.fresh + complete.total.cached);
+    expect(complete.agents.map(row => ({ agent: row.agent, fresh: row.fresh, cached: row.cached, model: row.model })))
+      .toEqual([{ agent: "lead", fresh: 140, cached: 60, model: "gpt" }, { agent: "coder", fresh: 30, cached: 20, model: "gpt-mini" }]);
+    expect(complete.liveTotal).toEqual({ fresh: 100, cached: 50 });
+    const missed = deriveRunUsage([a, child, terminal], { harness: "codex" });
+    expect(missed.agentTotal).toEqual({ fresh: 100, cached: 50, out: 16 });
+    expect(missed.total).toEqual(complete.total);
+    expect(missed.agentTotal.fresh + missed.agentTotal.cached).toBeLessThan(missed.total.fresh + missed.total.cached);
+  });
+  it.each([undefined, null, "", "bad", id1 + "x", id1 + "\n", "x".repeat(36)])("omits malformed dedicated identities: %s", (id) => {
+    const d = deriveRunUsage([accounting(id)]);
+    expect(d.agents).toEqual([]);
+    expect(d.hasLiveTokens).toBe(false);
+  });
+  it("separates Claude keys and leaves missing/invalid-split Codex evidence unpadded", () => {
+    const a = accounting(id1);
+    const claude = msg("text", "lead", { ...(a.payload as object), event: undefined, text: "assistant" });
+    expect(deriveRunUsage([a, claude]).agentTotal).toEqual({ fresh: 140, cached: 60, out: 24 });
+    // m1 omits missed/invalid-split response records: only the result is present.
+    const d = deriveRunUsage([finish()], { harness: "codex" });
+    expect(d.agentTotal).toEqual({ fresh: 0, cached: 0, out: 0 });
+    expect(d.total).toMatchObject({ fresh: 70, cached: 30, out: 12 });
   });
 });

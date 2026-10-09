@@ -2293,10 +2293,10 @@ uzi settings get --json
 The human table shows the two Plan cross-check cells: stage, harness,
 active/inactive status, stored model and effort, worker default model,
 resolved model and effort, and each resolved field's source. Stored null
-fields show `Default`; explicit choices show `Pin · value`. The Claude
-cell is inactive and editable in **Settings → Run defaults → Cross-check**;
-only Codex checkers for Claude leads execute today. CLI set/reset is deferred
-to #1703.
+fields show `Default`; explicit choices show `Pin · value`. Both
+cells are active and editable in **Settings → Run defaults → Cross-check**:
+the Codex cell configures the checker of a Claude lead, the Claude cell the
+checker of a Codex lead. CLI set/reset is deferred to #1703.
 
 JSON returns the decoded account settings DTO, including
 `cross_check_pins`. Each cell has nullable stored

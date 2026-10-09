@@ -11,8 +11,9 @@
 //     persisted `init` frame; duration_ms / num_turns are PER-INVOCATION (they read
 //     different CLI state), so they are taken raw per phase and summed for the total.
 //   • Assistant frames carry the API call's PER-CALL message.usage, attached by the
-//     worker to exactly one emitted message per SDK frame. Those SUM directly, per
-//     agent. This is a PURE reduction over the seq-deduped message list, recomputed
+//     worker to exactly one emitted message per SDK frame. Claude attribution sums
+//     deduplicated lane/usage signatures; Codex accounting statuses sum distinct
+//     response UUIDs. Both group by role. This is a PURE reduction, recomputed
 //     from state — never an incremental accumulator, which would double-count on the
 //     ws→reconnect→REST-replay overlap.
 //
@@ -95,15 +96,16 @@
 // the React components are thin.
 
 import type { RunMessage } from "./api";
+import { isAccountingStatus } from "./accountingStatus";
 
 export interface PhaseUsage {
   /** seq of the result-frame message, so the finish line can look up its delta. */
   seq: number;
   /** "Plan" for the first phase, "Implement · iteration N" after. */
   label: string;
-  /** Per-invocation, taken raw from the frame (not cumulative). */
-  turns: number;
-  durationMs: number;
+  /** Per-invocation finite evidence, or null when absent/nonfinite (not cumulative). */
+  turns: number | null;
+  durationMs: number | null;
   /** Per-phase figures: Σ over the frame's `modelUsage` models, per COLUMN, of (this
    *  frame's value − that model's running HIGH-WATER MARK WITHIN THE LEG), each clamped
    *  at 0. The mark resets at every `init` frame (PRD #1079), so for the common case of
@@ -164,8 +166,8 @@ export interface RunUsage {
     cached: number;
     out: number;
     costUsd: number;
-    turns: number;
-    durationMs: number;
+    turns: number | null;
+    durationMs: number | null;
     phaseCount: number;
   };
   /** cached / (fresh + cached) in [0,1] — the UNROUNDED truth.
@@ -193,8 +195,8 @@ export interface RunUsage {
   // confirmed a billed total. `agent_instance` is null on the lead lane, so two
   // byte-identical lead calls collapse to one record — the #194-validated key. A
   // subagent invocation carries a distinct `agent_instance`, so its calls never
-  // collapse into another lane's. This dedup is applied ONLY here; the confirmed
-  // per-agent sum (`agents`/`agentTotal`) counts every frame raw and is unchanged.
+  // collapse into another lane's. Claude confirmed attribution shares this signature;
+  // Codex confirmed attribution uses response UUIDs, while live keeps this signature.
   //
   // 🔴 THERE IS DELIBERATELY NO `out` AND NO COST FIELD on any live aggregate. Per-call
   // `output_tokens` is a message_start snapshot that captures only 1-4% of the true
@@ -262,6 +264,21 @@ function rec(v: unknown): Record<string, unknown> | undefined {
 function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
+function finiteNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** Preserve the live lane signature exactly, including nullable wire buckets. */
+function usageSignature(m: RunMessage, raw: Record<string, unknown>): string {
+  return JSON.stringify([
+    m.agent_instance,
+    num(raw["input_tokens"]),
+    num(raw["cache_read_input_tokens"]),
+    num(raw["cache_creation_input_tokens"]),
+    num(raw["output_tokens"]),
+  ]);
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
@@ -557,10 +574,11 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
   // The LIVE aggregate (issue #237), DEDUPED by `(agent_instance, usage)`. All state
   // is local to this one call — the reduction stays pure and idempotent under the
   // ws→reconnect→REST-replay overlap, exactly like the confirmed accumulators. The
-  // dedup NEVER touches the raw `agents`/`agentTotal` sum above: those count every
-  // frame. `Map` (not `{}`) for both bucket maps because agent/model ids are untrusted
+  // confirmed attribution has its own set: Claude shares the signature, Codex uses
+  // response UUIDs. `Map` (not `{}`) because agent/model ids are untrusted
   // payload (same rationale as `agentMap`/`readModelUsage`).
   const seenLiveKeys = new Set<string>();
+  const seenConfirmedKeys = new Set<string>();
   const liveTotal = { fresh: 0, cached: 0 };
   const liveByAgentMap = new Map<string, { fresh: number; cached: number }>();
   const liveByModelMap = new Map<string, { fresh: number; cached: number }>();
@@ -706,8 +724,8 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       const phase: PhaseUsage = {
         seq: m.seq,
         label,
-        turns: num(payload?.["num_turns"]),
-        durationMs: num(payload?.["duration_ms"]),
+        turns: finiteNumber(payload?.["num_turns"]),
+        durationMs: finiteNumber(payload?.["duration_ms"]),
         fresh,
         cached,
         out,
@@ -719,8 +737,8 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       continue;
     }
 
-    // Per-agent: assistant-frame per-call usage (never a result frame — that would
-    // fold the cumulative total into the sum). One usage record per SDK frame.
+    // Per-agent: deduplicated per-call assistant usage, including Codex accounting
+    // statuses. Result frames already continued above and never enter attribution.
     if (payload && "usage" in payload) {
       const u = readUsage(payload["usage"]);
       if (u) {
@@ -741,31 +759,28 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
           const ctx = readContext(payload["context"]);
           if (ctx) leadContext = ctx;
         }
-        const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: newModelCounts() };
-        acc.fresh += u.fresh;
-        acc.cached += u.cached;
-        acc.out += u.out;
-        // PRD #93 Decision 2: `model` is CO-GATED with `usage` by the worker — it
-        // rides the same surviving frame — so it is read only here, inside the
-        // counted branch. A model-only frame therefore never creates an agent row,
-        // and the strip's init model (a different path) never leaks in.
+        const liveKey = usageSignature(m, rec(payload["usage"]) ?? {});
+        const accounting = isAccountingStatus(m);
+        const responseId = payload["usage_response_id"];
+        // Dedicated accounting records require their UUID identity; never fall back
+        // to a usage signature when it is absent or malformed.
+        if (accounting && (typeof responseId !== "string" || responseId.length !== 36 ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(responseId))) continue;
+        const confirmedKey = accounting ? `codex:${responseId}` : `claude:${liveKey}`;
         const fm = str(payload["model"]);
-        if (fm) acc.modelCounts[fm] = (acc.modelCounts[fm] ?? 0) + 1;
-        agentMap.set(agent, acc);
+        if (!seenConfirmedKeys.has(confirmedKey)) {
+          seenConfirmedKeys.add(confirmedKey);
+          const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: newModelCounts() };
+          acc.fresh += u.fresh;
+          acc.cached += u.cached;
+          acc.out += u.out;
+          // Model frequencies count only attributed records; model-only frames and
+          // replayed records cannot create or change an agent's primary model.
+          if (fm) acc.modelCounts[fm] = (acc.modelCounts[fm] ?? 0) + 1;
+          agentMap.set(agent, acc);
+        }
 
-        // LIVE surface (issue #237): a SEPARATE dedup pass on the SAME frame. The raw
-        // `acc.*` above already counted this frame unconditionally; the live buckets
-        // count it only once per `(agent_instance, usage)` signature. The key is built
-        // from the RAW usage fields (not the folded `u`), so two calls collapse only
-        // when their four wire columns are byte-identical on the same lane.
-        const rawUsage = rec(payload["usage"]) ?? {};
-        const liveKey = JSON.stringify([
-          m.agent_instance,
-          num(rawUsage["input_tokens"]),
-          num(rawUsage["cache_read_input_tokens"]),
-          num(rawUsage["cache_creation_input_tokens"]),
-          num(rawUsage["output_tokens"]),
-        ]);
+        // Live retains the existing lane/usage signature for both harnesses.
         if (!seenLiveKeys.has(liveKey)) {
           seenLiveKeys.add(liveKey);
           liveTotal.fresh += u.fresh;
@@ -785,14 +800,14 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     }
   }
 
-  const total = phases.reduce(
+  const total = phases.reduce<RunUsage["total"]>(
     (t, p) => ({
       fresh: t.fresh + p.fresh,
       cached: t.cached + p.cached,
       out: t.out + p.out,
       costUsd: t.costUsd + p.costUsd,
-      turns: t.turns + p.turns,
-      durationMs: t.durationMs + p.durationMs,
+      turns: t.turns === null || p.turns === null ? null : finiteNumber(t.turns + p.turns),
+      durationMs: t.durationMs === null || p.durationMs === null ? null : finiteNumber(t.durationMs + p.durationMs),
       phaseCount: t.phaseCount + 1,
     }),
     { fresh: 0, cached: 0, out: 0, costUsd: 0, turns: 0, durationMs: 0, phaseCount: 0 },

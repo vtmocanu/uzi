@@ -8,29 +8,30 @@ import tea "charm.land/bubbletea/v2"
 // owns the actions; the binding is settled here so it never moves), `a` is the admin
 // toggle only, `r` is refresh only.
 const (
-	keyQuit         = "q"
-	keyCtrlC        = "ctrl+c"
-	keyEnter        = "enter"
-	keyEsc          = "esc"
-	keyUp           = "up"
-	keyDown         = "down"
-	keyLeft         = "left"
-	keyRight        = "right"
-	keyTab          = "tab"
-	keyFilter       = "/"
-	keyHelp         = "?"
-	keyAdmin        = "a"
-	keyHideDone     = "h" // board: hide terminal (completed/failed/cancelled) runs, keeping active + needs-you
-	keyRefresh      = "r"
-	keyConfirmY     = "y"
-	keyConfirmN     = "n"
-	keyGoLive       = "g" // M5: re-attach the transcript follow (f is already follow-up)
-	keyCollapseCrew = "c" // fold the crew list to a summary so the milestone block is reachable
-	keyPageUp       = "pgup"
-	keyPageDown     = "pgdown"
-	keyHome         = "home"
-	keyEnd          = "end"
-	keySpaceName    = "space" // v2 names the space key "space", never " "
+	keyQuit             = "q"
+	keyCtrlC            = "ctrl+c"
+	keyEnter            = "enter"
+	keyEsc              = "esc"
+	keyUp               = "up"
+	keyDown             = "down"
+	keyLeft             = "left"
+	keyRight            = "right"
+	keyTab              = "tab"
+	keyFilter           = "/"
+	keyHelp             = "?"
+	keyAdmin            = "a"
+	keyHideDone         = "h" // board: hide terminal (completed/failed/cancelled) runs, keeping active + needs-you
+	keyRefresh          = "r"
+	keyConfirmY         = "y"
+	keyConfirmN         = "n"
+	keyGoLive           = "g" // M5: re-attach the transcript follow (f is already follow-up)
+	keyCollapseQuestion = "z" // fold / unfold the pending question card
+	keyCollapseCrew     = "c" // fold the crew list to a summary so the milestone block is reachable
+	keyPageUp           = "pgup"
+	keyPageDown         = "pgdown"
+	keyHome             = "home"
+	keyEnd              = "end"
+	keySpaceName        = "space" // v2 names the space key "space", never " "
 	// Tab and shift+tab cycle floor, workers, pulls, ci in both layouts.
 	keyViewFloor   = "1"
 	keyViewWorkers = "2"
@@ -93,6 +94,7 @@ func helpLines(v tuiView) []string {
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
 			"c          fold / unfold crew (auto-folds when blocks below do not fit)",
+			"z          fold / unfold pending questions (awaiting input)",
 			"W          open this run's worker",
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)

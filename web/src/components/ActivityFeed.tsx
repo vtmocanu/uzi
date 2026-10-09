@@ -1,3 +1,4 @@
+import { isAccountingStatus } from "../lib/accountingStatus";
 import { planCheckEventText } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -583,10 +584,11 @@ export function ActivityFeed({
     prefs.set(VIEW_KEY, next);
   };
 
-  const toolIndex = useMemo(() => buildToolIndex(messages), [messages]);
+  const presentationMessages = useMemo(() => messages.filter((m) => !isAccountingStatus(m)), [messages]);
+  const toolIndex = useMemo(() => buildToolIndex(presentationMessages), [presentationMessages]);
 
-  const capped = messages.length > CAP_TRIGGER && !showAll;
-  const hiddenCount = capped ? messages.length - CAP_VISIBLE : 0;
+  const capped = presentationMessages.length > CAP_TRIGGER && !showAll;
+  const hiddenCount = capped ? presentationMessages.length - CAP_VISIBLE : 0;
   // Select from the full loaded stream, before the presentation cap. A future
   // version or malformed payload cannot supersede the last valid draft.
   const latestDraftSeq = useMemo(() => {
@@ -596,7 +598,7 @@ export function ActivityFeed({
     }
     return latest;
   }, [messages]);
-  const visible = (capped ? messages.slice(-CAP_VISIBLE) : messages).filter(
+  const visible = (capped ? presentationMessages.slice(-CAP_VISIBLE) : presentationMessages).filter(
     (msg) => !parseDraftPlanCapture(msg) || msg.seq === latestDraftSeq,
   );
   const groups = useMemo(() => groupByAgent(visible), [visible]);
@@ -833,7 +835,7 @@ export function ActivityFeed({
     seen.agent = activeAgent;
 
     let meaningful: RunMessage | undefined;
-    for (const mm of messages) {
+    for (const mm of presentationMessages) {
       if (
         mm.kind === "status" ||
         mm.kind === "error" ||
@@ -893,7 +895,7 @@ export function ActivityFeed({
     seen.terminal = terminal;
 
     if (next !== null) setAnnouncement(truncate(next, ANNOUNCE_MAX));
-  }, [messages, activeAgent, terminal, run.plan_cross_check_summary, run.harness]);
+  }, [presentationMessages, activeAgent, terminal, run.plan_cross_check_summary, run.harness]);
 
   const anchored = new Set<string>();
 
@@ -955,7 +957,7 @@ export function ActivityFeed({
             />
             Follow live
           </label>
-          <span className="text-xs text-muted">{messages.length} messages</span>
+          <span className="text-xs text-muted">{presentationMessages.length} messages</span>
         </div>
       </div>
 

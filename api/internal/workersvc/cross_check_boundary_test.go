@@ -212,7 +212,9 @@ func TestPlanCrossCheckRefusalStateBoundary(t *testing.T) {
 		{name: "unknown gate", reason: "approve", refusal: "candidate_invalid", want: ErrInvalidState},
 		{name: "not required", reason: "candidate_refused", refusal: "candidate_invalid", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.PlanCrossCheckRequired = false }, want: ErrInvalidState},
 		{name: "not auto", reason: "checker_failed", refusal: "submit_failed", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.AutoApprove = false }, want: ErrInvalidState},
-		{name: "codex lead", reason: "checker_failed", refusal: "submit_failed", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.Harness = "codex" }, want: ErrInvalidState},
+		// PRD #2460: a Codex lead is cross-checked too, so its refusal declarations are valid.
+		{name: "codex lead", reason: "checker_failed", refusal: "submit_failed", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.Harness = "codex" }},
+		{name: "unknown lead harness", reason: "checker_failed", refusal: "submit_failed", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.Harness = "gemini" }, want: ErrInvalidState},
 		{name: "other user", reason: "candidate_refused", refusal: "candidate_invalid", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.UserID = uuid.New() }, want: ErrInvalidState},
 		{name: "other worker", reason: "candidate_refused", refusal: "candidate_invalid", change: func(r *store.Run, _ *StateRequest, _ *crossCheckBoundaryTx) { r.WorkerID = pgconv.UUID(uuid.New()) }, want: ErrInvalidState},
 		{name: "stale generation", reason: "candidate_refused", refusal: "candidate_invalid", change: func(_ *store.Run, r *StateRequest, _ *crossCheckBoundaryTx) {

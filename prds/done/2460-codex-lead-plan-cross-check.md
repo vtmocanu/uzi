@@ -1,6 +1,6 @@
 # PRD #2460: Plan cross-check for Codex-lead runs (Claude checker)
 
-**Status**: Draft. Child 4 of 6 under umbrella #2148 (Cross-check). Split from PRD #2150 on 2026-10-07 (PRD #2150 D5). Blocked by PRD #2150 (both change the plan-gate code; automatic rounds land first). Naming follows PRD #2149 (D13, D14).
+**Status**: Done (2026-10-08). Child 4 of 6 under umbrella #2148 (Cross-check). Split from PRD #2150 on 2026-10-07 (PRD #2150 D5). Was blocked by PRD #2150 (both change the plan-gate code; automatic rounds landed first). Naming follows PRD #2149 (D13, D14).
 
 Resolved facts below were read at `main` `58cee732`.
 
@@ -54,7 +54,8 @@ Acceptance examples:
 
 ## Milestones
 
-- [ ] **M1: A Codex lead's plan is cross-checked on Claude.** Server acceptance of Codex leads and opposite-family child creation, single-family claim assembly, the Claude `CrossCheckRunner` path with path-guard confinement, Codex-executor checked-approval handoff and round handling, the capability and its mirrors, lifting the runner park, pins delivery when PRD #2151 is present, docs (`docs/cross-check.md`, `docs/worker-setup.md`, then `task docs:sync`), `specs/human.md`, CHANGELOG. Blocked by: PRD #2150 M1. Gates: `task gate:agent`, `task gate:api`, LiveDB via `./e2e/run-store-it.sh`, `task gate:repo`.
+- [x] **M1: A Codex lead's plan is cross-checked on Claude.** Server acceptance of Codex leads and opposite-family child creation, single-family claim assembly, the Claude `CrossCheckRunner` path with path-guard confinement, Codex-executor checked-approval handoff and round handling, the capability and its mirrors, lifting the runner park, pins delivery when PRD #2151 is present, docs (`docs/cross-check.md`, `docs/worker-setup.md`, then `task docs:sync`), `specs/human.md`, CHANGELOG. Blocked by: PRD #2150 M1. Gates: `task gate:agent`, `task gate:api`, LiveDB via `./e2e/run-store-it.sh`, `task gate:repo`.
+  - Gate evidence (2026-10-08, branch head before merge): `task gate:api`, `task gate:web` and `task gate:repo` passed; `./e2e/run-store-it.sh` reported `LiveDB: 2443 passed, 0 skipped`. `task gate:agent` was red on two load-sensitive tests, "a real usage 400 irrecoverably loses preparation receipts and terminates before submit" and "the live trigger never blocks execution". Both also fail at base `fdaef448` under parallel load, and both pass in isolation at the branch head. CI on the merged head is the authoritative gate.
 
 No `.github/workflows/**` change in implementation or validation.
 
@@ -64,3 +65,4 @@ No `.github/workflows/**` change in implementation or validation.
 - **D2. Split from PRD #2150.** User decision 2026-10-07, on buddy review: independently valuable from automatic rounds, and it needs server, claim and executor changes beyond lifting the runner park.
 - **D3. Single-family credential custody.** A child holds only its own family's credential, mirroring PRD #2149's Codex-only rule, so a checker can never act as the lead's family.
 - **D4. Implemented on the Claude harness.** User decision 2026-10-07: the work is a Claude SDK checker path.
+- **D5. MR !2526 rework (2026-10-09).** Merged main (#2514 dedicated slots): a Claude child uses the dedicated lane, with `worker_id` soft affinity to the lead's worker, which is guaranteed to advertise `cross_check_codex_lead_v1` at submit. The migration was renumbered to 00314 (00313 is #2514's lane migration). An additive claim signal `plan_cross_check_codex_lead` replaces reliance on a submit refusal (Greptile P1): a new worker without it does not submit and parks the Codex lead at the human gate (`codex_lead_unsupported`). Accepted rollback boundary: an api rollback while a claim carrying the field is in flight lets the worker submit to the older api and fail the run; the api is a single-replica Recreate deployment, so only an operator rollback can cause it, limited to Codex claims in flight then (strict goose does not refuse an older api against a database at 00314). The worker fallback can go once the minimum supported api sends the field.

@@ -28,14 +28,14 @@ beforeEach(() => vi.resetAllMocks());
 afterEach(cleanup);
 
 describe("checker defaults", () => {
-  it("has one accessible Plan row, exact headings, independent Defaults and editable dormant Claude", () => {
+  it("has one accessible Plan row, exact headings, independent Defaults and editable Claude", () => {
     render(<CrossCheckDefaults settings={settings()} onSaved={vi.fn()} />);
     const table = screen.getByRole("table", { name: "Cross-check defaults" });
     expect(within(table).getAllByRole("row")).toHaveLength(2);
     expect(within(table).getByRole("columnheader", { name: "Claude cross-checker" })).toBeTruthy();
     expect(within(table).getByRole("columnheader", { name: "Codex cross-checker" })).toBeTruthy();
     expect(screen.getByText("Checks leads running on the other model family")).toBeTruthy();
-    expect(screen.getByText("Used once Codex-lead runs are cross-checked")).toBeTruthy();
+    expect(screen.queryByText(/Used once Codex-lead runs are cross-checked/)).toBeNull();
     expect(within(model("Claude")).getByRole("option", { name: "Default · custom-template-model (worker default)" })).toBeTruthy();
     expect(within(model("Codex")).getByRole("option", { name: "Default · gpt-6.1-sol (worker default)" })).toBeTruthy();
     for (const family of ["Claude", "Codex"]) {

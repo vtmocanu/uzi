@@ -1679,7 +1679,8 @@ func (m tuiModel) filtering() bool {
 	return (m.view == viewWorkers && m.workers.filtering) ||
 		(m.view == viewBoard && m.board.filtering) ||
 		(m.view == viewPulls && m.pulls.filtering) ||
-		(m.view == viewCI && m.ci.filtering)
+		(m.view == viewCI && m.ci.filtering) ||
+		(m.view == viewDetail && m.detail.steer.mode == steerTyping)
 }
 
 func (m tuiModel) transcriptWidth() int {

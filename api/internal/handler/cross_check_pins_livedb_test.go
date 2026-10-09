@@ -189,14 +189,14 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 		return response.Settings.Pins
 	}
 	initial := request("{}", 200)
-	if initial[0].Harness != "claude" || initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
+	if initial[0].Harness != "claude" || !initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
 		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "medium" || initial[1].Model != nil {
-		t.Fatalf("defaults/dormancy: %+v", initial)
+		t.Fatalf("defaults/both-cells-active: %+v", initial)
 	}
 	exec("UPDATE users SET default_codex_model='gpt-6-sol',default_codex_effort='high' WHERE id=$1", user)
 	got := request(`{"cross_check_pins":[{"stage":"plan","harness":"codex","model":"gpt-6-astra","effort":"xhigh"},{"stage":"plan","harness":"claude","model":"sonnet"}]}`, 200)
 	if *got[1].Model != "gpt-6-astra" || *got[1].ResolvedModel != "gpt-6-astra" || got[1].ResolvedEffort != "xhigh" ||
-		got[1].ModelSource != "pin" || got[1].EffortSource != "pin" || got[0].Active || *got[0].Model != "sonnet" {
+		got[1].ModelSource != "pin" || got[1].EffortSource != "pin" || !got[0].Active || *got[0].Model != "sonnet" {
 		t.Fatalf("pins: %+v", got)
 	}
 	got = request(`{"cross_check_pins":[{"stage":"plan","harness":"codex","effort":"max"}]}`, 200)

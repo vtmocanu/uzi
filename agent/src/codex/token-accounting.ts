@@ -78,6 +78,13 @@ export interface CodexPricingContext {
   readonly now: Date;
 }
 
+/** A snapshot of one response adopted by the existing reconciliation gate. */
+export interface CodexAdoptedMeasurement {
+  readonly model: string;
+  readonly last: Readonly<CodexUsageBreakdown>;
+  readonly pricingEvidenceComplete: boolean;
+}
+
 /** A mutable per-bucket cumulative accumulator (the six wire buckets). */
 interface Cumulative {
   inputTokens: number;
@@ -236,7 +243,8 @@ export class CodexUsageAccountant {
    * Later notes advance the cumulative max only when strictly newer. Missing replay never
    * licenses component subtraction of last from total.
    */
-  record(threadId: string, usage: CodexThreadTokenUsage, replay = false): void {
+  record(threadId: string, usage: CodexThreadTokenUsage, replay = false): CodexAdoptedMeasurement | undefined {
+    let adopted: CodexAdoptedMeasurement | undefined;
     const acct = this.threads.get(threadId);
     if (acct === undefined) return; // unknown / unregistered thread — never attributed
     if (acct.resumed && acct.baseline === undefined && !replay) {
@@ -255,9 +263,16 @@ export class CodexUsageAccountant {
       acct.maxTotal = total;
       acct.maxMagnitude = magnitude(usage.total);
       // Historical replay last is never a response of this claim.
-      if (!replay) acct.responses.push(usage.last);
+      if (!replay) {
+        acct.responses.push(usage.last);
+        adopted = Object.freeze({
+          model: acct.model,
+          last: Object.freeze(toCumulative(usage.last)),
+          pricingEvidenceComplete: usage.pricingEvidenceComplete !== false,
+        });
+      }
       if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
-      return;
+      return adopted;
     }
     const m = magnitude(usage.total);
     if (m > acct.maxMagnitude) {
@@ -266,10 +281,18 @@ export class CodexUsageAccountant {
       // A genuinely newer note: `last` is this note's single most-recent response — record it as a
       // priced response. Mirrors the magnitude gate so a duplicate/stale/out-of-order note (which
       // does NOT advance the max) is never priced twice.
-      if (!replay) acct.responses.push(usage.last);
+      if (!replay) {
+        acct.responses.push(usage.last);
+        adopted = Object.freeze({
+          model: acct.model,
+          last: Object.freeze(toCumulative(usage.last)),
+          pricingEvidenceComplete: usage.pricingEvidenceComplete !== false,
+        });
+      }
       if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
     }
     // else: a duplicate, stale resume replay or out-of-order note — cannot increase usage or cost.
+    return adopted;
   }
 
   /**

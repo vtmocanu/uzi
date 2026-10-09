@@ -208,6 +208,12 @@ const CrossCheckRoundsV1 = "cross_check_rounds_v1"
 // CrossCheckPinsV1 identifies workers honoring hard checker model and effort pins.
 const CrossCheckPinsV1 = "cross_check_pins_v1"
 
+// CrossCheckCodexLeadV1 identifies workers that run a Codex lead's checked plan gate and a
+// Claude checker child (PRD #2460). It is a protocol capability: required of the claiming
+// worker for a Claude cross_check child and of a Codex lead's worker for a submit, and never
+// offered as a repo capability.
+const CrossCheckCodexLeadV1 = "cross_check_codex_lead_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -241,11 +247,12 @@ var protocolVocabulary = map[string]struct{}{
 	CrossCheckLaneV1:           {},
 	CrossCheckRoundsV1:         {},
 	CrossCheckPinsV1:           {},
+	CrossCheckCodexLeadV1:      {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1}
+var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

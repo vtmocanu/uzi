@@ -109,7 +109,7 @@ if (mockScenario() === "cross-check-mixed") {
 if (mockScenario() === "cross-check-dormant-claude") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "claude", model: "sonnet", effort: "max",
-      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: false },
+      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: true },
   ];
 }
 const SEED_APP_SETTINGS: AppSettings = {
@@ -493,7 +493,7 @@ function mySettingsResponse(): { settings: UserSettings } {
     const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
     return { stage: "plan", harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
       resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
-      effort_source: effort === null ? "worker default" : "pin", active: harness === "codex" };
+      effort_source: effort === null ? "worker default" : "pin", active: true };
   });
   return { settings: { ...userSettings, cross_check_pins, default_model: projected ?? null } };
 }
@@ -1156,7 +1156,7 @@ export const settingsApi = {
         if (seen.has(harness)) throw new ApiError(400, `${name}: duplicate cell`);
         seen.add(harness);
         const previous = pins.find(p => p.harness === harness);
-        const pin: CrossCheckPinDTO = previous ?? { stage: "plan", harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex" };
+        const pin: CrossCheckPinDTO = previous ?? { stage: "plan", harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: true };
         for (const field of ["model", "effort"] as const) {
           if (!(field in cell)) continue;
           const value = cell[field];

@@ -85,6 +85,58 @@ async function reduce(events: HarnessEvent[]) {
   return r.finish({ kind: "exhausted" }).result;
 }
 
+describe("RunTurnReducer — m1 dedicated response usage", () => {
+  it("persists root and child usage without context, assistant frames or lifecycle evidence", async () => {
+    let requests = 0;
+    let reads = 0;
+    const reducer = new RunTurnReducerImpl({
+      request() { requests++; },
+      async get() { reads++; return undefined; },
+    });
+    reducer.beginTurn();
+    const usage = { input_tokens: 50, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 40 };
+    let firstSession = true;
+    for (const attribution of [{ agent: "lead" }, { agent: "coder", agentInstance: "child-instance", agentLabel: "[m1]" }]) {
+      const event: HarnessEvent = {
+        kind: "usage_record", attribution, responseId: "response-1", model: "gpt-5.6-sol", usage, sessionId: "root",
+      };
+      const reduction = await reducer.accept(event);
+      assert.deepEqual(reduction.messages, [{
+        kind: "status", ...attribution,
+        payload: { event: "codex_response_usage", usage_response_id: "response-1", model: "gpt-5.6-sol", usage },
+      }]);
+      assert.equal(reduction.firstSessionId, firstSession ? "root" : undefined);
+      firstSession = false;
+    }
+    const result = reducer.finish({ kind: "exhausted" }).result;
+    assert.equal(result.sawModelActivity, undefined);
+    assert.equal(result.subagentActivity, undefined);
+    assert.equal(result.numTurns, undefined);
+    assert.equal(requests, 0);
+    assert.equal(reads, 0);
+  });
+
+  it("accepts duration-only Codex terminal wire metrics without inventing turns or cost", async () => {
+    const reducer = new RunTurnReducerImpl(noContext);
+    reducer.beginTurn();
+    const reduction = await reducer.accept({
+      kind: "turn_finished", terminal: {
+        outcome: "success", subtype: "success", errors: [],
+        metrics: { durationMs: 17, cost: { kind: "unreported" }, wire: { duration_ms: 17 } },
+      },
+    });
+    const resultMessage = reduction.messages.find(m => m.payload.event === "result");
+    assert.ok(resultMessage);
+    assert.equal(resultMessage.payload.duration_ms, 17);
+    const wire = JSON.parse(JSON.stringify(resultMessage.payload));
+    assert.ok(!("num_turns" in wire));
+    assert.ok(!("total_cost_usd" in wire));
+    const result = reducer.finish({ kind: "exhausted" }).result;
+    assert.equal(result.numTurns, undefined);
+    assert.equal(result.sawModelActivity, undefined);
+  });
+});
+
 describe("RunTurnReducer — empty-turn evidence (issue #1197 D-RC2a)", () => {
   it("a zero-turn terminal with no assistant frames yields numTurns===0 && !sawModelActivity", async () => {
     const result = await reduce([{ kind: "initialized", model: "m" }, terminal(0)]);

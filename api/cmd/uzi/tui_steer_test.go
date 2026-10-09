@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -169,6 +171,100 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 	m2 = press(t, m2, "f")
 	if _, cmd := m2.handleKey(keyEnter); cmd != nil {
 		t.Error("an empty follow-up submitted; a stray enter must not queue a blank steer")
+	}
+}
+
+func TestSteerFollowUpCapturesGlobalShortcuts(t *testing.T) {
+	newOwner := func(t *testing.T) tuiModel {
+		t.Helper()
+		return ownerModel(t, &uzicli.FakeClient{}, "r-own", ownedRun("r-own"))
+	}
+	typeKey := func(t *testing.T, m tuiModel, key, wantInput string) tuiModel {
+		t.Helper()
+		next, cmd := m.handleKey(key)
+		m = next.(tuiModel)
+		if cmd != nil || m.showHelp || m.detail.steer.mode != steerTyping || m.detail.steer.input != wantInput {
+			t.Fatalf("key %q: command present=%v help=%v mode=%v input=%q; want no command, no help, steerTyping, input=%q",
+				key, cmd != nil, m.showHelp, m.detail.steer.mode, m.detail.steer.input, wantInput)
+		}
+		return m
+	}
+	escape := func(t *testing.T, m tuiModel) tuiModel {
+		t.Helper()
+		next, cmd := m.handleKey(keyEsc)
+		m = next.(tuiModel)
+		if cmd != nil || m.showHelp || m.detail.steer.mode != steerIdle || m.detail.steer.input != "" {
+			t.Fatalf("esc: command present=%v help=%v mode=%v input=%q; want no command, no help, steerIdle, empty input",
+				cmd != nil, m.showHelp, m.detail.steer.mode, m.detail.steer.input)
+		}
+		return m
+	}
+	assertQuit := func(t *testing.T, cmd tea.Cmd) {
+		t.Helper()
+		if cmd == nil {
+			t.Fatal("q did not produce a quit command")
+		}
+		if msg := cmd(); msg == nil {
+			t.Fatal("q produced a nil message")
+		} else if _, ok := msg.(tea.QuitMsg); !ok {
+			t.Fatalf("q produced %T, want tea.QuitMsg", msg)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{"q", "aqb"},
+		{"?", "a?b"},
+		{"combined", "aq?b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := typeKey(t, newOwner(t), "f", "")
+			for i, key := range tc.text {
+				m = typeKey(t, m, string(key), tc.text[:i+1])
+			}
+			m = escape(t, m)
+			next, cmd := m.handleKey(keyQuit)
+			assertQuit(t, cmd)
+			if next.(tuiModel).showHelp {
+				t.Fatal("q opened help after esc")
+			}
+		})
+	}
+
+	t.Run("help after esc", func(t *testing.T) {
+		m := typeKey(t, newOwner(t), "f", "")
+		m = typeKey(t, m, "a", "a")
+		m = escape(t, m)
+		next, cmd := m.handleKey(keyHelp)
+		m = next.(tuiModel)
+		if cmd != nil || !m.showHelp || m.detail.steer.mode != steerIdle || m.detail.steer.input != "" {
+			t.Fatal("? did not open help with empty, idle follow-up input after esc")
+		}
+	})
+
+	for _, key := range []string{keyQuit, keyHelp} {
+		t.Run("confirmation "+key, func(t *testing.T) {
+			next, cmd := newOwner(t).handleKey("x")
+			m := next.(tuiModel)
+			if cmd != nil || m.showHelp || m.detail.steer.mode != steerConfirming || m.detail.steer.pending != kindCancel {
+				t.Fatal("x did not open a pending cancel confirmation")
+			}
+			next, cmd = m.handleKey(key)
+			m = next.(tuiModel)
+			if m.detail.steer.mode != steerConfirming || m.detail.steer.pending != kindCancel {
+				t.Fatal("global shortcut changed the pending cancel confirmation")
+			}
+			if key == keyQuit {
+				assertQuit(t, cmd)
+				if m.showHelp {
+					t.Fatal("q opened help during confirmation")
+				}
+			} else if cmd != nil || !m.showHelp {
+				t.Fatal("? did not open help during confirmation")
+			}
+		})
 	}
 }
 

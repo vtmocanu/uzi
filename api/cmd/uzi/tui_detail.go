@@ -82,6 +82,8 @@ type detailState struct {
 	railFold   railFoldMode
 	runLoaded  bool // the first GetRun has landed: header/milestones/accounts can render
 	tailLoaded bool // the newest transcript page has landed
+
+	questionCollapsed bool // session preference; only z toggles, reopening restores expanded
 	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
 	// cursor: the background walk requests the newest page strictly below it and the reply
 	// lowers it, until the start of history is reached. highSeq is the total, since seq is
@@ -410,13 +412,14 @@ func (d *detailState) rebuild() {
 	if d.laneIdx >= 0 && d.laneIdx < len(d.lanes) {
 		selKey = d.lanes[d.laneIdx].Key
 	}
-	d.lanes = buildLanes(d.frames)
+	visible := presentationFrames(d.frames)
+	d.lanes = buildLanes(visible)
 	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is the
 	// firehose and the individual lanes follow for isolating one. On the FIRST build there is no
 	// prior selection (selKey ""), so the restore below is skipped and the default index 0 lands on
 	// the firehose — the intended opening view for a multi-lane run.
 	if len(d.lanes) >= 2 {
-		d.lanes = append([]agentLane{allLane(d.frames)}, d.lanes...)
+		d.lanes = append([]agentLane{allLane(visible)}, d.lanes...)
 	}
 	if selKey != "" {
 		for i, l := range d.lanes {
@@ -546,6 +549,11 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.backfillCmd(m.detail.runID, m.detail.lowSeq))
 		}
 		return m, tea.Batch(cmds...)
+	case keyCollapseQuestion:
+		if _, open := m.openQuestionFrame(); open {
+			m.detail.questionCollapsed = !m.detail.questionCollapsed
+		}
+		return m, nil
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
 		// (the rail is height-clamped and does not scroll). `c` is a sticky override (PRD #1257
@@ -607,13 +615,14 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		if maxTop < 0 {
 			maxTop = 0
 		}
-		// F-M5a: reclamp the stored top against the CURRENT extent BEFORE applying the
-		// delta. A resize (WindowSizeMsg) since it was set can leave scroll above the new
-		// maxTop; applying the delta to that stale value would push it past the bottom clamp
-		// below and wrongly re-arm follow on the next key instead of scrolling to older
-		// output.
-		if m.detail.scroll > maxTop {
-			m.detail.scroll = maxTop
+		// renderTranscript preserves a paused top beyond maxTop with padding.
+		// Navigate from that anchor, bounded by the last content row.
+		bottom := maxTop
+		if !m.detail.follow && m.detail.scroll > maxTop {
+			bottom = min(m.detail.scroll, max(0, total-1))
+		}
+		if m.detail.scroll > bottom {
+			m.detail.scroll = bottom
 		}
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
@@ -633,9 +642,9 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
 		}
-		if m.detail.scroll >= maxTop {
-			m.detail.scroll = maxTop
-			if isLiveRunStatus(m.detail.run.Status) {
+		if m.detail.scroll >= bottom {
+			m.detail.scroll = bottom
+			if bottom == maxTop && isLiveRunStatus(m.detail.run.Status) {
 				m.detail.follow = true
 			}
 		}
@@ -875,6 +884,9 @@ func (m tuiModel) renderDetail() string {
 		return sb.String() + m.renderReviewOverlay()
 	}
 
+	for _, line := range m.questionCardLines() {
+		sb.WriteString(line + "\n")
+	}
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
 	sb.WriteString(m.joinColumns(rail, body, laneRailWidth))

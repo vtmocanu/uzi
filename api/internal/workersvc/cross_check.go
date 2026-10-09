@@ -61,6 +61,34 @@ func (c PlanCrossCheckCandidate) Digest() ([]byte, error) {
 	return sum[:], nil
 }
 
+// oppositeHarness is the family a lead's plan checker must run on: claude for a codex
+// lead, codex for a claude lead (PRD #2460). The second result is false for any other
+// harness, so an unknown lead can never be cross-checked.
+func oppositeHarness(lead string) (Harness, bool) {
+	switch lead {
+	case string(HarnessClaude):
+		return HarnessCodex, true
+	case string(HarnessCodex):
+		return HarnessClaude, true
+	}
+	return "", false
+}
+
+// leadCrossCheckCapable reports whether a lead of this harness, on a worker advertising
+// caps, may take another cross-check round: any known family, and for a Codex lead only a
+// worker with cross_check_codex_lead_v1.
+func leadCrossCheckCapable(lead string, caps []string) bool {
+	if !isCrossCheckLeadHarness(lead) {
+		return false
+	}
+	return lead != string(HarnessCodex) || slices.Contains(caps, capability.CrossCheckCodexLeadV1)
+}
+
+func isCrossCheckLeadHarness(lead string) bool {
+	_, ok := oppositeHarness(lead)
+	return ok
+}
+
 func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, candidate PlanCrossCheckCandidate, requestedRounds ...int32) (store.CrossCheck, error) {
 	round := int32(1)
 	if len(requestedRounds) > 1 {
@@ -79,7 +107,8 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
-	if lead.Harness != string(HarnessClaude) || !lead.PlanCrossCheckRequired || !lead.AutoApprove ||
+	childHarness, leadKnown := oppositeHarness(lead.Harness)
+	if !leadKnown || !lead.PlanCrossCheckRequired || !lead.AutoApprove ||
 		(lead.Status != "claimed" && lead.Status != "running") {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
@@ -124,7 +153,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	retryQ := store.New(tx)
 	locked, err := retryQ.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 	if err != nil || locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.ClaimReleasedAt.Valid ||
-		locked.Harness != string(HarnessClaude) || !locked.PlanCrossCheckRequired || !locked.AutoApprove ||
+		locked.Harness != lead.Harness || !locked.PlanCrossCheckRequired || !locked.AutoApprove ||
 		(locked.Status != "claimed" && locked.Status != "running") ||
 		validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
@@ -169,7 +198,6 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if worker.IsolatedLane {
 		return store.CrossCheck{}, ErrCrossCheckUnavailable
 	}
-	childHarness := HarnessCodex
 	var existing store.CrossCheck
 	errRetry := errors.New("existing plan cross-check")
 	_, err = s.createRunResolved(ctx, lead.UserID, &childHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
@@ -181,7 +209,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		if e != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
-		if locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.Harness != string(HarnessClaude) ||
+		if locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.Harness != lead.Harness ||
 			!locked.PlanCrossCheckRequired || !locked.AutoApprove || locked.ClaimReleasedAt.Valid ||
 			(locked.Status != "claimed" && locked.Status != "running") ||
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
@@ -202,13 +230,17 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		if e != nil {
 			return store.Run{}, e
 		}
-		if resolved.Harness != HarnessCodex {
+		if resolved.Harness != childHarness {
 			return store.Run{}, ErrCrossCheckRefused
 		}
 		childID := uuid.New()
 		child, e := txq.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
-			ChildID: childID, LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: budgetWallSeconds,
+			ChildID: childID, ChildHarness: string(childHarness), LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: budgetWallSeconds,
 		})
+		if errors.Is(e, pgx.ErrNoRows) {
+			// The guarded write found no lead of the opposite family in this state.
+			return store.Run{}, ErrCrossCheckRefused
+		}
 		if e != nil {
 			return store.Run{}, e
 		}
@@ -217,9 +249,13 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			Milestones: candidate.Milestones, RequiredCapabilities: candidate.RequiredCapabilities, RequiredTools: candidate.RequiredTools,
 			SizeClass: pgtype.Text{String: candidate.SizeClass, Valid: true}, BaseCommit: pgtype.Text{String: candidate.BaseCommit, Valid: true},
 			PlanningDiff: pgtype.Text{String: candidate.PlanningDiff, Valid: true}, CandidateDigest: digest,
-			CheckerRunID: pgconv.UUID(child.ID), DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true},
+			CheckerRunID: child.ID, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true},
 		})
 		if e != nil {
+			if errors.Is(e, pgx.ErrNoRows) {
+				// checker_harness comes from the child row and must differ from the lead's.
+				return store.Run{}, ErrCrossCheckRefused
+			}
 			return store.Run{}, e
 		}
 		return child, nil
@@ -460,6 +496,11 @@ func (s *Service) preparePlanCrossCheckRound(ctx context.Context, q *store.Queri
 	if err != nil {
 		return false, 0, ErrCrossCheckRefused
 	}
+	// A Codex lead's checked gate and its Claude checker need a worker that advertises
+	// cross_check_codex_lead_v1 (PRD #2460); a Claude lead's flow predates it.
+	if lead.Harness == string(HarnessCodex) && !slices.Contains(caps, capability.CrossCheckCodexLeadV1) {
+		return false, 0, ErrCrossCheckRefused
+	}
 	capable := slices.Contains(caps, capability.CrossCheckRoundsV1)
 	prior, err := q.GetPlanCrossCheck(ctx, lead.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -538,7 +579,7 @@ func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker,
 	row, err := q.GetPlanCrossCheckMetadata(ctx, leadID)
 	result := PlanCrossCheckLatestMetadata{Result: "no_row"}
 	if errors.Is(err, pgx.ErrNoRows) {
-		if lead.AutoApprove && lead.Harness == string(HarnessClaude) && lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
+		if lead.AutoApprove && leadCrossCheckCapable(lead.Harness, caps) && lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
 			next := int32(1)
 			result.NextRound = &next
 			result.NextRoundEligible = true
@@ -579,7 +620,7 @@ func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker,
 		result.FallbackReason = "revisions_exhausted"
 	}
 	if eligible && row.AutomaticRoundsEnabled && row.Round < row.AutomaticRevisionLimit+1 &&
-		slices.Contains(caps, capability.CrossCheckRoundsV1) && lead.AutoApprove && lead.Harness == string(HarnessClaude) &&
+		slices.Contains(caps, capability.CrossCheckRoundsV1) && lead.AutoApprove && leadCrossCheckCapable(lead.Harness, caps) &&
 		lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
 		next := row.Round + 1
 		result.NextRound = &next

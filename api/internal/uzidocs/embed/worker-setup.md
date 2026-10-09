@@ -466,6 +466,13 @@ The one exception is on the Claude run lane: `Read` may open a file directly
 inside that run's own SDK tool-result spill directory (the "Output too large ...
 Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
 worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
+The read-only Plan cross-check Claude checker (for a Codex lead) is stricter:
+`Read`, `Grep` and `Glob` only, with one path guard that confines them to its
+own checkout, apart from its own SDK spill files under its home. It also denies
+absolute, home-relative and `..` Glob/Grep patterns as defense in depth; the
+runner uid it runs as is the boundary, not that pattern check. See
+[Cross-check](./cross-check.md#claude-checker-isolation).
+
 This is a tool policy, not a promise that every shell command is filesystem
 confined: Claude's Bash guardrail screens commands but does not jail paths;
 Codex also screens the shell working directory, and uses Landlock only when
@@ -647,10 +654,11 @@ worker values fall back to 1. Zero disables lane advertisement and polling;
 it does not turn checks into ordinary run-slot work. The worker registers
 its slot count even when zero.
 
-A Claude lead can hold its run slot while its read-only Codex checker uses
-a cross-check slot on the same worker. The worker must support the required
-Codex harness/model. The reverse direction and Code cross-check are not
-shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
+A lead can hold its run slot while its read-only opposite-family checker
+uses a cross-check slot on the same worker: a Codex checker for a Claude lead
+(the worker must support the required Codex harness/model), or a Claude
+checker for a Codex lead (the worker must advertise
+`cross_check_codex_lead_v1`). Code cross-check is not shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
 own-worker preference, the 2-minute default fallback grace and mixed-image
 rollout behavior. Cordoning permits the worker's own pinned child to finish;
 quarantine and maintenance fencing still block claims. Shutdown and draining

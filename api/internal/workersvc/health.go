@@ -219,6 +219,10 @@ const (
 	reasonNoCrossCheckCapableWorker       = "no online worker supports plan cross-check (cross_check_v1); update or provision a capable worker"
 	reasonNoCrossCheckRoundsCapableWorker = "no online worker supports plan cross-check rounds (cross_check_rounds_v1); update or provision a capable worker"
 	reasonNoCrossCheckPinCapableWorker    = "no online worker supports pinned plan cross-check (cross_check_pins_v1); update or provision a pin-aware worker"
+	// reasonNoCrossCheckCodexLeadCapableWorker (PRD #2460) is emitted for a queued Claude
+	// plan-checker child (it checks a Codex lead) when the only capability the owner's fleet
+	// lacks is cross_check_codex_lead_v1, which ClaimRun requires for that child.
+	reasonNoCrossCheckCodexLeadCapableWorker = "no online worker supports Codex-lead plan cross-check (cross_check_codex_lead_v1); update or provision a capable worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -1165,6 +1169,10 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 				slog.Error("health: read cross-check capable workers", "run_id", r.ID, "error", werr)
 			} else {
 				capable := false
+				// capableIgnoringCodexLead: a worker that would qualify but for
+				// cross_check_codex_lead_v1, which only a Claude checker child needs.
+				capableIgnoringCodexLead := false
+				claudeChecker := run.Kind == "cross_check" && run.Harness == harnessClaude
 				for _, worker := range workers {
 					if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
 						slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
@@ -1173,11 +1181,17 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
 						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) &&
 						!worker.MaintenanceFenced && worker.MaintenancePhase != "requested" && worker.MaintenancePhase != "ready" && worker.MaintenancePhase != "stopping" && worker.MaintenancePhase != "recycling" {
-						capable = true
-						break
+						capableIgnoringCodexLead = true
+						if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
+							capable = true
+							break
+						}
 					}
 				}
 				if !capable {
+					if capableIgnoringCodexLead {
+						return reasonNoCrossCheckCodexLeadCapableWorker
+					}
 					if requiredProtocol == capability.CrossCheckRoundsV1 {
 						return reasonNoCrossCheckRoundsCapableWorker
 					}

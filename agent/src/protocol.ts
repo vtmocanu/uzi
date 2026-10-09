@@ -1277,6 +1277,10 @@ export interface ClaimResponse {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's
+   *  checked-plan submission. Absent on older servers, so a Codex lead parks as
+   *  codex_lead_unsupported instead of submitting to an api that would refuse it. */
+  plan_cross_check_codex_lead?: boolean;
   /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
    *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
    *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every

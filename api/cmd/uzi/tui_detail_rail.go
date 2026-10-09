@@ -595,6 +595,7 @@ func (m tuiModel) milestoneRowCell(blink bool) string {
 // — the SAME rule the server runs for RunDTO.CurrentActivity — so the board DTO and the rail can
 // never disagree on what is happening now (D3). Returns nil when no tool_use frame exists.
 func railActivity(frames []laneFrame) *apitypes.RunActivity {
+	frames = presentationFrames(frames)
 	ra := make([]runactivity.Frame, 0, len(frames))
 	for i := range frames {
 		f := &frames[i]

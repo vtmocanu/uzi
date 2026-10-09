@@ -332,6 +332,239 @@ function completedItem(item: Record<string, unknown>, threadId = "th-1"): CodexN
   return { kind: "activity", method: "item/completed", params: { threadId, item } };
 }
 
+
+describe("m1 response usage", () => {
+  const records = (events: HarnessEvent[]) => events.filter((e): e is Extract<HarnessEvent, { kind: "usage_record" }> => e.kind === "usage_record");
+  const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
+  const doubled = { inputTokens: 200, cachedInputTokens: 60, cacheWriteInputTokens: 40, outputTokens: 80, totalTokens: 280 };
+
+  it("measures RPC-inclusive duration with sequential and resumed dispatch resets", async () => {
+    for (const resumed of [false, true]) {
+      let now = 1000;
+      let turn = 0;
+      const transport = new FakeTransport(method => {
+        if (method === "turn/start") { now += 17.8; return { turn: { id: `tn-${++turn}` } }; }
+        return defaultResponder(method);
+      });
+      const { harness } = makeHarness({ transport, nowMs: () => now });
+      const root = resumed ? "resumed-1" : "th-1";
+      for (let i = 1; i <= 2; i++) {
+        now = i * 1000;
+        transport.push(turnCompleted("completed", undefined, root, `tn-${i}`));
+        const events = await collect(harness.startTurn(makeRequest(resumed ? { resumeSessionId: root } : {})).events);
+        const terminal = events.find(e => e.kind === "turn_finished");
+        assert.ok(terminal?.kind === "turn_finished");
+        assert.equal(terminal.terminal.metrics.durationMs, 17);
+        assert.deepEqual(terminal.terminal.metrics.wire, { duration_ms: 17 });
+      }
+    }
+  });
+
+  it("persists two identical root buckets with distinct adoption IDs without assistant text or lifecycle evidence", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(tokenUsage(last, last)).push(tokenUsage(last, last))
+      .push(tokenUsage({}, last)).push(tokenUsage(last, last, "unknown"))
+      .push(tokenUsage(doubled, last)).push(turnCompleted("completed"));
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const adopted = records(events);
+    assert.equal(adopted.length, 2);
+    assert.notEqual(adopted[0]!.responseId, adopted[1]!.responseId);
+    const { RunTurnReducerImpl } = await import("../src/harness-reducer.js");
+    let requests = 0;
+    const reducer = new RunTurnReducerImpl({ request() { requests++; }, async get() { return undefined; } });
+    reducer.beginTurn();
+    for (const record of adopted) {
+      assert.match(record.responseId, /^[0-9a-f-]{36}$/);
+      assert.equal(evidencesModelProcessing(record), false);
+      assert.deepEqual(record.usage, { input_tokens: 50, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 40 });
+      const reduction = await reducer.accept(record);
+      assert.deepEqual(reduction.messages, [{
+        kind: "status", agent: "lead",
+        payload: { event: "codex_response_usage", usage_response_id: record.responseId, usage: record.usage, model: provider.model },
+      }]);
+      assert.deepEqual((await reducer.accept(record)).messages, reduction.messages, "replay preserves worker identity");
+    }
+    assert.equal(requests, 0);
+    const completion = await reducer.finish({ kind: "exhausted" });
+    assert.equal(completion.result.sawModelActivity, undefined);
+    assert.equal(completion.result.subagentActivity, undefined);
+  });
+
+  it("omits incomplete and impossible splits, accepts equality, and retains aggregate accounting", async () => {
+    const { harness, transport } = makeHarness();
+    const complete = tokenUsage(last, last);
+    const incomplete = { ...complete, usage: { ...complete.usage, pricingEvidenceComplete: false } };
+    const impossible = { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
+    const equality = { inputTokens: 100, cachedInputTokens: 70, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
+    transport.push(incomplete).push(tokenUsage(doubled, impossible))
+      .push(tokenUsage({ inputTokens: 300, cachedInputTokens: 130, cacheWriteInputTokens: 80, outputTokens: 120, totalTokens: 420 }, equality))
+      .push(turnCompleted("completed"));
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    assert.deepEqual(records(events).map(e => e.usage), [{ input_tokens: 0, cache_read_input_tokens: 70, cache_creation_input_tokens: 30, output_tokens: 40 }]);
+    const terminal = events.find(e => e.kind === "turn_finished");
+    assert.ok(terminal?.kind === "turn_finished");
+    assert.deepEqual(terminal.terminal.usage?.wire?.modelUsage, { [provider.model]: {
+      inputTokens: 90, outputTokens: 120, cacheReadInputTokens: 130, cacheCreationInputTokens: 80, reasoningOutputTokens: 0, costStatus: "unreported",
+    } });
+  });
+
+  it("proved historical replay and unproved resume emit none; current resumed response emits once", async () => {
+    for (const proved of [false, true]) {
+      const { harness, transport } = makeHarness();
+      if (proved) transport.push(tokenUsage(last, last, "resumed-1", "old"));
+      transport.push(turnStarted("resumed-1")).push(tokenUsage(doubled, last, "resumed-1"))
+        .push(tokenUsage(doubled, last, "resumed-1")).push(tokenUsage(last, last, "resumed-1", "old"))
+        .push(turnCompleted("completed", undefined, "resumed-1"));
+      const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+      assert.equal(records(events).length, proved ? 1 : 0);
+    }
+  });
+
+  for (const bindAfter of [false, true]) {
+    it(`attributes child usage with bind ${bindAfter ? "after" : "before"} adoption, display cap and normal close; drains before first terminal`, async () => {
+      let h!: CodexHarness;
+      let bind!: () => void;
+      let release!: () => void;
+      const gate = new Promise<void>(r => { release = r; });
+      const broker = stubBroker(async (rt, name) => {
+        if (name !== "spawn_agent") return { ok: true, output: {} };
+        h.recordChildThreadModel("child", "gpt-6-sol");
+        h.registerChildSink("child", { push(note) {
+          if (note.kind === "token_usage_updated") {
+            if (bindAfter) bind();
+            h.unregisterChildSink("child");
+            release();
+          }
+        } });
+        bind = () => {
+          h.bindChildDispatch("child", rt, "coder");
+          h.emitChildFrame("child", [{ kind: "text", text: "lane" }, ...Array.from({ length: 2001 }, () => ({ kind: "text" as const, text: "cap" }))]);
+        };
+        if (!bindAfter) bind();
+        await gate;
+        return { ok: true, output: {} };
+      });
+      const { harness, transport } = makeHarness({ broker });
+      h = harness;
+      transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[usage lane]" }))
+        .push(tokenUsage(last, last)).push(tokenUsage(doubled, last))
+        .push(tokenUsage(last, last, "child")).push(tokenUsage(doubled, last, "child"))
+        .push(turnCompleted("completed"));
+      const events: HarnessEvent[] = [];
+      for await (const event of h.startTurn(makeRequest()).events) {
+        events.push(event);
+        if (event.kind === "turn_finished") break; // CodexExecutor's consumer seam.
+      }
+      const adopted = records(events);
+      assert.equal(adopted.length, 4);
+      const child = adopted.filter(e => e.model === "gpt-6-sol");
+      const display = events.find(e => e.kind === "frame" && e.origin.kind === "subagent");
+      assert.ok(display?.kind === "frame");
+      assert.equal(child.length, 2);
+      for (const record of child) assert.deepEqual(record.attribution, display.attribution);
+      assert.equal(events.at(-1)?.kind, "turn_finished");
+    });
+  }
+
+  for (const failure of ["failed start", "rejected binding", "ambiguous binding", "cancel", "stream failure"] as const) {
+    it(`discards unprovable child usage on ${failure} without leaking into the next turn`, async () => {
+      let h!: CodexHarness;
+      let turn = 0;
+      let admitted = 0;
+      let ready!: () => void;
+      const entered = new Promise<void>(resolve => { ready = resolve; });
+      let release!: () => void;
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      const controller = new AbortController();
+      const streamError = new Error("m1 stream failed");
+      let parent!: CallbackRuntimeId;
+      const transport = new FakeTransport(method => {
+        if (method === "turn/start") return { turn: { id: `tn-${++turn}` } };
+        return defaultResponder(method);
+      });
+      const broker = stubBroker(async rt => {
+        parent = rt;
+        h.recordChildThreadModel("child", "gpt-6-sol");
+        h.registerChildSink("child", { push(note) {
+          if (note.kind !== "token_usage_updated") return;
+          if (turn === 2) {
+            h.unregisterChildSink("child");
+            return;
+          }
+          if (failure === "rejected binding") h.bindChildDispatch("child", { ...rt, callId: "foreign" }, "coder");
+          if (failure === "ambiguous binding") h.bindChildDispatch("child", rt, "coder");
+          if (failure === "cancel") controller.abort();
+          else if (failure === "stream failure") transport.fail(streamError);
+          else {
+            h.unregisterChildSink("child");
+            release();
+          }
+        } });
+        if (turn === 2) {
+          h.bindChildDispatch("child", rt, "coder");
+          return { ok: true, output: {} };
+        }
+        if (++admitted === (failure === "ambiguous binding" ? 2 : 1)) ready();
+        await pending;
+        // Startup may settle after stream cancellation/failure. It cannot reopen the lane.
+        h.bindChildDispatch("child", rt, "coder");
+        return { ok: false, code: "startup_failed", message: "child did not start" };
+      });
+      h = makeHarness({ transport, broker }).harness;
+      transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder" }));
+      if (failure === "ambiguous binding") transport.push(toolCall(2, "spawn_agent", { subagent_type: "coder" }));
+      const events: HarnessEvent[] = [];
+      const first = (async () => {
+        for await (const event of h.startTurn(makeRequest({ signal: controller.signal })).events) events.push(event);
+      })();
+      await withTimeout(entered, 2000, "child callbacks admitted");
+      transport.push(tokenUsage(last, last, "child"));
+      if (failure !== "cancel" && failure !== "stream failure") transport.push(turnCompleted("completed"));
+      if (failure === "stream failure") await assert.rejects(withTimeout(first, 2000, failure), error => error === streamError);
+      else await withTimeout(first, 2000, failure);
+      assert.deepEqual(records(events), [], "unprovable child usage never falls back to lead");
+      if (failure === "cancel" || failure === "stream failure") {
+        assert.ok(!events.some(e => e.kind === "turn_finished"));
+        release();
+        await tick();
+        h.bindChildDispatch("child", parent, "coder");
+        h.unregisterChildSink("child");
+      }
+      // A failed transport cannot serve another turn; the other paths reuse the same
+      // harness/thread to prove abandoned measurements do not cross a turn boundary.
+      if (failure === "stream failure") return;
+      transport.push(toolCall(3, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-2", "next"))
+        .push(tokenUsage(doubled, last, "child", "tn-2"))
+        .push(turnCompleted("completed", undefined, "th-1", "tn-2"));
+      const next = await collect(h.startTurn(makeRequest()).events);
+      assert.equal(records(next).length, 1);
+      assert.equal(records(next)[0]!.attribution.agent, "coder");
+      assert.deepEqual(records(next)[0]!.usage, { input_tokens: 50, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 40 });
+    });
+  }
+
+  it("callback-queued binding flushes adopted usage before a consumer stops at terminal", async () => {
+    let h!: CodexHarness;
+    let parent!: CallbackRuntimeId;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      parent = rt;
+      h.recordChildThreadModel("child", "gpt-6-sol");
+      h.registerChildSink("child", { push() {} });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      h.bindChildDispatch("child", parent, "coder");
+      h.unregisterChildSink("child");
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker }); h = harness;
+    transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder" }))
+      .push(tokenUsage(last, last, "child")).push(turnCompleted("completed"));
+    const events: HarnessEvent[] = [];
+    for await (const event of h.startTurn(makeRequest()).events) { events.push(event); if (event.kind === "turn_finished") break; }
+    assert.equal(records(events).length, 1);
+  });
+});
+
 // --- request + harness builders -----------------------------------------------------
 
 function makeRequest(overrides: Partial<RunTurnRequest> = {}): RunTurnRequest {
@@ -376,6 +609,7 @@ function makeHarness(
     onTokenUsageIncomplete?: () => void | Promise<void>;
     scrubProjected?: (s: string) => string;
     idNonce?: string;
+    nowMs?: () => number;
     log?: Logger;
   } = {},
 ): HarnessBits {
@@ -399,6 +633,7 @@ function makeHarness(
     onTokenUsageIncomplete: opts.onTokenUsageIncomplete,
     scrubProjected: opts.scrubProjected,
     idNonce: opts.idNonce,
+    nowMs: opts.nowMs,
   });
   return { harness, transport, registry };
 }

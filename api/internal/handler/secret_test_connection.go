@@ -76,6 +76,14 @@ func (h *Handler) secretTester() *secretTestClients {
 	return h.secretTestClients
 }
 
+func (h *Handler) armSecretTestProbe(parent context.Context) (context.Context, context.CancelFunc) {
+	const budget = 12 * time.Second
+	if h.secretTestProbeContext != nil {
+		return h.secretTestProbeContext(parent, budget)
+	}
+	return context.WithTimeout(parent, budget)
+}
+
 // TestMySecret validates one owned, enabled credential. The result only contains
 // fixed vocabulary; provider bodies and transport errors are never returned.
 func (h *Handler) TestMySecret(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +115,7 @@ func (h *Handler) TestMySecret(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	ctx, cancel := h.armSecretTestProbe(r.Context())
 	defer cancel()
 	result := secretTestResult{Status: "inconclusive", Reason: "generic"}
 	switch kind {

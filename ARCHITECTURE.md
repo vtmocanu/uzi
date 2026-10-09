@@ -591,7 +591,7 @@ snapshot the requirement inside their INSERT. Seeded plans and gateless kinds
 are excluded. Required leads and `cross_check` children need a worker with
 `cross_check_v1`; the queued health reason exposes a missing capability.
 
-A Claude lead submits bounded, normalized candidates in explicit rounds with
+A Claude or Codex lead submits bounded, normalized candidates in explicit rounds with
 an immutable base commit and scanned planning diff. The first candidate
 snapshots automatic-round enablement and `PLAN_CROSS_CHECK_MAX_REVISIONS`
 (default 2, range 0–4); later rounds copy that snapshot. The server counts at
@@ -600,9 +600,13 @@ Automatic leads and later-round children require `cross_check_rounds_v1`;
 claimability/provisioning enforce the durable protocol capability independently
 of the runtime kill switch. Older workers snapshot disabled/0 and park REVISE;
 capable zero-budget workers park with `revisions exhausted`. The API stores
-`cross_checks` and a report-only Codex child atomically through existing credential resolution.
-The lead retains its Claude credential, the child its Codex credential and
-usage attribution. The child has its own checkout, dedicated cross-check slot
+`cross_checks` and a report-only child of the opposite family atomically through
+existing credential resolution (Codex for a Claude lead, Claude for a Codex
+lead; a guarded write refuses a same-family child, and a Claude child needs
+`cross_check_codex_lead_v1`). The lead retains its own credential, the child
+only its own family's (single-family custody: a Claude child holds the
+Anthropic token and no Codex credential, a Codex child the reverse) and usage
+attribution. The child has its own checkout, dedicated cross-check slot
 (or a legacy plan-stage run slot during a mixed-image roll) and expedite
 priority; it publishes no branch/MR. The lead retains its slot while
 waiting, with pending wait excluded from its wall budget and banked on
@@ -621,7 +625,7 @@ fields. Adjacent running/progress/completion guards prevent an unchecked
 plan from being stored or completed through those paths. The worker must obey
 a refusal; server guards cannot prevent arbitrary execution by a worker that
 ignores them. Stale child verdicts and plan writes cannot use an earlier
-round or generation. Eligible REVISE returns to the Claude lead automatically:
+round or generation. Eligible REVISE returns to the lead automatically:
 validated usage/preparation/reconciliation releases the actual reservation,
 then the checked-state barrier is released and awaited before revision. The
 worker returns `{kind: "revise", feedback, automatic: true}` without `inputId`,
@@ -631,7 +635,12 @@ human counters; human input cannot forge automatic provenance. A stage-neutral
 prompt builder nonce-fences checker advice and prior-plan context separately,
 requires verification against code/issue/uzi rules and declining conflicts,
 and preserves the separate human-revision builder. Exhaustion, BLOCK, timeout
-and other failures keep their fallbacks; Codex leads park as unsupported.
+and other failures keep their fallbacks. A Codex lead consumes automatic
+rounds without spending its human revision budget and implements exactly the
+acknowledged checked plan; its submit requires its worker to advertise
+`cross_check_codex_lead_v1` and the api must send the claim field
+`plan_cross_check_codex_lead`, otherwise it keeps the older
+`codex_lead_unsupported` park to a human gate.
 
 Recovery follows the 2026-10-07 preserve-decided-fallback decision in
 [PRD #2150 D8](prds/done/2150-plan-cross-check-auto-revise.md#decision-log).
@@ -657,7 +666,20 @@ D16 keeps the established human presentation/revision in execution-local
 context: status proof cannot mint or adopt a gate. Human revisions use the
 existing gate path; original checker findings remain historical evidence.
 
-The checker exposes Read and bounded Search, without shell/patch/delegation,
+The Claude checker (for a Codex lead) is confined in layers: the SDK `tools`
+list is `Read`, `Grep` and `Glob` only, with every other tool disallowed and
+`settingSources` empty; its environment is isolated and holds only the
+Anthropic token; it runs as the runner uid through `spawnDetached`; one path
+guard allows reads only inside the checkout plus its own SDK spill files under
+its home; and a Glob/Grep pattern guard denies absolute, home-relative and
+`..` patterns (defense in depth; the runner uid is the boundary). An init
+latch that cannot confirm the confinement fails the check
+`confinement_failed`. A claim for a Claude child takes the lead lock before the
+child lock; an unavailable or disabled Claude credential or an empty automatic
+pool settles `checker_unavailable` (child failure
+`plan cross-check: checker unavailable`, human gate, no credential delivered)
+instead of waiting in `pool_wait`; a locked vault stays transient. The Codex
+checker exposes Read and bounded Search, without shell/patch/delegation,
 and disables automatic repository instruction loading. Both fileop and direct
 provider access use required read-only checkout confinement. Explicit private
 home/Codex/sessions/XDG/tmp grants remain writable; broad shared access and
@@ -666,8 +688,9 @@ isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
 confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. Automatic
-rounds extend the original #2149
+rationale, validation provenance and pending hosted acceptance. The Codex-lead
+direction is [PRD #2460](prds/done/2460-codex-lead-plan-cross-check.md) and the
+[ADR-2149 addendum](adr/2149-cross-check.md#2460-addendum-codex-lead-claude-checker). Automatic rounds extend the original #2149
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
 [ADR-2149's dated extension](adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150);
 local round/recovery proofs do not establish hosted authenticated model acceptance.
@@ -699,13 +722,15 @@ authenticated pinned-model rejection at checker startup settles
 `checker_unavailable`, fails the child with
 `plan cross-check: checker unavailable` and forces the lead's human gate.
 Other startup failures retain #2149 handling, including model errors with
-worker defaults or effort-only pins. The Claude pin cell is stored and
-editable but inactive; only a Codex checker checks a Claude lead today.
+worker defaults or effort-only pins. Both pin cells are active; the Claude cell
+applies to the Claude checker of a Codex lead, and at Default follows the
+user's Claude worker default. A pinned Claude model rejected by the SDK
+(`model_not_found`) is checker unavailable.
 See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
 decision and validation limits, and
 [configuration](docs/configuration.md#plan-cross-check-model-and-effort-pins)
-for the settings contract. Codex-lead checking (#2460) and Code cross-check
-(#2170) remain outside this implementation.
+for the settings contract. Code cross-check (#2170) remains outside this
+implementation.
 
 PRD #2169 adds a third worker claim pool beside run and chat:
 `POST /api/worker/runs/claim?lane=cross_check`, bounded by

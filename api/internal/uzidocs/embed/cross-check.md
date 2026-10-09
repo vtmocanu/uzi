@@ -7,7 +7,9 @@ audience: user
 # Cross-check
 
 Cross-check asks the other model family for a second opinion on a run.
-**Plan cross-check** is a required gate on opted-in auto-approved plans.
+**Plan cross-check** is a required gate on opted-in auto-approved plans: a
+Claude lead is checked on Codex and a Codex lead on Claude, never on its own
+family.
 **Code cross-check** is a planned, separate advisory stage before publication;
 it is not available in this release.
 
@@ -25,14 +27,16 @@ The **Plan cross-check** row has independent model and effort choices for
 Claude and Codex. Select **Default · value (source)** to follow that family's
 worker default, or choose a hard pin, including a custom model ID. A model
 pin does not pin effort, and an effort pin does not pin model. Pins do not
-substitute models, clamp effort or retry on a default. The Claude cell is
-editable but inactive: **Used once Codex-lead runs are cross-checked**. Today
-only a Codex checker checks a Claude lead; Codex leads remain unsupported.
+substitute models, clamp effort or retry on a default. The Claude cell
+configures the Claude checker that checks a Codex lead; at Default it follows
+your Claude worker default.
 
 ## 2. Wait for the checked plan
 
 Required runs wait for a worker advertising `cross_check_v1`. A **Claude
-lead's plan is checked on Codex** in a separate, read-only checker run.
+lead's plan is checked on Codex** and a **Codex lead's plan on Claude**, in a
+separate, read-only checker run. The checker is always the opposite family of
+the lead; it never falls back to the lead's own family.
 On a worker advertising `cross_check_rounds_v1`, changes requested (REVISE)
 go back to the lead automatically within the revision budget. Each revised
 candidate gets a fresh check and deadline; an APPROVE of the latest exact
@@ -48,13 +52,18 @@ not spend your human revision allowance. Exhaustion parks with
 budget exhausts on REVISE; an older worker keeps the changes-requested human
 gate. BLOCK, timeout, failed or unavailable checker, refused candidate/diff
 and submit failure retain their human fallback or terminal delivery exception.
-An opted-in **Codex lead** still parks with
-`plan cross-check: not yet supported for a Codex lead`.
+A Codex lead consumes automatic REVISE rounds without spending its human
+revision allowance, and implements exactly the approved checked plan. Its
+worker must advertise `cross_check_codex_lead_v1` to submit for a check. A
+Codex lead on a worker without it, or on an api that does not signal support
+(see [rolling out](#rolling-out-codex-lead-checks)), keeps the older park, with
+`plan cross-check: not yet supported for a Codex lead`, and waits for a human.
 
 Checker runs use a dedicated cross-check lane (one slot by default); the lead
 holds its run slot while waiting. A worker supporting both families can check
-its own Claude lead on Codex even with a run cap of 1. This does not enable
-Codex-lead checking (follow-up #2460) or Code cross-check.
+its own Claude lead on Codex even with a run cap of 1. A Claude checker (for a Codex lead) additionally requires
+`cross_check_codex_lead_v1` on the worker that claims it; without one it stays
+queued. This does not enable Code cross-check.
 
 The lead's worker is preferred. Another eligible worker of the same user may
 claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
@@ -91,6 +100,15 @@ Recognized authenticated rejection of a pinned model at checker startup fails
 the child with `plan cross-check: checker unavailable` and forces a human gate.
 Other startup failures follow the existing cross-check failure path.
 
+A Claude checker also fails with `plan cross-check: checker unavailable`,
+and the lead parks for a human, when your Claude credential is unavailable or
+disabled at claim time, or the automatic Claude pool is empty. No credential is
+delivered, and your non-pooled default is never spent. A locked credential
+vault remains a transient wait. A pinned Claude model the account cannot use
+(the SDK reports `model_not_found`) is treated the same way. A checker session
+whose confinement cannot be confirmed at startup fails the check with
+`confinement_failed`.
+
 ## 3. Read the evidence and decide
 
 Open the run to see distinct rounds in the feed, the current gate reason,
@@ -109,9 +127,42 @@ as history, without an automatic new checker round.
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
+## Claude checker isolation
+
+The Claude checker has only the `Read`, `Grep` and `Glob` tools: no shell, web,
+nested-agent or write tools, and no repository settings, plugins, skills or MCP
+servers. It runs with an isolated environment holding only your Anthropic token
+(a Codex checker holds only Codex credentials), as the worker's runner user.
+Direct reads are limited to its own checkout, plus its own SDK spill files for
+oversized tool output. Glob and Grep patterns that are absolute, home-relative
+or have a `..` path segment in any brace expansion are denied, as are patterns
+with a backslash, unbalanced braces, or too many braces or expansions. That
+pattern check is defense in depth; the runner user's operating-system
+permissions are the boundary. See
+[worker setup](./worker-setup.md#run-artifacts-and-the-sandbox) for the
+tool-path policy and the [architecture](../ARCHITECTURE.md#plan-cross-check).
+
+## Rolling out Codex-lead checks
+
+Deploy the api and its migration before the workers. A new api adds
+`plan_cross_check_codex_lead` to a Codex lead's claim. A new worker that does
+not receive it (an older api) does not submit the check and parks the lead at
+the human gate with `plan cross-check: not yet supported for a Codex lead`
+(`codex_lead_unsupported`), the same park as a Codex lead on an older worker,
+until the api is upgraded. A worker with `WORKER_CROSS_CHECK_SLOTS=0`
+(hosted: `UZI_WORKER_CROSS_CHECK_SLOTS=0`) takes no checker children; if no
+other worker of the user can, the check waits until its deadline and the lead
+takes the human gate, for either family (see
+[cross-check slots](./worker-setup.md#cross-check-slots)). Migration 00314
+allows Claude checker runs; its Down
+deletes Claude checker runs but keeps the check history, with the checker run
+link empty. Run the Down only with the new api stopped. With ephemeral workers
+off, the settings toggle warns when no online worker can run the checker,
+including when none advertises `cross_check_codex_lead_v1`.
+
 ## Recovery before a human gate
 
-A reclaimed Claude lead can start a fresh round within the same budget when
+A reclaimed lead can start a fresh round within the same budget when
 there is no established human gate or durably approved plan, and the latest
 attempt was interrupted while pending strictly before its deadline, decided
 REVISE, or APPROVE whose plan was never durably stored (`approved_not_stored`).

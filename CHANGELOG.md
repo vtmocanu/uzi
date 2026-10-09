@@ -22,16 +22,30 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
+  Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
+
 ### Changed
 
 - **Retained work recovers within a durable budget on a fresh attempt ([#2512](https://github.com/vtmocanu/uzi/issues/2512)).**
   Three source-bound reserved iterations and a five-minute deadline survive crash, reclaim and handoff; a trusted successfully settled real model turn resets the budget. Permanent blockers or exhaustion fail with local work and custody retained, without automatic cycling or failed-run Resume. Verified under-cap thin bundles with locally verified prerequisites permit local execution despite unknown publication, but do not prove remote durability or release custody. Ordinary unwired resumes keep same-path continuity; downgrade during pending recovery is unsupported. Reachable-history integrity verification fails closed above 1 GiB of delivered decoded content and records the blocker in run recovery and worker logs; this cap does not bound Git-internal delta decompression memory, and the shared worker cgroup does not isolate sibling runs. Recovery records attribution before journal and clone adoption, repairs older-order attribution only for a proven absent successor path, preserves `clone_path_invalid` for invalid paths, and retains custody during pending rediscovery with a distinct missing-journal failure. Owner cancellation reports a failed run with reason `run cancelled` while preserving its source and pins; model settlement clears only episode suppression, and successor retirement requires authenticated, exact-generation covering FINAL authority and quiescence, with durable predecessor reanchoring before moving the successor, leaving predecessors, recovery pins and run HOMEs intact.
+
+- **A Codex lead's plan is now cross-checked by a read-only Claude checker ([#2460](https://github.com/vtmocanu/uzi/issues/2460)).**
+  With Plan cross-check enabled, an auto-approved Codex run no longer waits for a human by default: its plan is checked by a Claude child with only Read, Grep and Glob, the checker is always the opposite family of the lead, and only an APPROVE of the latest exact plan implements. A Codex lead consumes automatic REVISE rounds without spending its human revision allowance. This needs the new worker capability `cross_check_codex_lead_v1`; roll the api and migration 00314 first, because a new worker on an older api does not submit the check and parks the Codex lead at the human gate as not yet supported, the same park a Codex lead on an older worker keeps. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, fails `plan cross-check: checker unavailable` and the lead takes the human gate; no credential is delivered. The Plan cross-check Claude pin cell is now active (Default follows your Claude worker default), and with ephemeral workers off the settings toggle also warns when no online worker advertises the capability. The migration's Down deletes Claude checker runs but keeps the check history; run it with the new api stopped.
+
+- **Run usage distinguishes unknown metrics and estimates agent attribution ([#2555](https://github.com/vtmocanu/uzi/issues/2555)).**
+  Codex reports processing duration and per-agent input usage; absent duration or turns display as —. Repeated Claude usage records count once per lane, Codex responses retain distinct identities, and the estimated per-agent table omits output attribution. Accounting records stay out of the web activity feed, TUI and human run logs; JSON logs and pagination/follow cursors retain them. The TUI loading badge omits sequence-derived counts. Run token and cost totals remain unchanged.
 
 - **Usage ranks users by total tokens**
   The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
 
 - **Claude Agent SDK 0.3.287; long worker commands keep running up to two hours ([#2551](https://github.com/vtmocanu/uzi/pull/2551)).**
   From SDK 0.3.285 a backgrounded Bash command is stopped at its `timeout` (default 30 minutes, maximum two hours) in addition to being stopped when the turn ends. Claude agents are now told to start a command expected to outlast the 10-minute foreground limit in the background with the two-hour `timeout`; a command still stopped at the limit writes no exit-status file and its result is reported unverified, as before.
+
+- **Readable questions and pinned input cards in the TUI ([#2549](https://github.com/vtmocanu/uzi/issues/2549)).**
+  Run transcripts show question text, option descriptions and answer strings. Runs waiting for input pin the newest unanswered question above the transcript; `z` collapses or expands the bounded card without moving a paused transcript.
 
 - **Ground PR description diagrams in visible flows**
   The editor now requests compact diagrams for evidenced flows, fallback chains and component interactions; an opt-in Claude/Codex evaluator compares a frozen baseline with five fixed fixtures through the real sanitizer and publication rendering pipeline.

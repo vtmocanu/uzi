@@ -296,13 +296,18 @@ export function buildIsolatedPreToolUse(input: {
   cwd: string;
   log: Logger;
   secretPaths: readonly string[];
+  /** The session's own SDK HOME. When set, the single path guard also lets `Read` open the SDK's
+   *  authenticated tool-result spill file under it (buildPathGuardHook's `sdkHomeDir`, Read-only).
+   *  Omitted by the research and job lanes, which keep the plain workspace jail. */
+  sdkHomeDir?: string;
 }): PreToolUseMatchers {
   return [
     // Matcher-less: runs for EVERY tool call, whatever its name.
     { hooks: [buildIsolatedToolGate(input.gate, input.log, input.surface)] },
     {
       matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
-      hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR])],
+      hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR],
+        input.sdkHomeDir ? { sdkHomeDir: input.sdkHomeDir } : {})],
     },
     {
       matcher: WRITE_PATH_TOOLS.join("|"),

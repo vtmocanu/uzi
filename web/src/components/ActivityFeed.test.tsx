@@ -1534,3 +1534,58 @@ describe("usage-limit provider regression #2360", () => {
     expect(container.textContent).not.toContain("payload-provider");
   });
 });
+
+describe("m2 accounting presentation isolation", () => {
+  const accounting = (seq: number, agent = "lead", instance: string | null = null) => ({
+    ...m(seq, "status", { event: "codex_response_usage", usage_response_id: "11111111-1111-4111-8111-111111111111",
+      usage: { input_tokens: 7, cache_read_input_tokens: 3, cache_creation_input_tokens: 0, output_tokens: 2 }, model: "gpt" },
+      agent, "2026-07-04T00:10:00.000Z"),
+    agent_instance: instance,
+  });
+  it.each(["agent", "timeline"])("isolates counts, summaries, recency, active speaker and announcements in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const original = [m(1, "text", { text: "lead summary" }), m(2, "text", { text: "worker summary" }, "worker")];
+    const r = renderFeed(original);
+    const before = r.container.textContent;
+    const announcement = r.container.querySelector('[aria-live="polite"]')?.textContent;
+    r.rerender(<ActivityFeed messages={[...original, accounting(3), accounting(4, "accountant", "child"), accounting(5, "worker")]}
+      run={runFixture()} runningLive terminal={false} connected />);
+    expect(r.container.textContent).toBe(before);
+    expect(r.container.querySelector('[aria-live="polite"]')?.textContent).toBe(announcement);
+    expect(r.getByTitle("worker: working")).toBeTruthy();
+    expect(r.getByText("2 messages")).toBeTruthy();
+    expect(r.queryByText("accountant")).toBeNull();
+  });
+  it.each(["agent", "timeline"])("filters before cap and keeps real opener in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const r = renderFeed([m(1, "text", { text: "real opener" }), ...Array.from({ length: 1001 }, (_, i) => accounting(i + 2, "accountant", "child"))]);
+    expect(r.getAllByText("real opener").length).toBeGreaterThan(0);
+    expect(r.getByText("1 messages")).toBeTruthy();
+    expect(r.queryByRole("button", { name: /earlier messages/ })).toBeNull();
+  });
+  it.each(["agent", "timeline"])("creates no empty accounting group in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const r = renderFeed([accounting(1), accounting(2, "accountant", "child")], { status: "completed" });
+    expect(r.getByText("0 messages")).toBeTruthy();
+    expect(r.getByText("No messages were recorded for this run.")).toBeTruthy();
+    expect(r.queryByText("accountant")).toBeNull();
+  });
+});
+
+describe("m2 cap accounting exclusion", () => {
+  it.each(["agent", "timeline"])("computes the real cap and hidden count in %s without mutating replay source", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const messages = Array.from({ length: 1001 }, (_, i) => m(i + 1, "text", { text: `real ${i}` }));
+    messages.push(m(1002, "status", { event: "codex_response_usage" }, "ghost"));
+    const source = JSON.stringify(messages);
+    const r = renderFeed(messages, { status: "completed" });
+    expect(r.getByText("1001 messages")).toBeTruthy();
+    expect(r.getByRole("button", { name: /Show 501 earlier messages/ })).toBeTruthy();
+    expect(r.getAllByText("real 1000").length).toBeGreaterThan(0);
+    expect(r.queryByText("real 500")).toBeNull();
+    fireEvent.click(r.getByRole("button", { name: /Show 501 earlier messages/ }));
+    expect(r.getAllByText("real 0").length).toBeGreaterThan(0);
+    expect(r.queryByText("ghost")).toBeNull();
+    expect(JSON.stringify(messages)).toBe(source);
+  });
+});
