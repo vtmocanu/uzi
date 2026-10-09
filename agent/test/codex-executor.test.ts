@@ -197,6 +197,21 @@ class FakeTransport implements CodexTransport {
   closes = 0;
   threadStartCount = 0;
   turnStartCount = 0;
+  private readonly firstTurnListeners = new Set<() => void>();
+
+  onFirstTurnStart(listener: () => void): () => void {
+    const owner = this.countsFrom ?? this;
+    if (owner.turnStartCount > 0) {
+      listener();
+      return () => {};
+    }
+    owner.firstTurnListeners.add(listener);
+    return () => { owner.firstTurnListeners.delete(listener); };
+  }
+
+  firstTurnListenerCount(): number {
+    return (this.countsFrom ?? this).firstTurnListeners.size;
+  }
   /** When set for a method, request() returns THIS (rejects/pends) instead of the responder. */
   requestOverride?: (c: ResponderCtx, opts?: { signal?: AbortSignal; deadlineMs?: number }) => Promise<unknown> | undefined;
 
@@ -252,7 +267,12 @@ class FakeTransport implements CodexTransport {
       return Promise.resolve({ type: rec(params).type } as T);
     }
     if (method === "thread/start") counts.threadStartCount += 1;
-    if (method === "turn/start") counts.turnStartCount += 1;
+    if (method === "turn/start") {
+      counts.turnStartCount += 1;
+      const listeners = [...counts.firstTurnListeners];
+      counts.firstTurnListeners.clear();
+      for (const listener of listeners) listener();
+    }
     const c: ResponderCtx = {
       transport: this,
       method,
@@ -790,6 +810,75 @@ async function waitFor(cond: () => boolean, label: string, ms = 3000): Promise<v
     await tick();
   }
 }
+
+function armFirstTurnReadiness(transport: FakeTransport, signal: AbortSignal) {
+  let resolveReady!: () => void;
+  let rejectReady!: (reason: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  const removeListener = transport.onFirstTurnStart(resolveReady);
+  const abort = () => rejectReady(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  const dispose = () => {
+    removeListener();
+    signal.removeEventListener("abort", abort);
+  };
+  return {
+    wait: async (execution: Promise<unknown>) => {
+      try {
+        await Promise.race([ready, execution.then(() => {
+          throw new Error("runner execution ended before its first provider turn");
+        })]);
+      } finally { dispose(); }
+    },
+    dispose,
+  };
+}
+
+describe("#2535 first-turn readiness", () => {
+  it("observes the first turn from a successor transport and removes listeners", async () => {
+    const primary = new FakeTransport(() => ({}));
+    const successor = new FakeTransport(() => ({}));
+    successor.countsFrom = primary;
+    const controller = new AbortController();
+    const ready = armFirstTurnReadiness(primary, controller.signal);
+    const waiting = ready.wait(new Promise(() => {}));
+    assert.equal(primary.firstTurnListenerCount(), 1);
+    await successor.request("turn/start");
+    await waiting;
+    assert.equal(primary.firstTurnListenerCount(), 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+
+  it("propagates execution failure before readiness and removes listeners", async () => {
+    const transport = new FakeTransport(() => ({}));
+    const controller = new AbortController();
+    const ready = armFirstTurnReadiness(transport, controller.signal);
+    const failure = new Error("controlled startup failure");
+    await assert.rejects(ready.wait(Promise.reject(failure)), error => error === failure);
+    assert.equal(transport.firstTurnListenerCount(), 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+
+  it("rejects normal execution ending before readiness", async () => {
+    const transport = new FakeTransport(() => ({}));
+    const ready = armFirstTurnReadiness(transport, new AbortController().signal);
+    await assert.rejects(ready.wait(Promise.resolve()), /ended before its first provider turn/);
+    assert.equal(transport.firstTurnListenerCount(), 0);
+  });
+
+  it("uses the caller test signal as its only readiness bound", async () => {
+    const transport = new FakeTransport(() => ({}));
+    const controller = new AbortController();
+    const ready = armFirstTurnReadiness(transport, controller.signal);
+    const waiting = ready.wait(new Promise(() => {}));
+    const failure = new Error("test cancelled");
+    controller.abort(failure);
+    await assert.rejects(waiting, error => error === failure);
+    assert.equal(transport.firstTurnListenerCount(), 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+});
 
 // ================================================================================
 describe("CodexExecutor: dark selection seam (the makeExecutor decision)", () => {
@@ -1974,17 +2063,18 @@ describe("m1 credential-free owner cancel", () => {
     { work: "clean", drain: "root" },
     { work: "dirty", terminal: "statusless" },
     { work: "dirty", terminal: "lost" },
+    { work: "nested-gitignore", readinessDelayMs: 3500 },
     ...["immediate", "statusless", "lost"].flatMap(terminal =>
       ["clean", "dirty"].map(work => ({ work, route: "recovery", terminal }))),
     { work: "dirty", route: "deferred", terminal: "statusless" },
     { work: "clean", route: "deferred", terminal: "immediate" },
     ...["before-cancel", "settle", "inspect", "release-ack"].map(quarantine => ({ work: "clean", quarantine })),
   ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
-    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string }>;
+    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string; readinessDelayMs?: number }>;
   for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
       (scenario.work !== "lossy-path" || process.platform === "linux") &&
       (!scenario.quarantine || process.platform === "linux")))
-    it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async () => {
+    it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async (t) => {
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
       const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
@@ -2050,6 +2140,17 @@ describe("m1 credential-free owner cancel", () => {
           released: true, holds_released: 1, retained: scenario.release === "retained" };
       };
       const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      if (scenario.readinessDelayMs) {
+        const attach = git.runnerCloneForBranch.bind(git);
+        let delayed = false;
+        git.runnerCloneForBranch = async (...args) => {
+          if (!delayed) {
+            delayed = true;
+            await new Promise<void>(resolve => setTimeout(resolve, scenario.readinessDelayMs));
+          }
+          return attach(...args);
+        };
+      }
       let clone = "";
       let lifecycle: AbortSignal | undefined;
       let boundaryCalls = 0;
@@ -2199,6 +2300,7 @@ describe("m1 credential-free owner cancel", () => {
           api.overrideStateStatus(claim.run_id, "cancelled");
         }
       });
+      const readiness = armFirstTurnReadiness(rig.transport, t.signal);
       const execution = runner.execute(claim);
       const gitInClone = (...args: string[]) => {
         const result = spawnSync("git", ["-C", clone, ...args], { env: gitEnv(), encoding: "utf8" });
@@ -2206,7 +2308,7 @@ describe("m1 credential-free owner cancel", () => {
         return result.stdout;
       };
       try {
-        await waitFor(() => rig.transport.turnStartCount > 0, "runner provider");
+        await readiness.wait(execution);
         const safety = executor.safety!;
         const boundary = safety.withBoundary.bind(safety);
         safety.withBoundary = async <T>(request: BoundaryRequest, action: (permit: BoundaryPermit) => Promise<T>) => { boundaryCalls++; return boundary(request, action); };
@@ -2438,6 +2540,7 @@ describe("m1 credential-free owner cancel", () => {
         }
         assert.equal(await fs.access(path.join(clone, "FILTER-RAN")).then(() => true, () => false), false);
       } finally {
+        readiness.dispose();
         quarantineContinue.resolve();
         try {
           await runner.shutdown();
