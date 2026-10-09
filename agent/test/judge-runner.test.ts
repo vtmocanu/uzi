@@ -1322,7 +1322,7 @@ describe("buildJudgePrompt", () => {
   describe("target cost status (PRD #1429 M3, D7)", () => {
     it("renders a metered dollar figure in the trusted pre-fence header", () => {
       const prompt = buildJudgePrompt(emptyTrace, null, [], null, "metered", 1.23456);
-      assert.match(prompt, /Reviewed run cost: \$1\.23 \(metered\)\./);
+      assert.match(prompt, /Reviewed run cost: \$1\.23 \(API-equivalent\)\./);
       const costIdx = prompt.indexOf("Reviewed run cost:");
       const fenceIdx = prompt.indexOf("<untrusted_trace_");
       assert.ok(fenceIdx > 0, "expected an untrusted-trace fence");
@@ -1331,7 +1331,7 @@ describe("buildJudgePrompt", () => {
 
     it("labels a subscription spend and NEVER prints a dollar figure for it", () => {
       const prompt = buildJudgePrompt(emptyTrace, null, [], null, "subscription", 0);
-      assert.match(prompt, /Reviewed run cost: subscription usage/);
+      assert.match(prompt, /Reviewed run cost: no cost estimate was recorded\./);
       assert.ok(!/\$0(\.00)?\b/.test(prompt), "a subscription spend must never render as $0");
       assert.ok(!prompt.includes("$"), "subscription cost must carry NO dollar figure at all");
     });
@@ -1356,7 +1356,7 @@ describe("buildJudgePrompt", () => {
 
     it("a metered status with no known dollar amount says so rather than inventing a number", () => {
       const prompt = buildJudgePrompt(emptyTrace, null, [], null, "metered", null);
-      assert.match(prompt, /Reviewed run cost: metered \(dollar amount unavailable\)\./);
+      assert.match(prompt, /Reviewed run cost: API-equivalent estimate unavailable \(dollar amount unavailable\)\./);
     });
   });
 

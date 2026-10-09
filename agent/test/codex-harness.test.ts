@@ -718,8 +718,8 @@ describe("CodexHarness: resumed usage evidence", () => {
       assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
         inputTokens: 240, cacheReadInputTokens: 60, cacheCreationInputTokens: 0,
         outputTokens: 90, reasoningOutputTokens: 30,
-        costStatus: authMode === "api_key" ? "metered" : "subscription",
-        ...(authMode === "api_key" ? { costUSD: 0.00696 } : {}),
+        costStatus: "metered",
+        costUSD: 0.00696,
       });
       await harness.close();
     });
@@ -795,8 +795,8 @@ describe("CodexHarness: resumed usage evidence", () => {
         assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
           inputTokens: 240, cacheReadInputTokens: 60, cacheCreationInputTokens: 0,
           outputTokens: 90, reasoningOutputTokens: 30,
-          costStatus: authMode === "api_key" ? "metered" : "subscription",
-          ...(authMode === "api_key" ? { costUSD: 0.00696 } : {}),
+          costStatus: "metered",
+          costUSD: 0.00696,
         });
       } finally {
         await delivery;
@@ -873,7 +873,7 @@ describe("CodexHarness: resumed usage evidence", () => {
                 assert.equal(accountant.usageIncomplete, true);
                 assert.equal(result.usage, undefined);
                 assert.equal(accountant.aggregateByModel(), undefined);
-                assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+                assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
 
                 const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
                 try {
@@ -976,13 +976,13 @@ describe("CodexHarness: resumed usage evidence", () => {
             assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
               inputTokens: 560, cacheReadInputTokens: 140, cacheCreationInputTokens: 0,
               outputTokens: 210, reasoningOutputTokens: 70,
-              costStatus: authMode === "api_key" ? "metered" : "subscription",
-              ...(authMode === "api_key" ? { costUSD: 0.01624 } : {}),
+              costStatus: "metered",
+              costUSD: 0.01624,
             });
           } else {
             assert.equal(result.usage, undefined);
             assert.equal(accountant.aggregateByModel(), undefined);
-            assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+            assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
           }
         } finally {
           await delivery;
@@ -1099,7 +1099,7 @@ describe("CodexHarness: resumed usage evidence", () => {
         assert.equal(result.outcome, "success");
         assert.equal(result.usage?.wire?.modelUsage, undefined);
         assert.equal(result.usage, undefined);
-        assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+        assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
         assert.equal(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") }), undefined);
         assert.equal(accountant.usageIncomplete, true);
         assert.equal(notices, 1, "retry cannot redeliver a failed notice callback");
@@ -1132,7 +1132,7 @@ describe("CodexHarness: resumed usage evidence", () => {
         const result = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
         assert.equal(result.outcome, "success");
         assert.equal(result.usage, undefined);
-        assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+        assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
         assert.equal(accountant.usageIncomplete, true);
         assert.equal(accountant.aggregateByModel(), undefined);
         assert.equal(notices, 1, "retry shares the once-per-claim diagnostic latch");
@@ -1171,8 +1171,8 @@ describe("CodexHarness: resumed usage evidence", () => {
           assert.deepEqual(entry, {
             inputTokens: 800, cacheReadInputTokens: 200, cacheCreationInputTokens: 0,
             outputTokens: 300, reasoningOutputTokens: 100,
-            costStatus: authMode === "api_key" ? "metered" : "subscription",
-            ...(authMode === "api_key" ? { costUSD: 0.0232 } : {}),
+            costStatus: "metered",
+            costUSD: 0.0232,
           });
           assert.ok(before?.["gpt-6-astra"]);
           assert.equal(notices, 0);
@@ -1180,10 +1180,10 @@ describe("CodexHarness: resumed usage evidence", () => {
           assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"], {
             inputTokens: 800, cacheReadInputTokens: 200, cacheCreationInputTokens: 0,
             outputTokens: 300, reasoningOutputTokens: 100,
-            costStatus: authMode === "api_key" ? "unreported" : "subscription",
+            costStatus: "unreported",
           });
           assert.ok(result.usage);
-          assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+          assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
           assert.equal(accountant.usageIncomplete, false);
           assert.equal(notices, 0);
         }
@@ -1218,7 +1218,7 @@ describe("CodexHarness: resumed usage evidence", () => {
         const result = terminal(await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
         assert.equal(result.outcome, "success");
         assert.equal(result.usage, undefined);
-        assert.deepEqual(result.metrics?.cost, { kind: authMode === "api_key" ? "unreported" : "subscription" });
+        assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
         assert.equal(notices, 1);
         assert.equal(accountant.aggregateByModel(), undefined);
         await harness.close();
@@ -1872,7 +1872,7 @@ describe("CodexHarness: cost projection from the run auth mode (PRD #1332 C4b / 
     assert.deepEqual(term.metrics.cost, { kind: "metered", usd: mu.costUSD, source: "price_table" });
   });
 
-  it("a subscription run marks the entry subscription (no costUSD) and the run cost subscription", async () => {
+  it("a subscription run emits a PRIMARY metered model estimate and SECONDARY run cost", async () => {
     const { harness, transport } = makeHarness({ authMode: "subscription" });
     transport
       .push(threadStarted())
@@ -1882,9 +1882,24 @@ describe("CodexHarness: cost projection from the run auth mode (PRD #1332 C4b / 
       .end();
     const term = terminal(await collect(harness.startTurn(makeRequest()).events));
     const mu = entryOf(term, "gpt-6-astra");
-    assert.equal(mu.costStatus, "subscription");
+    assert.equal(mu.costStatus, "metered");
+    assert.equal(mu.costUSD, 0.013);
+    assert.deepEqual(term.metrics.cost, { kind: "metered", usd: 0.013, source: "price_table" });
+  });
+
+  it("missing auth keeps PRIMARY model usage and SECONDARY run cost unreported", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "unreported");
     assert.ok(!("costUSD" in mu));
-    assert.deepEqual(term.metrics.cost, { kind: "subscription" });
+    assert.deepEqual(term.metrics.cost, { kind: "unreported" });
   });
 
   it("an api_key run with an unreconciled gap keeps tokens but reports the run cost unreported", async () => {

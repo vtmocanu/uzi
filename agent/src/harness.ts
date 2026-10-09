@@ -40,7 +40,6 @@ export interface HarnessTokens {
 
 export type HarnessCost =
   | { kind: "metered"; usd: number; source: "provider" | "price_table" }
-  | { kind: "subscription" }
   | { kind: "unreported" };
 
 export interface HarnessModelUsage {

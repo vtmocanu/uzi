@@ -4075,12 +4075,9 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     const child = rec(modelUsage["gpt-5.6-sol"]);
     assert.equal(child.inputTokens, 200, "the child's uncached input rode through the accountant");
     assert.equal(child.outputTokens, 100, "the child's output rode through the accountant");
-    // C4b: this run's binding is SUBSCRIPTION, so the child entry carries costStatus 'subscription'
-    // with no per-token dollar figure (updated from C4a's hard-coded 'unreported' — the marker the
-    // C4b milestone removes). The executor→accountant delegation wiring this test really pins
-    // (recordChildThreadModel) is unchanged; only the cost projection is.
-    assert.equal(child.costStatus, "subscription", "a subscription run's per-model entry is subscription");
-    assert.ok(!("costUSD" in child), "no costUSD on a subscription entry");
+    // Subscription child usage gets the same pinned API-equivalent estimate as API-key usage.
+    assert.equal(child.costStatus, "metered");
+    assert.equal(child.costUSD, 0.0028);
   });
 });
 
@@ -4690,13 +4687,7 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 
   it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
-    // The seam under test is codex-executor.ts's `authMode: binding.authMode` into new CodexHarness:
-    // the RUN's credential mode selects the terminal cost semantics in the token accountant.
-    // Harness-level cost tests pass authMode DIRECTLY (bypassing this wiring), and the only existing
-    // executor costStatus test drives a SUBSCRIPTION binding — so nothing exercises the api_key
-    // metered path THROUGH the real executor. Hardcoding authMode:"subscription" at that call site
-    // passes every other executor test; this pins it end-to-end: an api_key run's per-model entry
-    // must be `metered` with a real costUSD, never `subscription`.
+    // Exercise API-equivalent pricing through the executor's API-key binding.
     const rig = makeRig();
     // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6.1-sol")
     // with priceable buckets: input 1000 (cached 600, cacheWrite 100 → uncached 300), output 200
@@ -4718,9 +4709,8 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     assert.equal(sol61.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
     assert.equal(sol61.outputTokens, 200, "output rode through the accountant");
     // C4b: the api_key binding threads through `authMode: binding.authMode` so the entry is METERED
-    // with the summed Standard price, NOT subscription. If line ~1413 is hardcoded to
-    // "subscription", this becomes costStatus:'subscription' with no costUSD and both asserts fail.
-    assert.equal(sol61.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
+    // The pinned Standard table estimates this reconciled usage under either credential mode.
+    assert.equal(sol61.costStatus, "metered");
     // 300*2 + 600*0.1 + 100*2.5 + 200*10 = 2910 µ$. Reasoning (50) is a subset of output, never re-added.
     assert.equal(Math.round((sol61.costUSD as number) * 1e6), 2910, "the exact summed Standard price in microdollars");
   });
@@ -4861,7 +4851,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       150,
       "the claim-leg accountant reports the claim cumulative (150), NOT the resumed epoch's own delta (50)",
     );
-    assert.equal(astra.costStatus, "subscription", "a subscription run's per-model entry is subscription");
+    assert.equal(astra.costStatus, "metered", "subscription usage is API-equivalent");
+    assert.equal(astra.costUSD, 0.0015);
   });
 
   it("emits one init for the executor claim even if an internal resumed epoch reports thread/started", async () => {

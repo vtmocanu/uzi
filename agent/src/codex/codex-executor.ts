@@ -3476,8 +3476,8 @@ export class CodexExecutor implements Executor {
         log: this.log,
         sessionInspect: () => this.sessionStore.inspect(storeDir),
         appServerAuth,
-        // PRD #1332 C4b / D5: the run's immutable credential mode selects the terminal cost
-        // semantics (subscription vs api-key metered/unreported) in the token accountant.
+        // Preserve the run's immutable credential mode. Both modes enable API-equivalent
+        // estimates in the token accountant when usage evidence fully reconciles.
         authMode: binding.authMode,
         // Share usage across internal provider epochs, but emit the server lineage marker only for
         // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
