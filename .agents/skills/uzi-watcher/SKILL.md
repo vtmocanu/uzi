@@ -492,8 +492,9 @@ and falling back to the durable bare tracking ref when no clone survives:
   For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
   launchd refused a log path in Downloads before starting the job. Set the plist's
   `WorkingDirectory` to the checkout (or `UZI_REPO_SLUG` in `EnvironmentVariables`);
-  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing. The loop
-  self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
+  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing.
+  A new session rewrites the plist's run ids and `UZI_CTX` rather than reusing an old plist.
+  The loop self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
   (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
   terminal run after its first complete terminal cycle, and retries active runs, and a failed

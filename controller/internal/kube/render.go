@@ -660,8 +660,8 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 // the cfg.EphemeralDataSize override, else ephemeralDataDefaultSize (issue #1815). /nix is FLAT (20Gi, PRD #87 bump
 // for the prebaked Chromium closure) and persists because the store is an expensive
 // INTERNET fetch (measured: 209 MB baked pre-#87 -> ~2.6 GiB baked with Chromium),
-// and Decision 9 rolls every worker on every release —
-// so not persisting it would pay that cost per worker per release.
+// so not persisting it would pay that cost per worker on each pod (re)start,
+// including rolls triggered by a changed pod template.
 //
 // The third is issue #224 M-a: the daemon's image + build cache, moved off the pod's
 // ephemeral storage so a runaway pull produces ENOSPC in the daemon instead of a
@@ -883,8 +883,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	fsGroup := workerGID
 	// OnRootMismatch, not the default Always. Always recursively chowns the WHOLE
 	// volume on EVERY mount; against a provisioned /nix (measured 1,703 MB / 1,205
-	// store paths) that is a full recursive walk on every pod start — i.e. on every
-	// release, since Decision 9 rolls every worker on every release.
+	// store paths) that is a full recursive walk when the volume mounts on pod
+	// (re)start, including each roll. Rolls follow a changed pod template, not every release.
 	fsGroupPolicy := corev1.FSGroupChangeOnRootMismatch
 	allowPrivilegeEscalation := false
 

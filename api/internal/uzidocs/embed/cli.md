@@ -84,6 +84,7 @@ see [Named contexts](#named-contexts) below.
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
 uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
+uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
@@ -676,6 +677,92 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
+- **`run plan <run-id>` prints the latest plan Markdown verbatim.** It
+  appends no newline and does no terminal rendering or sanitation, even on a
+  TTY. `--version N` selects the Nth `plan` message in ascending `seq`
+  order, starting at 1. An integer outside `1..K` is a usage error
+  (`ExitUsage`, exit 2): `run has K plan version(s)`. A run with no plan
+  is not found (`ExitNotFound`, exit 4): `run has no plan`.
+  These version numbers count feed plans; they are not the approval
+  `gate_revision`. This read-only command changes no gate decisions; use
+  `--expected-gate-revision` on a verdict as described above.
+
+  **`--diff` compares a feedback revision with its immediate predecessor.**
+  For selected plan P, only the immediately preceding plan Q can be the
+  base, and at least one `plan_feedback` F must satisfy
+  `Q.seq < F.seq < P.seq`. Human and automatic feedback both qualify.
+  There is no backtracking to an older plan: a re-presentation without
+  intervening feedback has no base. Pending feedback after P creates no
+  new base and does not change an existing one. After two feedback rounds,
+  v3 compares with v2, not v1; selecting an earlier version uses only that
+  version's adjacent feedback interval.
+
+  The unified text diff has `--- vB` / `+++ vN` headers and
+  `@@ -start,count +start,count @@` hunks with up to three context lines
+  on each side. Comparison normalizes only trailing CR/LF characters;
+  meaningful spaces and interior text (including interior CR) are preserved.
+
+  - No base: stdout is the original plan, stderr says
+    `no revision base (no feedback preceded this version)`, exit 0.
+  - Identical after stripping trailing CR/LF: stdout is an empty diff,
+    stderr says
+    `This revision is identical to v{B}. Your requested changes were not applied.`,
+    exit 0.
+  - Either original side exceeds `200 * 1024` UTF-8 bytes: `--diff`
+    returns `ExitUsage` (exit 2), with empty stdout and
+    `plan too large to compare (limit 200 KiB)` through the standard CLI
+    error report on stderr. This cap also applies without a base;
+    without `--diff`, oversized plans print normally.
+
+  **`--json` emits one object** with `version`, `base_version` (number
+  or `null`), `plan_md`, `diff` (string or `null`) and
+  `identical_after_feedback` (boolean). `plan_md` preserves the original
+  Markdown string. Base and identical status are derived even without
+  `--diff`; `diff` is `null` unless `--diff` has a base, and `""`
+  for an identical comparison. With `--json --diff` and no base, stdout
+  contains only the object with `diff: null`; the no-base note remains
+  on stderr. Comparison notes and warnings never enter JSON stdout.
+
+  For a run `r` whose v1 is `alpha\nold\nomega\n`, followed by feedback
+  and v2 `alpha\nnew\nomega\n`:
+
+  ```sh
+  uzi run plan r                 # latest (v2)
+  uzi run plan r --version 1     # original (v1)
+  ```
+
+  Latest stdout (the stored string ends with a newline):
+
+  ```text
+  alpha
+  new
+  omega
+  ```
+
+  `uzi run plan r --version 2 --diff` prints:
+
+  ```diff
+  --- v1
+  +++ v2
+  @@ -1,3 +1,3 @@
+   alpha
+  -old
+  +new
+   omega
+  ```
+
+  `uzi run plan r --version 2 --diff --json` prints:
+
+  ```json
+  {"version":2,"base_version":1,"plan_md":"alpha\nnew\nomega\n","diff":"--- v1\n+++ v2\n@@ -1,3 +1,3 @@\n alpha\n-old\n+new\n omega\n","identical_after_feedback":false}
+  ```
+
+  In the web plan panel, **Show changes since vB** starts collapsed and
+  reveals line changes with added/removed counts. It uses the same feedback
+  base rule, but comparison is offered only when the newest feed plan text
+  exactly matches the displayed `run.plan_md`. Either side over 200 KiB
+  shows **Plan too large to compare**; an identical revision shows the
+  warning even while changes are collapsed.
 - **A message's content is under `payload`, not `body` or `content`.** Each
   `--json` line carries the text under `payload` (raw per-kind JSON); there is no
   `body`/`content` field, so reading either returns empty — indistinguishable from

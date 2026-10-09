@@ -168,6 +168,13 @@ The script exits 0 whether or not there are findings; invalid sources,
 schema or arguments make the script exit 2. Task propagates command failure
 using its own status (currently 201). It fetches no prices and changes no
 rates. Aging alone does not disable pricing; existing promotional expiry behavior remains.
+
+A weekly GitHub workflow (`.github/workflows/pricing-freshness.yml`, Mondays
+06:47 UTC, also runnable by hand) runs the nudge and keeps one tracking issue
+labelled `pricing-freshness` in step with the findings: it opens the issue,
+rewrites it only when the findings change, closes it when they clear and
+reopens it when they recur (`scripts/pricing-freshness-issue.sh`). It never
+edits an issue it did not create.
 Only the hermetic script tests run in the repository gate.
 
 The read-only `pricing.codex` [Health check](admin-health.md#codex-price-coverage)

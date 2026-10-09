@@ -60,6 +60,8 @@ COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
 # Same reason for the TUI/web answer parity fixture (#2550): runQuestion.test.ts and
 # QuestionPanel.test.tsx statically import `../../../fixtures/run-question-answer.json`.
 COPY fixtures/run-question-answer.json /app/fixtures/run-question-answer.json
+# PlanPanel.test.tsx statically imports this typed JSON fixture.
+COPY fixtures/plan-revision/ /app/fixtures/plan-revision/
 RUN npm run build
 
 # --- runtime stage ---

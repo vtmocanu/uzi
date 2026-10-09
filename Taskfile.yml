@@ -318,6 +318,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:forge-fake
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -416,6 +417,7 @@ tasks:
       - task: test:semgrep-gate
       # Hermetic fixture tests only; aging real prices is advisory and never gates.
       - task: test:pricing-freshness
+      - task: test:pricing-freshness-issue
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -1002,6 +1004,11 @@ tasks:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
       - node ./scripts/renovate-codex-runtime.test.mjs
+
+  test:forge-fake:
+    desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
+    cmds:
+      - node --test e2e/forge-fake/issue-comments.test.mjs
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
@@ -3103,6 +3110,11 @@ tasks:
     desc: hermetic pricing freshness CLI schema and calendar tests
     cmds:
       - bash scripts/pricing-freshness.test.sh
+
+  test:pricing-freshness-issue:
+    desc: hermetic test of the weekly pricing freshness tracking-issue sync (stub gh)
+    cmds:
+      - bash scripts/pricing-freshness-issue.test.sh
 
   # Explicit writer only; the codexprice mirror test detects drift in gates.
   codex-pricing:sync:

@@ -329,6 +329,45 @@ export const SECRET_FIXTURE_HYGIENE_APPEND = [
 ].join("\n");
 
 /**
+ * Issue #2593: integration-gate sequencing and failed-gate triage for the LEAD only.
+ * An append (not a template edit) so customized lead templates get it without
+ * rewriting stored bodies. Deliberately NOT added to subagent prompts (agents.ts,
+ * codex/render.ts): subagents do not run the integration gate. Prompt-level guidance
+ * only; nothing enforces it. Refines PRD #215's overlap rule (gate overlapped with the
+ * read-only review wave) with one exception and a triage procedure. Generic by design:
+ * it names no repo, language, gate command or harness-specific tool.
+ */
+export const LEAD_GATE_SEQUENCING_APPEND = [
+  "Integration-gate sequencing and failed-gate triage. This policy overrides your template's",
+  "instructions only on when the integration gate runs relative to review; it takes no",
+  "precedence over any other template instruction.",
+  "- During implementation and repair, run focused checks appropriate to the change.",
+  "- By default, run the integration gate over a landed commit overlapped with its read-only",
+  "  review wave.",
+  "- Exception: once review invalidates a candidate whose full gate is costly (long relative to",
+  "  the review, typically several minutes or more), complete subsequent repair reviews and",
+  "  focused checks until the required review is clean, then repeat the full gate. Do not",
+  "  introduce an additional review requirement. Judge cost using observed gate and review",
+  "  durations and churn in this run, not an assumption that a change is low-risk. Deferring",
+  "  the gate changes when it runs, not whether it blocks.",
+  "- After a full gate fails, keep its command, exit status, log and tested revision. Identify",
+  "  the smallest useful reproducer before repeating the full gate.",
+  "- When the failure names a test or file, try that narrowed selection first on candidate and",
+  "  base, with equivalent commands and environment, without modifying the primary worktree:",
+  "  use whatever isolated copy of the base this runtime permits, for example an export of the",
+  "  base revision. If isolation does not reproduce the failure, report the comparison as",
+  "  inconclusive. A single equivalent full gate run on the base may provide comparison",
+  "  evidence only when the failure cannot be reproduced with a narrower selection; record the",
+  "  reason and the remaining uncertainty.",
+  "- A failure that reproduces on the base remains a reported failed check, with its base",
+  "  evidence.",
+  "- After triage, rerun full validation when a fix, a relevant environment change, or a",
+  "  necessary diagnostic invalidates or requires rechecking the earlier result. Record the",
+  "  reason. A prior green result remains usable only for the candidate and environment it",
+  "  validated.",
+].join("\n");
+
+/**
  * PRD #702 M5: the subagent-channel mirror of the lead's deps-provisioning notes
  * (depsProvisionPlanNote / depsProvisionImplementNote). Appended to EVERY subagent
  * prompt in `toDefinition` (agents.ts), exactly like FINDINGS_NUDGE_APPEND, so
@@ -538,6 +577,10 @@ export function buildLeadSystemPrompt(
   // right after the findings nudge and before every conditional append, so it never sits
   // inside the untrusted-repo fence (repoInstructions is pushed last).
   parts.push(SECRET_FIXTURE_HYGIENE_APPEND);
+  // Issue #2593: lead-only gate-sequencing and failed-gate triage policy. Unconditional
+  // across run kinds and pushed before every conditional append, so it sits outside the
+  // untrusted-repo fence (repoInstructions is pushed last).
+  parts.push(LEAD_GATE_SEQUENCING_APPEND);
   if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
   if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
