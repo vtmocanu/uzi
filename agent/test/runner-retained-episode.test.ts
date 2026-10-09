@@ -34,6 +34,39 @@ function episodeDeadline(t: TestContext, deadline: number, setupDelay = 0): () =
   };
 }
 
+function waitForEpisodeAbort(signal: AbortSignal, observed: { reason?: Error }): Promise<void> {
+  return new Promise<void>((_resolve, reject) => {
+    const aborted = () => {
+      observed.reason = signal.reason;
+      reject(signal.reason);
+    };
+    if (signal.aborted) aborted();
+    else signal.addEventListener("abort", aborted, { once: true });
+  });
+}
+
+for (const alreadyAborted of [false, true]) {
+  it(`wrong episode abort reason fails its assertion after cleanup (already aborted: ${alreadyAborted})`, async () => {
+    const controller = new AbortController();
+    const wrongReason = new Error("wrong episode reason");
+    const observed: { reason?: Error } = {};
+    if (alreadyAborted) controller.abort(wrongReason);
+    let joined = false;
+    const execution = waitForEpisodeAbort(controller.signal, observed).finally(() => { joined = true; });
+    const rejection = assert.rejects(execution, error => error === wrongReason);
+    if (!alreadyAborted) controller.abort(wrongReason);
+    try {
+      await rejection;
+    } finally {
+      await Promise.allSettled([execution]);
+    }
+    assert.equal(joined, true);
+    assert.throws(() => assert.equal(observed.reason?.message, "recovery deadline exhausted"), {
+      code: "ERR_ASSERTION",
+    });
+  });
+}
+
 async function requireEpisodeEntry(entry: Promise<void>, execution: Promise<unknown>): Promise<void> {
   const entered = await Promise.race([entry.then(() => true), execution.then(() => false, () => false)]);
   assert.equal(entered, true, "runner ended before the recovery seam");
@@ -527,11 +560,12 @@ for (const setupDelay of [0, 5_000]) {
     await held;
     const expire = episodeDeadline(t, before.recovery.deadline, setupDelay);
     let deadlineAborted = false;
+    let observedReason: Error | undefined;
     const reserve = git.reserveRecoveryIteration.bind(git);
     git.reserveRecoveryIteration = async (...args) => {
       const scope = (git as any).recoveryOperations.getStore();
       scope.signal.addEventListener("abort", () => {
-        assert.equal(scope.signal.reason.message, "recovery deadline exhausted");
+        observedReason = scope.signal.reason;
         deadlineAborted = true;
       }, { once: true });
       entered();
@@ -563,6 +597,7 @@ for (const setupDelay of [0, 5_000]) {
     assert.equal(proofs, 0);
     assert.equal(reads, 0);
     assert.equal(deadlineAborted, true, "queued reservation entered and its deadline aborted the wait");
+    assert.equal(observedReason?.message, "recovery deadline exhausted");
     assert.ok(api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
     assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
   });
@@ -775,7 +810,8 @@ for (const setupDelay of [0, 5_000]) {
       runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000,
     });
     await outbox.init();
-    let reads = 0, interrupted = false, models = 0, lateReads = 0, lateWork = 0, releases = 0;
+    let reads = 0, models = 0, lateReads = 0, lateWork = 0, releases = 0;
+    const observed: { reason?: Error } = {};
     const authority = client.hasRecoveryRetirementAuthority.bind(client);
     client.hasRecoveryRetirementAuthority = async (...args) => {
       if (Date.now() >= old.recovery.deadline) lateWork++;
@@ -808,14 +844,9 @@ for (const setupDelay of [0, 5_000]) {
       assert.ok(signal);
       assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2, "ownership read entered the charged iteration");
       entered();
-      await new Promise<void>((_resolve, reject) => {
-        signal!.addEventListener("abort", () => {
-          assert.equal(signal!.reason.message, "recovery deadline exhausted");
-          interrupted = true; reject(signal!.reason);
-        }, { once: true });
-        queueMicrotask(expire);
-        if (signal!.aborted) { interrupted = true; reject(signal!.reason); }
-      });
+      const aborted = waitForEpisodeAbort(signal, observed);
+      queueMicrotask(expire);
+      await aborted;
       throw new Error("unreachable");
     };
     const timers = process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
@@ -833,7 +864,7 @@ for (const setupDelay of [0, 5_000]) {
     assert.equal(reads, 1);
     assert.equal(lateWork, 0);
     assert.equal(releases, 0);
-    assert.equal(interrupted, true);
+    assert.equal(observed.reason?.message, "recovery deadline exhausted");
     assert.equal(models, 0);
     assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2);
     assert.equal(readJournal(bare, clone.branch).recovery.blocker, "budget_exhausted");
@@ -1052,7 +1083,7 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
         fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
       let expire!: () => void, entered!: () => void;
       let persisted: any;
-      let deadlineAborted = false;
+      const observed: { reason?: Error } = {};
       const entry = new Promise<void>(resolve => { entered = resolve; });
       git.verifyRecoveryClosure = async () => {
         verified++;
@@ -1067,16 +1098,9 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
         // A persisted original deadline bounds this blocked verifier, without refreshing it.
         const scope = (git as any).recoveryOperations.getStore();
         assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2, "verifier entered the charged iteration");
-        await new Promise<void>((_resolve, reject) => {
-          const aborted = () => {
-            assert.equal(scope.signal.reason.message, "recovery deadline exhausted");
-            deadlineAborted = true;
-            reject(scope.signal.reason);
-          };
-          scope.signal.addEventListener("abort", aborted, { once: true });
-          if (scope.signal.aborted) aborted();
-          queueMicrotask(expire);
-        });
+        const aborted = waitForEpisodeAbort(scope.signal, observed);
+        queueMicrotask(expire);
+        await aborted;
         return false;
       };
       if (failure === "timeout") {
@@ -1113,7 +1137,7 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
         assert.ok(api.states.some(s => s.body.status === "failed"));
       }
       if (failure === "timeout") {
-        assert.equal(deadlineAborted, true);
+        assert.equal(observed.reason?.message, "recovery deadline exhausted");
         assert.equal(journal.recovery.attempts, 2);
         assert.equal(journal.recovery.startedAt, persisted.startedAt);
         assert.equal(journal.recovery.deadline, persisted.deadline);
