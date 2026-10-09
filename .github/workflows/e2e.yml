@@ -93,7 +93,12 @@ jobs:
       # nothing is pushed.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
-          driver-opts: default-load=true
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+          driver-opts: |
+            default-load=true
+            image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       - name: Run compose E2E (stub executor)
         # Pin the harness rundir to a known path so the upload + issue steps can find

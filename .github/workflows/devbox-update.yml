@@ -135,6 +135,11 @@ jobs:
       - name: Set up buildx
         if: steps.delta.outputs.changed == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       # Validation: build the worker base image with the UPDATED lock. The build COPYs
       # the lock, runs `devbox global install`, then assert-toolchain.sh cross-checks the
