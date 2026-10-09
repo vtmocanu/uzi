@@ -2207,8 +2207,8 @@ export class RunRunner {
    *  the claim's first gatePlan; cleared with gatedRuns. */
   private readonly gateResumes = new Map<string, GateResume>();
   /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
-   *  catch fetch the committed work back before the container dies. Registered once the
-   *  runner clone exists (there is nothing to fetch back before that) and deregistered
+   *  catch fetch the committed work back before the container dies. Registered before
+   *  retained discovery so shutdown can interrupt pre-clone work too; deregistered
    *  in the terminal finally. */
   private readonly activeRuns = new Map<string, ActiveRun>();
   /** Per-run announcement ledger, kept across a park/resume on this worker so a resume emits only
@@ -3071,16 +3071,16 @@ export class RunRunner {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         await batcher.close().catch(() => undefined);
-      } else if (flight.active?.shuttingDown) {
+      } else if (flight.active?.shuttingDown && !(err instanceof RetainedRecoveryStop)) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
         // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
         // steering-cancel aborts the same controller with the same REASON_CANCELLED and
         // must still fall through to the generic failure below. The run's tree is
         // already reaped (sdk-executor's run() finally kills the agent tree before this
         // catch is entered); the belt-and-braces reap now lives INSIDE the durability sink
-        // below (m4: reapForSink — killAgentTree for Claude, withBoundary for Codex), which
-        // always runs on this path because `shuttingDown` is only ever set once the runner
-        // clone (hence barePath) exists.
+        // below (m4: reapForSink — killAgentTree for Claude, withBoundary for Codex).
+        // Early registration also permits shutdown before discovery or clone creation;
+        // the durability sink runs only when the clone coordinates below are available.
         if (flight.barePath && flight.worktreePath && flight.branch) {
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
@@ -8389,6 +8389,19 @@ export class RunRunner {
       }
       this.retainedLifecycleGuard(flight);
     } catch (error) {
+      // A switch can abort discovery or land just after it returns, when the
+      // retainedLifecycleGuard masks it as RetainedRecoveryStop. Keep unknown
+      // custody and clear the switch stamp without authorizing capture or release.
+      const switchError = error instanceof RetainedRecoveryStop ? flight.steering.lifecycleSignal().reason : error;
+      if (switchError instanceof CredentialSwitchSignal && !flight.active?.shuttingDown &&
+          !this.shuttingDownGlobal && !flight.steering.terminalLifecycleSignal().aborted &&
+          flight.steering.claimFence() === undefined) {
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.retainedLocalCustody = true;
+        flight.keepGuardedInventoryOpen = true;
+        throw switchError;
+      }
       this.retainedLifecycleGuard(flight);
       if (!(error instanceof ForeignRetainedRecoveryError)) {
         flight.preserveRecoveryClone = true;
