@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Usage ranks users by total tokens**
+  The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
+
 - **Ground PR description diagrams in visible flows**
   The editor now requests compact diagrams for evidenced flows, fallback chains and component interactions; an opt-in Claude/Codex evaluator compares a frozen baseline with five fixed fixtures through the real sanitizer and publication rendering pipeline.
 
