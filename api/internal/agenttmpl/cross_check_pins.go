@@ -64,8 +64,8 @@ func ResolveCrossCheck(harness string, model, effort, workerModel, workerEffort,
 			fallback := DefaultCodexModel
 			r.Model = &fallback
 		} else if templateModel != nil {
-			// The lead template can carry a Codex model for a Codex lead; never hand one to the
-			// Claude SDK. A non-Claude template model falls back to the SDK default (nil).
+			// Reject known curated Codex IDs in the lead template; invalid values use the SDK
+			// default. Custom IDs remain provider-validated.
 			if m, err := ValidateFamilyModel("claude", *templateModel); err == nil {
 				r.Model = &m
 			}
