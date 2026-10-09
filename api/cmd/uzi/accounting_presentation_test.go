@@ -390,10 +390,10 @@ func TestAccountingUXLabScene(t *testing.T) {
 				if out == "" {
 					t.Fatal("dedicated scene generation requires UZI_UXLAB_OUT_DIR")
 				}
-				if err := os.MkdirAll(out, 0o750); err != nil {
+				if err := os.MkdirAll(out, 0o750); err != nil { //nolint:gosec // G703: opt-in developer generation uses the caller's output directory, never run data.
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(out, "detail-accounting-backfill-"+name+".ansi"), []byte(frame), 0o600); err != nil {
+				if err := os.WriteFile(filepath.Join(out, "detail-accounting-backfill-"+name+".ansi"), []byte(frame), 0o600); err != nil { //nolint:gosec // G703: opt-in developer generation uses the caller's output directory, never run data.
 					t.Fatal(err)
 				}
 			}
