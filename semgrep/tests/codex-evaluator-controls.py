@@ -56,7 +56,9 @@ def main():
         ("copied-broker", "agent/src/codex/broker.ts", IMPORT + '\n' + CALL, ["codex-no-direct-spawn"]),
         ("copied-future", "agent/src/codex/future.ts", IMPORT + '\n' + CALL, ["codex-no-direct-spawn"]),
     ]
-    with tempfile.TemporaryDirectory(prefix="semgrep-evaluator-", dir=ROOT / ".uzi/scratch") as temporary:
+    scratch = ROOT / ".uzi/scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="semgrep-evaluator-", dir=scratch) as temporary:
         for name, file, source, expected in controls:
             root = Path(temporary) / name
             target = root / file
