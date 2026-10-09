@@ -4846,11 +4846,12 @@ export class GitCache {
       return await this.withLock(barePath, async () => {
         const paths = new Map<string, { branch: string; runId: string }>();
         const foreignOwners = new Set<string>();
+        // Keep the initial config read in its operation-scoped error classifier.
+        const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
         for (const record of await this.protectedRecoveries(barePath)) {
           if (record.journal.runId !== runId) { foreignOwners.add(record.journal.runId); continue; }
           for (const source of this.recoverySources(record.journal)) paths.set(source.clonePath, { branch: record.branch, runId });
         }
-        const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
         const entries = config.split("\0");
         const journals = new Map<string, string>();
         for (const item of entries) {
