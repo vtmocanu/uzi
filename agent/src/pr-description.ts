@@ -996,6 +996,7 @@ export interface RenderedRegion {
   withFields: boolean;
   /** Set when withFields is false. */
   fallback?: RegionFallback;
+  diagramRemoval?: { stage: "renderer" | "region_cap"; reason: "mermaid_bytes" | "backtick" | "region_bytes" };
 }
 
 const RUNG2_NOTE = "_Summary written by the agent, not checked against the diff._";
@@ -1062,9 +1063,9 @@ function verificationLines(fields: SanitizedPrDescriptionFields, input: RegionIn
   return out;
 }
 
-function diagramBlock(fields: SanitizedPrDescriptionFields): string[] {
+function diagramBlock(fields: SanitizedPrDescriptionFields): { lines: string[]; reason?: "mermaid_bytes" | "backtick" } {
   const diagram = fields.diagram;
-  if (!diagram) return [];
+  if (!diagram) return { lines: [] };
   const ids = new Map(diagram.nodes.map((node, i) => [node.key, `n${i + 1}`]));
   const connected = new Set(diagram.edges.flatMap((edge) => [edge.from, edge.to]));
   const source = diagram.kind === "flow"
@@ -1076,16 +1077,25 @@ function diagramBlock(fields: SanitizedPrDescriptionFields): string[] {
     : ["sequenceDiagram", ...diagram.nodes.map((node) => `  participant ${ids.get(node.key)} as ${sequenceLabel(node.label)}`),
       ...diagram.edges.map((edge) => `  ${ids.get(edge.from)}->>${ids.get(edge.to)}: ${sequenceLabel(edge.label || diagram.nodes.find((node) => node.key === edge.to)!.label)}`)];
   const mermaid = source.join("\n");
-  if (Buffer.byteLength(mermaid, "utf8") > 1500 || mermaid.includes("`")) return [];
-  return [...(diagram.title ? [`_${escapeInline(diagram.title)}_`, ""] : []), "```mermaid", ...source, "```"];
+  const reason = mermaidRemovalReason(mermaid);
+  if (reason) return { lines: [], reason };
+  return { lines: [...(diagram.title ? [`_${escapeInline(diagram.title)}_`, ""] : []), "```mermaid", ...source, "```"] };
+}
+
+/** Pure guard, also covers backticks that the decoder already rejects. */
+export function mermaidRemovalReason(source: string): "mermaid_bytes" | "backtick" | undefined {
+  if (Buffer.byteLength(source, "utf8") > 1500) return "mermaid_bytes";
+  if (source.includes("`")) return "backtick";
+  return undefined;
 }
 
 function sequenceLabel(label: string): string {
   return label.replace(/\bend\b/giu, "(end)");
 }
 
-function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, withoutDiagram = false): string {
+function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, withoutDiagram = false): { text: string; diagramRemoval?: RenderedRegion["diagramRemoval"] } {
   const blocks: string[][] = [];
+  let diagramRemoval: RenderedRegion["diagramRemoval"];
   const summary = fields.summary.trim();
   if (summary) blocks.push([summary]);
   // D8 rung 2: the note qualifies the summary, so it follows it, never under "### Verification"
@@ -1096,7 +1106,8 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, 
   if (fields.changes.length) blocks.push(["### What changed", ...fields.changes.map((c) => `- ${c}`)]);
   if (!withoutDiagram) {
     const diagram = diagramBlock(fields);
-    if (diagram.length) blocks.push(diagram);
+    if (diagram.lines.length) blocks.push(diagram.lines);
+    if (diagram.reason) diagramRemoval = { stage: "renderer", reason: diagram.reason };
   }
   const verification = verificationLines(fields, input);
   if (verification.length) blocks.push(["### Verification", ...verification]);
@@ -1107,7 +1118,7 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, 
   if (notes.length) blocks.push(["### Scope and review notes", ...notes]);
   const prov = provenanceOf(input);
   if (prov) blocks.push([prov]);
-  return wrapRegion(blocks.map((b) => b.join("\n")).join("\n\n").split("\n"));
+  return { text: wrapRegion(blocks.map((b) => b.join("\n")).join("\n\n").split("\n")), diagramRemoval };
 }
 
 /**
@@ -1115,7 +1126,8 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, 
  * instance from a WorkerClient decoder; it is checked with `SanitizedPrDescriptionFields.is()` at
  * runtime, and anything else (a plain object, `Object.assign({}, s, raw)`, `structuredClone(s)`, a
  * Proxy, an `any`) renders the size-and-provenance-only region instead (fail closed). A rendered
- * region over REGION_CAP_BYTES (6 KiB) also falls back to it. The fields are published as the api
+ * region over REGION_CAP_BYTES (6 KiB) first removes the diagram, then falls back to it if prose
+ * still exceeds the cap. Removal metadata survives both selections. The fields are published as the api
  * returned them: no re-escaping.
  */
 export function renderRegion(input: RegionInput, fields?: SanitizedPrDescriptionFields, withoutDiagram = false): RenderedRegion {
@@ -1126,14 +1138,15 @@ export function renderRegion(input: RegionInput, fields?: SanitizedPrDescription
   if (input.source === "deterministic_only") {
     return { text: deterministicRegion(input), withFields: false, fallback: "deterministic_only" };
   }
-  let text = fieldsRegion(fields, input, withoutDiagram);
+  let { text, diagramRemoval } = fieldsRegion(fields, input, withoutDiagram);
   if (!withoutDiagram && fields.diagram && Buffer.byteLength(text, "utf8") > REGION_CAP_BYTES) {
-    text = fieldsRegion(fields, input, true);
+    if (!diagramRemoval) diagramRemoval = { stage: "region_cap", reason: "region_bytes" };
+    text = fieldsRegion(fields, input, true).text;
   }
   if (Buffer.byteLength(text, "utf8") > REGION_CAP_BYTES) {
-    return { text: deterministicRegion(input), withFields: false, fallback: "region_cap" };
+    return { text: deterministicRegion(input), withFields: false, fallback: "region_cap", ...(diagramRemoval ? { diagramRemoval } : {}) };
   }
-  return { text, withFields: true };
+  return { text, withFields: true, ...(diagramRemoval ? { diagramRemoval } : {}) };
 }
 
 /** sha256 (hex) of the exact region text, markers included, with CRLF normalised to LF (a forge
@@ -1720,21 +1733,21 @@ export function renderBody(region: string | undefined, completion: string): stri
 
 /**
  * D15: the body `compose(region)` builds, unless it exceeds BODY_CAP_CHARS, in which case the
- * region is replaced by `sizeOnlyRegion` (the size line and provenance, no model text). Preserved
+ * region first tries `diagramLessRegion`, then `sizeOnlyRegion` (size and provenance). Preserved
  * text and the completion block are never truncated, so a body can stay over the cap when they
- * alone exceed it. `capped` reports that the region was dropped.
+ * alone exceed it. `capped` reports size-only selection; removal metadata names the chosen rung.
  */
 export function capBody(
   compose: (region: string) => string | undefined,
   region: string,
   sizeOnlyRegion: string,
   diagramLessRegion?: string,
-): { body: string | undefined; capped: boolean; diagramless?: boolean } {
+): { body: string | undefined; capped: boolean; diagramless?: boolean; removal?: "diagramless" | "sizeonly" } {
   const body = compose(region);
   if (body === undefined || body.length <= BODY_CAP_CHARS || region === sizeOnlyRegion) return { body, capped: false };
   if (diagramLessRegion && diagramLessRegion !== region) {
     const less = compose(diagramLessRegion);
-    if (less !== undefined && less.length <= BODY_CAP_CHARS) return { body: less, capped: false, diagramless: true };
+    if (less !== undefined && less.length <= BODY_CAP_CHARS) return { body: less, capped: false, diagramless: true, removal: "diagramless" };
   }
-  return { body: compose(sizeOnlyRegion), capped: true };
+  return { body: compose(sizeOnlyRegion), capped: true, removal: "sizeonly" };
 }

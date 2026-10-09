@@ -1,0 +1,45 @@
+{
+  "id": "truncation",
+  "context": {
+    "issue": "Add a visible fallback flow and update unrelated storage code.",
+    "prd": "Describe delivered behavior from visible evidence.",
+    "plan": "Implement the requested change.",
+    "previous": null,
+    "claims": "The agent reports the requested implementation.",
+    "commits": "Implement requested behavior",
+    "paths": "src/read.ts 5 0 [code]\nsrc/storage.ts unknown [code]",
+    "diff": "+function read() {\n+  if (cache.has()) return cache.get();\n+  if (remote.has()) return remote.get();\n+  return local.get();\n+}\n[unrelated storage diff unavailable]",
+    "truncated": {
+      "issue": false,
+      "prd": false,
+      "plan": false,
+      "previous": false,
+      "claims": false,
+      "commits": false,
+      "paths": false,
+      "diff": true
+    },
+    "bytes": 433
+  },
+  "code": {
+    "unavailable": false,
+    "added": 7,
+    "deleted": 0
+  },
+  "lead": {
+    "verifiedAtSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "verification": [
+      {
+        "command": "npm run typecheck",
+        "result": "pass"
+      }
+    ]
+  },
+  "region": {
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "targetBranch": "main",
+    "sizeLine": "**Size:** small"
+  },
+  "completion": "Finished fixture change.",
+  "bodyPrefix": ""
+}

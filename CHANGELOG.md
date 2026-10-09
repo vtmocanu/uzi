@@ -27,6 +27,23 @@ through `[0.52.0]`.)
 - **A Codex lead's plan is now cross-checked by a read-only Claude checker ([#2460](https://github.com/vtmocanu/uzi/issues/2460)).**
   With Plan cross-check enabled, an auto-approved Codex run no longer waits for a human by default: its plan is checked by a Claude child with only Read, Grep and Glob, the checker is always the opposite family of the lead, and only an APPROVE of the latest exact plan implements. A Codex lead consumes automatic REVISE rounds without spending its human revision allowance. This needs the new worker capability `cross_check_codex_lead_v1`; roll the api and migration 00314 first, because a new worker on an older api does not submit the check and parks the Codex lead at the human gate as not yet supported, the same park a Codex lead on an older worker keeps. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, fails `plan cross-check: checker unavailable` and the lead takes the human gate; no credential is delivered. The Plan cross-check Claude pin cell is now active (Default follows your Claude worker default), and with ephemeral workers off the settings toggle also warns when no online worker advertises the capability. The migration's Down deletes Claude checker runs but keeps the check history; run it with the new api stopped.
 
+- **Usage ranks users by total tokens**
+  The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
+
+- **Claude Agent SDK 0.3.287; long worker commands keep running up to two hours ([#2551](https://github.com/vtmocanu/uzi/pull/2551)).**
+  From SDK 0.3.285 a backgrounded Bash command is stopped at its `timeout` (default 30 minutes, maximum two hours) in addition to being stopped when the turn ends. Claude agents are now told to start a command expected to outlast the 10-minute foreground limit in the background with the two-hour `timeout`; a command still stopped at the limit writes no exit-status file and its result is reported unverified, as before.
+
+- **Ground PR description diagrams in visible flows**
+  The editor now requests compact diagrams for evidenced flows, fallback chains and component interactions; an opt-in Claude/Codex evaluator compares a frozen baseline with five fixed fixtures through the real sanitizer and publication rendering pipeline.
+
+- **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
+  Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
+
+### Security
+
+- **Go toolchain 1.27.2 and golang.org/x/net 0.60.0 ([#2543](https://github.com/vtmocanu/uzi/pull/2543), supersedes #2536, #2537, #2465).**
+  The api and controller build with Go 1.27.2 and golang.org/x/net 0.60.0 (controller golang.org/x/text 0.42.0), closing the HTTP/2, net/http, crypto/tls, mime/multipart and os advisories govulncheck reported as called against Go 1.27.1 and the controller's x/net 0.57.0 (x/net 0.59.0 and x/text 0.40.0 also cleared at module level). The embedded public-suffix list is unchanged; only its generated source stamp moves.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

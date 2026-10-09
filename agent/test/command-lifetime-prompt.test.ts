@@ -87,6 +87,14 @@ describe("CLAUDE_LONG_COMMAND_APPEND start and poll commands", () => {
     assert.match(flat, /foreground calls, each with `timeout` 600000/);
   });
 
+  // SDK 0.3.285+: a background command is stopped at its `timeout` (default 30 min, max 2 h),
+  // so the long-command start must carry the 2 h maximum while foreground calls keep 600000.
+  it("starts a long command in the background with the 7200000 ms deadline", () => {
+    assert.match(flat, /foreground command[^.]*explicit `timeout` \(at most 600000 ms\)/);
+    assert.match(flat, /`run_in_background: true` and `timeout` 7200000/);
+    assert.match(flat, /stopped 30 minutes later/);
+  });
+
   it("a failing command under set -e still writes its status, and a fresh shell polls it back", () => {
     assert.ok(start && poll);
     const dir = mkdtempSync(join(tmpdir(), "cmdlife-"));

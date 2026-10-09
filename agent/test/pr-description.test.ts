@@ -12,6 +12,7 @@ import {
   STALENESS_END,
   STALENESS_START,
   capBody,
+  mermaidRemovalReason,
   closingDirectiveFor,
   codeSpan,
   composeBody,
@@ -265,16 +266,49 @@ describe("diagram regions (PRD #1840 D5/D6/D9)", () => {
     assert.equal(closingDirectiveFor(region, 7, "o/r"), false);
     assert.equal((parseOwnedBlocks(renderBody(region, renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false }))) as OwnedBlocks).region, region);
     const over = await mint({ diagram: { ...diagram, nodes: [{ key: "worker", label: "Worker123456789012345" }, diagram.nodes[1]!] } });
-    assert.doesNotMatch(renderRegion({ sizeLine: table }, over).text, /```mermaid/u);
+    const removed = renderRegion({ sizeLine: table }, over);
+    assert.doesNotMatch(removed.text, /```mermaid/u);
+    assert.deepEqual(removed.diagramRemoval, { stage: "renderer", reason: "mermaid_bytes" });
   });
 
   it("retries a region over 6 KiB without its diagram and keeps the size table", async () => {
     const fields = await mint({ summary: "x".repeat(5850), changes: ["One change."], diagram: { ...cases[0]![1], nodes: [...cases[0]![1].nodes], edges: [...cases[0]![1].edges] } });
     const full = renderRegion({ sizeLine: table }, fields);
     assert.equal(full.withFields, true);
+    assert.deepEqual(full.diagramRemoval, { stage: "region_cap", reason: "region_bytes" });
     assert.equal(full.text.includes("```mermaid"), false);
     assert.ok(full.text.includes("x".repeat(5850)));
     assert.ok(full.text.includes(table));
+  });
+});
+
+describe("diagram removal metadata", () => {
+  it("tests the pure backtick guard without forging a decoder brand", () => {
+    assert.equal(mermaidRemovalReason("flowchart LR\n  n1[\"back`tick\"]"), "backtick");
+    assert.equal(mermaidRemovalReason("é".repeat(750)), undefined);
+    assert.equal(mermaidRemovalReason("é".repeat(751)), "mermaid_bytes");
+  });
+
+  it("keeps region removal metadata when the diagram-less prose still exceeds the cap", async () => {
+    const fields = await mint({ summary: "x".repeat(7000), diagram: { kind: "sequence", nodes: [{ key: "a", label: "A" }, { key: "b", label: "B" }], edges: [{ from: "a", to: "b" }, { from: "b", to: "a" }] } });
+    const region = renderRegion({}, fields);
+    assert.equal(region.fallback, "region_cap");
+    assert.deepEqual(region.diagramRemoval, { stage: "region_cap", reason: "region_bytes" });
+  });
+
+  it("reports both body-cap rungs, including a size-only body still over cap", () => {
+    const region = "r".repeat(500);
+    const less = "l".repeat(100);
+    const size = "size";
+    const prefix = "p".repeat(BODY_CAP_CHARS - 150);
+    const diagramless = capBody((r) => prefix + r, region, size, less);
+    assert.equal(diagramless.removal, "diagramless");
+    assert.equal(diagramless.body, prefix + less);
+    const huge = "p".repeat(BODY_CAP_CHARS + 1);
+    const sizeonly = capBody((r) => huge + r, region, size, less);
+    assert.equal(sizeonly.removal, "sizeonly");
+    assert.equal(sizeonly.body, huge + size);
+    assert.equal(capBody(() => undefined, region, size, less).removal, undefined);
   });
 });
 
