@@ -720,6 +720,28 @@ func TestTUIDetailEscReturnsToBoard(t *testing.T) {
 
 // The whole untrusted surface goes through the sanitizer. This drives REAL model
 // state rather than calling the helpers directly, so it covers the wiring too.
+func TestTUIQuestionAnswerViewStripsHostileFields(t *testing.T) {
+	const hostile = "\x1b[2J\u202e\x07\x01"
+	payload := `{"questions":[{"header":` + quoteJSON(hostile+"header-safe") + `,"question":` + quoteJSON(hostile+"question-safe") + `,"options":[{"label":` + quoteJSON(hostile+"option-safe") + `,"description":` + quoteJSON(hostile+"description-safe") + `}]}]}`
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "hostile-question")
+	m = applyDetail(m, apitypes.RunDTO{ID: "hostile-question", Status: "running"}, []apitypes.MessageDTO{
+		{Seq: 1, Kind: "question", Payload: json.RawMessage(payload), CreatedAt: time.Now()},
+		{Seq: 2, Kind: "answer", Payload: json.RawMessage(`{"answers":[` + quoteJSON(hostile+"answer-safe") + `]}`), CreatedAt: time.Now()},
+	})
+	out := m.View().Content
+	assertNoRawControls(t, "structured question and answer", out)
+	for _, marker := range []string{"header-safe", "question-safe", "option-safe", "description-safe", "answer-safe"} {
+		if !strings.Contains(stripANSI(out), marker) {
+			t.Fatalf("hostile field %q never reached View:\n%s", marker, stripANSI(out))
+		}
+	}
+	for _, control := range []string{"\x1b[2J", "\u202e", "\x07", "\x01"} {
+		if strings.Contains(out, control) {
+			t.Errorf("hostile control %q reached View", control)
+		}
+	}
+}
+
 func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	now := time.Now()
 	// Hostile bytes at the FRONT: capCell/Plain truncate to 8-60 runes, so a payload at

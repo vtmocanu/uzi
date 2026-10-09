@@ -125,6 +125,21 @@ func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 			}
 		}
 	}
+	// A single narrower renderer serves every structured field/frame in this build.
+	// Glamour reserves two cells on each document edge: add those four cells to
+	// the prose width after reserving five for option-description chrome.
+	// questionProse handles widths below newTUIRenderer's 20-cell minimum.
+	var questionModel *tuiModel
+	questionView := func() tuiModel {
+		if questionModel == nil {
+			copy := m
+			if renderer, err := newTUIRenderer(max(1, width-5)+4, m.dark); err == nil {
+				copy.renderer = renderer
+			}
+			questionModel = &copy
+		}
+		return *questionModel
+	}
 	blocks := make([]frameBlock, 0, len(lane.Frames)-start)
 	for i := start; i < len(lane.Frames); i++ {
 		f := lane.Frames[i]
@@ -183,6 +198,28 @@ func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 			}
 			line += m.pal.faint.Render(m.renderer.Plain(sum, 200))
 			block = clampVisual(line, width)
+		case "question", "answer":
+			// This event's fields are the only evidence of its actor. Lane identities
+			// can inherit labels/roles from earlier frames and must not label an answer.
+			actor := ""
+			if f.AgentLabel != "" || f.Agent != "" {
+				actor = frameAgentTag(f)
+			}
+			if f.Kind == "question" {
+				if questions := parseTranscriptQuestions(f.Payload); len(questions) > 0 {
+					block = questionView().formatTranscriptQuestions(questions, actor, width)
+				}
+			} else if answers := parseTranscriptAnswers(f.Payload); len(answers) > 0 && strings.TrimSpace(strings.Join(answers, "")) != "" {
+				block = questionView().formatTranscriptAnswers(answers, actor, width)
+			}
+			if block == "" {
+				// Preserve today's safe raw fallback when parsing yields no usable prose.
+				head := tungsten.Render("▪ " + m.renderer.Plain(f.Kind, 16))
+				if w := who(f); w != "" {
+					head += m.pal.faint.Render("  · ") + tungsten.Render(w)
+				}
+				block = clampVisual(head, width) + "\n" + strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+			}
 		case "text", "thinking":
 			// TrimLeft drops Glamour's document top-margin so the body sits directly under the
 			// "▪ <who>" speaker line instead of a blank line below it.

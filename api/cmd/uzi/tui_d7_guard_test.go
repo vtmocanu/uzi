@@ -93,6 +93,10 @@ import (
 var d7UntrustedFields = []string{
 	// internal (tui_lanes.go)
 	"Label",
+	// Structured transcript question prose (tui_question.go); all use sanitized Markdown.
+	"Question",
+	"Header",
+	"Description",
 	"Role",
 	"Agent",
 	// wire (apitypes)
