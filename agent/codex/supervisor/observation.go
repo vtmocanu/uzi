@@ -178,10 +178,10 @@ func (p *observationProc) children(pid int, limit int) ([]int, error) {
 	sort.Ints(out)
 	return out, nil
 }
-func identities(rows []observationRow) []int {
-	out := make([]int, 0, len(rows))
+func identities(rows []observationRow) []processIdentity {
+	out := make([]processIdentity, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, row.Pid)
+		out = append(out, row.processIdentity)
 	}
 	return out
 }
@@ -245,7 +245,9 @@ func (p *observationProc) walk(supervisor, primary processIdentity) ([]observati
 		if err != nil {
 			return nil, err
 		}
-		edges[parent.Pid] = identities(children)
+		for _, child := range children {
+			edges[parent.Pid] = append(edges[parent.Pid], child.Pid)
+		}
 		for _, row := range children {
 			if old, ok := seen[row.Pid]; ok {
 				if old.processIdentity != row.processIdentity || old.PPid != row.PPid {

@@ -1044,6 +1044,20 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     }
   });
 
+  it("bounded drain evidence remains unconfirmed without disabling disposal retries", async () => {
+    const fake = newFake({
+      disposeReply: (id) => ({ event: "dispose", id, state: "unconfirmed", reason: "oversize",
+        killed: [], reaped: [], children: [] }),
+    });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(200);
+    assert.equal(outcome.clean, false);
+    assert.ok(!outcome.clean);
+    assert.equal(outcome.event?.reason, "oversize", "bounded negative evidence reaches the caller");
+    assert.equal(handle.failed, undefined);
+    assert.equal(treeRemoveCalls.length, 0);
+  });
+
   it("rejects malformed memory drain identities and reasons without claiming clean disposal", async () => {
     const identity = { pid: 4243, startTime: "123" };
     const cases = [
@@ -1063,7 +1077,7 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     for (const fields of cases) {
       const fake = newFake({
         disposeReply: (id) => ({ event: "dispose", id, state: "unconfirmed", reason: "deadline",
-          killed: [], reaped: [], children: [], ...fields }),
+          killed: [], reaped: [], ...fields }),
       });
       const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
       const outcome = await handle.dispose(200);

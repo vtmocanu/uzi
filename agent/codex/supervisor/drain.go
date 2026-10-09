@@ -46,23 +46,44 @@ func drain(
 ) drainResult {
 	killed := map[int]bool{}
 	reaped := map[int]bool{}
+	unconfirmed := func(reason string, rows []observationRow) drainResult {
+		return drainResult{State: stateUnconfirmed, Reason: reason,
+			Killed: sortedKeys(killed), Reaped: sortedKeys(reaped), Children: identities(rows)}
+	}
+	// Each destructive step is gated by the deadline and retained-evidence
+	// budget. A failed enumeration or exhausted bound stops the entire drain.
 	for {
 		listed, listErr := children()
 		if listErr != nil {
-			return drainResult{State: stateUnconfirmed, Reason: "enumeration", Killed: sortedKeys(killed), Reaped: sortedKeys(reaped)}
+			return unconfirmed("enumeration", nil)
 		}
 		for _, child := range listed {
+			if !clock().Before(deadline) {
+				return unconfirmed(reasonDeadline, listed)
+			}
+			if !killed[child.Pid] && len(killed) >= observationItems {
+				return unconfirmed("oversize", nil)
+			}
 			if err := kill(child.processIdentity); err == nil {
 				killed[child.Pid] = true
 			}
 		}
 		for {
+			if !clock().Before(deadline) {
+				return unconfirmed(reasonDeadline, listed)
+			}
+			if len(reaped) >= observationItems {
+				return unconfirmed("oversize", nil)
+			}
 			pid, err := reap()
 			if err != nil {
 				if errors.Is(err, syscall.ECHILD) {
 					remaining, err := children()
 					if err != nil {
-						return drainResult{State: stateUnconfirmed, Reason: "enumeration", Killed: sortedKeys(killed), Reaped: sortedKeys(reaped)}
+						return unconfirmed("enumeration", nil)
+					}
+					if !clock().Before(deadline) {
+						return unconfirmed(reasonDeadline, remaining)
 					}
 					if len(remaining) > 0 {
 						return drainResult{

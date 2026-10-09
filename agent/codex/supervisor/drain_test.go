@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"reflect"
 	"syscall"
 	"testing"
@@ -99,7 +101,7 @@ func TestDrainDeadlineUnconfirmed(t *testing.T) {
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline {
 		t.Fatalf("got %+v, want unconfirmed/deadline", got)
 	}
-	if !reflect.DeepEqual(got.Children, []int{10}) {
+	if !reflect.DeepEqual(got.Children, []processIdentity{{10, "1"}}) {
 		t.Errorf("children = %v, want [10]", got.Children)
 	}
 }
@@ -114,7 +116,7 @@ func TestDrainEchildContradicted(t *testing.T) {
 	if got.State != stateUnconfirmed || got.Reason != reasonEchildContradicted {
 		t.Fatalf("got %+v, want unconfirmed/echild-contradicted", got)
 	}
-	if !reflect.DeepEqual(got.Children, []int{11}) {
+	if !reflect.DeepEqual(got.Children, []processIdentity{{11, "1"}}) {
 		t.Errorf("children = %v, want [11]", got.Children)
 	}
 }
@@ -255,6 +257,87 @@ func TestDrainExpiredAuditorProbe(t *testing.T) {
 		t.Fatalf("waits=%d kills=%d result=%+v", waits, kills, got)
 	}
 	t.Logf("auditor expired deadline: waits=%d kills=%d retained=%d state=%s", waits, kills, len(got.Reaped), got.State)
+}
+
+func TestDrainActualProducerWire(t *testing.T) {
+	for _, reason := range []string{reasonDeadline, reasonEchildContradicted, "enumeration"} {
+		t.Run(reason, func(t *testing.T) {
+			now := time.Unix(0, 0)
+			deadline := now.Add(time.Second)
+			rows := []observationRow{{processIdentity: processIdentity{4243, "18446744073709551615"}}}
+			children := func() ([]observationRow, error) {
+				if reason == "enumeration" {
+					return nil, errors.New("unreadable")
+				}
+				return rows, nil
+			}
+			reap := func() (int, error) {
+				if reason == reasonDeadline {
+					now = deadline
+					return 0, nil
+				}
+				return 0, syscall.ECHILD
+			}
+			got := drain(deadline, func() time.Time { return now }, func() {}, children,
+				func(processIdentity) error { return nil }, reap)
+			wantChildren := []processIdentity{}
+			if reason != "enumeration" {
+				wantChildren = append(wantChildren, processIdentity{4243, "18446744073709551615"})
+			}
+			for _, event := range []map[string]any{disposeEvidence(1, got), abnormalEvidence("control EOF", &got)} {
+				var output bytes.Buffer
+				if err := (&evidence{w: &output}).writeJSON(event); err != nil {
+					t.Fatal(err)
+				}
+				var wire map[string]json.RawMessage
+				if err := json.Unmarshal(output.Bytes(), &wire); err != nil {
+					t.Fatal(err)
+				}
+				if cleanup, ok := wire["cleanup"]; ok {
+					if err := json.Unmarshal(cleanup, &wire); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want, _ := json.Marshal(wantChildren)
+				if !bytes.Equal(wire["children"], want) {
+					t.Fatalf("producer children = %s, want %s", wire["children"], want)
+				}
+				if string(wire["state"]) != "\"unconfirmed\"" || string(wire["reason"]) != "\""+reason+"\"" || wire["authority"] != nil {
+					t.Fatalf("negative drain claimed authority or lost reason: %s", output.Bytes())
+				}
+			}
+		})
+	}
+}
+
+func TestDrainCumulativeRetainedEvidenceBound(t *testing.T) {
+	for _, mode := range []string{"killed", "reaped"} {
+		t.Run(mode, func(t *testing.T) {
+			deadline, clock, sleep := farClock()
+			passes, waits := 0, 0
+			got := drain(deadline, clock, sleep,
+				func() ([]observationRow, error) {
+					passes++
+					if mode == "killed" && passes <= 257 {
+						return testChildRows([]int{passes}), nil
+					}
+					return nil, nil
+				}, func(processIdentity) error { return nil },
+				func() (int, error) {
+					waits++
+					if mode == "reaped" && waits <= 257 {
+						return waits, nil
+					}
+					if mode == "killed" && passes <= 257 {
+						return 0, nil
+					}
+					return 0, syscall.ECHILD
+				})
+			if got.State != stateUnconfirmed || got.Reason != "oversize" || got.Authority != "" || len(got.Killed) > 256 || len(got.Reaped) > 256 {
+				t.Fatalf("retained evidence bound: state=%s reason=%s authority=%s killed=%d reaped=%d", got.State, got.Reason, got.Authority, len(got.Killed), len(got.Reaped))
+			}
+		})
+	}
 }
 
 // testChildRows adapts scripted PID lists to the identity-carrying seam.

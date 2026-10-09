@@ -1277,8 +1277,8 @@ async function createHandle(
             (record.state === "drained"
               ? record.authority !== "ECHILD+__WALL" || "reason" in record || "children" in record
               : record.state !== "unconfirmed" || !identities(record.children) ||
-                (record.reason !== "deadline" && record.reason !== "echild-contradicted" && record.reason !== "enumeration") ||
-                (record.reason === "enumeration" && (record.children as unknown[]).length !== 0) || "authority" in record)) {
+                (record.reason !== "deadline" && record.reason !== "echild-contradicted" && record.reason !== "enumeration" && record.reason !== "oversize") ||
+                ((record.reason === "enumeration" || record.reason === "oversize") && (record.children as unknown[]).length !== 0) || "authority" in record)) {
             fail(new TrustedExecutionRefusal("malformed dispose evidence or missing required authority"));
             return;
           }

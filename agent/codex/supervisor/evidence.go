@@ -25,7 +25,7 @@ type drainResult struct {
 	Reason    string
 	Killed    []int
 	Reaped    []int
-	Children  []int
+	Children  []processIdentity
 }
 
 // fields renders the drain result to the exact wire shape. killed/reaped are
@@ -43,7 +43,10 @@ func (d drainResult) fields() map[string]any {
 	}
 	if d.State == stateUnconfirmed {
 		m["reason"] = d.Reason
-		m["children"] = intSlice(d.Children)
+		m["children"] = d.Children
+		if d.Children == nil {
+			m["children"] = []processIdentity{}
+		}
 	}
 	return m
 }
