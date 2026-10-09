@@ -123,6 +123,20 @@ proof does not prove independent recovery, remote durability or custody
 release. Predecessor sources, pins, journals and descriptors stay retained
 until the existing verified final disposition or explicit discard.
 
+Local verification checks reachable object contents under a 1 GiB delivered
+decoded-history cap and the existing deadline. History above that cap keeps
+work and custody and fails with a recorded blocker in `uzi run recovery`
+and the worker log, even when the thin archive is below 64 MiB. Overflow,
+timeout, corruption and interruption never authorize custody release or
+source cleanup.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).
+
 Retained recovery uses a genuinely fenced fresh successor path and model
 session on external restarts too, including on unwired workers. Losing the
 retained storage can still lose work. A source-only failed run requires

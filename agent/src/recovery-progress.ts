@@ -8,7 +8,7 @@ export interface RecoverySource {
   restoreTip?: string;
 }
 
-export type RecoveryBlocker = "capture_failed" | "source_missing" | "adoption_failed" | "budget_exhausted" | "clock_invalid" | "oversize" | "prerequisites_unavailable" | "quiescence_failed" | "preservation_failed";
+export type RecoveryBlocker = "capture_failed" | "source_missing" | "adoption_failed" | "budget_exhausted" | "clock_invalid" | "oversize" | "prerequisites_unavailable" | "quiescence_failed" | "preservation_failed" | "decoded_history_limit";
 
 export interface RecoveryProgress {
   version: 1;
@@ -57,7 +57,7 @@ export function recoveryProgress(v: unknown): RecoveryProgress {
   if (o.restoreTip !== undefined && (typeof o.restoreTip !== "string" || !/^[0-9a-f]{40}$/.test(o.restoreTip))) invalid();
   if (["captured", "adopting", "ready-for-model"].includes(o.stage as string) && o.restoreTip === undefined) invalid();
   if (o.stage === "ready-for-model" && o.successor === undefined) invalid();
-  if (o.blocker !== undefined && (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed"].includes(o.blocker as string))) invalid();
+  if (o.blocker !== undefined && (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit"].includes(o.blocker as string))) invalid();
   if (o.stage === "blocked" && o.blocker === undefined) invalid();
   return o as unknown as RecoveryProgress;
 }

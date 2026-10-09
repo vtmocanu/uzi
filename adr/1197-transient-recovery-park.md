@@ -168,10 +168,12 @@ and owner worker-recovery-exhaustion hold are separate and unchanged.
 The guarded producer's actual verified thin bundle, under the cap and with
 needed prerequisites locally available and verified, permits local adoption
 and model execution despite unknown remote publication. Nonempty
-prerequisites alone are not a blocker. Content verification uses full Git
-integrity checking within the recovery deadline; corruption elsewhere in the
-shared local object store conservatively blocks recovery too. Local proof
-proves neither independent recovery nor remote durability and grants no custody release. Predecessor
+prerequisites alone are not a blocker. Content verification reads only the
+reachable object closure and verifies object hashes within the recovery
+deadline. A decoded history above 1 GiB fails closed with custody retained,
+even when its thin archive is below 64 MiB; the recorded reason is visible
+in `uzi run recovery` and the worker log. Local proof establishes neither
+independent recovery nor remote durability and grants no custody release. Predecessor
 sources, pins, journals and descriptors remain until the existing verified
 final disposition or explicit discard. Guarded prerequisite-free
 archive/verified-empty-inventory release conditions remain unchanged.
@@ -193,3 +195,20 @@ A failed source-only run needs operator recovery from retained storage.
 Export remains limited to a manifest-bound available archive, with no new
 download API or failed-run Resume. Downgrade during pending recovery is
 unsupported: older workers may drop the durable recovery fields.
+
+## Amendment 2026-10-09 — #2512: bounded reachable integrity verification
+
+The human review authorizes a 1 GiB delivered decoded-history limit for
+local recovery verification, separate from the 64 MiB encoded archive cap.
+Exceeding it fails closed and retains custody, with a visible recorded reason
+in `uzi run recovery` and the worker log. Verify reachable object contents
+and hashes under the existing deadline; unrelated cache objects do not
+participate in that proof. Overflow, timeout, corruption and interruption
+never authorize custody release or source cleanup.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).

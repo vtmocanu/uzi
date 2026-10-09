@@ -1,9 +1,11 @@
-import { it } from "node:test";
+import { it, afterEach } from "node:test";
+import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { deflateSync } from "node:zlib";
 import { Readable } from "node:stream";
 import type { ExecutorFactory } from "../src/runner.js";
 import { Outbox } from "../src/outbox.js";
@@ -38,8 +40,17 @@ async function seed(iid = 2512, large = false) {
 function readJournal(bare: string, branch: string): any {
   return JSON.parse(command(bare, "config", `uzi-recovery.${branch}.clone`));
 }
+let callbackFailures: unknown[] = [];
+afterEach(() => {
+  const failures = callbackFailures;
+  callbackFailures = [];
+  assert.deepEqual(failures, [], "runner must not swallow model callback assertions");
+});
 function factory(run: (ctx: import("../src/executor.js").RunContext) => Promise<never>): ExecutorFactory {
-  return runId => ({ homeDir: path.join(homeDir, runId), executor: { run } });
+  return runId => ({ homeDir: path.join(homeDir, runId), executor: { run: async ctx => {
+    try { return await run(ctx); }
+    catch (error) { if (error instanceof assert.AssertionError) callbackFailures.push(error); throw error; }
+  } } });
 }
 
 for (const outageAt of [1, 2]) {
@@ -629,3 +640,99 @@ it("verified guarded thin fallback permits local adoption despite unknown upload
   assert.ok(fs.existsSync(journal.clonePath));
   assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
 });
+
+it("real production declared overflow blocks runner with decoded_history_limit and retains source custody", async () => {
+  const { claim, bare, clone } = await seed();
+  claim.inventory_guarded = false;
+  let models = 0, releases = 0, proofs = 0;
+  const log = recordingLogger();
+  client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+  const record = git.recordRecoveryCapture.bind(git);
+  git.recordRecoveryCapture = async (...args) => {
+    proofs++;
+    const tip = args[5];
+    const oid = command(bare, "rev-parse", tip + ":retained.txt");
+    const objectPath = path.join(bare, "objects", oid.slice(0, 2), oid.slice(2));
+    fs.mkdirSync(path.dirname(objectPath), { recursive: true });
+    if (fs.existsSync(objectPath)) fs.chmodSync(objectPath, 0o600);
+    // Capture is complete; tamper before the real metadata proof, without allocating the declared body.
+    fs.writeFileSync(objectPath, deflateSync(Buffer.from("blob 1073741825\0")));
+    assert.equal(command(bare, "cat-file", "-s", oid), "1073741825");
+    return record(...args);
+  };
+  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 }).execute(claim);
+  assert.equal(proofs, 1);
+  assert.equal(models, 0);
+  assert.equal(releases, 0);
+  const journal = readJournal(bare, clone.branch);
+  assert.equal(journal.clonePath, clone.path);
+  assert.equal(journal.recovery.stage, "blocked");
+  assert.equal(journal.recovery.blocker, "decoded_history_limit");
+  assert.equal(journal.recovery.attempts, 1);
+  assert.equal(journal.recovery.restoreTip, undefined);
+  assert.equal(command(bare, "for-each-ref", "--format=%(refname)", "refs/uzi-recovery-episode/" + claim.run_id), "");
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  assert.ok(api.states.some(s => s.body.status === "failed" &&
+    s.body.failure_reason?.includes("1 GiB decoded verification limit")));
+  assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 GiB decoded verification limit")));
+});
+
+for (const failure of ["cap", "timeout", "interruption"] as const) {
+  it("closure verification " + failure + " keeps all source custody and never admits a model", async () => {
+    const { claim, bare, clone, key } = await seed();
+    let releases = 0, models = 0, verified = 0;
+    const log = recordingLogger();
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain"); };
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
+    git.verifyRecoveryClosure = async () => {
+      verified++;
+      if (failure === "cap") throw new RecoveryClosureLimitError();
+      if (failure === "interruption") {
+        (r as any).activeRuns.get(claim.run_id).cancel.abort();
+        const scope = (git as any).recoveryOperations.getStore();
+        scope.signal.throwIfAborted();
+        throw new Error("fixture interruption");
+      }
+      // A persisted original deadline bounds this blocked verifier, without refreshing it.
+      const scope = (git as any).recoveryOperations.getStore();
+      await new Promise<void>((_resolve, reject) => {
+        const aborted = () => reject(scope.signal.reason);
+        scope.signal.addEventListener("abort", aborted, { once: true });
+        if (scope.signal.aborted) aborted();
+      });
+      return false;
+    };
+    if (failure === "timeout") {
+      await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
+      const before = readJournal(bare, clone.branch);
+      before.recovery.startedAt = Date.now() - 297_000;
+      before.recovery.deadline = before.recovery.startedAt + 300_000;
+      command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
+    }
+    await r.execute(claim);
+    assert.equal(verified, 1);
+    assert.equal(models, 0);
+    assert.equal(releases, 0);
+    const journal = readJournal(bare, clone.branch);
+    assert.equal(journal.clonePath, clone.path);
+    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+    assert.equal(command(bare, "for-each-ref", "--format=%(refname)", "refs/uzi-recovery-episode/" + claim.run_id), "");
+    assert.equal(journal.recovery.restoreTip, undefined);
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+    if (failure === "interruption") {
+      assert.equal(journal.recovery.stage, "capturing");
+    } else {
+      assert.equal(journal.recovery.stage, "blocked");
+      assert.equal(journal.recovery.blocker, failure === "cap" ? "decoded_history_limit" : "budget_exhausted");
+      assert.ok(api.states.some(s => s.body.status === "failed"));
+    }
+    if (failure === "cap") {
+      assert.ok(api.states.some(s => s.body.failure_reason?.includes("1 GiB decoded verification limit")));
+      assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 GiB decoded verification limit")));
+      assert.equal(journal.recovery.attempts, 1);
+    }
+  });
+}

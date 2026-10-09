@@ -7,6 +7,7 @@ import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError, isRunOwnershipLost } from "./client.js";
+import { RecoveryClosureLimitError } from "./recovery-closure.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -15135,7 +15136,7 @@ export class RunRunner {
       // This is monotone episode bookkeeping followed by an exact-generation terminal
       // report, not recovery authority. A new ownership GET could fail independently
       // of the fenced state endpoint and leave an exhausted claim cycling again.
-      if (episode && Date.now() >= episode.deadline) blocker = "budget_exhausted";
+      if (episode && Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
       let persistence = "";
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
@@ -15151,7 +15152,9 @@ export class RunRunner {
         persistence = "; blocker persistence unavailable";
       }
       this.retainedLifecycleGuard(flight);
-      const reason = `Retained recovery blocked: ${blocker.replaceAll("_", " ")}${persistence}; local work and custody retained`;
+      const detail = blocker === "decoded_history_limit" ? "reachable recovery history exceeds the 1 GiB decoded verification limit" : blocker.replaceAll("_", " ");
+      const reason = `Retained recovery blocked: ${detail}${persistence}; local work and custody retained`;
+      flight.runLog.warn(reason, { blocker });
       await this.reportGenericFailure(claim, flight,
         blocker === "quiescence_failed" ? new RunResidueBlockedError(reason) : new Error(reason),
         { keepCustody: true });
@@ -15281,6 +15284,7 @@ export class RunRunner {
       } catch (error) {
         if (error instanceof RetainedRecoveryStop) throw error;
         this.retainedLifecycleGuard(flight);
+        if (error instanceof RecoveryClosureLimitError) { blocker = "decoded_history_limit"; await fail(); }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
         if (error === finalize || blocker === "quiescence_failed") await fail();
         if (error instanceof RunResidueBlockedError || error instanceof ResidueQuarantinedError) {

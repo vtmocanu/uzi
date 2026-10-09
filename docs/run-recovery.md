@@ -114,12 +114,21 @@ provider/empty-turn parks and the owner worker-recovery-exhaustion hold.
 A verified thin bundle within the cap, with its needed prerequisites locally
 available and verified, permits local adoption and model execution even
 when remote publication is unknown. Nonempty prerequisites alone do not
-block it. Local integrity checking can also block recovery when another
-object in the shared local cache is corrupt. Local proof does not establish
-independent recovery or remote durability and does not release custody: predecessor sources, pins, journals
+block it. Local verification reads reachable history and checks object hashes.
+Decoded history above 1 GiB fails closed with work and custody retained, even
+when the thin archive is below 64 MiB. `uzi run recovery` and the worker log
+show the recorded blocker. Local proof does not establish independent recovery
+or remote durability and does not release custody: predecessor sources, pins, journals
 and descriptors remain until the existing verified final disposition or
 explicit discard. The guarded prerequisite-free archive/empty-inventory
 release conditions below remain unchanged.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).
 
 A healthy run with an unknown publish outcome continues in the same claim
 generation, retaining its tip, owed roots and publication time gate.

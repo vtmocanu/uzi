@@ -31,6 +31,7 @@ import {
 } from "./attempt-path.js";
 import { recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { sanitizeForLog } from "./run-quiescence.js";
+import { RECOVERY_DECODED_LIMIT, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
 
 import {
@@ -797,6 +798,9 @@ interface SpawnGitOptions {
   /** Cap on the stderr kept for the failure message (both paths). Default: the boundary path keeps
    *  up to GIT_MAX_BUFFER, the plain path keeps all of it. */
   stderrMaxBytes?: number;
+  /** Trusted verifier traversal environment; never sourced from repository config. */
+  env?: NodeJS.ProcessEnv;
+  cancelOnAbandon?: boolean;
 }
 
 /** PRD #1798 M5: a bounded read's stdout, and whether the bound cut it. */
@@ -1521,7 +1525,7 @@ export class GitCache {
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
-  private readonly recoveryOperations = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number }>();
+  private readonly recoveryOperations = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; closureBudget: ClosureBudget }>();
 
   /** Local recovery clock, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -1531,7 +1535,7 @@ export class GitCache {
     if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
     try {
       combined.throwIfAborted();
-      return await this.recoveryOperations.run({ signal: combined, deadline }, () => action(combined));
+      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: this.recoveryOperations.getStore()?.closureBudget ?? { delivered: 0, limit: RECOVERY_DECODED_LIMIT } }, () => action(combined));
     } finally { clearTimeout(timer); }
   }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
@@ -4435,15 +4439,58 @@ export class GitCache {
   }
 
   async verifyRecoveryClosure(barePath: string, tip: string): Promise<boolean> {
+    const operation = this.recoveryOperations.getStore();
+    operation?.signal.throwIfAborted();
     if (!SHA40_RE.test(tip)) return false;
+    const budget = operation?.closureBudget ?? { delivered: 0, limit: RECOVERY_DECODED_LIMIT };
+    // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
+    const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
+      GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+    const read = async (args: string[], input?: string): Promise<string> =>
+      (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
+        { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
+    let producer: Awaited<ReturnType<GitCache["spawnGit"]>> | undefined;
     try {
-      await this.runGit(barePath, ["rev-parse", "--verify", `${tip}^{commit}`]);
-      await this.runGit(barePath, ["rev-list", "--objects", "--missing=error", tip]);
-      // rev-list proves presence, but does not read blob contents. Full fsck
-      // validates content too; unrelated corrupt objects conservatively block recovery.
-      await this.runGit(barePath, ["--no-replace-objects", "fsck", "--full", "--no-reflogs", "--no-dangling", "--no-progress", tip]);
+      if ((await read(["rev-parse", "--verify", `${tip}^{commit}`])).trim() !== tip) return false;
+      const listing = await read(["rev-list", "--objects", "--no-object-names", "--missing=error", tip]);
+      if (!listing.endsWith("\n")) return false;
+      const oids = listing.slice(0, -1).split("\n");
+      // Each SHA-only record occupies 41 bytes within the existing 64 MiB output cap.
+      if (oids.length > Math.floor(GIT_MAX_BUFFER / 41) || oids.some(oid => !SHA40_RE.test(oid)) ||
+          new Set(oids).size !== oids.length || !oids.includes(tip)) return false;
+      const input = oids.join("\n") + "\n";
+      const metadata = await read(["cat-file", "--batch-check"], input);
+      const rows = metadata.split("\n");
+      if (rows.pop() !== "" || rows.length !== oids.length) return false;
+      const objects: ClosureObject[] = [];
+      let declared = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const match = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(rows[i]!);
+        if (!match || match[1] !== oids[i]) return false;
+        const size = Number(match[3]);
+        if (!Number.isSafeInteger(size) || size > budget.limit - budget.delivered - declared) {
+          throw new RecoveryClosureLimitError();
+        }
+        declared += size;
+        objects.push({ oid: match[1]!, type: match[2]!, size });
+      }
+      operation?.signal.throwIfAborted();
+      producer = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"], input,
+        { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true });
+      await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
+      if (await producer.exited !== 0) return false;
+      operation?.signal.throwIfAborted();
       return true;
-    } catch { this.recoveryOperations.getStore()?.signal.throwIfAborted(); return false; }
+    } catch (error) {
+      // Abandoning the pipe cancels the exact owned producer; settlement precedes lock release.
+      if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited; }
+      operation?.signal.throwIfAborted();
+      if (error instanceof RecoveryClosureLimitError) {
+        this.log.warn(error.message);
+        throw error;
+      }
+      return false;
+    }
   }
 
   /** Verify the local captured commit's complete object closure and pin BEFORE journaling.
@@ -4474,7 +4521,7 @@ export class GitCache {
     reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
     guard?: () => void,
   ): Promise<void> {
-    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed"].includes(reason)) throw new Error("invalid blocker");
+    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
       guard?.();
@@ -8344,8 +8391,8 @@ export class GitCache {
     args: string[],
     stdin?: string,
     opts: SpawnGitOptions = {},
-  ): Promise<{ child?: ChildProcess; stdout: Readable; exited: Promise<number> }> {
-    const env = gitEnv();
+  ): Promise<{ child?: ChildProcess; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
+    const env = { ...gitEnv(), ...opts.env };
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
     const recovery = this.recoveryOperations.getStore();
@@ -8383,7 +8430,9 @@ export class GitCache {
         stderrChunks.push(kept);
         stderrBytes += kept.length;
       });
-      const gated = exitGatedStream(process.stdout, undefined, true);
+      let cancellation: Promise<unknown> | undefined;
+      const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
+      const gated = exitGatedStream(process.stdout, opts.cancelOnAbandon ? abortRecovery : undefined, true);
       process.completed.then(({ code, softTimedOut }) => {
         if (softTimedOut) {
           gated.exited(new CheckpointSoftDeadlineError());
@@ -8398,24 +8447,24 @@ export class GitCache {
       // uncaught EPIPE; the exit status already errors the stream with the failure.
       process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
-      let cancellation: Promise<unknown> | undefined;
-      const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
       if (recovery?.signal.aborted) abortRecovery();
       const exited = process.completed.then(({ code }) => code, () => -1).finally(async () => {
         recovery?.signal.removeEventListener("abort", abortRecovery);
         await cancellation;
       });
-      return { stdout: gated.out, exited };
+      return { stdout: gated.out, exited, cancel: abortRecovery };
     }
     const child = spawn("git", withDir(cwd, args), { env });
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const abortRecovery = () => {
+      if (killTimer || child.exitCode !== null || child.signalCode !== null) return;
       child.kill("SIGTERM");
       killTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
     };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
-    const timeout = recovery ? setTimeout(abortRecovery, Math.max(1, recovery.deadline - Date.now())) : undefined;
+    const timeoutMs = recovery ? Math.min(opts.timeoutMs ?? Infinity, Math.max(1, recovery.deadline - Date.now())) : opts.timeoutMs;
+    const timeout = timeoutMs === undefined ? undefined : setTimeout(abortRecovery, timeoutMs);
     child.once("close", () => {
       recovery?.signal.removeEventListener("abort", abortRecovery);
       if (timeout) clearTimeout(timeout);
@@ -8427,7 +8476,8 @@ export class GitCache {
       child.once("close", (code) => resolve(code ?? -1));
     });
     const gated = exitGatedStream(child.stdout as Readable, () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
+      if (opts.cancelOnAbandon) abortRecovery();
+      else if (child.exitCode === null && child.signalCode === null) child.kill();
     });
     const stderrChunks: Buffer[] = [];
     const stderrCap = opts.stderrMaxBytes;
@@ -8453,7 +8503,7 @@ export class GitCache {
       child.stdin.on("error", () => undefined); // see the scoped branch above
       child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: gated.out, exited };
+    return { child, stdout: gated.out, exited, cancel: abortRecovery };
   }
 
   /**

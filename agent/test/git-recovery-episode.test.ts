@@ -2,8 +2,11 @@ import { beforeEach, afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
-import { Readable } from "node:stream";
+import { execFileSync, spawn } from "node:child_process";
+import { Readable, PassThrough, Writable } from "node:stream";
+import { createHash } from "node:crypto";
+import { deflateSync } from "node:zlib";
+import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
@@ -746,3 +749,172 @@ test("explicit owner discard keeps paths intact and per-key attempt mode outlive
   });
   assert.ok(clone.path.endsWith(".attempt-" + aid(3)));
 });
+
+test("nested recovery verification shares one delivered-byte budget across prerequisite roots", async () => {
+  const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
+  await cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000, async () => {
+    assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
+    const budget = (cache as any).recoveryOperations.getStore().closureBudget;
+    assert.ok(budget.delivered > 0);
+    const delivered = budget.delivered;
+    budget.limit = delivered;
+    await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000,
+      () => cache.verifyRecoveryClosure(bare, tip)), RecoveryClosureLimitError);
+    assert.equal(budget.delivered, delivered);
+  });
+});
+test("invalid SHA lists and batch metadata never request raw content", async () => {
+  const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
+  const internals = cache as any;
+  let contents = 0;
+  internals.spawnGit = async () => { contents++; throw new Error("must not spawn"); };
+  for (const [listing, metadata] of [
+    [tip + "\n" + tip + "\n", ""],
+    [tip + " filename\n", ""],
+    [tip, ""],
+    [tip + "\n", tip + " blob -1\n"],
+    [tip + "\n", tip + " blob 01\n"],
+    [tip + "\n", tip + " unknown 1\n"],
+    [tip + "\n", tip + " missing\n"],
+    [tip + "\n", tip + " blob 1\nextra\n"],
+  ]) {
+    internals.execScoped = async (_command: string, args: string[]) => ({
+      stdout: args.includes("rev-parse") ? tip + "\n" : args.includes("rev-list") ? listing : metadata,
+    });
+    assert.equal(await cache.verifyRecoveryClosure(bare, tip), false);
+  }
+  assert.equal(contents, 0);
+});
+
+function loose(oid: string, bytes: Buffer): string {
+  const dir = path.join(bare, "objects", oid.slice(0, 2));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, oid.slice(2));
+  fs.writeFileSync(file, bytes);
+  return file;
+}
+test("unreachable compressed bomb and corrupt blob do not affect reachable verification", async () => {
+  const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
+  loose("e".repeat(40), deflateSync(Buffer.from("blob 1073741825\0")));
+  loose("d".repeat(40), Buffer.from("corrupt unreachable blob"));
+  assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
+});
+for (const damage of ["unreadable", "hash mismatch"] as const) {
+  test("reachable blob " + damage + " rejects capture without a pin or journal change", async () => {
+    await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const tip = await capture();
+    const before = journal();
+    const oid = git(bare, ["rev-parse", tip + ":work.txt"]);
+    const file = path.join(bare, "objects", oid.slice(0, 2), oid.slice(2));
+    fs.chmodSync(file, 0o600);
+    if (damage === "unreadable") fs.writeFileSync(file, "broken");
+    else loose(oid, deflateSync(Buffer.from("blob 4\0oops")));
+    assert.equal(await cache.verifyRecoveryClosure(bare, tip), false);
+    await assert.rejects(cache.recordRecoveryCapture(bare, branch, key, source, 1, tip));
+    assert.deepEqual(journal(), before);
+    assert.throws(() => git(bare, ["rev-parse", "--verify", `refs/uzi-recovery-episode/${runId}/${tip}`]));
+    assert.ok(fs.existsSync(source.clonePath));
+  });
+}
+test("production oversized declared loose object is refused before any content producer", async () => {
+  const oid = "b".repeat(40);
+  loose(oid, deflateSync(Buffer.from("blob 1073741825\0")));
+  const treeBytes = Buffer.concat([Buffer.from("100644 huge\0"), Buffer.from(oid, "hex")]);
+  const tree = execFileSync("git", ["-C", bare, "hash-object", "-t", "tree", "-w", "--stdin"], { input: treeBytes, encoding: "utf8" }).trim();
+  const tip = git(bare, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", "oversize"]);
+  let contents = 0;
+  const internals = cache as any;
+  const original = internals.spawnGit.bind(cache);
+  internals.spawnGit = async (...args: any[]) => { contents++; return original(...args); };
+  await assert.rejects(cache.verifyRecoveryClosure(bare, tip), RecoveryClosureLimitError);
+  assert.equal(contents, 0);
+});
+for (const stopAt of ["abort", "timeout"] as const) {
+  test("actual streaming Git child " + stopAt + " settles before proof releases the lock", async () => {
+    await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const before = journal();
+    const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
+    const refsBefore = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-recovery-episode/"]);
+    const stop = new AbortController();
+    let streamed!: () => void;
+    const started = new Promise<void>(resolve => { streamed = resolve; });
+    let cancelled = false, settled = false, decoded = 0;
+    const operation = cache.withRecoveryOperation(stop.signal, Date.now() + 3000,
+      () => cache.withBoundaryProcessSpawner(async request => {
+        const [executable, ...args] = request.argv;
+        const child = spawn(executable!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const batch = args.includes("--batch");
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", code => { if (batch) settled = true; resolve({ code: code ?? -1 }); });
+        });
+        // Keep only the content producer's stdin open after delivering its real OID list.
+        const stdin = batch ? new Writable({
+          write(chunk, _encoding, callback) { child.stdin.write(chunk, callback); },
+          final(callback) { callback(); },
+        }) : child.stdin;
+        if (batch) child.stdout.once("data", bytes => { decoded += bytes.length; streamed(); });
+        return { stdin, stdout: child.stdout, stderr: child.stderr, completed,
+          cancel: async () => {
+            if (batch) cancelled = true;
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+            await completed;
+          } };
+      }, new AbortController().signal,
+      () => cache.withBareLock(bare, () => cache.verifyRecoveryClosure(bare, tip))));
+    const outcome = operation.then(value => value, error => error);
+    await started;
+    if (stopAt === "abort") stop.abort(new Error("interrupted actual stream"));
+    const observer = cache.withBareLock(bare, async () => assert.equal(settled, true));
+    const result = await outcome;
+    await observer;
+    assert.match(String(result), /interrupted actual stream|deadline exhausted/);
+    assert.ok(decoded > 0, "actual Git content reached the parser");
+    assert.equal(cancelled, true);
+    assert.equal(settled, true);
+    assert.deepEqual(journal(), before);
+    assert.equal(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-recovery-episode/"]), refsBefore);
+  });
+}
+
+for (const stopAt of ["parser", "abort", "timeout"] as const) {
+  test(stopAt + " during raw verification settles supervised producer before lock release", async () => {
+    const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
+    const raw = Buffer.from("blob 1\0x");
+    const oid = createHash("sha1").update(raw).digest("hex");
+    const internals = cache as any;
+    internals.execScoped = async (_command: string, args: string[]) => ({
+      stdout: args.includes("rev-parse") ? tip + "\n" : args.includes("rev-list") ? tip + "\n" :
+        `${tip} blob 1\n`,
+    });
+    const stop = new AbortController();
+    let entered!: () => void, finish!: (value: { code: number }) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
+    const stdout = new PassThrough();
+    let cancelled = false, settled = false;
+    const operation = cache.withRecoveryOperation(stop.signal, Date.now() + (stopAt === "timeout" ? 50 : 1000),
+      () => cache.withBoundaryProcessSpawner(async () => {
+        entered();
+        if (stopAt === "parser") stdout.end(`${oid} blob 1\nx\n`);
+        return { stdout, stderr: Readable.from([]), stdin: null, completed,
+          cancel: async () => {
+            cancelled = true;
+            await new Promise(resolve => setTimeout(resolve, 20));
+            settled = true;
+            stdout.destroy();
+            finish({ code: -1 });
+          } };
+      }, new AbortController().signal, () => cache.withBareLock(bare, () => cache.verifyRecoveryClosure(bare, tip))));
+    // Install the rejection observer before timeout/abort can fire.
+    const outcome = operation.then(value => value, error => error);
+    await started;
+    if (stopAt === "abort") stop.abort(new Error("interrupted verification"));
+    const observer = cache.withBareLock(bare, async () => assert.equal(settled, true));
+    const result = await outcome;
+    await observer;
+    assert.equal(cancelled, true);
+    if (stopAt === "parser") assert.equal(result, false);
+    else assert.match(String(result), /interrupted verification|deadline exhausted/);
+  });
+}

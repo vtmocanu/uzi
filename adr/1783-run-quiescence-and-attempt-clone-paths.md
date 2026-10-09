@@ -712,3 +712,19 @@ unsupported because older workers may drop its recovery fields.
 
 See the matching [ADR-1197 amendment](1197-transient-recovery-park.md#amendment-2026-10-08--2512-source-bound-retained-recovery)
 and [user recovery guide](../docs/run-recovery-wait.md#bounded-retained-source-recovery).
+
+## Amendment 2026-10-09 — #2512: verification resource limit
+
+Human review authorizes a 1 GiB delivered decoded-history limit for reachable
+object integrity verification, even for a thin archive below 64 MiB. The
+worker verifies hashes under the existing deadline, records a visible blocker
+in `uzi run recovery` and its log on overflow, and retains source and custody
+on overflow, timeout, corruption or interruption. This limit is separate from
+archive size and does not make a thin archive independently recoverable.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).
