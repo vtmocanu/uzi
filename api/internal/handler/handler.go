@@ -51,6 +51,8 @@ type Handler struct {
 	pool              *pgxpool.Pool
 	q                 *store.Queries
 	cfg               config.Config
+	// secretTestProbeContext is a test-only deadline arm; nil retains the real probe budget.
+	secretTestProbeContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth
 	// token endpoint's code redemption, so a LiveDB test can hand it a transaction whose chosen
 	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
