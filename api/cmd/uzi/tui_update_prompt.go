@@ -139,10 +139,16 @@ func (m *tuiModel) setUpdateCandidate(owner, target string) {
 	if p.candidate.owner == owner && p.candidate.target == target {
 		return
 	}
+	// An offer still open when a newer target arrives was never answered: let the new
+	// candidate re-show it once its own checks pass, instead of the session latch hiding it.
+	reopen := p.showing && target != ""
 	p.generation++
 	p.candidate = updateCandidate{owner: owner, target: target, generation: p.generation}
 	p.installedVersion = ""
 	p.showing = false
+	if reopen {
+		p.shownThisSession = false
+	}
 	p.probeAgain = p.probePending && target != "" && owner != ""
 }
 
