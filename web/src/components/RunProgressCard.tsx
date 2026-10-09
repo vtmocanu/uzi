@@ -9,8 +9,11 @@
 //            milestone: done (solid), now (striped: the signature mark, it reads as "being
 //            laid down"), pending (empty)
 //   steps  → review / validate / implement, the active role's phase marked `▸`; only the
-//            current phase is known, so none is ever shown as passed
-//   role   → the active role line, the same sanitised role + task the now-line shows
+//            current phase is known, so none is ever shown as passed. Drawn only in the
+//            percent state with a known phase (PRD D6, as the TUI does): a waiting or parked
+//            run has no active role, so a marked phase there would be stale
+//   role   → the active role line, the same sanitised role + task the now-line shows; only
+//            while a role is actually working (percent, stalled), never on an idle run
 //   hint   → `⧗ may be blocked by <8>` linking to that run (GetRun only, awaiting_input)
 //
 // It renders only what the server derived (Run.progress, PRD D3) and nothing at all for an
@@ -43,6 +46,9 @@ type CardRun = Pick<
   Parameters<typeof parkLabel>[0];
 
 const PHASES = ["review", "validate", "implement"] as const;
+// The states in which a role is actually at work: the phase and the active-role line belong
+// to these only. waiting/parked/queued/planning runs are idle, whatever activity is cached.
+const ROLE_STATES = new Set(["percent", "stalled"]);
 
 type Tone = "danger" | "warn" | "info" | "dim";
 const FLAG_TONES: Record<Tone, string> = {
@@ -215,33 +221,45 @@ export function RunProgressCard({
     `Plan progress: planning done, ${segs.filter((s) => s.state === "done").length} of ${total} milestones done` +
     (activeIdx >= 0 ? `, milestone ${activeIdx + 1} (${activeTitle}) in progress` : "");
 
-  const role = activity ? stripUnsafeChars(activity.agent) : "";
-  const roleTask = activity ? stripUnsafeChars(activity.agent_label) || stripUnsafeChars(activity.tool) : "";
+  const live = activity && ROLE_STATES.has(p.state) ? activity : null;
+  const role = live ? stripUnsafeChars(live.agent) : "";
+  const roleTask = live ? stripUnsafeChars(live.agent_label) || stripUnsafeChars(live.tool) : "";
+  const showPhase = p.state === "percent" && (PHASES as readonly string[]).includes(p.phase);
 
   const blockedBy = p.maybe_blocked_by_run_id ? stripUnsafeChars(p.maybe_blocked_by_run_id) : "";
 
   return (
     <Card className="p-4">
-      <section aria-label="Run progress" data-run-progress-card={p.state} className="grid gap-3.5">
+      <section aria-label="Run progress" data-run-progress-card={p.state} className="grid grid-cols-[minmax(0,1fr)] gap-3.5">
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1.5">
           {pct !== null ? (
             <span
+              data-progress-pct
               className="font-mono text-[28px] font-semibold leading-none tabular-nums text-fg"
               title={`About ${pct}% through the approved plan; an estimate from milestones done, not a time`}
             >
-              ≈{pct}%
+              <span aria-hidden="true">≈</span>
+              <span className="sr-only">about </span>
+              {pct}%
             </span>
           ) : (
             <StateFlag run={run} now={now} />
           )}
-          {what && <span className="min-w-0 break-words font-mono text-sm font-medium text-muted">{what}</span>}
+          {what && (
+            <span
+              data-progress-what
+              className="min-w-0 [overflow-wrap:anywhere] font-mono text-sm font-medium text-muted"
+            >
+              {what}
+            </span>
+          )}
         </div>
 
         {blockedBy && (
           <div className="grid gap-1">
             <Link
               to={`/runs/${encodeURIComponent(blockedBy)}`}
-              className="inline-flex w-fit items-center gap-1.5 rounded bg-info/10 px-2 py-0.5 font-mono text-xs font-medium text-info hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
+              className="inline-flex w-fit items-center gap-1.5 rounded bg-info/10 px-2 py-0.5 font-mono text-xs font-medium text-info hover:underline"
               title="Open the run this one may be waiting on. A mention in the question is a hint, not a recorded dependency."
             >
               <span aria-hidden="true">⧗</span>
@@ -256,7 +274,7 @@ export function RunProgressCard({
             role="img"
             aria-label={trackLabel}
             className="grid gap-1"
-            style={{ gridTemplateColumns: `0.6fr repeat(${total}, minmax(0, 1fr))` }}
+            style={{ gridTemplateColumns: `minmax(0, 0.6fr) repeat(${total}, minmax(0, 1fr))` }}
           >
             <Segment state="done" label="plan" title="plan approved" />
             {segs.map((s) => (
@@ -265,8 +283,8 @@ export function RunProgressCard({
           </div>
         )}
 
-        {total > 0 && (
-          <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs">
+        {showPhase && (
+          <div data-progress-phase className="flex flex-wrap items-center gap-1.5 font-mono text-xs">
             {PHASES.map((ph) =>
               ph === p.phase ? (
                 <span

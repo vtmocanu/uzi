@@ -66,7 +66,11 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
   it("percent: ≈70%, milestone k of M with the active title, the segmented track and the active role", () => {
     const { container } = renderCard({}, anActivity());
     expect(card(container)?.getAttribute("data-run-progress-card")).toBe("percent");
-    expect(screen.getByText("≈70%")).toBeTruthy();
+    // ≈ is visual only; assistive tech hears "about 70%".
+    const pct = container.querySelector("[data-progress-pct]") as HTMLElement;
+    expect(pct.textContent).toBe("≈about 70%");
+    expect(within(pct).getByText("≈").getAttribute("aria-hidden")).toBe("true");
+    expect(within(pct).getByText("about").className).toContain("sr-only");
     expect(screen.getByText("milestone 3 of 3 · recovery-docs-validation")).toBeTruthy();
     const track = screen.getByRole("img");
     expect(track.getAttribute("aria-label")).toBe(
@@ -101,11 +105,72 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
     expect(screen.getByText("current phase only, from the active role")).toBeTruthy();
   });
 
-  it("marks no phase when the phase is empty", () => {
-    const { container } = renderCard({ progress: progress({ phase: "" }) });
+  it("hides the phase row when the phase is empty or unknown (PRD D6)", () => {
+    // "deploy" stands for a phase a newer server might add: no row rather than three unmarked steps.
+    for (const phase of ["", "deploy"] as RunProgress["phase"][]) {
+      const { container } = renderCard({ progress: progress({ phase }) });
+      expect(container.querySelector("[data-progress-phase]")).toBeNull();
+      expect(container.textContent).not.toContain("▸");
+      expect(screen.queryByText("implement")).toBeNull();
+      expect(container.querySelector("[data-seg]")).not.toBeNull(); // the track still draws
+      cleanup();
+    }
+  });
+
+  // D6: phase is the current role's phase only. A waiting/parked/queued/stalled run keeps the
+  // last phase in progress.phase, but no role is working it, so no phase is drawn (the TUI
+  // draws phase only in the percent state too).
+  it.each([
+    ["stalled", "running"],
+    ["waiting", "awaiting_input"],
+    ["parked", "paused"],
+    ["parked", "limit_wait"],
+    ["queued", "queued"],
+  ] as const)("no phase row in the %s state (%s), even with progress.phase set", (state, status) => {
+    const { container } = renderCard({ status, progress: progress({ state, pct: null, phase: "implement" }) });
+    expect(container.querySelector("[data-progress-phase]")).toBeNull();
     expect(container.querySelector('[aria-current="step"]')).toBeNull();
-    expect(container.textContent).not.toContain("▸");
-    expect(screen.getByText("implement")).toBeTruthy();
+  });
+
+  // The active-role line belongs to a working run: percent and stalled show it, an idle run
+  // (waiting, parked, queued, planning) does not, even when a cached activity is passed in.
+  it.each([
+    ["percent", "running", true],
+    ["stalled", "running", true],
+    ["waiting", "awaiting_approval", false],
+    ["parked", "paused", false],
+    ["parked", "limit_wait", false],
+    ["queued", "queued", false],
+    ["planning", "running", false],
+  ] as const)("active role line in the %s state (%s): %s", (state, status, shown) => {
+    renderCard(
+      { status, progress: progress({ state, pct: state === "percent" ? 70 : null }) },
+      anActivity(),
+    );
+    expect(screen.queryByText("Active role") !== null).toBe(shown);
+    expect(screen.queryByText("lead") !== null).toBe(shown);
+  });
+
+  // jsdom does no layout, so the overflow fix is locked in by structure: a long unbroken title
+  // must sit in a column that may shrink below its min-content (minmax(0,1fr)) and wrap
+  // anywhere, and every track column must be shrinkable with a truncating label. Measured in a
+  // real browser at 1280/390px: no horizontal scroll with a 120-char unbroken title.
+  it("a long unbroken milestone title cannot widen the card", () => {
+    const long = "x".repeat(120);
+    const { container } = renderCard({
+      milestones: [...milestones.slice(0, 2), { id: "recovery-docs-validation", title: long }],
+    });
+    expect(card(container)?.className).toContain("grid-cols-[minmax(0,1fr)]");
+    const what = container.querySelector("[data-progress-what]") as HTMLElement;
+    expect(what.textContent).toBe(`milestone 3 of 3 · ${long}`);
+    expect(what.className).toContain("[overflow-wrap:anywhere]");
+    expect(what.className).toContain("min-w-0");
+    const track = screen.getByRole("img") as HTMLElement;
+    expect(track.style.gridTemplateColumns).toBe("minmax(0, 0.6fr) repeat(3, minmax(0, 1fr))");
+    const label = track.querySelector('[data-seg="now"] > div:last-child') as HTMLElement;
+    expect(label.textContent).toBe(long);
+    expect(label.className).toContain("truncate");
+    expect((label.parentElement as HTMLElement).className).toContain("min-w-0");
   });
 
   it("stalled: `◼ stalled · since HH:MM` from health_since, health reason in the title, no percent", () => {
@@ -174,7 +239,7 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
     expect(screen.getByText("planning")).toBeTruthy();
     expect(screen.getByText("no milestones frozen yet")).toBeTruthy();
     expect(container.querySelector("[data-seg]")).toBeNull();
-    expect(screen.queryByText("implement")).toBeNull();
+    expect(container.querySelector("[data-progress-phase]")).toBeNull();
   });
 
   it("renders nothing for null/absent progress, `none`, an unknown state, or a percent without pct", () => {
@@ -210,6 +275,8 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
 
   it("strips control and bidi characters from a hostile milestone title and activity, in text and attributes", () => {
     const hostile = "evil\u202Etxt.exe\u200B\u0007-step";
+    // Bidi/control inside the first 8 characters, so the visible short id would carry them.
+    const hostileId = "fc\u202Ea7\u0007a8\u200B01-1111-4222-8333-944455556666";
     const { container } = renderCard(
       {
         milestones: [
@@ -217,7 +284,13 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
           { id: "m2", title: hostile },
         ],
         milestones_completed: ["m1"],
-        progress: progress({ pct: 55, milestone_done: 1, milestone_total: 2, active_milestone_id: "m2" }),
+        progress: progress({
+          pct: 55,
+          milestone_done: 1,
+          milestone_total: 2,
+          active_milestone_id: "m2",
+          maybe_blocked_by_run_id: hostileId,
+        }),
       },
       anActivity({ agent: "co\u202Eder", agent_label: "fix\u2066 it\u0000" }),
     );
@@ -227,6 +300,9 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
     expect(now.textContent).toBe(clean);
     expect(now.getAttribute("title")).toBe(`${clean} · in progress`);
     expect(screen.getByRole("img").getAttribute("aria-label")).toContain(`(${clean})`);
+    const link = screen.getByRole("link");
+    expect(link.textContent).toBe("⧗may be blocked by fca7a801");
+    expect(link.getAttribute("href")).toBe("/runs/fca7a801-1111-4222-8333-944455556666");
     const dd = within(container).getByText("coder").closest("dd") as HTMLElement;
     expect(dd.textContent).toBe("coder · fix it");
     // Nothing unsafe survives anywhere: text, titles or accessible names.
@@ -236,6 +312,7 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
         return c < 0x20 || c === 0x7f || c === 0x200b || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
       });
     expect(unsafe(hostile)).toBe(true); // control: the predicate flags the raw input
+    expect(unsafe(hostileId.slice(0, 8))).toBe(true);
     expect(unsafe(container.textContent ?? "")).toBe(false);
     for (const el of container.querySelectorAll("[title],[aria-label]")) {
       expect(unsafe(el.getAttribute("title") ?? "")).toBe(false);

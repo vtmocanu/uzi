@@ -329,7 +329,7 @@ describe("RunView — progress card (PRD #2602 M2)", () => {
       }),
     );
     await screen.findByText("Add rate limiting");
-    expect(screen.getByText("≈55%")).toBeTruthy();
+    expect(container.querySelector("[data-progress-pct]")?.textContent).toBe("≈about 55%");
     expect(screen.getByText("milestone 2 of 2 · Second")).toBeTruthy();
     const cardEl = container.querySelector("[data-run-progress-card]") as HTMLElement;
     const checklist = screen.getByText("Milestones (reported complete)");
