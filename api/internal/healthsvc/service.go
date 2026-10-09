@@ -96,6 +96,7 @@ type Store interface {
 	// forge.ciwatch: eligible run-branch counts per repo (one row per repo with >= 1
 	// eligible branch), compared to CIWatchMaxRefs. finishedAfter = now - CIWatchRunWindow.
 	CountEligibleCIWatchRefsPerRepo(ctx context.Context, finishedAfter pgtype.Timestamptz) ([]store.CountEligibleCIWatchRefsPerRepoRow, error)
+	ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch
@@ -184,6 +185,11 @@ type Service struct {
 
 	mu                     sync.Mutex
 	slackNonConnectedSince *time.Time
+
+	pricingMu          sync.Mutex
+	pricingInitialized bool
+	pricingResult      apitypes.HealthCheckDTO
+	pricingRefreshedAt time.Time
 }
 
 // New builds a Service from cfg. The db probe defaults to the live-pool probe; a nil pool
@@ -275,6 +281,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkBoardDrift(ctx, now),
 		s.checkCustodyHolds(ctx, now),
 		s.checkReleaseCheck(ctx, now),
+		s.checkCodexPricing(ctx, now),
 	}
 
 	blocking := false

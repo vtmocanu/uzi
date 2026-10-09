@@ -880,11 +880,11 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
-	// fleet.quarantine (workers), making 17.
+	// fleet.quarantine (workers); pricing.codex follows release.check, making 18.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
-		"schedules.paused", "board.drift", "custody.holds", "release.check",
+		"schedules.paused", "board.drift", "custody.holds", "release.check", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {
 		t.Fatalf("doc has %d checks, want %d", len(doc.Checks), len(wantIDs))
@@ -1497,4 +1497,8 @@ func TestCustodyHoldsAggregateError(t *testing.T) {
 	if got.Severity != sevUnknown || len(got.Evidence) != 0 {
 		t.Fatalf("failed aggregate check=%+v", got)
 	}
+}
+
+func (f *fakeStore) ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error) {
+	return nil, nil
 }
