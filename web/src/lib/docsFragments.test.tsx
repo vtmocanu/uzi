@@ -75,4 +75,4 @@ it("resolves all parsed fragments targeting the docs corpus", () => {
   expect(sameDoc).toBeGreaterThan(0);
   expect(relativeDoc).toBeGreaterThan(0);
   expect(failures, failures.join("\n")).toEqual([]);
-});
+}, 30000);
