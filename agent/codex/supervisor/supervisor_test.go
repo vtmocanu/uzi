@@ -366,9 +366,14 @@ func TestDisposeCleanupPastDeadlineIsRetainedDeadline(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(full, "f"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// timeoutMs 0: the drain deadline is its start, so the cleanup deadline has
-	// passed (on the real clock the safetree walk reads) before it begins.
-	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":0}`+"\n", scriptedReaper(reapEmpty))
+	// Drain completes at 950ms: before its 1000ms deadline but after the
+	// 900ms cleanup deadline. The real safetree clock also sees it as expired.
+	now := time.Unix(0, 0)
+	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":1000}`+"\n", func() (int, error) {
+		now = now.Add(950 * time.Millisecond)
+		return 0, syscall.ECHILD
+	})
+	sup.seams.now = func() time.Time { return now }
 	sup.seams.tmpCleanup = tmpCleanupFor(ct)
 	if code := sup.run(9, procStatus{}); code != 0 {
 		t.Fatalf("code = %d, want 0", code)

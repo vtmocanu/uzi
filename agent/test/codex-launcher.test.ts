@@ -1045,15 +1045,21 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
   });
 
   it("bounded drain evidence remains unconfirmed without disabling disposal retries", async () => {
+    let requests = 0;
     const fake = newFake({
-      disposeReply: (id) => ({ event: "dispose", id, state: "unconfirmed", reason: "oversize",
-        killed: [], reaped: [], children: [] }),
+      disposeReply: (id) => { requests += 1; return { event: "dispose", id, state: "unconfirmed", reason: "oversize",
+        killed: [], reaped: [], children: [] }; },
     });
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
     const outcome = await handle.dispose(200);
     assert.equal(outcome.clean, false);
     assert.ok(!outcome.clean);
     assert.equal(outcome.event?.reason, "oversize", "bounded negative evidence reaches the caller");
+    const retry = await handle.dispose(200);
+    assert.equal(retry.clean, false);
+    assert.ok(!retry.clean);
+    assert.equal(retry.event?.reason, "oversize");
+    assert.equal(requests, 2, "retry sends another supervisor request");
     assert.equal(handle.failed, undefined);
     assert.equal(treeRemoveCalls.length, 0);
   });
