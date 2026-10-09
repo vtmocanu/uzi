@@ -141,9 +141,11 @@ removes the tree.
     from the new attempt path. Continuity of WORK, not of conversation, is what
     survives: the tracking ref, the recovery journal, and captured checkpoints
     carry the prior attempt's committed state forward; only the model's own
-    memory of the conversation is lost. Unwired workers (no Docker daemon
-    configured) keep full same-path resume and are unaffected. The reviewers
-    chose this trade-off under the user's delegation: it is a real, disclosed cost
+    memory of the conversation is lost. Ordinary unwired resumes (no Docker
+    daemon configured), for keys that never entered retained-source recovery,
+    keep same-path continuity. Retained-source recovery uses a fresh attempt
+    path and model session even on unwired workers (see the #2512 amendment).
+    The reviewers chose this trade-off under the user's delegation: it is a real, disclosed cost
     of the isolation guarantee, not an oversight.
 
 ### Option B — the deferred durable follow-up
@@ -664,3 +666,49 @@ sandbox does not grant the bare and git inside the sandbox cannot follow the
 alternate. This applies to both the canonical seed and, since the merge that
 reconciled #1783 with #1769, the per-attempt seed as well (see
 `runnerCloneForBranch`'s docstring in `agent/src/git.ts`).
+
+## Amendment 2026-10-08 — #2512: retained recovery on unwired workers
+
+The same-path exception in decision 15 applies to ordinary unwired keys
+that never entered retained-source recovery. A retained-source claim uses
+a fresh attempt path and model session regardless of Docker wiring.
+Recovery must not run a model in the predecessor while its source and
+evidence remain necessary for custody. This extends the fresh-path trade-off
+to retained recovery without changing ordinary unwired continuity.
+
+Discovery precedes forge refresh and disk preflight. Recovery reserves a
+durable source-bound budget of 3 total iterations (blocked and nonblocked
+together), with a five-minute deadline from the first reservation and the
+existing exponential retry cap of 16 times its base. Reservations survive
+crash, reclaim and successor handoff; reset requires a trusted, successfully
+settled real model turn. External restarts require a genuinely fenced
+successor, not reuse of a discovered ready successor as execution authority.
+
+A permanent blocker or exhaustion ends `failed` with `keepCustody`, no
+automatic reclaim and no failed-run Resume. In this retained-recovery path,
+`worker_residue_blocked` denotes actual quiescence failure; archive size,
+prerequisite, source, clock, preservation and adoption blockers have their
+own accurate reasons. Healthy provider/empty-turn parks and the owner
+worker-recovery-exhaustion hold keep their existing budgets.
+
+An actual verified thin bundle under the cap can support local adoption
+and model execution with locally available, verified prerequisites despite
+unknown remote publication. A nonempty prerequisite list is not itself a
+blocker; unavailable/unverifiable needed prerequisites or a still-oversized
+fallback are. This local proof grants neither independent recovery, remote
+durability nor custody release. Predecessor sources, pins, journals and
+descriptors remain until existing verified final disposition or explicit
+discard; guarded archive-release conditions are unchanged.
+
+Healthy unknown publication stays in the same generation with the tip,
+owed roots and publication time gate retained; confirmed durability requires
+positive proof. No API/schema, hold-rebinding, custody-cap or #2486 behavior
+change is included, and [ADR-1751](1751-continuation-custody-admission.md)'s
+soft cap is unchanged. Local storage loss remains a limit: a failed
+source-only run requires operator recovery from retained storage, and
+export still requires a manifest-bound available archive. There is no new
+download API or failed-run Resume. Downgrade during pending recovery is
+unsupported because older workers may drop its recovery fields.
+
+See the matching [ADR-1197 amendment](1197-transient-recovery-park.md#amendment-2026-10-08--2512-source-bound-retained-recovery)
+and [user recovery guide](../docs/run-recovery-wait.md#bounded-retained-source-recovery).

@@ -4439,6 +4439,9 @@ export class GitCache {
     try {
       await this.runGit(barePath, ["rev-parse", "--verify", `${tip}^{commit}`]);
       await this.runGit(barePath, ["rev-list", "--objects", "--missing=error", tip]);
+      // rev-list proves presence, but does not read blob contents. Full fsck
+      // validates content too; unrelated corrupt objects conservatively block recovery.
+      await this.runGit(barePath, ["--no-replace-objects", "fsck", "--full", "--no-reflogs", "--no-dangling", "--no-progress", tip]);
       return true;
     } catch { this.recoveryOperations.getStore()?.signal.throwIfAborted(); return false; }
   }
@@ -4454,8 +4457,7 @@ export class GitCache {
       const recovery = journal.recovery;
       if (!recovery || recovery.stage !== "capturing" || recovery.attempts !== iteration ||
           !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
-      await this.runGit(barePath, ["rev-parse", "--verify", `${tip}^{commit}`]);
-      await this.runGit(barePath, ["rev-list", "--objects", "--missing=error", tip]);
+      if (!await this.verifyRecoveryClosure(barePath, tip)) throw new Error("captured object closure is invalid");
       const sourceHead = (await this.runGitAsRunner(expected.clonePath, ["rev-parse", "HEAD"])).trim();
       if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
       await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);

@@ -24,6 +24,8 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Retained work recovers within a durable budget on a fresh attempt ([#2512](https://github.com/vtmocanu/uzi/issues/2512)).**
+  Three source-bound reserved iterations and a five-minute deadline survive crash, reclaim and handoff; a trusted successfully settled real model turn resets the budget. Permanent blockers or exhaustion fail with local work and custody retained, without automatic cycling or failed-run Resume. Verified under-cap thin bundles with locally verified prerequisites permit local execution despite unknown publication, but do not prove remote durability or release custody. Ordinary unwired resumes keep same-path continuity; downgrade during pending recovery is unsupported.
 - **Usage ranks users by total tokens**
   The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
 
