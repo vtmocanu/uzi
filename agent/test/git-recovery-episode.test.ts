@@ -143,6 +143,251 @@ test("unrelated protected record missing .git does not block canonical seed", as
   assert.deepEqual(fs.readFileSync(workPath), workBytes);
 });
 
+function protectedValue(value = journal()): string {
+  return JSON.stringify({ version: 1, branch, key, journal: value });
+}
+
+function attemptSeed(n: number) {
+  return { attemptId: aid(n), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+}
+
+for (const overlap of [false, true]) {
+  test("custody isolation: foreign damaged evidence permits own inventory and seed with overlap " + overlap, async () => {
+    await ready();
+    const before = journal();
+    if (overlap) git(bare, ["config", `uzi-retained.${runId}.journal`, protectedValue(before)]);
+    else await cache.detachTerminalRetained(bare, branch, key, before);
+    const descriptor = git(bare, ["config", `uzi-retained.${runId}.journal`]);
+    fs.rmSync(path.join(source.clonePath, ".git"), { recursive: true });
+    const warnings: unknown[][] = [];
+    const logger = nullLogger();
+    logger.warn = (...args) => { warnings.push(args); };
+    const reader = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
+    const next = await reader.createOrAttachRunnerClone(bare, 2513, noProofReseed, "run-2513");
+    await reader.markRecoveryCapture(bare, next.path, "agent/issue-2513", "run-2513");
+    assert.equal(warnings.length, 1, "one summary per canonical discovery pass");
+    assert.deepEqual(warnings[0], ["recovery custody discovery: incomplete physical evidence; attribution remains protected"]);
+    warnings.length = 0;
+    const own = await reader.readInventoryCloneHeads(bare, "run-2513");
+    assert.equal(own.kind, "verified");
+    if (own.kind === "verified") {
+      assert.deepEqual(own.foreignOwners, [runId]);
+      assert.ok(own.clones.some(c => c.clonePath === next.path));
+    }
+    assert.equal(warnings.length, 1);
+    assert.deepEqual(await reader.readInventoryCloneHeads(bare, runId), { kind: "unknown", cause: "clone_head_unreadable" });
+    assert.equal(warnings.length, 2, "overlapping active/protected evidence still logs only once per pass");
+    const serialized = JSON.stringify(warnings);
+    for (const privateValue of [bare, branch, key, runId, source.clonePath, JSON.stringify(before)]) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+    if (overlap) {
+      await assert.rejects(reader.discoverRetainedRecovery(fx.originPath, branch, key, runId));
+      await assert.rejects(reader.prepareRecoverySuccessor(bare, branch, key, before, 1, aid(4)));
+      assert.deepEqual(journal(), before);
+    }
+    assert.equal(git(bare, ["config", `uzi-retained.${runId}.journal`]), descriptor);
+  });
+}
+
+for (const damage of ["root", "parent", "leaf", ".git", "distinct successor"] as const) {
+  test("custody isolation: own retained inventory is unknown for absent " + damage, async () => {
+    const { expected } = await ready();
+    const before = journal();
+    git(bare, ["config", `uzi-retained.${runId}.journal`, protectedValue(before)]);
+    const target = damage === "root" ? path.dirname(path.dirname(source.clonePath))
+      : damage === "parent" ? path.dirname(source.clonePath)
+      : damage === "leaf" ? source.clonePath
+      : damage === ".git" ? path.join(source.clonePath, ".git") : expected.clonePath;
+    fs.rmSync(target, { recursive: true });
+    const result = await cache.readInventoryCloneHeads(bare, runId);
+    assert.deepEqual(result, { kind: "unknown", cause: damage === "root" || damage === "parent"
+      ? "clone_ancestor_invalid" : damage === ".git" ? "clone_head_unreadable" : "clone_path_invalid" });
+    assert.deepEqual(journal(), before);
+    assert.equal(git(bare, ["config", `uzi-retained.${runId}.journal`]), protectedValue(before));
+  });
+}
+
+test("custody isolation: attributed adopting successor absent before creation makes own inventory unknown", async () => {
+  const { successor, before } = await legacyAdopting();
+  git(bare, ["config", "--add", `uzi-attempts.${branch}.entry`, JSON.stringify({
+    attemptId: successor.attemptId, runId, clonePath: successor.clonePath, state: "live",
+  })]);
+  assert.equal(fs.existsSync(successor.clonePath), false);
+  assert.deepEqual(await cache.readInventoryCloneHeads(bare, runId), { kind: "unknown", cause: "clone_path_invalid" });
+  assert.deepEqual(journal(), before);
+  await cache.createOrAttachRunnerClone(bare, 2513, noProofReseed, "run-2513");
+  assert.equal(fs.existsSync(successor.clonePath), false, "indexing never creates a successor");
+});
+
+test("custody isolation: every primary retained predecessor and successor survives sweep and compaction", async () => {
+  const { expected, tip } = await ready();
+  await cache.reserveRecoveryIteration(bare, branch, key, expected);
+  await cache.recordRecoveryCapture(bare, branch, key, expected, 2, tip);
+  await cache.prepareRecoverySuccessor(bare, branch, key, expected, 2, aid(3));
+  const before = journal();
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  const retained = [source.clonePath, expected.clonePath, before.clonePath];
+  fs.rmSync(path.join(source.clonePath, ".git"), { recursive: true });
+  fs.rmSync(expected.clonePath, { recursive: true });
+  const descriptor = git(bare, ["config", `uzi-retained.${runId}.journal`]);
+  // Duplicate ledger values force actual compaction; the absent retained attempt must stay attributed.
+  const entry = JSON.stringify({ attemptId: aid(2), runId, clonePath: expected.clonePath, state: "reclaimed" });
+  git(bare, ["config", "--add", `uzi-attempts.${branch}.entry`, entry]);
+  const residues = Array.from({ length: 6 }, (_, i) => path.join(path.dirname(source.clonePath),
+    `.uzi-residue-${key}.residue-00000000-0000-4000-8000-${String(i).padStart(12, "0")}`));
+  for (const [i, residue] of residues.entries()) {
+    fs.mkdirSync(residue);
+    fs.utimesSync(residue, i + 1, i + 1);
+  }
+  const warnings: unknown[][] = [];
+  const logger = nullLogger();
+  logger.warn = (...args) => { warnings.push(args); };
+  const reader = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
+  const next = await reader.createOrAttachRunnerClone(bare, 2512, noProofReseed, "run-next", false, undefined, attemptSeed(4));
+  assert.ok(fs.existsSync(next.path), "seed and retention sweep complete despite damaged custody");
+  assert.equal(fs.existsSync(residues[0]!), false, "sweep deletes the oldest unrelated disposable residue");
+  assert.ok(residues.slice(1).every(residue => fs.existsSync(residue)));
+  assert.equal(warnings.length, 2, "compaction and sweep each emit one fixed summary");
+  assert.ok(warnings.every(args => args.length === 1 && args[0] ===
+    "recovery custody discovery: incomplete physical evidence; attribution remains protected"));
+  const ledger = git(bare, ["config", "--get-all", `uzi-attempts.${branch}.entry`]).split("\n").map(raw => JSON.parse(raw));
+  assert.equal(ledger.filter(e => e.attemptId === aid(2)).length, 1, "compaction ran");
+  for (const [id, clonePath] of [[aid(2), expected.clonePath], [aid(3), before.clonePath]]) {
+    assert.equal(await reader.classifyOwnerClonePath(bare, branch, key, runId, clonePath), "attempt");
+    assert.ok(ledger.some(e => e.attemptId === id && e.clonePath === clonePath && e.runId === runId));
+  }
+  for (const clone of [retained[0]!, retained[2]!]) assert.equal(fs.readFileSync(path.join(clone, "work.txt"), "utf8"), "retained work\n");
+  assert.equal(fs.existsSync(expected.clonePath), false);
+  assert.equal(git(bare, ["config", `uzi-retained.${runId}.journal`]), descriptor);
+  assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+  await assert.rejects(reader.discardRetainedRecovery(bare, branch, key, before, true));
+});
+
+test("custody isolation: selected discard ignores foreign descriptor filesystems and preserves newer active", async () => {
+  const { tip } = await ready();
+  const before = journal();
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  const next = await cache.createOrAttachRunnerClone(bare, 2513, noProofReseed, "run-2513");
+  await cache.markRecoveryCapture(bare, next.path, "agent/issue-2513", "run-2513");
+  const foreign = { runId: "run-2513", clonePath: next.path, retainedSources: [{ runId: "run-2513", clonePath: next.path }] };
+  git(bare, ["config", "uzi-retained.run-2513.journal", JSON.stringify({ version: 1, branch: "agent/issue-2513", key: "issue-2513", journal: foreign })]);
+  git(bare, ["config", "uzi-recovery.agent/issue-2513.clone", JSON.stringify(foreign)]);
+  fs.rmSync(path.join(next.path, ".git"), { recursive: true });
+  const foreignDescriptor = git(bare, ["config", "uzi-retained.run-2513.journal"]);
+  const newer = await cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, "run-next", false, undefined, attemptSeed(4));
+  await cache.markRecoveryCapture(bare, newer.path, branch, "run-next", newer.attemptId);
+  const active = journal();
+  git(bare, ["config", "uzi-retained.run-malformed.journal", "{"]);
+  await cache.discardRetainedRecovery(bare, branch, key, before, true);
+  assert.equal(git(bare, ["config", "uzi-retained.run-malformed.journal"]), "{", "foreign descriptors are not parsed during selected discard");
+  assert.deepEqual(journal(), active);
+  assert.equal(git(bare, ["config", "uzi-retained.run-2513.journal"]), foreignDescriptor);
+  assert.throws(() => git(bare, ["rev-parse", "--verify", `refs/uzi-recovery-episode/${runId}/${tip}`]));
+  assert.ok(fs.existsSync(source.clonePath));
+});
+
+for (const invalid of ["malformed", "duplicate", "branch", "key", "source", "active conflict", "unsafe selected", "run"] as const) {
+  test("custody isolation: selected discard fails closed for " + invalid, async () => {
+    const { tip } = await ready();
+    const before = journal();
+    const envelope = { version: 1, branch, key, journal: before };
+    git(bare, ["config", `uzi-retained.${runId}.journal`, JSON.stringify(envelope)]);
+    if (invalid === "malformed") git(bare, ["config", `uzi-retained.${runId}.journal`, "{"]);
+    if (invalid === "duplicate") git(bare, ["config", "--add", `uzi-retained.${runId}.journal`, JSON.stringify(envelope)]);
+    if (invalid === "branch" || invalid === "key") {
+      git(bare, ["config", `uzi-retained.${runId}.journal`, JSON.stringify({ ...envelope, [invalid]: "issue-other" })]);
+    }
+    if (invalid === "source") git(bare, ["config", `uzi-retained.${runId}.journal`, protectedValue({ ...before, clonePath: source.clonePath + "-other" })]);
+    if (invalid === "active conflict") writeJournal({ ...before, recovery: { ...before.recovery, attempts: 2 } });
+    if (invalid === "unsafe selected") {
+      fs.rmSync(path.join(source.clonePath, ".git"), { recursive: true });
+      fs.symlinkSync(bare, path.join(source.clonePath, ".git"));
+    }
+    const active = journal();
+    const descriptor = git(bare, ["config", "--get-all", `uzi-retained.${runId}.journal`]);
+    const expected = invalid === "run" ? { ...before, runId: "../invalid" } : before;
+    await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, expected, true));
+    assert.deepEqual(journal(), active);
+    assert.equal(git(bare, ["config", "--get-all", `uzi-retained.${runId}.journal`]), descriptor);
+    assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+  });
+}
+
+test("custody isolation: unattributed legacy successor fails indexing without repair", async () => {
+  const { before } = await legacyAdopting();
+  const config = fs.readFileSync(path.join(bare, "config"));
+  await assert.rejects(cache.createOrAttachRunnerClone(bare, 2513, noProofReseed, "run-2513"), /does not belong/);
+  assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "unknown");
+  assert.deepEqual(journal(), before);
+  assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config);
+});
+
+for (const invalid of ["malformed", "duplicate", "conflicting ledger", "conflicting active", "unattributable"] as const) {
+  test("custody isolation: indexing fails closed for " + invalid, async () => {
+    await ready();
+    const before = journal();
+    git(bare, ["config", `uzi-retained.${runId}.journal`, protectedValue(before)]);
+    fs.rmSync(path.join(source.clonePath, ".git"), { recursive: true });
+    if (invalid === "malformed") git(bare, ["config", `uzi-retained.${runId}.journal`, "{"]);
+    if (invalid === "duplicate") git(bare, ["config", "--add", `uzi-retained.${runId}.journal`, protectedValue(before)]);
+    if (invalid === "conflicting ledger") git(bare, ["config", "--add", "uzi-attempts.agent/issue-other.entry", JSON.stringify({
+      attemptId: before.attemptId, runId, clonePath: before.clonePath, state: "live",
+    })]);
+    if (invalid === "conflicting active") writeJournal({ ...before, recovery: { ...before.recovery, attempts: 2 } });
+    if (invalid === "unattributable") git(bare, ["config", `uzi-retained.${runId}.journal`, JSON.stringify({
+      version: 1, branch, key: "issue-other", journal: before,
+    })]);
+    const config = fs.readFileSync(path.join(bare, "config"));
+    await assert.rejects(cache.createOrAttachRunnerClone(bare, 2513, noProofReseed, "run-2513"));
+    assert.equal((await cache.readInventoryCloneHeads(bare, "run-2513")).kind, "unknown");
+    assert.equal(fs.existsSync(cache.runnerClonePath(bare, "issue-2513")), false);
+    assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config);
+  });
+}
+
+for (const stopAt of ["abort", "deadline"] as const) {
+  for (const consumer of ["seed", "inventory"] as const) {
+    test("custody isolation: " + stopAt + " during physical " + consumer + " discovery propagates without mutation", async () => {
+      await ready();
+      const before = journal();
+      await cache.detachTerminalRetained(bare, branch, key, before);
+      const config = fs.readFileSync(path.join(bare, "config"));
+      const stop = new AbortController();
+      const reason = new Error("fixture interrupted");
+      const realLstat = fs.promises.lstat;
+      const realNow = Date.now;
+      const now = realNow();
+      let probed = false;
+      // A specific filesystem probe advances the operation clock or aborts it.
+      // No timer race or host-speed dependency is needed.
+      fs.promises.lstat = (async (target: fs.PathLike, ...rest: unknown[]) => {
+        if (String(target) === path.join(source.clonePath, ".git")) {
+          probed = true;
+          if (stopAt === "abort") stop.abort(reason);
+          else Date.now = () => now + 60_001;
+          throw Object.assign(new Error("private filesystem failure"), { code: "ENOENT" });
+        }
+        return Reflect.apply(realLstat, fs.promises, [target, ...rest]);
+      }) as typeof fs.promises.lstat;
+      try {
+        const operation = cache.withRecoveryOperation(stop.signal, now + 60_000, async () => {
+          if (consumer === "seed") return cache.createOrAttachRunnerClone(bare, 2513, noProofReseed, "run-2513");
+          return cache.readInventoryCloneHeads(bare, "run-2513");
+        });
+        if (stopAt === "abort") await assert.rejects(operation, error => error === reason);
+        else await assert.rejects(operation, /recovery deadline exhausted/);
+        assert.equal(probed, true);
+      } finally {
+        fs.promises.lstat = realLstat;
+        Date.now = realNow;
+      }
+      assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config);
+      assert.equal(fs.existsSync(cache.runnerClonePath(bare, "issue-2513")), false);
+    });
+  }
+}
+
 test("discard exact detached run preserves newer active ownership and fresh attempt marker", async () => {
   const { tip } = await ready();
   const before = journal();

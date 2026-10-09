@@ -39,6 +39,41 @@ async function withJournalInventory(check: (f: {
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 
+for (const damage of ["EIO", "EACCES", "symlink"] as const) {
+  it("custody isolation inventory keeps foreign " + damage + " evidence attributed and refuses own incomplete source", async () => {
+    await withJournalInventory(async f => {
+      const head = await f.ownClone();
+      const own = f.cache.runnerClonePath(f.bare, "issue-current");
+      const foreign = f.cache.runnerClonePath(f.bare, "issue-foreign");
+      await fs.mkdir(foreign);
+      const journal = { runId: "run-foreign", clonePath: foreign,
+        retainedSources: [{ runId: "run-foreign", clonePath: foreign }] };
+      const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+      execFileSync("git", ["-C", f.bare, "config", "--local", "uzi-retained.run-foreign.journal",
+        JSON.stringify({ version: 1, branch: "foreign", key: "issue-foreign", journal })], { env, stdio: "pipe" });
+      if (damage === "symlink") await fs.symlink(f.bare, path.join(foreign, ".git"));
+      const real = fs.lstat;
+      fs.lstat = (async (target, ...rest) => {
+        if (damage !== "symlink" && String(target) === path.join(foreign, ".git")) {
+          throw Object.assign(new Error("private failure content"), { code: damage });
+        }
+        return Reflect.apply(real, fs, [target, ...rest]);
+      }) as typeof fs.lstat;
+      try {
+        const result = await f.cache.readInventoryCloneHeads(f.bare, "run-current");
+        assert.equal(result.kind, "verified");
+        if (result.kind === "verified") {
+          assert.deepEqual(result.heads, [head]);
+          assert.deepEqual(result.foreignOwners, ["run-foreign"]);
+          assert.ok(result.clones.some(c => c.clonePath === own));
+        }
+        assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare, "run-foreign"),
+          { kind: "unknown", cause: "clone_head_unreadable" });
+      } finally { fs.lstat = real; }
+    });
+  });
+}
+
 for (const withOwnClone of [false, true]) {
   for (const staleValue of [false, true]) {
     it(`cleared journal leaves inventory verified (own clone=${withOwnClone}, stale value=${staleValue})`, async () => {
