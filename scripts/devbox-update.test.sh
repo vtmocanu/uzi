@@ -18,11 +18,12 @@ check contract '.permissions == {"contents":"read"}'
 check contract '.jobs.validate.permissions == {"contents":"read"}'
 check contract '[.jobs.validate.steps[] | select((.uses // "") | startswith("actions/checkout@")) | .with["persist-credentials"]] == [false]'
 check contract '.jobs.validate != null and ((.jobs.validate | tostring | contains("secrets.")) | not)'
-check contract '[.jobs.validate.steps[] | select((.uses // "") | startswith("DeterminateSystems/nix-installer-action@")) | [.env.OTEL_SDK_DISABLED, .with["diagnostic-endpoint"], .with["github-token"]]] == [["true", "", ""]]'
+check contract '[.jobs.validate.steps[] | select((.uses // "") | startswith("DeterminateSystems/nix-installer-action@")) | [.env.OTEL_SDK_DISABLED, .with["diagnostic-endpoint"], .with["github-token"]]] == [["true", "", "${{ github.token }}"]]'
 check contract '.jobs.propose.needs == "validate" and .jobs.propose.permissions == {"contents":"write","pull-requests":"write","issues":"write","actions":"read"}'
 check contract '[.jobs.propose.steps[] | has("uses")] | any | not'
 check contract '(.jobs.propose.env // {}) == {} and (.jobs.propose.steps | length) == 1'
 check contract '.jobs.propose.steps[-1].env.GH_TOKEN == "${{ secrets.DEVBOX_UPDATE_TOKEN || github.token }}"'
+check contract '.jobs.propose.steps[-1].env.ARTIFACT_TOKEN == "${{ github.token }}"'
 check contract '.on.workflow_dispatch.inputs.dry_run.default == false and (.jobs.propose.if | contains("inputs.dry_run != true"))'
 
 # If the security split is absent, the structural regression above must fail;
@@ -38,8 +39,12 @@ cat > "$TMP/bin/gh" <<'STUB'
 #!/bin/bash
 set -eu
 printf 'gh %s\n' "$*" >> "$CALLS"
+if [ "$1 $2" != 'run download' ]; then
+  [ "$GH_TOKEN" = proposal-fixture ] || { echo 'proposal lost its PAT binding' >&2; exit 2; }
+fi
 case "$1 $2" in
   'run download')
+    [ "$GH_TOKEN" = artifact-fixture ] || { echo 'artifact download must use built-in token' >&2; exit 2; }
     while [ "$#" -gt 0 ]; do
       if [ "$1" = --dir ]; then dest="$2"; break; fi
       shift
@@ -88,7 +93,7 @@ proposal_case() {
   : > "$TMP/$mode/calls"
   (cd "$TMP/$mode/workspace" && env -i PATH="$TMP/bin:$PATH" HOME="$TMP/$mode" \
     MODE="$mode" CALLS="$TMP/$mode/calls" FIXTURE_LOCK="$TMP/lock" LOCK_SHA="$LOCK_SHA" \
-    GH_TOKEN=fixture GITHUB_REPOSITORY=example/repo GITHUB_SERVER_URL=https://github.com \
+    GH_TOKEN=proposal-fixture ARTIFACT_TOKEN=artifact-fixture GITHUB_REPOSITORY=example/repo GITHUB_SERVER_URL=https://github.com \
     GITHUB_RUN_ID=42 GITHUB_SHA=0123456789012345678901234567890123456789 \
     RUNNER_TEMP="$TMP/$mode/runner" bash "$TMP/propose.sh") > "$TMP/$mode/out" 2>&1 || rc=$?
   case "$expected" in
@@ -118,4 +123,4 @@ check proposal_case pr-refused issue
 check proposal_case push-refused issue
 for mode in occupied query-failed remote-failed foreign diff-failed; do check proposal_case "$mode" protected; done
 printf 'cases=%s passed=%s\n' "$cases" "$passed"
-[ "$cases" -eq 23 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -eq 24 ] && [ "$cases" -eq "$passed" ]

@@ -80,12 +80,14 @@ jobs:
       - name: Install nix (flakes)
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa  # v23
         env:
-          # Action telemetry and installer diagnostics are separate channels.
+          # Keep repository/run metadata out of third-party telemetry. The
+          # action and installer use separate channels, so disable both.
           OTEL_SDK_DISABLED: "true"
         with:
           diagnostic-endpoint: ""
-          # Avoid adding even the read-only validation token to nix.conf.
-          github-token: ""
+          # Authenticated GitHub flake fetches avoid shared-IP rate limits.
+          # This job's token is read-only, so nix.conf gains no write credential.
+          github-token: ${{ github.token }}
 
       # The pinned devbox release BINARY (not the self-updating launcher), sha256-verified,
       # matching agent/templates/base/Dockerfile's ARG DEVBOX_VERSION so the lock is
@@ -196,20 +198,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
+      contents: write  # push the update branch
+      pull-requests: write  # open the PR
+      issues: write  # the tracking-issue fallback
       actions: read  # download this run's validated lock artifact
     steps:
       - name: Propose the validated bump (PR, else tracking issue)
         env:
           GH_TOKEN: ${{ secrets.DEVBOX_UPDATE_TOKEN || github.token }}
+          # Artifact access uses the built-in job token even when the proposal
+          # PAT has only contents/PR scope; job actions:read does not scope a PAT.
+          ARTIFACT_TOKEN: ${{ github.token }}
           LOCK_SHA: ${{ needs.validate.outputs.lock_sha }}
         run: |
           set -euo pipefail
           artifact_dir="$(mktemp -d "${RUNNER_TEMP}/devbox-lock.XXXXXX")"
           trap 'rm -rf "$artifact_dir"' EXIT
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+          GH_TOKEN="$ARTIFACT_TOKEN" gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name validated-devbox-lock --dir "$artifact_dir"
           # Treat the artifact as data only: exactly one regular lock, no links or
           # extra paths, and a digest supplied separately by the validation job.
