@@ -16,6 +16,8 @@ set -euo pipefail
 
 GH=${GH:-gh}
 LABEL=pricing-freshness
+# Taxonomy (.agents/skills/issue-triage/references/taxonomy.md); never a sweep label.
+TAXONOMY_LABELS=area::tooling,priority::low
 MARKER='<!-- uzi-bot:pricing-freshness -->'
 BOT_LOGIN='app/github-actions'
 
@@ -39,8 +41,10 @@ render_body() {
 
 # Newest bot-owned issue carrying the label and the marker, any state.
 existing=$("$GH" issue list --label "$LABEL" --author "$BOT_LOGIN" --state all --limit 50 \
-  --json number,state,body) || die "gh issue list failed"
-issue=$(jq -c --arg m "$MARKER" '[.[] | select(.body | contains($m))] | sort_by(.number) | last // empty' <<<"$existing")
+  --json number,state,body,author) || die "gh issue list failed"
+# Re-check ownership locally: the server-side --author filter is the first line,
+# this the second, so a human issue carrying the marker is never adopted.
+issue=$(jq -c --arg m "$MARKER" --arg bot "$BOT_LOGIN" '[.[] | select(.author.is_bot == true and .author.login == $bot and (.body | contains($m)))] | sort_by(.number) | last // empty' <<<"$existing")
 
 if [[ "$count" -eq 0 ]]; then
   if [[ -n "$issue" && $(jq -r .state <<<"$issue") == OPEN ]]; then
@@ -59,7 +63,7 @@ render_body >"$body_file"
 
 if [[ -z "$issue" ]]; then
   "$GH" label create "$LABEL" --color FBCA04 --description "Weekly pricing freshness findings" --force >/dev/null || die "gh label create failed"
-  "$GH" issue create --title "Pricing data needs re-verification" --label "$LABEL" --body-file "$body_file" >/dev/null || die "gh issue create failed"
+  "$GH" issue create --title "Pricing data needs re-verification" --label "$LABEL,$TAXONOMY_LABELS" --body-file "$body_file" >/dev/null || die "gh issue create failed"
   echo "created ($count findings)"
   exit 0
 fi
