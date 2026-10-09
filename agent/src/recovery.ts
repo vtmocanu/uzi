@@ -1612,9 +1612,10 @@ export class RecoveryCoordinator {
    * issue #1995: every journal write is guarded (a removed record is never recreated, a newer
    * state is never overwritten), the record's existence is re-checked before the reserve and
    * right before the stream opens, and an RPC failure is classified ({@link classifyUploadFailure}):
-   * permanent and credential dispositions are journaled as such, a transient one under the mode's
-   * retry reason (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds
-   * the record's capture-cycle lock.
+   * permanent and credential dispositions are journaled as such. A transient failure preserves
+   * its typed quota reason when present, otherwise using the mode's retry reason
+   * (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds the record's
+   * capture-cycle lock.
    */
   private async uploadJournaledBundle(
     record: RecoveryRecord,
