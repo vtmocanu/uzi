@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
+  Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
+
 ### Changed
 
 - **A Codex lead's plan is now cross-checked by a read-only Claude checker ([#2460](https://github.com/vtmocanu/uzi/issues/2460)).**
