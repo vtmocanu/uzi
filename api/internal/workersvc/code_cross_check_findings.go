@@ -20,11 +20,12 @@ var codeFindingID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // NormalizeCodeCrossCheckFindings rejects ambiguous identities before scrubbing.
 func NormalizeCodeCrossCheckFindings(outcome, reason string, findings []CodeCrossCheckFinding) ([]byte, error) {
-	if outcome == "completed" {
+	switch outcome {
+	case "completed":
 		if reason != "" {
 			return nil, ErrCrossCheckRefused
 		}
-	} else if outcome == "failed" {
+	case "failed":
 		switch reason {
 		case "malformed", "model_error", "model_timeout", "checker_unavailable", "confinement_failed", "snapshot_failed":
 		default:
@@ -33,7 +34,7 @@ func NormalizeCodeCrossCheckFindings(outcome, reason string, findings []CodeCros
 		if len(findings) != 0 {
 			return nil, ErrCrossCheckRefused
 		}
-	} else {
+	default:
 		return nil, ErrCrossCheckRefused
 	}
 	original, originalErr := json.Marshal(findings)

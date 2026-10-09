@@ -200,7 +200,7 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	}
 }
 
-// isClaudeCheckerChild reports a Claude plan cross-check child (PRD #2460), the one run
+// isClaudeCheckerChild reports a Claude cross-check child, the one run
 // shape whose claim-time credential failure decides its check instead of waiting or parking.
 func isClaudeCheckerChild(run store.Run) bool {
 	return run.Kind == runkind.CrossCheck && run.Harness == harnessClaude
@@ -213,8 +213,8 @@ func isClaudeCheckerChild(run store.Run) bool {
 // spend", and the auto lane never spends the owner's non-pooled default (secretchoice.go
 // autoChoice), so waiting for a check that has a deadline serves nothing. errVaultLocked
 // is NOT mapped: a locked vault is transient and a later claim may succeed. The sentinel
-// carries no credential detail, so the failure reason reads exactly
-// "plan cross-check: checker unavailable". Every other run shape returns err unchanged.
+// carries no credential detail. The finalizer selects the stage-specific failure
+// reason; the sentinel retains its legacy plan text. Other run shapes return err unchanged.
 func claudeCheckerClaimError(run store.Run, err error) error {
 	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) {
 		return err
@@ -235,11 +235,11 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
-	// Intrinsic pin failures, and EVERY Claude checker child claim (PRD #2460: its locked
-	// credential re-check below may decide the check), enter lead-first, before the child
-	// row lock below, the order DecidePlanCrossCheck and the credential-disable sweep use.
-	// LockPlanCrossCheckLeadForVerdict applies the live lead and child fences.
+	// Intrinsic pin failures and every Claude checker claim enter lead-first: the
+	// locked credential re-check may decide the check. The persisted stage selects
+	// the verdict lock and settlement before the child row is locked.
 	var checkerLead store.Run
+	var checkerStage string
 	var checkerQueries *store.Queries
 	if run.Kind == runkind.CrossCheck && (errors.Is(assemblyErr, errCheckerPinUnavailable) || isClaudeCheckerChild(run)) {
 		live, ok := q.(pgxClaimFinishTx)
@@ -247,8 +247,24 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			return nil, "", errClaimRecoveryNoTx
 		}
 		checkerQueries = live.Queries
-		checkerLead, err = checkerQueries.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
-			ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration})
+		persisted, readErr := checkerQueries.GetCrossCheckByChild(ctx, pgconv.UUID(run.ID))
+		if errors.Is(readErr, pgx.ErrNoRows) {
+			return nil, "", nil
+		}
+		if readErr != nil {
+			return nil, "", readErr
+		}
+		checkerStage = persisted.Stage
+		switch checkerStage {
+		case "code":
+			checkerLead, err = checkerQueries.LockCodeCrossCheckLeadForVerdict(ctx, store.LockCodeCrossCheckLeadForVerdictParams{
+				ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration})
+		case "plan":
+			checkerLead, err = checkerQueries.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
+				ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration})
+		default:
+			return nil, "", ErrCrossCheckRefused
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, "", nil
 		}
@@ -398,25 +414,41 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	var checkerEvent []byte
 	var checkerSeq int32
 	if checkerQueries != nil && errors.Is(decision, errCheckerPinUnavailable) {
-		cc, decideErr := checkerQueries.DecidePlanCrossCheck(ctx, store.DecidePlanCrossCheckParams{
-			ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
-			Verdict: "failed", ReasonClass: pgconv.TextOrNull("checker_unavailable"), Findings: []byte("null")})
+		var cc store.CrossCheck
+		var decideErr error
+		if checkerStage == "code" {
+			cc, decideErr = checkerQueries.DecideCodeCrossCheck(ctx, store.DecideCodeCrossCheckParams{
+				ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+				Outcome: "failed", ReasonClass: pgconv.TextOrNull("checker_unavailable"), Findings: []byte("[]")})
+		} else {
+			cc, decideErr = checkerQueries.DecidePlanCrossCheck(ctx, store.DecidePlanCrossCheckParams{
+				ChildID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+				Verdict: "failed", ReasonClass: pgconv.TextOrNull("checker_unavailable"), Findings: []byte("null")})
+		}
 		if errors.Is(decideErr, pgx.ErrNoRows) {
 			return nil, "", nil
 		}
 		if decideErr != nil {
 			return nil, "", decideErr
 		}
-		banked, bankErr := checkerQueries.BankPlanCrossCheckWait(ctx, cc.ID)
+		var banked int64
+		var bankErr error
+		if checkerStage == "code" {
+			banked, bankErr = checkerQueries.BankCodeCrossCheckWait(ctx, cc.ID)
+		} else {
+			banked, bankErr = checkerQueries.BankPlanCrossCheckWait(ctx, cc.ID)
+		}
 		if bankErr != nil {
 			return nil, "", bankErr
 		}
 		if banked != 1 {
 			return nil, "", ErrCrossCheckRefused
 		}
-		checkerSeq, checkerEvent, err = appendPlanCrossCheckEvent(ctx, checkerQueries, checkerLead, cc, "system")
-		if err != nil {
-			return nil, "", err
+		if checkerStage == "plan" {
+			checkerSeq, checkerEvent, err = appendPlanCrossCheckEvent(ctx, checkerQueries, checkerLead, cc, "system")
+			if err != nil {
+				return nil, "", err
+			}
 		}
 	}
 	var n int64
@@ -445,9 +477,14 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			ID:       run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
 		})
 	default:
+		failureReason := decision.Error()
+		if checkerStage == "code" && errors.Is(decision, errCheckerPinUnavailable) {
+			failureReason = "code cross-check: checker unavailable" +
+				strings.TrimPrefix(failureReason, errCheckerPinUnavailable.Error())
+		}
 		n, err = q.FailClaimAssemblyExact(ctx, store.FailClaimAssemblyExactParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
-			FailureReason: pgconv.TextOrNull(decision.Error()), FailOrigin: pgconv.TextOrNull(origin),
+			FailureReason: pgconv.TextOrNull(failureReason), FailOrigin: pgconv.TextOrNull(origin),
 		})
 	}
 	if err == nil && n != 1 {

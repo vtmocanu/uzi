@@ -34,6 +34,11 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 	if timeout <= 0 || timeout > 2*time.Hour {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
+	timeoutSeconds := int64((timeout + time.Second - 1) / time.Second)
+	if timeoutSeconds < 1 || timeoutSeconds > 7200 {
+		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	budgetWallSeconds := int32(timeoutSeconds)
 	var result store.CrossCheck
 	retry := errors.New("existing code cross-check")
 	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
@@ -109,7 +114,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		if e != nil {
 			return store.Run{}, e
 		}
-		child, e := txq.CreateCodeCrossCheckChild(ctx, store.CreateCodeCrossCheckChildParams{ChildID: uuid.New(), ChildHarness: string(harness), LeadRunID: leadID, UserID: locked.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: int32((timeout + time.Second - 1) / time.Second)})
+		child, e := txq.CreateCodeCrossCheckChild(ctx, store.CreateCodeCrossCheckChildParams{ChildID: uuid.New(), ChildHarness: string(harness), LeadRunID: leadID, UserID: locked.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: budgetWallSeconds})
 		if e != nil {
 			if errors.Is(e, pgx.ErrNoRows) {
 				e = ErrCrossCheckUnavailable

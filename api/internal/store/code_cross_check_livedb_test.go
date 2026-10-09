@@ -108,6 +108,9 @@ func TestCodeCrossCheckIdentityNullShapeLiveDB(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				mustExec(context.Background(), t, fx.f.pool, "DELETE FROM cross_checks WHERE id=$1", fx.crossCheckID)
+			})
 			err := insertCodeFixture(t, fx, tc.head, tc.base, tc.outcome, tc.reason)
 			if tc.valid {
 				if err != nil {
@@ -116,7 +119,6 @@ func TestCodeCrossCheckIdentityNullShapeLiveDB(t *testing.T) {
 			} else {
 				requireCodeCheckViolation(t, err)
 			}
-			mustExec(context.Background(), t, fx.f.pool, "DELETE FROM cross_checks WHERE id=$1", fx.crossCheckID)
 		})
 	}
 }
@@ -135,12 +137,20 @@ func TestCodeCrossCheckIdentityRetentionLiveDB(t *testing.T) {
 		"code_context='{\"rebound\":true}'", "guidance_snapshot='rebound'",
 		"candidate_digest=convert_to('rebound','UTF8')", "lead_claim_generation=2",
 	} {
-		// Each independent rejected write leaves the snapshot for the next assertion.
-		_, err := fx.f.pool.Exec(ctx, "UPDATE cross_checks SET "+assignment+" WHERE id=$1", fx.crossCheckID)
-		var pe *pgconn.PgError
-		if !errors.As(err, &pe) || pe.Code != "P0001" || !strings.Contains(pe.Message, "immutable code cross-check snapshot") {
-			t.Fatalf("%s: expected immutable snapshot, got %v", assignment, err)
-		}
+		t.Run(assignment, func(t *testing.T) {
+			// Each write has its own transaction so a weakened invariant cannot
+			// alter the fixture and mask later independent identity assertions.
+			tx, err := fx.f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			_, err = tx.Exec(ctx, "UPDATE cross_checks SET "+assignment+" WHERE id=$1", fx.crossCheckID)
+			var pe *pgconn.PgError
+			if !errors.As(err, &pe) || pe.Code != "P0001" || !strings.Contains(pe.Message, "immutable code cross-check snapshot") {
+				t.Fatalf("%s: expected immutable snapshot, got %v", assignment, err)
+			}
+		})
 	}
 	mustExec(ctx, t, fx.f.pool, "UPDATE cross_checks SET outcome='failed',reason_class='model_error',decided_at=now() WHERE id=$1", fx.crossCheckID)
 	var head, base string
