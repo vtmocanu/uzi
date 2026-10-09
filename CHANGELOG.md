@@ -43,6 +43,9 @@ through `[0.52.0]`.)
 
 - Checkpoint and park-bridge scratch publication refusals now name bounded kind and step codes in the feed, deduped per pair.
 
+- **CLI updates verify the installed version and tell you when to restart ([#2496](https://github.com/vtmocanu/uzi/issues/2496)).**
+  Homebrew upgrades use tap-qualified stable or RC targets and inherit your auto-update settings; a zero Homebrew exit succeeds only when the formula-owned CLI reaches the offered version. The TUI detects external upgrades on successful five-minute build-info polls, closes the update modal and shows the actual installed version with a restart hint, without automatic re-exec. Server release checks use the persisted checked-at timestamp to schedule their first attempt after startup, then wait the full configured interval after each attempt; existing opt-outs remain in effect.
+
 ### Changed
 
 - **The lead defers a costly full gate after review invalidates a candidate ([#2593](https://github.com/vtmocanu/uzi/issues/2593)).**
