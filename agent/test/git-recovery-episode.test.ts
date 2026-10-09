@@ -61,6 +61,27 @@ test("missing source discovery carries trusted coordinates and first blocker per
   await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source), /blocked/);
 });
 
+test("expected absent episode rejects a reservation created while finalizer waits for the lock", async () => {
+  let acquired!: () => void, release!: () => void;
+  const held = new Promise<void>(resolve => { acquired = resolve; });
+  const holder = cache.withBareLock(bare, async () => {
+    acquired();
+    await new Promise<void>(resolve => { release = resolve; });
+  });
+  await held;
+  // Queue reservation first, then the stale absence finalizer, on the same source.
+  const reservation = cache.reserveRecoveryIteration(bare, branch, key, source);
+  const finalizer = cache.blockRecoveryEpisode(bare, branch, key, source, "source_missing", null);
+  const rejected = assert.rejects(finalizer, /episode changed/);
+  release();
+  await holder;
+  await reservation;
+  const before = journal();
+  await rejected;
+  assert.deepEqual(journal(), before);
+  assert.equal(journal().recovery.stage, "capturing");
+});
+
 test("backward and invalid clocks fail closed at reservation, capture, adoption and reset", async () => {
   const realNow = Date.now;
   const first = await cache.reserveRecoveryIteration(bare, branch, key, source, 30_000);

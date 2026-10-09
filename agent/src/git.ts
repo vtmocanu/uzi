@@ -4465,16 +4465,18 @@ export class GitCache {
     });
   }
 
-  /** Store only a bounded worker reason code, never provider output or exception text. */
+  /** Store only a bounded worker reason code, never provider output or exception text.
+   * expectedEpisode null requires absence; omission preserves legacy unguarded callers. */
   async blockRecoveryEpisode(
     barePath: string, branch: string, key: string, expected: RecoverySource,
-    reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts">,
+    reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
     guard?: () => void,
   ): Promise<void> {
     if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
       guard?.();
+      if (expectedEpisode === null && journal.recovery) throw new Error("recovery episode changed");
       if (expectedEpisode && (!journal.recovery ||
           journal.recovery.startedAt !== expectedEpisode.startedAt ||
           journal.recovery.deadline !== expectedEpisode.deadline ||

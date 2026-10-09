@@ -3382,6 +3382,12 @@ export class RunRunner {
         });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RetainedRecoveryStop) {
+        // Discovery can stop before the source record reaches this flight. Preserve
+        // its existing HOME and custody as well as any subsequently discovered clone.
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.retainedLocalCustody = true;
+        flight.keepGuardedInventoryOpen = true;
         runLog.info("retained recovery stopped; source and accounting kept");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchRetainedStop) {
@@ -3701,7 +3707,12 @@ export class RunRunner {
       // must stay in place after a blocked proof. Inventory freeze uses the retire proof below.
       if (flight.barePath && flight.branch && !terminalDisposeUnproven && typeof this.git.retainCurrentOwedCandidate === "function") {
         try {
-          const retained = await this.git.retainCurrentOwedCandidate(flight.barePath, await this.owedOptions(flight, flight.barePath, flight.branch));
+          const retain = async () => this.git.retainCurrentOwedCandidate(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
+          // Retained-flight cleanup must not requeue behind a lock its lifecycle just cancelled.
+          const retained = flight.retainedLocalCustody
+            ? await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+              async () => { this.retainedLifecycleGuard(flight); return retain(); })
+            : await retain();
           if (retained.kind === "not_updated" && claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
         } catch (err) {
           if (claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
@@ -8355,37 +8366,54 @@ export class RunRunner {
     flight.effectiveAttemptPaths = this.attemptPaths;
     let retainedJournal: RecoveryJournalEntry | undefined;
     try {
-      const cachePresent = typeof this.git.discoverRetainedRecovery === "function" && await fs.lstat(this.git.barePathFor(claim.repo.clone_url)).then(() => true, error => {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-        throw error;
-      });
-      if (cachePresent && typeof this.git.recoveryAttemptMode === "function") {
-        flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
-      }
-      if (typeof this.git.discoverRetainedRecovery === "function") {
-        const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, coordinates.branch, coordinates.key, runId);
-        if (retained) {
-          flight.barePath = retained.barePath;
-          retainedJournal = retained.journal;
+      const discover = async () => {
+        const cachePresent = typeof this.git.discoverRetainedRecovery === "function" && await fs.lstat(this.git.barePathFor(claim.repo.clone_url)).then(() => true, error => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        });
+        if (cachePresent && typeof this.git.recoveryAttemptMode === "function") {
+          flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
         }
+        if (typeof this.git.discoverRetainedRecovery === "function") {
+          const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, coordinates.branch, coordinates.key, runId);
+          if (retained) {
+            flight.barePath = retained.barePath;
+            retainedJournal = retained.journal;
+          }
+        }
+      };
+      if (typeof this.git.withRecoveryOperation === "function") {
+        await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs, discover);
+      } else {
+        await discover();
       }
+      this.retainedLifecycleGuard(flight);
     } catch (error) {
+      this.retainedLifecycleGuard(flight);
       if (!(error instanceof ForeignRetainedRecoveryError)) {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         flight.keepGuardedInventoryOpen = true;
         flight.retainedLocalCustody = true;
-        try { await this.requireRetainedOwnership(flight); } catch { throw new RetainedRecoveryStop(); }
         let reason = "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
         if (error instanceof RetainedRecoveryBlockedError) {
           flight.barePath = error.barePath;
           flight.worktreePath = error.journal.clonePath;
           flight.branch = error.branch;
           reason = "Retained recovery blocked: required source is missing; local work and custody retained";
-          try { await this.git.blockRecoveryEpisode(error.barePath, error.branch, error.key, error.journal, "source_missing"); }
+          try {
+            // Bookkeeping gets its own allowance after the discovery scope has ended.
+            await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+              async () => {
+                this.retainedLifecycleGuard(flight);
+                await this.git.blockRecoveryEpisode(error.barePath, error.branch, error.key, error.journal,
+                  "source_missing", error.journal.recovery ?? null, () => this.retainedLifecycleGuard(flight));
+                this.retainedLifecycleGuard(flight);
+              });
+          }
           catch { reason += "; blocker persistence unavailable"; }
         }
-        try { await this.requireRetainedOwnership(flight); } catch { throw new RetainedRecoveryStop(); }
+        this.retainedLifecycleGuard(flight);
         await this.reportGenericFailure(claim, flight, new Error(reason), { keepCustody: true });
         throw new RetainedRecoveryStop();
       }
@@ -15100,7 +15128,7 @@ export class RunRunner {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
           async () => {
             this.retainedLifecycleGuard(flight);
-            await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode,
+            await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode ?? null,
               () => this.retainedLifecycleGuard(flight));
             this.retainedLifecycleGuard(flight);
           });
@@ -15121,7 +15149,10 @@ export class RunRunner {
       this.retainedLifecycleGuard(flight);
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;
       try {
-        reservation = await this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs);
+        const now = Date.now();
+        reservation = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight),
+          Math.min(episode?.deadline ?? now + 300_000, now + 300_000),
+          () => this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs));
       } catch (error) {
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";

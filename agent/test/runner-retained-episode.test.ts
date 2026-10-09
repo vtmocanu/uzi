@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { Readable } from "node:stream";
 import type { ExecutorFactory } from "../src/runner.js";
 import { Outbox } from "../src/outbox.js";
 import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
@@ -39,6 +40,211 @@ function readJournal(bare: string, branch: string): any {
 }
 function factory(run: (ctx: import("../src/executor.js").RunContext) => Promise<never>): ExecutorFactory {
   return runId => ({ homeDir: path.join(homeDir, runId), executor: { run } });
+}
+
+for (const outageAt of [1, 2]) {
+  it(`missing source finalization needs no ownership GET (former outage position ${outageAt})`, async () => {
+    const { claim, bare, clone } = await seed();
+    const before = readJournal(bare, clone.branch);
+    client.protocolFeatures = ["claim_generation_fence"];
+    const tip = command(clone.path, "rev-parse", "HEAD");
+    const pin = `refs/uzi-recovery-episode/${claim.run_id}/${tip}`;
+    command(bare, "update-ref", pin, tip);
+    fs.renameSync(clone.path, clone.path + ".saved");
+    let reads = 0, models = 0, fetches = 0, releases = 0;
+    const ownership = client.getRunOwnership.bind(client);
+    client.getRunOwnership = async (...args) => {
+      if (++reads === outageAt) throw new Error("ownership endpoint unavailable");
+      return ownership(...args);
+    };
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+    git.ensureClone = async () => { fetches++; throw new Error("must not refresh"); };
+    await runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab).execute(claim);
+    assert.equal(reads, 0, "discovery finalization uses the fenced terminal endpoint");
+    assert.equal(models, 0);
+    assert.equal(fetches, 0);
+    assert.equal(releases, 0);
+    const journal = readJournal(bare, clone.branch);
+    assert.equal(journal.clonePath, before.clonePath);
+    assert.equal(journal.runId, before.runId);
+    assert.equal(journal.recovery.blocker, "source_missing");
+    assert.equal(journal.recovery.attempts, 3);
+    assert.equal(journal.recovery.stage, "blocked");
+    assert.equal(command(bare, "rev-parse", pin), tip);
+    assert.ok(api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+    assert.equal(fs.readFileSync(path.join(clone.path + ".saved", "retained.txt"), "utf8"), "only local dirty work\n");
+  });
+}
+
+it("corrupt journal finalizes through the terminal fence with all ownership reads down", async () => {
+  const { claim, bare, clone } = await seed();
+  const corrupt = '{"runId":"broken"';
+  client.protocolFeatures = ["claim_generation_fence"];
+  command(bare, "config", `uzi-recovery.${clone.branch}.clone`, corrupt);
+  let reads = 0, models = 0;
+  client.getRunOwnership = async () => { reads++; throw new Error("ownership endpoint unavailable"); };
+  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab).execute(claim);
+  assert.equal(reads, 0);
+  assert.equal(models, 0);
+  assert.equal(command(bare, "config", `uzi-recovery.${clone.branch}.clone`), corrupt);
+  assert.ok(api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
+  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  assert.ok(fs.existsSync(clone.path));
+});
+
+for (const stage of ["reservation", "discovery"] as const) {
+  it(`cancelled queued ${stage} settles execute before bare lock release without a charge`, async () => {
+    const { claim, bare, clone } = await seed();
+    const before = readJournal(bare, clone.branch);
+    const configBytes = fs.readFileSync(path.join(bare, "config"));
+    let entered!: () => void, acquired!: () => void, release!: () => void;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { acquired = resolve; });
+    // This holder is outside the recovery ALS context.
+    const holder = git.withBareLock(bare, async () => {
+      acquired();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await held;
+    git.recoveryAttemptMode = async () => false;
+    if (stage === "reservation") {
+      git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+      const reserve = git.reserveRecoveryIteration.bind(git);
+      git.reserveRecoveryIteration = async (...args) => { entered(); return reserve(...args); };
+    } else {
+      const discover = git.discoverRetainedRecovery.bind(git);
+      git.discoverRetainedRecovery = async (...args) => { entered(); return discover(...args); };
+    }
+    const retainedHome = path.join(homeDir, claim.run_id);
+    fs.mkdirSync(retainedHome, { recursive: true });
+    const sessionArtifact = path.join(retainedHome, "retained-session.jsonl");
+    fs.writeFileSync(sessionArtifact, "predecessor session evidence\n");
+    let models = 0, settled = false;
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab);
+    const execution = r.execute(claim).finally(() => { settled = true; });
+    try {
+      await entry;
+      (r as any).activeRuns.get(claim.run_id).cancel.abort();
+      await Promise.race([execution, new Promise<void>(resolve => setTimeout(resolve, 250))]);
+      assert.equal(settled, true, "cancelled flight must settle while the lock is still held");
+      assert.deepEqual(readJournal(bare, clone.branch), before);
+    } finally {
+      release();
+      await holder;
+      await execution;
+    }
+    await git.withBareLock(bare, async () => {});
+    assert.deepEqual(readJournal(bare, clone.branch), before);
+    assert.deepEqual(fs.readFileSync(path.join(bare, "config")), configBytes);
+    assert.equal(fs.readFileSync(sessionArtifact, "utf8"), "predecessor session evidence\n",
+      "a stop before discovery completes retains the predecessor HOME");
+    assert.equal(models, 0);
+    assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
+    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  });
+}
+
+it("lifecycle cancellation settles the actual attempt-mode child without discovery or a terminal", async () => {
+  const { claim, bare, clone } = await seed();
+  const before = fs.readFileSync(path.join(bare, "config"));
+  let started!: () => void, finish!: (value: { code: number }) => void;
+  const entry = new Promise<void>(resolve => { started = resolve; });
+  const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
+  let cancelled = false, settledChild = false, models = 0, discoveries = 0;
+  const discover = git.discoverRetainedRecovery.bind(git);
+  git.discoverRetainedRecovery = async (...args) => { discoveries++; return discover(...args); };
+  const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab);
+  const execution = git.withBoundaryProcessSpawner(async () => {
+    started();
+    return {
+      stdout: Readable.from([]), stderr: Readable.from([]), stdin: null, completed,
+      cancel: async () => { cancelled = true; settledChild = true; finish({ code: -1 }); },
+    };
+  }, new AbortController().signal, () => r.execute(claim));
+  await entry;
+  (r as any).activeRuns.get(claim.run_id).cancel.abort();
+  await execution;
+  assert.equal(cancelled, true);
+  assert.equal(settledChild, true);
+  assert.equal(discoveries, 0);
+  assert.equal(models, 0);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
+  assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
+});
+
+it("queued reservation deadline admits no proof or later charge and bounds finalization lock waits", async () => {
+  const { claim, bare, clone, key } = await seed();
+  await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
+  const before = readJournal(bare, clone.branch);
+  before.recovery.startedAt = Date.now() - 299_000;
+  before.recovery.deadline = before.recovery.startedAt + 300_000;
+  command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
+  client.protocolFeatures = ["claim_generation_fence"];
+  git.recoveryAttemptMode = async () => false;
+  git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+  let release!: () => void, acquired!: () => void, entered!: () => void;
+  const held = new Promise<void>(resolve => { acquired = resolve; });
+  const entry = new Promise<void>(resolve => { entered = resolve; });
+  const holder = git.withBareLock(bare, async () => {
+    acquired();
+    await new Promise<void>(resolve => { release = resolve; });
+  });
+  await held;
+  const reserve = git.reserveRecoveryIteration.bind(git);
+  git.reserveRecoveryIteration = async (...args) => { entered(); return reserve(...args); };
+  let models = 0, proofs = 0, reads = 0, settled = false;
+  client.getRunOwnership = async () => { reads++; throw new Error("must not read"); };
+  const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    fakeGitlab().gitlab, undefined, nullLogger(), { codexBoundaryDeadlineMs: 100 });
+  (r as any).quiesceRun = async () => { proofs++; throw new Error("must not prove"); };
+  const execution = r.execute(claim).finally(() => { settled = true; });
+  try {
+    await entry;
+    await Promise.race([execution, new Promise<void>(resolve => setTimeout(resolve, 2_000))]);
+    assert.equal(settled, true, "deadline and bookkeeping must finish before unlock");
+    assert.deepEqual(readJournal(bare, clone.branch), before);
+  } finally {
+    release();
+    await holder;
+    await execution;
+  }
+  await git.withBareLock(bare, async () => {});
+  assert.deepEqual(readJournal(bare, clone.branch), before);
+  assert.equal(models, 0);
+  assert.equal(proofs, 0);
+  assert.equal(reads, 0);
+  assert.ok(api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
+  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+});
+
+for (const disposition of ["stale_claim", "released"]) {
+  it(`missing source terminal refusal (${disposition}) preserves custody and replacement state`, async () => {
+    const { claim, bare, clone } = await seed();
+    client.protocolFeatures = ["claim_generation_fence"];
+    fs.renameSync(clone.path, clone.path + ".saved");
+    api.failStateWhen(claim.run_id, body => body.status === "failed", { runStatus: "running", disposition });
+    let reports = 0, reads = 0, releases = 0;
+    const report = client.reportState.bind(client);
+    client.reportState = async (...args) => {
+      if (args[1].status === "failed") {
+        reports++;
+        assert.equal(args[1].claim_generation, 2);
+        api.setOwnershipStatus(claim.run_id, "running", 3);
+      }
+      return report(...args);
+    };
+    client.getRunOwnership = async () => { reads++; throw new Error("must not read"); };
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+    await runnerWith(factory(async () => { throw new Error("must not model"); }), fakeGitlab().gitlab).execute(claim);
+    assert.equal(reports, 1);
+    assert.equal(reads, 0);
+    assert.equal(releases, 0);
+    assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
+    assert.equal(readJournal(bare, clone.branch).recovery.blocker, "source_missing");
+    assert.equal(fs.readFileSync(path.join(clone.path + ".saved", "retained.txt"), "utf8"), "only local dirty work\n");
+  });
 }
 
 it("retained dirty work resumes locally on a fresh unwired path and resets only on trusted settled notification", async () => {
