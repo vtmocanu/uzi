@@ -143,6 +143,23 @@ func TestTUIAnswerViewLosslessAndFallback(t *testing.T) {
 	}
 }
 
+func TestTUIAnswerViewMalformedPayloadDoesNotInheritActor(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "malformed-actor")
+	m = applyDetail(m, apitypes.RunDTO{ID: "malformed-actor", Status: "running"}, []apitypes.MessageDTO{
+		{Seq: 1, Kind: "question", Agent: ptr("reviewer"), AgentLabel: ptr("old-label"), AgentInstance: ptr("shared-instance"), Payload: json.RawMessage(`{"questions":[{"question":"Earlier question"}]}`), CreatedAt: time.Now()},
+		{Seq: 2, Kind: "answer", AgentInstance: ptr("shared-instance"), Payload: json.RawMessage(`{"answers":false,"fallback":"answer-fallback"}`), CreatedAt: time.Now()},
+		msgDTO(3, "text", "coder", "", "", "Other lane", time.Now()),
+	})
+	out := stripANSI(m.View().Content)
+	_, answer, ok := strings.Cut(out, "▪ answer")
+	if !ok || !strings.Contains(answer, "answer-fallback") {
+		t.Fatalf("malformed answer lost raw fallback:\n%s", out)
+	}
+	if header := strings.SplitN(answer, "\n", 2)[0]; strings.Contains(header, "old-label") || strings.Contains(header, "reviewer") {
+		t.Fatalf("malformed answer inferred an actor from its lane: %q", header)
+	}
+}
+
 func TestTUIQuestionAnswerViewFrameActor(t *testing.T) {
 	for _, actor := range []string{"", "answer-actor"} {
 		t.Run(actor, func(t *testing.T) {

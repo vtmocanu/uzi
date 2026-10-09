@@ -213,10 +213,10 @@ func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 				block = questionView().formatTranscriptAnswers(answers, actor, width)
 			}
 			if block == "" {
-				// Preserve today's safe raw fallback when parsing yields no usable prose.
+				// Preserve the safe raw body fallback without borrowing a lane's actor.
 				head := tungsten.Render("▪ " + m.renderer.Plain(f.Kind, 16))
-				if w := who(f); w != "" {
-					head += m.pal.faint.Render("  · ") + tungsten.Render(w)
+				if actor != "" {
+					head += m.pal.faint.Render("  · ") + tungsten.Render(m.renderer.Plain(actor, 24))
 				}
 				block = clampVisual(head, width) + "\n" + strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
 			}
