@@ -141,9 +141,10 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
 }
 
 // PARK_LABELS is today's wording for each parked (held, not working) effective status:
-// the single source runBadge's pills and the PRD #2602 progress cell's parked flag both
-// print, so the board badge and the progress flag can never name one park two ways. The
-// paused pill prefixes its "‖" glyph at the call site; the progress cell uses its own ⏸.
+// the single source runBadge's pills and the PRD #2602 progress cell's parked text both
+// use, so the board badge and the progress cell can never name one park two ways. The
+// paused pill prefixes its "‖" glyph at the call site; the progress cell prints the bare
+// label as screen-reader text, since the pill beside it already shows the park.
 const PARK_LABELS = {
   limit_wait: "limit wait",
   pool_wait: "waiting for pool",

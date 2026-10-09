@@ -102,6 +102,17 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(flag.querySelector(".sr-only")?.textContent).toBe(" (looping)");
   });
 
+  it("stalled keeps the replaced health pill's reason in its tooltip, sanitised", () => {
+    renderCell({
+      health: "stalled",
+      health_reason: "no tool call for 12m\u202E\u0007",
+      progress: progress({ state: "stalled" }),
+    });
+    const title = screen.getByText("stalled").getAttribute("title") ?? "";
+    expect(title).toMatch(/^Stalled: .* no tool call for 12m$/);
+    expect(title.includes("\u202E") || title.includes("\u0007")).toBe(false);
+  });
+
   // queued/planning/parked repeat the adjacent status pill, so on a card row they are
   // screen-reader-only text with context; the state is still keyed by data-run-progress.
   it.each([

@@ -469,10 +469,10 @@ mislead:
 
 | Flag | When |
 |---|---|
-| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds `since HH:MM`); the TUI board shows only `waits on you` |
+| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds `since HH:MM`); the TUI board shows only `waits on you` (`on you` on a narrow terminal) |
 | Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI and TUI board say which: `limit wait`, `pool wait`, `recovery wait` or `paused` (the board abbreviates to `⏸ limit`, `⏸ pool`, `⏸ recov`, `⏸ paused`). On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
 | Queued | The run has not started yet (on the web, the status pill says it and the cell adds only screen-reader text) |
-| Stalled | The run's health is stalled or looping. The web row (`◼ stalled · since HH:MM`, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
+| Stalled | The run's health is stalled or looping. The web row (`◼ stalled` over a `since HH:MM` line, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
 | Planning | The run is planning and has no frozen milestone list yet (on the web, the status pill says it and the cell adds only screen-reader text) |
 
 When there is no estimate at all, the web cell shows `—`, the TUI board cell

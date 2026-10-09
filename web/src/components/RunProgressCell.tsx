@@ -21,13 +21,14 @@ import type { ReactNode } from "react";
 import type { Run, RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
 import { parkLabel } from "../lib/runBadge";
+import { stripUnsafeChars } from "../lib/safeText";
 import { Badge } from "./ui";
 
 // The fields the cell reads: the progress DTO, the two "since" instants, the health flag
 // (the stalled flag's wording), and whatever parkLabel folds through effectiveRunStatus
 // to name a park.
 type ProgressRun = Pick<Run, "progress" | "status_since" | "health_since"> &
-  Partial<Pick<Run, "health">> &
+  Partial<Pick<Run, "health" | "health_reason">> &
   Parameters<typeof parkLabel>[0];
 
 // progressShowsStall reports whether the cell shows the stalled flag. A row whose cell is
@@ -117,15 +118,17 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
       );
     case "stalled": {
       const looping = run.health === "looping";
+      // The health pill this flag replaces carried the owner-only health reason as its
+      // tooltip; keep it (sanitised: model-influenced text) so the row loses nothing.
+      const reason = run.health_reason ? stripUnsafeChars(run.health_reason) : "";
+      const base = looping
+        ? "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."
+        : "Stalled: no progress is being made; the percentage returns once activity resumes.";
       return (
         <Flagged state="stalled" since={formatLocalTime(run.health_since)}>
           <Badge
             tone="danger"
-            title={
-              looping
-                ? "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."
-                : "Stalled: no progress is being made; the percentage returns once activity resumes."
-            }
+            title={reason === "" ? base : `${base} ${reason}`}
           >
             <span aria-hidden="true">◼</span> stalled
             {looping && <span className="sr-only"> (looping)</span>}
