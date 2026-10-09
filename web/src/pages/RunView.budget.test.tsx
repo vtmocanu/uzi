@@ -304,3 +304,41 @@ describe("NearTimeoutPanel (PRD #1189)", () => {
     expect(container.textContent).toBe("");
   });
 });
+
+// PRD #2602 M2: the progress card mounts on the run page under the header's budget facts,
+// and stays absent when the server sends no progress.
+describe("RunView — progress card (PRD #2602 M2)", () => {
+  const ms = [
+    { id: "m1", title: "First" },
+    { id: "m2", title: "Second" },
+  ];
+  it("renders the card from run.progress, above the milestone checklist", async () => {
+    const { container } = renderPage(
+      budgeted({
+        milestones: ms,
+        milestones_completed: ["m1"],
+        milestones_in_progress: ["m2"],
+        progress: {
+          state: "percent",
+          pct: 55,
+          milestone_done: 1,
+          milestone_total: 2,
+          active_milestone_id: "m2",
+          phase: "review",
+        },
+      }),
+    );
+    await screen.findByText("Add rate limiting");
+    expect(container.querySelector("[data-progress-pct]")?.textContent).toBe("≈about 55%");
+    expect(screen.getByText("milestone 2 of 2 · Second")).toBeTruthy();
+    const cardEl = container.querySelector("[data-run-progress-card]") as HTMLElement;
+    const checklist = screen.getByText("Milestones (reported complete)");
+    expect(cardEl.compareDocumentPosition(checklist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("renders no card without progress", async () => {
+    const { container } = renderPage(budgeted({ progress: null }));
+    await screen.findByText("Add rate limiting");
+    expect(container.querySelector("[data-run-progress-card]")).toBeNull();
+  });
+});

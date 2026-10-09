@@ -1213,6 +1213,13 @@ Tracked as GitHub issue vtmocanu/uzi#2012.
 
 - Add a per-user persisted **Docker-capable** checkbox beside **Auto-provision on demand**, on one row with one shared paragraph; hide it without the instance Docker tier (including an old API omitting the flag), keep it usable and retain its value while auto-provision is off, save `{docker}` separately from `{enabled}`, disable competing writes while pending, update auth on success, and restore the confirmed value with a local error on rejection (including an old API's unknown-field error). The preference adds Docker on capability-gap and saturation provisioning only for ordinary runs whose non-null repository is explicitly in the admin's `docker_repo_allowlist`; jobs, isolated-lane and repo-less runs including judges are excluded. Failed allowlist reads discard returned values and mean empty membership; capability-driven Docker and the independent claim fence remain unchanged. Plain warm leases step aside and the capability-free gap widens under the same policy, preserving plain reuse when inapplicable and existing cap/early-eviction rules. Use exactly “Docker-capable includes Docker for repositories your admin allows, at extra CPU and storage.” only when the checkbox is visible; remove experimental/cold-start-size framing and rootless promises from the shipped worker sections while retaining the accurate rootless-by-default Docker documentation. [user 2026-10-05, #2278] (AI-synced 2026-10-05)
 
+## Feature #2602 — Run progress estimate
+
+PRD at `prds/done/2602-run-progress.md`.
+
+- Every non-terminal issue run with a frozen milestone list shows an approximate server-derived percent (11% for planning plus 89% of completed/total milestones, held below 100% until the run ends) on the web board and run page, the TUI board and detail, and `uzi run get`; a run that is waiting, parked, queued, stalled/looping or planning shows that flag instead of a number, and no surface shows a time remaining. (AI-synced 2026-10-09, #2602)
+- Run detail (web, TUI, CLI) shows "may be blocked by <run>" while a run waits on an unanswered question that mentions `#N` and another live run of the same owner on the same repo is working issue N; it is a hint, never another user's or repo's run, never the run itself. (AI-synced 2026-10-09, #2602)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is

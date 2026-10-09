@@ -2609,6 +2609,21 @@ export type RunPriority = "normal" | "background" | "expedited" | "restored";
 // convention here, mirroring FixVerdict/AgentSource, which ARE imported elsewhere).
 type PlanSource = "agent" | "seeded";
 
+/** PRD #2602: the run progress estimate (RunDTO.progress). `state` is a closed set; treat an
+ *  unknown value as "none". `pct` is set only when state is "percent". `phase` is
+ *  implement|review|validate or "" (set only where current_activity is). */
+export interface RunProgress {
+  state: "percent" | "waiting" | "parked" | "queued" | "stalled" | "planning" | "none";
+  pct: number | null;
+  milestone_done: number;
+  milestone_total: number;
+  active_milestone_id: string;
+  phase: "implement" | "review" | "validate" | "";
+  // GetRun only, while awaiting_input: a live run of the same owner and repo the open
+  // question mentions as #<issue>. A hint from untrusted text, not a recorded dependency.
+  maybe_blocked_by_run_id?: string;
+}
+
 // Milestone is one item of a milestone-structured run (PRD #122): a stable id and a
 // human title. The title is REPO/agent-authored UNTRUSTED text — safe as JSX (React
 // escapes it) but it must never be rendered through <Markdown> or interpolated into an
@@ -2800,6 +2815,10 @@ export interface Run {
    *  omits the key, and an absent value reads as not-planning (isPlanningRun requires
    *  `=== true`). RunListItem extends Run, so list rows inherit it. */
   is_planning?: boolean;
+  /** PRD #2602: server-derived progress estimate; null for a terminal run. OPTIONAL for the
+   *  same api/web rollout skew as is_planning: a pre-feature api omits the key, and absent
+   *  renders no progress. */
+  progress?: RunProgress | null;
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;

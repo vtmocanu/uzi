@@ -451,6 +451,96 @@ with the task label beneath it), and the board's selected row gains a
 second line with the same information. `uzi run get` shows the same now
 line as a `NOW` row — see [the CLI docs](./cli.md#commands).
 
+## Progress estimate
+
+Live issue runs show a progress percent on the web dashboard and runs list,
+on the TUI board and in `uzi run get`, so you can tell at a glance how far
+along a run is without opening it. The server derives it from the run's
+frozen milestone list: `11% + 89% × completed / total`, capped at 99% until
+the run finishes. The 11% is planning, the measured median share of a run's
+time spent before the first milestone starts. A run with three milestones
+and two reported complete shows `70%`. As with the [milestone
+marks](#milestones-and-the-now-line), "completed" is what the worker
+reported, not something uzi has verified.
+
+Only issue runs with a frozen milestone list get a percent; other run kinds
+show no percent. A flag replaces the number whenever a number would
+mislead:
+
+| Flag | When |
+|---|---|
+| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds `since HH:MM`); the TUI board shows only `waits on you` (`on you` on a narrow terminal) |
+| Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI and TUI board say which: `limit wait`, `pool wait`, `recovery wait` or `paused` (the board abbreviates to `⏸ limit`, `⏸ pool`, `⏸ recov`, `⏸ paused`). On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
+| Queued | The run has not started yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+| Stalled | The run's health is stalled or looping. The web row (`◼ stalled` over a `since HH:MM` line, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
+| Planning | The run is planning and has no frozen milestone list yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+
+When there is no estimate at all, the web cell shows `—`, the TUI board cell
+is blank and `uzi run get` omits the row.
+
+**No time remaining or finish time is shown.** The estimate is too
+unreliable to display: in a backtest of completed issue runs, only 59% of
+the estimates fell within 2x of the actual time remaining.
+
+Where it appears:
+
+- **Web** (dashboard and runs list rows): a Progress cell, `70%` with a thin
+  bar, or `● waits on you` / `◼ stalled` as above. On the Dashboard the cell
+  is hidden at phone widths; the runs list keeps it.
+- **TUI board**: a `PROG` column after `MILES`, e.g. `70% ▰▰▰▰▰▰▱▱`. The bar
+  drops before the percent on narrow terminals, leaving the percent or a
+  short flag. Every flag is text, so `NO_COLOR` keeps all of them. The board
+  shows no "since" time.
+- **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
+  of 3`, `stalled · since 14:05` or `waits on you · plan gate`; a run
+  waiting on a question may add ` · may be blocked by <id>` (see [May be
+  blocked by](#may-be-blocked-by)). The row is omitted when there is no estimate and once the run is terminal. See [the CLI docs](./cli.md#commands).
+
+### Run page and TUI detail
+
+The run page and the TUI run detail show the estimate in more depth. The two
+differ in what they carry; the run page has more.
+
+- **Run page**: a progress card under the budget facts. It shows the percent
+  large (`≈70%`), then `milestone k of M · <active milestone title>` (or
+  `N of M milestones done` when no milestone is active), and a segmented plan
+  track: one segment for planning plus one per milestone, each marked done, in
+  progress or pending. While the run is progressing with a known role, it also
+  shows the **phase** steps `review`, `validate` and `implement`, with the
+  current one marked `▸`. The phase is mapped from the active role:
+  `reviewer`, `auditor`, `fact-checker`, `architect`, `web-ux`, `tui-ux` and
+  `dba` are `review`, `tester` is `validate`, and any other role is
+  `implement`. It is the phase right now, not a history. An **Active role**
+  line shows only while the run is progressing or stalled. The flags from the
+  table above replace the number when it would mislead: `◼ stalled · since
+  HH:MM`, `● waits on you · plan gate|question|follow-up since HH:MM`, the park
+  word (`limit wait`, `paused`, ...), `queued`, and `planning · no
+  milestones frozen yet`. A parked card adds `resumes HH:MM` only for a
+  usage-limit or recovery wait whose resume time is known and in the future.
+  There is no card when the run has no estimate.
+- **TUI run detail**: a compact `PROGRESS` block above `MILESTONES` in the
+  rail: a `PROGRESS ≈70% · 3/4` line, plus `phase ▸ implement` while the run is
+  progressing. The flags are shown as `◼ stalled` with `since HH:MM`,
+  `● waits on you` with `plan gate|question|follow-up since HH:MM`,
+  `⏸ <park word>` (no resume time), `queued`, and `planning` with
+  `no milestones frozen yet`. It does not show the active-role line or the
+  resume time; use the run page for those.
+
+### May be blocked by
+
+While a run is waiting on a question (`awaiting_input`), the run page, the TUI
+detail and `uzi run get` can add `may be blocked by <short run id>`, linking to
+that run on the run page. It appears when the open, not-yet-answered question
+mentions `#N` and another live run of the **same run owner** on the **same
+repo** is working issue N: an issue run for N, or an MR rework or CI fix run
+on branch `agent/issue-N`.
+
+It is a hint, not a recorded dependency: a mention in the question text is all
+it goes on. It never matches another user's run, another repo or the run
+itself, and at most 5 `#N` references in the question are read. Once the
+question is answered the hint disappears. It is shown on the detail views
+only, not on the board or runs list.
+
 ## Stopping or narrowing a run
 
 On a milestone-structured issue run, two operator actions bound how far the

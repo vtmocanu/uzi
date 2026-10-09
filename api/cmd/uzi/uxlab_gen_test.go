@@ -39,6 +39,7 @@ const (
 
 func sp(s string) *string       { return &s }
 func ip(n int64) *int64         { return &n }
+func ip32(n int) *int           { return &n }
 func tp(t time.Time) *time.Time { return &t }
 
 // uxModel builds a model at the lab's fixed size and theme. The renderer is rebuilt
@@ -97,9 +98,11 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-planning":               func(d bool) string { return boardPlanning(d, now) },
 		"board-revising":               func(d bool) string { return boardRevising(d, now) },
 		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
+		"board-progress":               func(d bool) string { return boardProgress(d, now) },
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
 		"detail-accounting-backfill":   func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
 		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
+		"detail-blocked-by":            func(d bool) string { return detailBlockedBy(d, now) },
 		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
 		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
@@ -450,6 +453,14 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
 	runs[5].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
 	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → n/a
+	// PRD #2602: the PROG column, mirroring TUI mock 1 — a percent (55% here: 2 of 4 done), a
+	// stalled run, a looping run (also stalled), a run waiting on the plan gate, and a parked run.
+	pct := 55
+	runs[0].Progress = &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4, ActiveMilestoneID: "m3"}
+	runs[1].Progress = &apitypes.RunProgress{State: "waiting"}
+	runs[2].Progress = &apitypes.RunProgress{State: "stalled"}
+	runs[4].Progress = &apitypes.RunProgress{State: "stalled"}
+	runs[6].Progress = &apitypes.RunProgress{State: "parked"}
 	return runs
 }
 
@@ -610,12 +621,35 @@ func boardRevising(dark bool, now time.Time) string {
 // draws an all-empty ▱▱▱ bar — the graphical 0/N, never –/N text. No credential labels, so
 // the MILE column clears the width gate at the lab's 100 cols instead of being dropped.
 func boardMilestones(dark bool, now time.Time) string {
+	pct70 := 70
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}}}, // two in flight (#1176)
-		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}},                                                 // nil completed ⇒ never reported
-		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                                                                               // no frozen list ⇒ no bar
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, Progress: &apitypes.RunProgress{State: "percent", Pct: &pct70}}}, // two in flight (#1176)
+		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}},                                                                                                                 // nil completed ⇒ never reported
+		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                                                                                                                                               // no frozen list ⇒ no bar
+	}})
+	return m.View().Content
+}
+
+// boardProgress renders the own-board PROG column (PRD #2602) at 116 cols with no credential
+// column: the bar form (percent + 8-cell bar) plus the waiting, stalled, parked and queued
+// flags. The 100-col scenes show the narrow form (percent or short flag) instead.
+func boardProgress(dark bool, now time.Time) string {
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, "", dark)
+	m = step(m, tea.WindowSizeMsg{Width: 116, Height: frameHeight})
+	pct := 70
+	mk := func(id, status, title string, age time.Duration, p *apitypes.RunProgress) apitypes.RunListItemDTO {
+		return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status, IssueTitle: title, CreatedAt: now.Add(-age),
+			Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, Progress: p}}
+	}
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
+		mk("a1b2c3d4-1111", "running", "Add rate-limit headroom to the scheduler poll", 4*time.Minute, &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4}),
+		mk("b2c3d4e5-1111", "awaiting_input", "Pick the retry policy for webhook delivery", 9*time.Minute, &apitypes.RunProgress{State: "waiting"}),
+		mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"}),
+		mk("d4e5f6a7-1111", "limit_wait", "Port the judge to per-model usage folding", 22*time.Minute, &apitypes.RunProgress{State: "parked"}),
+		mk("e5f6a7b8-1111", "queued", "Tighten the retry backoff jitter", time.Minute, &apitypes.RunProgress{State: "queued"}),
 	}})
 	return m.View().Content
 }
@@ -685,7 +719,10 @@ func detailRunning(dark bool, now time.Time) string {
 		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
 		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
-		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}} // two in flight (#1176)
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, // two in flight (#1176)
+		// PRD #2602: the crew rail's PROGRESS block (TUI mock 2).
+		Progress: &apitypes.RunProgress{State: "percent", Pct: ip32(70), MilestoneDone: 2, MilestoneTotal: 4,
+			ActiveMilestoneID: "m3", Phase: "implement"}}
 	// The credential label rides the right of the header's first line, before the transport tag
 	// (PRD #295), coherent with the board's meta label for this same run id.
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
@@ -694,6 +731,18 @@ func detailRunning(dark bool, now time.Time) string {
 	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// detailBlockedBy is a run waiting on a question that mentions another live run: the PROGRESS
+// block draws the waits-on-you flag and the may-be-blocked-by hint (TUI mock 3).
+func detailBlockedBy(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll", StatusSince: tp(now.Add(-12 * time.Minute)),
+		Milestones: milestoneList, MilestonesCompleted: []string{"m1"},
+		Progress: &apitypes.RunProgress{State: "waiting", MilestoneDone: 1, MilestoneTotal: 4,
+			MaybeBlockedByRunID: sp("fca7a801-3b1c-4d52-9e0a-6c1f2d7e8a90")}}
+	m := detailBase(dark, run, now, true)
 	return m.View().Content
 }
 

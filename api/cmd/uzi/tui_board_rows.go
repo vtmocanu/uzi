@@ -288,6 +288,15 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if m.boardShowMile() {
 		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
 	}
+	// PROG (PRD #2602): shown with MILES (boardShowProg); a finished row has no progress (nil)
+	// and stays blank.
+	if m.boardShowProg() {
+		var prog string
+		if !terminal {
+			prog = m.boardProgCell(r.Progress, r.Status, bg, m.boardShowProgBar())
+		}
+		row += padSeg(prog, m.boardProgWidth(), bg) + gap
+	}
 
 	// WHICH credential this run spent, gated by its own harness:
 	// drawn after the milestone micro-bar and before the COST column, so the row reads
@@ -320,10 +329,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	} else if terminalRunStatuses[r.Status] {
 		text.runWorkerName = "—"
 	}
-	workerWidth := 0
-	if m.width >= 120 {
-		workerWidth = 18 // two spaces and a fixed 16-column worker cell
-	}
+	workerWidth := m.boardWorkerWidth()
 	contentWidth := m.width - workerWidth
 	avail := max(0, contentWidth-visualWidth(row)-markerAllow)
 	if avail > boardTitleMax {
