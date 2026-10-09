@@ -6,7 +6,7 @@
 
 -- name: BindCaptureManifest :one
 -- D2/D4: compare-and-set the byte manifest ONCE. The first bind (manifest_bound=false)
--- always wins; a retry with the SAME byte_size+checksum is idempotent (the second
+-- always wins; a retry with the SAME byte_size+checksum+ordered prerequisites is idempotent (the second
 -- disjunct matches and re-stamps updated_at); a DIFFERENT manifest under the same
 -- capture_id matches neither disjunct and returns zero rows (a conflict the caller must
 -- surface, never an overwrite of bound bytes). Manifest size/checksum/prerequisites need
@@ -19,7 +19,8 @@ SET manifest_bound = true,
     prerequisite_shas = @prerequisite_shas,
     updated_at = now()
 WHERE id = @id
-  AND (manifest_bound = false OR (byte_size = @byte_size AND checksum = @checksum))
+  AND (manifest_bound = false OR (byte_size = @byte_size AND checksum = @checksum
+    AND COALESCE(prerequisite_shas, '{}'::text[]) = COALESCE(@prerequisite_shas::text[], '{}'::text[])))
 RETURNING *;
 
 -- name: InsertCaptureChunk :exec
@@ -882,6 +883,7 @@ UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
 WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id::uuid
   AND c.source_sha = @source_sha AND c.coverage_digest = @coverage_digest
   AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+  AND COALESCE(cardinality(c.prerequisite_shas), 0) = 0
   AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.id = c.hold_id
     AND h.inventory_guarded AND h.state = 'open' AND h.live_worker_id = @worker_id::uuid);
 
@@ -907,6 +909,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
         AND c.original_worker_id = h.original_worker_id AND c.source_sha = sqlc.narg('final_source_sha')::text
         AND c.coverage_digest = @final_coverage_digest::text
         AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+        AND COALESCE(cardinality(c.prerequisite_shas), 0) = 0
         AND c.local_replica_worker_id = h.original_worker_id AND c.ready_retention_seconds > 0))
     OR (@final_disposition::text = 'settled' AND sqlc.narg('final_capture_id')::uuid IS NULL
       AND sqlc.narg('final_source_sha')::text IS NULL

@@ -66,12 +66,15 @@ SELECT * FROM workers WHERE id = @id;
 SELECT * FROM workers WHERE id = @id AND user_id = @user_id;
 
 -- name: ListWorkersByUser :many
--- Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
+-- Worker list for the owning user. Three derived signals (PRD #42 Decision 10):
 --   * active_runs counts the worker's NON-CHAT active runs (claimed/running/
---     awaiting_approval/awaiting_input) — the RUN lane that max_concurrent_runs
+--     awaiting_approval/awaiting_input/awaiting_followup), not on
+--     the durable cross-check lane — the RUN lane that max_concurrent_runs
 --     bounds. Chat runs
 --     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
 --     them, so counting a live chat here would render a false "3/2 runs" over-cap.
+--   * active_cross_checks uses the same active statuses, including released claims,
+--     selected by the durable lane marker rather than current advertisement.
 --   * busy is the ANY-kind non-terminal signal (a lone active chat still shows the
 --     worker as busy), so it is its own EXISTS over every kind — NOT derived from
 --     active_runs, which now omits chat.
@@ -95,8 +98,14 @@ SELECT w.*,
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-             AND r.kind <> 'chat'
+             AND r.kind <> 'chat' AND NOT r.cross_check_lane
        ) AS active_runs,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+             AND r.cross_check_lane
+       ) AS active_cross_checks,
        -- retaining_unpublished_work (PRD #1296 M4, D4): does this worker hold any OPEN
        -- custody hold? Healthy live runs included: custody is independent of busy/active_runs
        -- and owner decisions. It protects source through deletion, cleanup and per-owner
@@ -202,6 +211,7 @@ WITH prev AS (
         -- stores '{}', not NULL.
         protocol_capabilities = COALESCE(@protocol_capabilities::text[], '{}'),
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
+        max_cross_check_slots = sqlc.narg('max_cross_check_slots'),
         -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
         -- worker is already online with one, else STAMP now() — so a steady stream of
         -- registers never moves it and the first register after an offline gap (or for a
@@ -809,8 +819,14 @@ SELECT sqlc.embed(w),
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-             AND r.kind <> 'chat'
+             AND r.kind <> 'chat' AND NOT r.cross_check_lane
        ) AS active_runs,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+             AND r.cross_check_lane
+       ) AS active_cross_checks,
        u.email AS owner_email,
        rh.phase              AS roll_phase,
        rh.phase_since        AS roll_phase_since,
@@ -828,8 +844,10 @@ LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 ORDER BY w.created_at DESC;
 
 -- name: GetRunOwnedByWorker :one
--- Worker-endpoint authz: a worker may only touch a run it currently holds.
-SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
+-- Worker-endpoint authz: child worker_id is affinity until the first real claim.
+-- Keep previously claimed/released rows readable for recovery and idempotent retries.
+SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id
+  AND (kind <> 'cross_check' OR claim_generation > 0);
 
 -- name: GetRunOrphanIdentity :one
 -- Orphan-classification read (issue #1319): DISTINCT from GetRunOwnedByWorker. Scoped to
@@ -883,7 +901,12 @@ WITH claimant AS MATERIALIZED (
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
         AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
              OR r.worker_id = c.id))
-      AND r.kind <> 'chat'
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+      AND ((COALESCE(@lane::text, '') IN ('', 'run', 'ordinary') AND r.kind <> 'cross_check')
+           OR (r.kind = 'cross_check' AND EXISTS (
+               SELECT 1 FROM claimant c WHERE fn_cross_check_child_eligible(c, r, true,
+                   CASE WHEN COALESCE(@lane::text, '') = '' THEN 'run' ELSE @lane::text END,
+                   'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))))
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
       -- uzi/task/<id> branch and stamped dispatched_at — otherwise a worker could claim
       -- it before the branch exists (the claim-before-seed race). Every non-task kind is
@@ -912,7 +935,7 @@ WITH claimant AS MATERIALIZED (
               FOR UPDATE OF cc SKIP LOCKED
           ) locked_checks
       ))
-      AND (r.worker_id IS NULL
+      AND (r.kind = 'cross_check' OR r.worker_id IS NULL
            OR r.worker_id = @worker_id
            -- Hold the pin whenever the run's OWN worker ROW still exists AND it can
            -- still resume the run — i.e. it is either DRAINING (cordoned for an image
@@ -1167,6 +1190,7 @@ WITH claimant AS MATERIALIZED (
       -- absent lease admits nothing, so lease 0 / a non-leased worker is exactly the bound-run-only
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
       AND (NOT @is_ephemeral::boolean
+           OR (r.kind = 'cross_check' AND r.target_run_id = sqlc.narg('ephemeral_run_id')::uuid)
            OR r.id = sqlc.narg('ephemeral_run_id')::uuid
            OR ((fn_ephemeral_lease_admits(
                    sqlc.narg('lease_since')::timestamptz,
@@ -1198,8 +1222,11 @@ WITH claimant AS MATERIALIZED (
       -- NULL my.cap makes the product NULL -> row excluded -> I claim (fail-open);
       -- a 0 active count on me makes the RHS 0 -> no peer qualifies -> I always
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
+      -- Dedicated cross-check claims use affinity instead of spread (PRD #2169);
+      -- legacy run-lane children retain the ordinary spread rules.
       AND (
-          r.worker_id = @worker_id
+          (r.kind = 'cross_check' AND COALESCE(@lane::text, 'run') = 'cross_check')
+          OR r.worker_id = @worker_id
           OR r.updated_at < @spread_cutoff
           OR NOT EXISTS (
               SELECT 1
@@ -1209,7 +1236,7 @@ WITH claimant AS MATERIALIZED (
                   FROM runs pr
                   WHERE pr.worker_id = p.id
                     AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-                    AND pr.kind <> 'chat'
+                    AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
               ) pa
               WHERE p.user_id = @user_id
                 AND p.id <> @worker_id
@@ -1234,6 +1261,11 @@ WITH claimant AS MATERIALIZED (
                             r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
+                -- A legacy child can defer only to a peer eligible on the run lane;
+                -- explicit zero or dedicated cross-check capacity cannot use fallback.
+                -- Keep the protocol, pins and custom-model mirrors below as well.
+                AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(p, r, true,
+                     'run', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
                 -- the peer, or fleet-spread could DEFER an interlocked run to an INCAPABLE peer
@@ -1337,7 +1369,7 @@ WITH claimant AS MATERIALIZED (
                     < (SELECT count(*) FROM runs mr
                         WHERE mr.worker_id = @worker_id
                           AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-                          AND mr.kind <> 'chat')
+                          AND mr.kind <> 'chat' AND NOT mr.cross_check_lane)
                       * p.max_concurrent_runs
           )
       )
@@ -1434,6 +1466,7 @@ hold AS (
     RETURNING 1
 )
 UPDATE runs SET
+    cross_check_lane = COALESCE(@lane::text = 'cross_check', false),
     status     = 'claimed',
     status_since = now(),
     worker_id  = @worker_id,
@@ -3787,7 +3820,7 @@ UPDATE runs SET
     pause_mode         = NULL,
     pause_after_count  = NULL,
     updated_at         = now()
-WHERE id = @id AND worker_id = @worker_id
+WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   -- PRD #1497 M1 (D18): a failed owner-pause publish must not clear a SYSTEM 'wall' request that
   -- overwrote it (IS DISTINCT FROM because pause_mode is NULL on a no-pending-pause row).
   AND pause_mode IS DISTINCT FROM 'wall'
@@ -3832,7 +3865,7 @@ UPDATE runs SET
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND worker_id = @worker_id
+WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
@@ -3939,7 +3972,7 @@ UPDATE runs SET
          WHERE run_user_inputs.run_id = @id AND kind = 'follow_up' AND applied_at IS NOT NULL))),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND worker_id = @worker_id
+WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
@@ -4037,7 +4070,7 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE runs.id = @id AND runs.worker_id = @worker_id
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) `completed` from an
   -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
   -- leaves the row status='paused' with claim_released_at set and KEEPS worker_id (informational),
@@ -4094,7 +4127,7 @@ UPDATE runs SET
     mr_web_url = COALESCE(mr_web_url, @mr_web_url),
     branch     = COALESCE(branch, @branch),
     updated_at = now()
-WHERE id = @id AND worker_id = @worker_id;
+WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0);
 
 -- name: SetRunFailed :execrows
 -- failed restores the origin column → move_pending_since stamped in the same
@@ -4125,7 +4158,7 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = @id AND worker_id = @worker_id
+WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
@@ -4409,7 +4442,7 @@ LIMIT 1;
 -- SetRunFailed exactly, so a report onto an already-terminal run is a 0-row no-op.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = @id AND runs.worker_id = @worker_id
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
 ), parent_mapping AS MATERIALIZED (
@@ -4450,7 +4483,7 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE runs.id = @id AND runs.worker_id = @worker_id
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
@@ -4462,7 +4495,7 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
 -- guards keep late reports from changing runs they no longer control.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = @id AND runs.worker_id = @worker_id
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
@@ -4504,7 +4537,7 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE runs.id = @id AND runs.worker_id = @worker_id
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
@@ -6646,8 +6679,8 @@ WHERE worker_id = @worker_id
 
 -- name: UpsertWorkerActiveRun :execrows
 -- Insert (or replace) one validated snapshot entry, OWNERSHIP-ENFORCED in SQL (D3): the row is
--- written only when the run is actually `worker_id = @worker_id`, so a buggy or hostile worker
--- can never describe — and thereby suppress a sibling's claim on, or lease — a run it does not
+-- written only for this worker's run, with a real claim generation for a cross-check child.
+-- A buggy or hostile worker can never describe — and thereby suppress a sibling's claim on, or lease — a run it does not
 -- own. An entry that fails the EXISTS is silently dropped (0 rows affected); the Go caller logs
 -- it. terminal_pending_until is stamped now() + the lease for a pending entry and NULL for a
 -- live one; reported_at is this snapshot's capture time (now()), which ClaimRun's freshness
@@ -6670,7 +6703,7 @@ SELECT @worker_id, @run_id, @claim_generation, @phase,
        @snapshot_epoch, now()
 -- PRD #1497 M1 (D16): a RELEASED flight cannot refresh a snapshot row — otherwise a server-parked
 -- run's old flight could keep the run unclaimable by its own heartbeat past the reclaim.
-WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = @run_id AND r.worker_id = @worker_id AND r.claim_released_at IS NULL)
+WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = @run_id AND r.worker_id = @worker_id AND (r.kind <> 'cross_check' OR r.claim_generation > 0) AND r.claim_released_at IS NULL)
 ON CONFLICT (worker_id, run_id) DO UPDATE SET
     claim_generation       = EXCLUDED.claim_generation,
     phase                  = EXCLUDED.phase,
@@ -6723,7 +6756,7 @@ ORDER BY worker_id, run_id;
 -- reconciliation writes. Rows returned are ignored; the statement exists for its FOR UPDATE.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = ANY(@run_ids::uuid[]) AND runs.worker_id = @worker_id
+    WHERE runs.id = ANY(@run_ids::uuid[]) AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -6748,7 +6781,7 @@ WITH candidates AS MATERIALIZED (
 )
 SELECT runs.id FROM runs
 JOIN owned_candidates candidate ON candidate.run_id = runs.id
-WHERE runs.id = ANY(@run_ids::uuid[]) AND runs.worker_id = @worker_id
+WHERE runs.id = ANY(@run_ids::uuid[]) AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
 ORDER BY runs.id
 FOR UPDATE OF runs;
 
@@ -6768,6 +6801,7 @@ WITH candidates AS MATERIALIZED (
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
   AND r.claim_released_at IS NULL
@@ -6824,6 +6858,7 @@ FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
   AND r.claim_released_at IS NULL
@@ -7369,7 +7404,7 @@ SELECT count(seq)::int FROM run_messages WHERE run_id = @run_id AND seq BETWEEN 
 WITH authorized AS (
     SELECT 1 AS ok FROM runs r
     WHERE r.id = @run_id
-      AND r.worker_id = @worker_id
+      AND r.worker_id = @worker_id AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
       AND r.claim_released_at IS NULL
       AND r.claim_generation = @claim_generation
       -- PRD #1906 M5 (Decision D-D): the isolated-lane purpose check runOwnedByWorker applies,
@@ -8825,7 +8860,7 @@ WITH candidates AS MATERIALIZED (
     FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
-SELECT runs.id, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
+SELECT runs.id, runs.kind, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
        runs.credential_switch_generation, runs.egress_profile_id
 FROM runs WHERE runs.id = @run_id
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
@@ -8956,7 +8991,7 @@ SELECT rp.forge_project_id,
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
-WHERE r.id = @run_id AND r.worker_id = @worker_id;
+WHERE r.id = @run_id AND r.worker_id = @worker_id AND (r.kind <> 'cross_check' OR r.claim_generation > 0);
 
 -- name: ClaimAutopilotTerminalComment :execrows
 -- Atomically claim the single terminal issue comment for an autopilot run (PRD #19
@@ -9285,13 +9320,14 @@ WHERE w.user_id = @user_id
 WITH candidates AS (
 SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
-       (w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs) AS free_slot,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
+       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
+             ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
+       (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               @ephemeral_lease::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
-       (NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+       (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               @ephemeral_lease::interval, now(),
@@ -9302,7 +9338,7 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        )) AS strict_binding,
        (run.worker_id = w.id) AS own_worker,
        (NOT w.ephemeral) AS persistent,
-       (run.worker_id IS NULL OR run.worker_id = w.id
+       (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
@@ -9314,9 +9350,10 @@ CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
     WHERE pr.worker_id = w.id
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-      AND pr.kind <> 'chat'
+      AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
 WHERE run.id = @run_id
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= @heartbeat_cutoff
   AND fn_worker_can_claim(
@@ -9383,7 +9420,8 @@ WHERE run.id = @run_id
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
-SELECT count(*) FILTER (WHERE draining_since IS NULL AND free_slot AND advisory_binding)::bigint AS claimable,
+SELECT count(*) FILTER (WHERE online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
        count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
        count(*) FILTER (WHERE online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
        count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
@@ -9449,7 +9487,7 @@ WHERE w.user_id = @user_id
        OR (SELECT count(*) FROM runs r
             WHERE r.worker_id = w.id
               AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-              AND r.kind <> 'chat') < w.max_concurrent_runs);
+              AND r.kind <> 'chat' AND NOT r.cross_check_lane) < w.max_concurrent_runs);
 
 -- name: CountOnlineWorkersSatisfyingCaps :one
 -- How many of a user's ONLINE, non-draining workers have EFFECTIVE caps
@@ -9692,8 +9730,11 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND (NOT w.ephemeral
+        AND NOT w.maintenance_fenced
+        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+             OR (r.kind = 'cross_check' AND r.worker_id = w.id))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
@@ -9855,8 +9896,11 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND (NOT w.ephemeral
+        AND NOT w.maintenance_fenced
+        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+             OR (r.kind = 'cross_check' AND r.worker_id = w.id))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
@@ -9915,8 +9959,11 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND (NOT w.ephemeral
+        AND NOT w.maintenance_fenced
+        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+             OR (r.kind = 'cross_check' AND r.worker_id = w.id))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
@@ -9968,11 +10015,11 @@ WHERE r.status = 'queued'
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
-        AND (w.max_concurrent_runs IS NULL
+        AND (r.kind = 'cross_check' OR w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
                   WHERE r2.worker_id = w.id
                     AND r2.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-                    AND r2.kind <> 'chat') < w.max_concurrent_runs)
+                    AND r2.kind <> 'chat' AND NOT r2.cross_check_lane) < w.max_concurrent_runs)
   )
   AND NOT EXISTS (
       SELECT 1 FROM workers w2
@@ -10200,7 +10247,7 @@ WHERE id = @id AND user_id = @user_id AND status = 'queued';
 -- worker does not hold returns pgx.ErrNoRows.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = @id AND runs.worker_id = @worker_id
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -10223,7 +10270,7 @@ WITH candidates AS MATERIALIZED (
     FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
-SELECT runs.* FROM runs WHERE runs.id = @id AND runs.worker_id = @worker_id
+SELECT runs.* FROM runs WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
 FOR UPDATE OF runs;
 
@@ -10263,7 +10310,7 @@ WITH ins AS (
     INSERT INTO run_completion_attempts (run_id, contract_revision, unmet, head, worktree_fingerprint)
     SELECT r.id, sqlc.narg('contract_revision'), @unmet::jsonb, sqlc.narg('head'), sqlc.narg('worktree_fingerprint')
     FROM runs r
-    WHERE r.id = @run_id AND r.worker_id = @worker_id AND r.completion_contract_version IS NOT NULL
+    WHERE r.id = @run_id AND r.worker_id = @worker_id AND (r.kind <> 'cross_check' OR r.claim_generation > 0) AND r.completion_contract_version IS NOT NULL
       -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
       -- A CAPABILITY worker stamps claim_generation; a STALE attempt from an OLD flight (its claim
       -- RELEASED by a held-state switch, or SUPERSEDED by a reclaim) inserts NOTHING here, so with the
@@ -10319,7 +10366,7 @@ UPDATE runs SET
         'at', now()
     ),
     updated_at = now()
-WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND runs.completion_contract_version IS NOT NULL
+WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0) AND runs.completion_contract_version IS NOT NULL
   AND EXISTS (SELECT 1 FROM ins)
   -- PRD #1247 M5: mirror the ins CTE's generation fence on the counter/summary UPDATE too, so a
   -- fenced-out attempt updates NOTHING as well as inserting nothing (0 rows -> pgx.ErrNoRows ->
@@ -10556,10 +10603,10 @@ SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' O
 -- name: CreatePlanCrossCheckChild :one
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, trigger_source)
+                  issue_title, issue_description, required_capabilities, trigger_source, worker_id)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, 'codex', 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), 'cross_check'
+       COALESCE(repo.required_capabilities, '{}'), 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
@@ -10703,6 +10750,21 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
   AND lead.harness <> cc.checker_harness
   AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending' AND now() < cc.deadline_at
 RETURNING cc.*;
+
+-- name: GetPlanCrossCheckChildForHealth :one
+SELECT child.id FROM cross_checks cc
+JOIN runs lead ON lead.id = cc.lead_run_id
+JOIN runs child ON child.id = cc.checker_run_id
+WHERE lead.id = @lead_run_id AND cc.stage = 'plan'
+  AND cc.round = (SELECT max(latest.round) FROM cross_checks latest
+                  WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage)
+  AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1))
+  AND cc.verdict = 'pending' AND cc.deadline_at > now()
+  AND cc.lead_claim_generation = lead.claim_generation
+  AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+  AND lead.user_id = child.user_id AND lead.kind <> 'cross_check'
+  AND child.kind = 'cross_check' AND child.target_run_id = lead.id
+  AND child.status = 'queued';
 
 -- name: ResumeWorkerRecoveryEpisode :one
 -- Explicit owner release of an exhaustion hold is the only episode-renewal writer.

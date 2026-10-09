@@ -575,10 +575,11 @@ func TestGateRevisionSameGateReclaimLiveDB(t *testing.T) {
 		f.exec(`UPDATE runs SET status = 'queued' WHERE id = $1`, run)
 		// PRD #1226 M1 D2: an INTERLOCKED run (completion_contract_version set) is claimable
 		// only by a worker whose SELF-REPORTED protocol_capabilities include
-		// completion_interlock_v1; the claim clause reads this from the Go caller's argument,
-		// not a fresh DB read, so extend the fixture worker's capabilities for this claim only.
+		// completion_interlock_v1. Claim rereads the persisted worker under lock, so update
+		// both the request fixture and its database row.
 		interlocked := f.wkr
 		interlocked.ProtocolCapabilities = append(append([]string{}, f.wkr.ProtocolCapabilities...), capability.CompletionInterlockV1)
+		f.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, interlocked.ID, interlocked.ProtocolCapabilities)
 		claim, err := f.svc.Claim(f.ctx, interlocked, nil)
 		if err != nil {
 			t.Fatalf("svc.Claim: %v", err)

@@ -112,6 +112,9 @@ func setupPlanCrossCheckDeletion(ctx context.Context, t *testing.T) *planCrossCh
 func insertPlanCrossCheckDeletionRows(ctx context.Context, t *testing.T, fixture *planCrossCheckDeletionFixture) {
 	t.Helper()
 	f := fixture.f
+	// Child eligibility reads persisted worker negotiation as well as claim parameters.
+	mustExec(ctx, t, f.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`,
+		f.workerID, []string{"codex_harness_v1", "codex_runtime_v2", "cross_check_v1", "codex_custom_model_v1"})
 	mustExec(ctx, t, f.pool, `UPDATE runs SET harness = 'claude', plan_cross_check_required = true,
 		claim_generation = 1 WHERE id = $1`, f.runID)
 	mustExec(ctx, t, f.pool, `INSERT INTO runs

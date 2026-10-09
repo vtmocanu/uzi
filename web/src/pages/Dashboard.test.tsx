@@ -130,6 +130,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     hosted_size: null,
     active_runs: 0,
     max_concurrent_runs: null,
+    active_cross_checks: 0,
+    max_cross_check_slots: null,
     template_declared: null,
     template_reported: null,
     version: null,
@@ -718,6 +720,34 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
   // sets those so the worker appears in the card at all.
   const withStats = (over: Partial<Worker>): Worker =>
     aWorker({ stats_source: "cgroup", stats_mem_bytes: 1_000_000, ...over });
+
+  it("shows separate cap-one badges and drains dedicated cross-checks", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [withStats({
+        busy: true, active_runs: 1, max_concurrent_runs: 1,
+        active_cross_checks: 1, max_cross_check_slots: 1,
+        draining_since: "2026-07-05T12:00:00Z",
+      })],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("Worker load")).toBeTruthy();
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("draining")).toBeTruthy();
+  });
+
+  it("keeps cross-check-only workers draining", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [withStats({
+        active_runs: 0, active_cross_checks: 1, max_cross_check_slots: 1,
+        draining_since: "2026-07-05T12:00:00Z",
+      })],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("draining")).toBeTruthy();
+  });
 
   it("shows the cordoned pill for a drained worker holding no runs", async () => {
     mockApi.listWorkers.mockResolvedValue({

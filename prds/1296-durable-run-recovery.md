@@ -115,11 +115,27 @@ The API stores opaque encrypted Git bundle content. It must not spawn Git, check
 
 Produce a real Git bundle containing a named source ref, not a raw broker delta pack or a patch. Resolve the prerequisite against the actual forge's default history, using a fresh verified forge tip and its merge base with H. The runner clone's private `origin/main`, a prior checkpoint wrapper or an unpublished private base must never be excluded as if the user already had it.
 
+Scoped exception for inventory-guarded capture (#2476): try self-contained first;
+only a size-cap refusal permits a capped thin fallback against the exact cached
+worker-bare default-branch tip and all its merge bases with the captured source,
+without a forge PAT. If a merge base equals source H, exclude H's verified
+parents to keep H advertised; root H keeps the self-contained/oversized outcome.
+Cached dependencies are not a fresh public-availability guarantee. Record actual
+bundle-header prerequisites. Production verifies the guarded bundle in the
+trusted worker bare; isolated no-alternates import is exercised by conformance
+tests, not an additional production capture step. Thin archives are downloadable
+but cannot authorize archive-backed FINAL or source cleanup: retain holds, pins and
+clones until independently verified empty-inventory settlement or owner discard.
+Their ready TTL is normal; custody does not expire, and pod/PVC/hold costs continue.
+Legacy fresh-forge capture and restart/quarantine without the explicit guarded
+fallback option remain unchanged. No automatic reproduction of historical oversized
+captures. Deploy the API release guard before the worker producer.
+
 When no suitable forge-reachable prerequisite exists, use a self-contained bundle within the same size/resource limits; otherwise report the limitation and retain custody. Bundle metadata records the prerequisite SHA(s), original H, source tree, byte count and checksum. A forge base disappearing later through an external history rewrite is an explicit prerequisite failure, not an excuse to call an unusable bundle self-contained.
 
-Use trusted bare-object operations and bounded temporary storage, with no source checkout or repo-controlled hooks/filters. Any authenticated forge fetch obeys the existing reap-before-credentialed-Git boundary. Verify bundle integrity and import into an isolated no-alternates repository supplied only with the verified public prerequisite closure; producer tests must not accidentally borrow the worker's private object store.
+Use trusted bare-object operations and bounded temporary storage, with no source checkout or repo-controlled hooks/filters. Any authenticated forge fetch obeys the existing reap-before-credentialed-Git boundary. Verify bundle integrity and import into an isolated no-alternates repository supplied only with the verified public prerequisite closure; producer tests must not accidentally borrow the worker's private object store. For the scoped guarded fallback above, production verification uses the trusted worker bare and conformance imports use isolated no-alternates destination clones; this does not assert an isolated import on each production capture.
 
-Durably journal the verified bundle file BEFORE binding its byte manifest or starting upload, so a terminal/restart retry re-uploads exactly those bytes without a forge PAT. Pin/journal the verified public prerequisite closure while claim credentials are available if local reproduction may be needed. A production failure surviving beyond the claim is not permission to obtain fresh forge credentials: reproduce only from complete previously verified local inputs before a manifest was bound; otherwise show `needs_action`. Never silently swap a rebuilt bundle's checksum under a bound capture ID or fall back to an unbounded self-contained bundle.
+Durably journal the verified bundle file BEFORE binding its byte manifest or starting upload, so a terminal/restart retry re-uploads exactly those bytes without a forge PAT. Pin/journal the verified public prerequisite closure while claim credentials are available if local reproduction may be needed. For the scoped guarded fallback above, cached closure verifies local import only, not public availability; preserve the isolated no-alternates import contract. A production failure surviving beyond the claim is not permission to obtain fresh forge credentials: reproduce only from complete previously verified local inputs before a manifest was bound; otherwise show `needs_action`. Never silently swap a rebuilt bundle's checksum under a bound capture ID or fall back to an unbounded self-contained bundle.
 
 ### D6: All raw histories are quarantined
 

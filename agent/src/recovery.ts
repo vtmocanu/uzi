@@ -43,7 +43,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
@@ -233,7 +233,7 @@ export interface RecoveryBundleProducer {
   buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string): Promise<RecoveryCoverage>;
   produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult>;
   fetchDefaultTip(
     barePath: string,
@@ -282,9 +282,58 @@ export interface CaptureInput {
   signal?: AbortSignal;
 }
 
+const INVENTORY_READ_CAUSES = [
+  "attribution_unreadable", "clone_ancestor_invalid", "clone_path_invalid",
+  "clone_head_unreadable", "git_or_filesystem_error", "other",
+] as const;
+const INVENTORY_SOURCE_CHECKS = [
+  "execution_tail_present", "boundary_exception", "inventory_read_not_verified",
+  "non_linux_host", "live_attempt_path", "process_not_quiescent_before_git",
+  "process_not_quiescent_after_git", "worktree_status_dirty", "worktree_status_unreadable",
+  "source_identity_changed", "physical_sources_without_boundary",
+] as const;
+type InventorySourceCheck = typeof INVENTORY_SOURCE_CHECKS[number];
+type InventoryReadCause = typeof INVENTORY_READ_CAUSES[number];
+export type InventorySourceDiagnostic =
+  | { check: "inventory_read_not_verified"; cause: InventoryReadCause }
+  | { check: Exclude<InventorySourceCheck, "inventory_read_not_verified"> };
+export interface InventorySourceBoundaryContext {
+  runId: string;
+  generation: number;
+  barePath: string;
+  reportDiagnostic?: (diagnostic: InventorySourceDiagnostic) => unknown;
+}
+
+export function inventoryReadCause(inventory: unknown): InventoryReadCause {
+  const cause = (inventory as { cause?: unknown } | undefined)?.cause;
+  return INVENTORY_READ_CAUSES.find(known => known === cause) ?? "other";
+}
+
+/** First failure wins locally before observer delivery. Observer failures confer no authority. */
+export function inventorySourceReporter(context: InventorySourceBoundaryContext): (diagnostic: InventorySourceDiagnostic) => false {
+  let reported = false;
+  return diagnostic => {
+    if (!reported) {
+      reported = true;
+      try {
+        // Promise resolution guards thenable access/setup and consumes rejection without waiting.
+        const result = context.reportDiagnostic?.(diagnostic);
+        void Promise.resolve(result).catch(() => {});
+      } catch { /* Diagnostics must never change the proof's decision. */ }
+    }
+    return false;
+  };
+}
+
+function inventorySourceReason(diagnostic?: InventorySourceDiagnostic): string {
+  if (!diagnostic) return "inventory_source_not_quiescent";
+  return "inventory_source_not_quiescent:" + diagnostic.check +
+    (diagnostic.check === "inventory_read_not_verified" ? ":" + diagnostic.cause : "");
+}
+
 export interface RecoveryCoordinatorOptions {
   withInventorySourceBoundary?: (
-    context: { runId: string; generation: number; barePath: string },
+    context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ) => Promise<"passed" | "retained">;
   isExecuting?: (runId: string) => boolean;
@@ -352,6 +401,10 @@ const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "upload_transient",
   "credential_rejected",
   "inventory_source_not_quiescent",
+  "inventory_source_not_quiescent:inventory_read_not_verified",
+  ...INVENTORY_SOURCE_CHECKS.filter(check => check !== "inventory_read_not_verified")
+    .map(check => "inventory_source_not_quiescent:" + check),
+  ...INVENTORY_READ_CAUSES.map(cause => "inventory_source_not_quiescent:inventory_read_not_verified:" + cause),
 ]);
 
 /** Which entry point is uploading: picks the transient retry reason and the failure log. */
@@ -944,35 +997,73 @@ export class RecoveryCoordinator {
         typeof h.hold_id === "string" && h.hold_id.length > 0).length === 1;
   }
 
-  /** Persist the exact request before RPC. Lost ACKs replay this identity, never a new archive. */
+  private inventorySourceDiagnostics(context: InventorySourceBoundaryContext, captureId?: string) {
+    let first: InventorySourceDiagnostic | undefined;
+    let logged = false;
+    const logRetention = () => {
+      if (logged) return;
+      logged = true;
+      try {
+        this.log.warn("recovery: inventory source boundary retained", {
+          run_id: context.runId, generation: context.generation,
+          ...(captureId ? { capture_id: captureId } : {}),
+          source_boundary_reason: first?.check ?? "inventory_source_not_quiescent",
+          ...(first?.check === "inventory_read_not_verified" ? { inventory_read_cause: first.cause } : {}),
+        });
+      } catch { /* Logging cannot affect custody. */ }
+    };
+    return {
+      context: { ...context, reportDiagnostic: (diagnostic: InventorySourceDiagnostic) => {
+        if (first || !INVENTORY_SOURCE_CHECKS.includes(diagnostic.check)) return;
+        first = diagnostic.check === "inventory_read_not_verified"
+          ? { check: diagnostic.check, cause: inventoryReadCause(diagnostic) }
+          : { check: diagnostic.check };
+        logRetention();
+      } },
+      reason: () => inventorySourceReason(first),
+      retained: logRetention,
+    };
+  }
+
   private async inventorySourceBoundary(
-    context: { runId: string; generation: number; barePath: string },
+    context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ): Promise<"passed" | "retained"> {
     if (this.withInventorySourceBoundary) return this.withInventorySourceBoundary(context, action);
     // Only positive discovery of zero physical sources permits a callback-free producer.
+    const refuse = inventorySourceReporter(context);
     const prove = async () => {
       const inventory = await this.git.readInventoryCloneHeads?.(context.barePath, context.runId);
-      return inventory?.kind === "verified" && Array.isArray(inventory.clones) && inventory.clones.length === 0;
+      if (inventory?.kind !== "verified" || !Array.isArray(inventory.clones))
+        return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
+      if (inventory.clones.length !== 0) return refuse({ check: "physical_sources_without_boundary" });
+      return true;
     };
-    if (!await prove()) return "retained";
-    await action(prove);
-    return "passed";
+    try {
+      if (!await prove()) return "retained";
+      await action(prove);
+      return "passed";
+    } catch (err) {
+      refuse({ check: "boundary_exception" });
+      throw err;
+    }
   }
 
   private async finalizeInventory(snapshot: RecoveryRecord, reconcile = true): Promise<RecoveryOutcome | void> {
     if (!snapshot.coverageContext || typeof snapshot.generation !== "number") return;
     let outcome: RecoveryOutcome | void = undefined;
     let sourceVerified = true;
-    const result = await this.inventorySourceBoundary({ ...snapshot.coverageContext, generation: snapshot.generation }, async prove => {
+    const diagnostics = this.inventorySourceDiagnostics({ ...snapshot.coverageContext, generation: snapshot.generation }, snapshot.captureId);
+    const result = await this.inventorySourceBoundary(diagnostics.context, async prove => {
       outcome = await this.finalizeInventoryWithinBoundary(snapshot, async () => {
         sourceVerified = await prove();
         return sourceVerified;
       }, reconcile);
     });
     if (result === "retained" || !sourceVerified) {
+      diagnostics.retained();
       const retained = await this.writeExistingRecord(snapshot, cur => ({ ...cur,
-        state: cur.state === "uploaded" ? "uploaded" : "needs_action", reason: "inventory_source_not_quiescent" }));
+        state: cur.state === "uploaded" ? "uploaded" : "needs_action", reason: diagnostics.reason() }));
       return { state: retained.state, captureId: retained.captureId, reason: retained.reason };
     }
     return outcome;
@@ -987,6 +1078,16 @@ export class RecoveryCoordinator {
     if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
     if (!record.inventoryGuarded || record.finalAcknowledged || record.reason === "inventory_quiescence_breach" || !record.coverageDigest ||
         !(await this.inactiveInventory(record))) return;
+    // Archive FINAL releases local custody only with positive, retained-byte evidence.
+    // Settled FINAL has its own independently verified empty-inventory proof.
+    if (record.finalRequest?.disposition.kind !== "settled") {
+      if (record.selfContained !== true || !Array.isArray(record.prerequisiteShas) ||
+          record.prerequisiteShas.length !== 0 || !record.bundlePath) return;
+      try {
+        const header = await readRecoveryBundleHeader(record.bundlePath, record.sourceSha);
+        if (!header.selfContained || header.prerequisiteShas.length !== 0) return;
+      } catch { return; }
+    }
     // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
     if (!record.coverageContext || !this.git.enumerateOwedCandidates) return;
     const unresolved = await this.git.enumerateOwedCandidates(record.coverageContext.barePath, record.runId);
@@ -1247,7 +1348,8 @@ export class RecoveryCoordinator {
         if (!currentSha) continue; // No adopted source or positive tracking proof is not an empty snapshot.
         // freezeInventory alone compares the complete source/tree/context fingerprint.
         // Equal pin lists cannot justify reusing an archive of an earlier disposition source.
-        const boundary = await this.inventorySourceBoundary({ ...ctx, generation: ctx.generation }, async prove => {
+        const diagnostics = this.inventorySourceDiagnostics({ ...ctx, generation: ctx.generation }, original?.captureId);
+        const boundary = await this.inventorySourceBoundary(diagnostics.context, async prove => {
           if (!await this.inactiveInventory(probe) || !await prove()) return;
           const record = await this.freezeInventory({
             context: ctx as PositiveOwedCandidateContext, currentSha, originalSourceSha,
@@ -1255,8 +1357,9 @@ export class RecoveryCoordinator {
           });
           if (record) records.push(record);
         });
+        if (boundary === "retained") diagnostics.retained();
         if (boundary === "retained" && original) {
-          await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: "inventory_source_not_quiescent" }));
+          await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: diagnostics.reason() }));
         }
       } catch (err) {
         this.log.warn("recovery: boot inventory retained; reconstruction failed", { run_id: ctx.runId, generation: ctx.generation, error: errText(err) });
@@ -1408,7 +1511,7 @@ export class RecoveryCoordinator {
       result = await this.git.produceRecoveryBundle(input.barePath, {
         sourceSha: record.sourceSha,
         outPath: tmpPath,
-        forgeTip,
+        ...(record.inventoryGuarded ? { guardedDefaultBranch: input.defaultBranch } : { forgeTip }),
       });
     } catch (err) {
       await fs.rm(tmpPath, { force: true }).catch(() => undefined);
@@ -1470,6 +1573,7 @@ export class RecoveryCoordinator {
         const cur = await this.requireRecord(snapshot);
         if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
+        const header = cur.inventoryGuarded ? await readRecoveryBundleHeader(tmpPath, cur.sourceSha) : undefined;
         await fs.rename(tmpPath, finalPath);
         const bundled: RecoveryRecord = {
           ...cur,
@@ -1479,8 +1583,8 @@ export class RecoveryCoordinator {
           byteSize: result.byteSize,
           checksum: result.checksum,
           chunkCount: result.chunkCount,
-          prerequisiteShas: result.prerequisiteShas,
-          selfContained: result.selfContained,
+          prerequisiteShas: header?.prerequisiteShas ?? result.prerequisiteShas,
+          selfContained: header?.selfContained ?? result.selfContained,
           reason: undefined,
         };
         try {

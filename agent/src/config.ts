@@ -201,6 +201,8 @@ export interface Config {
    *  (Decision 4). Default 1 — one live conversation per user-worker; a second chat
    *  queues until the first ends. The run lane is always a separate concurrent slot. */
   chatSessions: number;
+  /** Dedicated cross-check concurrency, 0 disables polling; maximum 16. */
+  crossCheckSlots: number;
   /**
    * How many issue/ci_fix RUNS the worker executes CONCURRENTLY (PRD #42 Decision
    * 3), bounded by the slot semaphore in worker.ts. Default 1 — the pre-#42 serial
@@ -390,6 +392,13 @@ function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): num
   if (!raw) return fallback;
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function nonNegativeInt(env: NodeJS.ProcessEnv, key: string, fallback: number, max: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 && n <= max ? n : fallback;
 }
 
 /** SUMMARY_MODEL_TIMEOUT_MS, the one parser (summary-runner.ts reads it through this too): a
@@ -584,6 +593,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     chatIdleTimeoutMs: duration(env, "WORKER_CHAT_IDLE_TIMEOUT", "60m"),
     chatPollMs: duration(env, "WORKER_CHAT_POLL_MS", "1000"),
     chatSessions: positiveInt(env, "WORKER_CHAT_SESSIONS", 1),
+    crossCheckSlots: nonNegativeInt(env, "WORKER_CROSS_CHECK_SLOTS", 1, 16),
     // RUN-lane concurrency cap (PRD #42 Decision 3). positiveInt already enforces
     // integer ≥ 1 with fallback to 1, so a blank/zero/negative/fractional value is
     // the safe default. The soft-ceiling warn lives in main.ts (needs the logger,

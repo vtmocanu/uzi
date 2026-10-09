@@ -49,14 +49,16 @@ func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time,
 		allowlist = []uuid.UUID{}
 	}
 	return s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
-		RunID:               runID,
-		HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
-		AffinityCutoff:      pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
-		DockerRepoAllowlist: allowlist,
-		WorkerDockerEnabled: s.effectiveDockerTier,
-		CapabilityAware:     capAware,
-		CodexCuratedModels:  codexCuratedModelsSlice(),
-		EphemeralLease:      LeaseInterval(s.ephemeralLease),
+		RunID:                    runID,
+		HeartbeatCutoff:          pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
+		AffinityCutoff:           pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
+		CrossCheckEvaluatedAt:    pgconv.Time(now),
+		CrossCheckAffinityCutoff: pgconv.Time(now.Add(-s.p.WorkerAffinityGrace)),
+		DockerRepoAllowlist:      allowlist,
+		WorkerDockerEnabled:      s.effectiveDockerTier,
+		CapabilityAware:          capAware,
+		CodexCuratedModels:       codexCuratedModelsSlice(),
+		EphemeralLease:           LeaseInterval(s.ephemeralLease),
 	})
 }
 
@@ -284,6 +286,8 @@ const (
 	// fail or discard. Same fixed-string contract as its siblings.
 	reasonOutcomeUndelivered    = "the run's outcome is journaled on its worker but has not been delivered"
 	reasonPlanCrossCheckWaiting = "waiting for plan cross-check"
+	reasonNoCrossCheckWorker    = "no eligible cross-check worker"
+	reasonCrossCheckSlotsBusy   = "waiting for a cross-check slot"
 	// reasonLongToolCall (issue #2046) flags a running run whose oldest open lead tool call
 	// (delegation dispatches excluded) has been in flight longer than health_tool_call_seconds
 	// while the run itself has gone quiet. It maps to healthStalled, NOT healthSlow: slow
@@ -428,9 +432,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
-		// A live plan cross-check is expected waiting, not an owner-actionable warning.
+		// A live plan cross-check is expected waiting. A worker-pickup nudge would
+		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
-		if reason == reasonPlanCrossCheckWaiting {
+		if reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
 			nudge = false
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -578,6 +583,20 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 			if err != nil {
 				slog.Error("health: read live plan cross-check", "run_id", r.ID, "error", err)
 			} else if live {
+				if reader, ok := s.q.(interface {
+					GetPlanCrossCheckChildForHealth(context.Context, uuid.UUID) (uuid.UUID, error)
+				}); ok {
+					if childID, err := reader.GetPlanCrossCheckChildForHealth(ctx, r.ID); err == nil {
+						if counts, err := s.workerEligibilityForHealth(ctx, now, childID, s.capabilityAwareOn(ctx)); err == nil {
+							if counts.StrictEligible == 0 {
+								return healthWaitingWorker, reasonNoCrossCheckWorker
+							}
+							if counts.Claimable == 0 {
+								return healthWaitingWorker, reasonCrossCheckSlotsBusy
+							}
+						}
+					}
+				}
 				return healthWaitingWorker, reasonPlanCrossCheckWaiting
 			}
 		}
@@ -982,6 +1001,21 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// Read the capability-aware kill-switch ONCE and thread the same value into both the
 	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
 	// counts and the claim path can never disagree on whether capabilities are enforced.
+	if r.Kind == "cross_check" {
+		counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
+		if err != nil {
+			slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
+			return reasonPlanCrossCheckWaiting
+		}
+		if counts.StrictEligible > 0 {
+			if counts.Claimable == 0 {
+				return reasonCrossCheckSlotsBusy
+			}
+			return reasonPlanCrossCheckWaiting
+		}
+		// Diagnose missing rounds/pins below when no worker meets the combined
+		// child contract. StrictEligible includes bound ephemeral checker workers.
+	}
 	capAware := s.capabilityAwareOn(ctx)
 	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
 	if eligibilityErr != nil {
@@ -1150,10 +1184,16 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 					if r.CrossCheckPinRequired {
 						return reasonNoCrossCheckPinCapableWorker
 					}
+					if r.Kind == "cross_check" {
+						return reasonNoCrossCheckWorker
+					}
 					return reasonNoCrossCheckCapableWorker
 				}
 			}
 		}
+	}
+	if r.Kind == "cross_check" {
+		return reasonNoCrossCheckWorker
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is
 	// yielding to interactive work — so its owner gets a reason that says so rather than the
@@ -1223,14 +1263,16 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			}
 		}
 		if claimable, cerr := s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
-			RunID:               r.ID,
-			CodexCuratedModels:  codexCuratedModelsSlice(),
-			AffinityCutoff:      pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
-			HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
-			DockerRepoAllowlist: allowlist,
-			WorkerDockerEnabled: s.effectiveDockerTier,
-			CapabilityAware:     capAware,
-			EphemeralLease:      LeaseInterval(s.ephemeralLease),
+			RunID:                    r.ID,
+			CodexCuratedModels:       codexCuratedModelsSlice(),
+			AffinityCutoff:           pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
+			CrossCheckEvaluatedAt:    pgconv.Time(now),
+			CrossCheckAffinityCutoff: pgconv.Time(now.Add(-s.p.WorkerAffinityGrace)),
+			HeartbeatCutoff:          pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
+			DockerRepoAllowlist:      allowlist,
+			WorkerDockerEnabled:      s.effectiveDockerTier,
+			CapabilityAware:          capAware,
+			EphemeralLease:           LeaseInterval(s.ephemeralLease),
 		}); cerr != nil {
 			slog.Error("health: count workers claimable for run", "run_id", r.ID, "error", cerr)
 		} else if claimable.Claimable == 0 {

@@ -154,14 +154,17 @@ export class Worker {
   private readonly runActive = new Set<Promise<void>>();
   /** The chat lane's in-flight sessions (same reason). */
   private readonly chatActive = new Set<Promise<void>>();
+  /** Cross-check executions consume only their dedicated lane's slots. */
+  private readonly crossCheckActive = new Set<Promise<void>>();
 
   /**
    * issue #1759 M3: true only when this worker executes nothing: no run-lane execution
-   * (issue/ci_fix/judge/review), no chat session, and no entry in the active-run
+   * (issue/ci_fix/judge/review), no chat or cross-check session, and no entry in the active-run
    * registry (when wired). The DinD prune requires it while holding the claim gate.
    */
   isIdle(): boolean {
-    return this.runActive.size === 0 && this.chatActive.size === 0 && (this.activeRuns?.size ?? 0) === 0;
+    return this.runActive.size === 0 && this.chatActive.size === 0 &&
+      this.crossCheckActive.size === 0 && (this.activeRuns?.size ?? 0) === 0;
   }
 
   /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
@@ -377,14 +380,14 @@ export class Worker {
     // alongside the claim loops (it never gates them): an immediate sweep of every due
     // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
     const settlement = this.settlementLoop(signal);
-    // The run lane and the chat lane join the already-running heartbeat until abort.
+    // All three claim lanes join the already-running heartbeat until abort.
     // issue #1759 M3: the DinD prune loop, only when enabled (createDindPrune returned a
     // controller). Its loop never throws.
     const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
     const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
     // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
     const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
-    await Promise.all([heartbeat, rejections, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    await Promise.all([heartbeat, rejections, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -753,6 +756,7 @@ export class Worker {
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
+        if (this.config.crossCheckSlots > 0) protocolCapabilities.push("cross_check_lane_v1");
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,
@@ -761,6 +765,7 @@ export class Worker {
           capabilities,
           protocolCapabilities,
           initialSnapshot,
+          this.config.crossCheckSlots,
         );
         this.log.info("registered", {
           name: this.config.workerName,
@@ -1022,6 +1027,12 @@ export class Worker {
     }
   }
 
+  /** Dedicated cross-check pool, disabled without positive capacity. */
+  private async crossCheckClaimLoop(signal: AbortSignal): Promise<void> {
+    if (!(this.config.crossCheckSlots > 0)) return;
+    await this.claimLoop(signal, true);
+  }
+
   /**
    * The RUN lane, bounded by a slot semaphore (PRD #42 Decision 1). Executes up to
    * WORKER_MAX_CONCURRENT_RUNS issue/ci_fix runs concurrently as tracked promises;
@@ -1038,9 +1049,12 @@ export class Worker {
    * back into the worker bare, and the `Promise.allSettled` drain below then awaits
    * those unwinding executes; see below.
    */
-  private async claimLoop(signal: AbortSignal): Promise<void> {
-    const cap = this.config.maxConcurrentRuns;
-    const active = this.runActive;
+  // Both run-based lanes share admission, snapshot and cleanup mechanics. Each poll is
+  // bounded by httpTimeoutMs; a failed cycle backs off one poll without blocking siblings.
+  private async claimLoop(signal: AbortSignal, crossCheckLane = false): Promise<void> {
+    const cap = crossCheckLane ? this.config.crossCheckSlots : this.config.maxConcurrentRuns;
+    const active = crossCheckLane ? this.crossCheckActive : this.runActive;
+    const lane = crossCheckLane ? "cross-check" : "run";
     const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedAtCapacity = false;
     let loggedQuarantined = false;
@@ -1071,7 +1085,7 @@ export class Worker {
       // loops and keep going. Same sleep-and-continue shape as the gates above; logged once.
       if (residueQuarantine() !== undefined) {
         if (!loggedQuarantined) {
-          this.log.warn("worker residue quarantine latched; the run lane claims nothing until the worker restarts");
+          this.log.warn(`worker residue quarantine latched; the ${lane} lane claims nothing until the worker restarts`);
           loggedQuarantined = true;
         }
         await sleep(this.config.pollIntervalMs, signal);
@@ -1085,7 +1099,7 @@ export class Worker {
         // default cap of 1, where "busy with the one run" is the steady state, not
         // saturation — this keeps the default path's output identical to pre-#42.
         if (cap > 1 && !loggedAtCapacity) {
-          this.log.info("run lane at capacity, deferring claim", { active: active.size, cap });
+          this.log.info(`${lane} lane at capacity, deferring claim`, { active: active.size, cap });
           loggedAtCapacity = true;
         }
         await Promise.race([...active, sleep(this.config.pollIntervalMs, signal)]);
@@ -1120,8 +1134,13 @@ export class Worker {
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.
-        const claim = await this.client.claimRun(this.buildActiveSnapshot(), signal, this.config.httpTimeoutMs);
-        if (claim && this.activeRuns?.has(claim.run_id)) {
+        const claim = crossCheckLane
+          ? await this.client.claimCrossCheck(this.buildActiveSnapshot(), signal, this.config.httpTimeoutMs)
+          : await this.client.claimRun(this.buildActiveSnapshot(), signal, this.config.httpTimeoutMs);
+        if (claim && crossCheckLane && claim.kind !== "cross_check") {
+          this.log.error("cross-check lane returned a non-cross-check claim; refusing to execute",
+            { run_id: claim.run_id, kind: claim.kind });
+        } else if (claim && this.activeRuns?.has(claim.run_id)) {
           // PRD #1390 M3 (blocker 7) — belt-and-braces duplicate-claim assertion. The
           // server-side pre-claim dedupe (M3 api) is the real guard; this is the loud last
           // line of defence. The claim loop tracks in-flight PROMISES, not run ids, so a
@@ -1138,7 +1157,6 @@ export class Worker {
             { run_id: claim.run_id },
           );
         } else if (claim) {
-          claimed = true;
           // PRD #400 M4b: a DIFF-REVIEW claim is a `task`-kind claim carrying a non-null
           // review_target_run_id — routed to the slim ReviewRunner (clone + diff + reviewer
           // model, report-only) FIRST, before the kind switch, since it is a task by kind
@@ -1185,6 +1203,7 @@ export class Worker {
           const run = exec.catch((err) =>
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
           );
+          claimed = true;
           active.add(run);
           // issue #1759: the ending is activity the DinD prune's custody check orders against.
           void run.finally(() => {

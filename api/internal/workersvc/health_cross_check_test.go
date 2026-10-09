@@ -22,9 +22,9 @@ func TestHealthCrossCheckPinsWorkerReason(t *testing.T) {
 		want                         string
 	}{
 		{"missing pin support", true, false, true, reasonNoCrossCheckPinCapableWorker},
-		{"unPinned old worker", false, false, true, reasonWaitingWorker},
-		{"pin aware worker", true, true, true, reasonWaitingWorker},
-		{"missing check support", false, false, false, reasonNoCrossCheckCapableWorker},
+		{"unPinned old worker", false, false, true, reasonPlanCrossCheckWaiting},
+		{"pin aware worker", true, true, true, reasonPlanCrossCheckWaiting},
+		{"missing check support", false, false, false, reasonNoCrossCheckWorker},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := stalledRunRow()
@@ -42,6 +42,9 @@ func TestHealthCrossCheckPinsWorkerReason(t *testing.T) {
 				caps = append(caps, capability.CrossCheckPinsV1)
 			}
 			fs.crossCheckWorkers = []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: caps}}
+			if tc.checkAware && (!tc.pinned || tc.pinAware) {
+				fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1, Claimable: 1}
+			}
 			svc.detectRunHealth(context.Background(), t0)
 			if w := lastWrite(t, fs, r.ID); w.HealthReason.String != tc.want {
 				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)

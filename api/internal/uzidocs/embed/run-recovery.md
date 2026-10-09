@@ -18,8 +18,8 @@ uzi captures at other boundaries too, not only at final failure: when a run
 is parked (a usage limit or a recovery wait) or gracefully stopped while it
 holds committed work, uzi archives that exact work before its source can be
 torn down. For guarded generations, release requires final acknowledgment
-of a covering archive or a verified empty inventory, not just publication
-of the current head. Legacy generations can release on proof that their
+of a covering, prerequisite-free archive or a verified empty inventory, not
+just publication of the current head. Legacy generations can release on proof that their
 recorded work is published. If the boundary cannot verify and resolve the
 source, it keeps the source held for you to decide (see below). A hard
 crash with no shutdown window — a killed node, an out-of-memory kill — is
@@ -104,7 +104,7 @@ uzi run export <run-id> --output ./recovered.bundle
   exactly one `available` capture, export uses it; with more than one, it
   refuses to guess and lists every capture's id and state so you can pick
   with `--capture <id>`.
-- **Verified and atomic.** The byte count and checksum are verified against
+- **Byte-verified and atomic.** The byte count and checksum are verified against
   the server's manifest before the file is written, and the destination is
   never overwritten (an existing file or symlink there is refused).
 - **No partial files.** An interrupted, corrupt, or expired download exits
@@ -120,23 +120,41 @@ A downloaded archive is a real Git bundle with a dedicated
 repo:
 
 ```sh
-git bundle verify recovered.bundle
 git clone <your-forge-repo-url> recovered-repo
 cd recovered-repo
+git bundle verify ../recovered.bundle
 git fetch ../recovered.bundle refs/heads/recovered-source:refs/heads/recovered-source
 git checkout recovered-source
 ```
 
-Where possible the bundle relies on your repo's existing default-branch
-history as its prerequisite (so it stays small); when no such history was
-reachable, it is self-contained instead. The original commits retain
-identical commit ids, parent relationships, trees, and binary contents.
+Run verification inside the destination clone **before importing or discarding
+retained source**. Every required prerequisite commit must already exist in that
+clone. The download's byte count and checksum verify the file against its
+manifest; they do not prove that those external commits are available. If
+verification fails because dependencies are missing (for example after a forge
+history rewrite), keep custody and recover the missing history from retained
+source before importing. Do not discard the source on the strength of a checksum.
+
+Inventory-guarded capture tries a self-contained bundle first. Only a size-cap
+refusal permits a thin fallback using the exact worker-bare cached default-branch
+tip and **all** its merge bases with the captured source. If a merge base equals
+the source H, it excludes H's verified parents instead so H remains in the
+bundle; a root H has no useful boundary and keeps the self-contained/oversized
+outcome. This needs no forge PAT
+and makes no fresh public-availability guarantee. The prerequisite list records
+the dependencies actually written in the bundle header. Legacy capture using a
+fresh verified forge tip is unchanged; restart and quarantine capture without the
+explicit guarded fallback option stays self-contained. The thin fallback obeys
+the same byte cap as self-contained capture. Historical oversized
+captures are not automatically reproduced. Original commits retain identical
+commit ids, parent relationships, trees, and binary contents.
 
 For an inventory-guarded capture, `recovered-source` can be a **synthetic
 aggregate**, with the current source tree and the retained divergent heads
 in its ancestry. It is not necessarily an original agent commit, and its
 tree does not combine the contents of those divergent heads. Inspect the
-ancestor history, then check out the exact original SHA you need:
+ancestor history and **every original root**, not just the aggregate tree, then
+check out each exact original SHA you need:
 
 ```sh
 git log --graph --oneline recovered-source
@@ -158,7 +176,7 @@ operator-configurable environment variable on the API:
 
 | Limit | Default | Meaning |
 |---|---|---|
-| Max bundle size | 64 MiB | A larger archive is refused, not truncated; the source stays retained and is retried once capacity allows. |
+| Max bundle size | 64 MiB | A larger archive is refused, not truncated. Guarded capture may fall back to a capped thin bundle; if capture still fails, the source stays retained. Historical oversized captures are not automatically reproduced. |
 | Ready payload per owner | 1 GiB | Total bytes of *your* ready (downloadable) archives. |
 | Instance byte quota | 4 GiB | Total ready bytes across the whole deployment (scoped to the owner who breached it, never a global stop). |
 | Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. |
@@ -232,8 +250,13 @@ current source tree. This aggregate never becomes the task branch or a
 checkpoint, and introduces no new publication path.
 
 Custody transfers only after the API acknowledges the final disposition:
-either the exact selected available archive (capture id, source SHA and
-`coverage_digest`) or a verified empty inventory with settlement evidence.
+either the exact selected available, prerequisite-free archive (capture id,
+source SHA and `coverage_digest`) or a verified empty inventory with settlement
+evidence. A thin archive is downloadable but never authorizes archive-backed
+FINAL or source cleanup, even when it covers every original root. Holds, pins and
+clones remain retained until independently verified empty-inventory settlement
+or explicit owner discard. There is no automatic thin-archive pod retirement;
+pod, PVC and hold costs continue.
 The owner-readable receipt remains visible through `uzi run recovery`, and
 the selected available archive remains downloadable through `uzi run export`
 after the hold closes, including after worker deletion. This receipt is an
@@ -299,8 +322,12 @@ local worker row exists. Physical worker deletion renews its configured
 normal ready-retention window (7 days by default) and clears the server's
 local-replica marker; protection is not perpetual. Local acknowledgment
 cleanup leaves that marker and the archive's expiry unchanged. Earlier
-non-final and legacy ready captures keep their existing TTL. Size limits,
+non-final and legacy ready captures keep their existing TTL, including thin
+captures. Custody itself does not expire when a download expires. Size limits,
 quotas, owner-only access and explicit discard behavior are unchanged.
+
+Operational rollout: deploy the API's prerequisite-release guard before deploying
+the worker producer that can emit guarded thin archives.
 
 ### Published checkpoint refs
 
@@ -410,7 +437,8 @@ you. Each row offers the right action for its state:
 - **Export archive** — download a ready archive (same bundle as `uzi run
   export`). Downloading does not itself release custody. Legacy holds can
   release automatically when an archive becomes ready; guarded holds await
-  final inventory acknowledgment even if an earlier archive is available.
+  a verified final disposition even if an archive is available; prerequisites
+  prevent archive-backed final custody release.
   An Export-only row is not proof that guarded custody has closed.
 - **Discard held work** — for a hold whose source may be the only copy (no
   ready archive can restore it), permanently release custody so the worker
@@ -461,16 +489,18 @@ yet downloadable, and an earlier archive may omit latest worker-local work. Thes
 capture facts do not settle the owner decision or implicitly release custody.
 Other terminal holds without a verified available capture report `source_only`,
 rather than `active_protected`. An inventory-guarded hold also reports `source_only` while an
-earlier archive is downloadable: that archive does not cover the full inventory
-and does not settle custody. Recorded evidence or uncertainty at exhaustion holds the
+archive is downloadable: coverage may be incomplete, or the archive may require
+external commits even when it covers every root. Availability does not settle
+custody. Recorded evidence or uncertainty at exhaustion holds the
 run for owner Resume; the MAC rejection grants no extra allowance. Absence of
 recorded evidence does not prove absence of unrecorded worker work:
 
 > no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)
 
 A rejected record cannot supply a source head or make an archive exportable.
-Export is offered when an independently verified capture is available; an
-independently verified pin must first produce an available archive.
+Export is offered when a capture is available, including a thin capture; a
+verified pin must first produce an available archive. Export verifies bytes only;
+verify Git dependencies in the destination clone before import or source discard.
 
 The worker negotiates `terminal_rejection_report` through registration's
 `protocol_features`. Without support it sends neither the diagnostic POST

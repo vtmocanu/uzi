@@ -602,8 +602,9 @@ of the runtime kill switch. Older workers snapshot disabled/0 and park REVISE;
 capable zero-budget workers park with `revisions exhausted`. The API stores
 `cross_checks` and a report-only Codex child atomically through existing credential resolution.
 The lead retains its Claude credential, the child its Codex credential and
-usage attribution. The child has its own checkout, ordinary run slot and
-expedite priority; it publishes no branch/MR. The lead retains its slot while
+usage attribution. The child has its own checkout, dedicated cross-check slot
+(or a legacy plan-stage run slot during a mixed-image roll) and expedite
+priority; it publishes no branch/MR. The lead retains its slot while
 waiting, with pending wait excluded from its wall budget and banked on
 settlement. Each candidate's fresh server verdict deadline includes queue time.
 
@@ -665,7 +666,8 @@ isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
 confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. Automatic rounds extend the original #2149
+rationale, validation provenance and pending hosted acceptance. Automatic
+rounds extend the original #2149
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
 [ADR-2149's dated extension](adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150);
 local round/recovery proofs do not establish hosted authenticated model acceptance.
@@ -702,9 +704,59 @@ editable but inactive; only a Codex checker checks a Claude lead today.
 See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
 decision and validation limits, and
 [configuration](docs/configuration.md#plan-cross-check-model-and-effort-pins)
-for the settings contract. Dedicated slots (#2169), Codex-lead checking
-(#2460) and Code cross-check (#2170) remain
-outside this implementation.
+for the settings contract. Codex-lead checking (#2460) and Code cross-check
+(#2170) remain outside this implementation.
+
+PRD #2169 adds a third worker claim pool beside run and chat:
+`POST /api/worker/runs/claim?lane=cross_check`, bounded by
+`WORKER_CROSS_CHECK_SLOTS` (default 1, range 0–16). New agent registration always sends
+`max_cross_check_slots`, including zero; only a positive setting advertises
+`cross_check_lane_v1` and starts polling. Legacy fallback requires both a
+NULL cap and absence of that capability. Explicit zero or incomplete
+lane-aware negotiation cannot fall back.
+
+The shared `ClaimRun` transaction locks and re-reads the worker in a separate
+statement before selecting a child under READ COMMITTED; a lock inside the
+selection statement would leave its occupancy snapshot stale after a wait.
+The lane retains run claim-generation, credential, custody, snapshot and
+overflow fences through the existing claim/finish paths. The shared
+`fn_cross_check_child_eligible` predicate serves claim, health and
+provisioning; other claim guards remain at their callers.
+
+A generation-zero child is pinned through `worker_id` to the lead's worker,
+ordered own-first, with same-user fallback after `WORKER_AFFINITY_GRACE`
+(default 2m). A cordoned worker admits its pinned child; maintenance fencing
+and quarantine still apply. Ephemeral workers admit their bound parent's
+child or their own provisioned child, preserve the parent lease binding even
+on legacy fallback, and cannot lease, tear down or reap while a child is active.
+An eligible own lane with space suppresses an extra pod; full or unsupported
+capacity keeps existing provisioning caps and saturation policy.
+
+Migration 00313 records occupancy in `runs.cross_check_lane` and its
+claim-generation history in `cross_check_lane_generation`. Queuing clears
+the bool, including older API writes; same-generation recovery restores lane
+accounting independently of later advertisements, while a new generation
+replaces history. Run load excludes dedicated occupancy; legacy children
+still count as runs. A valid advertised lane allowance extends the live
+snapshot budget of run cap + 2; the absolute entry ceiling remains.
+
+Owner/admin worker DTOs expose `active_cross_checks` and
+`max_cross_check_slots` separately. Web capacity can show `1/1 runs` and
+`1/1 cross-checks`; CLI lists use `RUN SLOTS` and `CROSS-CHECKS`. Draining
+counts the checker pool, and existing active checks stay visible if the cap
+becomes unknown or disabled. Fleet run-slot totals retain their run-lane
+meaning; children remain hidden in the Runs list.
+
+Hosted configuration relays `workers.crossCheckSlots` →
+`UZI_WORKER_CROSS_CHECK_SLOTS` → `RenderConfig` →
+`WORKER_CROSS_CHECK_SLOTS`, preserving zero. Slot changes alter the spec hash
+and roll workers without increasing preset memory. Lead/checker memory is
+shared; default-one headroom and hosted acceptance remain unmeasured/pending.
+Checkout confinement does not prove network isolation or remove same-uid
+process residuals; the hosted uid split depends on the configured profile.
+See [ADR-2169](adr/2169-cross-check-lane.md) for the additional history
+column, rollback and proof limits, and [PRD #2169](prds/2169-cross-check-lane.md)
+for decisions and the pending acceptance checklist.
 
 ### Run lifecycle
 
@@ -1339,7 +1391,9 @@ chain in the diagram above, with no intervening `running`.
 - **Bounded worker concurrency** (PRD #42, `adr/0042-worker-run-concurrency.md`): a
   worker may drive several of these state machines at once, capped by a worker-side
   slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1, the serial behavior
-  above) that the worker advertises at registration but the server never enforces.
+  above) that the worker advertises at registration. Legacy plan checker
+  admission also observes the advertised run cap; dedicated checkers use their
+  separate advertised cap and tracked pool (PRD #2169).
   A run parked at `awaiting_approval` holds its slot. Cap>1 is an informed opt-in
   with one accepted intra-user residual (Bash writes reaching outside a run's own
   worktree); the sibling push-credential read is closed by the PRD #51 uid split on
@@ -1595,7 +1649,7 @@ uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slac
 uzi's fifth surface is a conversational one: a **Chat** page, and since PRD #191 a **Slack DM** to the bot (see the Slack section above), where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft forge issues or start runs the user confirms. It adds **no new service and no new trust boundary**: chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/done/39-chat-agent.md`); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
 
 - **Chat is a run kind, not a new service.** A conversation is one `chat` run: `repo_id`/`issue_iid`/`branch` all NULL (`runs.repo_id` was made nullable, with `runs_kind_shape` enforcing the all-NULL shape for chat and the existing NOT-NULL shape for every other kind). The first user message and every follow-up are ordinary `run_user_inputs` (`kind='follow_up'`) rows — the initial message is atomically seeded into `run_user_inputs` by `CreateChatRun` so a chat can never exist without its first message — and the whole conversation streams through the same persisted-first `run_messages` → `/api/ws` pipeline (with REST replay) as any run. Chat runs are excluded from the board, the runs list, and the admin runs list (they have no repo/issue), but an individual chat is still openable owner-or-admin via the run view (`GET /api/runs/:id`).
-- **A dedicated claim lane, narrower credentials.** The worker polls a second, independent claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold (no clone, worktree, or provisioning). The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** (the `ForgePAT` field does not exist on it), one tier narrower than a run claim. A chat needs no repo and no forge connection: a user with only an Anthropic token can still chat.
+- **A dedicated claim lane, narrower credentials.** The worker polls an independent chat claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold (no clone, worktree, or provisioning). The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** (the `ForgePAT` field does not exist on it), one tier narrower than a run claim. A chat needs no repo and no forge connection: a user with only an Anthropic token can still chat.
 - **`ChatRunner`, not `RunRunner`.** Chat has its own slim runner (claim → session loop → complete) with no git/clone/push/MR spine. The `ChatExecutor` runs the SDK session at the baked source under a **deny-by-default tool surface**: `tools` restricted to `Read`/`Grep`/`Glob` plus the uzi MCP tools (not `allowedTools`, which does not confine under `bypassPermissions`), with `disallowedTools`, `settingSources: []`, the Bash deny-hook, and the **path-guard hook rooted at `/opt/uzi-src`** (the load-bearing protection is the outside-root deny, since the token file lives outside the baked root, plus the `/proc` deny closing the one non-Bash egress for `CLAUDE_CODE_OAUTH_TOKEN`). No Bash, Write/Edit, WebFetch/WebSearch, or subagents. Lifecycle is idle-bounded + per-turn wall-clocked + turn-capped (server-enforced from persisted inputs); an idle sweep replaces the global `RUN_TIMEOUT`. An idle-ended conversation is resumable via **Continue** (a new chat run carrying `resume_of_run_id`).
 - **Baked source, never a clone.** uzi's own source is copied into the worker image at build time to `/opt/uzi-src` (read-only, root-owned) with a `BUILD_INFO` stamp, so the agent's answers match the *deployed* version exactly and need no PAT and no network, the same bundle-at-build discipline the docs section uses. This moved the agent image's build context to the repo root with a per-Dockerfile ignore that hard-excludes `.env*`, `.git`, `inspiration/`, and `node_modules` (committed history is never baked).
 - **uzi tools are an in-worker MCP server** (`agent/src/uzi-tools.ts`, the `signals.ts` precedent): `list_runs`/`get_run`/`get_run_messages` read the worker's **own user's** runs (user-scoped worker endpoints `GET /api/worker/chat/runs*` filtering by the authenticated worker's `user_id`, never a bare run id, so a foreign id is a 404), and `propose_issue` drafts on the **current** chat run only (closure-scoped) and **never writes the forge**. All forge- and model-derived text the read tools return is wrapped in an **untrusted-evidence fence** with a per-call CSPRNG nonce in the closing sentinel, the same posture `ci_fix` uses for job logs. `start_run` and, since PRD #322, `cancel_run`/`steer_run` each emit a **card only** (`run_request`/`cancel_request`/`steer_request`) and make no mutating call, so the run write happens on the human's click or Steer thread-reply through the presser's own connection, resolved against the owner-scoped `SubmitInput` (no new endpoint, run kind, or migration).
@@ -2087,8 +2141,8 @@ thrash-cooldown-as-capacity-signal — is in
 
 Issue #1760 adds a separate DinD-only arm for sustained fresh byte or inode
 pressure. All non-terminal worker-owned runs, including parks and approval waits,
-block it. Requested maintenance drains new run/chat claims while owned runs may
-resume; only an atomic terminal-only claim fence, drained local activity and fresh
+block it. Requested maintenance drains unrelated run, chat and cross-check
+claims while owned runs and pinned plan checkers may finish; only an atomic terminal-only claim fence, drained local activity and fresh
 custody clearance permit gated anonymous-volume prune and stop authorization.
 The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.

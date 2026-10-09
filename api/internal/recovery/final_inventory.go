@@ -138,7 +138,7 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 			return apitypes.RecoveryReleaseResponse{}, err
 		}
 		if cap.SourceSha != f.SourceSha || cap.CoverageDigest.String != f.CoverageDigest ||
-			!cap.ManifestBound || cap.State != "available" || !cap.ExpiresAt.Valid || !cap.ExpiresAt.Time.After(time.Now()) {
+			!cap.ManifestBound || len(cap.PrerequisiteShas) != 0 || cap.State != "available" || !cap.ExpiresAt.Valid || !cap.ExpiresAt.Time.After(time.Now()) {
 			return apitypes.RecoveryReleaseResponse{}, ErrManifestConflict
 		}
 		if s.limits.ReadyRetention < time.Second {

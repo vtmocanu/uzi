@@ -358,15 +358,17 @@ describe("custodyHoldView — attention → presentation + actions (D6/D8/D9)", 
     expect(v.actions).toEqual(["discard"]);
   });
 
-  it("keeps an earlier archive distinct from final guarded inventory coverage", () => {
+  it("keeps archive availability distinct from coverage and recovery independence", () => {
     const v = custodyHoldView(hold({
       attention: "source_only",
       inventory_guarded: true,
       has_available_capture: true,
       capture_state: "available",
     }));
-    expect(v.summary).toContain("An earlier recovery archive is available");
-    expect(v.summary).toContain("final inventory coverage is pending");
+    expect(v.summary).toContain("A recovery archive is available");
+    expect(v.summary).toContain("custody remains unresolved");
+    expect(v.summary).toContain("Coverage may be incomplete");
+    expect(v.summary).toContain("external commits even when all retained roots are covered");
     expect(v.autoReleasing).toBe(false);
     expect(v.needsDecision).toBe(true);
     expect(v.actions).toEqual(["discard"]);

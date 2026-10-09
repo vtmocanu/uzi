@@ -1017,6 +1017,8 @@ type Run struct {
 	WorkerRecoveryEpisode     int64              `json:"worker_recovery_episode"`
 	RequeueEpisodeBaseline    int32              `json:"requeue_episode_baseline"`
 	WorkerRecoveryEvidence    []byte             `json:"worker_recovery_evidence"`
+	CrossCheckLane            bool               `json:"cross_check_lane"`
+	CrossCheckLaneGeneration  pgtype.Int8        `json:"cross_check_lane_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -1491,6 +1493,7 @@ type Worker struct {
 	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
 	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
 	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
+	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
 }
 
 type WorkerActiveRun struct {

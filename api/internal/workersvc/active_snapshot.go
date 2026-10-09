@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"log/slog"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -268,6 +270,10 @@ func normalizeActiveSnapshot(p Params, wkr store.Worker, snap *ActiveSnapshot, m
 	liveCap := p.ActiveSnapshotMaxEntries
 	if wkr.MaxConcurrentRuns.Valid {
 		liveCap = int(wkr.MaxConcurrentRuns.Int32) + 2
+		if wkr.MaxCrossCheckSlots.Valid && wkr.MaxCrossCheckSlots.Int32 >= 0 && wkr.MaxCrossCheckSlots.Int32 <= 16 &&
+			slices.Contains(wkr.ProtocolCapabilities, capability.CrossCheckLaneV1) {
+			liveCap += int(wkr.MaxCrossCheckSlots.Int32)
+		}
 	}
 	if liveCount > liveCap {
 		return nil, "snapshot exceeds the live-entry cap"

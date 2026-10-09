@@ -72,7 +72,7 @@ for (const value of [" ", "{", JSON.stringify({ runId: "other-run" })]) {
   it(`malformed nonempty journal still refuses inventory (${JSON.stringify(value)})`, async () => {
     await withJournalInventory(async f => {
       f.config(value);
-      assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare, "run-current"), { kind: "unknown" });
+      assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare, "run-current"), { kind: "unknown", cause: "attribution_unreadable" });
     });
   });
 }
@@ -182,10 +182,131 @@ for (const latestJournal of [false, true]) {
       }
       await fs.rename(path.join(clone, ".git", "HEAD"), path.join(clone, ".git", "saved-HEAD"));
       await fs.symlink(path.join(clone, ".git", "saved-HEAD"), path.join(clone, ".git", "HEAD"));
-      assert.deepEqual(await restartedCache.readInventoryCloneHeads(bare, context.runId), { kind: "unknown" });
+      assert.deepEqual(await restartedCache.readInventoryCloneHeads(bare, context.runId), { kind: "unknown", cause: "clone_head_unreadable" });
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 }
+
+type ReaderInternals = {
+  runGit(cwd: string, args: string[]): Promise<string>;
+  readAllAttemptLedgerRaw(bare: string): Promise<Map<string, string>>;
+  readAllAttemptLedgers(bare: string): Promise<Map<string, unknown>>;
+  classifyOwnerClonePath(...args: string[]): Promise<unknown>;
+  withLock<T>(bare: string, fn: () => Promise<T>): Promise<T>;
+};
+
+for (const site of ["config", "raw ledger", "parsed ledger", "owner path", "entry resolution", "lock"] as const)
+  for (const message of ["opaque failure A", "/private/fixture/value B"]) {
+    it(`#2507 reader classifies ${site} independently of raw error ${message}`, async (t) => {
+      const f = await inventoryFixture(false);
+      try {
+        const internal = f.cache as unknown as ReaderInternals;
+        const fail = async () => { throw new Error(message); };
+        if (site === "config") t.mock.method(internal, "runGit", fail);
+        if (site === "raw ledger") t.mock.method(internal, "readAllAttemptLedgerRaw", fail);
+        if (site === "parsed ledger") t.mock.method(internal, "readAllAttemptLedgers", fail);
+        if (site === "owner path") t.mock.method(internal, "classifyOwnerClonePath", fail);
+        if (site === "entry resolution") t.mock.method(f.cache, "resolveRecoveryBareDir", fail);
+        if (site === "lock") t.mock.method(internal, "withLock", fail);
+        assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare, inventoryRun),
+          { kind: "unknown", cause: site === "lock" ? "other" : "git_or_filesystem_error" });
+      } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+    });
+  }
+
+it("#2507 reader entry guards classify other and verified carries no cause", async () => {
+  const f = await inventoryFixture(false);
+  try {
+    assert.deepEqual(await f.read(), emptyInventory);
+    assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare, ""), { kind: "unknown", cause: "other" });
+    assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare + "-mismatch", inventoryRun),
+      { kind: "unknown", cause: "other" });
+  } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+});
+
+for (const shape of ["canonical key", "outside root", "unnormalized", "clone file"] as const) {
+  it(`#2507 reader identifies invalid clone path ${shape}`, async () => {
+    const f = await inventoryFixture(false);
+    try {
+      if (shape === "canonical key") f.journal({ runId: inventoryRun, clonePath: f.clone + ".bad" });
+      if (shape === "outside root") f.journal({ runId: inventoryRun, clonePath: "/outside/issue-2433" });
+      if (shape === "unnormalized") f.journal({ runId: inventoryRun, clonePath: f.parent + "/../" + path.basename(f.parent) + "/" + path.basename(f.clone) });
+      if (shape === "clone file") {
+        await fs.mkdir(f.parent, { recursive: true });
+        await fs.writeFile(f.clone, "unsafe leaf");
+      }
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
+    } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
+it("#2507 clone-leaf IO remains distinct from ancestor and HEAD IO", async t => {
+  const f = await inventoryFixture(false);
+  try {
+    await fs.mkdir(f.parent, { recursive: true });
+    const original = fs.lstat;
+    t.mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
+      if (String(args[0]) === f.clone) throw Object.assign(new Error("opaque leaf failure"), { code: "EIO" });
+      return original(...args);
+    }) as typeof fs.lstat);
+    assert.deepEqual(await f.read(), { kind: "unknown", cause: "git_or_filesystem_error" });
+  } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+});
+
+for (const invalid of ["syntax", "sha", "oversized HEAD", "HEAD directory", "missing gitdir",
+  "gitdir symlink", "ref traversal", "ref parent file", "oversized ref", "missing packed ref", "HEAD IO"] as const) {
+  it(`#2507 reader categorizes bounded HEAD/ref failure ${invalid}`, async t => {
+    const f = await inventoryFixture(false);
+    try {
+      const gitdir = path.join(f.clone, ".git");
+      await fs.mkdir(gitdir, { recursive: true });
+      const head = path.join(gitdir, "HEAD");
+      await fs.writeFile(head, "a".repeat(40));
+      if (invalid === "syntax") await fs.writeFile(head, "ref: bad");
+      if (invalid === "sha") await fs.writeFile(head, "unreadable-sha");
+      if (invalid === "oversized HEAD") await fs.writeFile(head, "a".repeat(1024 * 1024 + 1));
+      if (invalid === "HEAD directory") { await fs.unlink(head); await fs.mkdir(head); }
+      if (invalid === "missing gitdir") await fs.rm(gitdir, { recursive: true });
+      if (invalid === "gitdir symlink") { await fs.rename(gitdir, gitdir + "-saved"); await fs.symlink(gitdir + "-saved", gitdir); }
+      if (invalid === "ref traversal") await fs.writeFile(head, "ref: refs/heads/../escape");
+      if (invalid === "ref parent file") {
+        await fs.writeFile(head, "ref: refs/heads/task");
+        await fs.writeFile(path.join(gitdir, "refs"), "unsafe directory");
+      }
+      if (invalid === "oversized ref") {
+        await fs.writeFile(head, "ref: refs/heads/task");
+        await fs.mkdir(path.join(gitdir, "refs", "heads"), { recursive: true });
+        await fs.writeFile(path.join(gitdir, "refs", "heads", "task"), "b".repeat(1024 * 1024 + 1));
+      }
+      if (invalid === "missing packed ref") await fs.writeFile(head, "ref: refs/heads/task");
+      if (invalid === "HEAD IO") {
+        const original = fs.open;
+        t.mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
+          if (String(args[0]) === head) throw new Error("opaque HEAD failure");
+          return original(...args);
+        }) as typeof fs.open);
+      }
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_head_unreadable" });
+    } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
+it("#2507 packed fallback success and missing siblings never leave a stale cause", async () => {
+  const f = await inventoryFixture(false);
+  try {
+    const gitdir = path.join(f.clone, ".git");
+    await fs.mkdir(gitdir, { recursive: true });
+    await fs.writeFile(path.join(gitdir, "HEAD"), "ref: refs/heads/task");
+    await fs.writeFile(path.join(gitdir, "packed-refs"), "a".repeat(40) + " refs/heads/task\n");
+    const result = await f.read();
+    assert.deepEqual(result, { kind: "verified", heads: ["a".repeat(40)],
+      clones: [{ clonePath: f.clone, branch: "task", runId: inventoryRun }], foreignOwners: [] });
+    const later = f.clone + "-later";
+    f.journal({ runId: inventoryRun, clonePath: later }, false, "later");
+    await fs.writeFile(later, "unsafe leaf");
+    assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
+  } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+});
 
 const inventoryRun = "run-inventory";
 const inventoryAttempt = "20260907T030405Z-g3-0123456789abcdef";
@@ -216,7 +337,7 @@ async function inventoryFixture(attempt: boolean) {
     if (attempt) ledger({ attemptId: inventoryAttempt, runId: inventoryRun, clonePath: clone, state: "live" });
     const read = () => new GitCache(data, nullLogger(), undefined, testGitCacheOptions())
       .readInventoryCloneHeads(bare, inventoryRun);
-    return { root, bare, runner, parent, clone, canonical, journal, ledger, read, git };
+    return { root, bare, runner, parent, clone, canonical, journal, ledger, read, git, cache };
   } catch (err) {
     await fs.rm(root, { recursive: true, force: true });
     throw err;
@@ -274,7 +395,7 @@ for (const attempt of [false, true]) {
             if (unsafe === "symlink") await fs.mkdir(destination);
             await fs.symlink(destination, target);
           }
-          assert.deepEqual(await f.read(), { kind: "unknown" });
+          assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_ancestor_invalid" });
         } finally { await fs.rm(f.root, { recursive: true, force: true }); }
       });
     }
@@ -292,7 +413,7 @@ for (const attempt of [false, true]) {
         }) as typeof fs.lstat);
         try {
           await fs.mkdir(f.parent, { recursive: true });
-          assert.deepEqual(await f.read(), { kind: "unknown" });
+          assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_ancestor_invalid" });
           assert.equal(injected, true);
         } finally {
           stub.mock.restore();
@@ -309,7 +430,7 @@ for (const malformed of ["journal", "ledger"]) {
     try {
       if (malformed === "journal") f.journal({ runId: inventoryRun });
       else f.ledger({ attemptId: inventoryAttempt, state: "invalid" });
-      assert.deepEqual(await f.read(), { kind: "unknown" });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "attribution_unreadable" });
     } finally { await fs.rm(f.root, { recursive: true, force: true }); }
   });
 }
@@ -320,7 +441,7 @@ for (const owner of ["missing", "wrong"]) {
     try {
       if (owner === "missing") f.git(["-C", f.bare, "config", "--local", "--unset-all", "uzi-attempts.task.entry"]);
       else f.ledger({ attemptId: inventoryAttempt, runId: "other-run", clonePath: f.clone, state: "live" });
-      assert.deepEqual(await f.read(), { kind: "unknown" });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
     } finally { await fs.rm(f.root, { recursive: true, force: true }); }
   });
 }
@@ -336,7 +457,7 @@ for (const present of [false, true]) {
         f.git(["-C", f.clone, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com",
           "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "fixture"]);
       }
-      assert.deepEqual(await f.read(), { kind: "unknown" });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
     } finally { await fs.rm(f.root, { recursive: true, force: true }); }
   });
 }
@@ -345,7 +466,7 @@ it("inventory refuses explicit attempt ID on absent canonical path", async () =>
   const f = await inventoryFixture(false);
   try {
     f.journal({ runId: inventoryRun, clonePath: f.clone, attemptId: inventoryAttempt });
-    assert.deepEqual(await f.read(), { kind: "unknown" });
+    assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
   } finally { await fs.rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -380,7 +501,7 @@ it("inventory continues past absent sibling and refuses later unsafe sibling", a
     f.journal({ runId: inventoryRun, clonePath: f.clone }, false, "unsafe");
     await fs.mkdir(f.parent, { recursive: true });
     await fs.symlink(absent, f.clone);
-    assert.deepEqual(await f.read(), { kind: "unknown" });
+    assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
     assert.ok(trace.probes.indexOf(missingLeaf) >= 0);
     assert.ok(trace.probes.indexOf(f.clone) > trace.probes.indexOf(missingLeaf));
   } finally {

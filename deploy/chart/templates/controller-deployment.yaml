@@ -157,6 +157,9 @@ spec:
             # env being absent. The controller rejects a non-integer or a value < 1.
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
+            # Unconditional: Helm treats 0 as empty, but it disables this lane.
+            - name: UZI_WORKER_CROSS_CHECK_SLOTS
+              value: {{ .Values.workers.crossCheckSlots | quote }}
             # PRD #422 M5 drain knobs. The deadline bounds how long a cordoned BUSY worker
             # delays a deliberate roll before the controller rolls it anyway (its run
             # requeues); force-roll is the emergency override that rolls every drifted

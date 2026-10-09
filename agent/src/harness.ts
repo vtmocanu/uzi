@@ -465,6 +465,18 @@ export interface BoundaryProcessRequest {
   readonly recoverableTimeout?: true;
 }
 
+/** A checkpoint child missed startup, but its exact attempt's cleanup was verified.
+ * Recovery result only; this error grants no cleanup authority. */
+export class CheckpointChildStartupTimeoutError extends Error {
+  readonly classification = "started_deadline";
+  readonly cleanupStatus = "verified";
+
+  constructor(cause: unknown) {
+    super("checkpoint child startup failed (started_deadline; cleanup verified)", { cause });
+    this.name = "CheckpointChildStartupTimeoutError";
+  }
+}
+
 export interface BoundaryProcessHandle {
   readonly stdin: Writable | null;
   readonly stdout: Readable | null;
