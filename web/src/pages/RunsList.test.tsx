@@ -1825,11 +1825,25 @@ describe("RunRow — Progress cell (PRD #2602)", () => {
     const cell = container.querySelector('[data-run-progress="stalled"]')!;
     expect(cell).toBeTruthy();
     expect(cell.textContent).toMatch(/^◼ stalledsince /);
+    // One stall, one flag: the health badge yields to the cell (its word is in the tooltip).
+    expect(container.textContent).not.toContain("⚠");
   });
 
-  it("shows the parked flag with today's park word", () => {
+  it("keeps the health badge when the cell is not showing the stalled flag", () => {
+    const { container } = renderRow({
+      status: "running",
+      health: "slow",
+      health_since: "2026-07-05T11:41:00Z",
+      progress: { ...prog("percent"), pct: 40, milestone_done: 1, milestone_total: 3 },
+    });
+    expect(container.textContent).toContain("⚠ near timeout");
+  });
+
+  it("names the park in screen-reader text only (the status pill shows it)", () => {
     const { container } = renderRow({ status: "limit_wait", progress: prog("parked") });
-    expect(container.querySelector('[data-run-progress="parked"]')?.textContent?.trim()).toBe("limit wait");
+    const cell = container.querySelector('[data-run-progress="parked"]')!;
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe("Progress: limit wait");
   });
 
   it("is hidden while the row reads waiting for vault unlock", () => {

@@ -23,7 +23,7 @@ import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { UsageCard, type UsageWindow } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
-import { RunProgressCell } from "../components/RunProgressCell";
+import { RunProgressCell, progressShowsStall } from "../components/RunProgressCell";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
@@ -541,7 +541,16 @@ export function Dashboard() {
                     <span className="hidden sm:contents">
                       <RunProgressCell run={r} />
                     </span>
-                    <RunHealthBadge run={r} />
+                    {/* A stalled cell already says so (with the health word in its
+                        tooltip), so the health badge yields to it from sm up and stays
+                        the only stall signal on phones, where the cell is hidden. */}
+                    {progressShowsStall(r) ? (
+                      <span className="contents sm:hidden">
+                        <RunHealthBadge run={r} />
+                      </span>
+                    ) : (
+                      <RunHealthBadge run={r} />
+                    )}
                     <StatusPill status={effectiveRunStatus(r)} />
                   </div>
                 </div>

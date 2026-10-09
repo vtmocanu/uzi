@@ -6,44 +6,71 @@
 //
 // States (PRD rules 1-8; the board shows `70%` without the ≈ the run page carries):
 //   percent  → `70%` over a thin brand-tone bar (a progressbar, aria value 0-100)
-//   waiting  → `● waits on you`, warn, with `since HH:MM` from status_since when known
-//   stalled  → `◼ stalled`, danger, with `since HH:MM` from health_since when known
-//   parked   → `⏸ <today's park word>` (runBadge's PARK_LABELS via parkLabel), faint
-//   queued   → faint `queued`
-//   planning → plan-tone `planning` (plain text, see the parked note below)
-//   none     → faint `—`
+//   waiting  → `● waits on you`, warn, with a `plan gate|question|follow-up since HH:MM`
+//              sub-line (the reason from the status, the time from status_since)
+//   stalled  → `◼ stalled`, danger, with `since HH:MM` from health_since; its tooltip and
+//              accessible name carry the health word (stalled vs looping), because the row
+//              drops its RunHealthBadge while this flag shows (see progressShowsStall)
+//   parked / queued / planning → screen-reader-only `Progress: <word>`: the status pill
+//              beside the cell already names the state, so a visible flag would repeat it
+//              (the TUI and CLI, which have no such pill, keep the visible flag)
+//   none     → faint `—`, titled, with a screen-reader `Progress: no estimate`
 // An absent/null progress (a pre-feature server, or a terminal run) or an unknown state
 // (a newer server's enum member) renders nothing, so the row reads exactly as before.
 import type { ReactNode } from "react";
-import type { Run } from "../lib/apiTypes";
+import type { Run, RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
 import { parkLabel } from "../lib/runBadge";
 import { Badge } from "./ui";
 
-// The fields the cell reads: the progress DTO, the two "since" instants, and whatever
-// parkLabel folds through effectiveRunStatus to name a park.
+// The fields the cell reads: the progress DTO, the two "since" instants, the health flag
+// (the stalled flag's wording), and whatever parkLabel folds through effectiveRunStatus
+// to name a park.
 type ProgressRun = Pick<Run, "progress" | "status_since" | "health_since"> &
+  Partial<Pick<Run, "health">> &
   Parameters<typeof parkLabel>[0];
 
-// The ⏸ glyph is drawn rather than typed: U+23F8 is missing from many UI fonts (a tofu box
-// in headless Chromium) and becomes a colour emoji on macOS, so two bars stand in for it.
-function PauseGlyph() {
+// progressShowsStall reports whether the cell shows the stalled flag. A row whose cell is
+// visible suppresses its RunHealthBadge then, so one stall is not drawn twice (`◼ stalled`
+// beside `⚠ stalled · Nm`); the cell's tooltip and accessible name keep the health word.
+export function progressShowsStall(run: { progress?: RunProgress | null }): boolean {
+  return run.progress?.state === "stalled";
+}
+
+// The waiting reason, named from the raw status the server derived `waiting` from.
+const WAIT_REASONS: Record<string, string> = {
+  awaiting_approval: "plan gate",
+  awaiting_input: "question",
+  awaiting_followup: "follow-up",
+};
+
+// Stacked flag + faint sub-line (`<reason> since HH:MM`, or whichever half is known); the
+// sub-line drops when neither is.
+function Flagged({
+  state,
+  reason,
+  since,
+  children,
+}: {
+  state: string;
+  reason?: string;
+  since: string | null;
+  children: ReactNode;
+}) {
+  const sub = [reason, since && `since ${since}`].filter(Boolean).join(" ");
   return (
-    <span aria-hidden="true" data-glyph="pause" className="inline-flex h-2 items-stretch gap-[2px]">
-      <span className="w-[2px] rounded-[1px] bg-current" />
-      <span className="w-[2px] rounded-[1px] bg-current" />
+    <span data-run-progress={state} className="inline-flex flex-col items-start gap-0.5">
+      {children}
+      {sub && <span className="font-mono text-[10px] leading-none tabular-nums text-faint">{sub}</span>}
     </span>
   );
 }
 
-// Stacked flag + faint `since HH:MM` sub-line; the sub drops when the instant is absent.
-function Flagged({ state, since, children }: { state: string; since: string | null; children: ReactNode }) {
+// A state the adjacent status pill already names: kept for assistive tech, not drawn.
+function Quiet({ state, word }: { state: string; word: string }) {
   return (
-    <span data-run-progress={state} className="inline-flex flex-col items-start gap-0.5">
-      {children}
-      {since && (
-        <span className="font-mono text-[10px] leading-none tabular-nums text-faint">since {since}</span>
-      )}
+    <span data-run-progress={state} className="sr-only">
+      Progress: {word}
     </span>
   );
 }
@@ -66,9 +93,12 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
           aria-valuenow={pct}
           aria-label={`Run progress: about ${pct}%${of}`}
           title={`About ${pct}% through the approved plan${of}`}
-          className="inline-flex w-12 flex-col gap-1"
+          className="inline-flex w-16 flex-col gap-1"
         >
-          <span aria-hidden="true" className="font-mono text-xs font-semibold leading-none tabular-nums text-fg">
+          <span
+            aria-hidden="true"
+            className="font-mono text-[13px] font-semibold leading-none tabular-nums text-fg"
+          >
             {pct}%
           </span>
           <span aria-hidden="true" className="relative h-1 w-full overflow-hidden rounded-full bg-edge">
@@ -79,49 +109,36 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
     }
     case "waiting":
       return (
-        <Flagged state="waiting" since={formatLocalTime(run.status_since)}>
+        <Flagged state="waiting" reason={WAIT_REASONS[run.status]} since={formatLocalTime(run.status_since)}>
           <Badge tone="warning" dot title="This run is waiting on you: a plan approval, a question or a follow-up.">
             waits on you
           </Badge>
         </Flagged>
       );
-    case "stalled":
+    case "stalled": {
+      const looping = run.health === "looping";
       return (
         <Flagged state="stalled" since={formatLocalTime(run.health_since)}>
-          <Badge tone="danger" title="No progress is being made; the percentage returns once activity resumes.">
+          <Badge
+            tone="danger"
+            title={
+              looping
+                ? "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."
+                : "Stalled: no progress is being made; the percentage returns once activity resumes."
+            }
+          >
             <span aria-hidden="true">◼</span> stalled
+            {looping && <span className="sr-only"> (looping)</span>}
           </Badge>
         </Flagged>
       );
-    // parked/queued/planning are quiet column values, not pills: on a card row the status
-    // pill beside them already names the state, so a second bordered badge would read as
-    // the same word twice. Mock section 3 draws these as dim flags.
+    }
     case "parked":
-      return (
-        <span
-          data-run-progress="parked"
-          title="Parked: the run is held and is not working right now."
-          className="inline-flex items-center gap-1 whitespace-nowrap font-mono text-[11px] text-faint"
-        >
-          <PauseGlyph /> {parkLabel(run)}
-        </span>
-      );
+      return <Quiet state="parked" word={parkLabel(run)} />;
     case "queued":
-      return (
-        <span data-run-progress="queued" className="font-mono text-[11px] text-faint">
-          queued
-        </span>
-      );
+      return <Quiet state="queued" word="queued" />;
     case "planning":
-      return (
-        <span
-          data-run-progress="planning"
-          title="Planning: no milestones are frozen yet, so there is no percentage."
-          className="font-mono text-[11px] text-plan"
-        >
-          planning
-        </span>
-      );
+      return <Quiet state="planning" word="planning" />;
     case "none":
       return (
         <span
@@ -130,7 +147,7 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
           className="font-mono text-[11px] text-faint"
         >
           <span aria-hidden="true">—</span>
-          <span className="sr-only">no progress estimate</span>
+          <span className="sr-only">Progress: no estimate</span>
         </span>
       );
     default:

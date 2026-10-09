@@ -48,6 +48,9 @@ describe("RunProgressCell (PRD #2602)", () => {
     // The fill is the brand tone at the percentage width, not a utilisation colour.
     const fill = bar.querySelector(".bg-brand") as HTMLElement;
     expect(fill.style.width).toBe("70%");
+    // Mock sizing: a 13px semibold figure over a w-16 bar.
+    expect(bar.className).toContain("w-16");
+    expect(bar.firstElementChild?.className).toContain("text-[13px]");
   });
 
   it("percent with a missing pct renders nothing rather than a fabricated 0%", () => {
@@ -55,72 +58,84 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  it("waiting: warn flag with `since HH:MM` from status_since", () => {
-    const { container } = renderCell({
-      status: "awaiting_input",
-      status_since: STATUS_SINCE,
-      progress: progress({ state: "waiting" }),
-    });
+  it.each([
+    ["awaiting_approval", "plan gate"],
+    ["awaiting_input", "question"],
+    ["awaiting_followup", "follow-up"],
+  ] as const)("waiting (%s): warn flag with `%s since HH:MM` from status_since", (status, reason) => {
+    const { container } = renderCell({ status, status_since: STATUS_SINCE, progress: progress({ state: "waiting" }) });
     expect(cellOf(container)?.getAttribute("data-run-progress")).toBe("waiting");
     const flag = screen.getByText("waits on you");
     expect(flag.className).toContain("text-warn");
-    expect(container.textContent).toContain(`since ${formatLocalTime(STATUS_SINCE)}`);
+    expect(container.textContent).toBe(`waits on you${reason} since ${formatLocalTime(STATUS_SINCE)}`);
   });
 
-  it("waiting without status_since omits the sub-line", () => {
+  it("waiting without status_since keeps just the reason", () => {
     const { container } = renderCell({ status: "awaiting_approval", progress: progress({ state: "waiting" }) });
     expect(screen.getByText("waits on you")).toBeTruthy();
+    expect(screen.getByText("plan gate")).toBeTruthy();
     expect(container.textContent).not.toContain("since");
   });
 
   it("stalled: danger flag with `since HH:MM` from health_since (not status_since)", () => {
     const { container } = renderCell({
       status_since: STATUS_SINCE,
+      health: "stalled",
       health_since: HEALTH_SINCE,
       progress: progress({ state: "stalled", milestone_done: 1, milestone_total: 3 }),
     });
     const flag = screen.getByText("stalled");
     expect(flag.className).toContain("text-danger");
     expect(flag.textContent).toBe("◼ stalled");
+    expect(flag.getAttribute("title")).toMatch(/^Stalled: /);
     expect(container.textContent).toContain(`since ${formatLocalTime(HEALTH_SINCE)}`);
     expect(container.textContent).not.toContain(`since ${formatLocalTime(STATUS_SINCE)}`);
     // A flag replaces the percent (PRD D4).
     expect(screen.queryByRole("progressbar")).toBeNull();
   });
 
+  it("stalled while looping: the health word rides in the tooltip and accessible name", () => {
+    renderCell({ health: "looping", progress: progress({ state: "stalled" }) });
+    const flag = screen.getByText("stalled");
+    expect(flag.getAttribute("title")).toMatch(/^Looping: /);
+    expect(flag.textContent).toBe("◼ stalled (looping)");
+    expect(flag.querySelector(".sr-only")?.textContent).toBe(" (looping)");
+  });
+
+  // queued/planning/parked repeat the adjacent status pill, so on a card row they are
+  // screen-reader-only text with context; the state is still keyed by data-run-progress.
   it.each([
     ["limit_wait", {}, "limit wait"],
     ["pool_wait", {}, "waiting for pool"],
     ["recovery_wait", {}, "recovery wait"],
     ["paused", {}, "paused"],
     ["paused", { hold_reason: "credential_disabled" }, "waiting: credential disabled"],
-  ] as const)("parked (%s) keeps today's park wording", (status, extra, text) => {
+  ] as const)("parked (%s): sr-only `Progress: <today's park word>`", (status, extra, text) => {
     const { container } = renderCell({ status, ...extra, progress: progress({ state: "parked" }) });
-    expect(cellOf(container)?.getAttribute("data-run-progress")).toBe("parked");
-    expect(container.textContent?.trim()).toBe(text);
-    // The pause mark is a drawn, aria-hidden glyph (U+23F8 is tofu in many UI fonts).
-    expect(container.querySelector('[data-glyph="pause"]')?.getAttribute("aria-hidden")).toBe("true");
-  });
-
-  it("queued: faint `queued`", () => {
-    const { container } = renderCell({ status: "queued", progress: progress({ state: "queued" }) });
     const cell = cellOf(container) as HTMLElement;
-    expect(cell.textContent).toBe("queued");
-    expect(cell.className).toContain("text-faint");
+    expect(cell.getAttribute("data-run-progress")).toBe("parked");
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe(`Progress: ${text}`);
   });
 
-  it("planning: plan-tone `planning`", () => {
-    renderCell({ is_planning: true, progress: progress({ state: "planning" }) });
-    expect(screen.getByText("planning").className).toContain("text-plan");
-    expect(screen.getByText("planning").getAttribute("data-run-progress")).toBe("planning");
+  it.each([
+    ["queued", { status: "queued" }],
+    ["planning", { is_planning: true }],
+  ] as const)("%s: sr-only `Progress: %s`", (state, over) => {
+    const { container } = renderCell({ ...over, progress: progress({ state }) });
+    const cell = cellOf(container) as HTMLElement;
+    expect(cell.getAttribute("data-run-progress")).toBe(state);
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe(`Progress: ${state}`);
   });
 
-  it("none: a faint em dash with a screen-reader name", () => {
+  it("none: a visible faint em dash, titled, with a screen-reader name", () => {
     const { container } = renderCell({ progress: progress({ state: "none" }) });
     const cell = cellOf(container) as HTMLElement;
     expect(cell.className).toContain("text-faint");
-    expect(cell.textContent).toBe("—no progress estimate");
+    expect(cell.getAttribute("title")).toBe("No milestone plan to measure progress against");
     expect(cell.querySelector('[aria-hidden="true"]')?.textContent).toBe("—");
+    expect(cell.querySelector(".sr-only")?.textContent).toBe("Progress: no estimate");
   });
 
   it.each([

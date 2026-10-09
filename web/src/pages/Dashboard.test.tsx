@@ -902,4 +902,36 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     const old = screen.getByText("Pre-feature run").closest("li")!;
     expect(old.querySelector("[data-run-progress]")).toBeNull();
   });
+  it("a stalled cell replaces the health badge from sm up; phones keep the badge", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "s",
+          issue_title: "Stalled run",
+          status: "running",
+          health: "looping",
+          health_since: "2026-07-05T11:41:00Z",
+          progress: {
+            state: "stalled",
+            pct: null,
+            milestone_done: 1,
+            milestone_total: 3,
+            active_milestone_id: "b",
+            phase: "",
+          },
+        }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const row = screen.getByText("Stalled run").closest("li")!;
+    // The cell is hidden below sm (its wrapper), the health badge only below sm.
+    const cell = row.querySelector('[data-run-progress="stalled"]')!;
+    expect(cell.parentElement?.className).toBe("hidden sm:contents");
+    expect(cell.textContent).toContain("(looping)");
+    const health = within(row).getByText(/^⚠ looping/);
+    expect(health.parentElement?.className).toBe("contents sm:hidden");
+  });
 });
