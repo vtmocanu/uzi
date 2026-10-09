@@ -180,6 +180,8 @@ if ci_checks_valid "$cj" && [ "$(printf '%s' "$cj" | jq length)" -gt 0 ]; then
   ci_fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
   ci_pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
   ci_cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
+  missing=$(missing_required "$req" "$cj") || { UNKNOWN=1; missing=0; }
+  ci_pend=$((ci_pend + missing))
   if [ "$cj_rc" -ne 0 ] && [ "$ci_fail" -eq 0 ] && [ "$ci_pend" -eq 0 ] && [ "$ci_cancel" -eq 0 ]; then UNKNOWN=1; fi
 else
   UNKNOWN=1

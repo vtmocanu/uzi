@@ -36,6 +36,11 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
   exit 0
 fi
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
+case "$*" in *'/protection/required_status_checks'*)
+  printf 'HTTP/2.0 %s Test\r\n\r\n' "${CLASSIC_HTTP:-404}"
+  if [ -n "${CLASSIC_BODY:-}" ]; then printf '%s' "$CLASSIC_BODY"; else printf '{"message":"Branch not protected"}'; fi
+  exit "${CLASSIC_RC:-1}" ;;
+esac
 # pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
 case "$*" in
@@ -285,5 +290,22 @@ CHECKS_JSON='[{"name":"ci","bucket":"mystery"}]'; snap head_clean noreq-malforme
 CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; export RULES_FAIL=1
 snap head_clean noreq-unreadable; has noreq-unreadable 'NEXT=unknown'
 unset CHECKS_REQUIRED_EMPTY CHECKS_JSON RULES_FAIL
+
+export CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+snap head_clean classic-partial; has classic-partial 'NEXT=ci_pending'
+CLASSIC_BODY='{"contexts":["slow"],"checks":[]}'
+export CHECKS_REQUIRED_EMPTY=1 CHECKS_JSON='[{"name":"fast","bucket":"pass"}]'
+snap head_clean classic-unregistered; has classic-unregistered 'NEXT=unknown'
+unset CHECKS_REQUIRED_EMPTY
+CLASSIC_HTTP=403; CLASSIC_RC=1; CLASSIC_BODY='{"message":"Forbidden"}'
+snap head_clean classic-forbidden; has classic-forbidden 'NEXT=unknown'
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
+snap head_clean rules-present-classic-forbidden; has rules-present-classic-forbidden 'NEXT=ready'
+unset RULES_JSON
+CLASSIC_HTTP=404; CLASSIC_BODY='{"message":"Required status checks not enabled"}'
+snap head_clean classic-disabled; has classic-disabled 'NEXT=ready'
+unset CLASSIC_HTTP CLASSIC_RC CLASSIC_BODY CHECKS_JSON
 
 echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit; a conflicting PR is NEXT=conflict"

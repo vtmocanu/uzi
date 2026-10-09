@@ -12,6 +12,11 @@ mkdir -p "$WORK/bin"
 cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # RULES_OUT is the slurped `gh api --paginate --slurp` reply; RULES_RC its exit status.
+case "$*" in *'/protection/required_status_checks'*)
+  printf 'HTTP/2.0 %s Test\r\n\r\n' "${CLASSIC_HTTP:-404}"
+  if [ -n "${CLASSIC_BODY:-}" ]; then printf '%s' "$CLASSIC_BODY"; else printf '{"message":"Branch not protected"}'; fi
+  exit "${CLASSIC_RC:-1}" ;;
+esac
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
   printf '%s\n' "$*" > "$CHECKS_CALL"
   printf '%s' "$CHECKS_OUT"; exit "${CHECKS_RC:-0}"
@@ -53,6 +58,23 @@ RULES_OUT='[[{}]]'; bad "missing rule type"
 RULES_OUT='[[{"type":7}]]'; bad "non-string rule type"
 RULES_OUT="[[$(rule '[{"context":"a"}]')]]"; export RULES_RC=1; bad "gh page fetch failed"
 unset RULES_RC
+
+RULES_OUT='[[]]'; export CLASSIC_HTTP=404 CLASSIC_BODY='{"message":"Required status checks not enabled"}'
+ok "classic checks disabled" '[]'
+CLASSIC_BODY='{"message":"Not Found"}'; bad "ambiguous classic 404"
+CLASSIC_HTTP=403; CLASSIC_BODY='{"message":"Branch not protected"}'; bad "403 is not absence"
+CLASSIC_HTTP=500; bad "classic server error"
+CLASSIC_HTTP=200; export CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["slow"],"checks":[{"context":"other"}]}'
+ok "classic contexts and checks" '["other","slow"]'
+RULES_OUT="[[$(rule '[{"context":"ci"}]')]]"; ok "union of both authorities" '["ci","other","slow"]'
+CLASSIC_HTTP=403; CLASSIC_RC=1; CLASSIC_BODY='{"message":"Forbidden"}'
+ok "rulesets retain legacy behaviour without classic permission" '["ci"]'
+RULES_OUT='[[]]'; CLASSIC_HTTP=200; CLASSIC_RC=0
+CLASSIC_BODY='{"contexts":"slow"}'; bad "malformed classic contexts"
+CLASSIC_BODY='{"checks":[{}]}'; bad "malformed classic check"
+CLASSIC_BODY='{}'; bad "classic body missing lists"
+CLASSIC_BODY='{"contexts":[],"checks":[]}'; bad "enabled empty classic is not explicit absence"
+unset CLASSIC_HTTP CLASSIC_RC CLASSIC_BODY
 
 [ "$(missing_required '["a","b"]' '[{"name":"a","bucket":"pass"}]')" = 1 ] || fail "one absent context not counted"
 [ "$(missing_required '["a"]' '[{"name":"a","bucket":"pending"}]')" = 0 ] || fail "a registered context counted missing"

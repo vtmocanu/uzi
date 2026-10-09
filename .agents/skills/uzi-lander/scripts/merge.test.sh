@@ -80,6 +80,10 @@ fi
 # (CS_MODE alert|broken), issue comments (COMMENTS_FILE) and reviews (none). Default: clear.
 if [ "\${1:-}" = api ]; then
   case "\$*" in
+    *'/protection/required_status_checks'*)
+      printf 'HTTP/2.0 %s Test\r\n\r\n' "\${CLASSIC_HTTP:-404}"
+      if [ -n "\${CLASSIC_BODY:-}" ]; then printf '%s' "\$CLASSIC_BODY"; else printf '{"message":"Branch not protected"}'; fi
+      exit "\${CLASSIC_RC:-1}" ;;
     *graphql*) printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":%s,"pageInfo":{"hasNextPage":false}}}}}}\n' "\${THREADS_JSON:-[]}"; exit 0 ;;
     *'/code-scanning/alerts'*)
       [ "\${CS_MODE:-}" = broken ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }
@@ -319,6 +323,24 @@ CHECKS_JSON='[{"name":"ci","bucket":"fail"}]'; merge_run noreq-fail
 CHECKS_JSON='[]'; merge_run noreq-empty
 [ "$rc" -eq 2 ] && [ ! -e "$WORK/merge.log" ] || fail "no-required zero checks was merge-ready"
 unset CHECKS_REQUIRED_EMPTY CHECKS_JSON CHECKS_RC
+
+export CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["slow"],"checks":[]}'
+export CHECKS_REQUIRED_EMPTY=1 CHECKS_JSON='[{"name":"fast","bucket":"pass"}]' CHECKS_RC=0
+merge_run classic-unregistered
+[ "$rc" -eq 2 ] && [ ! -e "$WORK/merge.log" ] || fail "merged before classic slow registered"
+unset CHECKS_REQUIRED_EMPTY
+CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; merge_run classic-partial
+[ "$rc" -eq 2 ] && [ ! -e "$WORK/merge.log" ] || fail "merged without all classic contexts"
+CLASSIC_HTTP=403; CLASSIC_RC=1; CLASSIC_BODY='{"message":"Forbidden"}'; merge_run classic-forbidden
+[ "$rc" -eq 2 ] && [ ! -e "$WORK/merge.log" ] || fail "unreadable classic protection was none"
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
+merge_run rules-present-classic-forbidden
+grep -q -- '--match-head-commit' "$WORK/merge.log" || fail "ruleset repo lost legacy readiness without classic read rights"
+unset RULES_JSON
+CLASSIC_HTTP=404; CLASSIC_BODY='{"message":"Required status checks not enabled"}'; merge_run classic-disabled
+grep -q -- '--match-head-commit' "$WORK/merge.log" || fail "explicit classic-disabled reply not accepted"
+unset CLASSIC_HTTP CLASSIC_RC CLASSIC_BODY CHECKS_JSON CHECKS_RC
 
 # 6. A PR that conflicts with its base gets no pull_request CI, so gh reports no required
 #    checks and exits 1. Name the conflict (exit 3, land-prep), not "cannot read the checks".

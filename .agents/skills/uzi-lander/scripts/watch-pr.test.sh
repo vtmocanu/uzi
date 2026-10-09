@@ -56,6 +56,11 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
   exit 0
 fi
 if [ "${1:-}" = api ]; then
+case "$*" in *'/protection/required_status_checks'*)
+  printf 'HTTP/2.0 %s Test\r\n\r\n' "${CLASSIC_HTTP:-404}"
+  if [ -n "${CLASSIC_BODY:-}" ]; then printf '%s' "$CLASSIC_BODY"; else printf '{"message":"Branch not protected"}'; fi
+  exit "${CLASSIC_RC:-1}" ;;
+esac
 # The base branch's required contexts, as `gh api --paginate --slurp` returns them (pages).
 # RULES_JSON = one page; RULES_FAIL=1 = unreadable. Default: none required.
 case "$*" in *'/rules/branches/main'*)
@@ -551,6 +556,25 @@ CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; export RULES_FAIL=1
 noreq_watch unreadable-rules 9
 grep -q 'required_rules' "$WORK/noreq-unreadable-rules.out" || fail "unreadable rules were treated as none required"
 unset CHECKS_REQUIRED_EMPTY CHECKS_JSON RULES_FAIL
+
+# A classic required context must register even when rulesets have no requirements.
+export CHECKS_REQUIRED_EMPTY=1 CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["slow"],"checks":[{"context":"slow"}]}'
+export CHECKS_JSON='[{"name":"fast","bucket":"pass"}]'
+noreq_watch classic-unregistered 2 15
+grep -q 'req_pend=1' "$WORK/noreq-classic-unregistered.out" || fail "unregistered classic check not pending"
+noreq_watch classic-unregistered-unknown 9
+unset CHECKS_REQUIRED_EMPTY
+CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; noreq_watch classic-partial 2
+grep -q 'req_missing=1' "$WORK/noreq-classic-partial.out" || fail "missing classic required context not counted"
+CLASSIC_HTTP=403; CLASSIC_RC=1; CLASSIC_BODY='{"message":"Forbidden"}'
+noreq_watch classic-forbidden 9
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
+noreq_watch rules-present-classic-forbidden 0
+unset RULES_JSON
+CLASSIC_HTTP=404; CLASSIC_BODY='{"message":"Required status checks not enabled"}'
+noreq_watch classic-disabled 0
+unset CLASSIC_HTTP CLASSIC_RC CLASSIC_BODY CHECKS_JSON
 
 # Required contexts not yet registered on the head are pending, not green: right after a push
 # `gh pr checks --required` lists only the fast checks that already passed.
