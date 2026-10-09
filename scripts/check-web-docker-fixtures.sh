@@ -14,6 +14,9 @@
 # Each file is scanned whole, so a specifier split from its keyword is still found.
 # Hermetic tests: scripts/check-web-docker-fixtures.test.sh.
 #
+# A fixture counts as copied only by `COPY fixtures/<name> /app/fixtures/<name>` placed before
+# `RUN npm run build`, where the type-check reads it.
+#
 # Exit: 0 every imported fixture is copied; 1 a fixture is missing from a Dockerfile;
 # 2 instrument broken (no fixture import found at all, or a Dockerfile is missing).
 set -euo pipefail
@@ -48,11 +51,23 @@ if [[ ${#names[@]} -eq 0 ]]; then
   exit 2
 fi
 
+# copied_before_build <dockerfile> <name>: a `COPY fixtures/<name>[/] /app/fixtures/<name>[/]`
+# line that precedes the first `RUN npm run build`, so the fixture is where the type-check
+# resolves it, when it runs.
+copied_before_build() {
+  awk -v name="$2" '
+    BEGIN { src = "fixtures/" name; dst = "/app/fixtures/" name }
+    /^RUN npm run build/ { exit found ? 0 : 1 }
+    $1 == "COPY" && ($2 == src || $2 == src "/") && ($3 == dst || $3 == dst "/") { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$1"
+}
+
 missing=0
 for name in "${names[@]}"; do
   for df in "${dockerfiles[@]}"; do
-    if ! grep -q -E "^COPY fixtures/${name//./\\.}(/| )" "$df"; then
-      echo "check-web-docker-fixtures: $df does not COPY fixtures/$name, which web/src imports" >&2
+    if ! copied_before_build "$df" "$name"; then
+      echo "check-web-docker-fixtures: $df does not COPY fixtures/$name to /app/fixtures/$name before 'RUN npm run build', and web/src imports it" >&2
       missing=1
     fi
   done

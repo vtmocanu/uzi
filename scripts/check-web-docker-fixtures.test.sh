@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=10
+FLOOR=12
 cases=0
 passed=0
 
@@ -96,6 +96,20 @@ drop_line() { grep -v -F "$2" "$1" > "$1.new"; mv "$1.new" "$1"; }
 drop_line "$d/web/Dockerfile.mock" 'fixtures/run-progress'
 src "$d" lib/a.test.ts 'import parity from "../../../fixtures/run-progress/parity.json";'
 expect 1 "copied in web/Dockerfile but not web/Dockerfile.mock" "$d"
+
+d=$(repo wrong-destination)
+for df in Dockerfile Dockerfile.mock; do
+  printf 'FROM scratch\nCOPY fixtures/run-progress/ /tmp/run-progress/\nRUN npm run build\n' > "$d/web/$df"
+done
+src "$d" lib/a.test.ts 'import parity from "../../../fixtures/run-progress/parity.json";'
+expect 1 "a COPY to a destination other than /app/fixtures/<name>" "$d"
+
+d=$(repo after-build)
+for df in Dockerfile Dockerfile.mock; do
+  printf 'FROM scratch\nRUN npm run build\nCOPY fixtures/run-progress/ /app/fixtures/run-progress/\n' > "$d/web/$df"
+done
+src "$d" lib/a.test.ts 'import parity from "../../../fixtures/run-progress/parity.json";'
+expect 1 "a COPY placed after RUN npm run build" "$d"
 
 d=$(repo no-imports)
 src "$d" lib/a.ts 'export const x = 1;'
