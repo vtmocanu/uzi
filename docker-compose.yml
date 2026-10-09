@@ -369,6 +369,8 @@ services:
       # it but warns at boot). Raising it multiplies memory/CPU/token pressure — size
       # cpus/mem_limit above and RUN_MAX_REQUEUES with it. See docs/worker-setup.md.
       WORKER_MAX_CONCURRENT_RUNS: ${WORKER_MAX_CONCURRENT_RUNS:-1}
+      # Per-worker cross-check slots (0 disables cross-checks); accepted range 0..16.
+      WORKER_CROSS_CHECK_SLOTS: ${WORKER_CROSS_CHECK_SLOTS:-1}
       # PRD #83 M2: the DinD sidecar socket the worker probes. Unset by DEFAULT (empty):
       # a plain `--profile agent` worker then does ONE fast probe of the default path and
       # NEVER blocks. When you run `--profile agent-docker`, SET this (to

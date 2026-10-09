@@ -58,14 +58,36 @@ worker must advertise `cross_check_codex_lead_v1` to submit for a check. A
 Codex lead on a worker without it keeps the older park, with
 `plan cross-check: not yet supported for a Codex lead`, and waits for a human.
 
-Checker runs use ordinary worker slots; the lead holds its slot while
-waiting. A Claude checker (for a Codex lead) additionally requires
+Checker runs use a dedicated cross-check lane (one slot by default); the lead
+holds its run slot while waiting. A worker supporting both families can check
+its own Claude lead on Codex even with a run cap of 1. A Claude checker (for a Codex lead) additionally requires
 `cross_check_codex_lead_v1` on the worker that claims it; without one it stays
-queued. A non-null Codex model or effort pin also requires
+queued. This does not enable Code cross-check.
+
+The lead's worker is preferred. Another eligible worker of the same user may
+claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
+worker may still claim its own pinned child; maintenance fences and worker
+quarantine remain authoritative. An ephemeral worker may check its bound lead
+or the child it was provisioned for, but cannot take another lead's child.
+An eligible own lane with space avoids provisioning another pod; a full or
+unsupported lane follows the existing capability-gap and saturation policy.
+
+During a mixed-image rollout, older workers with a NULL (unadvertised) slot cap and
+no `cross_check_lane_v1` capability can still take plan checks on ordinary run
+slots. Explicitly disabling the lane with `WORKER_CROSS_CHECK_SLOTS=0` does
+not enable that fallback; incomplete lane-aware negotiation cannot fall back
+either. See [worker setup](./worker-setup.md#cross-check-slots)
+for capacity and isolation limits. Checker children remain hidden from the
+Runs list; worker capacity shows runs and cross-checks separately.
+
+A non-null Codex model or effort pin also requires
 `cross_check_pins_v1`; a custom resolved Codex model independently requires
 `codex_custom_model_v1`. Unpinned round-1 checks remain eligible on older
 `cross_check_v1` workers; later rounds additionally require
-`cross_check_rounds_v1` on the same worker. Missing capabilities leave the child queued.
+`cross_check_rounds_v1` on the same worker. These requirements apply to both
+dedicated-lane claims and negotiated legacy run-slot fallback. Missing
+capabilities leave the child queued.
+
 The verdict deadline includes queue time. Waiting for the check is
 excluded from the lead's wall budget. See [Configuration](./configuration.md#cross-check-settings)
 for timeout defaults and bounds. A claim-time snapshot freezes the delivered

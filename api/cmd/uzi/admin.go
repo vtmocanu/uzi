@@ -140,9 +140,9 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 					cleanup = "cleanup pending"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.OwnerEmail), cellText(w.Name), w.Status + quarantineMark(w.WorkerDTO),
+					w.ID, cellText(w.OwnerEmail), cellText(w.Name), statusCell(w.WorkerDTO),
 					version, upgradeCell(w.WorkerDTO), blockingCell(w.WorkerDTO),
-					reportedRunsCell(w.WorkerDTO), disk, cleanup, largestRunCell(w.WorkerDTO), outboxCell(w.WorkerDTO),
+					workerSlots(w.WorkerDTO), workerCrossCheckSlots(w.WorkerDTO), reportedRunsCell(w.WorkerDTO), disk, cleanup, largestRunCell(w.WorkerDTO), outboxCell(w.WorkerDTO),
 				})
 			}
 			// VERSION / UPGRADE / BLOCKING (PRD #1484 M3): the roll health the admin list finally
@@ -155,7 +155,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			// WorkerDTO. LARGEST RUN (PRD #1809 M6, D8) is the HOME size of each worker's largest
 			// run, the same largestRunCell `uzi worker list` uses; it is the fleet-wide view the
 			// fleet.rundisk health check's action points at.
-			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "UPGRADE", "BLOCKING", "RUNS", "DISK", "CLEANUP", "LARGEST RUN", "OUTBOX"}, rows)
+			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "UPGRADE", "BLOCKING", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "DISK", "CLEANUP", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 

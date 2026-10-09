@@ -1,21 +1,22 @@
 import { Badge } from "./ui";
-import { workerRunBadge } from "../lib/workerRuns";
+import { workerRunBadge, workerCrossCheckBadge } from "../lib/workerRuns";
 import type { Worker } from "../lib/api";
 
-// WorkerRunBadge renders a worker's run-load pill (PRD #42 Decision 10): "N/M runs"
-// once the worker runs more than one run or advertises a cap above 1, the legacy
-// "busy" pill for a single run, or nothing when idle. A thin presentational wrapper
-// over workerRunBadge so WorkersSettings and the admin RunsList render it identically.
+// Keep the lanes as separate pills wherever worker capacity is shown.
 export function WorkerRunBadge({
   worker,
 }: {
-  worker: Pick<Worker, "busy" | "active_runs" | "max_concurrent_runs">;
+  worker: Pick<Worker, "busy" | "active_runs" | "max_concurrent_runs" | "active_cross_checks" | "max_cross_check_slots">;
 }) {
-  const badge = workerRunBadge(worker);
-  if (!badge) return null;
+  const runs = workerRunBadge(worker);
+  const checks = workerCrossCheckBadge(worker);
   return (
-    <Badge tone={badge.tone} title={badge.title}>
-      {badge.label}
-    </Badge>
+    <>
+      {runs && <Badge tone={runs.tone} title={runs.title}>{runs.label}</Badge>}
+      {checks && <Badge tone={checks.tone} title={checks.title}>{checks.label}</Badge>}
+      {worker.busy && worker.active_runs === 0 && worker.active_cross_checks === 0 &&
+        (worker.max_cross_check_slots ?? 0) > 0 &&
+        <Badge tone="warning" title="Chat active">busy</Badge>}
+    </>
   );
 }

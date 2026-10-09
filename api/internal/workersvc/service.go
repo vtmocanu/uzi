@@ -2265,6 +2265,15 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // terminal lease still protects a journaled outcome. Fail runs first: the two are disjoint, and
 // failing first keeps the requeue's returned set free of anything the fail just terminated.
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+	return s.RegisterWithCrossCheckSlots(ctx, wkr, version, template, maxConcurrentRuns, nil, capabilities, protocolCapabilities, snapshot)
+}
+
+// RegisterWithCrossCheckSlots validates the independently advertised checker budget.
+func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns, maxCrossCheckSlots *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+	if maxCrossCheckSlots != nil && (*maxCrossCheckSlots < 0 || *maxCrossCheckSlots > 16) {
+		return store.Worker{}, "", errors.New("max_cross_check_slots must be between 0 and 16")
+	}
+
 	nonce, err := mintSnapshotNonce()
 	if err != nil {
 		return store.Worker{}, "", err
@@ -2303,6 +2312,7 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		Capabilities:          storedCaps,
 		ProtocolCapabilities:  protocolCaps,
 		MaxConcurrentRuns:     pgconv.Int4Ptr(maxConcurrentRuns),
+		MaxCrossCheckSlots:    pgconv.Int4Ptr(maxCrossCheckSlots),
 		SnapshotRegisterNonce: pgconv.TextOrNull(nonce),
 		ID:                    wkr.ID,
 	}
@@ -2963,6 +2973,19 @@ func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uu
 // beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
 // the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
+	return s.claimLane(ctx, wkr, snapshot, "run")
+}
+
+// ClaimCrossCheck uses the run claim assembly and exact-generation finish transaction.
+func (s *Service) ClaimCrossCheck(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
+	if s.txBeginner == nil {
+		return nil, errors.New("cross-check claim requires a transaction")
+	}
+	return s.claimLane(ctx, wkr, snapshot, "cross_check")
+}
+
+func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string) (*ClaimPayload, error) {
+
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
 	// they stay queued as "waiting for vault unlock" instead of failing. This is a
@@ -3046,16 +3069,23 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	// transactional path (only the request arrays differ, and they are empty in the no-snapshot
 	// path). @snapshot_fresh_cutoff is the stale window plus one heartbeat interval (D3): a
 	// worker_active_runs row reported within it fences the run out of every claim.
+	if s.txBeginner == nil {
+		// A transaction-less adapter cannot select children: queued affinity is not a claim.
+		lane = "ordinary"
+	}
 	claimNow := s.now()
 	params := store.ClaimRunParams{
-		WorkerID:            pgconv.UUID(wkr.ID),
-		UserID:              wkr.UserID,
-		AffinityCutoff:      pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
-		IsDockerWorker:      isDocker,
-		WorkerDockerEnabled: s.effectiveDockerTier,
-		DockerRepoAllowlist: allowlist,
-		WorkerCaps:          wkr.Capabilities,
-		CapabilityAware:     capabilityAware,
+		Lane:                     lane,
+		WorkerID:                 pgconv.UUID(wkr.ID),
+		UserID:                   wkr.UserID,
+		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
+		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
+		IsDockerWorker:           isDocker,
+		WorkerDockerEnabled:      s.effectiveDockerTier,
+		DockerRepoAllowlist:      allowlist,
+		WorkerCaps:               wkr.Capabilities,
+		CapabilityAware:          capabilityAware,
 		// PRD #1226 M1 (D2): the claiming worker's self-reported protocol capabilities,
 		// read by the non-bypassable completion-protocol clause in ClaimRun. An interlocked
 		// run is claimable only when this set contains 'completion_interlock_v1'; a legacy
@@ -3109,20 +3139,10 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
 
-	// No request snapshot (an old worker) or no tx beginner wired (fake-store unit tests): keep
-	// TODAY'S path — a single auto-commit ClaimRun, then assembleClaim. The predicate params above
-	// still apply, so an old worker gets the persisted-snapshot exclusions and the overflow closure;
-	// only the claimant guard (the flagged-worker-itself refusal) and the request pre-lock are
-	// snapshot-only, and an old worker is never flagged and lists nothing. Either path ends in
-	// finishRunClaim's exact-claim transaction (PRD #1590 M1), which refuses with no payload
-	// when no tx beginner is wired, so a fake-store claim never delivers or mutates unfenced.
+	// Bodyless claims also lock and re-read the worker in a separate statement.
+	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
 	if snapshot == nil || s.txBeginner == nil {
-		// PRD #2006: a possibly-leased ephemeral claimant must claim under the lease discipline
-		// even with no snapshot (UZI_ACTIVE_SNAPSHOT_DISABLED, or an agent that has not negotiated
-		// active_run_snapshot), or its same-branch follow-up would sit queued for the whole lease.
-		// That takes a short transaction. Every other claimant (a non-ephemeral worker, lease 0, no
-		// tx beginner wired) keeps the single auto-commit ClaimRun below, byte for byte.
-		if s.txBeginner != nil && s.ephemeralLease > 0 && wkr.Ephemeral {
+		if s.txBeginner != nil {
 			return s.claimRunLeasedNoSnapshot(ctx, wkr, params)
 		}
 		run, err := s.q.ClaimRun(ctx, params)
@@ -3148,6 +3168,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	if lane == "cross_check" {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+			return nil, err
+		}
+	}
 	qtx := store.New(tx)
 	// (a) Lock the worker row FIRST — the canonical order shared with Register, Heartbeat and the
 	// stale-worker passes.
@@ -5563,7 +5588,7 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		}
 		return store.Run{}, err
 	}
-	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+	if (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
 		return store.Run{}, ErrRunNotOwned
 	}
 	return run, nil

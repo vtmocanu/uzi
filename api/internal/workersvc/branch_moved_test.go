@@ -19,6 +19,9 @@ func TestSetStateFailedBranchMovedKindRegistry(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			run := runningRun(false)
 			run.Kind = kind
+			if kind == runkind.CrossCheck {
+				run.ClaimGeneration = 1 // A running checker has passed a real claim.
+			}
 			fs, svc, wkr := limitParkFixture(t, run)
 			moved := true
 			reason := branchMovedCanonical

@@ -217,7 +217,8 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// "N/M runs", never enforced server-side. Optional — an older image (and
 		// every M3a worker, before the M2 agent starts sending it) omits it and the
 		// column stays NULL. A pointer so absent (NULL) is distinct from a sent 0.
-		MaxConcurrentRuns *int `json:"max_concurrent_runs"`
+		MaxConcurrentRuns  *int `json:"max_concurrent_runs"`
+		MaxCrossCheckSlots *int `json:"max_cross_check_slots"`
 		// Capabilities is the worker's self-reported REACHABLE capability set (PRD #83
 		// Q1: today only ["docker"], meaning a daemon sidecar is reachable). Threaded
 		// into wsvc.Register (PRD #84 M1), which UNIONs it with the template-derived
@@ -269,6 +270,10 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// unadvertised) with a warn — like a malformed template, never a 400. The worker
 	// validates ≥ 1 and warns above the documented soft ceiling before sending (M2);
 	// this is the server-side backstop against a hostile/garbled report.
+	if req.MaxCrossCheckSlots != nil && (*req.MaxCrossCheckSlots < 0 || *req.MaxCrossCheckSlots > 16) {
+		httpx.Error(w, http.StatusBadRequest, "max_cross_check_slots must be between 0 and 16")
+		return
+	}
 	advertisedCap := req.MaxConcurrentRuns
 	if advertisedCap != nil && (*advertisedCap < 1 || *advertisedCap > maxAdvertisedConcurrentRuns) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
@@ -298,7 +303,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("worker register active snapshot dropped: parse rejected", "worker_id", wkr.ID.String())
 		}
 	}
-	updated, registerNonce, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
+	updated, registerNonce, err := h.wsvc.RegisterWithCrossCheckSlots(r.Context(), wkr, version, reported, advertisedCap, req.MaxCrossCheckSlots, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1052,7 +1057,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		httpx.JSON(w, http.StatusOK, payload)
-	case "", "run":
+	case "", "run", "cross_check":
 		// PRD #1390 M3 (Task 1): the run-lane claim carries the worker's active-run snapshot, so a
 		// claim that beats the first post-outage heartbeat (fact 7) still dedupes and pre-locks its
 		// own runs. Strict-decode a body with just `active_snapshot`, treating EOF as "no snapshot"
@@ -1077,7 +1082,13 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		} else {
 			snapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
 		}
-		payload, err := h.wsvc.Claim(r.Context(), wkr, snapshot)
+		var payload *workersvc.ClaimPayload
+		var err error
+		if r.URL.Query().Get("lane") == "cross_check" {
+			payload, err = h.wsvc.ClaimCrossCheck(r.Context(), wkr, snapshot)
+		} else {
+			payload, err = h.wsvc.Claim(r.Context(), wkr, snapshot)
+		}
 		if err != nil {
 			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,
 			// no claim, no side effect. Same generic body the worker reads for its strip-and-retry.
@@ -1095,7 +1106,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		writeWorkerRunClaim(w, payload)
 	default:
-		httpx.Error(w, http.StatusBadRequest, "lane must be one of run, chat")
+		httpx.Error(w, http.StatusBadRequest, "lane must be one of run, chat, cross_check")
 	}
 }
 
