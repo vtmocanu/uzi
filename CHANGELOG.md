@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Live issue runs show a progress percent ([#2602](https://github.com/vtmocanu/uzi/issues/2602)).**
+  The server derives it from the frozen milestone list (`11% + 89% × completed / total`, capped at 99% until the run finishes) and shows it on the web dashboard and runs list, in a `PROG` column on the TUI board, and as a `PROGRESS` row in `uzi run get` (`progress` object in `--json`); a flag (waits on you, parked, queued, stalled, planning) replaces the number when it would mislead, other run kinds show none, and no time remaining is shown because the estimate is too unreliable.
+
 - **Answer agent questions from the TUI ([#2550](https://github.com/vtmocanu/uzi/issues/2550)).**
   Run owners can press `i` to compose option selections and details, review each answer before sending, and reopen drafts kept in the current TUI session; uncertain delivery blocks resending in that session and points to the web or Slack, which remain the fallback for read-only viewers and unsupported payloads.
 

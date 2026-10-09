@@ -2271,7 +2271,7 @@ you *do* parse `--json`, use `printf '%s'` (never `echo`) or write it to a file.
 A `null` or absent field prints an empty line (so a nil array field is an empty
 line, not an error). An unknown field, or a **non-scalar** one that is populated
 — any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
-`usage`, `current_activity`), which you read with `--json` — is a usage error
+`usage`, `current_activity`, `progress`), which you read with `--json` — is a usage error
 (exit 2). `--field` and `--json` are mutually exclusive (two output modes).
 
 The model a schedule froze onto a run is readable this way too:
@@ -2389,6 +2389,13 @@ uniquely-matching lane and role · label alone on the rest; an in-progress
 milestone the lead did not attribute gets no `NOW` row at all, just its
 plain mark in the `MILESTONES` block. A run with no effective attribution
 keeps the single global `NOW` row unchanged.
+`run get` also prints a `PROGRESS` row for a live run: the server-derived
+estimate, e.g. `≈70% · milestone 3 of 3`, or a flag (waits on you, parked,
+queued, stalled, planning) when a number would mislead (see [Progress
+estimate](./run-activity.md#progress-estimate)). It is omitted once the run
+is terminal. `--json` carries `progress` as an object (`null` for a terminal
+run), so `--field progress` is a usage error (exit 2) while the run is live
+and prints an empty line once it is terminal, as for `milestones`.
 `--json` carries the full `current_activity` object; `current_activity` is
 an object, so `--field current_activity` is the documented usage error
 above (exit 2) even when the run has one — read it with `--json` instead.

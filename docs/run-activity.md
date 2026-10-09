@@ -451,6 +451,44 @@ with the task label beneath it), and the board's selected row gains a
 second line with the same information. `uzi run get` shows the same now
 line as a `NOW` row — see [the CLI docs](./cli.md#commands).
 
+## Progress estimate
+
+Live issue runs show a progress percent on the web dashboard and runs list,
+on the TUI board and in `uzi run get`, so you can tell at a glance how far
+along a run is without opening it. The server derives it from the run's
+frozen milestone list: `11% + 89% × completed / total`, capped at 99% until
+the run finishes. The 11% is planning, the measured median share of a run's
+time spent before the first milestone starts. A run with three milestones
+and two reported complete shows `70%`. As with the [milestone
+marks](#milestones-and-the-now-line), "completed" is what the worker
+reported, not something uzi has verified.
+
+Only issue runs with a frozen milestone list get a percent; other run kinds
+show no percent. A flag replaces the number whenever a number would
+mislead:
+
+| Flag | When |
+|---|---|
+| Waits on you | The run is awaiting approval, input or a follow-up |
+| Parked | The run is in a usage-limit, pool or recovery wait, or paused (the surface shows the same park wording it shows elsewhere) |
+| Queued | The run has not started yet |
+| Stalled | The run's health is stalled or looping; shows since when |
+| Planning | The run is planning and has no frozen milestone list yet |
+
+**No time remaining or finish time is shown.** The estimate is too
+unreliable to display: in a backtest of completed issue runs, only 59% of
+the estimates fell within 2x of the actual time remaining.
+
+Where it appears:
+
+- **Web** (dashboard and runs list rows): a Progress cell, `70%` with a thin
+  bar, or the flag.
+- **TUI board**: a `PROG` column after `MILES`. The bar drops first on
+  narrow terminals, leaving the percent or a short flag. Every flag is text,
+  so `NO_COLOR` keeps all of them.
+- **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
+  of 3`. See [the CLI docs](./cli.md#commands).
+
 ## Stopping or narrowing a run
 
 On a milestone-structured issue run, two operator actions bound how far the
