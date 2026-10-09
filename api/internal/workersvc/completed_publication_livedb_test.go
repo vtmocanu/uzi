@@ -18,6 +18,9 @@ import (
 
 type publicationForge struct {
 	forgetest.BaseFake
+	t                               *testing.T
+	projectID, mrIID                int64
+	expectedBranch                  string
 	branch, head, summaryHead       string
 	ancestry                        forge.Ancestry
 	summaryErr, headErr, compareErr error
@@ -25,13 +28,25 @@ type publicationForge struct {
 	afterCompare                    func()
 }
 
-func (f *publicationForge) GetMergeRequestSummary(context.Context, int64, int64) (forge.MergeRequestSummary, error) {
+func (f *publicationForge) GetMergeRequestSummary(_ context.Context, projectID, mrIID int64) (forge.MergeRequestSummary, error) {
+	f.t.Helper()
+	if projectID != f.projectID || mrIID != f.mrIID {
+		f.t.Fatalf("summary arguments: project=%d MR=%d want project=%d MR=%d", projectID, mrIID, f.projectID, f.mrIID)
+	}
 	return forge.MergeRequestSummary{SourceBranch: f.branch, HeadSHA: f.summaryHead}, f.summaryErr
 }
-func (f *publicationForge) BranchHead(context.Context, int64, string) (string, error) {
+func (f *publicationForge) BranchHead(_ context.Context, projectID int64, branch string) (string, error) {
+	f.t.Helper()
+	if projectID != f.projectID || branch != f.expectedBranch {
+		f.t.Fatalf("branch arguments: project=%d branch=%q want project=%d branch=%q", projectID, branch, f.projectID, f.expectedBranch)
+	}
 	return f.head, f.headErr
 }
-func (f *publicationForge) CompareAncestry(_ context.Context, _ int64, head, candidate string) (forge.Ancestry, error) {
+func (f *publicationForge) CompareAncestry(_ context.Context, projectID int64, head, candidate string) (forge.Ancestry, error) {
+	f.t.Helper()
+	if projectID != f.projectID {
+		f.t.Fatalf("comparison project=%d want own project=%d", projectID, f.projectID)
+	}
 	f.compareCalls++
 	if head != f.head || candidate != strings.Repeat("a", 40) {
 		return forge.AncestryUnknown, errors.New("wrong repository head comparison")
@@ -49,8 +64,12 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 		name, kind, reason string
 		change             func(*publicationForge)
 		drift              string
+		reportedBranch     string
+		retry              bool
 	}{
 		{name: "issue_equal", kind: "issue"},
+		{name: "issue_reported_branch_replay", kind: "issue", reportedBranch: "agent/old"},
+		{name: "issue_reported_branch_retry", kind: "issue", reportedBranch: "agent/old", retry: true},
 		{name: "issue_ancestor", kind: "issue", change: func(f *publicationForge) { f.head = strings.Repeat("b", 40); f.summaryHead = f.head }},
 		{name: "rework_ancestor", kind: "mr_rework"},
 		{name: "unrelated", reason: "not_ancestor", change: func(f *publicationForge) { f.ancestry = forge.AncestryNotAncestor }},
@@ -60,8 +79,8 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 		{name: "missing_mr", reason: "mr_missing", change: func(f *publicationForge) { f.summaryErr = forge.ErrMergeRequestNotFound }},
 		{name: "missing_branch", reason: "branch_missing", change: func(f *publicationForge) { f.headErr = forge.ErrRefNotFound }},
 		{name: "poisoned_prior_worker_branch", reason: "branch_mismatch", change: func(f *publicationForge) { f.branch = "agent/issue-poisoned" }},
-		{name: "fork_shaped_mismatch", reason: "branch_mismatch", change: func(f *publicationForge) { f.branch = "fork:agent/issue-1" }},
-		{name: "matching_own_repo_copy"},
+		{name: "fork_shaped_mismatch", kind: "mr_rework", reason: "branch_mismatch", change: func(f *publicationForge) { f.branch = "fork:agent/issue-1" }},
+		{name: "matching_own_repo_copy", kind: "mr_rework"},
 		{name: "head_mismatch", reason: "head_mismatch", change: func(f *publicationForge) { f.summaryHead = strings.Repeat("c", 40) }},
 		{name: "malformed_head", reason: "head_mismatch", change: func(f *publicationForge) { f.head = "BAD" }},
 		{name: "control_branch", reason: "branch_mismatch", change: func(f *publicationForge) { f.branch = "agent/issue-1\u202e" }},
@@ -89,7 +108,7 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
  VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, e.userID, e.repoID, run, wid)
 			old := mhOpenHold(t, e, run, 0, wid)
 			successor := mhOpenHold(t, e, run, 2, wid)
-			f := &publicationForge{branch: branch, head: final, summaryHead: final, ancestry: forge.AncestryAncestor}
+			f := &publicationForge{t: t, projectID: 1, mrIID: mr, expectedBranch: branch, branch: branch, head: final, summaryHead: final, ancestry: forge.AncestryAncestor}
 			if tc.change != nil {
 				tc.change(f)
 			}
@@ -99,10 +118,31 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 			svc := e.permitService(t)
 			svc.SetForges(settleUnitBuilder{f: f})
 			w := store.Worker{ID: wid, UserID: e.userID, ProtocolCapabilities: []string{capability.RecoveryCompletedPublicationV1}}
-			req := StateRequest{State: "completed", ClaimGeneration: &gen, CompletionFinalHead: &final, Branch: &branch, MrIID: &mr}
+			reportedBranch := branch
+			if tc.reportedBranch != "" {
+				reportedBranch = tc.reportedBranch
+			}
+			req := StateRequest{State: "completed", ClaimGeneration: &gen, CompletionFinalHead: &final, Branch: &reportedBranch, MrIID: &mr}
+			if tc.retry {
+				f.compareErr = errors.New("transient forge refusal")
+			}
 			result, err := svc.SetStateReportWithReconciliation(e.ctx, w, run, req)
 			if err != nil || !result.Applied || result.Run.Status != "completed" {
 				t.Fatalf("completion committed: %+v %v", result, err)
+			}
+			if tc.retry {
+				if result.CompletedPublicationReceipt != nil || result.CompletedPublicationReason != "ancestry_unknown" || f.compareCalls != 1 {
+					t.Fatalf("transient refusal must retain: %+v calls=%d", result, f.compareCalls)
+				}
+				retained, err := e.q.GetCompletedPublicationHold(e.ctx, store.GetCompletedPublicationHoldParams{RunID: run, UserID: e.userID, WorkerID: wid, Generation: gen})
+				if err != nil || retained.State != "open" {
+					t.Fatalf("transient refusal hold: %s %v", retained.State, err)
+				}
+				f.compareErr = nil
+				result, err = svc.SetStateReportWithReconciliation(e.ctx, w, run, req)
+				if err != nil || !result.Applied || result.CompletedPublicationReceipt == nil || f.compareCalls != 2 {
+					t.Fatalf("exact duplicate retry with API branch: %+v %v calls=%d", result, err, f.compareCalls)
+				}
 			}
 			if result.CompletedPublicationReason != tc.reason {
 				t.Fatalf("refusal class=%q want %q", result.CompletedPublicationReason, tc.reason)
@@ -116,8 +156,15 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 					t.Fatalf("refusal must retain exact hold: %+v", result)
 				}
 			} else {
-				if stored.State != "released" || result.CompletedPublicationReceipt == nil || f.compareCalls != 1 {
+				wantCalls := 1
+				if tc.retry {
+					wantCalls = 2
+				}
+				if stored.State != "released" || result.CompletedPublicationReceipt == nil || f.compareCalls != wantCalls {
 					t.Fatalf("proof must release exact hold after comparison: %+v calls=%d", result, f.compareCalls)
+				}
+				if result.CompletedPublicationReceipt.Branch != branch {
+					t.Fatalf("receipt branch=%q want frozen API branch=%q", result.CompletedPublicationReceipt.Branch, branch)
 				}
 				want, _ := json.Marshal(result.CompletedPublicationReceipt)
 				var receipt apitypes.CompletedPublicationReceipt

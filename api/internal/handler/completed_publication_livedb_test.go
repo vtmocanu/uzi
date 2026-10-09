@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 type completionRouteForge struct{ settleFakeForge }
@@ -88,17 +89,47 @@ func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
 		t.Fatalf("shared literal receipt drift: got %s want %s", actualJSON, expectedJSON)
 	}
 	h.wsvc.SetForges(nil)
-	replay := call(token, body)
-	var replayAck struct {
-		CompletedPublicationReceipt *apitypes.CompletedPublicationReceipt `json:"completed_publication_receipt"`
-	}
-	if replay.Code != 200 || json.Unmarshal(replay.Body.Bytes(), &replayAck) != nil {
-		t.Fatalf("replay: %d %s", replay.Code, replay.Body.String())
-	}
-	a, _ := json.Marshal(receipt)
-	b, _ := json.Marshal(replayAck.CompletedPublicationReceipt)
-	if string(a) != string(b) {
-		t.Fatalf("receipt replay differs: %s", replay.Body.String())
+	for _, phase := range []string{"original", "changed_status_claim", "deleted"} {
+		t.Run(phase, func(t *testing.T) {
+			switch phase {
+			case "changed_status_claim":
+				cliMustExec(t, pool, "UPDATE runs SET status='failed',claim_generation=2,worker_id=NULL WHERE id=$1", run)
+			case "deleted":
+				n, err := store.New(pool).DeleteForgeConnectionForUser(context.Background(), store.DeleteForgeConnectionForUserParams{ID: conn, UserID: owner})
+				if err != nil || n != 1 {
+					t.Fatalf("delete released connection: rows=%d err=%v", n, err)
+				}
+				var exists bool
+				if err := pool.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM runs WHERE id=$1)", run).Scan(&exists); err != nil || exists {
+					t.Fatalf("run deletion not demonstrated: exists=%v err=%v", exists, err)
+				}
+			}
+			replay := call(token, body)
+			var replayAck struct {
+				Run                         apitypes.RunDTO                       `json:"run"`
+				CompletedPublicationReceipt *apitypes.CompletedPublicationReceipt `json:"completed_publication_receipt"`
+			}
+			if replay.Code != 200 || json.Unmarshal(replay.Body.Bytes(), &replayAck) != nil {
+				t.Fatalf("exact authenticated receipt replay: %d %s", replay.Code, replay.Body.String())
+			}
+			a, _ := json.Marshal(receipt)
+			b, _ := json.Marshal(replayAck.CompletedPublicationReceipt)
+			if string(a) != string(b) || replayAck.Run.ID != run.String() || replayAck.Run.Status != "completed" || replayAck.Run.WorkerID == nil || *replayAck.Run.WorkerID != worker.String() || replayAck.Run.Kind != "" {
+				t.Fatalf("receipt/frozen completed ACK differs: %s", replay.Body.String())
+			}
+			var changedRequest map[string]any
+			if err := json.Unmarshal([]byte(body), &changedRequest); err != nil {
+				t.Fatal(err)
+			}
+			changedRequest["head"] = settleOther
+			wrongHead, _ := json.Marshal(changedRequest)
+			if wrong := call(token, string(wrongHead)); strings.Contains(wrong.Body.String(), "completed_publication_receipt") {
+				t.Fatalf("mismatched request head received receipt: %s", wrong.Body.String())
+			}
+			if f.compareCalls != 1 {
+				t.Fatal("stored replay consulted forge")
+			}
+		})
 	}
 	changed := strings.Replace(body, settlePushed, settleOther, 1)
 	if wrong := call(token, changed); strings.Contains(wrong.Body.String(), "completed_publication_receipt") {

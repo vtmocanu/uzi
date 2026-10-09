@@ -82,7 +82,7 @@ func TestCompletedPublicationFencesLiveDB(t *testing.T) {
 	// A trigger can refuse with zero affected rows. Verification must retain and never fabricate ACK evidence.
 	e.exec(t, `CREATE FUNCTION test_publication_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='`+hold.String()+`' AND NEW.completed_publication_receipt IS NOT NULL THEN RETURN NULL; END IF; RETURN NEW; END $$`)
 	e.exec(t, "CREATE TRIGGER test_publication_refuse BEFORE UPDATE ON recovery_custody_holds FOR EACH ROW EXECUTE FUNCTION test_publication_refuse()")
-	svc.SetForges(settleUnitBuilder{f: &publicationForge{branch: branch, head: head, summaryHead: head, ancestry: forge.AncestryAncestor}})
+	svc.SetForges(settleUnitBuilder{f: &publicationForge{t: t, projectID: 1, mrIID: 7, expectedBranch: branch, branch: branch, head: head, summaryHead: head, ancestry: forge.AncestryAncestor}})
 	refused, err := svc.SetStateReportWithReconciliation(e.ctx, w, run, req)
 	e.exec(t, "DROP TRIGGER test_publication_refuse ON recovery_custody_holds")
 	e.exec(t, "DROP FUNCTION test_publication_refuse()")

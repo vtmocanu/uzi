@@ -60,7 +60,7 @@ func TestCompletedPublicationCompletionIdentityLiveDB(t *testing.T) {
 				}
 			}
 			// Initial proof failure commits completion and freezes identity for a retry.
-			f := &publicationForge{branch: branch, head: head, summaryHead: head, ancestry: forge.AncestryUnknown}
+			f := &publicationForge{t: t, projectID: 1, mrIID: 7, expectedBranch: branch, branch: branch, head: head, summaryHead: head, ancestry: forge.AncestryUnknown}
 			svc.SetForges(settleUnitBuilder{f: f})
 			first, err := svc.SetStateReportWithReconciliation(e.ctx, w, run, req)
 			if err != nil || !first.Applied || first.CompletedPublicationReceipt != nil || first.CompletedPublicationReason != "ancestry_unknown" {

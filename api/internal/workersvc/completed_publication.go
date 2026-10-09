@@ -109,18 +109,25 @@ func (s *Service) replayCompletedPublication(ctx context.Context, w store.Worker
 	if req.MrIID != nil && (id.MRIID == nil || *req.MrIID != *id.MRIID) {
 		return nil, nil
 	}
-	if req.Branch != nil && *req.Branch != id.Branch {
+	// The frozen API branch is proof authority; req.Branch is worker-reported text.
+	if req.Head != nil && *req.Head != id.FinalHead {
 		return nil, nil
+	}
+	if receipt := completedPublicationReceipt(h, id); receipt != nil {
+		// Receipt authority survives run deletion or a successor claim. This terminal
+		// ACK projects only authenticated frozen fields; ancillary run data is unknown.
+		run := store.Run{
+			ID: runID, UserID: w.UserID, WorkerID: pgconv.UUID(w.ID), RepoID: h.RepoID,
+			Status: "completed", ClaimGeneration: id.Generation, Branch: pgconv.Text(id.Branch),
+		}
+		if id.MRIID != nil {
+			run.MrIid = pgconv.Int8Ptr(id.MRIID)
+		}
+		return &StateReportResult{Run: run, Applied: true, CompletedPublicationReceipt: receipt}, nil
 	}
 	run, err := s.GetRun(ctx, w.UserID, runID)
 	if err != nil {
 		return nil, err
-	}
-	if run.CompletionContractVersion.Valid && (req.Head == nil || *req.Head != id.FinalHead) {
-		return nil, nil
-	}
-	if receipt := completedPublicationReceipt(h, id); receipt != nil {
-		return &StateReportResult{Run: run, Applied: true, CompletedPublicationReceipt: receipt}, nil
 	}
 	if run.Status == "completed" && run.ClaimGeneration == id.Generation && run.WorkerID == pgconv.UUID(w.ID) {
 		receipt, reason := s.verifyCompletedPublication(ctx, w, runID, req)
