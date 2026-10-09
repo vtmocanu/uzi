@@ -1,3 +1,4 @@
+import { isAccountingStatus } from "../lib/accountingStatus";
 import { PlanCrossCheckEvent } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
@@ -1061,6 +1062,7 @@ export const RunEventRow = memo(function RunEventRow({
   phaseUsage?: PhaseUsage;
   onFindingMutation?: () => void;
 }) {
+  if (isAccountingStatus(msg)) return null;
   const rec = asRecord(msg.payload);
   switch (msg.kind) {
     case "text": {

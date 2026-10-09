@@ -1384,3 +1384,14 @@ it("usage-limit provider regression #2360: memo rows respond to context", () => 
   rerender(<RunEventRow msg={event} live={false} harness="codex" />);
   expect(container.textContent).toContain("Codex usage limit reached");
 });
+
+describe("m2 accounting-only status", () => {
+  it("defensively renders no row even for malformed accounting payloads", () => {
+    const r = render(<RunEventRow msg={msg({ seq: 1, kind: "status", payload: { event: "codex_response_usage", usage_response_id: "bad" } })} live />);
+    expect(r.container.firstChild).toBeNull();
+  });
+  it("keeps text carrying the same event name", () => {
+    const r = render(<RunEventRow msg={msg({ seq: 1, kind: "text", payload: { event: "codex_response_usage", text: "visible prose" } })} live />);
+    expect(r.getByText("visible prose")).toBeTruthy();
+  });
+});

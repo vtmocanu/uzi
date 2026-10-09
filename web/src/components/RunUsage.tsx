@@ -16,14 +16,15 @@ import { cx } from "./ui";
 //
 // TWO states, gated by two independent flags off deriveRunUsage:
 //   • CONFIRMED (`hasConfirmed`, once a result frame carried per-model usage): the
-//     billed surface — the 4-stat strip, per-phase table, per-agent table, cost.
+//     billed totals — the 4-stat strip, per-phase table and cost — plus estimated
+//     deduplicated per-agent input attribution.
 //   • LIVE-ONLY (`hasLiveTokens && !hasConfirmed`, from the first assistant-usage
 //     frame until the first result frame lands): a provisional IN-FLIGHT view of
 //     input tokens only. Deliberately NO output and NO cost — per-call output is a
 //     message_start snapshot capturing ~1-4% of the truth, so a live out/cost figure
 //     would be wrong by ~25-100x (see runUsage.ts). Once `hasConfirmed` flips true the
 //     confirmed surfaces take over and this disappears — we never show the deduped
-//     live table beside the raw confirmed per-agent one.
+//     live table beside the confirmed attribution table.
 // A pre-feature run has neither flag, so this renders nothing rather than a fabricated 0.
 
 const K_CLASS = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
@@ -187,10 +188,10 @@ export function RunUsagePanel({
         </Stat>
         <Stat label="Tokens out" value={formatTokens(total.out)}>
           <div className="text-[11px] text-muted">
-            {total.phaseCount} phase{total.phaseCount === 1 ? "" : "s"} · {total.turns} turns
+            {total.phaseCount} phase{total.phaseCount === 1 ? "" : "s"} · {total.turns ?? "—"} turns
           </div>
         </Stat>
-        <Stat label="Duration" value={formatDuration(total.durationMs)}>
+        <Stat label="Duration" value={total.durationMs === null ? "—" : formatDuration(total.durationMs)}>
           {model && <div className="truncate text-[11px] text-muted">{model}</div>}
         </Stat>
         <Stat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"}>
@@ -249,7 +250,7 @@ export function RunUsagePanel({
               {phases.map((p) => (
                 <tr key={p.seq}>
                   <Td left>{p.label}</Td>
-                  <Td>{p.turns}</Td>
+                  <Td>{p.turns ?? "—"}</Td>
                   <Td>{formatTokens(p.fresh)}</Td>
                   <Td>{formatTokens(p.cached)}</Td>
                   <Td>{formatTokens(p.out)}</Td>
@@ -258,7 +259,7 @@ export function RunUsagePanel({
               ))}
               <tr>
                 <Td left total>Run total</Td>
-                <Td total>{total.turns}</Td>
+                <Td total>{total.turns ?? "—"}</Td>
                 <Td total>{formatTokens(total.fresh)}</Td>
                 <Td total>{formatTokens(total.cached)}</Td>
                 <Td total>{formatTokens(total.out)}</Td>
@@ -287,7 +288,6 @@ export function RunUsagePanel({
                   <Th left>Model</Th>
                   <Th>In (fresh)</Th>
                   <Th>In (cached)</Th>
-                  <Th>Out</Th>
                 </tr>
               </thead>
               <tbody>
@@ -299,7 +299,6 @@ export function RunUsagePanel({
                     <Td left mono>{agentModelCell(a)}</Td>
                     <Td>{formatTokens(a.fresh)}</Td>
                     <Td>{formatTokens(a.cached)}</Td>
-                    <Td>{formatTokens(a.out)}</Td>
                   </tr>
                 ))}
                 <tr>
@@ -307,14 +306,12 @@ export function RunUsagePanel({
                   <Td left total mono>{totalModelCell(agentModels)}</Td>
                   <Td total>{formatTokens(agentTotal.fresh)}</Td>
                   <Td total>{formatTokens(agentTotal.cached)}</Td>
-                  <Td total>{formatTokens(agentTotal.out)}</Td>
                 </tr>
               </tbody>
             </table>
           </div>
           <p className="mt-1.5 text-[11px] text-faint">
-            Attributed from each agent's assistant messages; may not sum to the run total (tokens only — per-agent
-            cost is not available).
+            Estimated attribution from deduplicated assistant usage; identical usage records on the same lane may collapse, and attribution may be incomplete. Output is not attributed.
           </p>
         </details>
       )}
