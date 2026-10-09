@@ -674,6 +674,7 @@ export class Worker {
           "recovery_archive_v1",
           "recovery_archive_v2",
           "recovery_inventory_v1",
+          "recovery_completed_publication_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised

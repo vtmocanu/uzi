@@ -2294,6 +2294,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
+  completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
   candidate_digest?: string;
   status: RunState;
@@ -2574,6 +2576,30 @@ export interface PlanCrossCheckReconciliation {
   currentPlanSHA256: string;
 }
 
+/** API proof for exactly one completed generation, independent of archive coverage.
+ * Observed branch head may be a descendant of final_head. No physical cleanup is implied. */
+export interface CompletedPublicationReceipt {
+  hold_id: string;
+  run_id: string;
+  owner_id: string;
+  worker_id: string;
+  generation: number;
+  final_head: string;
+  repo_id: string;
+  connection_id: string;
+  project_id: number;
+  forge_type: "gitlab" | "forgejo" | "github";
+  base_url: string;
+  branch: string;
+  mr_iid: number;
+  observed_branch_head: string;
+}
+
+export type CompletedPublicationReason =
+  | "completion_identity_missing" | "not_completed" | "identity_changed"
+  | "mr_missing" | "branch_missing" | "branch_mismatch" | "head_mismatch"
+  | "not_ancestor" | "ancestry_unknown" | "forge_timeout" | "unsupported_feature";
+
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
  * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
@@ -2596,6 +2622,9 @@ export interface PlanCrossCheckReconciliation {
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Validated by WorkerClient against registration, request and known inventory. */
+  completedPublicationReceipt?: CompletedPublicationReceipt;
+  completedPublicationReason?: CompletedPublicationReason;
   reconciliation?: PlanCrossCheckReconciliation;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
@@ -2922,6 +2951,9 @@ export interface RecoveryReleaseRequest {
  *  has_available_capture is true when a ready archive already covers this hold's source, and
  *  capture_state is the latest capture's lifecycle state ('' when the hold has no capture). */
 export interface RecoveryHold {
+  /** Wire projections; receipt authority still requires request/registration validation. */
+  completed_publication_receipt?: CompletedPublicationReceipt;
+  completed_publication_reason?: CompletedPublicationReason;
   inventory_guarded?: boolean;
   hold_id: string;
   generation: number;

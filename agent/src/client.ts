@@ -47,6 +47,8 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type CompletedPublicationReceipt,
+  type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
@@ -998,6 +1000,9 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
+  // Authenticated observations only; empty later inventories do not erase an observed identity.
+  private readonly completionClaims = new Map<string, { repoId?: string; forgeType?: string; branch?: string; eligible: boolean; guarded: boolean }>();
+  private readonly completionHolds = new Map<string, string | null>();
   private readonly inventoryGuardedClaims = new Set<string>();
   private readonly settledInventoryGuardedClaims = new Set<string>();
 
@@ -1127,6 +1132,7 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
+    const priorWorkerId = this.registeredWorkerId;
     this.registeredWorkerId = undefined;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
@@ -1187,6 +1193,10 @@ export class WorkerClient {
         ? Math.floor(res.worker_outbox_max_pending)
         : undefined;
     this.registeredWorkerId = terminalUUID(res.worker_id) ? res.worker_id.toLowerCase() : undefined;
+    if (this.registeredWorkerId !== priorWorkerId) {
+      this.completionClaims.clear();
+      this.completionHolds.clear();
+    }
     return res;
   }
 
@@ -1395,6 +1405,17 @@ export class WorkerClient {
         claim.pr_description = pr;
       }
     }
+    if (isRecord(claim) && terminalUUID(claim.run_id) && terminalGeneration(claim.claim_generation) && claim.claim_generation > 0) {
+      const kind = claim.kind ?? "issue";
+      const branch = kind === "issue" && Number.isSafeInteger(claim.issue_iid) && (claim.issue_iid ?? 0) > 0
+        ? `agent/issue-${claim.issue_iid}`
+        : kind === "self_improve" ? `uzi/self-improve/${claim.run_id.toLowerCase()}`
+        : kind === "mr_rework" ? claim.branch ?? undefined : undefined;
+      this.completionClaims.set(`${claim.run_id}:${claim.claim_generation}`, {
+        repoId: claim.repo?.id, forgeType: claim.repo?.forge_type ?? "gitlab", branch,
+        eligible: ["issue", "mr_rework", "self_improve"].includes(kind), guarded: claim.inventory_guarded === true,
+      });
+    }
     return claim;
   }
 
@@ -1585,20 +1606,68 @@ export class WorkerClient {
     // claim (generation ?? 0) OMIT the key rather than send 0. The transient-retry loop, AbortSignal,
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
+    const outbound = { ...body };
+    if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
     // gate presentation fields are not either: the report degrades to an id-less one, which an
     // allocating api still answers with its revision and an older api accepts unchanged.
-    return this.withGenerationFallback(included, (includeField) =>
+    const ack = await this.withGenerationFallback(included, (includeField) =>
       this.reportStateOnce(
         runId,
         path,
-        includeField ? body : { ...body, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined },
+        includeField ? outbound : { ...outbound, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
         signal,
       ),
     );
+    if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
+    return ack;
+  }
+
+  /** Validate proof only at the authenticated state-report seam. This does not settle local custody. */
+  private validateCompletedPublicationReceipt(runId: string, body: StateRequest, fields: Awaited<ReturnType<typeof readRunAck>>): CompletedPublicationReceipt | undefined {
+    const value = fields.completedPublicationCandidate;
+    if (!this.registeredWorkerId || !this.hasFeature("recovery_completed_publication_v1") ||
+        body.status !== "completed" || fields.status !== "completed" ||
+        fields.completedPublicationReason || fields.staleClaim || fields.credentialSwitch ||
+        fields.runId !== runId || fields.workerId !== this.registeredWorkerId ||
+        !isRecord(value)) return undefined;
+    for (const key of ["hold_id", "run_id", "owner_id", "worker_id", "repo_id", "connection_id"]) {
+      if (!terminalUUID(value[key]) || value[key] !== (value[key] as string).toLowerCase()) return undefined;
+    }
+    if (value.run_id !== runId || value.worker_id !== this.registeredWorkerId ||
+        !terminalGeneration(value.generation) || value.generation <= 0 || value.generation !== body.claim_generation ||
+        !completionSHA(value.final_head) || value.final_head !== body.completion_final_head ||
+        !completionSHA(value.observed_branch_head) ||
+        !completionPositiveInteger(value.project_id) || !completionPositiveInteger(value.mr_iid) ||
+        (typeof value.forge_type !== "string" || !["gitlab", "forgejo", "github"].includes(value.forge_type)) ||
+        !completionSafeIdentifier(value.branch) || !completionSafeIdentifier(value.base_url) ||
+        (body.branch !== undefined && value.branch !== body.branch) ||
+        (body.mr_iid !== undefined && value.mr_iid !== body.mr_iid)) return undefined;
+    try {
+      const url = new URL(value.base_url as string);
+      if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return undefined;
+    } catch { return undefined; }
+    const key = `${runId}:${body.claim_generation}`;
+    const claim = this.completionClaims.get(key);
+    const hold = this.completionHolds.get(key);
+    if ((claim && (!claim.eligible || !claim.guarded ||
+          (claim.repoId !== undefined && claim.repoId !== value.repo_id) ||
+          (claim.forgeType !== undefined && claim.forgeType !== value.forge_type) ||
+          (claim.branch !== undefined && claim.branch !== value.branch))) ||
+        (hold !== undefined && hold !== value.hold_id)) return undefined;
+    // Copy exactly the contract fields: unknown response fields carry no authority.
+    return {
+      hold_id: value.hold_id as string, run_id: value.run_id as string,
+      owner_id: value.owner_id as string, worker_id: value.worker_id as string,
+      generation: value.generation, final_head: value.final_head,
+      repo_id: value.repo_id as string, connection_id: value.connection_id as string,
+      project_id: value.project_id as number, forge_type: value.forge_type as CompletedPublicationReceipt["forge_type"],
+      base_url: value.base_url as string, branch: value.branch as string, mr_iid: value.mr_iid as number,
+      observed_branch_head: value.observed_branch_head,
+    };
   }
 
   /** One /state POST WITH the given body, including the transient-retry loop, AbortSignal
@@ -1623,6 +1692,15 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
           };
+          if (body.completion_final_head !== undefined) {
+            if (!this.hasFeature("recovery_completed_publication_v1")) {
+              ack.completedPublicationReason = "unsupported_feature";
+            } else {
+              const receipt = this.validateCompletedPublicationReceipt(runId, body, fields);
+              if (receipt && res.status === 200) ack.completedPublicationReceipt = receipt;
+              else if (fields.completedPublicationReason) ack.completedPublicationReason = fields.completedPublicationReason;
+            }
+          }
           // PRD #1497 M2: carry the run's hold_reason off the SAME body so the reportState closure
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
@@ -1882,9 +1960,22 @@ export class WorkerClient {
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
    *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
-    return (await this.getJSON(
+    const response = (await this.getJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`,
     )) as RecoveryHoldsResponse;
+    if (this.registeredWorkerId && response?.run_id === runId && Array.isArray(response.holds)) {
+      const seen = new Set<number>();
+      // One pass over the finite returned inventory, no retries; malformed siblings are skipped.
+      for (const hold of response.holds) {
+        if (!isRecord(hold) || !terminalGeneration(hold.generation) || hold.generation <= 0) continue;
+        const key = `${runId}:${hold.generation}`;
+        const prior = this.completionHolds.get(key);
+        const id = terminalUUID(hold.hold_id) && hold.inventory_guarded === true ? hold.hold_id : null;
+        this.completionHolds.set(key, seen.has(hold.generation) || (prior !== undefined && prior !== id) ? null : id);
+        seen.add(hold.generation);
+      }
+    }
+    return response;
   }
 
   /** settleRecoveryHold asks the api to settle ONE older-generation custody hold on a completed
@@ -3182,6 +3273,10 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * applied it.
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
+  completedPublicationCandidate?: unknown;
+  completedPublicationReason?: CompletedPublicationReason;
+  runId?: unknown;
+  workerId?: unknown;
   status?: string;
   holdReason?: string | null;
   budgetMaxIterations?: number;
@@ -3209,7 +3304,11 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const parsed = JSON.parse(text) as {
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
+      completed_publication_receipt?: unknown;
+      completed_publication_reason?: unknown;
       run?: {
+        id?: unknown;
+        worker_id?: unknown;
         status?: unknown;
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
@@ -3236,6 +3335,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     };
     const run = parsed?.run;
     const out: {
+      completedPublicationCandidate?: unknown;
+      completedPublicationReason?: CompletedPublicationReason;
+      runId?: unknown;
+      workerId?: unknown;
       status?: string;
       holdReason?: string | null;
       budgetMaxIterations?: number;
@@ -3256,6 +3359,11 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gateRevision?: number;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
+    const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);
+    if (completionReason) out.completedPublicationReason = completionReason;
+    if (run?.id !== undefined) out.runId = run.id;
+    if (run?.worker_id !== undefined) out.workerId = run.worker_id;
     if (typeof run?.status === "string") out.status = run.status;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
@@ -3405,6 +3513,30 @@ function abortableSleep(
       },
     );
   });
+}
+
+function completionSHA(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+function completionPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+function completionSafeIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 2048 &&
+    value.trim() === value && !Array.from(value).some(char => {
+      const code = char.codePointAt(0)!;
+      return code <= 32 || (code >= 127 && code <= 159) || code === 0x061c ||
+        code === 0x200e || code === 0x200f || (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069);
+    });
+}
+function decodeCompletedPublicationReason(value: unknown): CompletedPublicationReason | undefined {
+  switch (value) {
+    case "completion_identity_missing": case "not_completed": case "identity_changed":
+    case "mr_missing": case "branch_missing": case "branch_mismatch": case "head_mismatch":
+    case "not_ancestor": case "ancestry_unknown": case "forge_timeout": return value;
+    default: return undefined;
+  }
 }
 
 const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;
