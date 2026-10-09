@@ -37,6 +37,8 @@ COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
 # Same reason for the shared schedule presets (#2344): schedulePresets.test.ts imports them.
 # Mirrors web/Dockerfile.
 COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
+# The TUI/web answer parity fixture (#2550), imported by runQuestion.test.ts and QuestionPanel.test.tsx.
+COPY fixtures/run-question-answer.json /app/fixtures/run-question-answer.json
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 

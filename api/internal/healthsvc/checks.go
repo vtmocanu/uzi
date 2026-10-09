@@ -55,6 +55,7 @@ var checkMeta = map[string]struct {
 	"board.drift":        {"owner", groupHousekeeping, "Board drift", ""},
 	"custody.holds":      {"owner", groupHousekeeping, "Recovery custody holds", ""},
 	"release.check":      {"owner", groupHousekeeping, "Upstream release", ""},
+	"pricing.codex":      {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)

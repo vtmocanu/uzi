@@ -124,8 +124,11 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 }
 
 func TestTUIBoardHelpExplainsMarkedCost(t *testing.T) {
-	if got := strings.Join(helpLines(viewBoard), "\n"); !strings.Contains(got, "+ after 7d cost means subscription/unreported costs excluded") {
-		t.Fatalf("board help missing marked-cost explanation: %q", got)
+	got := strings.Join(helpLines(viewBoard), "\n")
+	for _, want := range []string{"API-equivalent estimate", "+ after 7d cost means the estimate is incomplete", "runs without estimates: tokens only", "unreported: recorded partials included"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("board help missing %q: %q", want, got)
+		}
 	}
 }
 

@@ -488,8 +488,8 @@ export const runsApi = {
     delay<SelfUsage>({
       // PRD #1429 M1 (D7): aggregate cost status stays empty; the explicit counts carry
       // subscription/unreported truth for each window.
-      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "" as const },
-      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55, cost_status: "" as const },
+      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "" as const },
+      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 5.16, cost_status: "" as const },
       run_count: 23,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + failed, and sum(fail_origins) === failed. finished is a
@@ -507,17 +507,18 @@ export const runsApi = {
           last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 1 },
         },
       },
-      // Mixed billing: eight lifetime subscription runs, two in the last week.
+      // Eight legacy rows (two recent) lack estimates. One mixed unreported run
+      // contributes its recorded $0.61 partial to both windows, matching u-vlad.
       lifetime_subscription_run_count: 8,
-      lifetime_unreported_run_count: 0,
+      lifetime_unreported_run_count: 1,
       last7_subscription_run_count: 2,
-      last7_unreported_run_count: 0,
+      last7_unreported_run_count: 1,
     }),
   getAdminUsage: async () =>
     delay<AdminUsage>({
       factory: {
-        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15, cost_status: "" as const },
-        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9, cost_status: "" as const },
+        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.76, cost_status: "" as const },
+        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 15.51, cost_status: "" as const },
         run_count: 79,
         // Factory lifetime outcomes are the sum of the four per-user rows below (finished 38 +
         // 30 + 21 + 8 = 97, failed 5 + 5 + 2 + 0 = 12, needs_landing 1 + 2 + 0 + 0 = 3); the
@@ -532,11 +533,11 @@ export const runsApi = {
             last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 2, run_timeout: 1 },
           },
         },
-        // Lifetime = 12 + 8 across the two mixed-billing users; last week = 3 + 2.
+        // Lifetime = 12 + 8 across the two users with legacy rows; last week = 3 + 2.
         lifetime_subscription_run_count: 20,
-        lifetime_unreported_run_count: 0,
+        lifetime_unreported_run_count: 1,
         last7_subscription_run_count: 5,
-        last7_unreported_run_count: 0,
+        last7_unreported_run_count: 1,
       },
       users: [
         {
@@ -548,11 +549,11 @@ export const runsApi = {
           last7_outcomes: { finished: 9, completed: 7, cancelled: 0, plan_rejected: 1, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
-          user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 0,
-          last_7_days: { input_tokens: 280000, cache_read_tokens: 2800000, cache_creation_tokens: 40000, output_tokens: 120000, cost_usd: 4.55, cost_status: "" as const },
+          user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 1,
+          last_7_days: { input_tokens: 280000, cache_read_tokens: 2800000, cache_creation_tokens: 40000, output_tokens: 120000, cost_usd: 5.16, cost_status: "" as const },
           last7_run_count: 6,
           last7_subscription_run_count: 2,
-          last7_unreported_run_count: 0,
+          last7_unreported_run_count: 1,
           last7_outcomes: { finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
@@ -622,7 +623,8 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    return delay({ run: { ...harnessOverlay(credentialOverlay(run)), own_agents } }, 60);
+    const decorated = harnessOverlay(credentialOverlay(run));
+    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and

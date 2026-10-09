@@ -8,6 +8,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
 type captureForge struct {
@@ -113,18 +115,55 @@ func TestM2CaptureParentCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Both child-expiry tests run on synctest's fake clock; the production defaults are
+// asserted separately in interactive_timeout_test.go.
 func TestM2CaptureChildExpiryValidRaw(t *testing.T) {
-	f := &expiryForge{expireDuringAssessment: true}
-	c, err := issueinput.Fetch(context.Background(), f, 7, 11, 1)
-	if err != nil || !c.Unknown || c.Issue.Description != "raw" {
-		t.Fatalf("%+v %v", c, err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		budget := issueinput.InteractiveAssessmentTimeout
+		start := time.Now()
+		f := &expiryForge{expireDuringAssessment: true}
+		f.comments = []forge.IssueComment{{AuthorForgeUserID: 4, Body: "UNVERIFIED_RAW"}}
+		c, err := issueinput.FetchWithTimeout(parent, f, 7, 11, 1, budget)
+		if err != nil || c == nil {
+			t.Fatalf("valid raw lost on child expiry: %+v %v", c, err)
+		}
+		if parent.Err() != nil {
+			t.Fatalf("child expiry cancelled the parent: %v", parent.Err())
+		}
+		if time.Now() != start.Add(budget) {
+			t.Fatalf("expired at %v, want child budget %v", time.Since(start), budget)
+		}
+		if c.Issue.Description != "raw" {
+			t.Fatalf("raw description=%q", c.Issue.Description)
+		}
+		if c.Reason != issueinput.Unknown || !c.Unknown {
+			t.Fatalf("child expiry treated as eligibility: reason=%q unknown=%v", c.Reason, c.Unknown)
+		}
+		if len(c.Thread.Comments) != 1 || c.Thread.Comments[0].Body != issueinput.Placeholder {
+			t.Fatalf("unverified author released: %+v", c.Thread.Comments)
+		}
+	})
 }
 func TestM2CaptureLateRawRejected(t *testing.T) {
-	f := &expiryForge{}
-	if _, err := issueinput.Fetch(context.Background(), f, 7, 11, 1); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatal(err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		budget := issueinput.InteractiveAssessmentTimeout
+		start := time.Now()
+		c, err := issueinput.FetchWithTimeout(parent, &expiryForge{}, 7, 11, 1, budget)
+		if !errors.Is(err, context.DeadlineExceeded) || c != nil {
+			t.Fatalf("late raw accepted: %+v %v", c, err)
+		}
+		if parent.Err() != nil {
+			t.Fatalf("late raw cancelled the parent: %v", parent.Err())
+		}
+		if time.Now() != start.Add(budget) {
+			t.Fatalf("expired at %v, want child budget %v", time.Since(start), budget)
+		}
+	})
 }
 
 type expiryForge struct {

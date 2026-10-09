@@ -34,7 +34,7 @@ func (e leaseEnv) claimNoSnapshotAsync(svc *Service, workerID uuid.UUID) <-chan 
 func TestClaimNoSnapshotThroughLeaseRebindsLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(2*time.Hour, e.pool)
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 	r := awaitClaim(t, e.claimNoSnapshotAsync(svc, w))
@@ -58,7 +58,7 @@ func TestClaimNoSnapshotThroughLeaseRebindsLiveDB(t *testing.T) {
 func TestClaimNoSnapshotWorkerDeletedIsIdleLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(2*time.Hour, e.pool)
-	w, _, _ := e.seedLeasedWorker(t, 0)
+	w, _, _ := e.seedLeasedWorker(t)
 	wkr := e.workerRow2(w)
 	if _, err := e.pool.Exec(e.ctx, `DELETE FROM workers WHERE id = $1`, w); err != nil {
 		t.Fatalf("delete worker: %v", err)
@@ -69,29 +69,42 @@ func TestClaimNoSnapshotWorkerDeletedIsIdleLiveDB(t *testing.T) {
 	}
 }
 
-// TestClaimNoSnapshotLeaseClocksLiveDB: the clock discipline holds on the no-snapshot path. The lease
-// has `window` left when the claim starts and expires while it waits for the worker row.
+// TestClaimNoSnapshotLeaseClocksLiveDB: the clock discipline holds on the no-snapshot path. The claim
+// transaction begins while the lease is live and blocks on the worker row; the lease then expires
+// (armed inside the lock holder's transaction, see TestClaimStaleTxStartClockLiveDB for the barrier)
+// and only afterwards does the claim proceed.
 //   - admission clock: admission reads a fresh clock after the wait, so nothing is admitted; the
 //     probe still shows the lease path ran (one call, none admitted).
-//   - rebind clock: with admission pinned to a pre-expiry instant the claim is admitted, and the
-//     rebind's own clock refuses: the claim rolls back to its savepoint, the follow-up stays queued
-//     with no hold and the worker keeps its binding and reports idle.
+//   - rebind clock: with admission pinned to a pre-expiry database instant the claim is admitted,
+//     and the rebind's own clock refuses: the claim rolls back to its savepoint, the follow-up stays
+//     queued with no hold and the worker keeps its binding and reports idle.
 func TestClaimNoSnapshotLeaseClocksLiveDB(t *testing.T) {
-	const lease, window = 5 * time.Second, 2500 * time.Millisecond
+	const lease = 5 * time.Second
 	run := func(t *testing.T, pin bool) {
 		e := newLeaseEnv(t)
 		svc := e.service(lease, e.pool)
 		probe := &leaseProbe{}
 		svc.leaseClaimProbe = probe.hook
-		if pin {
-			svc.leaseAtOverride = pgtype.Timestamptz{Time: time.Now(), Valid: true} // pre-expiry
-		}
-		w, served, follow := e.leaseClockCase(t, lease, window)
+		w, served, follow := e.leaseClockCase(t)
 
-		holder := e.sideTx(t, `SELECT id FROM workers WHERE id = $1 FOR UPDATE`, w)
+		var pinAt time.Time
+		if pin {
+			// A database instant taken before the claim starts, hence before the arming below.
+			if err := e.pool.QueryRow(e.ctx, `SELECT clock_timestamp()`).Scan(&pinAt); err != nil {
+				t.Fatalf("read database clock for the pin: %v", err)
+			}
+			svc.leaseAtOverride = pgtype.Timestamptz{Time: pinAt, Valid: true} // pre-expiry
+		}
+		holder, pid := e.lockHolder(t, `SELECT id FROM workers WHERE id = $1 FOR UPDATE`, w)
 		res := e.claimNoSnapshotAsync(svc, w)
-		e.waitLockWaiters(t, 1)
-		time.Sleep(window + 400*time.Millisecond) // the lease expires while the claim waits
+		xactStart, _ := e.waitBlockedBy(t, pid, "GetWorkerForUpdate")
+		_, expiry := e.armLeaseExpiry(t, holder, w, lease, workerLockWindow)
+		assertBefore(t, "claim xact_start (its transaction-start now())", xactStart, expiry)
+		if pin {
+			assertBefore(t, "pinned @lease_at", pinAt, expiry)
+		}
+		fresh := e.awaitDBClockPast(t, expiry) // the lease expires while the claim waits
+		logClockOrdering(t, "claim xact_start", xactStart, expiry, fresh)
 		if err := holder.Commit(e.ctx); err != nil {
 			t.Fatalf("commit holder: %v", err)
 		}
@@ -142,7 +155,7 @@ func TestClaimRebindUniqueViolationLiveDB(t *testing.T) {
 			svc := e.service(2*time.Hour, e.pool)
 			probe := &leaseProbe{}
 			svc.leaseClaimProbe = probe.hook
-			w, served, iid := e.seedLeasedWorker(t, 0)
+			w, served, iid := e.seedLeasedWorker(t)
 			follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 			// The provisioner commits another ephemeral worker bound to the follow-up after ClaimRun's
 			// statement snapshot but before the rebind (ClaimRun skips a run another ephemeral worker

@@ -318,6 +318,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:forge-fake
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -414,6 +415,9 @@ tasks:
       - task: test:semgrep-parity
       - task: check:semgrep-parity
       - task: test:semgrep-gate
+      # Hermetic fixture tests only; aging real prices is advisory and never gates.
+      - task: test:pricing-freshness
+      - task: test:pricing-freshness-issue
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -849,10 +853,6 @@ tasks:
       # (groupName "shellcheck" in renovate.json) folds them into ONE bump PR. A
       # single shared variable would have to be spliced into a `cmds:` line, which
       # this file's header bans.
-      #
-      # NOTE: temporarily downgraded to 0.10.0 to force a live Renovate bump-back
-      # PR (0.11.0 is latest; with no version delta Renovate opens nothing). This
-      # proves the wiring end to end; Renovate then bumps it back to 0.11.0.
       # renovate: datasource=github-releases depName=koalaman/shellcheck
       - ./scripts/lint-shell.sh warning 0.11.0
 
@@ -1004,6 +1004,11 @@ tasks:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
       - node ./scripts/renovate-codex-runtime.test.mjs
+
+  test:forge-fake:
+    desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
+    cmds:
+      - node --test e2e/forge-fake/issue-comments.test.mjs
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
@@ -3101,6 +3106,23 @@ tasks:
       - rm -f api/internal/uzidocs/embed/*.md
       - cp docs/*.md api/internal/uzidocs/embed/
 
+  test:pricing-freshness:
+    desc: hermetic pricing freshness CLI schema and calendar tests
+    cmds:
+      - bash scripts/pricing-freshness.test.sh
+
+  test:pricing-freshness-issue:
+    desc: hermetic test of the weekly pricing freshness tracking-issue sync (stub gh)
+    cmds:
+      - bash scripts/pricing-freshness-issue.test.sh
+
+  # Explicit writer only; the codexprice mirror test detects drift in gates.
+  codex-pricing:sync:
+    desc: mirror canonical agent Codex pricing bytes into the API embed package
+    cmds:
+      - mkdir -p api/internal/codexprice
+      - cp agent/src/codex/codex-pricing.json api/internal/codexprice/codex-pricing.json
+
   # e2e:registry-doc regenerates the phase-registry table in e2e/README.md from the
   # e2e/phases/NN-*.sh headers and splices it between the registry:begin/end markers.
   # NOT a gate target and NOT under gate: it WRITES the tree; check:e2e-registry-doc
@@ -3139,6 +3161,16 @@ tasks:
     dir: api
     cmds:
       - go run ./cmd/roleparity
+
+  # Offline advisory: findings exit 0; invalid inputs/instrument failures exit 2.
+  # Deliberately absent from gates: only test:pricing-freshness is a gate member.
+  nudge:pricing:
+    desc: 'pricing freshness NUDGE - recorded verification and promotional review dates (never gates)'
+    # Pass findings through unchanged, including machine-readable --json output.
+    silent: true
+    interactive: true
+    cmds:
+      - bash scripts/pricing-freshness.sh {{.CLI_ARGS}}
 
   # Same contract as nudge:roles: never in a gate, exits 0 on any drift. It
   # compares each builtin byte for byte with the upstream product-agents/ file at

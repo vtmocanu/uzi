@@ -96,9 +96,11 @@ delete and let a stale pruner reset a waiting author's position. `CACHE 1`
 keeps values monotonic in lock order across sessions, which the guard needs;
 `NO CYCLE` stops a wrapped value repeating.
 
-**Per-lookup timeout.** Each author lookup is cut off after 5 seconds inside the
-30-second, 200-author assessment, so one hanging forge call costs one slot, not
-the tick.
+**Per-lookup timeout.** Each author lookup is cut off after 5 seconds independently
+of the total, 200-author assessment budget: 30 seconds for the background watcher,
+5 seconds for on-demand rework across Begin and Snapshot (#2372). The total deadline
+can cut a lookup short. In the background watcher, one hanging call costs one slot,
+not the tick.
 
 **Shared-evidence condition.** On GitHub, eligibility evidence (the
 repository-wide collaborator list) is shared across lookups. A tick only
@@ -159,6 +161,9 @@ this bound but is never dropped or suppressed.
 - Two forges on one host under different paths share an allowlist key.
 - A stale GitHub REST listing can cost a queue position; that affects fairness
   only, never who is trusted.
-- The on-demand handler shares the 30-second assessment deadline while the API
-  write timeout is 15 seconds (same mismatch as #2372); deferred.
+- Resolved in #2372: the on-demand handler selects a 5-second total assessment
+  deadline while the background watcher retains 30 seconds. Queue and verdict
+  writes and Snapshot keep the original parent context. This leaves headroom in
+  the 15-second HTTP write budget when earlier work is prompt; it does not enforce
+  an overall request or creation deadline or provide idempotency.
 - Not shipped: the CLI cannot edit the allowlist (cookie-only endpoint).

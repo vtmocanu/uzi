@@ -72,7 +72,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   own worktree, or save a patch file.
 - **CI is the gate; do not run full gates locally.** `land-prep.sh` runs none by default
   (`LOCAL_GATES=none`; report "awaiting CI", never a local pass); `merge.sh` requires the exact
-  head's required checks green. Run locally only fast targeted checks (`go build`/`vet` of
+  head's required checks green, or all reported checks passing/skipping when both readable rulesets and classic protection require none (zero reported checks never means green). Run locally only fast targeted checks (`go build`/`vet` of
   touched packages, `gofmt -l`, a `sqlc generate` diff, `task docs:sync` + `check-docs:web`,
   `check:changelog-entry`, the focused tests and their red/green mutation) and checks CI lacks.
   `--gate auto` still runs full component gates; a local failure counts only after the same

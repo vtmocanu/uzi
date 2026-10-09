@@ -77,8 +77,8 @@ func TestAdminHealthAuthLiveDB(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("decode health doc: %v (body %s)", err, rec.Body.String())
 	}
-	if len(doc.Checks) != 17 {
-		t.Fatalf("health doc carries %d checks, want the 17 checks (11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213)\nbody: %s", len(doc.Checks), rec.Body.String())
+	if len(doc.Checks) != 18 {
+		t.Fatalf("health doc carries %d checks, want the 18 checks (11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + pricing.codex from PRD #2560)\nbody: %s", len(doc.Checks), rec.Body.String())
 	}
 	if doc.Status == "" {
 		t.Fatalf("health doc status is empty\nbody: %s", rec.Body.String())

@@ -17,8 +17,8 @@ type UsageDTO struct {
 	// CostStatus is the run's folded per-run cost-observability marker (PRD #1429 M1 / D7),
 	// one of "metered" | "subscription" | "unreported" — so a reader keys on the status
 	// rather than reading a placeholder cost_usd 0 as a real dollar total: metered may show
-	// dollars, subscription is labelled subscription usage, unreported shows tokens with cost
-	// unavailable. It is meaningful on a PER-RUN bundle (RunDTO.Usage, run-list rows), copied
+	// API-equivalent dollars, legacy subscription rows show tokens without an estimate,
+	// and unreported rows show cost unavailable even when cost_usd retains a partial amount. It is meaningful on a PER-RUN bundle (RunDTO.Usage, run-list rows), copied
 	// from run_usage_totals; on a per-WINDOW aggregate (SelfUsageDTO.Lifetime/Last7Days) a
 	// single status does not apply, so it is left "" and the window's truth is the
 	// subscription/unreported RUN COUNTS on the containers below. A client must render an
@@ -169,7 +169,8 @@ type AdminUserUsageDTO struct {
 // The subscription/unreported run counts (PRD #1429 M1 / D7) ride here through its two
 // members: the windowed factory counts on Factory (a SelfUsageDTO) and the windowed per-user
 // counts on each Users row (AdminUserUsageDTO), so the admin dashboard shows the counts beside
-// numeric metered totals and never presents a partial dollar sum as complete.
+// numeric dollar totals (including retained unreported partial amounts) and never
+// presents a partial API-equivalent estimate as complete.
 type AdminUsageDTO struct {
 	Factory SelfUsageDTO        `json:"factory"`
 	Users   []AdminUserUsageDTO `json:"users"`

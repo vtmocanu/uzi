@@ -407,12 +407,12 @@ export function RunUsageTailBlock({ tail }: { tail: UsageTail | null | undefined
   const version = stripUnsafeChars(tail.price_table_version);
   return (
     <section
-      aria-label="Estimated usage, not metered"
+      aria-label="Estimated usage, not in the total"
       className="rounded-lg border border-dashed border-edge bg-raised/40 px-3.5 py-3"
     >
-      <div className={K_CLASS}>Estimated, not metered</div>
+      <div className={K_CLASS}>Estimated, not in the total</div>
       <p className="mt-1 text-[11px] text-faint">
-        Usage after the last reported total of an interrupted session. It is not included in the metered total.
+        Usage after the last reported total of an interrupted session. It is not included in the recorded total.
       </p>
       <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-1 font-mono text-[13px] tabular-nums">
         <span>

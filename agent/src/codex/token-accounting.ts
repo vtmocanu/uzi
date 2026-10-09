@@ -25,14 +25,9 @@
 //   - UNKNOWN / unregistered threads are dropped, NEVER attributed to the root model.
 //   - Reasoning tokens are a subset of output and are carried, never added to output twice.
 //
-// COST (C4b, D5): each emitted entry now carries a closed `costStatus` marker and, ONLY for a
-// `metered` entry, a numeric `costUSD`. There are three mutually-exclusive semantics, chosen by
-// the RUN's per-run authMode plus the reconciliation and pricing outcome (see {@link
-// CodexPricingContext} and {@link aggregateByModel}):
-//   - subscription run  → every entry `subscription`, NO costUSD (no per-token charge exists);
-//   - api-key run       → `metered` with the summed per-response price WHEN every observed
-//                         response for the model priced AND reconciled; otherwise `unreported`;
-//   - no pricing context (a token-only caller / the pre-C4b default) → every entry `unreported`.
+// COST (C4b, D5): metered entries carry an API-equivalent dollar estimate from the pinned
+// per-response table for either credential mode. Missing context, evidence or reconciliation
+// produces unreported entries with no dollar figure.
 // TOKEN TOTALS are unchanged from C4a — they always come from the cumulative `total` deltas, never
 // from the per-response `last` sum — so a model that fails to price still RETAINS its tokens as an
 // `unreported` entry rather than losing them.
@@ -41,10 +36,8 @@ import type { CodexThreadTokenUsage, CodexUsageBreakdown } from "./transport.js"
 import type { HarnessCost } from "../harness.js";
 import { priceCodexResponse } from "./codex-pricing.js";
 
-/** The closed cost marker on an emitted Codex `modelUsage` entry (C4b, D5): `subscription` (a
- *  subscription run, no per-token charge), `metered` (a fully-priced api-key run, carries
- *  `costUSD`), or `unreported` (unknown/stale/inconsistent — tokens retained, no dollar figure). */
-export type CodexCostStatus = "subscription" | "metered" | "unreported";
+/** The cost marker: fully priced API-equivalent usage, or unavailable cost with tokens retained. */
+export type CodexCostStatus = "metered" | "unreported";
 
 /**
  * One per-model entry in the result-frame `modelUsage` map, as emitted for a Codex run. The
@@ -54,7 +47,7 @@ export type CodexCostStatus = "subscription" | "metered" | "unreported";
  * closed {@link CodexCostStatus} marker. `inputTokens` here is the UNCACHED input (Claude's
  * `input_tokens` semantics — non-overlapping with the two cache buckets), and
  * `reasoningOutputTokens` is a subset of `outputTokens` (never added to it). `costUSD` is present
- * ONLY on a `metered` entry (a fully-priced api-key run); it is ABSENT for `subscription` and
+ * ONLY on a `metered` entry (fully-priced API-equivalent usage); it is ABSENT for
  * `unreported`, matching the server's `resultModelUsage` decode where a missing `costUSD` reads as
  * a numeric-zero placeholder that the closed `costStatus` distinguishes from a real $0.
  */
@@ -193,7 +186,7 @@ interface ThreadAccount {
   readonly responses: CodexUsageBreakdown[];
   /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note carried an
    *  absent or malformed pricing-required bucket (`transport.ts` pricingEvidenceComplete). It
-   *  fails pricing closed for this thread's model in {@link aggregateByModel}'s api-key branch even
+   *  fails pricing closed for this thread's model in {@link aggregateByModel}'s pricing branch even
    *  when the coerced-to-0 buckets reconcile numerically — token totals are still retained; only
    *  cost/costStatus is gated. A stale/out-of-order note (not adopted) never taints it. */
   pricingEvidenceComplete: boolean;
@@ -303,9 +296,7 @@ export class CodexUsageAccountant {
    * TOKEN buckets are always the cumulative `total` deltas (unchanged from C4a). COST (C4b, D5)
    * depends on `pricing`:
    *   - `pricing` omitted            → every entry `unreported`, no `costUSD` (token-only caller).
-   *   - `authMode: 'subscription'`   → every entry `subscription`, no `costUSD` (no per-token
-   *                                    charge exists; even an unknown model is subscription).
-   *   - `authMode: 'api_key'`        → per model, CONSERVATIVE DOMINANCE: the entry is `metered`
+   *   - `pricing` present (either auth mode) → per model, CONSERVATIVE DOMINANCE: the entry is `metered`
    *                                    with the SUMMED per-response price ONLY when EVERY observed
    *                                    response of EVERY thread on that model has COMPLETE pricing
    *                                    evidence (m3: no present-but-malformed priced bucket),
@@ -321,19 +312,19 @@ export class CodexUsageAccountant {
     interface ModelAgg {
       tokens: Cumulative;
       /** True until a thread on this model fails to reconcile or has an unpriceable response.
-       *  Only consulted on an api-key run. */
+       *  Only consulted when pricing context is present. */
       priceable: boolean;
-      /** Summed per-response price across every thread on this model (api-key run only). */
+      /** Summed per-response price across every thread on this model (either credential mode). */
       costUSD: number;
     }
     const byModel = new Map<string, ModelAgg>();
-    const priceApiKey = pricing !== undefined && pricing.authMode === "api_key";
+    const hasPricing = pricing !== undefined;
     for (const acct of this.threads.values()) {
       if (acct.maxTotal === undefined) continue; // registered but saw no usage note
       const charged = diffClamp(acct.maxTotal, acct.baseline ?? zeroCumulative());
       const agg = byModel.get(acct.model) ?? { tokens: zeroCumulative(), priceable: true, costUSD: 0 };
       addInto(agg.tokens, charged);
-      if (priceApiKey && agg.priceable) {
+      if (hasPricing && agg.priceable) {
         // PRD #1332 m3 (CodeRabbit 4004800884): fail closed on pricing-evidence completeness FIRST.
         // If any consumed note on this thread carried a present-but-malformed pricing-required
         // bucket, the coerced-to-0 values can make sum(last) and the delta BOTH zero and reconcile
@@ -383,8 +374,6 @@ export class CodexUsageAccountant {
       } as const;
       if (pricing === undefined) {
         out[model] = { ...base, costStatus: "unreported" };
-      } else if (pricing.authMode === "subscription") {
-        out[model] = { ...base, costStatus: "subscription" };
       } else if (agg.priceable) {
         out[model] = { ...base, costStatus: "metered", costUSD: agg.costUSD };
       } else {
@@ -398,17 +387,14 @@ export class CodexUsageAccountant {
 
 /**
  * The RUN-level {@link HarnessCost} for a Codex terminal, folded from the emitted per-model
- * entries with the D5 unreported-dominant rollup. A subscription run is `subscription` regardless
- * of usage (the auth mode has no per-token charge). An api-key run is `metered` (with the summed
+ * entries with the D5 unreported-dominant rollup. Either credential mode is metered (with summed
  * `costUSD`) ONLY when there is at least one entry and EVERY entry is metered; any `unreported`
  * entry — or no usage at all — makes the run `unreported`, so a numeric zero is never presented as
  * a real metered $0.
  */
 export function deriveCodexRunCost(
   entries: Record<string, CodexModelUsageEntry> | undefined,
-  authMode: "subscription" | "api_key",
 ): HarnessCost {
-  if (authMode === "subscription") return { kind: "subscription" };
   if (entries === undefined) return { kind: "unreported" };
   let totalUSD = 0;
   let any = false;

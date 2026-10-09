@@ -37,7 +37,7 @@ it("demo shows matching failure recency, a valid drill-in, and a never-failed us
   expect(admin.users.filter((user) => user.subscription_run_count > 0).length).toBe(2);
   for (const user of admin.users) {
     expect(user.subscription_run_count).toBeLessThanOrEqual(user.run_count);
-    expect(user.unreported_run_count).toBe(0);
+    expect(user.unreported_run_count).toBe(user.user_id === "u-vlad" ? 1 : 0);
   }
 });
 
@@ -82,8 +82,8 @@ it("demo renders selected-window cost exclusions and seven-day per-user totals",
     createElement(UsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {} }),
   ));
   const personal = within(getByRole("region", { name: "Your usage" }));
-  expect(personal.getByText("+ 2 Codex sub runs").getAttribute("title")).toBe("Codex subscription runs: no per-run cost reported");
+  expect(personal.getByText("+ 2 runs without a cost estimate and 1 unreported run").getAttribute("title")).toBe("Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included");
   expect(getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
   const totalRow = getByText("uzi total").closest("tr")!;
-  expect(within(totalRow).getByText("+ 5 Codex sub runs")).toBeTruthy();
+  expect(within(totalRow).getByText("+ 5 runs without a cost estimate and 1 unreported run")).toBeTruthy();
 });

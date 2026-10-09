@@ -158,12 +158,15 @@ fi
 # is not green. gh exits non-zero while still printing the array when a check is failing or
 # pending, so its status only matters when no array came back.
 cj_rc=0
-cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>/dev/null) || cj_rc=$?
-if ! printf '%s' "$cj" | jq -e 'type=="array"' >/dev/null 2>&1; then
+req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
+[ -n "$req" ] || { echo "cannot read the required checks of ${base:-the base branch}; not merging"; exit 2; }
+ci_scope=required; [ "$req" = '[]' ] && ci_scope=all
+cj=$(pr_ci_checks "$REPO" "$PR" "$req" "$head" "$base" 2>/dev/null) || cj_rc=$?
+if ! ci_checks_valid "$cj"; then
   echo "cannot read the required checks for #$PR (gh exit $cj_rc); not merging"; exit 2
 fi
 if [ "$(printf '%s' "$cj" | jq 'length')" -eq 0 ]; then
-  echo "no required checks reported on ${head:0:8}; not merging"; exit 2
+  echo "no $ci_scope checks reported on ${head:0:8}; not merging"; exit 2
 fi
 f=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
 p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
@@ -171,8 +174,6 @@ c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
 [ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
 [ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
 # A required context that has not registered yet is pending too (lib/required-checks.sh).
-req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
-[ -n "$req" ] || { echo "cannot read the required checks of ${base:-the base branch}; not merging"; exit 2; }
 miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required checks on ${head:0:8}; not merging"; exit 2; }
 [ "$miss" -gt 0 ] && { echo "$miss required check(s) not yet reported on ${head:0:8}; not merging"; exit 2; }
 [ "$c" -gt 0 ] && { echo "a required check on ${head:0:8} was cancelled (superseded?); not merging"; exit 2; }
@@ -182,7 +183,9 @@ miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required che
 # passing one are fine.
 [ "$cj_rc" -ne 0 ] && { echo "gh pr checks exited $cj_rc with no failing or pending check on ${head:0:8} (partial read?); not merging"; exit 2; }
 ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
-[ "$ok" -gt 0 ] || { echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2; }
+if [ "$req" != '[]' ] && [ "$ok" -eq 0 ]; then
+  echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2
+fi
 
 # ---- every-author blockers, last moment — FAIL CLOSED ---------------------------------------
 # Whatever the review bots said: any unresolved thread from anyone (bots included), an open

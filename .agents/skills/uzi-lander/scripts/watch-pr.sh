@@ -206,7 +206,8 @@ while [ "$i" -lt "$MAX" ]; do
     exit 8
   fi
 
-  # CI: only REQUIRED checks gate (an optional failure must not force red), and `cancel` is
+  # CI: required checks gate; definitively empty requirements gate all reported checks.
+  # Unreadable rules never select that fallback. `cancel` is
   # a non-ready state (a cancelled required check = supersession, not green). Parse the JSON
   # by validity, NOT by gh's exit code — `gh pr checks` exits non-zero merely for pending.
   # The payload must be a NON-EMPTY array: `{}` or `[]` (a PR whose checks have not
@@ -216,22 +217,28 @@ while [ "$i" -lt "$MAX" ]; do
   fail=0; pend=0; cancel=0; missing=0; ci_wait=""
   # The first poll that saw this head starts its --ci-grace window.
   if [ "$head" != "${seen_head:-}" ]; then seen_head="$head"; seen_ts=$(date +%s); fi
-  cj=$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket 2>"$cj_errf" || true)
-  if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
+  # Re-read every poll: a retargeted PR or rules change must not use stale requirements.
+  req_ctx=""
+  if [ -n "$req_base" ]; then req_ctx=$(required_contexts "$REPO" "$req_base") || req_ctx=""; fi
+  cj=""; cj_rc=0
+  if [ -n "$req_ctx" ]; then
+    cj=$(pr_ci_checks "$REPO" "$PR" "$req_ctx" "$head" "$req_base" 2>"$cj_errf") || cj_rc=$?
+  else
+    unk required_rules
+  fi
+  if ci_checks_valid "$cj" && [ "$(printf '%s' "$cj" | jq length)" -gt 0 ]; then
     fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length') || unk ci_checks
     pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length') || unk ci_checks
     cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length') || unk ci_checks
-    # Re-read every poll: a retargeted PR or a rules change must not be judged by stale rules.
-    req_ctx=""
-    if [ -n "$req_base" ]; then req_ctx=$(required_contexts "$REPO" "$req_base") || req_ctx=""; fi
     if [ -n "$req_ctx" ]; then
       missing=$(missing_required "$req_ctx" "$cj") || unk ci_checks
       pend=$((pend + ${missing:-0}))
     else
       unk required_rules
     fi
-  elif [ "$mergeable" = MERGEABLE ] \
-       && { [ "$(printf '%s' "$cj" | jq -c . 2>/dev/null)" = "[]" ] || grep -qF 'no required checks reported' "$cj_errf"; } \
+    if [ "$cj_rc" -ne 0 ] && [ "$fail" -eq 0 ] && [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ]; then unk ci_checks; fi
+  elif [ -n "$req_ctx" ] && [ "$mergeable" = MERGEABLE ] \
+       && { [ "$(printf '%s' "$cj" | jq -c . 2>/dev/null)" = "[]" ] || grep -qF 'no required checks reported' "$cj_errf" || grep -qF 'no checks reported' "$cj_errf"; } \
        && [ $(( $(date +%s) - seen_ts )) -lt $(( CI_GRACE_MIN * 60 )) ]; then
     # No checks registered yet on a fresh MERGEABLE head (queued runners): pending CI, not
     # unknown. mergeable=UNKNOWN (still computing, may yet conflict) gets no grace.

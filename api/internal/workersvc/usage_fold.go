@@ -846,8 +846,8 @@ func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
 //     and no marker resolves to metered" — so Claude accounting is unchanged. An unexpected harness
 //     (impossible under the runs CHECK) also lands here, preserving accounting rather than zeroing.
 //   - Codex (harness == codex): HONOR the closed marker the agent emits per model (D5).
-//     'subscription' → cost_status='subscription', cost_usd=0 (that credential mode has no
-//     per-token charge, so zero is neutral, not a metered $0). 'metered' → cost_status='metered',
+//     'subscription' → cost_status='subscription', cost_usd=0 (stored legacy usage has no
+//     estimate; tokens remain, and zero is a placeholder rather than a metered $0). 'metered' → cost_status='metered',
 //     cost_usd = the agent's price-table amount (emittedCostUSD) — but ONLY when that amount is
 //     genuinely present and usable (costPresent, finite, >= 0, and within numeric(12,6)); an ABSENT
 //     or INVALID metered amount resolves to cost_status='unreported',

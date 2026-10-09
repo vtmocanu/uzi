@@ -223,12 +223,9 @@ export interface CodexHarnessOptions {
   readonly appServerAuth?: CodexAppServerAuthSession;
   /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
-  /** PRD #1332 C4b / D5: the RUN's immutable credential auth mode, from the binding. It selects
-   *  the terminal cost semantics — a subscription run's per-model usage is `subscription` (no
-   *  per-token charge), an api_key run's is `metered` (versioned Standard price table) or
-   *  `unreported`. When ABSENT (a transitional/test construction that supplies no mode) the
-   *  terminal prices NOTHING — every entry stays `unreported` and the run cost `unreported` — the
-   *  conservative choice that retains tokens and never invents a subscription or a dollar figure. */
+  /** The RUN's immutable credential auth mode, from the binding. Either mode enables
+   *  API-equivalent estimates from the pinned Standard price table when usage fully reconciles.
+   *  When absent, entries and run cost stay unreported while token totals are retained. */
   readonly authMode?: CodexAppServerAuthMode;
   /** PRD #1332 C4a / CodeRabbit 4004800880: the executor-claim-leg token accountant, INJECTED so it
    *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
@@ -2190,9 +2187,9 @@ export class CodexHarness implements RunHarness {
     const usage = this.accountant.usageIncomplete
       ? undefined
       : attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
-    // The RUN-level cost status: subscription/metered/unreported, folded with D5's unreported
+    // The RUN-level API-equivalent cost: metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
-    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage, this.authMode);
+    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
     const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
     const limitEvidence = usageLimit ? this.rateLimits.classify(this.authMode) : undefined;
     const durationMs = Math.max(0, Math.floor(this.nowMs() - (this.dispatchStartedAt ?? this.nowMs())));

@@ -363,7 +363,7 @@ func TestAGenerationChangeRollsTheDeploymentAndReadsNoSecret(t *testing.T) {
 }
 
 // Drift source 2: the spec hash. This is the one a generation can never catch — a
-// new release changes the agent image tag, which the controller resolves from its
+// deliberate worker image-tag change is resolved by the controller from its
 // OWN config, so the generation does not move.
 func TestASpecHashChangeRollsTheDeploymentAndReadsNoSecret(t *testing.T) {
 	m, client := newMat(t, deployedWorker("w1", 0, "the-old-releases-hash"))

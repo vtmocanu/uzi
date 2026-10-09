@@ -509,8 +509,8 @@ export class JudgeRunner {
 /** PRD #1429 M3, D7: render the reviewed run's cost-observability status.
  *  Known statuses are server-computed from run_usage_totals; buildJudgePrompt fences
  *  the raw fallback for an unknown status as untrusted context.
- *  Rendered honestly: metered shows a dollar figure when known, subscription is labelled
- *  and carries NO dollar figure, unreported says the total is incomplete — a
+ *  Rendered honestly: metered shows an API-equivalent estimate when known, legacy subscription
+ *  says no estimate was recorded, unreported says the total is incomplete — a
  *  subscription/unreported run is never presented as a complete $0. A value outside the
  *  closed three (a newer server) is still named plainly rather than silently dropped or
  *  read as zero. "" (omitted from the prompt) only when there is no usage row at all. */
@@ -518,10 +518,10 @@ export function renderTargetCostLine(status: string | null | undefined, costUsd:
   switch (status) {
     case "metered":
       return typeof costUsd === "number" && Number.isFinite(costUsd)
-        ? `Reviewed run cost: $${costUsd.toFixed(2)} (metered).`
-        : "Reviewed run cost: metered (dollar amount unavailable).";
+        ? `Reviewed run cost: $${costUsd.toFixed(2)} (API-equivalent).`
+        : "Reviewed run cost: API-equivalent estimate unavailable (dollar amount unavailable).";
     case "subscription":
-      return "Reviewed run cost: subscription usage — no per-token dollar figure applies.";
+      return "Reviewed run cost: no cost estimate was recorded.";
     case "unreported":
       return "Reviewed run cost: unreported — token totals only; the dollar cost is unavailable for this harness/plan.";
     case null:

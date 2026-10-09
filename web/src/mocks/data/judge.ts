@@ -290,8 +290,7 @@ export const mockReviews: MockReview[] = [
     // done rung outranks filed on the shared ladder, so the filed link above does NOT make
     // ripgrep filed.
     triage: { total: 4, todo: 2, filed: 0, done: 1, dismissed: 1, false_positives: 0 },
-    // A judge run on a SUBSCRIPTION plan (PRD #69 M6): the SDK prices it at $0, so the
-    // Cost tile renders "—" (never "$0.00") while the token + duration tiles still show.
+    // Claude judge usage carries the SDK-computed API-equivalent estimate.
     judge_run: {
       judge_run_id: "judge-run-closed",
       claimed_at: secsAgo(300),
@@ -302,8 +301,8 @@ export const mockReviews: MockReview[] = [
         cache_read_tokens: 9200,
         cache_creation_tokens: 0,
         output_tokens: 1120,
-        cost_usd: 0,
-        cost_status: "subscription", // PRD #1429 M1 (D7): $0 is subscription usage, not a real 0.
+        cost_usd: 0.12,
+        cost_status: "metered",
       },
     },
   },

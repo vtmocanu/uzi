@@ -25,6 +25,7 @@ const (
 	keyConfirmY         = "y"
 	keyConfirmN         = "n"
 	keyGoLive           = "g" // M5: re-attach the transcript follow (f is already follow-up)
+	keyAnswerQuestion   = "i" // open the owner-only parked question composer
 	keyCollapseQuestion = "z" // fold / unfold the pending question card
 	keyCollapseCrew     = "c" // fold the crew list to a summary so the milestone block is reachable
 	keyPageUp           = "pgup"
@@ -95,6 +96,7 @@ func helpLines(v tuiView) []string {
 			"g          follow live: re-attach and jump to newest (live runs)",
 			"c          fold / unfold crew (auto-folds when blocks below do not fit)",
 			"z          fold / unfold pending questions (awaiting input)",
+			"i          answer parked questions (owner only)",
 			"W          open this run's worker",
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
@@ -149,7 +151,10 @@ func helpLines(v tuiView) []string {
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs; keep active and needs-you",
-			"+ after 7d cost means subscription/unreported costs excluded",
+			"cost       API-equivalent estimate",
+			"+ after 7d cost means the estimate is incomplete",
+			"           runs without estimates: tokens only",
+			"           unreported: recorded partials included",
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 		}, common...)

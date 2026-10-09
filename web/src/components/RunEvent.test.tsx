@@ -1149,7 +1149,7 @@ describe("RunEventRow finish-line usage (PRD #40)", () => {
 });
 
 describe("FinishTokens $0 cost (Decision 8)", () => {
-  it("shows tokens but DROPS a $0 cost on the finish line (subscription auth)", () => {
+  it("unchanged control: finish lines omit zero deltas without inferring credential mode", () => {
     const { container } = render(
       <RunEventRow
         msg={msg({ seq: 8, kind: "status", payload: { event: "result", subtype: "success", duration_ms: 1000, num_turns: 2 } })}

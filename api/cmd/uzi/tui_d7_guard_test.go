@@ -91,6 +91,10 @@ import (
 // added here — that is this guard's standing weakness, and it is why the render tests
 // remain the primary defence rather than this.
 var d7UntrustedFields = []string{
+	// Session answer drafts and delivery outcomes (tui_answer.go).
+	"answerText",
+	"answerNotice",
+	"Answers", // composed answerBody review strings
 	// internal (tui_lanes.go)
 	"Label",
 	// Structured transcript question prose (tui_question.go); all use sanitized Markdown.
@@ -239,12 +243,13 @@ var d7Writers = map[string]bool{
 }
 
 var d7Sanitizers = map[string]bool{
-	"sanitizeTTY": true,
-	"cellText":    true,
-	"compactText": true,
-	"capCell":     true,
-	"Markdown":    true,
-	"Plain":       true,
+	"questionProse": true,
+	"sanitizeTTY":   true,
+	"cellText":      true,
+	"compactText":   true,
+	"capCell":       true,
+	"Markdown":      true,
+	"Plain":         true,
 }
 
 func TestD7UntrustedFieldsNeverReachAWriterUnsanitized(t *testing.T) {

@@ -487,7 +487,7 @@ it("fails model errors, missing verdict and unsuccessful terminal turns, retaini
   assert.equal(usage.is_error, true);
   assert.deepEqual((usage.modelUsage as any)["unknown-check-model"], {
    inputTokens: 8, cacheReadInputTokens: 2, cacheCreationInputTokens: 0, outputTokens: 3,
-   reasoningOutputTokens: 1, costStatus: "subscription",
+   reasoningOutputTokens: 1, costStatus: "unreported",
   });
   assert.equal(r.secrets.size, 0);
  }
@@ -636,3 +636,18 @@ for (const ids of [{ threadId: "foreign", id: "turn" }, { threadId: "thread", id
   assertOneAttempt(r);
  });
 }
+
+it("subscription checker posts a metered API-equivalent amount for a known model", async () => {
+ const c = claim(true);
+ c.config = { default_model: "gpt-6.1-sol", default_effort: "high" };
+ const r = rig({ subscription: true, claim: c, notes: (emit) => {
+  const bucket = { inputTokens: 1000, cachedInputTokens: 600, cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 };
+  emit({ method: "thread/tokenUsage/updated", params: { threadId: "thread", turnId: "turn", tokenUsage: { total: bucket, last: bucket } } });
+  r.terminal(emit);
+ } });
+ await r.run();
+ assert.deepEqual((r.usage.at(-1)!.modelUsage as any)["gpt-6.1-sol"], {
+  inputTokens: 300, cacheReadInputTokens: 600, cacheCreationInputTokens: 100,
+  outputTokens: 200, reasoningOutputTokens: 50, costStatus: "metered", costUSD: 0.00291,
+ });
+});

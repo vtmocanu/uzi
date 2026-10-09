@@ -1174,9 +1174,43 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       cwd,
       dispose: async () => {
         let cleanDisposal = false;
+        let disposalDiagnostic = {
+          classification: "failure", reason: "thrown_or_unavailable", state: "unknown",
+          authority: "unknown", cleanup_attempted: false,
+        };
         try {
           const outcome = await handle.dispose();
           cleanDisposal = outcome?.clean === true;
+          if (!cleanDisposal) {
+            const state = outcome?.event?.state;
+            const reason = outcome && !outcome.clean ? outcome.reason : undefined;
+            // Categories only: an abnormal supervisor reason may contain private text.
+            const reasons: Record<string, string> = {
+              "dispose unconfirmed: deadline": "drain_deadline",
+              "dispose unconfirmed: echild-contradicted": "drain_contradicted",
+              "supervisor exited non-zero after a drained report": "supervisor_exit_nonzero",
+              "supervisor exited without confirmed disposal": "supervisor_exit_unconfirmed",
+              "control channel unavailable; disposal unconfirmed": "control_unavailable",
+              "supervisor channels close unconfirmed": "channels_unconfirmed",
+              "final disposal evidence unconfirmed": "final_evidence_unconfirmed",
+              "evidence stream closed before confirmed disposal": "evidence_closed",
+              "supervisor channels closed with an unanswered control request": "unanswered_request",
+              "malformed dispose evidence or missing required authority": "invalid_dispose_evidence",
+              "unmatched supervisor response": "unmatched_response",
+            };
+            const category = typeof reason !== "string" ? "outcome_unavailable"
+              : (Object.hasOwn(reasons, reason) ? reasons[reason] : undefined) ?? (/^dispose deadline exceeded \([0-9]+ms\)$/.test(reason) ? "dispose_deadline"
+                : /^supervisor exit deadline exceeded \([0-9]+ms\)$/.test(reason) ? "exit_deadline"
+                  : /^supervisor already exited \(code=(?:null|[0-9]+)\)$/.test(reason) ? "already_exited"
+                    : state === "unconfirmed" ? "drain_unconfirmed" : "other_unconfirmed");
+            disposalDiagnostic = {
+              classification: "not_clean",
+              reason: category,
+              state: state === "drained" || state === "unconfirmed" ? state : "unknown",
+              authority: outcome?.event?.authority === "ECHILD+__WALL" ? "ECHILD+__WALL" : "unknown",
+              cleanup_attempted: false,
+            };
+          }
         } finally {
           // The launcher's normal removal and this fallback share the same forensic
           // retention rule: only positively confirmed clean disposal permits deletion.
@@ -1186,7 +1220,7 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
               log.warn("Codex advice data cleanup failed", { error: errMessage(error) }),
             );
           } else {
-            log.warn("Codex advice data retained: disposal was not confirmed clean");
+            log.warn("Codex advice data retained: disposal was not confirmed clean", disposalDiagnostic);
           }
           await rmTeardownTree(cwd).catch((error) =>
             log.warn("Codex advice cwd cleanup failed", { error: errMessage(error) }),
@@ -3442,8 +3476,8 @@ export class CodexExecutor implements Executor {
         log: this.log,
         sessionInspect: () => this.sessionStore.inspect(storeDir),
         appServerAuth,
-        // PRD #1332 C4b / D5: the run's immutable credential mode selects the terminal cost
-        // semantics (subscription vs api-key metered/unreported) in the token accountant.
+        // Preserve the run's immutable credential mode. Both modes enable API-equivalent
+        // estimates in the token accountant when usage evidence fully reconciles.
         authMode: binding.authMode,
         // Share usage across internal provider epochs, but emit the server lineage marker only for
         // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
@@ -5081,6 +5115,7 @@ async function defaultLaunchProviderRoot(
   redactDiagnostic?: (s: string) => string,
   launch: typeof launchCodexRoot = launchCodexRoot,
 ): Promise<CodexLaunchRootResult> {
+  // Keep deadline arming native here; test timer dependencies never come from claims or config.
   const launcherDeps: LauncherDeps = {
     ...(openAIBaseUrlForTest === undefined ? {} : { appServerAuthOpenAIBaseUrlForTest: openAIBaseUrlForTest }),
     ...(redactDiagnostic === undefined ? {} : { redactDiagnostic }),

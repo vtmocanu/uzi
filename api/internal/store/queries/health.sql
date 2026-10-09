@@ -104,3 +104,13 @@ WHERE status NOT IN ('completed', 'failed', 'cancelled')
        AND mr_state IS DISTINCT FROM 'merged' AND mr_state IS DISTINCT FROM 'closed')
 GROUP BY latest_per_branch.repo_id, repo.path_with_namespace
 ORDER BY latest_per_branch.repo_id;
+
+-- name: ListRecentUnpricedCodexModels :many
+SELECT model, COUNT(DISTINCT run_id) AS runs
+FROM run_usage
+WHERE harness = 'codex'
+  AND updated_at >= @cutoff
+  AND model <> ALL(@priced::text[])
+GROUP BY model
+ORDER BY runs DESC, model ASC
+LIMIT 11;

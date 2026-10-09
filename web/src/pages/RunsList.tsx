@@ -458,7 +458,7 @@ export function RunRow({
                     <span className="inline-flex items-center text-brand/90"><MetaSep />{cost.dollars}</span>
                   ) : (
                     <span className="inline-flex items-center text-faint">
-                      <MetaSep />{cost.kind === "subscription" ? "subscription" : "cost n/a"}
+                      <MetaSep />cost n/a
                     </span>
                   )}
                 </>

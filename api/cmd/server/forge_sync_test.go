@@ -418,3 +418,7 @@ func TestPollerForgeSyncRuntimeToggleStaleInflight(t *testing.T) {
 		})
 	}
 }
+
+func (s *wiringStore) ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error) {
+	return nil, nil
+}

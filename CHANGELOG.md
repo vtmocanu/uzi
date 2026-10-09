@@ -22,7 +22,18 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Answer agent questions from the TUI ([#2550](https://github.com/vtmocanu/uzi/issues/2550)).**
+  Run owners can press `i` to compose option selections and details, review each answer before sending, and reopen drafts kept in the current TUI session; uncertain delivery blocks resending in that session and points to the web or Slack, which remain the fallback for read-only viewers and unsupported payloads.
+
 ### Fixed
+
+- **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
+  Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
+
+- **Interactive author assessments leave room for run creation ([#2372](https://github.com/vtmocanu/uzi/issues/2372)).**
+  Manual issue starts and on-demand MR rework use a five-second total author-assessment budget, preserving fail-closed unknown handling and the live parent for persistence; background assessments retain thirty seconds.
 
 - **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
   Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
@@ -32,14 +43,23 @@ through `[0.52.0]`.)
 - **Retained work recovers within a durable budget on a fresh attempt ([#2512](https://github.com/vtmocanu/uzi/issues/2512)).**
   Three source-bound reserved iterations and a five-minute deadline survive crash, reclaim and handoff; a trusted successfully settled real model turn resets the budget. Permanent blockers or exhaustion fail with local work and custody retained, without automatic cycling or failed-run Resume. Verified under-cap thin bundles with locally verified prerequisites permit local execution despite unknown publication, but do not prove remote durability or release custody. Ordinary unwired resumes keep same-path continuity; downgrade during pending recovery is unsupported. Reachable-history integrity verification fails closed above 1 GiB of delivered decoded content and records the blocker in run recovery and worker logs; this cap does not bound Git-internal delta decompression memory, and the shared worker cgroup does not isolate sibling runs. Recovery records attribution before journal and clone adoption, repairs older-order attribution only for a proven absent successor path, preserves `clone_path_invalid` for invalid paths, and retains custody during pending rediscovery with a distinct missing-journal failure. Owner cancellation reports a failed run with reason `run cancelled` while preserving its source and pins; model settlement clears only episode suppression, and successor retirement requires authenticated, exact-generation covering FINAL authority and quiescence, with durable predecessor reanchoring before moving the successor, leaving predecessors, recovery pins and run HOMEs intact.
 
+- **The lead defers a costly full gate after review invalidates a candidate ([#2593](https://github.com/vtmocanu/uzi/issues/2593)).**
+  The lead still overlaps the integration gate with the read-only review wave by default (refining #215), but once review invalidates a candidate whose full gate is costly it completes the repair reviews and focused checks before repeating the full gate, and it triages a failed gate (narrowest reproducer on candidate and base) before rerunning it. This is prompt-level guidance, not enforcement; it ships in the worker image (agent prompt) and in the app release (builtin lead body).
+
 - **A Codex lead's plan is now cross-checked by a read-only Claude checker ([#2460](https://github.com/vtmocanu/uzi/issues/2460)).**
   With Plan cross-check enabled, an auto-approved Codex run no longer waits for a human by default: its plan is checked by a Claude child with only Read, Grep and Glob, the checker is always the opposite family of the lead, and only an APPROVE of the latest exact plan implements. A Codex lead consumes automatic REVISE rounds without spending its human revision allowance. This needs the new worker capability `cross_check_codex_lead_v1`; roll the api and migration 00314 first, because a new worker on an older api does not submit the check and parks the Codex lead at the human gate as not yet supported, the same park a Codex lead on an older worker keeps. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, fails `plan cross-check: checker unavailable` and the lead takes the human gate; no credential is delivered. The Plan cross-check Claude pin cell is now active (Default follows your Claude worker default), and with ephemeral workers off the settings toggle also warns when no online worker advertises the capability. The migration's Down deletes Claude checker runs but keeps the check history; run it with the new api stopped.
 
 - **Run usage distinguishes unknown metrics and estimates agent attribution ([#2555](https://github.com/vtmocanu/uzi/issues/2555)).**
   Codex reports processing duration and per-agent input usage; absent duration or turns display as —. Repeated Claude usage records count once per lane, Codex responses retain distinct identities, and the estimated per-agent table omits output attribution. Accounting records stay out of the web activity feed, TUI and human run logs; JSON logs and pagination/follow cursors retain them. The TUI loading badge omits sequence-derived counts. Run token and cost totals remain unchanged.
 
+- **Codex subscription runs record API-equivalent cost for comparison ([#2559](https://github.com/vtmocanu/uzi/issues/2559)).**
+  Codex prices either auth mode per response with uzi's pinned Standard table, retaining fail-closed handling of unknown, expired or incomplete pricing evidence; Claude keeps its SDK-computed figure. The cost is a comparison, not a bill, and subscription users may consume purchased credits. Legacy subscription rows show no estimate with tokens retained, not zero dollars; unreported runs show no per-run dollars even when a partial is stored. Self/Admin totals retain recorded partials and disclose runs without estimates and unreported runs; same-key status conflicts zero that row only. Dashboard cost is labelled API-equivalent and Claude tails read "Estimated, not in the total". No historical backfill, price/freshness, auth, capacity, SQL, schema, DTO or wire change.
+
+- **Admin Health warns about unpriced Codex usage, alongside canonical pricing data and an advisory freshness nudge ([#2560](https://github.com/vtmocanu/uzi/issues/2560)).**
+  Codex rates now live in validated JSON with per-model verification dates and official source URLs, mirrored into the API without changing rates or recorded verification dates. `task codex-pricing:sync` updates the mirror; `task nudge:pricing` reports Codex and Anthropic dates more than 30 days old and promotional reviews within 14 days or passed, with UTC date overrides and JSON output. The script exits 0 with or without findings; malformed inputs make the script exit 2, while Task propagates command failure using its own status (currently 201). Admin Health and Overview now show `pricing.codex` coverage warnings with distinct-run counts for usage folded within seven days, distinguishing missing prices from expired promotions; the CLI prints the capped model evidence in its default attention view and `--all`, with JSON unchanged. Query failures, including a five-second deadline, read unknown; successful reads and failures are cached ten minutes per API replica, so changes can appear up to ten minutes late. Coverage uses the API's embedded release table, which can differ from workers during a roll or image override. No automatic fetching or age-based pricing disablement is added.
+
 - **Usage ranks users by total tokens**
-  The per-user table now matches token Share, including Codex subscription usage. Cards and rows show compact subscription and unreported run counts with explanatory tooltips.
+  The per-user table now matches token Share, including Codex subscription usage. Cards and rows disclose runs without a cost estimate and unreported runs with explanatory tooltips; incomplete cost totals retain recorded partials.
 
 - **Claude Agent SDK 0.3.287; long worker commands keep running up to two hours ([#2551](https://github.com/vtmocanu/uzi/pull/2551)).**
   From SDK 0.3.285 a backgrounded Bash command is stopped at its `timeout` (default 30 minutes, maximum two hours) in addition to being stopped when the turn ends. Claude agents are now told to start a command expected to outlast the 10-minute foreground limit in the background with the two-hour `timeout`; a command still stopped at the limit writes no exit-status file and its result is reported unverified, as before.
@@ -52,6 +72,9 @@ through `[0.52.0]`.)
 
 - **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
   Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
+
+- **Documentation heading links work in the app ([#2262](https://github.com/vtmocanu/uzi/issues/2262)).**
+  In-app documentation headings have fragment IDs, and links to a heading scroll it into view with space for the mobile navigation bar.
 
 ### Security
 

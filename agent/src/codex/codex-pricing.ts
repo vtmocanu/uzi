@@ -8,19 +8,26 @@
 //
 // SERVICE TIER (D5): the >272K threshold, the four bucket rates and the whole table assume the
 // OpenAI **Standard** service tier as an ESTIMATION POLICY, not an observed fact. Uzi sets no
-// `service_tier`, and in pinned 0.159.3 a catalog `default_service_tier` (gpt-6-sol lists `priority`)
+// `service_tier`, and in the pinned Codex version a catalog `default_service_tier` (gpt-6-sol lists `priority`)
 // is applied only by the interactive TUI, never by app-server request building, so the request
 // carries none. OpenAI then processes it at the API PROJECT's configured tier, which uzi cannot
-// see: a project set to priority is billed above these rates. The pinned 0.159.3
+// see: a project set to priority is billed above these rates. The pinned Codex version
 // app-server `thread/tokenUsage/updated` notification (source commit
 // 01fc69f4026735edfdf6789820549727a4867b11, `codex-rs/app-server-protocol/src/protocol/v2/
-// thread.rs`, unchanged since 0.153.2) carries NO service-tier field on either `total` or `last`, so the tier is NOT
+// thread.rs`, as exposed by the pinned Codex version) carries NO service-tier field on either `total` or `last`, so the tier is NOT
 // observable here. Per D5's explicit fallback ("if the tier isn't observable in the pinned
 // protocol, price as Standard only for the two known models"), we price the known models as
 // Standard and leave every unknown model `unreported`. A future protocol that surfaces the tier
 // must gate a non-Standard tier (Batch/Flex/Fast) to `unreported` here.
 
+import { readFileSync } from "node:fs";
 import type { CodexUsageBreakdown } from "./transport.js";
+import table from "./codex-pricing.json" with { type: "json" };
+import { validateCodexPricing, validateCodexPricingBytes } from "./codex-pricing-validation.js";
+
+validateCodexPricingBytes(readFileSync(new URL("./codex-pricing.json", import.meta.url)));
+const validatedTable = validateCodexPricing(table);
+const TABLE = validatedTable.models;
 
 /**
  * The pinned price-table version. Recorded WITH the table (D5): the rates below were verified
@@ -29,14 +36,14 @@ import type { CodexUsageBreakdown } from "./transport.js";
  * from https://developers.openai.com/api/docs/models/gpt-6.1-sol on 2026-10-01. A re-verification
  * that changes any rate MUST bump this id and, for a promotional row, its review boundary.
  */
-export const CODEX_PRICE_TABLE_VERSION = "openai-standard-2026-10-01";
+export const CODEX_PRICE_TABLE_VERSION = validatedTable.version;
 
 /**
  * The per-response input-tier boundary (D5): the rates change for the WHOLE response when its
  * TOTAL input tokens EXCEED this value. "272K" is 272,000 tokens. The comparison is strict
  * (`inputTokens > threshold`): a response at exactly 272,000 input is still the LOW tier.
  */
-export const CODEX_INPUT_TIER_THRESHOLD_TOKENS = 272_000;
+export const CODEX_INPUT_TIER_THRESHOLD_TOKENS = validatedTable.input_tier_threshold_tokens;
 
 /**
  * The `gpt-5.6-sol` promotional review boundary (D5), as a UTC calendar date. The official model
@@ -44,57 +51,7 @@ export const CODEX_INPUT_TIER_THRESHOLD_TOKENS = 272_000;
  * date, `gpt-5.6-sol` api-key cost becomes `unreported` until a maintainer re-verifies and
  * re-versions the row. `gpt-6-astra` is unaffected.
  */
-export const SOL_PROMO_REVIEW_DATE = "2026-11-21";
-
-/** The four Standard bucket rates for one tier, in USD per 1,000,000 tokens. */
-interface TierRates {
-  readonly uncachedInput: number;
-  readonly cachedInput: number;
-  readonly cacheWrite: number;
-  readonly output: number;
-}
-
-/** A model's Standard rates, split at {@link CODEX_INPUT_TIER_THRESHOLD_TOKENS}. `promoReviewDate`
- *  is set only for a row whose pricing is promotional and must fail closed to `unreported` once the
- *  review boundary passes. */
-interface ModelRates {
-  readonly low: TierRates;
-  readonly high: TierRates;
-  readonly promoReviewDate?: string;
-}
-
-/**
- * The `openai-standard-2026-10-01` table: PRD D5's `openai-standard-2026-09-13` rows plus `gpt-6-sol`
- * (official model page, 2026-09-23: >272K input is 2x input and cache, 1.5x output). USD / 1,000,000 tokens:
- *
- *   gpt-6-astra   input <= 272K:  uncached 10.00  cached 1.00  cacheWrite 12.50  output 50.00
- *   gpt-6-astra   input  > 272K:  uncached 20.00  cached 2.00  cacheWrite 25.00  output 75.00
- *   gpt-5.6-sol   input <= 272K:  uncached  4.00  cached 0.40  cacheWrite  5.00  output 20.00
- *   gpt-5.6-sol   input  > 272K:  uncached  8.00  cached 0.80  cacheWrite 10.00  output 30.00
- *   gpt-6-sol     input <= 272K:  uncached  2.00  cached 0.20  cacheWrite  2.50  output 10.00
- *   gpt-6-sol     input  > 272K:  uncached  4.00  cached 0.40  cacheWrite  5.00  output 15.00
- *   gpt-6.1-sol   input <= 272K:  uncached  2.00  cached 0.10  cacheWrite  2.50  output 10.00
- *   gpt-6.1-sol   input  > 272K:  uncached  4.00  cached 0.20  cacheWrite  5.00  output 15.00
- */
-const TABLE: Readonly<Record<string, ModelRates>> = {
-  "gpt-6-astra": {
-    low: { uncachedInput: 10.0, cachedInput: 1.0, cacheWrite: 12.5, output: 50.0 },
-    high: { uncachedInput: 20.0, cachedInput: 2.0, cacheWrite: 25.0, output: 75.0 },
-  },
-  "gpt-5.6-sol": {
-    low: { uncachedInput: 4.0, cachedInput: 0.4, cacheWrite: 5.0, output: 20.0 },
-    high: { uncachedInput: 8.0, cachedInput: 0.8, cacheWrite: 10.0, output: 30.0 },
-    promoReviewDate: SOL_PROMO_REVIEW_DATE,
-  },
-  "gpt-6-sol": {
-    low: { uncachedInput: 2.0, cachedInput: 0.2, cacheWrite: 2.5, output: 10.0 },
-    high: { uncachedInput: 4.0, cachedInput: 0.4, cacheWrite: 5.0, output: 15.0 },
-  },
-  "gpt-6.1-sol": {
-    low: { uncachedInput: 2.0, cachedInput: 0.1, cacheWrite: 2.5, output: 10.0 },
-    high: { uncachedInput: 4.0, cachedInput: 0.2, cacheWrite: 5.0, output: 15.0 },
-  },
-};
+export const SOL_PROMO_REVIEW_DATE = TABLE["gpt-5.6-sol"]?.promo_review_date;
 
 /** True once `now` is on or after the UTC calendar date `reviewDate` (`YYYY-MM-DD`). The boundary
  *  is that date's UTC midnight, so any instant on the review date itself is on-or-after it. */
@@ -116,9 +73,9 @@ function promoReviewPassed(reviewDate: string, now: Date): boolean {
  * `new Date()`) so the Sol boundary is deterministic in tests.
  */
 export function priceCodexResponse(model: string, last: CodexUsageBreakdown, now: Date): number | undefined {
-  const rates = TABLE[model];
+  const rates = Object.hasOwn(TABLE, model) ? TABLE[model] : undefined;
   if (rates === undefined) return undefined; // unknown model — never priced as Standard
-  if (rates.promoReviewDate !== undefined && promoReviewPassed(rates.promoReviewDate, now)) {
+  if (rates.promo_review_date !== undefined && promoReviewPassed(rates.promo_review_date, now)) {
     return undefined; // stale promotional row — fail closed until re-verified/re-versioned
   }
   const input = last.inputTokens;
@@ -130,9 +87,9 @@ export function priceCodexResponse(model: string, last: CodexUsageBreakdown, now
   const uncached = Math.max(input - cached - cacheWrite, 0);
   const tier = input > CODEX_INPUT_TIER_THRESHOLD_TOKENS ? rates.high : rates.low;
   const usd =
-    (uncached * tier.uncachedInput +
-      cached * tier.cachedInput +
-      cacheWrite * tier.cacheWrite +
+    (uncached * tier.uncached_input +
+      cached * tier.cached_input +
+      cacheWrite * tier.cache_write +
       last.outputTokens * tier.output) /
     1_000_000;
   return usd;

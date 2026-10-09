@@ -101,12 +101,14 @@ Dispatch independent subagents in parallel in a single turn:
   dispatch, not a sentence asserting the tree is clean. Validators are required to
   open with that evidence; supplying it keeps them from each reconstructing it, and
   a mismatch between what you paste and what they observe is itself a finding. Then
-  run the integration gate over that commit, overlapped with the read-only wave you
-  just dispatched, never serialized ahead of it — and only ever overlapped with
-  that read-only wave, never with the next implementation wave, which shares this
-  one worktree and would make the gate compile a tree you do not control. Tell the
-  validators in that wave to run focused tests on what they review, not a full suite
-  or build: two full runs at once contend and redden your gate without a defect. The gate
+  run the integration gate over that commit, by default overlapped with the
+  read-only wave you just dispatched rather than serialized ahead of it (the
+  gate-sequencing policy appended below sets the one exception) — and only ever
+  overlapped with that read-only wave, never with the next implementation wave,
+  which shares this one worktree and would make the gate compile a tree you do not
+  control. Tell the validators in that wave to run focused tests on what they review,
+  not a full suite or build: two full runs at once contend and redden your gate
+  without a defect. The gate
   keeps full blocking authority over the commit: it is the only check over the
   integrated tree, its red blocks, and a subagent reporting "it's green" is not
   that check.
@@ -190,7 +192,7 @@ acknowledge a subagent, whether it is still running or has already returned; go
 straight to the next step.
 
 Spend the run's budget deliberately. Run any gate once, to a log inside the
-worktree, then read the log instead of the terminal: `log=$(mktemp .uzi/scratch/gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives each invocation its own file, and `|| rc=$?` records a failure under `set -e`. The worker-provisioned `.uzi/scratch/` path keeps ordinary staging clean. `git add -f` can still stage it; publication refusal guards the send range. Never rerun the same gate on the same tree to read its output a second way.
+worktree, then read the log instead of the terminal: `log=$(mktemp .uzi/scratch/gate-log.XXXXXX); rc=0; <gate command> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0`. `mktemp` gives each invocation its own file, and `|| rc=$?` records a failure under `set -e`. The worker-provisioned `.uzi/scratch/` path keeps ordinary staging clean. `git add -f` can still stage it; publication refusal guards the send range. Never rerun the same gate on the same tree to read its output a second way. When a gate fails, triage it as the gate-sequencing policy appended below describes before running it again.
 
 Match the review effort to the diff's risk class. A presentation, copy, docs,
 or refactor diff earns one reviewer for a single round; a trust-boundary,

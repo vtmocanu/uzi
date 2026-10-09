@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -188,17 +189,18 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		as, err := assessor.Begin(r.Context(), workersvc.ReviewAssessParams{
-			RepoID:         repo.ID,
-			Ref:            run.Branch.String,
-			ProjectID:      repo.ForgeProjectID,
-			BaseURL:        repo.BaseUrl,
-			BotForgeUserID: repo.BotForgeUserID,
-			Lookup:         f,
-			Trusted:        trusted,
-			Comments:       comments,
-			HighWater:      led.HighWater,
-			Pending:        led.PendingUnknownIds,
-			QueueBound:     queueBound,
+			AssessmentTimeout: issueinput.InteractiveAssessmentTimeout,
+			RepoID:            repo.ID,
+			Ref:               run.Branch.String,
+			ProjectID:         repo.ForgeProjectID,
+			BaseURL:           repo.BaseUrl,
+			BotForgeUserID:    repo.BotForgeUserID,
+			Lookup:            f,
+			Trusted:           trusted,
+			Comments:          comments,
+			HighWater:         led.HighWater,
+			Pending:           led.PendingUnknownIds,
+			QueueBound:        queueBound,
 		})
 		if err != nil {
 			slog.Error("mr-rework: assess review comment authors", "error", err)

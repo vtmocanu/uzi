@@ -40,8 +40,9 @@ It surfaces five ways:
 - **Overview**, for an admin: a self-hiding card beside the custody-hold
   alert. When every check passes it collapses to one quiet line ("System
   health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, with one Open health link to the Health tab. It
-  makes no request at all for a non-admin.
+  three attention items, including each item's evidence and docs link,
+  with one Open health link to the Health tab. It makes no request at all
+  for a non-admin.
 - **An app-wide Danger banner**, admins only, shown while `blocking` is
   `true`. It carries the instance-blocker verdict, the first instance danger
   check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger
@@ -53,9 +54,9 @@ It surfaces five ways:
   upgrade information at all for another user's worker.
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
-  `danger`. The current instance checks are `db`, `controller.report`, `loops`
-  and `fleet.roll`; the rest are `owner`. `fleet.roll` remains instance
-  infrastructure even when the hosted workers belong to a single owner.
+  `danger`. The current instance checks are `db`, `controller.report`, `loops`,
+  `fleet.roll` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains
+  instance infrastructure even when the hosted workers belong to a single owner.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
   next still-blocking evaluation claims one notice per admin. Another instance
@@ -314,11 +315,43 @@ These are bounded observations, not a globally ordered snapshot:
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
 | `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `na` when custody admission is disabled |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
+| `pricing.codex` | Recent Codex usage on models without a currently valid price in this release's table | any such model | — | `unknown` when the usage query fails or exceeds its five-second deadline |
 
 `unknown` and `na` are first-class outcomes, not edge cases to squint past: a
 check reading `unknown` means its observation is missing, stale, unreadable,
 or turned off, and a check reading `na` means it genuinely does not apply here (no
 hosted workers, no Slack). Neither is ever folded into, or displayed as, `ok`.
+
+### Codex price coverage
+
+`pricing.codex` ([PRD #2560](../prds/done/2560-pricing-freshness.md)) is a
+read-only coverage check, not a rate fetch or price-freshness verification.
+It looks at Codex `run_usage` rows whose `updated_at` is within the last
+seven days, including the cutoff. That timestamp is the last usage fold,
+including redelivery, not the exact inference time.
+
+The check compares observed model IDs with the API's embedded price table
+for this release. The currently priced set and the distinction between
+**no price** and **promotional price expired** use the same UTC clock;
+promotions expire at midnight UTC on their review date. Counts are distinct
+runs per model, not usage rows. Priced models are excluded before the
+evidence limit. Evidence lists at most ten models, ordered by run count
+descending then model ID, with an **and more** row when further models exist.
+
+Any finding is `warn`; this check has no `danger` band. With no findings it
+is `ok`, with the summary **"no recent Codex usage on unpriced models"**.
+A failed query, including its five-second deadline, reads `unknown`.
+Every result, including `ok`, `warn` and `unknown`, is cached for ten
+minutes per API replica, so a new finding, cleared warning or recovered
+query can take up to ten minutes to appear. These bounds are fixed; there
+is no new index or admin setting.
+
+Workers price runs with their own copy of the table. During a worker roll,
+or with a worker image tag override, that copy can differ from the API's
+embedded table. This accepted skew means the check describes release
+coverage, not why an individual run's cost was unavailable. A maintainer
+must verify rates against official sources before updating the table; see
+[Updating prices](run-cost.md#updating-prices).
 
 ## What it cannot see
 
@@ -356,6 +389,12 @@ Text output includes `blocking: true (instance-wide)` or
 `blocking: false (instance-wide)` alongside the overall status and tally.
 Owner-only danger still exits `8`; `blocking` does not change `--strict`,
 transport/auth handling or malformed-document handling.
+
+The text table's `EVIDENCE` column prints bounded evidence entries, using
+continuation rows for additional entries, including the capped model list
+and `and more` marker.
+Both the default attention view and `--all` print those entries; `--json`
+continues to return the endpoint's document unchanged.
 
 The exit code is the probe contract:
 

@@ -113,10 +113,12 @@ detail page and by `uzi run get`.
   inherit.
 - **Yours alone.** These settings only change runs you own; they never
   affect other users or the shared `lead` template.
-- **Cost status stays honest.** For an API key, usage on a model with no
-  price row (any unrecognized custom Codex model) reports `unreported`;
-  tokens are still counted, no dollar amount is invented. Subscription
-  usage always reports `subscription`, with or without a price row.
+- **Cost status stays honest.** Codex uses uzi's pinned Standard price table
+  for both API-key and subscription runs. Unknown models, expired price rows
+  or incomplete pricing evidence report `unreported`: tokens remain, with no
+  per-run dollar figure. Legacy `subscription` rows mean no estimate was
+  recorded. API-equivalent cost compares work, not a bill; subscription
+  users may consume purchased credits. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
 - **Separate from the judge model.** The [run judge](./judge.md) runs on
   its own model, set instance-wide by an admin (`opus` by default). Your
   worker-model settings here have no effect on it.

@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import type { SpawnSyncOptions } from "node:child_process";
-import { readFileSync } from "node:fs";
+import syncFs, { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -23,7 +23,10 @@ import {
   type RunnerTreeRequest,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
-import { registeredRoot } from "../src/codex/codex-executor.js";
+import { registeredRoot, makeProductionLaunchAdviceRoot, CODEX_PRODUCTION_PROVIDER } from "../src/codex/codex-executor.js";
+import { recordingLogger } from "./helpers.js";
+import { AdviceTeardownDiagnostic } from "./advice-teardown-diagnostic.js";
+import { assertGone } from "./runner-teardown-fixtures.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { makeTextRedactor } from "../src/redact.js";
@@ -71,6 +74,7 @@ interface FakeOpts {
   exitCode?: number;
   disposeNearBudget?: boolean;
   exitDelayMs?: number;
+  exitBeforeEvidence?: boolean;
   /** When set (even to a malformed value), attached verbatim as the drained dispose's `tmpCleanup`. */
   disposeTmpCleanup?: unknown;
 }
@@ -91,6 +95,7 @@ class FakeSupervisor extends EventEmitter {
   private readonly exitCode: number;
   private readonly disposeNearBudget: boolean;
   private readonly exitDelayMs: number;
+  private readonly exitBeforeEvidence: boolean;
   private readonly tmpCleanup: { value: unknown } | undefined;
   readonly disposeTimeouts: number[] = [];
 
@@ -103,6 +108,7 @@ class FakeSupervisor extends EventEmitter {
     this.exitCode = opts.exitCode ?? 0;
     this.disposeNearBudget = opts.disposeNearBudget ?? false;
     this.exitDelayMs = opts.exitDelayMs ?? 0;
+    this.exitBeforeEvidence = opts.exitBeforeEvidence ?? false;
     this.tmpCleanup = "disposeTmpCleanup" in opts ? { value: opts.disposeTmpCleanup } : undefined;
     createInterface({ input: this.control }).on("line", (line) => this.onControl(line));
     if (opts.autoStarted ?? true) {
@@ -139,10 +145,16 @@ class FakeSupervisor extends EventEmitter {
             event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1],
             ...(this.tmpCleanup ? { tmpCleanup: this.tmpCleanup.value } : {}),
           });
-          setTimeout(() => this.exitWith(this.exitCode), this.exitDelayMs);
+          if (this.exitBeforeEvidence) {
+            this.stdout.end(); this.stderr.end(); this.evidence.end();
+            setImmediate(() => this.emit("close", this.exitCode, null));
+          } else setTimeout(() => this.exitWith(this.exitCode), this.exitDelayMs);
         };
         if (this.disposeNearBudget) setTimeout(emit, Math.max(0, (cmd.timeoutMs ?? 0) - 5));
-        else emit();
+        else if (this.exitBeforeEvidence) {
+          this.emit("exit", this.exitCode, null);
+          setImmediate(emit);
+        } else emit();
       } else {
         this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [this.pid + 1] });
       }
@@ -810,6 +822,131 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
     assert.equal(outcome.clean, true);
     assert.ok((fake.disposeTimeouts[0] ?? 1000) <= 800, "drain received no more than four fifths of the total budget");
   });
+});
+
+describe("M1 controlled advice disposal ordering probe", () => {
+  // Portable lifecycle probe, not a replacement for the real worker-UID security
+  // inventory: privileged provisioning/parent metadata are scripted on this host.
+  for (const ordering of ["exit_first", "evidence_first", "unclean"] as const) {
+    for (const leaf of ["single_uid", "owner_refusal"] as const) {
+      it(ordering + " through actual executor " + leaf, async (t) => {
+        const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "advice-probe-"));
+        const fake = newFake({ exitBeforeEvidence: ordering === "exit_first", exitCode: ordering === "unclean" ? 1 : 0 });
+        const { logger, lines } = recordingLogger();
+        const diagnostic = new AdviceTeardownDiagnostic((line) => t.diagnostic(line));
+        const originalOpen = fs.open.bind(fs);
+        let owned = "";
+        let shared = false;
+        const parentMetadata = t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]).startsWith(base + "/codex-advice-")) {
+            const stat = handle.stat.bind(handle);
+            t.mock.method(handle, "stat", async () => Object.assign(await stat(), { uid: WORKER_UID, gid: RUNNER_UID }));
+          }
+          return handle;
+        });
+        // Same spawnSync provisioning seam as the session seed test above. No
+        // shell payload is executed: script categories select literal FS actions.
+        const provision = t.mock.method(childProcess, "spawnSync", (command: string, args: readonly string[]) => {
+          let stdout = "";
+          if (command === "id") stdout = String(RUNNER_UID);
+          else {
+            assert.equal(command, "/bin/setpriv");
+            const sh = args.indexOf("/bin/sh");
+            assert.ok(sh >= 0, "only scripted provisioning shells are needed");
+            const script = args[sh + 2]!;
+            const operands = args.slice(sh + 4);
+            if (script === 'stat -c "%u:%g:%a" -- "$1"') {
+              const target = operands[0]!;
+              assert.ok(target.startsWith(base + "/"));
+              const session = target.endsWith("/sessions");
+              const traversable = shared && (target === owned || target === owned + "/codex");
+              stdout = RUNNER_UID + ":" + (session || traversable ? CODEX_SESSION_GID : RUNNER_UID) + ":" +
+                (target.endsWith("/config.toml") ? "600" : session ? "2750" : traversable ? "710" : "700") + "\n";
+            } else if (script.includes("mkdir -m 700")) {
+              owned = operands[0]!;
+              assert.ok(owned.startsWith(base + "/codex-advice-data/"));
+              for (const dir of [owned, ...operands.slice(2)]) syncFs.mkdirSync(dir, { mode: 0o700 });
+            } else if (script.includes("chgrp")) {
+              shared = true;
+              syncFs.mkdirSync(owned + "/codex/sessions", { mode: 0o750 });
+            } else {
+              assert.ok(script.includes("cat >"), "only the config write remains");
+              // Contents are unnecessary for this lifecycle probe.
+              syncFs.writeFileSync(operands[0]!, "", { mode: 0o600 });
+            }
+          }
+          return { status: 0, signal: null, pid: 0, output: [], stdout, stderr: "" };
+        });
+        const spawn = t.mock.method(childProcess, "spawn", () => fake);
+        syncBuiltinESMExports();
+        try {
+          await diagnostic.run(async () => {
+            const handle = await makeProductionLaunchAdviceRoot(base, "api_key", logger)({
+              kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+            });
+            await diagnostic.watch(owned, handle.cwd, lines);
+            // Match the named leaf's replacement of the launch-owned tree.
+            await fs.rename(owned, owned + ".retained");
+            await fs.mkdir(owned);
+            await fs.writeFile(owned + "/keep", "keep");
+            if (leaf === "single_uid") delete process.env.UZI_UID_SPLIT;
+            await handle.dispose();
+            await assertGone(handle.cwd);
+            const retained = lines.find((line) => (line as Record<string, unknown>).msg ===
+              "Codex advice data retained: disposal was not confirmed clean") as Record<string, unknown> | undefined;
+            const refused = lines.some((line) => {
+              const value = line as Record<string, unknown>;
+              return value.msg === "Codex advice data cleanup failed" && /not owned/.test(String(value.error));
+            });
+            if (ordering === "unclean") {
+              assert.equal(await fs.readFile(owned + "/keep", "utf8"), "keep");
+              assert.equal(retained?.classification, "not_clean");
+              assert.equal(retained?.state, "drained");
+              assert.equal(retained?.authority, "ECHILD+__WALL");
+              assert.equal(retained?.cleanup_attempted, false);
+              assert.equal(refused, false, "unclean disposal skips owner-refusal cleanup");
+              const snapshot = await diagnostic.snapshot();
+              assert.equal((snapshot.warnings as Record<string, unknown>[])[0]?.cleanup_attempted, false);
+              const printed: string[] = [];
+              const output = t.mock.method(console, "error", (line: string) => printed.push(line));
+              const failureDiagnostic = new AdviceTeardownDiagnostic();
+              await failureDiagnostic.watch(owned, handle.cwd, lines);
+              const originalAssertion = new assert.AssertionError({ message: "private probe assertion" });
+              await assert.rejects(failureDiagnostic.run(async () => { throw originalAssertion; }), (error) => error === originalAssertion);
+              output.mock.restore();
+              const failureSnapshot = JSON.parse(printed[0]!.slice("advice-teardown-diagnostic ".length));
+              assert.deepEqual(failureSnapshot.warnings[0], {
+                category: "retained", classification: "not_clean", reason: "supervisor_exit_nonzero",
+                state: "drained", authority: "ECHILD+__WALL", cleanup_attempted: false,
+              });
+              assert.equal(printed[0]!.includes("private probe assertion"), false);
+            } else {
+              assert.equal(retained, undefined);
+              if (leaf === "single_uid") await assertGone(owned);
+              else {
+                assert.equal(await fs.readFile(owned + "/keep", "utf8"), "keep");
+                assert.equal(refused, true, "clean disposal reaches owner refusal");
+              }
+            }
+            const snapshot = await diagnostic.snapshot();
+            const events = snapshot.events as Record<string, unknown>[];
+            const exit = events.findIndex((event) => event.event === "exit");
+            const evidence = events.findIndex((event) => event.event === "evidence" && event.category === "dispose");
+            assert.ok(exit >= 0 && evidence >= 0);
+            assert.equal(exit < evidence, ordering === "exit_first");
+            t.diagnostic(JSON.stringify({ ordering, leaf, result: ordering === "unclean" ? "legitimate_retention" : "clean",
+              exit_ordinal: events[exit]?.ordinal, dispose_evidence_ordinal: events[evidence]?.ordinal,
+              pipe_end_ordinals: events.filter((event) => event.event === "pipe_end").map((event) => event.ordinal) }));
+          });
+        } finally {
+          process.env.UZI_UID_SPLIT = "1";
+          spawn.mock.restore(); provision.mock.restore(); parentMetadata.mock.restore(); syncBuiltinESMExports();
+          await fs.rm(base, { recursive: true, force: true });
+        }
+      });
+    }
+  }
 });
 
 describe("createHandle: strict tmpCleanup evidence", () => {

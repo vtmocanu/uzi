@@ -86,7 +86,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
       usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0,
         cost_status: status as "metered" },
     }) })} />);
-    expect(r.container.textContent).toContain(status === "metered" ? "Checker cost: $0.00" : status === "subscription" ? "subscription usage" : "cost unavailable");
+    expect(r.container.textContent).toContain(status === "metered" ? "Checker cost: $0.00 · API-equivalent" : status === "subscription" ? "Checker cost: No estimate · no cost estimate recorded" : "cost unavailable");
     if (status !== "metered") expect(r.container.textContent).not.toContain("$0");
   });
   it("shows the reported metered amount, not a zero default", () => {
@@ -94,7 +94,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
       usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 1.25,
         cost_status: "metered" },
     }) })} />);
-    expect(r.container.textContent).toContain("Checker cost: $1.25");
+    expect(r.container.textContent).toContain("Checker cost: $1.25 · API-equivalent");
   });
   it.each(["panel", "detail", "event"])("hardens and bounds %s findings and attributes", (sink) => {
     const findings = { summary: '# Safe\u202e\u0007 heading\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))\n\n[good](https://example.com "review &#8238;denied&#8236;")\n\n&#x202e;plain',

@@ -53,6 +53,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/freshness.sh"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
+# shellcheck source=lib/required-checks.sh
+. "$HERE/lib/required-checks.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -170,11 +172,17 @@ arr_or_unknown() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1 || U
 
 # Required checks by bucket (must be a non-empty array; `{}`/`[]` are unknown).
 ci_fail=0; ci_pend=0; ci_cancel=0
-cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null || true)
-if printf '%s' "$cj" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
+req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
+cj=""; cj_rc=0
+if [ -n "$req" ]; then cj=$(pr_ci_checks "$REPO" "$PR" "$req" "$head" "$base" 2>/dev/null) || cj_rc=$?
+else UNKNOWN=1; echo "CI_REQUIRED_RULES=unreadable"; fi
+if ci_checks_valid "$cj" && [ "$(printf '%s' "$cj" | jq length)" -gt 0 ]; then
   ci_fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
   ci_pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
   ci_cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
+  missing=$(missing_required "$req" "$cj") || { UNKNOWN=1; missing=0; }
+  ci_pend=$((ci_pend + missing))
+  if [ "$cj_rc" -ne 0 ] && [ "$ci_fail" -eq 0 ] && [ "$ci_pend" -eq 0 ] && [ "$ci_cancel" -eq 0 ]; then UNKNOWN=1; fi
 else
   UNKNOWN=1
   if [ "$mergeable" = "CONFLICTING" ]; then echo "CI_CHECKS=none (conflicting PR: GitHub runs no pull_request CI)"

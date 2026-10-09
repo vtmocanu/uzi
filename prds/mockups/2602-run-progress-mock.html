@@ -1,0 +1,199 @@
+<title>Run Progress Estimate</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: uzi app chrome (ember dark / dawn light); three stacked surfaces: board rows, run header, state gallery. */
+:root {
+  --bg: #f2f4f7; --surface: #ffffff; --raised: #f6f7fa; --edge: #dde1e8; --edge-strong: #c4cad6;
+  --fg: #151a22; --muted: #4a5567; --faint: #66718a;
+  --brand: #c2560c; --ok: #0f8a5f; --warn: #a76a00; --danger: #c2334f; --info: #0b77a8; --plan: #5562d8;
+  --new: #c2560c; --new-bg: #fff3e8;
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #080a0f; --surface: #0f121a; --raised: #171b26; --edge: #272d3c; --edge-strong: #3a4256;
+  --fg: #e4e8f0; --muted: #949eb0; --faint: #7a859a;
+  --brand: #fb923c; --ok: #34d399; --warn: #fbbf24; --danger: #fb7185; --info: #38bdf8; --plan: #818cf8;
+  --new: #fb923c; --new-bg: #2a1a0e; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #080a0f; --surface: #0f121a; --raised: #171b26; --edge: #272d3c; --edge-strong: #3a4256;
+  --fg: #e4e8f0; --muted: #949eb0; --faint: #7a859a;
+  --brand: #fb923c; --ok: #34d399; --warn: #fbbf24; --danger: #fb7185; --info: #38bdf8; --plan: #818cf8;
+  --new: #fb923c; --new-bg: #2a1a0e; color-scheme: dark }
+
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.5; padding: 32px 20px 64px; }
+.wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 40px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance }
+h2 { font-size: 13px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 4px }
+p { margin: 0; max-width: 70ch; color: var(--muted) }
+.lede { display: grid; gap: 8px }
+.section { display: grid; gap: 12px }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums }
+.faint { color: var(--faint) }
+.newtag { display: inline-block; font: 500 10px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--new); border: 1px dashed var(--new); border-radius: 3px; padding: 3px 5px; vertical-align: middle }
+.callout { outline: 1.5px dashed var(--new); outline-offset: 3px; border-radius: 6px; background: var(--new-bg) }
+.later { outline: 1.5px dotted var(--faint); outline-offset: 3px; border-radius: 6px }
+
+/* ---------- board ---------- */
+.board { background: var(--surface); border: 1px solid var(--edge); border-radius: 10px; overflow-x: auto }
+.board table { width: 100%; border-collapse: collapse; min-width: 820px }
+.board th { text-align: left; font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); padding: 10px 12px; border-bottom: 1px solid var(--edge) }
+.board td { padding: 11px 12px; border-bottom: 1px solid var(--edge); vertical-align: middle; white-space: nowrap }
+.board tr:last-child td { border-bottom: 0 }
+.board td.title { white-space: normal; min-width: 220px }
+.pill { display: inline-flex; align-items: center; gap: 6px; font: 500 12px var(--mono); padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor }
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor }
+.s-run { color: var(--info) } .s-input { color: var(--warn) }
+.mile { font-family: var(--mono); letter-spacing: 1px; color: var(--brand) } .mile .e { color: var(--edge-strong) } .mile .ip { animation: blink 1.4s steps(2) infinite }
+@keyframes blink { 50% { opacity: .35 } }
+@media (prefers-reduced-motion: reduce) { .mile .ip { animation: none } }
+.est { display: grid; gap: 4px; width: 132px; padding: 6px 8px }
+.est .pct { font: 600 15px var(--mono) }
+.bar { position: relative; height: 5px; background: var(--raised); border-radius: 3px; overflow: hidden }
+.bar .done { position: absolute; inset: 0 auto 0 0; background: var(--brand); border-radius: 3px }
+.flag { display: inline-flex; gap: 6px; align-items: center; font: 500 12px var(--mono); padding: 3px 8px; border-radius: 4px; width: fit-content }
+.f-stall { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent) }
+.f-you { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent) }
+.f-dep { color: var(--info); background: color-mix(in srgb, var(--info) 12%, transparent) }
+.f-dim { color: var(--faint); background: var(--raised) }
+.issue { color: var(--muted); font-family: var(--mono); margin-right: 6px }
+.sub { font: 400 11px var(--mono); color: var(--faint) }
+
+/* ---------- run header ---------- */
+.runhdr { background: var(--surface); border: 1px solid var(--edge); border-radius: 10px; padding: 18px 20px; display: grid; gap: 16px }
+.runhdr .top { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center }
+.runhdr .top h3 { margin: 0; font-size: 18px; font-weight: 600; flex: 1 1 320px; min-width: 0; text-wrap: balance }
+.facts { display: flex; flex-wrap: wrap; gap: 6px 22px; font: 400 13px var(--mono); color: var(--muted) }
+.facts b { color: var(--fg); font-weight: 500 }
+.prog { padding: 16px; display: grid; gap: 14px }
+.prog-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px }
+.prog-head .big { font: 600 28px var(--mono) }
+.prog-head .what { font: 500 14px var(--mono); color: var(--muted) }
+.track { display: grid; grid-template-columns: .6fr 1fr 1fr 1fr; gap: 4px }
+.seg { display: grid; gap: 6px; min-width: 0 }
+.seg .b { height: 10px; border-radius: 3px; background: var(--raised); border: 1px solid var(--edge); position: relative; overflow: hidden }
+.seg.done .b { background: var(--brand); border-color: var(--brand) }
+.seg.now .b { background: repeating-linear-gradient(90deg, var(--brand) 0 3px, transparent 3px 6px); border-color: var(--brand) }
+.seg .l { font: 400 11px var(--mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.seg.now .l { color: var(--fg) }
+.steps { display: flex; flex-wrap: wrap; gap: 6px; font: 400 12px var(--mono) }
+.step { padding: 2px 8px; border-radius: 4px; background: var(--raised); color: var(--faint) }
+.step.ok { color: var(--ok) } .step.cur { color: var(--fg); outline: 1px solid var(--brand) }
+.basis { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 20px; border-top: 1px solid var(--edge); padding-top: 12px; margin: 0 }
+.basis div { display: grid; gap: 2px; min-width: 0 }
+.basis dt { font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--faint) }
+.basis dd { margin: 0; font: 400 13px var(--mono) }
+.now { font-size: 13px; color: var(--muted); padding: 6px 8px } .now b { color: var(--fg); font-weight: 500 }
+
+/* ---------- gallery ---------- */
+.gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px }
+.card { background: var(--surface); border: 1px solid var(--edge); border-radius: 8px; padding: 14px; display: grid; gap: 8px; align-content: start }
+.card h4 { margin: 0; font: 600 13px var(--sans) }
+.card p { font-size: 13px }
+.notes { display: grid; gap: 6px; padding-left: 18px; margin: 0; color: var(--muted); max-width: 80ch }
+</style>
+
+<div class="wrap">
+  <header class="lede">
+    <h1>Run progress estimate</h1>
+    <p>Where the progress estimate lives in the web app. New in this PRD is outlined in dashed orange; the dotted outline is the follow-up PRD (one-line "Now" summary). Everything else is today's UI. Rows are the five live runs at 17:08 UTC on 2026-10-09.</p>
+  </header>
+
+  <section class="section">
+    <h2>1 · Dashboard and board rows <span class="newtag">new column</span></h2>
+    <p>A compact <b>Progress</b> cell next to the existing milestone bar: a percentage and a bar. When a percentage would mislead, the cell shows a flag instead. There is no time-remaining figure: the backtest put only 59% of estimates within 2× of the truth.</p>
+    <div class="board">
+      <table>
+        <thead><tr><th>Status</th><th>Run</th><th>Milestones</th><th>Progress</th><th>Issue</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><span class="pill s-run">running</span></td><td class="mono">9363c1c0</td>
+            <td><span class="mile">▰▰<span class="ip">▰</span></span></td>
+            <td><div class="est callout"><span class="pct">≈70%</span><div class="bar"><span class="done" style="width:70%"></span></div></div></td>
+            <td class="title"><span class="issue">#2507</span>Guarded runs end with “custody final ACK pending”</td>
+          </tr>
+          <tr>
+            <td><span class="pill s-run">running</span></td><td class="mono">03e700fc</td>
+            <td><span class="mile"><span class="ip">▰</span><span class="e">▱</span></span></td>
+            <td><div class="est callout"><span class="pct">≈11%</span><div class="bar"><span class="done" style="width:11%"></span></div></div></td>
+            <td class="title"><span class="issue">#2566</span>LiveDB tests: lease expiry at observed locks</td>
+          </tr>
+          <tr>
+            <td><span class="pill s-run">running</span></td><td class="mono">63464bf2</td>
+            <td><span class="mile"><span class="ip">▰</span><span class="e">▱▱▱▱</span></span></td>
+            <td><div class="est callout"><span class="pct">≈11%</span><div class="bar"><span class="done" style="width:11%"></span></div></div></td>
+            <td class="title"><span class="issue">#2170</span>PRD: Code cross-check before publication</td>
+          </tr>
+          <tr>
+            <td><span class="pill s-run">running</span></td><td class="mono">fca7a801</td>
+            <td><span class="faint mono">rework</span></td>
+            <td><div class="est callout"><span class="flag f-stall">◼ stalled</span><span class="sub">since 16:41</span></div></td>
+            <td class="title"><span class="issue">PR #2556</span>Rework MR review: agent/issue-2512</td>
+          </tr>
+          <tr>
+            <td><span class="pill s-input">needs input</span></td><td class="mono">24c8ec8b</td>
+            <td><span class="mile">▰<span class="e">▱▱▱</span></span></td>
+            <td><div class="est callout"><span class="flag f-you">● waits on you</span><span class="sub">question since 06:50</span></div></td>
+            <td class="title"><span class="issue">#2396</span>Worker memory guard before container OOM</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="mono" style="font-size:12px">Percent = 11% for planning + 89% × completed / total milestones, held below 100% until the run finishes. A run without a frozen milestone list (planning, rework, task) shows no percentage.</p>
+  </section>
+
+  <section class="section">
+    <h2>2 · Run page header <span class="newtag">new card</span></h2>
+    <p>The run page keeps its budget facts and adds a progress card under them: where the run is in its plan and which phase the active role belongs to. When a waiting run’s open question mentions an issue another of your runs is working, the card names that run.</p>
+    <div class="runhdr">
+      <div class="top">
+        <span class="pill s-run">running</span>
+        <h3><span class="issue">#2507</span>Guarded runs end with “custody final ACK pending”</h3>
+        <span class="mono faint">run 9363c1c0 · codex</span>
+      </div>
+      <div class="facts">
+        <span>Elapsed <b>11h 09m / 18h</b></span><span>Started <b>05:22</b></span><span>Milestones <b>2 / 3</b></span>
+      </div>
+      <div class="prog callout">
+        <div class="prog-head">
+          <span class="big">≈70%</span>
+          <span class="what">milestone 3 of 3 · recovery-docs-validation</span>
+        </div>
+        <div class="track" aria-label="Plan progress: planning done, two milestones done, third in progress">
+          <div class="seg done"><div class="b"></div><div class="l">plan</div></div>
+          <div class="seg done"><div class="b"></div><div class="l">api-completion-receipt</div></div>
+          <div class="seg done"><div class="b"></div><div class="l">worker-receipt-ordering</div></div>
+          <div class="seg now"><div class="b"></div><div class="l">recovery-docs-validation</div></div>
+        </div>
+        <div class="steps"><span class="step">review</span><span class="step">validate</span><span class="step cur">▸ implement</span><span class="faint" style="font-size:12px">current phase only, from the active role</span></div>
+        <p class="now later"><b>Now:</b> lead is running the agent gate for the docs milestone. <span class="faint">(follow-up PRD: one-line model summary; it describes only what the recent tool calls show)</span></p>
+        <dl class="basis">
+          <div><dt>Active role</dt><dd>lead · running a gate</dd></div>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>3 · States the cell and card handle</h2>
+    <div class="gallery">
+      <div class="card"><h4>Planning</h4><span class="flag f-dim">planning</span><p>No frozen milestones yet, so no percentage.</p></div>
+      <div class="card"><h4>Waiting on you</h4><span class="flag f-you">● waits on you · plan gate</span><p>Approval, a question, or an interactive follow-up.</p></div>
+      <div class="card"><h4>Blocked on another run</h4><span class="flag f-dep">⧗ may be blocked by fca7a801</span><p>Run page only. The open question mentions an issue on the same repo that another live run of yours is working. A mention is a hint, not a recorded dependency, so the wording is "may be". Links to that run.</p></div>
+      <div class="card"><h4>Stalled</h4><span class="flag f-stall">◼ stalled</span><p>The existing run-health signal. Replaces the percentage until activity resumes.</p></div>
+      <div class="card"><h4>Parked</h4><span class="flag f-dim">⏸ usage limit · resumes 21:00</span><p>Limit, pool, recovery and owner pauses keep their existing wording.</p></div>
+      <div class="card"><h4>No milestones</h4><span class="sub">—</span><p>Rework, task, chat and prompt runs have no plan to measure against.</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Not in this PRD</h2>
+    <ul class="notes">
+      <li>Time remaining or a finish time. The backtest over 232 completed runs put only 59% of estimates within 2× of the truth.</li>
+      <li>The one-line "Now" summary (dotted outline above). It is the follow-up PRD.</li>
+      <li>Per-milestone durations and how long the active milestone has been open. They need a structured milestone event from the worker and an index; deferred to a later PRD.</li>
+    </ul>
+  </section>
+</div>
