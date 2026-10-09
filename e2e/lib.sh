@@ -731,6 +731,36 @@ settle_runs_terminal() {
   return 0
 }
 
+# wait_runs_terminal_off_worker TIMEOUT RUN...: cancellation is enqueued, not
+# acknowledged. Before starting the next case or recreating its worker, require
+# terminal outcomes AND absence from the worker snapshot for these exact fixtures.
+# Never changes custody. One shared deadline bounds the whole batch.
+wait_runs_terminal_off_worker() {
+  local timeout="$1" run status active start=$SECONDS deadline pending settled; shift
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture settlement timeout: $timeout"
+  [ "$#" -gt 0 ] || fail "fixture settlement requires run ids"
+  deadline=$((SECONDS + timeout))
+  while :; do
+    pending=(); settled=()
+    for run in "$@"; do
+      status="$(run_status_quick "$run")" || status=""
+      active="$(db_psql "SELECT count(*) FROM worker_active_runs WHERE run_id = '$run'")" || active=""
+      case "$status:$active" in
+        cancelled:0|failed:0|completed:0) settled+=("run=$run status=$status") ;;
+        *) pending+=("run=$run status=${status:-unknown} worker_active_runs=${active:-unknown}") ;;
+      esac
+    done
+    if [ "${#pending[@]}" -eq 0 ]; then
+      record_margin "fixtures terminal and off worker" "$((SECONDS - start))" "$timeout"
+      for run in "${settled[@]}"; do pass "fixture settled off worker: $run"; done
+      return 0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "fixture settlement timeout after ${timeout}s: ${pending[*]}"
+    sleep 0.3
+  done
+}
+
 # wait_regated RUN PREV_CLAIMED_AT [TIMEOUT] — after a restart/kill of a run parked at the
 # plan gate, wait until a NEW claim has re-shown the gate: status awaiting_approval AND
 # claimed_at set and different from PREV_CLAIMED_AT. `wait_status RUN awaiting_approval`
