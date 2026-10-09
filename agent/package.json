@@ -18,14 +18,14 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.287",
-    "agent-browser": "0.38.1",
+    "agent-browser": "0.38.2",
     "smol-toml": "1.9.0",
     "tsx": "^4.19.2",
     "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
-    "knip": "6.38.0",
+    "knip": "6.39.0",
     "oxlint": "1.86.0",
     "typescript": "^7.0.0"
   },
