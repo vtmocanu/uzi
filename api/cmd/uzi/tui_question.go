@@ -87,7 +87,7 @@ func parseTranscriptAnswers(payload json.RawMessage) []string {
 }
 
 // questionProse uses the sanitized Markdown renderer shared by this transcript
-// build (buildFrameBlocksFrom). Remove its two-cell document margins,
+// build (buildFrameBlocksFrom). Remove its two-cell left document margin,
 // then reflow at the chrome's available inner width, including long unbroken words.
 // Every physical line receives UI-owned indentation; Plain would lose rune 201+.
 func (m tuiModel) questionProse(text, indent string, width int) string {
@@ -95,7 +95,9 @@ func (m tuiModel) questionProse(text, indent string, width int) string {
 	lines := strings.Split(body, "\n")
 	if m.renderer != nil && m.renderer.md != nil {
 		for i, line := range lines {
-			end := max(2, ansi.StringWidth(line)-2)
+			// Long-word wraps may have no right padding. Trim only actual
+			// trailing spaces below, rather than deleting two content cells.
+			end := max(2, ansi.StringWidth(line))
 			lines[i] = ansi.Cut(line, 2, end)
 		}
 	}

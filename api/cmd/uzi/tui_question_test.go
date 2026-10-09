@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -187,6 +188,59 @@ func TestTUIQuestionViewMinimumRendererWidth(t *testing.T) {
 	for _, line := range m.transcriptLines(lane) {
 		if visualWidth(line) > m.transcriptWidth() {
 			t.Fatalf("minimum-width transcript overflow: %q", stripANSI(line))
+		}
+	}
+}
+
+// Reconstruct prose from View's transcript column, so a surviving tail marker
+// cannot conceal characters lost where Glamour wraps an unbroken word.
+func TestTUIQuestionAnswerViewPreservesWholeWords(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		for _, word := range []string{
+			"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789END",
+			strings.Repeat("a", 245) + "END",
+		} {
+			for _, field := range []string{"header", "question", "label", "description", "answer"} {
+				t.Run(fmt.Sprintf("dark=%t/%s/%d", dark, field, len(word)), func(t *testing.T) {
+					q := map[string]any{"header": "Header", "question": "Choose"}
+					option := map[string]any{"label": "Choice", "description": "Details"}
+					switch field {
+					case "header", "question":
+						q[field] = word
+					case "label", "description":
+						option[field] = word
+					}
+					q["options"] = []any{option}
+					kind := "question"
+					payload := map[string]any{"questions": []any{q}}
+					if field == "answer" {
+						kind = "answer"
+						payload = map[string]any{"answers": []string{word}}
+					}
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						t.Fatal(err)
+					}
+					m := tuiTestModel(t, &uzicli.FakeClient{}, "whole-word")
+					m.width, m.height, m.dark = 100, 100, dark
+					m.renderer, err = newTUIRenderer(m.transcriptWidth(), dark)
+					if err != nil {
+						t.Fatal(err)
+					}
+					m = applyDetail(m, apitypes.RunDTO{ID: "whole-word", Status: "running"}, []apitypes.MessageDTO{
+						{Seq: 1, Kind: kind, Payload: raw, CreatedAt: time.Now()},
+					})
+					var prose strings.Builder
+					for _, row := range strings.Split(stripANSI(m.View().Content), "\n") {
+						if _, transcript, ok := strings.Cut(row, " ▏ "); ok {
+							prose.WriteString(strings.TrimSpace(transcript))
+						}
+					}
+					if !strings.Contains(prose.String(), word) {
+						t.Fatalf("%s lost characters at a wrap boundary: want %q in %q", field, word, prose.String())
+					}
+				})
+			}
 		}
 	}
 }
