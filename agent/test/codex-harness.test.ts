@@ -392,8 +392,8 @@ describe("m1 response usage", () => {
 
   it("omits incomplete and impossible splits, accepts equality, and retains aggregate accounting", async () => {
     const { harness, transport } = makeHarness();
-    const incomplete = tokenUsage(last, last);
-    incomplete.usage.pricingEvidenceComplete = false;
+    const complete = tokenUsage(last, last);
+    const incomplete = { ...complete, usage: { ...complete.usage, pricingEvidenceComplete: false } };
     const impossible = { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
     const equality = { inputTokens: 100, cachedInputTokens: 70, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
     transport.push(incomplete).push(tokenUsage(doubled, impossible))

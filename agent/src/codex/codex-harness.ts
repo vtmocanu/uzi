@@ -1310,10 +1310,10 @@ export class CodexHarness implements RunHarness {
         // PRD #1332 C4a: reconcile every typed token-usage note into the per-model accountant
         // BEFORE the demux, so BOTH root and demuxed-child usage is captured off this single
         // consumer. An unknown/unregistered thread id is dropped inside record() (never
-        // attributed to root). The note still flows on to its normal handling below (a child's
-        // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
-        // Account snapshots have no thread identity; observe before child demux and
-        // project only liveness, keeping metadata out of the run feed.
+        // attributed to root). Adopted complete responses also queue accounting records before
+        // demux; the original note still routes to the child sink or root `activity` below.
+        // Rate-limit account snapshots have no thread identity. Observe before child demux;
+        // those snapshots remain pure liveness, without rate-limit metadata in the run feed.
         if (step.value.kind === "rate_limits_updated") this.rateLimits.observe(step.value.rateLimits);
         this.recordUsageNote(step.value);
         await this.deliverIncompleteNotice();
