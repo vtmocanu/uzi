@@ -1476,6 +1476,8 @@ export interface ReleaseCheckStatus {
   // reason on error, empty otherwise.
   status: string;
   message?: string;
+  // Check now persisted stable facts, but the RC fetch failed.
+  partial?: boolean;
 }
 
 // HealthDoc is the admin-health document (PRD #1484 M1): the response of

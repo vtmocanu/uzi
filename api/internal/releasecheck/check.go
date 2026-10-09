@@ -56,6 +56,7 @@ type Result struct {
 	Status  string
 	Message string
 	Facts   Facts
+	Partial bool
 }
 
 // Reconciler fetches the constant releases/latest endpoint and, when the master
@@ -171,7 +172,7 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 	}
 	r.settings.Invalidate()
 	if rcErr != nil {
-		return Result{Status: statusError, Facts: facts, Message: "stable release updated; RC fetch failed: " + rcErr.Error()}, nil
+		return Result{Status: statusError, Facts: facts, Partial: true, Message: "stable release updated; RC fetch failed: " + rcErr.Error()}, nil
 	}
 	return Result{Status: statusOK, Facts: facts}, nil
 }
