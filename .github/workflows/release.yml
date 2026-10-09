@@ -183,6 +183,8 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - uses: ./.github/actions/dockerhub-mirror
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -241,6 +243,8 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - uses: ./.github/actions/dockerhub-mirror
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -289,6 +293,8 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - uses: ./.github/actions/dockerhub-mirror
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -373,6 +379,8 @@ jobs:
       queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - uses: ./.github/actions/dockerhub-mirror
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -536,6 +544,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - uses: ./.github/actions/dockerhub-mirror
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -580,6 +590,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - uses: ./.github/actions/dockerhub-mirror
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |

@@ -132,6 +132,10 @@ jobs:
             git --no-pager diff -- agent/devbox-global/devbox.lock
           fi
 
+      # The buildx builder image itself comes from Docker Hub via the daemon.
+      - name: Route Docker Hub pulls through mirror.gcr.io
+        if: steps.delta.outputs.changed == 'true'
+        uses: ./.github/actions/dockerhub-mirror
       - name: Set up buildx
         if: steps.delta.outputs.changed == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
