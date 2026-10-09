@@ -3097,6 +3097,13 @@ tasks:
       - rm -f api/internal/uzidocs/embed/*.md
       - cp docs/*.md api/internal/uzidocs/embed/
 
+  # Explicit writer only; the codexprice mirror test detects drift in gates.
+  codex-pricing:sync:
+    desc: mirror canonical agent Codex pricing bytes into the API embed package
+    cmds:
+      - mkdir -p api/internal/codexprice
+      - cp agent/src/codex/codex-pricing.json api/internal/codexprice/codex-pricing.json
+
   # e2e:registry-doc regenerates the phase-registry table in e2e/README.md from the
   # e2e/phases/NN-*.sh headers and splices it between the registry:begin/end markers.
   # NOT a gate target and NOT under gate: it WRITES the tree; check:e2e-registry-doc

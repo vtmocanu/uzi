@@ -36,6 +36,7 @@ cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 
 | file | read by |
 |---|---|
+| `agent/src/codex/codex-pricing.json` | `api/internal/codexprice/codexprice_test.go` (byte-equality mirror guard; run with `-count=1`) |
 | `fixtures/judge-fidelity/{cases,expected}.json` | `api/internal/workersvc/judge_backlog_fidelity_test.go` |
 | `fixtures/run-usage/` | `api/internal/workersvc/run_usage_contract_test.go`, `web/src/lib/runUsageContract.test.ts` |
 | `fixtures/split-secret-redaction/cases.json` | `api/internal/termsafe/split_secret_fixture_test.go`, `agent/test/redact.test.ts` |
