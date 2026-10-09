@@ -48,6 +48,7 @@ import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { AdminWorkerResources } from "../components/AdminWorkerResources";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
+import { RunProgressCell } from "../components/RunProgressCell";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
 import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
@@ -492,6 +493,9 @@ export function RunRow({
                   {msBadge.label}
                 </Badge>
               )}
+              {/* PRD #2602: the server-derived progress cell, beside the milestone badge
+                  it estimates from; hidden with it under waitingForVault. */}
+              <RunProgressCell run={run} />
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run. */}
               <RunHealthBadge run={run} />

@@ -5,6 +5,7 @@
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import { deriveMockProgress } from "./runProgress";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -55,12 +56,16 @@ export interface MockState {
 // seedRun copies a fixture into the store with status_since defaulted to the fixture's own
 // value, else its updated_at: the same backfill the issue #1727 migration applied to existing
 // rows, so every stored run carries the field a current server always sends.
+//
+// PRD #2602: progress is derived the way the server's runToDTO derives it (runProgress.ts),
+// unless the fixture pins one explicitly.
 function seedRun(r: Run): Run {
   return {
     ...r,
     auto_approve_blocked_reasons: r.auto_approve_blocked_reasons ?? [],
     issue_input_reason: r.issue_input_reason ?? null,
     status_since: r.status_since ?? r.updated_at,
+    progress: r.progress !== undefined ? r.progress : deriveMockProgress(r),
   };
 }
 
@@ -348,6 +353,9 @@ export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
     updated_at: now,
     status_since: "status_since" in patch ? patch.status_since : statusChanged ? now : run.status_since,
   };
+  // PRD #2602: re-derive progress after every write (status, health, milestones and
+  // planning all feed it), as every server RunDTO response does; an explicit patch wins.
+  if (!("progress" in patch)) next.progress = deriveMockProgress(next);
   state.runs.set(runId, next);
   syncCards(runId, patch);
   // Broadcast a "state" frame when any refresh-worthy field actually changed. The frame

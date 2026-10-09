@@ -23,6 +23,7 @@ import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { UsageCard, type UsageWindow } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
+import { RunProgressCell } from "../components/RunProgressCell";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
@@ -532,6 +533,14 @@ export function Dashboard() {
                         {msBadge.label}
                       </Badge>
                     )}
+                    {/* PRD #2602: the server-derived progress cell (percent or a flag);
+                        renders nothing for a pre-feature server or a terminal run. This
+                        cluster does not wrap, so below sm the cell yields its ~60px to the
+                        truncating title (the M badge still carries the count there); the
+                        Runs list rows wrap and keep it at every width. */}
+                    <span className="hidden sm:contents">
+                      <RunProgressCell run={r} />
+                    </span>
                     <RunHealthBadge run={r} />
                     <StatusPill status={effectiveRunStatus(r)} />
                   </div>
