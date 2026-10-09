@@ -1,6 +1,6 @@
 # PRD #2559: API-equivalent cost for Codex subscription runs
 
-**Status**: Approved; implementation and documentation in progress, final verification pending. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
+**Status**: Implemented and reviewed; full agent gate verification unresolved. Child 1 of 2 under umbrella #2558 (Codex run cost). Independent of its sibling PRD #2560 (price-table freshness). The two overlap textually only in `docs/run-cost.md`, its `api/internal/uzidocs/embed/` mirror and `CHANGELOG.md`; in-flight #2555 (run usage card) also touches `web/src/components/RunUsage.tsx` and `codex-harness.ts`, so expect landing conflicts there.
 
 Planning facts were read at `main` `140b5c767` (after #2552, which rewrote the aggregate disclosure wording).
 
@@ -99,8 +99,9 @@ Acceptance: examples 1 to 6 hold in tests; `task gate:agent`, `task gate:web`, `
 ## Verification checklist (2026-10-09)
 
 Evidence below composes producer, persistence, aggregate and renderer tests;
-it is **not an actual-provider end-to-end test**. Final verification is still
-pending; M1 is not marked complete and this PRD stays active.
+it is **not an actual-provider end-to-end cost test**. The implementation and
+documentation have passed fixed-commit reviewer/tester coverage. M1 is not
+marked complete and this PRD stays active because the full agent gate is red.
 
 - [x] Unit A (`ea707` + fix `192413`): producer pricing coverage has literal
   $1.278 = $0.293 low-tier + $0.985 high-tier in
@@ -131,10 +132,23 @@ pending; M1 is not marked complete and this PRD stays active.
   house-style length warnings only); focused `TestEmbeddedDocsMatchSource`
   log `hxp1z9` exited 0. Owned current cost assertions were checked against
   producer, renderer, same-key upsert and run/aggregate fold boundaries.
-- [ ] Remaining final verification, including a passing full agent gate and
-  outstanding final acceptance checks. The full agent gate failed one
-  plan-revision recovery assertion; focused runs passed on both base and head,
-  so the failure remains unexplained. No full agent gate pass is claimed.
+- [x] Repository gate (`task gate:repo`, log `Lwce5J`) exited 0, including
+  tracked-source secret and static-analysis checks. Documentation reviewer and
+  tester found no mandatory findings over `4b6bacf1..5b9a3060`.
+- [x] Standalone `task test:codex-m4` (log `XElIOs`) exited 0: 183 tests
+  passed, zero skips/cancellations; its required Claude/U, Codex/U and Codex/P
+  completeness matrix passed. This checks conformance, not a real-provider
+  cost run.
+- [ ] Passing full `task gate:agent` and final M1 completion. Three completed
+  full runs (`7ML8PD`, `ELKW5e`, `JlKdkk`) each reported 11,226 passes,
+  one failure, three skips and no cancellations, then exited 201. They failed
+  different assertions in unchanged plan-replay/cancellation test files;
+  cost tests passed in all three. The failed cases passed focused BASE/HEAD
+  comparisons. All 72 plan-replay tests and all 14 evaluator tests also passed
+  on BASE. A typechecked baseline delayed-exit fixture reproduced the
+  evaluator's double-exit assertion, but natural baseline failure was not
+  reproduced and causes of the full-suite failures remain unconfirmed. The
+  independent conformance result above does not replace a green full gate.
 
 ## Risks
 
