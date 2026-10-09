@@ -4,18 +4,21 @@
 // sets the phase from the run's current_activity role afterwards.
 package runprogress
 
-import "github.com/vtmocanu/uzi/api/internal/apitypes"
+import (
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
+)
 
 // State values of apitypes.RunProgress.State (closed set; a consumer must treat
 // an unknown value as "none").
 const (
-	StatePercent = "percent"
-	StateWaiting = "waiting"
-	StateParked  = "parked"
-	StateQueued  = "queued"
-	StateStalled = "stalled"
-	StatePlan    = "planning"
-	StateNone    = "none"
+	StatePercent  = "percent"
+	StateWaiting  = "waiting"
+	StateParked   = "parked"
+	StateQueued   = "queued"
+	StateStalled  = "stalled"
+	StatePlanning = "planning"
+	StateNone     = "none"
 )
 
 // Phase values of apitypes.RunProgress.Phase; empty when no activity is known.
@@ -24,10 +27,6 @@ const (
 	PhaseReview    = "review"
 	PhaseValidate  = "validate"
 )
-
-// kindIssue mirrors runkind.Issue; only issue runs have a milestone plan to
-// measure. Kept as a literal so the package stays a leaf over apitypes.
-const kindIssue = "issue"
 
 // Input is the subset of a run Derive reads. A nil and an empty FrozenIDs both
 // mean "no measurable plan" and derive "none".
@@ -64,11 +63,11 @@ func Derive(in Input) *apitypes.RunProgress {
 	case in.Health == "stalled" || in.Health == "looping":
 		p.State = StateStalled
 	case in.IsPlanning:
-		p.State = StatePlan
-	case in.Kind != kindIssue || total == 0:
+		p.State = StatePlanning
+	case in.Kind != runkind.Issue || total == 0:
 		p.State = StateNone
 	case !knownLive(in.Status):
-		// A status from a newer server: show no number rather than guess.
+		// A live status this build does not know: show no number rather than guess.
 		p.State = StateNone
 	default:
 		p.State = StatePercent

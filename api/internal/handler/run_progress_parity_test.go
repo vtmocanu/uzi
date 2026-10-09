@@ -39,20 +39,20 @@ func TestRunProgressParityFixture(t *testing.T) {
 		name string
 		run  store.Run
 	}{
-		{"frozen list, nothing reported", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(frozen)}},
-		{"two of three done, third in progress", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+		{"frozen list, nothing reported", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen)}},
+		{"two of three done, third in progress", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen),
 			MilestonesCompleted: []byte(`["m1","m2"]`), MilestonesInProgress: []byte(`["m3"]`)}},
-		{"completed id outside the frozen list is ignored", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+		{"completed id outside the frozen list is ignored", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen),
 			MilestonesCompleted: []byte(`["m1","dropped"]`), MilestonesInProgress: []byte(`["m2"]`)}},
-		{"in-progress id that is also completed is not active", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+		{"in-progress id that is also completed is not active", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen),
 			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: []byte(`["m1","m3"]`)}},
-		{"two in progress, first in frozen order is active", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+		{"two in progress, first in frozen order is active", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen),
 			MilestonesInProgress: []byte(`["m3","m2"]`)}},
-		{"all done is capped below 100", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+		{"all done is capped below 100", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen),
 			MilestonesCompleted: []byte(`["m1","m2","m3"]`)}},
-		{"empty frozen list", store.Run{Kind: "issue", Status: "running", IterationCount: 1, MilestonesFrozen: []byte(`[]`),
+		{"empty frozen list", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(`[]`),
 			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: []byte(`["m1"]`)}},
-		{"no frozen list", store.Run{Kind: "issue", Status: "running", IterationCount: 1}},
+		{"no frozen list", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1}},
 	}
 
 	out := make([]runProgressParityCase, 0, len(cases))

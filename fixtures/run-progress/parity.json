@@ -3,7 +3,7 @@
     "name": "frozen list, nothing reported",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [
       {
@@ -34,7 +34,7 @@
     "name": "two of three done, third in progress",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [
       {
@@ -70,7 +70,7 @@
     "name": "completed id outside the frozen list is ignored",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [
       {
@@ -106,7 +106,7 @@
     "name": "in-progress id that is also completed is not active",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [
       {
@@ -142,7 +142,7 @@
     "name": "two in progress, first in frozen order is active",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [
       {
@@ -176,7 +176,7 @@
     "name": "all done is capped below 100",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [
       {
@@ -211,7 +211,7 @@
     "name": "empty frozen list",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": [],
     "milestones_completed": [
@@ -233,7 +233,7 @@
     "name": "no frozen list",
     "kind": "issue",
     "status": "running",
-    "health": "",
+    "health": "ok",
     "is_planning": false,
     "milestones": null,
     "milestones_completed": null,
