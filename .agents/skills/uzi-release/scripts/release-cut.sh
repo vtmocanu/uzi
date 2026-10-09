@@ -163,26 +163,32 @@ prev_stable_below() {
 changelog_unreleased_body() {
   awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
 }
-# shipping_commits_since <ref> -> count of first-parent commits in <ref>..HEAD that touched
+# shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
 # a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
 # a docs/skill/prd/build-only commit after the RC must NOT force a next candidate that ships
 # nothing (it would leave an empty [X] section and, with an empty [Unreleased], fail the main
 # half and roll the stable tag back). Counting raw `git log` commits conflated the two.
 shipping_commits_since() {
-  local c=0 sha f files
+  local sha f shipping files_fd files_pid
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
-    files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
-    while IFS= read -r f; do
+    shipping=0
+    # Two attempts at most; drain the whole producer before trusting its status.
+    exec {files_fd}< <(git diff --name-only -z "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= -z "$sha")
+    files_pid=$!
+    while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
-      if is_shipping "$f"; then c=$((c + 1)); break; fi
-    done <<EOF
-$files
-EOF
+      if is_shipping "$f"; then shipping=1; fi
+    done <&"$files_fd"
+    exec {files_fd}<&-
+    if ! wait "$files_pid"; then
+      echo "release-cut: could not list changed paths for $sha" >&2
+      return 1
+    fi
+    if [ "$shipping" = 1 ]; then printf '%s\n' "$sha"; fi
   done <<EOF
 $(git log --first-parent --format=%H "$1..HEAD" 2>/dev/null)
 EOF
-  echo "$c"
 }
 # rc_tag_on_remote <tag> -> 0 present on origin, 2 absent from origin, 3 origin
 # unreachable (network/auth). A promote re-tags the in-flight RC's PUBLISHED agent image
@@ -500,24 +506,29 @@ run_links() {
 # PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
 # carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
 dependency_merge_refs() {
-  local prev="$1" sha subject files f shipping manifest_only touched_cl pr short
+  local prev="$1" sha subject f shipping manifest_only touched_cl pr short files_fd files_pid
   [ -n "$prev" ] || return 0
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     subject="$(git log -1 --format=%s "$sha")"
     is_dependency_subject "$subject" || continue
     if git log -1 --format=%B "$sha" | grep -iE '^Changelog:[[:space:]]*none' >/dev/null; then continue; fi
-    files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
+    # A failed listing aborts this scan before any dependency citations are used.
+    exec {files_fd}< <(git diff --name-only -z "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= -z "$sha")
+    files_pid=$!
     shipping=0; manifest_only=1; touched_cl=0
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
       [ "$f" != CHANGELOG.md ] || touched_cl=1
       is_shipping "$f" || continue
       shipping=1
       is_dependency_manifest "$f" || manifest_only=0
-    done <<EOF
-$files
-EOF
+    done <&"$files_fd"
+    exec {files_fd}<&-
+    if ! wait "$files_pid"; then
+      echo "release-cut: could not list changed paths for $sha" >&2
+      return 1
+    fi
     [ "$shipping" = 1 ] && [ "$manifest_only" = 1 ] && [ "$touched_cl" = 0 ] || continue
     pr="$(printf '%s\n' "$subject" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')"
     short="$(git rev-parse --short "$sha")"
@@ -689,7 +700,15 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
   # after the RC (e.g. a `docs(...) [skip ci]` anchor refresh) must still take promote-only,
   # not drop through to the main half and fail on an empty [Unreleased] (which would roll the
   # stable tag back). "Shipping" is is_shipping, the same predicate the coverage oracle uses.
-  merges="$(shipping_commits_since "$INFLIGHT")"
+  if ! SHIPPING_SHAS="$(shipping_commits_since "$INFLIGHT")"; then
+    exit 3
+  fi
+  merges=0
+  while IFS= read -r shipping_sha; do
+    [ -z "$shipping_sha" ] || merges=$((merges + 1))
+  done <<EOF
+$SHIPPING_SHAS
+EOF
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
   trap promote_guard EXIT
   promote_inflight
@@ -723,7 +742,9 @@ if [ -n "$PREV_OVERRIDE" ]; then
 else
   PREV="$(prev_stable_below "$BASE")"
 fi
-DEP_REFS="$(dependency_merge_refs "$PREV")"
+if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
+  exit 3
+fi
 
 # --- CHANGELOG (main half) ----------------------------------------------------
 case "$OP" in

@@ -32,6 +32,9 @@
 set -uo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
+mkdir -p "$TMPDIR"
+export TMPDIR
 ORACLE="$SCRIPTS_DIR/assert-changelog-covers-release.sh"
 SECTION="$SCRIPTS_DIR/changelog-section.sh"
 
@@ -1327,6 +1330,163 @@ rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI"
 rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
        "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \
        "$S8R.draft.md" "$SBH" "$SBH.origin.git"
+
+echo "=== #1468 M1: NUL paths and checked listing producers ==="
+LIST_SHIM="$(mktemp -d)"
+export LIST_REAL_GIT
+LIST_REAL_GIT="$(command -v git)"
+cat > "$LIST_SHIM/git" <<'STUB'
+#!/usr/bin/env bash
+# Intercept only path listings for this fixture's selected commit.
+listing=0
+case "${1:-}" in
+  diff|show)
+    for arg in "$@"; do
+      [ "$arg" != --name-only ] || listing=1
+    done
+    ;;
+esac
+if [ "$listing" = 1 ] && [ "${!#}" = "${LIST_SHA:-}" ]; then
+  case "${LIST_MODE:-}" in
+    fallback) [ "$1" != diff ] || exit 71 ;;
+    fail) exit 72 ;;
+    partial)
+      printf 'api/go.mod\0api/é.go\0'
+      exit 73
+      ;;
+    large)
+      # 20,000 records exceed pipe capacity; success requires draining all of them.
+      printf 'api/é.go\0'
+      for ((i=0; i<20000; i++)); do
+        printf 'prds/nonshipping-record-%08d-padding-padding-padding.md\0' "$i" || exit 74
+      done
+      printf 'drained\n' >> "$LIST_LOG"
+      exit 0
+      ;;
+  esac
+fi
+exec "$LIST_REAL_GIT" "$@"
+STUB
+chmod +x "$LIST_SHIM/git"
+export PATH="$LIST_SHIM:$PATH"
+export LIST_SHA LIST_MODE LIST_LOG
+listing_failure() {
+  if [ "$2" -ne 0 ]; then pass "$1 refuses"; else fail "$1 refuses"; fi
+  assert_contains "$1 names SHA" "$LIST_SHA" "$3"
+  assert_contains "$1 explains listing failure" "list" "$3"
+}
+unusual_feature() {
+  local d="$1" path="$2"
+  printf 'package main\n' > "$d/$path"
+  git -C "$d" add -- "$path"
+  gcommit "$d" 'feat: unusual path (#1468)'
+}
+published_rc() {
+  seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
+  feature_201_changelog "$1"
+  run_rc "$1" 0.2.0
+  assert_eq "listing fixture initial RC succeeds" 0 "$RC_RC"
+  git -C "$1" tag v0.2.0-rc.1
+  push_tag_to_origin "$1" v0.2.0-rc.1
+}
+# Each oracle path is the ONLY shipping path on its commit.
+for unusual in 'api/é.go' $'api/new\n"quote.go'; do
+  LN="$(mktemp -d)"; seed_repo "$LN"
+  unusual_feature "$LN" "$unusual"
+  printf '# Changelog\n\n## [0.2.0]\n### Added\n- Other (#201)\n' | put_changelog "$LN"
+  out="$(cd "$LN" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; status=$?
+  assert_eq "oracle flags uncited unusual path $unusual" 1 "$status"
+  assert_contains "oracle reports unusual commit" 'feat: unusual path (#1468)' "$out"
+  rm -rf "$LN"
+done
+for consumer in oracle shipping dependency; do
+  for mode in fallback fail partial large; do
+    # Large output is a shipping-drain probe, not another failure mode.
+    [ "$mode" != large ] || [ "$consumer" = shipping ] || continue
+    LN="$(mktemp -d)"
+    LIST_SHA=""; LIST_MODE=""
+    if [ "$consumer" = shipping ]; then
+      published_rc "$LN"
+      unusual_feature "$LN" 'api/é.go'
+      LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
+      # Empty Unreleased exposes a mistaken promote-only classification.
+    else
+      seed_repo "$LN"
+      if [ "$consumer" = dependency ]; then
+        add_dep "$LN" api/go.mod 'fix(deps): bump x (#1468)'
+      else
+        unusual_feature "$LN" 'api/é.go'
+      fi
+      LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
+      if [ "$consumer" = dependency ]; then
+        feature_201_changelog "$LN"
+      else
+        printf '# Changelog\n\n## [Unreleased]\n### Added\n- Other (#201)\n\n## [0.2.0]\n### Added\n- Cited (#1468)\n' | put_changelog "$LN"
+      fi
+    fi
+    before="$(git -C "$LN" rev-parse HEAD)"
+    before_reflog="$(git -C "$LN" reflog --format=%H HEAD)"
+    LIST_MODE="$mode"; LIST_LOG="$LN.producer.log"
+    if [ "$consumer" = oracle ]; then
+      out="$(cd "$LN" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; status=$?
+    else
+      if [ "$consumer" = shipping ]; then
+        run_rc "$LN" 0.2.0 --promote-only
+      else
+        run_rc "$LN" 0.2.0
+      fi
+      out="$RC_OUT"; status="$RC_RC"
+    fi
+    case "$mode" in
+      fallback|large)
+        assert_eq "$consumer $mode succeeds" 0 "$status"
+        if [ "$consumer" = shipping ]; then
+          assert_contains "shipping $mode counts the unusual commit once" '1 shipping commit(s)' "$out"
+        fi
+        if [ "$consumer" = dependency ]; then
+          assert_contains "dependency fallback retains autocitation" '#1468' "$(dep_bullet "$LN")"
+        fi
+        if [ "$mode" = large ]; then
+          assert_eq "large producer completed without SIGPIPE" drained "$(cat "$LIST_LOG")"
+        fi
+        ;;
+      *)
+        listing_failure "$consumer $mode" "$status" "$out"
+        assert_eq "$consumer $mode creates no release commit" "$before" "$(git -C "$LN" rev-parse HEAD)"
+        if [ "$consumer" = dependency ]; then
+          assert_eq "dependency $mode does not create then roll back a release commit" "$before_reflog" "$(git -C "$LN" reflog --format=%H HEAD)"
+        fi
+        if git -C "$LN" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+          fail "$consumer $mode creates no stable tag"
+        else
+          pass "$consumer $mode creates no stable tag"
+        fi
+        ;;
+    esac
+    LIST_SHA=""; LIST_MODE=""
+    rm -rf "$LN" "$LN.origin.git" "$LN.producer.log"
+  done
+done
+# Source + manifest in ONE dependency-typed commit must never gain an autocitation.
+LN="$(mktemp -d)"; seed_repo "$LN"; add_feature "$LN" 201
+printf '// bump\n' > "$LN/api/go.mod"
+printf 'package main\n' > "$LN/api/é.go"
+git -C "$LN" add -- api/go.mod api/é.go
+gcommit "$LN" 'fix(deps): bump and adapt (#1468)'
+feature_201_changelog "$LN"
+run_rc "$LN" 0.2.0
+assert_eq "Unicode source plus manifest is not autocited" 1 "$RC_RC"
+assert_eq "Unicode source plus manifest has no Routine bullet" 0 "$(dep_bullets "$LN")"
+rm -rf "$LN"
+# With entries, Unicode work after a published RC reaches the next main-half cut.
+LN="$(mktemp -d)"; published_rc "$LN"
+unusual_feature "$LN" 'api/é.go'
+printf '# Changelog\n\n## [Unreleased]\n### Added\n- Unicode (#1468)\n\n## [0.2.0]\n### Added\n- Feature (#201)\n\n## [0.1.0]\n- Initial (#100)\n' | put_changelog "$LN"
+run_rc "$LN" 0.3.0 --promote
+assert_eq "Unicode work with entries promotes and cuts main" 0 "$RC_RC"
+assert_eq "Unicode work advances main chart" 0.3.0-rc.1 "$(chart_ver "$LN")"
+rm -rf "$LN" "$LN.origin.git" "$LIST_SHIM"
+unset LIST_SHA LIST_MODE LIST_LOG LIST_REAL_GIT
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh
