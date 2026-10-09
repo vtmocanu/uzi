@@ -849,10 +849,6 @@ tasks:
       # (groupName "shellcheck" in renovate.json) folds them into ONE bump PR. A
       # single shared variable would have to be spliced into a `cmds:` line, which
       # this file's header bans.
-      #
-      # NOTE: temporarily downgraded to 0.10.0 to force a live Renovate bump-back
-      # PR (0.11.0 is latest; with no version delta Renovate opens nothing). This
-      # proves the wiring end to end; Renovate then bumps it back to 0.11.0.
       # renovate: datasource=github-releases depName=koalaman/shellcheck
       - ./scripts/lint-shell.sh warning 0.11.0
 
