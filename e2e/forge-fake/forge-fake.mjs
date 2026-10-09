@@ -1021,10 +1021,11 @@ const server = https.createServer(
       return send(res, 200, { id: 1, login: "uzi-bot", is_admin: false });
     }
     if (method === "GET" && path === "/api/v1/users/search") {
-      // GetUserByID (ProjectRole resolves the numeric bot id -> login). Only the
-      // bot (uid=1) is known.
+      // GetUserByID resolves the bot and recorded reviewer identities.
       const uid = url.searchParams.get("uid");
-      return send(res, 200, { data: uid === "1" ? [{ id: 1, login: "uzi-bot" }] : [] });
+      const data = uid === "1" ? [{ id: 1, login: "uzi-bot" }]
+        : uid === "2" ? [{ id: 2, login: "reviewer" }] : [];
+      return send(res, 200, { data });
     }
     const fjTokens = path.match(/^\/api\/v1\/users\/([^/]+)\/tokens$/);
     if (method === "GET" && fjTokens) {
@@ -1091,7 +1092,7 @@ const server = https.createServer(
       const rest = fjRepo[3] || "";
       if (method === "GET" && (rest === "/teams" || rest === "/collaborators")) {
         if (!PROJECTS.some((p) => p.path_with_namespace === `${fjRepo[1]}/${fjRepo[2]}`)) return send(res, 404, { message: "Not Found" });
-        return sendPage(req, res, url, rest === "/teams" ? [] : [{ id: 1, login: "uzi-bot" }], "limit", 50);
+        return sendPage(req, res, url, rest === "/teams" ? [] : [{ id: 1, login: "uzi-bot" }, { id: 2, login: "reviewer" }], "limit", 50);
       }
 
       // Issues list. Emits real issues AND every MR as a pull_request issue, so the
@@ -1215,7 +1216,8 @@ const server = https.createServer(
       // RoleWrite, member=true (compliant, no finding).
       const fjPerm = rest.match(/^\/collaborators\/([^/]+)\/permission$/);
       if (method === "GET" && fjPerm) {
-        return send(res, 200, { permission: "write", role_name: "Write", user: { id: 1, login: "uzi-bot" } });
+        const user = fjPerm[1] === "reviewer" ? { id: 2, login: "reviewer" } : { id: 1, login: "uzi-bot" };
+        return send(res, 200, { permission: "write", role_name: "Write", user });
       }
 
       // Pull requests.
@@ -1335,6 +1337,9 @@ const server = https.createServer(
       if (method === "GET" && g === "/user/1") {
         return send(res, 200, { id: 1, login: "uzi-bot" });
       }
+      if (method === "GET" && g === "/user/2") {
+        return send(res, 200, { id: 2, login: "reviewer" });
+      }
       // UserExists (human_username verify). No human accounts are known, so 404 ->
       // the driver returns (false, nil) -> saved WITH a warning, never a hard reject
       // (the verified-or-warned path, mirroring the other tables' empty/absent user).
@@ -1385,6 +1390,9 @@ const server = https.createServer(
           if (!PROJECTS.some((p) => p.path_with_namespace === `${ghRepo[1]}/${ghRepo[2]}`)) return send(res, 404, { message: "Not Found" });
           return sendPage(req, res, url, [{
             id: 1, login: "uzi-bot",
+            permissions: { pull: true, triage: false, push: true, maintain: false, admin: false },
+          }, {
+            id: 2, login: "reviewer",
             permissions: { pull: true, triage: false, push: true, maintain: false, admin: false },
           }], "per_page", 100);
         }

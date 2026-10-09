@@ -9,14 +9,15 @@ import test from "node:test";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const bot = { id: 1, login: "uzi-bot" };
+const reviewer = { id: 2, login: "reviewer" };
 const permissions = { pull: true, triage: false, push: true, maintain: false, admin: false };
 const timestamp = (day) => `2020-01-${String(day).padStart(2, "0")}T00:00:00.000Z`;
-const note = (id, project_id, issue_iid, day) => ({
+const note = (id, project_id, issue_iid, day, author = { id: 1, username: "uzi-bot" }) => ({
   id, project_id, issue_iid, body: `note ${id}`, created_at: timestamp(day),
-  author: { id: 1, username: "uzi-bot" },
+  author,
 });
 
-test("shared fake HTTPS comment and bot-author contracts", { timeout: 30000 }, async (t) => {
+test("shared fake HTTPS comment and author contracts", { timeout: 30000 }, async (t) => {
   mkdirSync(path.join(root, ".uzi/scratch"), { recursive: true });
   const scratch = mkdtempSync(path.join(root, ".uzi/scratch/issue-comments-"));
   let child;
@@ -43,7 +44,7 @@ test("shared fake HTTPS comment and bot-author contracts", { timeout: 30000 }, a
   const legacy = { id: 11, issue_iid: 7, body: "legacy", created_at: timestamp(1) };
   const fixtures = [
     note(15, 1, 7, 4), note(13, 1, 7, 2), note(12, 1, 7, 2),
-    note(14, 1, 7, 3), legacy,
+    note(14, 1, 7, 3, { id: 2, username: "reviewer" }), legacy,
     note(25, 2, 7, 5), note(23, 2, 7, 3), note(21, 2, 7, 1),
     note(24, 2, 7, 4), note(22, 2, 7, 2), note(30, 1, 8, 1),
     ...Array.from({ length: 105 }, (_, i) => note(100 + i, 1, 9, 1)),
@@ -110,7 +111,8 @@ test("shared fake HTTPS comment and bot-author contracts", { timeout: 30000 }, a
     }
   }
   const expectedComment = (fixture) => ({
-    id: fixture.id, body: fixture.body, user: bot,
+    id: fixture.id, body: fixture.body,
+    user: fixture.author ? { id: fixture.author.id, login: fixture.author.login ?? fixture.author.username } : bot,
     created_at: fixture.created_at, updated_at: fixture.created_at,
   });
   async function get(route) {
@@ -194,11 +196,34 @@ test("shared fake HTTPS comment and bot-author contracts", { timeout: 30000 }, a
     });
   }
 
+  for (const dialect of ["v1", "v3"]) {
+    await t.test(`${dialect} reviewer comment identity and membership`, async () => {
+      const comments = (await get(`/api/${dialect}/repos/group/repo/issues/7/comments`)).body;
+      const author = comments.find((comment) => comment.id === 14).user;
+      assert.deepEqual(author, reviewer);
+      const identity = dialect === "v3"
+        ? (await get(`/api/v3/user/${author.id}`)).body
+        : (await get(`/api/v1/users/search?uid=${author.id}`)).body.data[0];
+      assert.deepEqual(identity, author);
+      for (const slug of ["group/repo", "group/repo2"]) {
+        const collaborators = (await get(`/api/${dialect}/repos/${slug}/collaborators`)).body;
+        const member = collaborators.find((user) => user.id === identity.id && user.login === identity.login);
+        assert.deepEqual(member, dialect === "v3" ? { ...identity, permissions } : identity);
+        if (dialect === "v1") {
+          assert.deepEqual((await get(`/api/v1/repos/${slug}/collaborators/${identity.login}/permission`)).body,
+            { permission: "write", role_name: "Write", user: identity });
+        }
+      }
+    });
+  }
+
   await t.test("positive bot author evidence, terminal collaborators and teams", async () => {
     // github_author.go uses singular Users.GetByID and all five permission pointers.
     assert.deepEqual((await get("/api/v3/user/1")).body, bot);
     // forgejo_author.go resolves uid, repository, teams, direct collaborators and permission.
     assert.deepEqual((await get("/api/v1/users/search?uid=1")).body, { data: [bot] });
+    assert.deepEqual((await get("/api/v1/users/search?uid=999")).body, { data: [] });
+    assert.equal((await request("/api/v3/user/999")).status, 404);
     for (const dialect of ["v1", "v3"]) {
       for (const [id, slug] of [[1, "group/repo"], [2, "group/repo2"]]) {
         const repo = (await get(`/api/${dialect}/repositories/${id}`)).body;
@@ -209,16 +234,28 @@ test("shared fake HTTPS comment and bot-author contracts", { timeout: 30000 }, a
         assert.notEqual(repo.owner.login, bot.login);
         const sizeKey = dialect === "v1" ? "limit" : "per_page";
         const route = `/api/${dialect}/repos/${slug}/collaborators`;
+        const collaborators = [bot, reviewer].map((user) => dialect === "v3" ? { ...user, permissions } : user);
         for (const page of [1, 2, 8]) {
           const response = await get(route + `?${sizeKey}=${dialect === "v1" ? 50 : 100}&page=${page}`);
-          assert.deepEqual(response.body, page === 1 ? [dialect === "v3" ? { ...bot, permissions } : bot] : []);
+          assert.deepEqual(response.body, page === 1 ? collaborators : []);
           assert.equal(response.headers.link, undefined);
+        }
+        for (const page of [1, 2, 3]) {
+          const response = await get(route + `?${sizeKey}=1&page=${page}`);
+          assert.deepEqual(response.body, collaborators.slice(page - 1, page));
+          if (page === 1) {
+            const next = new URL(route + `?${sizeKey}=1&page=2`, origin);
+            assert.equal(response.headers.link, `<${next.href}>; rel="next"`);
+            assert.deepEqual((await get(next.href)).body, [collaborators[1]]);
+          } else assert.equal(response.headers.link, undefined);
         }
         if (dialect === "v1") {
           const teams = await get(`/api/v1/repos/${slug}/teams?limit=50`);
           assert.deepEqual(teams.body, []);
           assert.equal(teams.headers.link, undefined);
           assert.deepEqual((await get(`/api/v1/repos/${slug}/collaborators/uzi-bot/permission`)).body,
+            { permission: "write", role_name: "Write", user: bot });
+          assert.deepEqual((await get(`/api/v1/repos/${slug}/collaborators/unrelated/permission`)).body,
             { permission: "write", role_name: "Write", user: bot });
         }
       }
