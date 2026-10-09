@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -113,7 +114,14 @@ func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCu
 		HasAvailableCapture:     row.HasAvailableCapture,
 		CaptureState:            row.CaptureState,
 	}
-	if row.FinalDisposition.Valid {
+	out.CompletedPublicationReason = row.CompletedPublicationReason.String
+	if len(row.CompletedPublicationReceipt) > 0 {
+		var receipt apitypes.CompletedPublicationReceipt
+		if json.Unmarshal(row.CompletedPublicationReceipt, &receipt) == nil {
+			out.CompletedPublicationReceipt = &receipt
+		}
+	}
+	if row.FinalDisposition.Valid && row.FinalDisposition.String != "completed_publication" {
 		out.FinalReceipt = &apitypes.RecoveryFinalDisposition{
 			Kind:           row.FinalDisposition.String,
 			SourceSha:      row.FinalSourceSha.String,

@@ -646,6 +646,9 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 	if s.txBeginner == nil {
 		return 0, false, lease, fmt.Errorf("completion transaction unavailable: no tx beginner wired for run %s", owned.ID)
 	}
+	if req.CompletionFinalHead != nil && (req.Head == nil || *req.CompletionFinalHead != *req.Head) {
+		return 0, false, lease, ErrInvalidState
+	}
 	head := ""
 	if req.Head != nil {
 		// NUL-strip BEFORE the trim (a NUL is not whitespace, so a "\x00 h \x00" would survive a

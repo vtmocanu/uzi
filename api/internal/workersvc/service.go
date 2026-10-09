@@ -3624,7 +3624,9 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
+	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -4005,6 +4007,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	if err := validateCompletedPublicationReport(wkr, req); err != nil {
+		return store.Run{}, false, err
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
 		return store.Run{}, false, err
@@ -4587,7 +4592,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// Interlocked completion derives its stamp from the locked row; leave audit
 		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
-			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
+			CompletionFinalHead:  completedPublicationHead(wkr, req),
+			CompletionGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
+			Branch:               stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
 			// Checker report-only is a server-owned kind invariant. Checker

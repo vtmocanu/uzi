@@ -765,33 +765,36 @@ type RecoveryCaptureChunk struct {
 }
 
 type RecoveryCustodyHold struct {
-	ID                         uuid.UUID          `json:"id"`
-	UserID                     uuid.UUID          `json:"user_id"`
-	RepoID                     pgtype.UUID        `json:"repo_id"`
-	RunID                      uuid.UUID          `json:"run_id"`
-	Generation                 int64              `json:"generation"`
-	State                      string             `json:"state"`
-	OriginalWorkerID           uuid.UUID          `json:"original_worker_id"`
-	OriginalWorkerIdentity     string             `json:"original_worker_identity"`
-	LiveWorkerID               pgtype.UUID        `json:"live_worker_id"`
-	LiveRunID                  pgtype.UUID        `json:"live_run_id"`
-	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt                 pgtype.Timestamptz `json:"released_at"`
-	ReleaseEvidence            pgtype.Text        `json:"release_evidence"`
-	ReleasePushedSha           pgtype.Text        `json:"release_pushed_sha"`
-	ReleaseSourceSha           pgtype.Text        `json:"release_source_sha"`
-	ReleaseAdoptedSha          pgtype.Text        `json:"release_adopted_sha"`
-	ReleaseFinalHeadSha        pgtype.Text        `json:"release_final_head_sha"`
-	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
-	ReleaseBranch              pgtype.Text        `json:"release_branch"`
-	ReleaseTarget              pgtype.Text        `json:"release_target"`
-	TerminalRecordRejection    pgtype.Text        `json:"terminal_record_rejection"`
-	InventoryGuarded           bool               `json:"inventory_guarded"`
-	FinalDisposition           pgtype.Text        `json:"final_disposition"`
-	FinalCaptureID             pgtype.UUID        `json:"final_capture_id"`
-	FinalSourceSha             pgtype.Text        `json:"final_source_sha"`
-	FinalCoverageDigest        pgtype.Text        `json:"final_coverage_digest"`
+	ID                          uuid.UUID          `json:"id"`
+	UserID                      uuid.UUID          `json:"user_id"`
+	RepoID                      pgtype.UUID        `json:"repo_id"`
+	RunID                       uuid.UUID          `json:"run_id"`
+	Generation                  int64              `json:"generation"`
+	State                       string             `json:"state"`
+	OriginalWorkerID            uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity      string             `json:"original_worker_identity"`
+	LiveWorkerID                pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID                   pgtype.UUID        `json:"live_run_id"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt                  pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence             pgtype.Text        `json:"release_evidence"`
+	ReleasePushedSha            pgtype.Text        `json:"release_pushed_sha"`
+	ReleaseSourceSha            pgtype.Text        `json:"release_source_sha"`
+	ReleaseAdoptedSha           pgtype.Text        `json:"release_adopted_sha"`
+	ReleaseFinalHeadSha         pgtype.Text        `json:"release_final_head_sha"`
+	ReleaseSuccessorGeneration  pgtype.Int8        `json:"release_successor_generation"`
+	ReleaseBranch               pgtype.Text        `json:"release_branch"`
+	ReleaseTarget               pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection     pgtype.Text        `json:"terminal_record_rejection"`
+	InventoryGuarded            bool               `json:"inventory_guarded"`
+	FinalDisposition            pgtype.Text        `json:"final_disposition"`
+	FinalCaptureID              pgtype.UUID        `json:"final_capture_id"`
+	FinalSourceSha              pgtype.Text        `json:"final_source_sha"`
+	FinalCoverageDigest         pgtype.Text        `json:"final_coverage_digest"`
+	CompletionIdentity          []byte             `json:"completion_identity"`
+	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
+	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
 }
 
 type RecoveryCustodyHoldFact struct {
@@ -1019,6 +1022,7 @@ type Run struct {
 	WorkerRecoveryEvidence    []byte             `json:"worker_recovery_evidence"`
 	CrossCheckLane            bool               `json:"cross_check_lane"`
 	CrossCheckLaneGeneration  pgtype.Int8        `json:"cross_check_lane_generation"`
+	CompletionFinalHead       pgtype.Text        `json:"completion_final_head"`
 }
 
 type RunCompletionAttempt struct {

@@ -3986,6 +3986,7 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
 -- move still leaves the reconcile loop a marker to heal from.
 UPDATE runs SET
     plan_cross_check_gate_reason = NULL,
+    completion_final_head = sqlc.narg('completion_final_head'),
     status             = 'completed',
     status_since       = now(),
     branch             = @branch,
@@ -4075,6 +4076,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND (sqlc.narg('completion_final_head')::text IS NULL OR runs.claim_generation = sqlc.narg('completion_generation')::bigint)
   -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) `completed` from an
   -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
   -- leaves the row status='paused' with claim_released_at set and KEEPS worker_id (informational),

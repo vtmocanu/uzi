@@ -400,7 +400,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 func protocolFeatures(activeSnapshotEnabled bool) []string {
 	groups := [][]string{
 		{"dind_maintenance_v1"},
-		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1"}, // PRD #1392 M1
+		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1"}, // PRD #1392 M1
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
 		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
 		{"claim_generation_fence"},    // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
@@ -1425,6 +1425,12 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ack := h.workerStateAck(r, run)
+	if result.CompletedPublicationReceipt != nil {
+		ack["completed_publication_receipt"] = result.CompletedPublicationReceipt
+	}
+	if result.CompletedPublicationReason != "" {
+		ack["completed_publication_reason"] = result.CompletedPublicationReason
+	}
 	if req.State == "credential_switch" {
 		// PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied — a
 		// FRESH requeue (status 'queued') OR an idempotent release after a reclaim (applied, status
