@@ -71,7 +71,7 @@ require(unicode_strings; "JSON strings must contain well-formed Unicode")
         finding($model; $row.verified_at; "verified more than 30 days ago"; $row.sources)
        else empty end),
       (if $row | has("promo_review_date") then
-         ($row.promo_review_date | day) - $now as $remaining |
+         (($row.promo_review_date | day) - $now) as $remaining |
          if $remaining <= 0 then
            finding($model; $row.promo_review_date; "promotional review date passed"; $row.sources)
          elif $remaining <= 14 then

@@ -264,11 +264,11 @@ jq -c '[.[] | [.subject, .reason]]' "$scratch/out" >"$scratch/actual"
 printf '%s\n' '[["a","verified more than 30 days ago"],["a","promotional review date passed"],["z","verified more than 30 days ago"],["Anthropic","fetched more than 30 days ago"]]' >"$scratch/expected"
 cmp "$scratch/actual" "$scratch/expected" || die "deterministic finding order"
 ok --today 2026-02-01
-[[ $(wc -l <"$scratch/out") == 4 ]] || die "one text line per finding"
+(( $(wc -l <"$scratch/out") == 4 )) || die "one text line per finding"
 change '.models = {"line\nbreak": .models.model}'
 jq -e '(.models | keys[0]) == "line\nbreak"' "$UZI_PRICING_TEST_CODEX_PATH" >/dev/null || die "fixture must contain actual newline"
 ok --today 2026-02-01
-[[ $(wc -l <"$scratch/out") == 2 ]] || die "escaped subject must stay on one line"
+(( $(wc -l <"$scratch/out") == 2 )) || die "escaped subject must stay on one line"
 [[ $(head -n 1 "$scratch/out") == 'line\nbreak | 2026-01-01 | verified more than 30 days ago | https://example.com/pricing' ]] || die "newline subject must render as escaped text"
 base
 for mutation in \
