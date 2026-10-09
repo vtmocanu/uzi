@@ -622,16 +622,12 @@ func TestSetStateEnterLeaseLiveDB(t *testing.T) {
 
 // seedLeasedWorker creates an ephemeral worker that served a completed issue run on `iid` (branch
 // NULL: identity agent/issue-<iid>) and entered its lease through the real EnterEphemeralLease.
-// leaseAge backdates lease_since.
-func (e leaseEnv) seedLeasedWorker(t *testing.T, leaseAge time.Duration) (workerID, served uuid.UUID, iid int64) {
+func (e leaseEnv) seedLeasedWorker(t *testing.T) (workerID, served uuid.UUID, iid int64) {
 	t.Helper()
 	workerID, served, iid = e.seedBound(t, "completed", 1, false)
 	n, err := e.q.EnterEphemeralLease(e.ctx, store.EnterEphemeralLeaseParams{WorkerID: workerID, RunID: served})
 	if err != nil || n != 1 {
 		t.Fatalf("EnterEphemeralLease = (%d, %v), want (1, nil)", n, err)
-	}
-	if leaseAge > 0 {
-		e.exec(`UPDATE workers SET lease_since = now() - $2::interval WHERE id = $1`, workerID, fmt.Sprintf("%d microseconds", leaseAge.Microseconds()))
 	}
 	return workerID, served, iid
 }
@@ -703,7 +699,7 @@ func (p *leaseProbe) hook(admitted, rebound bool) {
 func TestClaimThroughLeaseRebindsLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(2*time.Hour, e.pool)
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 	r := awaitClaim(t, e.claimAsync(svc, w, 1))
@@ -761,7 +757,7 @@ func TestClaimIssueRerunCreatedThroughServiceLiveDB(t *testing.T) {
 func TestClaimLeaseOffNeverClaimsForeignLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(0, e.pool)
-	w, _, iid := e.seedLeasedWorker(t, 0)
+	w, _, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	r := awaitClaim(t, e.claimAsync(svc, w, 1))
 	if r.err != nil || r.payload != nil {
@@ -783,7 +779,7 @@ func TestClaimTwoFollowUpsForOneLeasedWorkerLiveDB(t *testing.T) {
 	svc := e.service(2*time.Hour, gate)
 	probe := &leaseProbe{}
 	svc.leaseClaimProbe = probe.hook
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	r1 := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	// uq_runs_one_active_per_issue allows one active issue run per issue, so the second lease-eligible
 	// follow-up is an mr_rework on the same branch (its identity is its pipeline_ref).
@@ -834,7 +830,7 @@ func TestClaimVsCordonLiveDB(t *testing.T) {
 		svc := e.service(2*time.Hour, e.pool)
 		probe := &leaseProbe{}
 		svc.leaseClaimProbe = probe.hook
-		w, _, iid := e.seedLeasedWorker(t, 0)
+		w, _, iid := e.seedLeasedWorker(t)
 		follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 		cordon := e.sideTx(t, `UPDATE workers SET draining_since = COALESCE(draining_since, now()),
@@ -859,7 +855,7 @@ func TestClaimVsCordonLiveDB(t *testing.T) {
 		e := newLeaseEnv(t)
 		gate := newGate(t, e.pool)
 		svc := e.service(2*time.Hour, gate)
-		w, _, iid := e.seedLeasedWorker(t, 0)
+		w, _, iid := e.seedLeasedWorker(t)
 		follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 		gate.arm()
@@ -897,7 +893,7 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	gate := newGate(t, e.pool)
 	svc := e.service(2*time.Hour, gate)
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	del := func() int64 {
 		n, err := e.q.DeleteEphemeralWorkerForRun(e.ctx, store.DeleteEphemeralWorkerForRunParams{
@@ -946,9 +942,9 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 const workerLockWindow = 250 * time.Millisecond
 
 // runLockWindow is how long after arming the lease expires when the claim is blocked on a RUN lock.
-// The claim reads its pinned/early clock after taking the worker lock, so the window must cover the
-// span from arming to the claim reaching LockWorkerRecoveryParents; that is asserted (the blocked
-// statement's query_start must be before the expiry) rather than assumed.
+// An early admission clock (the bug this case catches) would be read right after the worker lock, so
+// the window must cover the span from arming to the claim reaching LockWorkerRecoveryParents; that
+// is asserted (the blocked statement's query_start must be before the expiry) rather than assumed.
 const runLockWindow = time.Second
 
 // leaseClockCase seeds a worker with a FRESH lease (never pre-expired: a lease that already expired
@@ -956,7 +952,7 @@ const runLockWindow = time.Second
 // same-branch follow-up. The test then arms the expiry with armLeaseExpiry.
 func (e leaseEnv) leaseClockCase(t *testing.T) (w, served uuid.UUID, follow uuid.UUID) {
 	t.Helper()
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	return w, served, e.seedFollowUp(t, iid, agentIssueBranch(iid))
 }
 
