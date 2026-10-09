@@ -104,7 +104,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   const replay = () => resolvePendingTerminal(run.protectRecoveryTerminalDeps({
     outbox: outbox!, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger(),
   }), { runId: receipt.run_id, claimGeneration: receipt.generation, send });
-  return { root, events, sent, receipt, recovery, record, run, flight, terminal, replay, outbox, client,
+  return { root, events, sent, receipt, recovery, record, run, flight, body, terminal, replay, outbox, client,
     registerAs: async (id: string) => {
       workerId = id; receipt.worker_id = id;
       await client.register("identity-change");
@@ -358,16 +358,20 @@ it("P1-d: lost ACK original replays at capacity, persists and retires exact body
   } finally { await f.close(); }
 });
 
-it("P1-d: separate new attempt at capacity prepares before terminal send", async () => {
+it("MR2598 regression 3: separate new attempt at capacity prepares and omits completion disposition", async () => {
   const f = await fixture();
   try {
     await pressure(f);
     f.select(literal.run_id, 4098);
+    const originalBody = structuredClone(f.body);
     await f.terminal();
+    assert.deepEqual(f.body, originalBody, "refused admission leaves the caller body immutable");
     assert.ok(f.events.indexOf("prepare") >= 0);
     assert.ok(f.events.indexOf("prepare") < f.events.indexOf("state:completed"),
       "refused new completion-first attempt prepares before sending");
-    assert.equal(f.sent[0]?.completion_final_head, literal.final_head);
+    assert.ok(f.sent[0]);
+    assert.equal("completion_final_head" in f.sent[0], false,
+      "new attempt refused admission sends ordinary completion without disposition");
     assert.equal(f.sent.some(body => body.status === "failed"), false);
   } finally { await f.close(); }
 });
@@ -387,7 +391,8 @@ for (const status of ["completed", "failed"] as const) {
         const journal = await f.outbox!.readTerminalJournal(f.receipt.run_id, f.flight.claimGeneration);
         assert.ok(journal, "original not journaled before " + stage);
         assert.equal(journal.body.status, status);
-        if (status === "completed") assert.equal(journal.body.completion_final_head, literal.final_head);
+        if (status === "completed") assert.equal("completion_final_head" in journal.body, false,
+          "refused new attempt journals ordinary completion before preparation");
       };
       const provider = f.run as unknown as {
         reapRecoveryProviderForSettle: (...args: unknown[]) => Promise<boolean>;

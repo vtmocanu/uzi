@@ -463,6 +463,62 @@ async function saturateClaims() {
   claim.claim_generation = 1;
 }
 
+it("MR2598 regression 1: accepted claim-only completion replays at capacity and preserves conflict refusal", async () => {
+  await client.register("worker");
+  await client.claimRun();
+  const original = Object.freeze(structuredClone(fixture.request)) as StateRequest;
+  assert.deepEqual((await client.reportState(RUN, original)).completedPublicationReceipt, receipt);
+  assert.equal(fetchedPaths.some(path => path.endsWith("/recovery-holds")), false,
+    "original completion is accepted without hold inventory");
+  await saturateClaims();
+  assert.deepEqual((await client.reportState(RUN, original)).completedPublicationReceipt, receipt,
+    "exact accepted original remains recognizable without a fetched hold at capacity");
+  assert.equal(client.canStartPublicationCompletion(RUN, 1), true,
+    "accepted original retains admission under pressure");
+  assert.deepEqual(sent, [original, original], "replay preserves the original wire body");
+  holds = [{ ...holds[0], hold_id: receipt.owner_id }];
+  await client.listRecoveryHolds(RUN);
+  assert.equal((await client.reportState(RUN, original)).completedPublicationReceipt, undefined,
+    "known conflicting hold still refuses the accepted original");
+});
+
+it("MR2598 regression 2: retiring A does not discard an unrelated delayed guarded claim B", async t => {
+  await client.register("worker");
+  await client.claimRun();
+  const ack = await client.reportState(RUN, fixture.request);
+  assert.ok(ack.completedPublicationReceipt);
+  const runB = "00000000-0000-4000-8000-000000002598";
+  const claimB = { ...claim, run_id: runB, claim_generation: 2 };
+  let finish!: (value: Response) => void;
+  const delayed = new Promise<Response>(resolve => { finish = resolve; });
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const originalFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (new URL(String(input)).pathname.endsWith("/claim")) {
+      entered();
+      return delayed;
+    }
+    return originalFetch(input, init);
+  });
+  const pendingClaim = client.claimRun();
+  try {
+    await started;
+    client.releasePublicationCompletion(ack.completedPublicationReceipt);
+    finish(Response.json(claimB));
+    const returned = await pendingClaim;
+    assert.equal(returned?.run_id, runB);
+    assert.equal(returned?.claim_generation, 2);
+    assert.equal(client.canStartPublicationCompletion(runB, 2), true,
+      "unrelated retirement must not saturate B admission");
+    const bindings = Reflect.get(client, "completionClaims") as Map<string, unknown>;
+    assert.ok(bindings.get(runB + ":2"), "delayed eligible B provenance remains cached");
+  } finally {
+    finish(Response.json(claimB));
+    await pendingClaim;
+  }
+});
+
 it("P1-b/c: unresolved bound receipt survives capacity and same-worker registration without forgetting conflict", async () => {
   await client.register("worker");
   await client.claimRun();

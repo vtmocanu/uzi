@@ -33,7 +33,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
       const capacity = variant === "capacity" || variant === "capacity-codex";
       const excluded = variant === "excluded" || capacity;
       const lostAck = variant === "lost-ack";
-      it(`${kind}/${variant}/${host}: full execute ${lostAck ? "preserves lost-ACK completion through closed fallback, exact replay and platform cleanup policy" : excluded ? "falls back when advertised API omits receipt" : "accepts authenticated completion receipt without archive or heartbeat"}`, { concurrency: false }, async t => {
+      it(`${capacity ? "MR2598 regression 3: " : ""}${kind}/${variant}/${host}: full execute ${lostAck ? "preserves lost-ACK completion through closed fallback, exact replay and platform cleanup policy" : excluded ? "falls back when advertised API omits receipt" : "accepts authenticated completion receipt without archive or heartbeat"}`, { concurrency: false }, async t => {
         const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
         try {
           const linux = host === "native" && process.platform === "linux";
@@ -175,7 +175,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             }
             assert.equal(response.status, 200);
             assert.equal(insideFinalize, false, "deferred Codex completion sends after finalize boundary release");
-            assert.equal(body.completion_final_head, finalHead, "terminal carries the delivered post-checkpoint SHA");
+            if (!capacity) assert.equal(body.completion_final_head, finalHead, "terminal carries the delivered post-checkpoint SHA");
             assert.notEqual(finalHead, checkpointHead);
             assert.equal(command(fx.originPath, ["rev-parse", `refs/heads/${branch}`]), finalHead, "receipt follows actual push");
             assert.equal(r.isExecuting(claim.run_id), true, "own execution tail is still present at ACK");
@@ -224,10 +224,8 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           await r.execute(claim);
           if (capacity) {
             assert.ok(firstPreparationJournal, "full execute original not journaled before first preparation");
-            assert.equal(firstPreparationJournal.body.completion_final_head, finalHead);
             assert.ok(firstCaptureJournal, "full execute original not journaled before first capture");
             assert.equal(firstCaptureJournal.body.status, "completed");
-            assert.equal(firstCaptureJournal.body.completion_final_head, finalHead);
           }
           assert.equal(acknowledgements, lostAck ? 3 : 1, "all initial completed retries lose their responses");
           assert.equal(api.states.filter(s => s.body.status === "failed").length, 0);
@@ -337,6 +335,21 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
               const retained = await recovery.inspect(claim.run_id);
               assert.ok(retained.length > 0, "non-Linux retains excluded generation recovery records");
               assert.ok(retained.every(record => record.generation === claim.claim_generation && !record.completionReceipt));
+            }
+            if (capacity) {
+              const completed = api.states.find(s => s.body.status === "completed");
+              assert.ok(completed);
+              assert.equal("completion_final_head" in completed.body, false,
+                "refused new attempt sends ordinary completion without disposition");
+              assert.equal("completion_final_head" in firstPreparationJournal!.body, false,
+                "refused new attempt journals ordinary completion before preparation");
+              assert.equal("completion_final_head" in firstCaptureJournal!.body, false,
+                "capture retains the same ordinary terminal body");
+              if (linux) {
+                assert.equal(outbox.hasPendingTerminal(claim.run_id, claim.claim_generation!), false,
+                  "real ordinary archive FINAL allows pending terminal retirement");
+                assert.equal(await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!), undefined);
+              }
             }
             assert.equal(api.states.filter(s => s.body.status === "failed").length, 0);
           } else {
