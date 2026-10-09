@@ -88,24 +88,19 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleas
 		return nil
 	}
 	wantRC := p.owner == "uzi-cli-rc" || (p.owner == "" && rctag.IsPublishedTag(version))
-	normalize := func(fact *apitypes.LatestReleaseDTO, rc bool) *apitypes.LatestReleaseDTO {
+	channelFact := func(fact *apitypes.LatestReleaseDTO, rc bool) *apitypes.LatestReleaseDTO {
 		if fact == nil {
 			return nil
 		}
 		if (!rc && !isStableTag(fact.Version)) || (rc && !rctag.IsPublishedTag(fact.Version)) {
 			return nil
 		}
-		v, ok := validatedVersion(fact.Version)
-		if !ok {
-			return nil
-		}
-		copy := *fact
-		copy.Version = v
-		return &copy
+		// Keep the release tag unchanged: persisted dismissals use its exact value.
+		return fact
 	}
-	chosen := normalize(latest, false)
+	chosen := channelFact(latest, false)
 	if wantRC {
-		rc := normalize(latestRC, true)
+		rc := channelFact(latestRC, true)
 		if rc != nil {
 			if chosen == nil {
 				chosen = rc
@@ -527,8 +522,8 @@ func runPendingUpgrade(env Env, argv []string, offered string) error {
 	if formula == "" {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update: invalid brew upgrade target")
 	}
-	target, ok := validatedVersion(offered)
-	if !ok {
+	target := "v" + strings.TrimPrefix(offered, "v")
+	if _, ok := uzicli.CompareServerVersion(target, target); !ok {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update: invalid offered version")
 	}
 	if env.Brew == nil {
@@ -557,7 +552,7 @@ func runPendingUpgrade(env Env, argv []string, offered string) error {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: invalid version comparison")
 	}
 	if cmp < 0 {
-		line := fmt.Sprintf("Installed CLI is %s; requested %s was not reached. Try again later.", installed, target)
+		line := fmt.Sprintf("Installed CLI is %s; requested %s was not reached. Try again later.", installed, cellText(target))
 		_, _ = fmt.Fprintln(env.Stderr, line)
 		return uzicli.Exitf(uzicli.ExitGeneric, "%s", line)
 	}

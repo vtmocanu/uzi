@@ -166,6 +166,9 @@ func TestInstalledProbeRejectsPathsAndOutput(t *testing.T) {
 			if err == nil || got != "" {
 				t.Fatalf("accepted %s: %q %v", name, got, err)
 			}
+			if name == "escaping symlink" && !strings.Contains(err.Error(), "escapes formula prefix") {
+				t.Fatalf("escaping symlink rejected for wrong reason: %v", err)
+			}
 			if strings.Contains(name, "prefix") || strings.Contains(name, "executable") || name == "escaping symlink" || name == "missing brew" {
 				if calls != 1 {
 					t.Fatalf("unsafe path reached child: calls=%d", calls)

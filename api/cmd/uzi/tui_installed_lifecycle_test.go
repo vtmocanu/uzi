@@ -330,3 +330,37 @@ func TestM2ReleaseTagsRemainStrict(t *testing.T) {
 		})
 	}
 }
+
+func TestM2OfferedFactsPreserveDismissal(t *testing.T) {
+	withVersion(t, "v0.83.0")
+	for _, tag := range []string{"0.85.0", "v0.85.0+" + strings.Repeat("a", 210)} {
+		t.Run(tag, func(t *testing.T) {
+			m := updatePromptModel(t)
+			m.updatePrompt.owner = "uzi-cli"
+			m.store, m.serverURL = uzicli.NewStore(t.TempDir()), "https://server.example"
+			if err := m.store.RecordDismissedUpdate(m.serverURL, tag); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			m.installedVersion = func(string) (string, error) { calls++; return "v0.84.0", nil }
+			next, _ := settledUpdate(m, releasePoll(tag))
+			m = next.(tuiModel)
+			if calls != 1 || m.updatePrompt.showing || m.updatePrompt.latestVersion != tag {
+				t.Fatalf("valid offered tag changed dismissal semantics: probes=%d modal=%v tag=%q", calls, m.updatePrompt.showing, m.updatePrompt.latestVersion)
+			}
+		})
+	}
+}
+
+func TestM2LongOfferedUpgrade(t *testing.T) {
+	var out strings.Builder
+	calls := 0
+	env := Env{Stdout: &out, Stderr: &out,
+		Brew:             func(bool, ...string) (string, error) { calls++; return "", nil },
+		InstalledVersion: func(string) (string, error) { return "v0.85.0", nil },
+	}
+	err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0+"+strings.Repeat("a", 210))
+	if err != nil || calls != 1 || !strings.Contains(out.String(), "Update complete") {
+		t.Fatalf("valid offered semver was rejected: calls=%d err=%v", calls, err)
+	}
+}
