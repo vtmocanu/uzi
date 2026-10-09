@@ -4152,8 +4152,11 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
-    const admitted = this.selectPublicationCompletion(flight, body);
     const deps = this.terminalDeps();
+    const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
+    const previouslyAttempted = flight.completionSendAttempted ||
+      this.attemptedPublicationTerminals.has(this.completionKey(flight.runId, flight.claimGeneration));
+    const admitted = preexistingPending || previouslyAttempted || this.selectPublicationCompletion(flight, body);
     if (!deps) {
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
       // stale ack still THROWS StaleClaimError out of `send` and propagates to executeClaim's catch
@@ -4202,7 +4205,6 @@ export class RunRunner {
         throw err;
       }
     };
-    if (!admitted && !deps.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration)) await flight.prepareTerminalInventory();
     const fence = flight.batcher.currentSeq();
     const installed = await installTerminalWriteAhead(deps, {
       runId: flight.runId,
@@ -4222,7 +4224,7 @@ export class RunRunner {
       ? (await deps.outbox.readTerminalJournal(flight.runId, flight.claimGeneration))?.body
       : ("canonical" in installed ? installed.canonical : undefined);
     const deferred = !!selected && this.eligiblePublicationCompletion(flight, selected) &&
-      (installed.journaled || admitted);
+      (preexistingPending || previouslyAttempted || admitted);
     if (deferred) await this.bindCompletionSource(flight);
     if (!deferred && (installed.journaled || !("deferred" in installed))) await flight.prepareTerminalInventory();
     if (installed.journaled && !deferred) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
@@ -5443,10 +5445,11 @@ export class RunRunner {
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
           body.status === "completed" && typeof finalHead === "string" && /^[0-9a-f]{40}$/.test(finalHead))
         body = { ...body, completion_final_head: finalHead };
-      const admitted = this.selectPublicationCompletion(flight, body);
+      this.selectPublicationCompletion(flight, body);
+      const eligible = this.eligiblePublicationCompletion(flight, body);
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
-          if (!admitted) await flight.prepareTerminalInventory();
+          if (!eligible) await flight.prepareTerminalInventory();
           await batcher.close();
           // Journal write-ahead here too (D3): the deferred Codex sink sends through
           // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
@@ -5461,7 +5464,7 @@ export class RunRunner {
         });
         return;
       }
-      if (!admitted) await flight.prepareTerminalInventory();
+      if (!eligible) await flight.prepareTerminalInventory();
       await closeBatcher();
       await journalTerminalReport(body);
       runLog.info(logMessage, fields);

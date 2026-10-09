@@ -28,9 +28,10 @@ function commit(dir: string, name: string): string {
 }
 
 for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
-  for (const variant of kind === "self_improve" ? ["receipt", "excluded", "lost-ack"] : kind === "issue" ? ["receipt", "codex", "lost-ack"] : ["receipt", "lost-ack"]) {
+  for (const variant of kind === "self_improve" ? ["receipt", "excluded", "lost-ack"] : kind === "issue" ? ["receipt", "codex", "lost-ack", "capacity", "capacity-codex"] : ["receipt", "lost-ack"]) {
     for (const host of process.platform === "linux" && (variant === "lost-ack" || variant === "excluded") ? ["native", "darwin"] : ["native"]) {
-      const excluded = variant === "excluded";
+      const capacity = variant === "capacity" || variant === "capacity-codex";
+      const excluded = variant === "excluded" || capacity;
       const lostAck = variant === "lost-ack";
       it(`${kind}/${variant}/${host}: full execute ${lostAck ? "preserves lost-ACK completion through closed fallback, exact replay and platform cleanup policy" : excluded ? "falls back when advertised API omits receipt" : "accepts authenticated completion receipt without archive or heartbeat"}`, { concurrency: false }, async t => {
         const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -46,11 +47,17 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature]);
           const registration = await client.register("completion-full-execute", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
           assert.ok(registration.worker_id);
+          if (capacity) {
+            for (let slot = 0; slot < 4096; slot++)
+              client.canStartPublicationCompletion("00000000-0000-4000-8000-" + String(slot).padStart(12, "0"), 1);
+            assert.equal(client.canStartPublicationCompletion(claim.run_id, claim.claim_generation!), false);
+          }
           let serverAuthoritativeHoldReleased = false, replaying = false;
           let storedAck: typeof wire.ack | undefined;
           let originalTerminal: Awaited<ReturnType<Outbox["readTerminalJournal"]>>;
           let open = true, manifest: { checksum: string; byte_size: number } | undefined;
           let reserves = 0, uploads = 0, finals = 0;
+          let firstCaptureJournal: Awaited<ReturnType<Outbox["readTerminalJournal"]>>;
           const captureId = "00000000-0000-4000-8000-000000002507";
           // The same exact-generation guarded-server archive seam as runner-inventory-terminal-settle.
           client.getRunOwnership = async () => ({
@@ -63,6 +70,9 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           }] : [] });
           client.reserveRecoveryCapture = async () => {
             reserves++;
+            if (capacity && reserves === 1) {
+              firstCaptureJournal = await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!);
+            }
             if (serverAuthoritativeHoldReleased) throw new Error("capture reservation refused: hold closed");
             return { capture_id: captureId, state: "preparing" };
           };
@@ -94,7 +104,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
           };
           // Reuse the real registry/process-spawner fixture rather than copying the sink rig.
-          const codex = variant === "codex" ? codexReapFixture([], () => false) : undefined;
+          const codex = (variant === "codex" || variant === "capacity-codex") ? codexReapFixture([], () => false) : undefined;
           if (codex) t.after(() => fs.rmSync(codex.root, { recursive: true, force: true }));
           let insideFinalize = false;
           if (codex) {
@@ -131,7 +141,16 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             outbox, checkpointIntervalMs: 1, checkpointTickIntervalMs: 0,
           });
           const recovery = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
-          const freeze = t.mock.method(recovery, "freezeInventory");
+          let firstPreparationJournal: Awaited<ReturnType<Outbox["readTerminalJournal"]>>;
+          let preparationObserved = false;
+          const freezeInventory = recovery.freezeInventory.bind(recovery);
+          const freeze = t.mock.method(recovery, "freezeInventory", async (...args: Parameters<typeof freezeInventory>) => {
+            if (capacity && finalHead && !preparationObserved) {
+              preparationObserved = true;
+              firstPreparationJournal = await outbox.readTerminalJournal(claim.run_id, claim.claim_generation!);
+            }
+            return freezeInventory(...args);
+          });
           const capture = t.mock.method(recovery, "captureAndUpload");
           const transfer = t.mock.method(r as unknown as {
             transferRestorePointToTrustedBare: (...args: unknown[]) => Promise<unknown>;
@@ -161,7 +180,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             assert.equal(command(fx.originPath, ["rev-parse", `refs/heads/${branch}`]), finalHead, "receipt follows actual push");
             assert.equal(r.isExecuting(claim.run_id), true, "own execution tail is still present at ACK");
             assert.equal(fs.existsSync(clone), true, "release cannot delete the active clone");
-            assert.equal(command(clone, ["rev-parse", "HEAD"]), finalHead);
+            if (!capacity) assert.equal(command(clone, ["rev-parse", "HEAD"]), finalHead);
             assert.equal(fs.existsSync(path.join(clone, "deliberate-leftover.txt")), true, "dirty leftovers survive until ACK");
             if (!excluded) {
               assert.equal(freeze.mock.callCount(), 0, "no preterminal inventory freeze");
@@ -203,6 +222,13 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             return ack;
           });
           await r.execute(claim);
+          if (capacity) {
+            assert.ok(firstPreparationJournal, "full execute original not journaled before first preparation");
+            assert.equal(firstPreparationJournal.body.completion_final_head, finalHead);
+            assert.ok(firstCaptureJournal, "full execute original not journaled before first capture");
+            assert.equal(firstCaptureJournal.body.status, "completed");
+            assert.equal(firstCaptureJournal.body.completion_final_head, finalHead);
+          }
           assert.equal(acknowledgements, lostAck ? 3 : 1, "all initial completed retries lose their responses");
           assert.equal(api.states.filter(s => s.body.status === "failed").length, 0);
           assert.equal(api.states.filter(s => s.body.status === "completed").length, lostAck ? 3 : 1);

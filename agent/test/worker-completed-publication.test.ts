@@ -372,6 +372,51 @@ it("P1-d: separate new attempt at capacity prepares before terminal send", async
   } finally { await f.close(); }
 });
 
+for (const status of ["completed", "failed"] as const) {
+  it(status + " ordering: original durable at first preparation and first provider reap", async t => {
+    const f = await fixture();
+    try {
+      if (status === "completed") {
+        for (let slot = 0; slot < 4096; slot++)
+          f.client.canStartPublicationCompletion("00000000-0000-4000-8000-" + String(slot).padStart(12, "0"), 1);
+        f.select(literal.run_id, 4098);
+        assert.equal(f.client.canStartPublicationCompletion(f.receipt.run_id, 4098), false);
+      }
+      let preparations = 0, reaps = 0;
+      const assertOriginal = async (stage: string) => {
+        const journal = await f.outbox!.readTerminalJournal(f.receipt.run_id, f.flight.claimGeneration);
+        assert.ok(journal, "original not journaled before " + stage);
+        assert.equal(journal.body.status, status);
+        if (status === "completed") assert.equal(journal.body.completion_final_head, literal.final_head);
+      };
+      const provider = f.run as unknown as {
+        reapRecoveryProviderForSettle: (...args: unknown[]) => Promise<boolean>;
+      };
+      t.mock.method(provider, "reapRecoveryProviderForSettle", async () => {
+        if (reaps++ === 0) await assertOriginal("first provider reap");
+        return true;
+      });
+      t.mock.method(f.flight, "prepareTerminalInventory", async () => {
+        if (preparations++ === 0) await assertOriginal("first preparation");
+        await provider.reapRecoveryProviderForSettle(makeClaim(), f.flight, nullLogger(), "terminal");
+        f.events.push("prepare");
+      });
+      await (f.run as unknown as {
+        journalAndSendTerminal(f: unknown, phase: string, b: StateRequest, send: (b: StateRequest) => Promise<StateAck>, hook?: () => Promise<void>): Promise<void>;
+      }).journalAndSendTerminal(f.flight, "running",
+        status === "completed" ? { ...wire.request, claim_generation: 4098 } : { status: "failed", failure_reason: "ordinary failure" },
+        async b => { f.events.push("send"); return f.client.reportState(f.receipt.run_id, b); },
+        async () => {
+          f.flight.cancel.abort();
+          await provider.reapRecoveryProviderForSettle(makeClaim(), f.flight, nullLogger(), "terminal");
+        });
+      assert.ok(preparations > 0);
+      assert.ok(reaps > 0);
+      assert.ok(f.events.indexOf("prepare") < f.events.indexOf("send"));
+    } finally { await f.close(); }
+  });
+}
+
 it("P1-b: delayed pre-retirement inventory cannot recreate a released generation", async t => {
   const f = await fixture();
   try {
@@ -431,7 +476,7 @@ for (const returnToA of [false, true]) {
       const pending = new Promise<void>(resolve => { finish = resolve; });
       let entered!: () => void;
       const started = new Promise<void>(resolve => { entered = resolve; });
-      t.mock.method(f.recovery, "persistCompletionReceipt", async receipt => {
+      t.mock.method(f.recovery, "persistCompletionReceipt", async (receipt: Parameters<RecoveryCoordinator["persistCompletionReceipt"]>[0]) => {
         entered(); await pending; return persist(receipt);
       });
       const terminal = f.terminal();
