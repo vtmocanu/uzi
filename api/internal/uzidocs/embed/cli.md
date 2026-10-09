@@ -2393,7 +2393,11 @@ keeps the single global `NOW` row unchanged.
 estimate, e.g. `≈70% · milestone 3 of 3`, or a flag when a number would
 mislead: `stalled · since HH:MM` (UTC), `waits on you · plan gate|question|follow-up`,
 `parked · limit wait|pool wait|recovery wait|paused`, `queued` or `planning`
-(see [Progress estimate](./run-activity.md#progress-estimate)). The row is
+(see [Progress estimate](./run-activity.md#progress-estimate)). A run waiting
+on a question can add ` · may be blocked by <id>` when the open question
+mentions an issue another live run of the same owner and repo is working (a
+hint, not a recorded dependency; see
+[May be blocked by](./run-activity.md#may-be-blocked-by)). The row is
 omitted when the run has no estimate and once the run is terminal. `--json` carries `progress` as an object (`null` for a terminal
 run), so `--field progress` is a usage error (exit 2) while the run is live
 and prints an empty line once it is terminal, as for `milestones`.

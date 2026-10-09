@@ -492,8 +492,43 @@ Where it appears:
   short flag. Every flag is text, so `NO_COLOR` keeps all of them. The board
   shows no "since" time.
 - **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
-  of 3`, `stalled · since 14:05` or `waits on you · plan gate`. The row is
-  omitted when there is no estimate and once the run is terminal. See [the CLI docs](./cli.md#commands).
+  of 3`, `stalled · since 14:05` or `waits on you · plan gate`; a run
+  waiting on a question may add ` · may be blocked by <id>` (see [May be
+  blocked by](#may-be-blocked-by)). The row is omitted when there is no estimate and once the run is terminal. See [the CLI docs](./cli.md#commands).
+
+### Run page and TUI detail
+
+The run page and the TUI run detail show the same estimate in more depth.
+
+- **Run page**: a progress card under the budget facts. It shows the percent
+  large (`≈70%`), then `milestone 3 of 3 · <active milestone title>`, and a
+  segmented plan track: one segment for planning plus one per milestone, each
+  marked done, in progress or pending. Beside it is the **current phase** of
+  the active role, `implement`, `review` or `validate`, mapped from the role:
+  `reviewer`, `auditor`, `fact-checker`, `architect`, `web-ux`, `tui-ux` and
+  `dba` are `review`, `tester` is `validate`, and any other role is
+  `implement`. It is the phase right now, not a history. The active role line
+  sits under it. The flags from the table above show here too, as on the
+  board: `stalled since HH:MM`, `waits on you · plan gate|question|follow-up
+  since HH:MM`, `parked` (with the resume time when it is known), `queued`, and
+  `planning · no milestones frozen yet`.
+- **TUI run detail**: a `PROGRESS` block above `MILESTONES` in the rail, with
+  the same information wrapped to the rail width.
+
+### May be blocked by
+
+While a run is waiting on a question (`awaiting_input`), the run page, the TUI
+detail and `uzi run get` can add `may be blocked by <short run id>`, linking to
+that run on the run page. It appears when the open, not-yet-answered question
+mentions `#N` and another live run of the **same run owner** on the **same
+repo** is working issue N: an issue run for N, or an MR rework or CI fix run
+on branch `agent/issue-N`.
+
+It is a hint, not a recorded dependency: a mention in the question text is all
+it goes on. It never matches another user's run, another repo or the run
+itself, and at most 5 `#N` references in the question are read. Once the
+question is answered the hint disappears. It is shown on the detail views
+only, not on the board or runs list.
 
 ## Stopping or narrowing a run
 
