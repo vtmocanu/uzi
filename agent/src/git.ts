@@ -5009,9 +5009,9 @@ export class GitCache {
     const out: Array<[string, string]> = [];
     for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
       const nl = item.indexOf("\n");
-      if (nl < 0) continue;
-      const m = /^uzi-attempts\.(.+)\.entry$/.exec(item.slice(0, nl));
-      if (m) out.push([m[1]!, item.slice(nl + 1)]);
+      const m = /^uzi-attempts\.(.+)\.entry$/.exec(nl < 0 ? item : item.slice(0, nl));
+      // Valueless ledger keys remain malformed evidence for strict readers.
+      if (m) out.push([m[1]!, nl < 0 ? "" : item.slice(nl + 1)]);
     }
     return out;
   }

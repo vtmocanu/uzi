@@ -284,6 +284,39 @@ test("absent legacy adopting successor repairs exact attribution before rediscov
   assert.equal((await recreate().reserveRecoveryIteration(bare, branch, key, source)).attempts, 2);
 });
 
+for (const ledgerBranch of [branch, "agent/other-branch"]) {
+  test(`legacy adopting successor refuses repair for valueless ledger on ${ledgerBranch}`, async () => {
+    const { successor, tip, before } = await legacyAdopting();
+    fs.appendFileSync(path.join(bare, "config"), `\n[uzi-attempts "${ledgerBranch}"]\n\tentry\n`);
+    const ledgerKey = `uzi-attempts.${ledgerBranch}.entry`;
+    const entries = git(bare, ["config", "--null", "--list"]).split("\0");
+    assert.ok(entries.includes(ledgerKey), "fixture must contain a valueless key without a value separator");
+    assert.ok(!entries.some(e => e.startsWith(ledgerKey + "\n")), "fixture must not be an empty valued string");
+    const configBefore = fs.readFileSync(path.join(bare, "config"));
+    await assert.rejects(recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId),
+      /unreadable or conflicting recovery successor ledger/);
+    assert.deepEqual(fs.readFileSync(path.join(bare, "config")), configBefore);
+    assert.deepEqual(journal(), before);
+    assert.equal(await recreate().classifyOwnerClonePath(bare, branch, key, runId, successor.clonePath), undefined);
+    assert.equal(fs.existsSync(successor.clonePath), false);
+    assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "retained work\n");
+    assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+  });
+}
+
+test("legacy adopting successor repairs with an unrelated valueless nonledger key", async () => {
+  const { successor, before } = await legacyAdopting();
+  fs.appendFileSync(path.join(bare, "config"), '\n[fixture]\n\tvalueless\n');
+  assert.ok(git(bare, ["config", "--null", "--list"]).split("\0").includes("fixture.valueless"));
+  assert.deepEqual(JSON.parse(JSON.stringify((await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))!.journal)), before);
+  assert.equal(await recreate().classifyOwnerClonePath(bare, branch, key, runId, successor.clonePath), "attempt");
+  assert.deepEqual(JSON.parse(git(bare, ["config", "--get-all", `uzi-attempts.${branch}.entry`])), {
+    attemptId: aid(2), runId, clonePath: successor.clonePath, state: "live",
+  });
+  assert.ok(git(bare, ["config", "--null", "--list"]).split("\0").includes("fixture.valueless"));
+  assert.equal(fs.existsSync(successor.clonePath), false);
+});
+
 for (const invalid of ["existing path", "conflict", "unreadable ledger", "unsafe ancestor", "missing ancestor", "foreign owner", "unsafe sibling"] as const) {
   test(`legacy adopting successor refuses repair for ${invalid}`, async () => {
     const { successor, before } = await legacyAdopting();
