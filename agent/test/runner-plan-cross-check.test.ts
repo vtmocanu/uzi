@@ -2200,10 +2200,9 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
     let implemented = false;
     const exec: Executor = { run: async (ctx) => {
       const verdict = await ctx.gatePlan!(PLAN);
-      // The switch reaches this stub on one of two transports: the inputs poll aborting the checker
-      // call, or the canonical running report's state ack (which trips the switch and aborts ctx.signal
-      // before gatePlan resolves). An executor that does not wire attemptCredentialSwitch re-throws the
-      // abort reason, as a real one does; which transport wins is a timing race the test must not depend on.
+      // Both transports are armed (the inputs poll and the canonical running report's state ack), so
+      // the test does not depend on which wins; gatePlan normally rejects with CredentialSwitchSignal.
+      // This check is defensive only.
       ctx.signal?.throwIfAborted();
       if (verdict.kind === "approve") implemented = true;
       return { branch: ctx.branch };
