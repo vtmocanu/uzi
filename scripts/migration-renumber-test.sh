@@ -348,6 +348,62 @@ DOTTED_RC=$?
 assert_eq "A: path-free dotted basename accepted" "0" "$DOTTED_RC"
 if cmp -s "$CASE_A/dotted-expected.sql" "$CASE_A/dotted.sql"; then pass "A: dotted filename/stem identities rewritten"; else fail "A: dotted filename/stem identities rewritten: $DOTTED_OUT"; fi
 
+# A-dot-tail: longer dotted identities must stay unchanged and be reported, even
+# when the character after the dot is a hyphen or underscore.
+printf '00231\t00233\t00231_pair.sql\n' > "$CASE_A/dot-tail-map.txt"
+wf "$CASE_A/dot-tail.sql" <<'SQL'
+-- See 00231_pair.-other.sql
+-- See 00231_pair._other.sql
+-- See 00231_pair.sql.-other.sql
+-- See 00231_pair.sql._other.sql
+SELECT '00231_pair.-other.sql';
+SQL
+cp "$CASE_A/dot-tail.sql" "$CASE_A/dot-tail-expected.sql"
+DOT_TAIL_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/dot-tail-map.txt" "$CASE_A/dot-tail.sql" 2>&1)"
+DOT_TAIL_RC=$?
+assert_eq "A-dot-tail: rewrite succeeds" "0" "$DOT_TAIL_RC"
+if cmp -s "$CASE_A/dot-tail-expected.sql" "$CASE_A/dot-tail.sql"; then pass "A-dot-tail: longer dotted identities whole-file comparison"; else fail "A-dot-tail: longer dotted identities whole-file comparison"; fi
+DOT_TAIL_EXPECTED="$(printf '%s:1\t%s\n%s:2\t%s\n%s:3\t%s\n%s:4\t%s\n' "$CASE_A/dot-tail.sql" '-- See 00231_pair.-other.sql' "$CASE_A/dot-tail.sql" '-- See 00231_pair._other.sql' "$CASE_A/dot-tail.sql" '-- See 00231_pair.sql.-other.sql' "$CASE_A/dot-tail.sql" '-- See 00231_pair.sql._other.sql')"
+assert_eq "A-dot-tail: unresolved path/line/content diagnostics" "$DOT_TAIL_EXPECTED" "$DOT_TAIL_OUT"
+
+# A-atomic-dotted: consume the whole matched identity so a mapped number inside
+# its slug is preserved, for both full basename and extensionless stem.
+printf '00231\t00233\t00231_x.00232_y.sql\n00232\t00234\t00232_y.sql\n' > "$CASE_A/atomic-dotted-map.txt"
+wf "$CASE_A/atomic-dotted.sql" <<'SQL'
+-- See 00231_x.00232_y.sql
+-- See 00231_x.00232_y.
+-- Path: api/internal/store/migrations/00231_x.00232_y.sql, (00232_y).
+SELECT '00231_x.00232_y.sql';
+SQL
+wf "$CASE_A/atomic-dotted-expected.sql" <<'SQL'
+-- See 00233_x.00232_y.sql
+-- See 00233_x.00232_y.
+-- Path: api/internal/store/migrations/00233_x.00232_y.sql, (00234_y).
+SELECT '00231_x.00232_y.sql';
+SQL
+ATOMIC_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/atomic-dotted-map.txt" "$CASE_A/atomic-dotted.sql" 2>&1)"
+ATOMIC_RC=$?
+assert_eq "A-atomic-dotted: rewrite succeeds" "0" "$ATOMIC_RC"
+if cmp -s "$CASE_A/atomic-dotted-expected.sql" "$CASE_A/atomic-dotted.sql"; then pass "A-atomic-dotted: filename/stem whole-file comparison"; else fail "A-atomic-dotted: filename/stem whole-file comparison"; fi
+assert_eq "A-atomic-dotted: no internal-number diagnostic" "" "$ATOMIC_OUT"
+
+# A-dot-left-boundary: the suffix of an unknown dotted filename or stem is not
+# a standalone mapped identity.
+wf "$CASE_A/dot-left.sql" <<'SQL'
+-- See unknown.00232_y.sql
+-- See unknown.00232_y.
+-- See 00231_unknown.00232_y.sql
+-- See 00231_unknown.00232_y.
+SELECT 'unknown.00232_y.sql';
+SQL
+cp "$CASE_A/dot-left.sql" "$CASE_A/dot-left-expected.sql"
+DOT_LEFT_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/atomic-dotted-map.txt" "$CASE_A/dot-left.sql" 2>&1)"
+DOT_LEFT_RC=$?
+assert_eq "A-dot-left-boundary: rewrite succeeds" "0" "$DOT_LEFT_RC"
+if cmp -s "$CASE_A/dot-left-expected.sql" "$CASE_A/dot-left.sql"; then pass "A-dot-left-boundary: unknown filename/stem whole-file comparison"; else fail "A-dot-left-boundary: unknown filename/stem whole-file comparison"; fi
+DOT_LEFT_EXPECTED="$(printf '%s:1\t%s\n%s:2\t%s\n%s:3\t%s\n%s:4\t%s\n' "$CASE_A/dot-left.sql" '-- See unknown.00232_y.sql' "$CASE_A/dot-left.sql" '-- See unknown.00232_y.' "$CASE_A/dot-left.sql" '-- See 00231_unknown.00232_y.sql' "$CASE_A/dot-left.sql" '-- See 00231_unknown.00232_y.')"
+assert_eq "A-dot-left-boundary: unresolved path/line/content diagnostics" "$DOT_LEFT_EXPECTED" "$DOT_LEFT_OUT"
+
 # The main preflight accepts spaces in slugs. Drive the generated identity map through
 # the public entry and compare filename/stem rewrites and preserved SQL bytes together.
 CASPACE="$ROOT/caseAspace"; build_base "$CASPACE"; RASPACE="$CASPACE/repo"

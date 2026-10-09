@@ -81,8 +81,8 @@ map_is_valid() {
 
 # rewrite_comments <mapfile> <sqlfile>
 # Rewrite <sqlfile> IN PLACE using strict OLD<TAB>NEW<TAB>OLD_BASENAME rows.
-# Only exact basename/stem identities in COMMENT LINES are rewritten. Each digit run
-# in the original line is visited once; inserted values are never scanned again.
+# Only exact basename/stem identities in COMMENT LINES are rewritten. Matched identities
+# are consumed whole; their slug digits and inserted values are never scanned again.
 # Unmatched old numbers in comments are reported to the optional diagnostics file
 # (stderr for the subcommand), including other slugs and ambiguous suffixes.
 # This is the SAME code path the main transform calls per renamed
@@ -98,12 +98,12 @@ rewrite_comments() {
     FILENAME==mapfile { m[$1]=$2; basename[$1]=$3; next }
     function exact(line, pos, name,    after, tail) {
       if (substr(line,pos,length(name)) != name) return 0
-      if (pos > 1 && substr(line,pos-1,1) ~ /[[:alnum:]_-]/) return 0
+      if (pos > 1 && substr(line,pos-1,1) ~ /[[:alnum:]_.-]/) return 0
       after=substr(line,pos+length(name),1)
       if (after ~ /[[:alnum:]_-]/) return 0
       # A sentence period is punctuation; a dotted suffix belongs to the filename.
       tail=substr(line,pos+length(name)+1,1)
-      if (after == "." && tail ~ /[[:alnum:]_.]/) return 0
+      if (after == "." && tail ~ /[[:alnum:]_.-]/) return 0
       return 1
     }
     {
@@ -114,16 +114,18 @@ rewrite_comments() {
       while (match(rest, /[0-9]+/)) {
         tok=substr(rest, RSTART, RLENGTH)
         out=out substr(rest, 1, RSTART-1)
-        replacement=tok
+        replacement=tok; consumed=RLENGTH
         if (length(tok)==5 && (tok in m)) {
           name=basename[tok]; stem=name; sub(/\.sql$/, "", stem)
-          if (exact($0,offset+RSTART,name) || exact($0,offset+RSTART,stem))
-            replacement=m[tok]
+          if (exact($0,offset+RSTART,name)) consumed=length(name)
+          else if (exact($0,offset+RSTART,stem)) consumed=length(stem)
           else unresolved=1
+          if (consumed > RLENGTH)
+            replacement=m[tok] substr(rest,RSTART+RLENGTH,consumed-RLENGTH)
         }
         out=out replacement
-        offset+=RSTART+RLENGTH-1
-        rest=substr(rest, RSTART+RLENGTH)
+        offset+=RSTART+consumed-1
+        rest=substr(rest, RSTART+consumed)
       }
       print out rest
       if (unresolved) print FILENAME ":" FNR "\t" out rest >> diagnostics
