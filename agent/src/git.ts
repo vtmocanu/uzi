@@ -5324,15 +5324,45 @@ export class GitCache {
    * the whole validate→rename→clear sequence under one lock via readRecoveryCapture
    * (lock-free) + a direct runGit config write.
    */
+  /** Credential-free exact prior retirement proof. Absence alone is never attribution. */
+  async completionSourceAlreadyRetired(barePath: string, branch: string, runId: string,
+    clonePath: string, attemptId: string | undefined): Promise<boolean> {
+    if (!attemptId) return false;
+    return this.withLock(barePath, async () => {
+      const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
+      if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending) return false; // A successor/adoption owns this branch now.
+      try { await fs.lstat(clonePath); return false; }
+      catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
+    });
+  }
+
   async retireRunnerClone(
     barePath: string,
     clonePath: string,
     branch: string,
     ownerRunId: string,
-    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics },
+    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      completionSource?: { expectedHead: string; canDelete: () => boolean } },
+  ): Promise<RunnerCloneRetireResult> {
+    // Completion retains adoption exclusion through holding/scratch disposal as well.
+    if (opts.completionSource) return this.withLock(barePath,
+      () => this.retireRunnerCloneImpl(barePath, clonePath, branch, ownerRunId, opts, true));
+    return this.retireRunnerCloneImpl(barePath, clonePath, branch, ownerRunId, opts);
+  }
+
+  private async retireRunnerCloneImpl(
+    barePath: string,
+    clonePath: string,
+    branch: string,
+    ownerRunId: string,
+    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      completionSource?: { expectedHead: string; canDelete: () => boolean } },
+    bareLockHeld = false,
   ): Promise<RunnerCloneRetireResult> {
     let stage: OrphanRetireStage = "journal_read";
-    const result = await this.withLock(barePath, async (): Promise<{ holding?: string; scratch?: string; disposition: RunnerCloneRetireResult }> => {
+    const retire = async (): Promise<{ holding?: string; scratch?: string; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
@@ -5340,6 +5370,15 @@ export class GitCache {
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
+      }
+      if (opts.completionSource) {
+        // Exact ownership and expected HEAD are checked while adoption shares this bare lock.
+        const parsed = parseAttemptPath(clonePath, path.resolve(this.runnerRoot));
+        const key = parsed?.key ?? path.basename(clonePath);
+        if (pending.attemptId !== opts.attemptId ||
+            !await this.classifyOwnerClonePath(barePath, branch, key, ownerRunId, clonePath) ||
+            await this.worktreeHead(clonePath) !== opts.completionSource.expectedHead ||
+            !opts.completionSource.canDelete()) throw new Error("completion source attribution changed");
       }
       // 2. Containment. Only ever move a path strictly UNDER runnerRoot. Resolve both
       //    sides and require a path-separator boundary so a sibling like
@@ -5375,6 +5414,7 @@ export class GitCache {
       stage = "rename";
       // issue #2213: a latch that landed during the awaits above keeps the clone; nothing moved.
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+      if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
@@ -5394,6 +5434,7 @@ export class GitCache {
             // socket / FIFO the clone may carry. No holdingDest is used on this path.
             stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
+            if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
             renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent);
             scratch = scratchParent;
           } else {
@@ -5462,7 +5503,7 @@ export class GitCache {
       //    concurrent successor must never have its journal cleared by us.
       stage = "journal_clear";
       const still = await this.readRecoveryCapture(barePath, branch);
-      if (residueQuarantine() !== undefined) {
+      if (residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
         // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
         // dispose of nothing; the latched worker keeps the clone at its journaled path.
         const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
@@ -5488,7 +5529,7 @@ export class GitCache {
       // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
       // cleared, so a failed append must neither fail the completed retire nor skip step 6's
       // disposal of the holding copy.
-      if (opts.attemptId !== undefined) {
+      if (opts.attemptId !== undefined && !opts.completionSource) {
         await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
           (err: unknown) =>
             this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
@@ -5499,17 +5540,20 @@ export class GitCache {
         );
       }
       return { holding, scratch, disposition: holding ? "quarantined" : "source-already-absent" };
-    }).catch((error: unknown) => {
+    };
+    const result = await (bareLockHeld ? retire() : this.withLock(barePath, retire)).catch((error: unknown) => {
       if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
       throw error;
     });
-    // 6. Disposal, OUTSIDE the lock. Terminal trash (discard) — best-effort delete the
+    // 6. Normal retirement disposes outside its lock; completion keeps the outer bare lock.
+    //    Terminal trash (discard) — best-effort delete the
     //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
     //    Always best-effort delete the intra-device scratch parent (issue #1354): by here
     //    the canonical is already free and the journal already cleared, so a partial
     //    scratch rm is harmless residue.
     const { holding, scratch } = result;
-    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) ||
+      (opts.completionSource !== undefined && !opts.completionSource.canDelete());
     // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
     if (residueQuarantine() !== undefined) {
       if (holding || scratch) {
@@ -5520,6 +5564,20 @@ export class GitCache {
           scratch,
         });
       }
+      return result.disposition;
+    }
+    if (opts.completionSource) {
+      const open = (): void => {
+        if (protectedNow || residueQuarantine() !== undefined || !opts.completionSource!.canDelete())
+          throw new Error("completion disposal protection changed");
+      };
+      open();
+      if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
+      open();
+      if (scratch) await fs.rm(scratch, { recursive: true, force: true });
+      open();
+      if (opts.attemptId !== undefined) await this.appendAttemptLedger(barePath, branch,
+        { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
       return result.disposition;
     }
     if (holding && opts.discard && !protectedNow) {
@@ -8830,7 +8888,8 @@ export class GitCache {
   async cleanupRecoveryGeneration(barePath: string, context: PositiveOwedCandidateContext,
     roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
     coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
-    coveringSha: string, canDelete: () => boolean = () => true): Promise<"removed" | "retained"> {
+    coveringSha: string, canDelete: () => boolean = () => true,
+    authority: "archive" | "completion" | "completion-check" = "archive"): Promise<"removed" | "retained" | "verified"> {
     await this.validateOwedContext(barePath, context.branch, context);
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
     await this.assertOwedBare(barePath);
@@ -8875,7 +8934,7 @@ export class GitCache {
       for (const record of exact) {
         if ("origin" in record.c || !roots.some(root => root.sha === record.sha &&
             root.contexts.some(c => !("origin" in c) && this.contextName(c) === record.contextName))) return "retained";
-        if (await this.ancestry(barePath, record.sha, coveringSha) !== "ancestor") return "retained";
+        if (authority === "archive" && await this.ancestry(barePath, record.sha, coveringSha) !== "ancestor") return "retained";
       }
       const ownedPins = allRefs.filter(p => p.ref.startsWith(`refs/uzi-coverage/${context.runId}/${context.generation}/`) ||
         p.ref === recoveryPinRef(context.runId, context.generation));
@@ -8890,7 +8949,7 @@ export class GitCache {
         const heads = coveragePins.find(p => p.sha === pin.sha)?.coveredHeads ?? [pin.sha];
         if (!heads.length) return "retained";
         for (const head of heads) {
-          if (!OWED_OID.test(head) || await this.ancestry(barePath, head, coveringSha) !== "ancestor") return "retained";
+          if (!OWED_OID.test(head) || (authority === "archive" && await this.ancestry(barePath, head, coveringSha) !== "ancestor")) return "retained";
         }
       }
       const open = (): void => {
@@ -8902,6 +8961,7 @@ export class GitCache {
         await this.runGit(barePath, ["update-ref", "-d", ref, sha]);
         if (await this.checkedRefSha(barePath, ref) !== undefined) throw new Error("recovery cleanup ref deletion mismatch");
       };
+      if (authority === "completion-check") { open(); return "verified"; }
       for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
       for (const sha of new Set(exact.map(r => r.sha))) {
         const ref = `refs/uzi-owed/${context.runId}/${sha}`;
