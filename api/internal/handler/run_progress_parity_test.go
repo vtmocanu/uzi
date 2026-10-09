@@ -53,6 +53,15 @@ func TestRunProgressParityFixture(t *testing.T) {
 		{"empty frozen list", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(`[]`),
 			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: []byte(`["m1"]`)}},
 		{"no frozen list", store.Run{Kind: "issue", Status: "running", Health: "ok", IterationCount: 1}},
+		{"awaiting input outranks stalled health", store.Run{Kind: "issue", Status: "awaiting_input", Health: "stalled", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+			MilestonesCompleted: []byte(`["m1"]`)}},
+		{"plan gate waits", store.Run{Kind: "issue", Status: "awaiting_approval", Health: "ok", MilestonesCandidate: []byte(frozen)}},
+		{"limit wait is parked", store.Run{Kind: "issue", Status: "limit_wait", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen)}},
+		{"claimed is queued", store.Run{Kind: "issue", Status: "claimed", Health: "ok"}},
+		{"looping health is stalled", store.Run{Kind: "issue", Status: "running", Health: "looping", IterationCount: 1, MilestonesFrozen: []byte(frozen),
+			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: []byte(`["m2"]`)}},
+		{"planning turn", store.Run{Kind: "issue", Status: "running", Health: "ok"}},
+		{"non-issue kind with a frozen list shows none", store.Run{Kind: "mr_rework", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen)}},
 	}
 
 	out := make([]runProgressParityCase, 0, len(cases))
@@ -69,7 +78,7 @@ func TestRunProgressParityFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := os.ReadFile(filepath.FromSlash(runProgressParityFile)) //nolint:gosec // G304: fixed in-repo fixture path
+	want, err := os.ReadFile(filepath.FromSlash(runProgressParityFile))
 	if err != nil {
 		t.Fatalf("parity fixture unreadable: %v -- record it from this exact output:\n%s", err, got)
 	}

@@ -246,5 +246,189 @@
       "active_milestone_id": "",
       "phase": ""
     }
+  },
+  {
+    "name": "awaiting input outranks stalled health",
+    "kind": "issue",
+    "status": "awaiting_input",
+    "health": "stalled",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1"
+    ],
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "waiting",
+      "pct": null,
+      "milestone_done": 1,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "plan gate waits",
+    "kind": "issue",
+    "status": "awaiting_approval",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "waiting",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "limit wait is parked",
+    "kind": "issue",
+    "status": "limit_wait",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "parked",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "claimed is queued",
+    "kind": "issue",
+    "status": "claimed",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "queued",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "looping health is stalled",
+    "kind": "issue",
+    "status": "running",
+    "health": "looping",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1"
+    ],
+    "milestones_in_progress": [
+      "m2"
+    ],
+    "progress": {
+      "state": "stalled",
+      "pct": null,
+      "milestone_done": 1,
+      "milestone_total": 3,
+      "active_milestone_id": "m2",
+      "phase": ""
+    }
+  },
+  {
+    "name": "planning turn",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": true,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "planning",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "non-issue kind with a frozen list shows none",
+    "kind": "mr_rework",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "none",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
   }
 ]
