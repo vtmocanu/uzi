@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Security
+
+- **Go toolchain 1.27.2 and golang.org/x/net 0.60.0 (#2536, #2537).**
+  The api and controller build with Go 1.27.2 and golang.org/x/net 0.60.0 (controller golang.org/x/text 0.42.0), closing the HTTP/2, net/http, crypto/tls, mime/multipart and os advisories govulncheck reported against Go 1.27.1, x/net 0.57.0/0.59.0 and x/text 0.40.0. The embedded public-suffix list is unchanged; only its generated source stamp moves.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

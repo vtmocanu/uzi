@@ -5,7 +5,7 @@ go 1.26.4
 // Build with the patched toolchain selected below so stdlib fixes reach the
 // packages govulncheck gates (net/http, crypto/tls, net/url, encoding/asn1, ...).
 // Go auto-downloads it; Renovate keeps it current while `go` remains the floor.
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
 	charm.land/bubbletea/v2 v2.0.10
@@ -32,7 +32,7 @@ require (
 	gitlab.com/gitlab-org/api/client-go/v3 v3.15.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/mod v0.41.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.23.0
 	gopkg.in/yaml.v3 v3.0.1
