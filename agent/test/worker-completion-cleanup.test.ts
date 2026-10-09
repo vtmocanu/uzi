@@ -107,6 +107,11 @@ async function fixture(shared = false, attempted = false, receipted = true, fore
   client.listRecoveryHolds = async () => { rpc++; throw new Error("receipt cleanup must be local"); };
   const restarted = make();
   const snapshot = (await restarted.recovery.inspect(runId)).filter(r => r.generation === generation);
+  if (foreignSibling) snapshot.reverse(); // Selection must not depend on filesystem record order.
+  const completingRecord = snapshot.find(r => r.runId === runId && r.generation === generation &&
+    r.branch === branch && r.completionSource?.clonePath === clone &&
+    r.completionSource.expectedHead === head && r.completionSource.attemptId === attemptId);
+  assert.ok(completingRecord, "fixture selects the full completing source identity");
   const sweep = () => restarted.recovery.resumePending(undefined, snapshot);
   const journal = path.join(git.recoveryRoot, runId, record.captureId + ".json");
   const bundle = path.join(git.recoveryRoot, runId, record.captureId + ".bundle");
@@ -119,7 +124,7 @@ async function fixture(shared = false, attempted = false, receipted = true, fore
     assert.equal(rpc, 0, "persisted receipt cleanup never calls custody RPCs");
   };
   return { root, git, bare, clone, context, head, cmd, runId, generation, branch, journal, bundle,
-    restarted, make, snapshot, sweep, retained, siblingJournal, siblingBundle, rpc: () => rpc,
+    restarted, make, snapshot, completingRecord, sweep, retained, siblingJournal, siblingBundle, rpc: () => rpc,
     close: () => fs.rm(root, { recursive: true, force: true }) };
 }
 
@@ -127,7 +132,7 @@ for (const conflict of ["foreign-clone", "different-attempt", "sibling-branch", 
   it(conflict + " refuses completion source rebinding and retains physical state", async () => {
     const f = await fixture(false, true, conflict === "frozen-receipt", conflict === "sibling-branch");
     try {
-      const source = f.snapshot[0]?.completionSource;
+      const source = f.completingRecord.completionSource;
       assert.ok(source);
       let proposed = { ...source, expectedHead: f.cmd(f.bare, ["rev-parse", "refs/remotes/origin/main"]) };
       if (conflict === "foreign-clone") proposed = { ...proposed, clonePath: path.join(f.root, "foreign-clone") };
@@ -135,7 +140,7 @@ for (const conflict of ["foreign-clone", "different-attempt", "sibling-branch", 
         attemptId: `20261009T000001Z-g${f.generation}-fedcba0987654321` };
       if (conflict === "missing-MAC") {
         await fs.writeFile(path.join(path.dirname(f.journal), "unknown.json"),
-          JSON.stringify({ ...f.snapshot[0], captureId: "unknown" }));
+          JSON.stringify({ ...f.completingRecord, captureId: "unknown" }));
       }
       const journals = (await fs.readdir(path.dirname(f.journal))).filter(name => name.endsWith(".json"));
       const before = await Promise.all(journals.map(name => fs.readFile(path.join(path.dirname(f.journal), name), "utf8")));
@@ -150,8 +155,8 @@ for (const conflict of ["foreign-clone", "different-attempt", "sibling-branch", 
 it("persisted receipt removes actual dirty own clone, generation bundle and journal after quiescence", async () => {
   const f = await fixture();
   try {
-    assert.equal(f.snapshot[0]?.finalAcknowledged, undefined);
-    assert.equal(f.snapshot[0]?.coverageDigest, undefined);
+    assert.equal(f.completingRecord.finalAcknowledged, undefined);
+    assert.equal(f.completingRecord.coverageDigest, undefined);
     await f.sweep();
     for (const target of [f.clone, f.journal, f.bundle]) {
       await assert.rejects(fs.stat(target), { code: "ENOENT" }, "receipt retires its attributed physical source");
@@ -405,6 +410,104 @@ it("completed generation finalize must retire after receipt cleanup", async () =
     assert.equal(f.rpc(), 0, "completion cleanup and finalize retirement require no custody RPC");
   } finally { await f.close(); }
 });
+
+for (const failure of ["ledger", "journal-clear"] as const) {
+  for (const permanent of [false, true]) {
+    it((permanent ? "permanent " : "transient ") + failure + " EIO after actual disposal preserves retirement authority", async t => {
+      const f = await fixture(false, true);
+      const rawGit = f.git as unknown as {
+        runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string>;
+      };
+      const runGit = rawGit.runGit.bind(rawGit);
+      let failures = 0;
+      t.mock.method(rawGit, "runGit", async (...args: Parameters<typeof runGit>) => {
+        const command = args[1];
+        const targeted = command[0] === "config" && (failure === "ledger"
+          ? command[2] === "--add" && command[3]?.startsWith("uzi-attempts.") && command[4]?.includes("retired")
+          : command[2]?.startsWith("uzi-recovery.") && command[3] === "");
+        if (targeted && (permanent || failures === 0)) {
+          await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
+          assert.deepEqual(await fs.readdir((f.git as unknown as { runnerHoldingRoot: string }).runnerHoldingRoot), [],
+            "the actual holding tree was fully disposed before the metadata write");
+          failures++;
+          throw Object.assign(new Error("metadata write EIO"), { code: "EIO" });
+        }
+        return runGit(...args);
+      });
+      try {
+        await f.sweep();
+        assert.equal(failures, permanent ? 2 : 1, "one immediate retry only");
+        if (permanent) {
+          assert.ok(await fs.stat(f.journal), "unknown outcome keeps authenticated receipt");
+          assert.ok(await fs.stat(f.bundle));
+        } else {
+          await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
+          await assert.rejects(fs.stat(f.bundle), { code: "ENOENT" });
+        }
+        t.mock.restoreAll();
+        await f.make().recovery.resumePending();
+        if (permanent && failure === "ledger") {
+          assert.ok(await fs.stat(f.journal), "absence without durable retirement proof confers no authority");
+          assert.ok(await fs.stat(f.bundle));
+          assert.equal(await f.git.completionSourceAlreadyRetired(f.bare, f.branch, f.runId, f.clone,
+            f.completingRecord.completionSource!.attemptId), false);
+        } else {
+          await assert.rejects(fs.stat(f.journal), { code: "ENOENT" }, "durable retirement finishes fresh cleanup");
+          await assert.rejects(fs.stat(f.bundle), { code: "ENOENT" });
+        }
+        assert.equal(f.rpc(), 0);
+      } finally { t.mock.restoreAll(); await f.close(); }
+    });
+  }
+}
+
+for (const conflict of ["foreign", "successor", "unknown", "canonical", "quarantine", "exclusion"] as const) {
+  it("durable retirement refuses old journal clear under " + conflict + " protection", async t => {
+    const f = await fixture(false, true);
+    const rawGit = f.git as unknown as {
+      runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string>;
+    };
+    const runGit = rawGit.runGit.bind(rawGit);
+    let failures = 0;
+    t.mock.method(rawGit, "runGit", async (...args: Parameters<typeof runGit>) => {
+      if (args[1][0] === "config" && args[1][2]?.startsWith("uzi-recovery.") && args[1][3] === "") {
+        failures++;
+        throw Object.assign(new Error("journal clear EIO"), { code: "EIO" });
+      }
+      return runGit(...args);
+    });
+    try {
+      await f.sweep();
+      assert.equal(failures, 2);
+      t.mock.restoreAll();
+      if (conflict === "foreign" || conflict === "successor") {
+        await f.git.markRecoveryCapture(f.bare, f.clone, f.branch,
+          conflict === "foreign" ? "22222222-2222-4222-8222-222222222222" : f.runId,
+          conflict === "successor" ? "20261009T000001Z-g2-fedcba0987654321" : undefined);
+      }
+      if (conflict === "unknown") {
+        const keys = f.cmd(f.bare, ["config", "--local", "--name-only", "--get-regexp", "^uzi-recovery\\."]);
+        assert.equal(keys.split("\n").length, 1);
+        f.cmd(f.bare, ["config", "--local", keys, "malformed"]);
+      }
+      if (conflict === "canonical") {
+        await fs.mkdir(f.clone);
+        await fs.writeFile(path.join(f.clone, "occupant.txt"), "retain occupant");
+      }
+      if (conflict === "quarantine")
+        latchResidueQuarantine({ cause: "fixture quarantine", runId: f.runId, site: "completion_cleanup" }, nullLogger());
+      if (conflict === "exclusion")
+        t.mock.method(f.git, "hasPhysicalTerminalProtection", async () => true);
+      const before = f.cmd(f.bare, ["config", "--local", "--get-regexp", "^uzi-recovery\\."]);
+      await f.make().recovery.resumePending();
+      assert.equal(f.cmd(f.bare, ["config", "--local", "--get-regexp", "^uzi-recovery\\."]), before);
+      assert.ok(await fs.stat(f.journal));
+      assert.ok(await fs.stat(f.bundle));
+      if (conflict === "canonical")
+        assert.equal(await fs.readFile(path.join(f.clone, "occupant.txt"), "utf8"), "retain occupant");
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+}
 
 for (const code of ["EIO", "EBUSY"]) {
   it(code + " completion disposal restores exact attempt attribution for a fresh coordinator retry", async t => {

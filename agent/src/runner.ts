@@ -2550,7 +2550,7 @@ export class RunRunner {
     }
   }
 
-  /** Reserve execution through retirement's outside-bare-lock disposal. Successor admission
+  /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
    * replaces this tail and stops any further destruction while waiting for our release. */
   private async withCompletionSourceBoundary(source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>): Promise<"passed" | "retained"> {

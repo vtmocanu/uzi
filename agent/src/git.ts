@@ -5331,10 +5331,18 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
       if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+      const open = async (): Promise<boolean> =>
+        !await this.hasPhysicalTerminalProtection(runId) && residueQuarantine() === undefined;
+      if (!await open()) return false;
       const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending) return false; // A successor/adoption owns this branch now.
+      if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
+        return false; // A successor/adoption owns this branch now.
       try { await fs.lstat(clonePath); return false; }
-      catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      if (!await open()) return false;
+      // Durable retirement already proves disposal; only finish this exact old journal.
+      if (pending) await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      return true;
     });
   }
 
@@ -5362,7 +5370,7 @@ export class GitCache {
     bareLockHeld = false,
   ): Promise<RunnerCloneRetireResult> {
     let stage: OrphanRetireStage = "journal_read";
-    const retire = async (): Promise<{ holding?: string; scratch?: string; disposition: RunnerCloneRetireResult }> => {
+    const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
@@ -5541,7 +5549,7 @@ export class GitCache {
             }),
         );
       }
-      return { holding, scratch, disposition: holding ? "quarantined" : "source-already-absent" };
+      return { holding, scratch, renamed, disposition: holding ? "quarantined" : "source-already-absent" };
     };
     const result = await (bareLockHeld ? retire() : this.withLock(barePath, retire)).catch((error: unknown) => {
       if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
@@ -5574,17 +5582,51 @@ export class GitCache {
           throw new Error("completion disposal protection changed");
       };
       try {
+        if (!result.renamed || !opts.discard) throw new Error("completion disposal was not established");
         open();
         if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
         open();
         if (scratch) await fs.rm(scratch, { recursive: true, force: true });
         open();
-        if (opts.attemptId !== undefined) await this.appendAttemptLedger(barePath, branch,
-          { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
-        const pending = await this.readRecoveryCapture(barePath, branch);
-        if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
-          throw new Error("completion source journal changed");
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        // Full disposal succeeded in this held lock. Retry only a metadata write, once;
+        // every attempt rechecks exact ownership and exclusion. Failure keeps the receipt.
+        const finishMetadata = async (): Promise<void> => {
+          const pending = await this.readRecoveryCapture(barePath, branch);
+          if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
+            throw new Error("completion source journal changed");
+          const canonicalAbsent = await fs.lstat(clonePath).then(() => false, (err: NodeJS.ErrnoException) => {
+            if (err.code === "ENOENT") return true;
+            throw err;
+          });
+          if (!canonicalAbsent || await this.hasPhysicalTerminalProtection(ownerRunId))
+            throw new Error("completion metadata protection changed");
+          open();
+          if (opts.attemptId !== undefined) {
+            const entry = (await this.readAttemptLedger(barePath, branch)).get(opts.attemptId);
+            open();
+            if (entry?.runId !== ownerRunId || entry.clonePath !== clonePath)
+              throw new Error("completion attempt ledger changed");
+            if (entry.state !== "retired") {
+              try {
+                await this.appendAttemptLedger(barePath, branch,
+                  { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
+              } catch (error) { return retryWrite(error); }
+            }
+          }
+          const still = await this.readRecoveryCapture(barePath, branch);
+          if (still?.runId !== ownerRunId || still.clonePath !== clonePath || still.attemptId !== opts.attemptId)
+            throw new Error("completion source journal changed");
+          open();
+          try { await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]); }
+          catch (error) { return retryWrite(error); }
+        };
+        let retried = false;
+        const retryWrite = async (error: unknown): Promise<void> => {
+          if (retried || (error as NodeJS.ErrnoException).code !== "EIO") throw error;
+          retried = true;
+          await finishMetadata();
+        };
+        await finishMetadata();
       } catch (error) {
         // One rollback attempt, still under adoption exclusion. Partial deletion or a failed
         // proof/rename retains the journal and remaining residue; no new crash discovery.
