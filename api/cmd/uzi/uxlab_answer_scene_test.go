@@ -243,9 +243,11 @@ func TestUXLabAnswerSceneDraftResize(t *testing.T) {
 	f = uxAnswerKey(f, tea.KeyPressMsg{Code: tea.KeyEscape})
 	f = uxAnswerKey(f, uxAnswerRune('i'))
 	answerAssertView(t, f.model, "retain custody", "[x] Stronger resource boundary", "[x] Preserve existing boundary")
+	position, review := f.model.detail.answer.draft().position, f.model.detail.answer.draft().review
 	f = uxAnswerResize(f, 30, 8)
 	f = uxAnswerKey(f, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if f.pending != nil {
+	draft := f.model.detail.answer.draft()
+	if f.pending != nil || draft.position != position || draft.review != review {
 		t.Fatal("small terminal advanced")
 	}
 	f = uxAnswerResize(f, 80, 16)
