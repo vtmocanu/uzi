@@ -423,7 +423,7 @@ func resultIsError(payload json.RawMessage) bool {
 	return json.Unmarshal(payload, &p) == nil && p.IsError
 }
 
-// transcriptViewport is the transcript's visible line budget (the pane title is a fixed
+// transcriptBudgetWithoutCard is the transcript's visible line budget before the card (the pane title is a fixed
 // header above it, so it is one row shorter than the pane).
 //
 // The budget is the terminal height minus every OTHER row the detail view draws, so the
@@ -435,7 +435,9 @@ func resultIsError(payload json.RawMessage) bool {
 // the pane title row, an optional attention banner, an optional steer bar, and the footer — so
 // this and the render cannot disagree; both the window render and the scroll clamp read it.
 // renderSteerBar/detailBanner/transportLine are pure and never call back here (no recursion).
-func (m tuiModel) transcriptViewport() int {
+// transcriptBudgetWithoutCard shares the existing chrome accounting with the card.
+// It excludes the pane title, and deliberately has no minimum floor.
+func (m tuiModel) transcriptBudgetWithoutCard() int {
 	lineCount := func(s string) int {
 		if s == "" {
 			return 0
@@ -471,10 +473,11 @@ func (m tuiModel) transcriptViewport() int {
 	if m.detail.steer.mode == steerIdle {
 		chrome++ // the footer (suppressed while the steer bar owns the key hints)
 	}
-	if h := m.height - chrome; h > 3 {
-		return h
-	}
-	return 3
+	return m.height - chrome
+}
+
+func (m tuiModel) transcriptViewport() int {
+	return max(3, m.transcriptBudgetWithoutCard()-len(m.questionCardLines()))
 }
 
 // padLinesToViewport joins lines and pads with blank lines to exactly vp rows, so the
@@ -542,11 +545,12 @@ func (m tuiModel) renderTranscript() string {
 		maxTop = 0
 	}
 	top := m.detail.scroll
-	if m.detail.follow || top > maxTop {
+	if m.detail.follow {
 		top = maxTop
-	}
-	if top < 0 {
-		top = 0
+	} else {
+		// A larger viewport must not pull a paused content anchor upward.
+		// Clamp stale offsets to content, then pad a short window near the end.
+		top = min(max(0, top), max(0, len(lines)-1))
 	}
 	end := top + vp
 	if end > len(lines) {

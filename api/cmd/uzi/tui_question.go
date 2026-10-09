@@ -60,6 +60,112 @@ func parseTranscriptQuestions(payload json.RawMessage) []transcriptQuestion {
 	return questions
 }
 
+// openQuestionFrame derives the pending event from the run-wide log, independent
+// of the selected lane and payload validity. Any newer answer closes the card.
+func (m tuiModel) openQuestionFrame() (laneFrame, bool) {
+	if m.detail.run.Status != "awaiting_input" {
+		return laneFrame{}, false
+	}
+	var latest laneFrame
+	found := false
+	for _, frame := range m.detail.frames {
+		if frame.Kind != "question" && frame.Kind != "answer" {
+			continue
+		}
+		if !found || frame.Seq > latest.Seq {
+			latest, found = frame, true
+		}
+	}
+	return latest, found && latest.Kind == "question"
+}
+
+// questionCardLines is pure layout: the shared chrome budget excludes this card,
+// avoiding a cycle through transcriptViewport and the rail's folding calculation.
+func (m tuiModel) questionCardLines() []string {
+	frame, open := m.openQuestionFrame()
+	if !open || !m.detail.runLoaded || m.detail.loadErr != nil || m.detail.review.open {
+		return nil
+	}
+	budget := m.transcriptBudgetWithoutCard()
+	if budget < 4 {
+		return nil // reserve at least three transcript content rows
+	}
+	questions := parseTranscriptQuestions(frame.Payload)
+	count := max(1, len(questions))
+	noun := "questions"
+	if count == 1 {
+		noun = "question"
+	}
+	title := fmt.Sprintf("┃ ✎ ANSWER REQUIRED · %d %s", count, noun)
+	if m.detail.questionCollapsed || m.height < 24 {
+		var headers []string
+		for _, q := range questions {
+			if header := strings.TrimSpace(m.renderer.Plain(q.Header, 200)); header != "" {
+				headers = append(headers, header)
+			}
+		}
+		if len(headers) > 0 {
+			title += " (" + strings.Join(headers, ", ") + ")"
+		}
+		return []string{clampVisual(title+" · z expand", m.width)}
+	}
+	capRows := min(12, (budget+1)/2, budget-3)
+	if capRows < 4 {
+		return []string{clampVisual(title+" · z expand", m.width)}
+	}
+	// Use the full terminal width, rather than the narrower joined transcript.
+	// Markdown keeps prose beyond Plain's cell cap; every physical line has a border.
+	copy := m
+	if renderer, err := newTUIRenderer(max(1, m.width-5)+4, m.dark); err == nil {
+		copy.renderer = renderer
+	}
+	var content []string
+	appendProse := func(text, indent string) {
+		if rendered := copy.questionProse(text, indent, m.width); rendered != "" {
+			content = append(content, strings.Split(rendered, "\n")...)
+		}
+	}
+	if len(questions) == 0 {
+		// A malformed newest event is shown instead of resurrecting an older question.
+		appendProse(string(frame.Payload), "┃   ")
+	}
+	for i, q := range questions {
+		header := fmt.Sprintf("┃ %d/%d", i+1, len(questions))
+		if q.Header != "" {
+			prefix := header + " · "
+			indent := "┃" + strings.Repeat(" ", ansi.StringWidth(prefix)-1)
+			prose := copy.questionProse(q.Header, indent, m.width)
+			if prose != "" {
+				header = prefix + strings.TrimPrefix(prose, indent)
+			}
+		}
+		content = append(content, strings.Split(header, "\n")...)
+		appendProse(q.Question, "┃   ")
+		for j, option := range q.Options {
+			prefix := fmt.Sprintf("┃   %d. ", j+1)
+			indent := "┃" + strings.Repeat(" ", ansi.StringWidth(prefix)-1)
+			label := copy.questionProse(option.Label, indent, m.width)
+			if label != "" {
+				label = prefix + strings.TrimPrefix(label, indent)
+				content = append(content, strings.Split(label, "\n")...)
+			}
+			appendProse(option.Description, "┃      ")
+		}
+	}
+	lines := []string{clampVisual(title+" · parked until answered", m.width)}
+	available := capRows - 3 // title, collapse hint and divider are inside the cap
+	if len(content) > available {
+		visible := available - 1 // also reserve the overflow row
+		lines = append(lines, content[:visible]...)
+		lines = append(lines, clampVisual(fmt.Sprintf("┃ … +%d lines", len(content)-visible), m.width))
+	} else {
+		lines = append(lines, content...)
+	}
+	lines = append(lines, clampVisual("┃ z collapse", m.width),
+		clampVisual("┃ "+strings.Repeat("─", max(0, m.width-2)), m.width))
+	return lines
+}
+
 func questionString(raw json.RawMessage) string {
 	var s string
 	_ = json.Unmarshal(raw, &s)
@@ -126,7 +232,7 @@ func (m tuiModel) questionProse(text, indent string, width int) string {
 	return strings.Join(lines, "\n")
 }
 
-// formatTranscriptQuestions is also the prose/chrome seam for the future card.
+// formatTranscriptQuestions renders structured question prose in the transcript.
 // actor must come from this frame, never from a preceding question.
 func (m tuiModel) formatTranscriptQuestions(questions []transcriptQuestion, actor string, width int) string {
 	head := "✎ question"

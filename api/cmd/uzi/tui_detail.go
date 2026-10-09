@@ -82,6 +82,8 @@ type detailState struct {
 	railFold   railFoldMode
 	runLoaded  bool // the first GetRun has landed: header/milestones/accounts can render
 	tailLoaded bool // the newest transcript page has landed
+
+	questionCollapsed bool // session preference; only z toggles, reopening restores expanded
 	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
 	// cursor: the background walk requests the newest page strictly below it and the reply
 	// lowers it, until the start of history is reached. highSeq is the total, since seq is
@@ -546,6 +548,11 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.backfillCmd(m.detail.runID, m.detail.lowSeq))
 		}
 		return m, tea.Batch(cmds...)
+	case keyCollapseQuestion:
+		if _, open := m.openQuestionFrame(); open {
+			m.detail.questionCollapsed = !m.detail.questionCollapsed
+		}
+		return m, nil
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
 		// (the rail is height-clamped and does not scroll). `c` is a sticky override (PRD #1257
@@ -875,6 +882,9 @@ func (m tuiModel) renderDetail() string {
 		return sb.String() + m.renderReviewOverlay()
 	}
 
+	for _, line := range m.questionCardLines() {
+		sb.WriteString(line + "\n")
+	}
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
 	sb.WriteString(m.joinColumns(rail, body, laneRailWidth))

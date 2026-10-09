@@ -730,6 +730,35 @@ func TestTUIQuestionAnswerViewStripsHostileFields(t *testing.T) {
 	})
 	out := m.View().Content
 	assertNoRawControls(t, "structured question and answer", out)
+	// Exercise the pinned card itself, not just the transcript's sanitizer.
+	m.detail.run.Status = "awaiting_input"
+	m.detail.frames = m.detail.frames[:1]
+	for _, collapsed := range []bool{false, true} {
+		if collapsed {
+			m = cardUpdateZ(t, m)
+		}
+		card := strings.Join(cardRows(m.View().Content), "\n")
+		assertNoRawControls(t, "question card", card)
+		for _, marker := range []string{"header-safe", "ANSWER REQUIRED"} {
+			if !strings.Contains(card, marker) {
+				t.Fatalf("hostile card marker %q never reached View: %s", marker, card)
+			}
+		}
+		if !collapsed {
+			for _, marker := range []string{"question-safe", "option-safe", "description-safe"} {
+				if !strings.Contains(card, marker) {
+					t.Fatalf("expanded card marker %q missing: %s", marker, card)
+				}
+			}
+		}
+	}
+	m.detail.frames[0].Payload = json.RawMessage(hostile + "raw-card-safe")
+	m = cardUpdateZ(t, m)
+	card := strings.Join(cardRows(m.View().Content), "\n")
+	assertNoRawControls(t, "raw question card", card)
+	if !strings.Contains(card, "raw-card-safe") {
+		t.Fatalf("hostile raw card marker never reached View: %s", card)
+	}
 	for _, marker := range []string{"header-safe", "question-safe", "option-safe", "description-safe", "answer-safe"} {
 		if !strings.Contains(stripANSI(out), marker) {
 			t.Fatalf("hostile field %q never reached View:\n%s", marker, stripANSI(out))
