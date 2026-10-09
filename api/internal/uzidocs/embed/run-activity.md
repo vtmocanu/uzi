@@ -498,22 +498,33 @@ Where it appears:
 
 ### Run page and TUI detail
 
-The run page and the TUI run detail show the same estimate in more depth.
+The run page and the TUI run detail show the estimate in more depth. The two
+differ in what they carry; the run page has more.
 
 - **Run page**: a progress card under the budget facts. It shows the percent
-  large (`≈70%`), then `milestone 3 of 3 · <active milestone title>`, and a
-  segmented plan track: one segment for planning plus one per milestone, each
-  marked done, in progress or pending. Beside it is the **current phase** of
-  the active role, `implement`, `review` or `validate`, mapped from the role:
+  large (`≈70%`), then `milestone k of M · <active milestone title>` (or
+  `N of M milestones done` when no milestone is active), and a segmented plan
+  track: one segment for planning plus one per milestone, each marked done, in
+  progress or pending. While the run is progressing with a known role, it also
+  shows the **phase** steps `review`, `validate` and `implement`, with the
+  current one marked `▸`. The phase is mapped from the active role:
   `reviewer`, `auditor`, `fact-checker`, `architect`, `web-ux`, `tui-ux` and
   `dba` are `review`, `tester` is `validate`, and any other role is
-  `implement`. It is the phase right now, not a history. The active role line
-  sits under it. The flags from the table above show here too, as on the
-  board: `stalled since HH:MM`, `waits on you · plan gate|question|follow-up
-  since HH:MM`, `parked` (with the resume time when it is known), `queued`, and
-  `planning · no milestones frozen yet`.
-- **TUI run detail**: a `PROGRESS` block above `MILESTONES` in the rail, with
-  the same information wrapped to the rail width.
+  `implement`. It is the phase right now, not a history. An **Active role**
+  line shows only while the run is progressing or stalled. The flags from the
+  table above replace the number when it would mislead: `◼ stalled · since
+  HH:MM`, `● waits on you · plan gate|question|follow-up since HH:MM`, the park
+  word (`limit wait`, `paused`, ...), `queued`, and `planning · no
+  milestones frozen yet`. A parked card adds `resumes HH:MM` only for a
+  usage-limit or recovery wait whose resume time is known and in the future.
+  There is no card when the run has no estimate.
+- **TUI run detail**: a compact `PROGRESS` block above `MILESTONES` in the
+  rail: a `PROGRESS ≈70% · 3/4` line, plus `phase ▸ implement` while the run is
+  progressing. The flags are shown as `◼ stalled` with `since HH:MM`,
+  `● waits on you` with `plan gate|question|follow-up since HH:MM`,
+  `⏸ <park word>` (no resume time), `queued`, and `planning` with
+  `no milestones frozen yet`. It does not show the active-role line or the
+  resume time; use the run page for those.
 
 ### May be blocked by
 

@@ -2390,7 +2390,7 @@ milestone the lead did not attribute gets no `NOW` row at all, just its
 plain mark in the `MILESTONES` block. A run with no effective attribution
 keeps the single global `NOW` row unchanged.
 `run get` also prints a `PROGRESS` row for a live run: the server-derived
-estimate, e.g. `≈70% · milestone 3 of 3`, or a flag when a number would
+estimate, e.g. `≈70% · milestone 3 of 3` (`3 of 3 done` when no milestone is active), or a flag when a number would
 mislead: `stalled · since HH:MM` (UTC), `waits on you · plan gate|question|follow-up`,
 `parked · limit wait|pool wait|recovery wait|paused`, `queued` or `planning`
 (see [Progress estimate](./run-activity.md#progress-estimate)). A run waiting
