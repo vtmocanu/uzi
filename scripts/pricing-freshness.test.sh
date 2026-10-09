@@ -177,19 +177,43 @@ while IFS='|' read -r name verdict hex; do
     done
   done
 done < <(raw_utf8_fixtures)
-# Exercise the documented Task command under the repo's default output mode.
-base
-anthropic 2026-02-01 https://example.com/anthropic
-rc=0
-task nudge:pricing -- --today 2026-02-01 --json >"$scratch/out" 2>"$scratch/err" || rc=$?
-[[ "$rc" == 0 && ! -s "$scratch/err" ]] || die "Task JSON command failed"
-jq -e 'type == "array"' "$scratch/out" >/dev/null || die "Task stdout must be a plain JSON array"
-expected model 2026-01-01 "verified more than 30 days ago" https://example.com/pricing
+# Task owns the GitHub Actions failure annotation; the production bad() contract
+# above still requires exit 2 and empty stdout.
+printf "::error title=Task 'nudge:pricing' failed::exit status 2\n" >"$scratch/task-annotation"
+task_failure_stdout() {
+  if [[ "$1" == ci ]]; then
+    cmp -s "$scratch/task-annotation" "$scratch/out"
+  else
+    [[ ! -s "$scratch/out" ]]
+  fi
+}
+# Negative controls use the same assertion as the actual calls below.
+cp "$scratch/task-annotation" "$scratch/out"
+printf 'extra stdout\n' >>"$scratch/out"
+if task_failure_stdout ci; then die "Task annotation plus extra stdout accepted"; fi
 checks=$((checks + 1))
-rc=0
-task nudge:pricing -- --today invalid --json >"$scratch/out" 2>"$scratch/err" || rc=$?
-[[ "$rc" != 0 && ! -s "$scratch/out" && -s "$scratch/err" ]] || die "Task invalid input must fail with stderr and empty stdout"
+cp "$scratch/task-annotation" "$scratch/out"
+if task_failure_stdout maintainer; then die "maintainer Task annotation accepted"; fi
 checks=$((checks + 1))
+# Both environments are explicit, independent of the suite caller's environment.
+# The finite loop stops on the first failure; stdin is closed for every Task call.
+for task_mode in maintainer ci; do
+  base
+  anthropic 2026-02-01 https://example.com/anthropic
+  task_env=(CI=false GITHUB_ACTIONS=false)
+  [[ "$task_mode" == maintainer ]] || task_env=(CI=true GITHUB_ACTIONS=true)
+  rc=0
+  env "${task_env[@]}" task nudge:pricing -- --today 2026-02-01 --json </dev/null >"$scratch/out" 2>"$scratch/err" || rc=$?
+  [[ "$rc" == 0 && ! -s "$scratch/err" ]] || die "Task JSON command failed ($task_mode)"
+  jq -e 'type == "array"' "$scratch/out" >/dev/null || die "Task stdout must be a plain JSON array ($task_mode)"
+  expected model 2026-01-01 "verified more than 30 days ago" https://example.com/pricing
+  checks=$((checks + 1))
+  rc=0
+  env "${task_env[@]}" task nudge:pricing -- --today invalid --json </dev/null >"$scratch/out" 2>"$scratch/err" || rc=$?
+  [[ "$rc" != 0 && -s "$scratch/err" ]] || die "Task invalid input must fail with stderr ($task_mode)"
+  task_failure_stdout "$task_mode" || die "unexpected Task failure stdout ($task_mode)"
+  checks=$((checks + 1))
+done
 
 # Generate decoded controls in files, including NUL, which Bash variables cannot hold.
 # The fixed corpus bounds this loop; any failure stops the suite.
@@ -306,7 +330,18 @@ for date in 0000-01-01 1900-02-29 2026-02-29 2026-02-30 2026-04-31 2026-00-01 20
   anthropic 2026-01-01 https://example.com/anthropic
   bad --today "$date" --json
 done
+# macOS libc can reject year 0001 in jq's gmtime even at its known timestamp.
+# Only that exact capability error skips this one positive case.
+gmtime_capability=$(jq -cner '
+  try (-62135596800 | gmtime | [.[0], .[1] + 1, .[2]]
+    | if . == [1,1,1] then "supported" else error("unexpected year 0001 components") end)
+  catch if . == "gmtime/1: invalid gmtime representation" then "unsupported" else error(.) end
+' </dev/null) || die "year 0001 gmtime capability probe failed"
 for date in 0001-01-01 9999-12-31 2000-02-29 2024-02-29; do
+  if [[ "$date" == 0001-01-01 && "$gmtime_capability" == unsupported ]]; then
+    printf 'SKIP: positive 0001-01-01; jq gmtime is unsupported by this libc\n'
+    continue
+  fi
   change ".models.model.verified_at = \"$date\" | .models.model.promo_review_date = \"$date\""
   anthropic "$date" https://example.com/anthropic
   ok --today "$date" --json
