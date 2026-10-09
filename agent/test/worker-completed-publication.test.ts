@@ -390,6 +390,7 @@ for (const mode of ["none", "reserve"] as const) {
       f.lose(true);
       await assert.rejects(f.terminal());
       const attempted = structuredClone(f.sent[0]);
+      assert.ok(attempted, "lost ACK follows an actual terminal send");
       assert.equal(attempted.completion_final_head, literal.final_head);
       await pressure(f);
       f.lose(false);

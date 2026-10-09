@@ -178,7 +178,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             withInventorySourceBoundary(context: { runId: string }, action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained">;
           };
           const sourceBoundary = boundaryRunner.withInventorySourceBoundary.bind(r);
-          t.mock.method(boundaryRunner, "withInventorySourceBoundary", async (context, action) => {
+          t.mock.method(boundaryRunner, "withInventorySourceBoundary", async (context: Parameters<typeof sourceBoundary>[0], action: Parameters<typeof sourceBoundary>[1]) => {
             const executionTailPresent = r.isExecuting(context.runId);
             return sourceBoundary(context, async prove => {
               assert.equal(executionTailPresent, false, "execution tail cannot authorize FINAL");
