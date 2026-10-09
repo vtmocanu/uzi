@@ -246,3 +246,17 @@ posture and diagnostic caps remain unchanged. The code gate ran once at the
 commit above; M3 changes documentation only, so the unchanged code gate needs
 no repeat. Scratch logs are ephemeral; the commands and results recorded here
 are the persistent verification record.
+
+## Explicit conditional-milestone disposition
+
+The human explicitly exempted M2 from the frozen completion contract after the
+structural interlock rejected the diagnostics-only finalization:
+
+> Exempt M2. This matches the approved plan v2 exit: no controlled local RED was found, so finalize the reviewed M1/M3 diagnostics with M2 not attempted, no cause or fix claimed, other #2397 cases unproven, privileged CI acceptance pending post-finalize, and the PR body using Refs #2397 (not a closing keyword).
+
+Decision: M2 is **exempted and not attempted**, not completed. Its controlled-RED
+entry condition was not met. M1 and M3 deliver the approved diagnostics-only
+scope; this exemption does not assert a verified fix or issue acceptance.
+The completion interlock repeated after this human decision, so publication
+remains blocked by the unresolved contract mismatch. No further completion
+signal is made while that mismatch persists.
