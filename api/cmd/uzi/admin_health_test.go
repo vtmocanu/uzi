@@ -2,8 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -320,5 +324,117 @@ func TestAdminHealthOwnerDangerRemainsExitEightWithoutInstanceBlocking(t *testin
 	}
 	if code != uzicli.ExitHealthDanger || got.Blocking || len(got.Checks) != 1 || got.Checks[0].Scope != "owner" {
 		t.Fatalf("owner JSON scope/blocking/exit changed: exit=%d doc=%+v", code, got)
+	}
+}
+
+func codexPricingWarnCheck() apitypes.HealthCheckDTO {
+	return apitypes.HealthCheckDTO{
+		ID: "pricing.codex", Scope: "instance", Group: "housekeeping", Title: "Codex price coverage",
+		Severity: "warn", Summary: "2 Codex models lack usable pricing", Doc: func() *string { s := "admin-health"; return &s }(),
+		Evidence: []apitypes.HealthEvidenceDTO{
+			{Label: "gpt-5.5", Value: "3 runs, no price"},
+			{Label: "gpt-5.6-sol", Value: "2 runs, promotional price expired"},
+		},
+	}
+}
+
+func TestAdminHealthCodexEvidence(t *testing.T) {
+	check := codexPricingWarnCheck()
+	for _, flags := range [][]string{nil, {"--no-color"}, {"--all"}, {"--no-color", "--all"}} {
+		t.Run(fmt.Sprint(flags), func(t *testing.T) {
+			doc := healthDoc("warn", check, dbOKCheck())
+			out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: doc}), append([]string{"admin", "health"}, flags...)...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d", code)
+			}
+			for _, want := range []string{"EVIDENCE", "gpt-5.5: 3 runs, no price", "gpt-5.6-sol: 2 runs, promotional price expired", "blocking: false"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("missing %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+func TestAdminHealthCodexFullCapAndHostileEvidence(t *testing.T) {
+	check := codexPricingWarnCheck()
+	for i := 2; i < 10; i++ {
+		check.Evidence = append(check.Evidence, apitypes.HealthEvidenceDTO{Label: fmt.Sprintf("model-%02d", i), Value: "1 run, no price"})
+	}
+	check.Evidence = append(check.Evidence, apitypes.HealthEvidenceDTO{Label: "and more", Value: "4 additional models"})
+	for _, flags := range [][]string{{"--no-color"}, {"--no-color", "--all"}} {
+		out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), append([]string{"admin", "health"}, flags...)...)
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d", code)
+		}
+		for _, want := range []string{"gpt-5.5: 3 runs, no price", "gpt-5.6-sol: 2 runs, promotional price expired", "and more: 4 additional models"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing %q:\n%s", want, out)
+			}
+		}
+		for i := 2; i < 10; i++ {
+			if !strings.Contains(out, fmt.Sprintf("model-%02d: 1 run, no price", i)) {
+				t.Errorf("model %d lost:\n%s", i, out)
+			}
+		}
+	}
+	check.Evidence = []apitypes.HealthEvidenceDTO{
+		{Label: "hostile\x1b\r\t\n" + strings.Repeat("界", 300), Value: "tail"},
+		{Label: "value", Value: "hostile\x1b\r\t\n" + strings.Repeat("界", 300)},
+	}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), "admin", "health", "--no-color")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	var cells int
+	evidenceStart := strings.Index(strings.Split(out, "\n")[0], "EVIDENCE")
+	if evidenceStart < 0 {
+		t.Fatalf("missing EVIDENCE header:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		for _, r := range line {
+			if unicode.IsControl(r) && r != '\t' {
+				t.Errorf("control %U survived", r)
+			}
+		}
+		if len(line) > evidenceStart && strings.Contains(line[evidenceStart:], "hostile") {
+			cells++
+			if utf8.RuneCountInString(strings.TrimSpace(line[evidenceStart:])) > 201 {
+				t.Errorf("unbounded evidence: %d runes", utf8.RuneCountInString(strings.TrimSpace(line[evidenceStart:])))
+			}
+		}
+	}
+	if cells != 2 {
+		t.Errorf("want two bounded hostile evidence cells, got %d:\n%s", cells, out)
+	}
+}
+
+func TestAdminHealthCodexOKAllAndJSONUnchanged(t *testing.T) {
+	check := codexPricingWarnCheck()
+	doc := healthDoc("warn", check)
+	fc := &uzicli.FakeClient{AdminHealthDoc: doc}
+	out, _, code := runCLI(t, fakeEnv(fc), "admin", "health", "--json")
+	var got apitypes.HealthDocDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if code != uzicli.ExitOK || !reflect.DeepEqual(got, doc) {
+		t.Fatalf("JSON changed: exit=%d got=%+v", code, got)
+	}
+	check.Severity = "ok"
+	check.Summary = "no recent Codex usage on unpriced models"
+	check.Evidence = []apitypes.HealthEvidenceDTO{}
+	fc.AdminHealthDoc = healthDoc("ok", check)
+	out, _, code = runCLI(t, fakeEnv(fc), "admin", "health", "--all", "--no-color")
+	if code != uzicli.ExitOK || !strings.Contains(out, "pricing.codex") || !strings.Contains(out, check.Summary) {
+		t.Fatalf("OK pricing missing: exit=%d\n%s", code, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "pricing.codex") {
+			evidenceStart := strings.Index(strings.Split(out, "\n")[0], "EVIDENCE")
+			if evidenceStart < 0 || (len(line) > evidenceStart && strings.TrimSpace(line[evidenceStart:]) != "") {
+				t.Fatalf("no-evidence cell must be blank: %q", line)
+			}
+		}
 	}
 }

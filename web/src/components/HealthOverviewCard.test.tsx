@@ -35,6 +35,30 @@ function renderCard() {
 }
 
 describe("HealthOverviewCard", () => {
+  it("shows both Codex pricing reasons and operator docs as a nonblocking warning", async () => {
+    const doc = healthySilentDoc();
+    expect(doc.checks).toHaveLength(18);
+    const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
+    pricing.severity = "warn";
+    pricing.summary = "2 Codex models lack usable pricing";
+    pricing.evidence = [
+      { label: "gpt-5.5", value: "3 runs, no price" },
+      { label: "gpt-5.6-sol", value: "2 runs, promotional price expired" },
+    ];
+    doc.status = "warn";
+    doc.counts = { ok: 17, warn: 1, danger: 0, unknown: 0, na: 0 };
+    mockApi.getAdminHealth.mockResolvedValue(doc);
+    renderCard();
+    const card = await screen.findByRole("status", { name: "System health" });
+    expect(within(card).getByText("Codex price coverage")).toBeTruthy();
+    for (const reason of ["gpt-5.5: 3 runs, no price", "gpt-5.6-sol: 2 runs, promotional price expired"]) {
+      expect(within(card).getByText((_, el) => el?.tagName === "SPAN" && el.textContent === reason)).toBeTruthy();
+    }
+    expect(within(card).getByRole("link", { name: "Docs: admin-health" }).getAttribute("href")).toBe("/docs/admin-health");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(doc.blocking).toBe(false);
+  });
+
   it("keeps owner danger evidence visible without an instance-wide blocker claim", async () => {
     const doc = ownerOnlyDoc();
     mockApi.getAdminHealth.mockResolvedValue(doc);
@@ -45,23 +69,23 @@ describe("HealthOverviewCard", () => {
     const items = within(card).getAllByRole("listitem");
     expect(items).toHaveLength(3);
     for (const item of items.slice(0, 2)) {
-      expect(within(item).getByText("Waiting run:")).toBeTruthy();
+      expect(within(item).getAllByText("Waiting run:")).toHaveLength(2);
       expect(within(item).getByText((_, el) =>
         el?.tagName === "SPAN" && el.textContent === `Waiting run: run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca`,
       )).toBeTruthy();
       expect(within(item).getByText("Danger")).toBeTruthy();
-      expect(within(item).queryByText("Owners affected:")).toBeNull();
-      expect(item.textContent).not.toContain("22930000-0000-0000-0000-000000000005");
+      if (items.indexOf(item) === 0) expect(within(item).getByText("Owners affected:")).toBeTruthy();
+      expect(item.textContent).toContain("22930000-0000-0000-0000-000000000005");
     }
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();
   });
 
   it("collapses to one quiet line when every check passes", async () => {
-    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 17 checks, all ok
+    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 18 checks, all ok
     renderCard();
     // A healthy card is a status region (not an alert), scoped by its label.
     const card = await screen.findByRole("status", { name: "System health" });
-    expect(within(card).getByText("System health: all 17 checks passing")).toBeTruthy();
+    expect(within(card).getByText("System health: all 18 checks passing")).toBeTruthy();
     // No verdict/attention items in the quiet form.
     expect(within(card).queryByText(/uzi cannot run work/)).toBeNull();
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();

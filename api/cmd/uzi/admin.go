@@ -481,15 +481,24 @@ func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comman
 		if !all && (ck.Severity == "ok" || ck.Severity == "na") {
 			continue
 		}
-		rows = append(rows, []string{
+		row := []string{
 			cellText(strings.ToUpper(ck.Severity)),
 			cellText(ck.ID),
 			cellText(healthSince(ck.Since)),
 			cellText(ck.Summary),
-		})
+			"",
+		}
+		for i, evidence := range ck.Evidence {
+			if i > 0 {
+				rows = append(rows, row)
+				row = []string{"", "", "", "", ""}
+			}
+			row[4] = cellText(evidence.Label + ": " + evidence.Value)
+		}
+		rows = append(rows, row)
 	}
 	if len(rows) > 0 {
-		if err := p.Table([]string{"SEVERITY", "CHECK", "SINCE", "SUMMARY"}, rows); err != nil {
+		if err := p.Table([]string{"SEVERITY", "CHECK", "SINCE", "SUMMARY", "EVIDENCE"}, rows); err != nil {
 			return err
 		}
 	} else if !all {
