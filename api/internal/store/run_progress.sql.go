@@ -76,7 +76,7 @@ type RunQuestionAnswerExistsParams struct {
 // True when ANY answer for the run's open question was submitted, applied or not: the
 // owner may have answered while the status still reads awaiting_input, before the
 // worker consumes it, and the hint must not show then. Served by
-// idx_run_user_inputs_answer (migration 00315), so it never scans run_user_inputs.
+// idx_run_user_inputs_answer (migration 00315).
 func (q *Queries) RunQuestionAnswerExists(ctx context.Context, arg RunQuestionAnswerExistsParams) (bool, error) {
 	row := q.db.QueryRow(ctx, runQuestionAnswerExists, arg.RunID, arg.QuestionID)
 	var answered bool

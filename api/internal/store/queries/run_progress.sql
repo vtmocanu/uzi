@@ -5,7 +5,7 @@
 -- True when ANY answer for the run's open question was submitted, applied or not: the
 -- owner may have answered while the status still reads awaiting_input, before the
 -- worker consumes it, and the hint must not show then. Served by
--- idx_run_user_inputs_answer (migration 00315), so it never scans run_user_inputs.
+-- idx_run_user_inputs_answer (migration 00315).
 SELECT EXISTS (
     SELECT 1 FROM run_user_inputs
     WHERE run_id = @run_id
