@@ -81,10 +81,6 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 	}
 	t.Cleanup(pool.Close)
 	f := &retentionFixture{ctx: ctx, pool: pool, q: store.New(pool), user: uuid.New(), other: uuid.New(), recorder: &retentionRecordingSlacker{}}
-	for _, u := range []uuid.UUID{f.user, f.other} {
-		mustExec(ctx, t, pool, `INSERT INTO users (id,email,password_hash,slack_resolved_id,slack_link_confirmed_at)
-   VALUES ($1,$2,'x','U1',now())`, u, fmt.Sprintf("retention-%s@e2e", u))
-	}
 	// Delete only this test's users (notifications cascade); never clear neighbours.
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -93,6 +89,10 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 			t.Errorf("fixture cleanup: %v", err)
 		}
 	})
+	for _, u := range []uuid.UUID{f.user, f.other} {
+		mustExec(ctx, t, pool, `INSERT INTO users (id,email,password_hash,slack_resolved_id,slack_link_confirmed_at)
+   VALUES ($1,$2,'x',$3,now())`, u, fmt.Sprintf("retention-%s@e2e", u), "U"+u.String())
+	}
 	var anchor time.Time
 	if err := pool.QueryRow(ctx, `SELECT now()`).Scan(&anchor); err != nil {
 		t.Fatal(err)

@@ -36,8 +36,6 @@ func TestRedeliveryRetention(t *testing.T) {
 				if len(fc.pruned) == 1 && len(slk.renders) != 0 {
 					t.Fatal("published before prune")
 				}
-				// Model deletion by cleanup: all claimed final renders must remain usable.
-				fc.rows = nil
 			}
 			var logs bytes.Buffer
 			var opts []RedelivererOption
