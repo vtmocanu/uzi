@@ -39,6 +39,8 @@ COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
 COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
 # The TUI/web answer parity fixture (#2550), imported by runQuestion.test.ts and QuestionPanel.test.tsx.
 COPY fixtures/run-question-answer.json /app/fixtures/run-question-answer.json
+# PlanPanel.test.tsx statically imports this typed JSON fixture.
+COPY fixtures/plan-revision/ /app/fixtures/plan-revision/
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 
