@@ -4058,10 +4058,11 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
 
     // The coder subagent is configured with a DISTINCT valid contract model from the root
-    // (root = provider.model = "gpt-6-astra"); its usage must be charged to "gpt-5.6-sol".
+    // (root = provider.model = "gpt-6-astra"); use a non-promotional child model so
+    // the price assertion remains valid after the Sol promotional review date.
     const childModelAgents: AgentTemplate[] = [
       { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
-      { name: "coder", description: "a coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", model: "gpt-6.1-sol", tools: null, skills: [] },
     ];
     const { ctx, emitted } = makeCtx({ agents: childModelAgents });
     const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
@@ -4071,13 +4072,13 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
 
     const modelUsage = lastResultModelUsage(emitted);
     assert.ok(modelUsage, "the terminal carries per-model usage");
-    assert.deepEqual(Object.keys(modelUsage), ["gpt-5.6-sol"], "the child usage is charged to its own model, never the root's or dropped");
-    const child = rec(modelUsage["gpt-5.6-sol"]);
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6.1-sol"], "the child usage is charged to its own model, never the root's or dropped");
+    const child = rec(modelUsage["gpt-6.1-sol"]);
     assert.equal(child.inputTokens, 200, "the child's uncached input rode through the accountant");
     assert.equal(child.outputTokens, 100, "the child's output rode through the accountant");
     // Subscription child usage gets the same pinned API-equivalent estimate as API-key usage.
     assert.equal(child.costStatus, "metered");
-    assert.equal(child.costUSD, 0.0028);
+    assert.equal(child.costUSD, 0.0014); // (200*2 + 100*10)/1e6
   });
 });
 
