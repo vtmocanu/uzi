@@ -13,6 +13,7 @@ import { LimitReachedError } from "../src/limit.js";
 import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { formatAttemptId, parseAttemptPath } from "../src/attempt-path.js";
+import { InvalidRecoveryClonePathError } from "../src/recovery-progress.js";
 import {
   LiveAttemptRegistry,
   mintAttemptId,
@@ -1035,7 +1036,7 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
       `${path.sep}${path.basename(runnerRepoDir())}${path.sep}..${path.sep}${path.basename(runnerRepoDir())}${path.sep}`,
     );
     assert.ok(traversal.includes(`${path.sep}..${path.sep}`), `a traversal path: ${traversal}`);
-    await assert.rejects(git.markRecoveryCapture(b, traversal, `agent/issue-${iid}`, owner, tid), /invalid retained recovery progress/);
+    await assert.rejects(git.markRecoveryCapture(b, traversal, `agent/issue-${iid}`, owner, tid), InvalidRecoveryClonePathError);
     execFileSync("git", ["-C", b, "config", "--local", `uzi-recovery.agent/issue-${iid}.clone`,
       JSON.stringify({ runId: owner, clonePath: traversal, attemptId: tid })], { env: GIT_ENV, stdio: "pipe" });
     terminalOwner(owner, iid);

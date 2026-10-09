@@ -4305,7 +4305,7 @@ export class RunRunner {
     // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
     await batcher.awaitPermanentFailureSettled();
     const ownerCancel = this.isCredentialFreeOwnerCancel(claim, flight);
-    if (ownerCancel && !opts.keepCustody) await this.disposeCredentialFreeOwnerCancel(claim, flight);
+    if (ownerCancel) await this.disposeCredentialFreeOwnerCancel(claim, flight);
     // PRD #1391 Run B M3 (fact 2, D5, N2): suppress a SECOND `failed` when a terminal outcome
     // resolved or a competing outcome was deferred for an unavailable selected winner
     // (the `terminalResolved` latch survives a 200 retiring the journal), or a pending terminal
@@ -13014,7 +13014,7 @@ export class RunRunner {
   ): Promise<"released" | "retained"> {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
-    if (flight.retainedLocalCustody || flight.keepGuardedInventoryOpen || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
+    if (flight.retainedEpisode || flight.retainedEpisodeCustody || flight.retainedLocalCustody || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
     const gen = claim.claim_generation;
     const fenced = () => flight.steering.claimFence() !== undefined;
     if (!Number.isSafeInteger(gen) || gen === undefined || gen <= 0 ||
