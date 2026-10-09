@@ -45,6 +45,24 @@ const WAIT_REASONS: Record<string, string> = {
   awaiting_followup: "follow-up",
 };
 
+// waitReason names what a `waiting` run waits on (plan gate / question / follow-up), or
+// undefined for a status outside the three. Shared with the run page's RunProgressCard.
+export function waitReason(status: string): string | undefined {
+  return WAIT_REASONS[status];
+}
+
+// stallTitle is the stalled flag's tooltip: the health word (stalled vs looping) plus the
+// owner-only health reason the replaced health pill carried, sanitised because it is
+// model-influenced text. Shared with the run page's RunProgressCard.
+export function stallTitle(run: Partial<Pick<Run, "health" | "health_reason">>): string {
+  const reason = run.health_reason ? stripUnsafeChars(run.health_reason) : "";
+  const base =
+    run.health === "looping"
+      ? "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."
+      : "Stalled: no progress is being made; the percentage returns once activity resumes.";
+  return reason === "" ? base : `${base} ${reason}`;
+}
+
 // Stacked flag + faint sub-line (`<reason> since HH:MM`, or whichever half is known); the
 // sub-line drops when neither is.
 function Flagged({
@@ -110,7 +128,7 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
     }
     case "waiting":
       return (
-        <Flagged state="waiting" reason={WAIT_REASONS[run.status]} since={formatLocalTime(run.status_since)}>
+        <Flagged state="waiting" reason={waitReason(run.status)} since={formatLocalTime(run.status_since)}>
           <Badge tone="warning" dot title="This run is waiting on you: a plan approval, a question or a follow-up.">
             waits on you
           </Badge>
@@ -118,17 +136,11 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
       );
     case "stalled": {
       const looping = run.health === "looping";
-      // The health pill this flag replaces carried the owner-only health reason as its
-      // tooltip; keep it (sanitised: model-influenced text) so the row loses nothing.
-      const reason = run.health_reason ? stripUnsafeChars(run.health_reason) : "";
-      const base = looping
-        ? "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."
-        : "Stalled: no progress is being made; the percentage returns once activity resumes.";
       return (
         <Flagged state="stalled" since={formatLocalTime(run.health_since)}>
           <Badge
             tone="danger"
-            title={reason === "" ? base : `${base} ${reason}`}
+            title={stallTitle(run)}
           >
             <span aria-hidden="true">◼</span> stalled
             {looping && <span className="sr-only"> (looping)</span>}
