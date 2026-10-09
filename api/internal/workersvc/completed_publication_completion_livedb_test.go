@@ -13,6 +13,12 @@ import (
 )
 
 func TestCompletedPublicationCompletionIdentityLiveDB(t *testing.T) {
+	for _, kind := range []string{"issue", "self_improve"} {
+		t.Run(kind, func(t *testing.T) { completedPublicationCompletionIdentity(t, kind) })
+	}
+}
+
+func completedPublicationCompletionIdentity(t *testing.T, kind string) {
 	for _, permit := range []bool{false, true} {
 		name := "direct"
 		if permit {
@@ -32,6 +38,10 @@ func TestCompletedPublicationCompletionIdentityLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			branch := agentIssueBranch(iid)
+			if kind == "self_improve" {
+				branch = selfImproveBranch(run)
+				e.exec(t, "UPDATE runs SET kind='self_improve' WHERE id=$1", run)
+			}
 			head, changed := strings.Repeat("a", 40), strings.Repeat("c", 40)
 			gen, mr := int64(1), int64(7)
 			hold := uuid.New()
@@ -116,10 +126,17 @@ func TestCompletedPublicationCompletionIdentityLiveDB(t *testing.T) {
 
 func TestCompletedPublicationLegacyOmissionsLiveDB(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		caps     []string
-		omitHead bool
+		name, kind string
+		older      bool
+		caps       []string
+		omitHead   bool
 	}{
+		{name: "self_improve_without_capability", kind: "self_improve"},
+		{name: "self_improve_without_head", kind: "self_improve", caps: []string{capability.RecoveryCompletedPublicationV1}, omitHead: true},
+		{name: "older_completed_self_improve", kind: "self_improve", caps: []string{capability.RecoveryCompletedPublicationV1}, older: true},
+		{name: "excluded_ci_fix", kind: "ci_fix", caps: []string{capability.RecoveryCompletedPublicationV1}},
+		{name: "excluded_prompt", kind: "prompt", caps: []string{capability.RecoveryCompletedPublicationV1}},
+		{name: "excluded_task", kind: "task", caps: []string{capability.RecoveryCompletedPublicationV1}},
 		{name: "legacy_without_capability"},
 		{name: "capable_without_final_head", caps: []string{capability.RecoveryCompletedPublicationV1}, omitHead: true},
 	} {
@@ -133,14 +150,40 @@ func TestCompletedPublicationLegacyOmissionsLiveDB(t *testing.T) {
 			hold := uuid.New()
 			e.exec(t, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
  VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, e.userID, e.repoID, run, wid)
+			switch tc.kind {
+			case "ci_fix":
+				e.exec(t, "UPDATE runs SET kind='ci_fix',pipeline_id=123,pipeline_ref='agent/ci' WHERE id=$1", run)
+			case "prompt", "task":
+				e.exec(t, "UPDATE runs SET kind=$2,issue_iid=NULL,branch='agent/task' WHERE id=$1", run, tc.kind)
+			case "self_improve":
+				e.exec(t, "UPDATE runs SET kind='self_improve' WHERE id=$1", run)
+			}
+			if tc.older {
+				e.exec(t, "UPDATE runs SET status='completed' WHERE id=$1", run)
+			}
 			req := StateRequest{State: "completed", ClaimGeneration: &gen, CompletionFinalHead: &head}
+			if tc.kind == "task" {
+				branch := "agent/task"
+				req.Branch = &branch
+			}
 			if tc.omitHead {
 				req.CompletionFinalHead = nil
 			}
 			svc := e.permitService(t)
 			result, err := svc.SetStateReportWithReconciliation(e.ctx, store.Worker{ID: wid, UserID: e.userID, ProtocolCapabilities: tc.caps}, run, req)
-			if err != nil || !result.Applied || result.Run.Status != "completed" || result.CompletedPublicationReceipt != nil {
+			if err != nil || result.Applied == tc.older || result.Run.Status != "completed" || result.CompletedPublicationReceipt != nil {
 				t.Fatalf("legacy completion: %+v %v", result, err)
+			}
+			if tc.older {
+				req.CompletionFinalHead = nil
+				replay, err := svc.SetStateReportWithReconciliation(e.ctx, store.Worker{ID: wid, UserID: e.userID, ProtocolCapabilities: tc.caps}, run, req)
+				if err != nil || replay.CompletedPublicationReceipt != nil {
+					t.Fatalf("older completed replay: %+v %v", replay, err)
+				}
+				var missingHead bool
+				if err := e.pool.QueryRow(e.ctx, "SELECT completion_final_head IS NULL FROM runs WHERE id=$1", run).Scan(&missingHead); err != nil || !missingHead {
+					t.Fatalf("older replay minted final head: missing=%t err=%v", missingHead, err)
+				}
 			}
 			var state string
 			var identity []byte

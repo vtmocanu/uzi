@@ -17,12 +17,29 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-type completionRouteForge struct{ settleFakeForge }
+type completionRouteForge struct {
+	settleFakeForge
+	t      *testing.T
+	branch string
+}
 
-func (*completionRouteForge) GetMergeRequestSummary(context.Context, int64, int64) (forge.MergeRequestSummary, error) {
-	return forge.MergeRequestSummary{SourceBranch: "agent/issue-7", HeadSHA: settleHead}, nil
+func (f *completionRouteForge) BranchHead(ctx context.Context, projectID int64, branch string) (string, error) {
+	if projectID != 2507 || branch != f.branch {
+		f.t.Fatalf("own-repository canonical branch: project=%d branch=%q want=%q", projectID, branch, f.branch)
+	}
+	return f.settleFakeForge.BranchHead(ctx, projectID, branch)
+}
+
+func (f *completionRouteForge) GetMergeRequestSummary(context.Context, int64, int64) (forge.MergeRequestSummary, error) {
+	return forge.MergeRequestSummary{SourceBranch: f.branch, HeadSHA: settleHead}, nil
 }
 func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
+	for _, kind := range []string{"issue", "self_improve"} {
+		t.Run(kind, func(t *testing.T) { completedPublicationHandler(t, kind) })
+	}
+}
+
+func completedPublicationHandler(t *testing.T, kind string) {
 	h, router, pool := cliLiveDB(t)
 	h.wsvc.SetTxBeginner(pool)
 	h.wsvc.SetBackground(func(func()) {})
@@ -30,6 +47,11 @@ func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
 	conn := rmSeedConn(t, pool, owner)
 	repo := rmSeedRepo(t, pool, conn, 2507, true)
 	run := rmSeedRun(t, pool, owner, repo, "running")
+	branch := "agent/issue-7"
+	if kind == "self_improve" {
+		branch = "uzi/self-improve/" + run.String()
+		cliMustExec(t, pool, "UPDATE runs SET kind='self_improve',branch='agent/prior-poison',pipeline_ref='agent/pipeline-poison' WHERE id=$1", run)
+	}
 	worker, hold := uuid.New(), uuid.New()
 	token := "completion-worker-" + uuid.NewString()
 	sum := sha256.Sum256([]byte(token))
@@ -37,7 +59,7 @@ func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
 	cliMustExec(t, pool, "UPDATE runs SET worker_id=$2,claim_generation=1 WHERE id=$1", run, worker)
 	cliMustExec(t, pool, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
  VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, owner, repo, run, worker)
-	f := &completionRouteForge{settleFakeForge: settleFakeForge{head: settleHead, verdict: map[string]forge.Ancestry{settlePushed: forge.AncestryAncestor}}}
+	f := &completionRouteForge{t: t, branch: branch, settleFakeForge: settleFakeForge{head: settleHead, verdict: map[string]forge.Ancestry{settlePushed: forge.AncestryAncestor}}}
 	h.wsvc.SetForges(settleForgeBuilder{f: f})
 	raw, err := os.ReadFile("../../../fixtures/completed-publication/state-ack.json")
 	if err != nil {
@@ -53,6 +75,18 @@ func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(wire.Request)
+	if kind == "self_improve" {
+		var request map[string]any
+		if err := json.Unmarshal(wire.Request, &request); err != nil {
+			t.Fatal(err)
+		}
+		request["branch"] = "agent/worker-poison"
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = string(encoded)
+	}
 	call := func(auth, payload string) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(http.MethodPost, "/api/worker/runs/"+run.String()+"/state", strings.NewReader(payload))
@@ -73,10 +107,11 @@ func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
 		t.Fatalf("completion ACK: %d %s", rec.Code, rec.Body.String())
 	}
 	receipt := ack.CompletedPublicationReceipt
-	if receipt.HoldID != hold.String() || receipt.RunID != run.String() || receipt.WorkerID != worker.String() || receipt.OwnerID != owner.String() || receipt.Generation != 1 || receipt.FinalHead != settlePushed || receipt.ObservedBranchHead != settleHead || receipt.RepoID != repo.String() || receipt.ConnectionID != conn.String() || receipt.Branch != "agent/issue-7" || receipt.MRIID == nil || *receipt.MRIID != 17 || f.compareCalls != 1 {
+	if receipt.HoldID != hold.String() || receipt.RunID != run.String() || receipt.WorkerID != worker.String() || receipt.OwnerID != owner.String() || receipt.Generation != 1 || receipt.FinalHead != settlePushed || receipt.ObservedBranchHead != settleHead || receipt.RepoID != repo.String() || receipt.ConnectionID != conn.String() || receipt.Branch != branch || receipt.MRIID == nil || *receipt.MRIID != 17 || f.compareCalls != 1 {
 		t.Fatalf("exact ACK authority: %+v comparison calls=%d", receipt, f.compareCalls)
 	}
 	expected := wire.Ack.Receipt
+	expected.Branch = branch
 	expected.HoldID = hold.String()
 	expected.RunID = run.String()
 	expected.OwnerID = owner.String()

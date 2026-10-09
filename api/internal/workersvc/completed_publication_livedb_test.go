@@ -67,6 +67,16 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 		reportedBranch     string
 		retry              bool
 	}{
+		{name: "self_improve_equal", kind: "self_improve", reportedBranch: "agent/poisoned"},
+		{name: "self_improve_ancestor", kind: "self_improve", reportedBranch: "agent/poisoned", change: func(f *publicationForge) { f.head = strings.Repeat("b", 40); f.summaryHead = f.head }},
+		{name: "self_improve_retry", kind: "self_improve", reportedBranch: "agent/poisoned", retry: true},
+		{name: "self_improve_missing_mr", kind: "self_improve", reason: "mr_missing", change: func(f *publicationForge) { f.summaryErr = forge.ErrMergeRequestNotFound }},
+		{name: "self_improve_missing_branch", kind: "self_improve", reason: "branch_missing", change: func(f *publicationForge) { f.headErr = forge.ErrRefNotFound }},
+		{name: "self_improve_tracking_issue_branch", kind: "self_improve", reason: "branch_mismatch", change: func(f *publicationForge) { f.branch = "agent/issue-1" }},
+		{name: "self_improve_head_mismatch", kind: "self_improve", reason: "head_mismatch", change: func(f *publicationForge) { f.summaryHead = strings.Repeat("c", 40) }},
+		{name: "self_improve_not_ancestor", kind: "self_improve", reason: "not_ancestor", change: func(f *publicationForge) { f.ancestry = forge.AncestryNotAncestor }},
+		{name: "self_improve_error", kind: "self_improve", reason: "ancestry_unknown", change: func(f *publicationForge) { f.compareErr = errors.New("forge unavailable") }},
+		{name: "self_improve_timeout", kind: "self_improve", reason: "forge_timeout", change: func(f *publicationForge) { f.compareErr = context.DeadlineExceeded }},
 		{name: "issue_equal", kind: "issue"},
 		{name: "issue_reported_branch_replay", kind: "issue", reportedBranch: "agent/old"},
 		{name: "issue_reported_branch_retry", kind: "issue", reportedBranch: "agent/old", retry: true},
@@ -102,10 +112,15 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 				branch = "agent/rework"
 				e.exec(t, "UPDATE runs SET kind='mr_rework',pipeline_ref=$2,mr_iid=7,target_run_id=$1 WHERE id=$1", run, branch)
 			}
+			if tc.kind == "self_improve" {
+				branch = selfImproveBranch(run)
+				e.exec(t, "UPDATE runs SET kind='self_improve',branch='agent/prior-poison',pipeline_ref='agent/pipeline-poison' WHERE id=$1", run)
+			}
 			e.exec(t, "UPDATE runs SET claim_generation=1 WHERE id=$1", run)
 			hold := uuid.New()
 			e.exec(t, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
  VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, e.userID, e.repoID, run, wid)
+			sibling := mhOpenHold(t, e, e.seedLegacyRunningRun(t, wid), 1, wid)
 			old := mhOpenHold(t, e, run, 0, wid)
 			successor := mhOpenHold(t, e, run, 2, wid)
 			f := &publicationForge{t: t, projectID: 1, mrIID: mr, expectedBranch: branch, branch: branch, head: final, summaryHead: final, ancestry: forge.AncestryAncestor}
@@ -191,7 +206,7 @@ func TestCompletedPublicationLiveDB(t *testing.T) {
 					t.Fatalf("delayed refusal overwrote receipt: %d %v", n, err)
 				}
 			}
-			for _, id := range []uuid.UUID{old, successor} {
+			for _, id := range []uuid.UUID{old, successor, sibling} {
 				if state, _ := e.fpHoldEvidence(t, id); state != "open" {
 					t.Fatal("older/successor hold released")
 				}

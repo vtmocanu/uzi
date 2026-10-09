@@ -202,12 +202,18 @@ VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, e.userID, e.repoID, r
 }
 
 func TestCompletedPublicationNonCompletedCustodyLiveDB(t *testing.T) {
+	for _, kind := range []string{"issue", "self_improve"} {
+		t.Run(kind, func(t *testing.T) { completedPublicationNonCompletedCustody(t, kind) })
+	}
+}
+func completedPublicationNonCompletedCustody(t *testing.T, kind string) {
 	for _, status := range []string{"failed", "cancelled", "paused"} {
 		t.Run(status, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)
 			caps := []string{capability.RecoveryCompletedPublicationV1}
 			wid := e.seedWorker(t, caps)
 			run := e.seedLegacyRunningRun(t, wid)
+			e.exec(t, "UPDATE runs SET kind=$2 WHERE id=$1", run, kind)
 			gen := int64(1)
 			e.exec(t, "UPDATE runs SET claim_generation=1 WHERE id=$1", run)
 			if status == "paused" {

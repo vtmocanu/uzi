@@ -13,6 +13,12 @@ import (
 )
 
 func TestCompletedPublicationFencesLiveDB(t *testing.T) {
+	for _, kind := range []string{"issue", "self_improve"} {
+		t.Run(kind, func(t *testing.T) { completedPublicationFences(t, kind) })
+	}
+}
+
+func completedPublicationFences(t *testing.T, kind string) {
 	e := setupInterlockLiveDB(t)
 	wid := e.seedWorker(t, []string{capability.RecoveryCompletedPublicationV1})
 	run := e.seedLegacyRunningRun(t, wid)
@@ -20,6 +26,10 @@ func TestCompletedPublicationFencesLiveDB(t *testing.T) {
 	gen := int64(1)
 	head := strings.Repeat("a", 40)
 	branch := "agent/issue-1"
+	if kind == "self_improve" {
+		branch = selfImproveBranch(run)
+		e.exec(t, "UPDATE runs SET kind='self_improve',branch='agent/poisoned' WHERE id=$1", run)
+	}
 	mr := int64(7)
 	e.exec(t, "UPDATE runs SET claim_generation=1 WHERE id=$1", run)
 	e.exec(t, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
@@ -93,11 +103,20 @@ func TestCompletedPublicationFencesLiveDB(t *testing.T) {
 	if err != nil || success.CompletedPublicationReceipt == nil {
 		t.Fatalf("retry release: %+v %v", success, err)
 	}
+	zero("UPDATE recovery_custody_holds SET state='open',live_worker_id=$2,live_run_id=$3,final_disposition='settled',release_evidence='publication',completed_publication_receipt=NULL WHERE id=$1", hold, wid, run)
 	zero("UPDATE recovery_custody_holds SET completed_publication_receipt='{}' WHERE id=$1", hold)
 	zero("UPDATE recovery_custody_holds SET completed_publication_reason='forge_timeout' WHERE id=$1", hold)
 	n, err := e.q.RecordCompletedPublicationRefusal(e.ctx, store.RecordCompletedPublicationRefusalParams{HoldID: hold, RunID: run, UserID: e.userID, WorkerID: wid, Generation: gen, Identity: h.CompletionIdentity, Reason: pgconv.Text("forge_timeout")})
 	if err != nil || n != 0 {
 		t.Fatal("delayed refusal modified released hold")
+	}
+	n, err = e.q.ReleaseFinalInventoryHold(e.ctx, store.ReleaseFinalInventoryHoldParams{
+		ID: hold, RunID: run, UserID: e.userID, WorkerID: wid, Generation: gen,
+		FinalDisposition: "settled", ReleaseEvidence: "publication",
+		FinalCoverageDigest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	})
+	if err != nil || n != 0 {
+		t.Fatalf("delayed fallback mutated publication release: rows=%d err=%v", n, err)
 	}
 	got, _ := json.Marshal(success.CompletedPublicationReceipt)
 	var receipt []byte

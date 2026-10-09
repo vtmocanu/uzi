@@ -196,7 +196,8 @@ WHERE h.id = $2 AND h.run_id = $3 AND h.user_id = $4
             AND c.base_url = h.completion_identity->>'base_url'
             AND r.mr_iid::text = h.completion_identity->>'mr_iid'
             AND CASE WHEN r.kind = 'issue' THEN 'agent/issue-' || r.issue_iid::text
-                WHEN r.kind = 'mr_rework' THEN r.pipeline_ref END = h.completion_identity->>'branch')
+                WHEN r.kind = 'mr_rework' THEN r.pipeline_ref
+                WHEN r.kind = 'self_improve' THEN 'uzi/self-improve/' || r.id::text END = h.completion_identity->>'branch')
 `
 
 type ReleaseCompletedPublicationHoldParams struct {
