@@ -465,6 +465,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			slog.Error("current activity", "run_id", run.ID, "error", err)
 		} else {
 			dto.CurrentActivity = activity[run.ID]
+			setProgressPhase(&dto)
 		}
 	}
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
