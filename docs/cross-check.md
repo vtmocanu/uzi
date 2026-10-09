@@ -55,7 +55,8 @@ and submit failure retain their human fallback or terminal delivery exception.
 A Codex lead consumes automatic REVISE rounds without spending its human
 revision allowance, and implements exactly the approved checked plan. Its
 worker must advertise `cross_check_codex_lead_v1` to submit for a check. A
-Codex lead on a worker without it keeps the older park, with
+Codex lead on a worker without it, or on an api that does not signal support
+(see [rolling out](#rolling-out-codex-lead-checks)), keeps the older park, with
 `plan cross-check: not yet supported for a Codex lead`, and waits for a human.
 
 Checker runs use a dedicated cross-check lane (one slot by default); the lead
@@ -143,9 +144,17 @@ tool-path policy and the [architecture](../ARCHITECTURE.md#plan-cross-check).
 
 ## Rolling out Codex-lead checks
 
-Deploy the api and its migration before the workers. A new worker on an older
-api has its Codex-lead submit refused, so those runs go to the human gate until
-the api is upgraded. Migration 00314 allows Claude checker runs; its Down
+Deploy the api and its migration before the workers. A new api adds
+`plan_cross_check_codex_lead` to a Codex lead's claim. A new worker that does
+not receive it (an older api) does not submit the check and parks the lead at
+the human gate with `plan cross-check: not yet supported for a Codex lead`
+(`codex_lead_unsupported`), the same park as a Codex lead on an older worker,
+until the api is upgraded. A worker with `WORKER_CROSS_CHECK_SLOTS=0`
+(hosted: `UZI_WORKER_CROSS_CHECK_SLOTS=0`) takes no checker children; if no
+other worker of the user can, the check waits until its deadline and the lead
+takes the human gate, for either family (see
+[cross-check slots](./worker-setup.md#cross-check-slots)). Migration 00314
+allows Claude checker runs; its Down
 deletes Claude checker runs but keeps the check history, with the checker run
 link empty. Run the Down only with the new api stopped. With ephemeral workers
 off, the settings toggle warns when no online worker can run the checker,

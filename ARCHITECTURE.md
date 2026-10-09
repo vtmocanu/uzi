@@ -638,7 +638,8 @@ and preserves the separate human-revision builder. Exhaustion, BLOCK, timeout
 and other failures keep their fallbacks. A Codex lead consumes automatic
 rounds without spending its human revision budget and implements exactly the
 acknowledged checked plan; its submit requires its worker to advertise
-`cross_check_codex_lead_v1`, otherwise it keeps the older
+`cross_check_codex_lead_v1` and the api must send the claim field
+`plan_cross_check_codex_lead`, otherwise it keeps the older
 `codex_lead_unsupported` park to a human gate.
 
 Recovery follows the 2026-10-07 preserve-decided-fallback decision in
