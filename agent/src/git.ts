@@ -795,6 +795,8 @@ interface SpawnGitOptions {
   /** Inside a boundary scope: forwarded as BoundaryProcessRequest.timeoutMs, so the spawner
    *  terminates the child's process group when it elapses. Ignored outside a scope. */
   timeoutMs?: number;
+  /** Native producer only: retain this cause when its own deadline kills a still-running child. */
+  nativeTimeoutError?: Error;
   /** Cap on the stderr kept for the failure message (both paths). Default: the boundary path keeps
    *  up to GIT_MAX_BUFFER, the plain path keeps all of it. */
   stderrMaxBytes?: number;
@@ -6781,8 +6783,10 @@ export class GitCache {
     const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
     if (Number.isNaN(timeoutMs) || timeoutMs <= 0) throw new Error(`${what} has no time left`);
     if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
+    const deadlineError = new Error(`${what} exceeded ${timeoutMs}ms`);
     const { stdout } = await this.spawnGit(barePath, [...args], undefined, {
       timeoutMs,
+      nativeTimeoutError: deadlineError,
       stderrMaxBytes: READ_BARE_STDERR_MAX_BYTES,
     });
     return new Promise<BoundedRead>((resolve, reject) => {
@@ -6828,7 +6832,7 @@ export class GitCache {
       stdout.on("data", onData);
       stdout.once("end", onEnd);
       stdout.once("error", onError);
-      timer = setTimeout(() => finish(undefined, new Error(`${what} exceeded ${timeoutMs}ms`)), timeoutMs);
+      timer = setTimeout(() => finish(undefined, deadlineError), timeoutMs);
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -8701,7 +8705,13 @@ export class GitCache {
     };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
     const timeoutMs = recovery ? Math.min(opts.timeoutMs ?? Infinity, Math.max(1, recovery.deadline - Date.now())) : opts.timeoutMs;
-    const timeout = timeoutMs === undefined ? undefined : setTimeout(abortRecovery, timeoutMs);
+    let timeoutError: Error | undefined;
+    const timeout = timeoutMs === undefined ? undefined : setTimeout(() => {
+      if (timeoutMs === opts.timeoutMs && !killTimer && child.exitCode === null && child.signalCode === null) {
+        timeoutError = opts.nativeTimeoutError;
+      }
+      abortRecovery();
+    }, timeoutMs);
     child.once("close", () => {
       recovery?.signal.removeEventListener("abort", abortRecovery);
       if (timeout) clearTimeout(timeout);
@@ -8731,7 +8741,8 @@ export class GitCache {
     });
     child.on("error", (err) => gated.exited(err));
     child.on("close", (code) => {
-      if (code !== 0) {
+      if (timeoutError) gated.exited(timeoutError);
+      else if (code !== 0) {
         const detail = Buffer.concat(stderrChunks).toString().trim();
         gated.exited(new Error(`git ${args.join(" ")} exited ${code ?? "signal"}${detail ? `: ${detail}` : ""}`));
       } else gated.exited();

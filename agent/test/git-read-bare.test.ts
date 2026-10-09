@@ -97,6 +97,26 @@ describe("GitCache.readBare (PRD #1798 M5)", () => {
     });
   });
 
+  it("reports the read deadline when the native producer timeout closes before the reader timer", async (t) => {
+    await withBare({ "a.txt": "a" }, async (gc, bare) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const setTimer = globalThis.setTimeout;
+      let deadlineTimers = 0;
+      t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        // Keep the reader deadline pending while the actual producer timeout kills its child.
+        const delayMs = ms === 100 && ++deadlineTimers === 2 ? 101 : ms;
+        return setTimer(callback, delayMs, ...args);
+      });
+      const read = gc.readBare(bare, ["-c", "alias.wait=!sleep 3", "wait"], { maxBytes: 1024, timeoutMs: 100 });
+      const rejected = assert.rejects(read, /exceeded 100ms/);
+      await Promise.resolve(); // readBare installs its timer after awaiting spawnGit.
+      assert.equal(deadlineTimers, 2, "both 100ms deadlines were armed");
+      t.mock.timers.tick(100);
+      // No further clock advance: only the producer's timeout can cause this rejection.
+      await rejected;
+    });
+  });
+
   it("rejects at timeoutMs on a read that does not finish, and on a mid-read abort", async () => {
     await withBare({ "a.txt": "a" }, async (gc, bare) => {
       // A literal, inert alias that just waits: the read must not outlive its bound.
