@@ -2156,7 +2156,8 @@ it(`${checked ? "checked" : "ordinary"} confirmed human wait survives one real s
 });
 
 // PRD #2460: a Codex lead (claim.secrets.codex) takes the same checked path as a Claude lead.
-// The runner no longer parks it as codex_lead_unsupported; the Claude checker is server-side.
+// It no longer parks as codex_lead_unsupported when the api signals plan_cross_check_codex_lead
+// (an older api: see the "older api" describe below).
 describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
   const codexClaim = () => freshClaim(1, { kind: "issue", auto_approve: true, plan_cross_check_required: true,
     plan_cross_check_codex_lead: true,
@@ -2193,11 +2194,17 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
     const c = codexClaim();
     api.crossCheckHandler = ({ runId, body }) => {
       api.requestCredentialSwitch(runId, 1);
+      api.armStateAckCredentialSwitch(runId, 1);
       return { status: 200, body: answer(runId, body, "approve", "approve", canonicalOf(body)) };
     };
     let implemented = false;
     const exec: Executor = { run: async (ctx) => {
       const verdict = await ctx.gatePlan!(PLAN);
+      // The switch reaches this stub on one of two transports: the inputs poll aborting the checker
+      // call, or the canonical running report's state ack (which trips the switch and aborts ctx.signal
+      // before gatePlan resolves). An executor that does not wire attemptCredentialSwitch re-throws the
+      // abort reason, as a real one does; which transport wins is a timing race the test must not depend on.
+      ctx.signal?.throwIfAborted();
       if (verdict.kind === "approve") implemented = true;
       return { branch: ctx.branch };
     } };
