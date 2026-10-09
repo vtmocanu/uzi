@@ -3,9 +3,14 @@ import fs from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { it, mock } from "node:test";
+import { after, before, describe, it, mock } from "node:test";
 import { WorkerClient } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
+import { Worker } from "../src/worker.js";
+import type { Config } from "../src/config.js";
+import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
 import { RecoveryCoordinator, canonicalJson } from "../src/recovery.js";
 import { Outbox, type RawWriteSeam } from "../src/outbox.js";
 import { resolvePendingTerminal } from "../src/terminal-resolve.js";
@@ -24,6 +29,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   const events: string[] = [];
   const sent: StateRequest[] = [];
   let loseResponse = false, refuse = false, enabled = true, released = false;
+  let workerId = literal.worker_id;
   const branch = kind === "self_improve" ? "uzi/self-improve/" + literal.run_id : literal.branch;
   const receipt = { ...literal, branch };
   const claim = makeClaim({ run_id: receipt.run_id, claim_generation: 1, inventory_guarded: true,
@@ -31,18 +37,18 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     repo: { ...makeClaim().repo, id: literal.repo_id, forge_type: "gitlab" } });
   mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(String(input));
-      if (url.pathname.endsWith("/register")) return Response.json({ worker_id: literal.worker_id,
+      if (url.pathname.endsWith("/register")) return Response.json({ worker_id: workerId,
         protocol_features: ["claim_generation_fence", "recovery_inventory_v1", ...(enabled ? [feature] : [])] });
       if (url.pathname.endsWith("/claim")) return Response.json(claim);
       if (url.pathname.endsWith("/recovery-holds")) return Response.json({ run_id: receipt.run_id,
-        holds: released ? [] : [{ hold_id: receipt.hold_id, generation: 1, inventory_guarded: true, has_available_capture: false }] });
+        holds: released ? [] : [{ hold_id: receipt.hold_id, generation: receipt.generation, inventory_guarded: true, has_available_capture: false }] });
       if (url.pathname.endsWith("/state")) {
         const body = JSON.parse(String(init?.body)) as StateRequest;
         events.push("state:" + body.status);
         sent.push(body);
         if (body.status === "completed" && !refuse) released = true;
         if (loseResponse) throw new Error("response lost after API release");
-        return Response.json({ run: { ...wire.ack.run },
+        return Response.json({ run: { ...wire.ack.run, id: receipt.run_id, worker_id: workerId },
           ...(!refuse && enabled ? { completed_publication_receipt: receipt } : { completed_publication_reason: "mr_missing" }) });
       }
       if (url.pathname.includes("recovery-captures")) {
@@ -89,16 +95,28 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   };
   const send = async (b: StateRequest): Promise<StateAck> => {
     const ack = await client.reportState(receipt.run_id, b);
-    await run.observeSettlementTerminalAck(receipt.run_id, 1, b, ack);
+    await run.observeSettlementTerminalAck(receipt.run_id, receipt.generation, b, ack);
     return ack;
   };
-  const terminal = () => (run as unknown as {
-    journalAndSendTerminal(f: unknown, phase: string, b: StateRequest, sender: (b: StateRequest) => Promise<StateAck>): Promise<void>;
-  }).journalAndSendTerminal(flight, "running", body, send);
+  const terminal = (beforeResolve?: () => Promise<void>) => (run as unknown as {
+    journalAndSendTerminal(f: unknown, phase: string, b: StateRequest, sender: (b: StateRequest) => Promise<StateAck>, beforeResolve?: () => Promise<void>): Promise<void>;
+  }).journalAndSendTerminal(flight, "running", body, send, beforeResolve);
   const replay = () => resolvePendingTerminal(run.protectRecoveryTerminalDeps({
     outbox: outbox!, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger(),
-  }), { runId: receipt.run_id, claimGeneration: 1, send });
+  }), { runId: receipt.run_id, claimGeneration: receipt.generation, send });
   return { root, events, sent, receipt, recovery, record, run, flight, terminal, replay, outbox, client,
+    registerAs: async (id: string) => {
+      workerId = id; receipt.worker_id = id;
+      await client.register("identity-change");
+    },
+    select: (runId: string, generation: number) => {
+      receipt.run_id = runId; receipt.generation = generation;
+      claim.run_id = runId; claim.claim_generation = generation;
+      flight.runId = runId; flight.claimGeneration = generation;
+      body.claim_generation = generation;
+      released = false;
+    },
+    ineligible: (value: boolean) => { claim.kind = value ? "chat" : kind; },
     lose: (value: boolean) => { loseResponse = value; }, refuse: () => { refuse = true; },
     disable: async () => { enabled = false; await client.register("fixture"); },
     close: async () => { mock.restoreAll(); await fs.rm(root, { recursive: true, force: true }); } };
@@ -283,5 +301,216 @@ it("missing key and missing exact generation cannot silently persist or create r
     assert.equal(await f.recovery.persistCompletionReceipt({ ...f.receipt, generation: 2 }), false);
     assert.equal((await f.recovery.inspect(f.receipt.run_id)).length, 1);
     assert.equal((await f.recovery.inspect(f.receipt.run_id))[0]?.completionReceipt, undefined);
+  } finally { await f.close(); }
+});
+
+
+describe("P1-a/c: 4097 authenticated completing generations reclaim bindings through real protected retirement", () => {
+  let f: Awaited<ReturnType<typeof fixture>>;
+  before(async () => { f = await fixture(); });
+  after(async () => { await f.close(); });
+  // Serial chunks retain one client/runner and bound each test well below the timeout.
+  for (let chunk = 0; chunk < 5; chunk++) it("successful history chunk " + chunk, async () => {
+    // Remove only this fixture's proved record between iterations to keep disk work linear.
+    for (let n = chunk * 1024 + 1; n <= Math.min((chunk + 1) * 1024, 4097); n++) {
+      const id = n.toString(16).padStart(8, "0") + "-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      f.select(id, n);
+      await f.client.claimRun();
+      await f.client.listRecoveryHolds(id);
+      assert.ok(await f.recovery.pin({ runId: id, generation: n, sourceSha: "b".repeat(40),
+        inventoryGuarded: true, branch: literal.branch, kind: "issue" }));
+      await f.terminal();
+      assert.equal(await f.recovery.hasPersistedCompletionReceipt(id, n), true, "persisted receipt " + n);
+      assert.equal(f.outbox!.hasPendingTerminal(id, n), false, "real protected retirement " + n);
+      await fs.rm(path.join(f.root, "recovery", id), { recursive: true, force: true });
+      if (n === 4096) await f.client.register("same-worker-after-history");
+    }
+    assert.equal(f.events.includes("prepare"), false, "successful history never forces fallback");
+    assert.equal(f.sent.some(body => body.status === "failed"), false);
+  });
+});
+
+async function pressure(f: Awaited<ReturnType<typeof fixture>>) {
+  // Claim-only observations reserve the missing hold slot. The final unseen attempt taints.
+  for (let generation = 2; generation <= 4097; generation++) {
+    f.select(literal.run_id, generation);
+    await f.client.claimRun();
+  }
+  f.select(literal.run_id, 1);
+}
+
+it("P1-d: lost ACK original replays at capacity, persists and retires exact body/head", async () => {
+  const f = await fixture();
+  try {
+    f.lose(true);
+    await f.terminal();
+    const original = await f.outbox!.readTerminalJournal(literal.run_id, 1);
+    assert.ok(original);
+    await pressure(f);
+    await f.client.register("same-worker-under-pressure");
+    f.lose(false);
+    await f.replay();
+    assert.deepEqual(f.sent.at(-1), { ...original.body, claim_generation: 1 }, "exact original replay");
+    assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 1), true,
+      "original receipt remains accepted under pressure");
+    assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, 1), false, "protected original retired");
+    assert.equal(f.sent.some(body => body.status === "failed"), false);
+  } finally { await f.close(); }
+});
+
+it("P1-d: separate new attempt at capacity prepares before terminal send", async () => {
+  const f = await fixture();
+  try {
+    await pressure(f);
+    f.select(literal.run_id, 4098);
+    await f.terminal();
+    assert.ok(f.events.indexOf("prepare") >= 0);
+    assert.ok(f.events.indexOf("prepare") < f.events.indexOf("state:completed"),
+      "refused new completion-first attempt prepares before sending");
+    assert.equal(f.sent[0]?.completion_final_head, literal.final_head);
+    assert.equal(f.sent.some(body => body.status === "failed"), false);
+  } finally { await f.close(); }
+});
+
+it("P1-b: delayed pre-retirement inventory cannot recreate a released generation", async t => {
+  const f = await fixture();
+  try {
+    let complete!: (value: Response) => void;
+    const pending = new Promise<Response>(resolve => { complete = resolve; });
+    const originalFetch = globalThis.fetch;
+    t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      if (new URL(String(input)).pathname.endsWith("/recovery-holds")) return pending;
+      return originalFetch(input, init);
+    });
+    const inventory = f.client.listRecoveryHolds(literal.run_id);
+    await f.terminal();
+    complete(Response.json({ run_id: literal.run_id, holds: [{
+      hold_id: literal.owner_id, generation: 1, inventory_guarded: true,
+    }] }));
+    await inventory;
+    const ack = await f.client.reportState(literal.run_id, wire.request);
+    assert.equal(ack.completedPublicationReceipt, undefined, "skipped old inventory taints unknown provenance");
+    assert.equal((Reflect.get(f.client, "completionHolds") as Map<string, unknown>).has(literal.run_id + ":1"), false,
+      "old response must not recreate the retired binding");
+  } finally { await f.close(); }
+});
+
+it("P1-b: unlink failure keeps pending journal and exact client conflict protection", async t => {
+  const f = await fixture();
+  try {
+    const originalUnlink = fs.unlink;
+    t.mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => {
+      if (String(args[0]).includes("terminal")) throw Object.assign(new Error("unlink refused"), { code: "EIO" });
+      return originalUnlink(...args);
+    });
+    await f.terminal();
+    assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, 1), true, "failed unlink retains pending entry");
+    assert.ok((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"));
+  } finally { await f.close(); }
+});
+
+for (const mode of ["journal", "none", "reserve"] as const) {
+  it("P1-d: " + mode + " admission stays stable through pressure before first send", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      await f.terminal(async () => { await pressure(f); });
+      assert.equal(f.events.includes("prepare"), false, "admitted completion-first choice stays stable");
+      assert.equal(f.sent[0]?.completion_final_head, literal.final_head);
+      assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 1), true);
+      assert.equal(f.sent.some(body => body.status === "failed"), false);
+    } finally { await f.close(); }
+  });
+}
+
+for (const returnToA of [false, true]) {
+  it("P1-b: delayed receipt persistence cannot release bindings after " + (returnToA ? "A-B-A" : "A-B"), async t => {
+    const f = await fixture();
+    let finish!: () => void;
+    try {
+      const persist = f.recovery.persistCompletionReceipt.bind(f.recovery);
+      const pending = new Promise<void>(resolve => { finish = resolve; });
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      t.mock.method(f.recovery, "persistCompletionReceipt", async receipt => {
+        entered(); await pending; return persist(receipt);
+      });
+      const terminal = f.terminal();
+      await started;
+      await f.registerAs(literal.owner_id);
+      if (returnToA) await f.registerAs(literal.worker_id);
+      f.receipt.hold_id = literal.owner_id;
+      f.select(literal.run_id, 1);
+      await f.client.claimRun();
+      const inventory = await f.client.listRecoveryHolds(literal.run_id);
+      assert.equal(inventory.holds[0]?.hold_id, literal.owner_id, "conflicting new-incarnation hold was observed");
+      finish();
+      await terminal;
+      f.receipt.hold_id = literal.hold_id;
+      assert.equal((await f.client.reportState(literal.run_id, wire.request)).completedPublicationReceipt, undefined,
+        "new-incarnation foreign-hold binding survives old persisted retirement proof");
+    } finally { finish?.(); await f.close(); }
+  });
+}
+
+it("guarded new completion after ineligible history skips preparation", async () => {
+  const f = await fixture();
+  try {
+    f.select(literal.run_id, 2);
+    f.ineligible(true);
+    await f.client.claimRun();
+    f.select(literal.run_id, 3);
+    f.ineligible(false);
+    await f.client.claimRun();
+    await f.client.listRecoveryHolds(literal.run_id);
+    assert.ok(await f.recovery.pin({ runId: literal.run_id, generation: 3,
+      sourceSha: "b".repeat(40), inventoryGuarded: true, branch: literal.branch, kind: "issue" }));
+    await f.terminal();
+    assert.equal(f.events.includes("prepare"), false);
+    assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 3), true);
+    assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, 3), false);
+  } finally { await f.close(); }
+});
+
+for (const handler of ["resolveBootTerminals", "resolveRunTerminal", "sweepPendingTerminals"] as const) {
+  it("Worker " + handler + " replays lost ACK original after pressure with persisted receipt and retirement", async () => {
+    const f = await fixture();
+    try {
+      f.lose(true);
+      await f.terminal();
+      const original = await f.outbox!.readTerminalJournal(literal.run_id, 1);
+      assert.ok(original);
+      await pressure(f);
+      f.lose(false);
+      const w = new Worker({ gapFillMax: 100, outboxTerminalMaxBytes: 1 << 20 } as Config,
+        f.client, f.run, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(),
+        () => ({ ok: true, missing: [] }), f.outbox, new Map()) as unknown as {
+          resolveBootTerminals(signal: AbortSignal): Promise<void>;
+          resolveRunTerminal(id: string, signal: AbortSignal): Promise<void>;
+          sweepPendingTerminals(signal: AbortSignal): Promise<void>;
+        };
+      const signal = new AbortController().signal;
+      if (handler === "resolveRunTerminal") await w.resolveRunTerminal(literal.run_id, signal);
+      else await w[handler](signal);
+      assert.deepEqual(f.sent.at(-1), { ...original.body, claim_generation: 1 });
+      assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 1), true);
+      assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, 1), false);
+      assert.equal(f.sent.some(body => body.status === "failed"), false);
+    } finally { await f.close(); }
+  });
+}
+
+it("retiring different journal head cannot reclaim old persisted receipt bindings", async () => {
+  const f = await fixture();
+  try {
+    await f.terminal();
+    await f.client.claimRun();
+    await f.client.listRecoveryHolds(literal.run_id);
+    await f.outbox!.journalTerminal(literal.run_id, 1, "running", 7,
+      { ...wire.request, completion_final_head: "c".repeat(40) });
+    const deps = f.run.protectRecoveryTerminalDeps({
+      outbox: f.outbox!, client: f.client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger(),
+    });
+    assert.equal(await deps.outbox.retireTerminal(literal.run_id, 1), true);
+    assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), true);
   } finally { await f.close(); }
 });

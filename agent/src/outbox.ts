@@ -1436,15 +1436,30 @@ export class Outbox {
 
   /** Retire a terminal journal (the api applied the transition on a 200, or answered a 409 whose
    *  returned status is terminal): unlink the file and drop it from the pending set (D3). */
-  async retireTerminal(runId: string, claimGeneration: number): Promise<void> {
-    if (this.disabled) return;
-    await this.withRunLock(runId, async () => {
-      if (!this.validRunId(runId)) return;
-      if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
-      await fs
-        .rm(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)), { force: true })
-        .catch(() => undefined);
+  async retireTerminal(runId: string, claimGeneration: number): Promise<boolean> {
+    if (this.disabled) return false;
+    return this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return false;
+      if (!await this.readTerminalAuthed(runId, claimGeneration)) return false;
+      try {
+        await fs.unlink(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)));
+      } catch { return false; }
       this.runs.get(runId)?.terminals.delete(claimGeneration);
+      return true;
+    });
+  }
+
+  /** Positive absence proof for a successful unjournaled send, under the same run lock. */
+  async confirmTerminalAbsent(runId: string, claimGeneration: number): Promise<boolean> {
+    if (this.disabled || !this.validRunId(runId)) return false;
+    return this.withRunLock(runId, async () => {
+      if (this.hasPendingTerminal(runId, claimGeneration)) return false;
+      // Unknown or noncanonical physical aliases cannot prove absence.
+      if (await this.hasPhysicalTerminalProtection(runId)) return false;
+      try {
+        await fs.lstat(path.join(this.runDir(runId), terminalFileName(claimGeneration)));
+        return false;
+      } catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
     });
   }
 

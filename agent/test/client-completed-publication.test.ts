@@ -454,3 +454,121 @@ it("refuses known noneligible or unguarded claims", async () => {
     assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
   }
 });
+
+async function saturateClaims() {
+  for (let generation = 2; generation <= 4097; generation++) {
+    claim.claim_generation = generation;
+    await client.claimRun();
+  }
+  claim.claim_generation = 1;
+}
+
+it("P1-b/c: unresolved bound receipt survives capacity and same-worker registration without forgetting conflict", async () => {
+  await client.register("worker");
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  await saturateClaims();
+  await client.register("same-worker");
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt,
+    "fully observed unresolved original remains eligible under ordinary pressure");
+  assert.equal(client.canStartPublicationCompletion(RUN, 1), true,
+    "fully observed eligible generation remains admissible after saturation");
+  holds = [{ ...holds[0], hold_id: receipt.owner_id }];
+  await client.listRecoveryHolds(RUN);
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined,
+    "known hold conflict must survive capacity");
+});
+
+it("P1-b: inventory scans known conflict sibling after unseen overflow", async () => {
+  await client.register("worker");
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  await saturateClaims();
+  holds = [{ ...holds[0], generation: 4098 }, { ...holds[0], hold_id: receipt.owner_id }];
+  await client.listRecoveryHolds(RUN);
+  assert.equal((Reflect.get(client, "completionHolds") as Map<string, unknown>).get(RUN + ":1"), null,
+    "known contradictory sibling after unseen overflow must be poisoned");
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+});
+
+it("P1-b: ineligible history uses no binding budget and preserves eligible completion", async () => {
+  await client.register("worker");
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  for (let generation = 2; generation <= 4097; generation++) {
+    claim = { ...claim, kind: "chat", claim_generation: generation };
+    await client.claimRun();
+  }
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt,
+    "ineligible history must not exhaust eligible completion bindings");
+  claim.claim_generation = 1;
+  await client.claimRun();
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined,
+    "eligible to ineligible contradiction remains refused");
+});
+
+for (const returnToA of [false, true]) {
+  it("P1-b: delayed inventory from A cannot poison " + (returnToA ? "A after A-B-A" : "B"), async () => {
+    await client.register("A");
+    let finish!: (value: Response) => void;
+    const pending = new Promise<Response>(resolve => { finish = resolve; });
+    holdsResponse = () => pending as unknown as Response;
+    const inventory = client.listRecoveryHolds(RUN);
+    workerId = receipt.owner_id;
+    await client.register("B");
+    if (returnToA) { workerId = receipt.worker_id; await client.register("A-again"); }
+    holdsResponse = undefined;
+    await client.claimRun();
+    await client.listRecoveryHolds(RUN);
+    finish(Response.json({ run_id: RUN, holds: [{ ...holds[0], hold_id: receipt.owner_id }] }));
+    await inventory;
+    response = { ...fixture.ack, run: { ...fixture.ack.run, worker_id: workerId },
+      completed_publication_receipt: { ...receipt, worker_id: workerId } };
+    assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt,
+      response.completed_publication_receipt);
+  });
+}
+
+for (const failure of ["503", "transport"] as const) {
+  it("transient inventory " + failure + " preserves cached receipt and new admission", async () => {
+    await client.register("worker");
+    await client.claimRun();
+    await client.listRecoveryHolds(RUN);
+    holdsResponse = () => {
+      if (failure === "transport") throw new Error("temporary network failure");
+      return Response.json({ error: "temporary outage" }, { status: 503 });
+    };
+    await assert.rejects(client.listRecoveryHolds(RUN));
+    assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+    holdsResponse = undefined;
+    claim.claim_generation = 2;
+    await client.claimRun();
+    holds = [{ ...holds[0], generation: 2 }];
+    await client.listRecoveryHolds(RUN);
+    assert.equal(client.canStartPublicationCompletion(RUN, 2), true);
+    response.completed_publication_receipt = { ...receipt, generation: 2 };
+    assert.deepEqual((await client.reportState(RUN, { ...fixture.request, claim_generation: 2 })).completedPublicationReceipt,
+      { ...receipt, generation: 2 });
+  });
+}
+
+it("oversized inventory containing known contradiction hard refuses cached completion", async () => {
+  await client.register("worker");
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  holdsResponse = () => Response.json({ run_id: RUN,
+    holds: [{ ...holds[0], hold_id: receipt.owner_id }], padding: "x".repeat(1024 * 1024) });
+  await assert.rejects(client.listRecoveryHolds(RUN));
+  assert.equal(client.canStartPublicationCompletion(RUN, 1), false);
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+});
+
+it("admission reserves an unknown key before later provenance fills its counterpart", async () => {
+  await client.register("worker");
+  assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+  await saturateClaims();
+  await client.claimRun();
+  await client.listRecoveryHolds(RUN);
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
+});

@@ -2462,6 +2462,18 @@ export class RunRunner {
     return runId + ":" + generation;
   }
 
+  private readonly publicationAdmissions = new WeakMap<object, boolean>();
+  private readonly persistedReceiptProofs = new WeakSet<object>();
+
+  private selectPublicationCompletion(flight: RunFlight, body: StateRequest | Record<string, unknown>): boolean {
+    const prior = this.publicationAdmissions.get(body);
+    if (prior !== undefined) return prior;
+    const admitted = this.eligiblePublicationCompletion(flight, body) &&
+      this.client.canStartPublicationCompletion?.(flight.runId, flight.claimGeneration) !== false;
+    this.publicationAdmissions.set(body, admitted);
+    return admitted;
+  }
+
   private eligiblePublicationCompletion(flight: RunFlight, body: StateRequest | Record<string, unknown>): boolean {
     return flight.inventoryGuarded === true && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
       this.client.hasFeature("recovery_completed_publication_v1") && body.status === "completed" &&
@@ -2485,6 +2497,7 @@ export class RunRunner {
       this.unpersistedCompletionReceipts.add(key);
       const persisted = await this.recovery.persistCompletionReceipt(receipt).catch(() => false);
       if (persisted) {
+        this.persistedReceiptProofs.add(receipt);
         this.unpersistedCompletionReceipts.delete(key);
         this.persistedCompletionReceipts.add(key);
       }
@@ -4077,7 +4090,15 @@ export class RunRunner {
     const outbox = new Proxy(deps.outbox, {
       get: (target, property) => {
         if (property === "retireTerminal") return async (runId: string, generation: number) => {
-          if (!(await this.recoveryInventoryPending(runId, generation))) await target.retireTerminal(runId, generation);
+          const receipt = this.completionReceipts.get(this.completionKey(runId, generation));
+          const original = receipt && this.persistedReceiptProofs.has(receipt)
+            ? await target.readTerminalJournal(runId, generation) : undefined;
+          if (await this.recoveryInventoryPending(runId, generation)) return false;
+          const retired = await target.retireTerminal(runId, generation);
+          if (retired === true && receipt && this.persistedReceiptProofs.has(receipt) &&
+              original?.body.status === "completed" && original.body.completion_final_head === receipt.final_head)
+            this.client.releasePublicationCompletion?.(receipt);
+          return retired;
         };
         const value = Reflect.get(target, property);
         return typeof value === "function" ? value.bind(target) : value;
@@ -4085,6 +4106,15 @@ export class RunRunner {
     });
     this.protectedTerminalOutboxes.set(deps.outbox, outbox);
     return { ...deps, outbox };
+  }
+
+  private async releaseUnjournaledCompletion(flight: RunFlight, body: StateRequest): Promise<void> {
+    const receipt = this.completionReceipts.get(this.completionKey(flight.runId, flight.claimGeneration));
+    if (!receipt || !this.persistedReceiptProofs.has(receipt) ||
+        body.status !== "completed" || body.completion_final_head !== receipt.final_head) return;
+    // A disabled store cannot prove absence; a pending/unreadable original stays retained.
+    if (this.outbox && !(await this.outbox.confirmTerminalAbsent(flight.runId, flight.claimGeneration))) return;
+    this.client.releasePublicationCompletion?.(receipt);
   }
 
   private terminalDeps(): TerminalOutboxDeps | undefined {
@@ -4122,6 +4152,7 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
+    const admitted = this.selectPublicationCompletion(flight, body);
     const deps = this.terminalDeps();
     if (!deps) {
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
@@ -4129,7 +4160,7 @@ export class RunRunner {
       // (there is no journal to stale-retire on this degradation path), so this branch is otherwise
       // byte-for-byte unchanged.
       await beforeResolve?.();
-      const deferred = this.eligiblePublicationCompletion(flight, body);
+      const deferred = admitted;
       if (deferred) await this.bindCompletionSource(flight);
       else await flight.prepareTerminalInventory();
       try {
@@ -4137,7 +4168,8 @@ export class RunRunner {
           flight.completionSendAttempted = true;
           this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
         }
-        await send(body);
+        const ack = await send(body);
+        if (ack.applied && ack.status === "completed") await this.releaseUnjournaledCompletion(flight, body);
       } finally {
         if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
       }
@@ -4162,12 +4194,15 @@ export class RunRunner {
           flight.completionSendAttempted = true;
           this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
         }
-        return await send(b, sig);
+        const ack = await send(b, sig);
+        if (ack.applied && ack.status === "completed") await this.releaseUnjournaledCompletion(flight, b);
+        return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
         throw err;
       }
     };
+    if (!admitted && !deps.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration)) await flight.prepareTerminalInventory();
     const fence = flight.batcher.currentSeq();
     const installed = await installTerminalWriteAhead(deps, {
       runId: flight.runId,
@@ -4186,7 +4221,8 @@ export class RunRunner {
     const selected = installed.journaled
       ? (await deps.outbox.readTerminalJournal(flight.runId, flight.claimGeneration))?.body
       : ("canonical" in installed ? installed.canonical : undefined);
-    const deferred = !!selected && this.eligiblePublicationCompletion(flight, selected);
+    const deferred = !!selected && this.eligiblePublicationCompletion(flight, selected) &&
+      (installed.journaled || admitted);
     if (deferred) await this.bindCompletionSource(flight);
     if (!deferred && (installed.journaled || !("deferred" in installed))) await flight.prepareTerminalInventory();
     if (installed.journaled && !deferred) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
@@ -5407,9 +5443,10 @@ export class RunRunner {
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
           body.status === "completed" && typeof finalHead === "string" && /^[0-9a-f]{40}$/.test(finalHead))
         body = { ...body, completion_final_head: finalHead };
+      const admitted = this.selectPublicationCompletion(flight, body);
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
-          if (!this.eligiblePublicationCompletion(flight, body)) await flight.prepareTerminalInventory();
+          if (!admitted) await flight.prepareTerminalInventory();
           await batcher.close();
           // Journal write-ahead here too (D3): the deferred Codex sink sends through
           // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
@@ -5424,7 +5461,7 @@ export class RunRunner {
         });
         return;
       }
-      if (!this.eligiblePublicationCompletion(flight, body)) await flight.prepareTerminalInventory();
+      if (!admitted) await flight.prepareTerminalInventory();
       await closeBatcher();
       await journalTerminalReport(body);
       runLog.info(logMessage, fields);
