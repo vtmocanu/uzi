@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Documentation heading links work in the app ([#2262](https://github.com/vtmocanu/uzi/issues/2262)).**
+  In-app documentation headings have fragment IDs, and links to a heading scroll it into view with space for the mobile navigation bar.
+
 - **Codex commentary stays live during long tool calls ([#2283](https://github.com/vtmocanu/uzi/issues/2283)).**
   Assistant commentary is emitted while a tool callback is still running, so the run feed and transcript show it before the tool result. Ordinary tool callbacks remain serial, and cancellation still ends the turn promptly.
 
