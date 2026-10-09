@@ -173,24 +173,30 @@ func TestAnswerComposerUncertaintyResolvedByClosure(t *testing.T) {
 func TestAnswerComposerEditPagingReachability(t *testing.T) {
 	for _, options := range []bool{false, true} {
 		t.Run(fmt.Sprint(options), func(t *testing.T) {
-			q := map[string]any{"question": "QUESTIONBEGIN " + strings.Repeat("explain ", 500) + " REQUIREDTAIL"}
+			q := map[string]any{"question": "QUESTIONBEGIN " + strings.Repeat("explain ", 80) + " REQUIREDTAIL"}
 			if options {
-				q["options"] = []any{map[string]any{"label": "Current", "description": "DESCRIPTIONBEGIN " + strings.Repeat("describe ", 500) + " DESCRIPTIONTAIL"}}
+				q["options"] = []any{map[string]any{"label": "Current", "description": "DESCRIPTIONBEGIN " + strings.Repeat("describe ", 80) + " DESCRIPTIONTAIL"}}
 			}
 			wire, _ := json.Marshal(map[string]any{"question_id": "paging", "questions": []any{q}})
 			m, _ := answerFlowModel(t, string(wire))
 			m = answerUpdate(t, m, tea.WindowSizeMsg{Width: 80, Height: 16})
 			m = answerKeys(t, m, "i")
 			var seen strings.Builder
+			// Manual mode pins the option, adding one row to the paging limit.
+			_, limit, _ := m.answerLayout(m.answerRoom())
 			for _, key := range []string{"pgup", "pgdown", "pgup"} {
 				// One-row paging must reach the full prose even with a compact viewport.
-				for range 150 {
+				for range limit + 2 {
 					m = answerKeys(t, m, key)
 					view := stripANSI(m.View().Content)
 					seen.WriteString(view)
-					answerAssertView(t, m, "detail (optional)", "esc cancel", "pgup")
-					if options {
-						answerAssertView(t, m, "Current")
+					for _, marker := range []string{"detail (optional)", "esc cancel", "pgup"} {
+						if !strings.Contains(view, marker) {
+							t.Fatalf("paging hid %s:\n%s", marker, view)
+						}
+					}
+					if options && !strings.Contains(view, "› 1 [ ] Current") {
+						t.Fatalf("paging hid current option:\n%s", view)
 					}
 					lines := strings.Split(view, "\n")
 					if len(lines) > 16 {
@@ -216,9 +222,86 @@ func TestAnswerComposerEditPagingReachability(t *testing.T) {
 				}
 				m = answerKeys(t, m, "1")
 				answerAssertView(t, m, "› 1 [x] Current")
+				if m.detail.answer.draft().manualScroll || m.detail.answer.draft().editScroll != 0 {
+					t.Fatal("selection did not restore automatic focus")
+				}
 			}
 			answerAssertView(t, answerKeys(t, m, "pgup"), "detail (optional)")
 		})
+	}
+}
+
+// Read the actual View indicator only in tests; production uses layout metadata.
+func answerViewOffset(t *testing.T, m tuiModel) int {
+	t.Helper()
+	view := stripANSI(m.View().Content)
+	for _, line := range strings.Split(view, "\n") {
+		var offset, remaining int
+		if n, err := fmt.Sscanf(line, "┃ … ↑ %d lines · ↓ %d lines", &offset, &remaining); err == nil && n == 2 {
+			return offset
+		}
+	}
+	t.Fatalf("missing paging indicator:\n%s", view)
+	return 0
+}
+
+func TestAnswerComposerFirstPagingPreservesVisibleOffset(t *testing.T) {
+	wire, _ := json.Marshal(map[string]any{
+		"question_id": "first-page",
+		"questions": []any{map[string]any{
+			"question": "QUESTIONBEGIN " + strings.Repeat("explain ", 200) + " QUESTIONTAIL",
+			"options": []any{map[string]any{
+				"label":       "Current",
+				"description": "DESCRIPTIONBEGIN " + strings.Repeat("describe ", 80) + " DESCRIPTIONTAIL",
+			}},
+		}},
+	})
+	for _, dark := range []bool{false, true} {
+		for _, key := range []string{"pgdown", "pgup"} {
+			t.Run(fmt.Sprintf("dark=%v/%s", dark, key), func(t *testing.T) {
+				m, _ := answerFlowModel(t, string(wire))
+				m.dark = dark
+				var err error
+				m.renderer, err = newTUIRenderer(80, dark)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m = answerKeys(t, m, "i", "1")
+				for _, size := range [][2]int{{80, 16}, {40, 10}} {
+					// Picker navigation restores auto-focus before resizing the viewport.
+					m = answerKeys(t, m, "down")
+					m = answerUpdate(t, m, tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+					if m.answerTooSmall() || m.detail.answer.draft().manualScroll {
+						t.Fatal("expected accepted size with automatic focus")
+					}
+					before := answerViewOffset(t, m)
+					if before < 2 {
+						t.Fatalf("fixture did not auto-scroll: offset=%d", before)
+					}
+					m = answerKeys(t, m, key)
+					want := before + 1
+					if key == "pgup" {
+						want = before - 1
+					}
+					if after := answerViewOffset(t, m); after != want {
+						t.Fatalf("%s at %v: visible offset %d → %d, want %d", key, size, before, after, want)
+					}
+					if !m.detail.answer.draft().manualScroll || m.detail.answer.draft().editScroll != want {
+						t.Fatal("manual paging state disagrees with visible offset")
+					}
+					answerAssertView(t, m, "› 1 [x] Current", "detail (optional)", "esc cancel")
+					view := stripANSI(m.View().Content)
+					if len(strings.Split(view, "\n")) > size[1] {
+						t.Fatalf("paging exceeded height at %v", size)
+					}
+					for _, line := range strings.Split(view, "\n") {
+						if visualWidth(line) > size[0] {
+							t.Fatalf("paging exceeded width at %v: %s", size, line)
+						}
+					}
+				}
+			})
+		}
 	}
 }
 

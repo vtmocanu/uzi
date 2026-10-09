@@ -302,7 +302,7 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 	if d.review {
-		_, limit := m.answerLayout(m.answerRoom())
+		_, limit, _ := m.answerLayout(m.answerRoom())
 		d.reviewScroll = min(d.reviewScroll, limit)
 		switch k {
 		case "shift+tab":
@@ -338,7 +338,7 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 			}
 			return m, cmd, true
 		}
-		_, limit = m.answerLayout(m.answerRoom())
+		_, limit, _ = m.answerLayout(m.answerRoom())
 		d.reviewScroll = min(d.reviewScroll, limit)
 		return m, nil, true
 	}
@@ -351,9 +351,13 @@ func (m tuiModel) answerKey(k string) (tea.Model, tea.Cmd, bool) {
 	}
 	switch k {
 	case "pgup", "pgdown":
-		d.manualScroll = true
-		_, limit := m.answerLayout(m.answerRoom())
-		d.editScroll = min(d.editScroll, limit)
+		_, limit, start := m.answerLayout(m.answerRoom())
+		d.editScroll = start
+		if !d.manualScroll {
+			d.manualScroll = true
+			// Pinning the current option changes the available prose rows.
+			_, limit, _ = m.answerLayout(m.answerRoom())
+		}
 		if k == "pgup" {
 			d.editScroll = max(0, d.editScroll-1)
 		} else {
@@ -516,14 +520,15 @@ func (m tuiModel) answerNoticeOverflow() string {
 // Untrusted prose is sanitized before wrapping; focus has a text marker
 // so it survives an Ascii writer as well as a colour-capable terminal.
 func (m tuiModel) answerCardLines(rows int) []string {
-	lines, _ := m.answerLayout(rows)
+	lines, _, _ := m.answerLayout(rows)
 	return lines
 }
 
-func (m tuiModel) answerLayout(rows int) ([]string, int) {
+// answerLayout returns the card, scroll limit and currently rendered prose offset.
+func (m tuiModel) answerLayout(rows int) ([]string, int, int) {
 	d := m.detail.answer.draft()
 	if d == nil || rows == 0 {
-		return nil, 0
+		return nil, 0, 0
 	}
 	w := max(1, m.width)
 	wrap := func(s string) []string {
@@ -536,7 +541,7 @@ func (m tuiModel) answerLayout(rows int) ([]string, int) {
 	}
 	if m.answerTooSmall() {
 		lines := []string{clampVisual("┃ resize required to answer", w), clampVisual("┃ esc cancel", w)}
-		return lines[:min(rows, len(lines))], 0
+		return lines[:min(rows, len(lines))], 0, 0
 	}
 	title := "┃ ✎ SEND ANSWER?"
 	var content []string
@@ -668,7 +673,7 @@ func (m tuiModel) answerLayout(rows int) ([]string, int) {
 		lines = append(lines, clampVisual(fmt.Sprintf("┃ … ↑ %d lines · ↓ %d lines", start, len(content)-end), w))
 	}
 	lines = append(lines, bottom...)
-	return lines, limit
+	return lines, limit, start
 }
 
 // Composition uses the existing pinned slot. If it cannot coexist with a useful
