@@ -24,7 +24,8 @@ through `[0.52.0]`.)
 
 ### Changed
 
-- The lead context meter now reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)), skipping the per-category token-count API calls the full reading made each turn; the meter's values and timeout are unchanged.
+- **The lead context meter reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)).**
+  It skips the per-category token-count API calls the full reading made each turn; the summary answers from the last response's usage plus local estimates, and the meter's fields and timeout are unchanged.
 
 ### Fixed
 
