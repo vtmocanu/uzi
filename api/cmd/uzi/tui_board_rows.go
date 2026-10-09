@@ -329,10 +329,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	} else if terminalRunStatuses[r.Status] {
 		text.runWorkerName = "—"
 	}
-	workerWidth := 0
-	if m.width >= 120 {
-		workerWidth = 18 // two spaces and a fixed 16-column worker cell
-	}
+	workerWidth := m.boardWorkerWidth()
 	contentWidth := m.width - workerWidth
 	avail := max(0, contentWidth-visualWidth(row)-markerAllow)
 	if avail > boardTitleMax {

@@ -866,10 +866,9 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 // byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
 // in the frozen order, else `done/total done`), `stalled · since 16:41` (health_since, UTC like
 // the other since clauses), `waits on you · plan gate|question|follow-up` by status,
-// `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`; none or an unknown
-// state prints no row. Only
-// the closed state enum, the integer counts and server timestamps are drawn; the active
-// milestone id is used for its position and never printed.
+// `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`; none or an
+// unknown state prints no row. Only the closed state enum, the integer counts and server
+// timestamps are drawn; the active milestone id is used for its position and never printed.
 func progressRow(r apitypes.RunDTO) []string {
 	p := r.Progress
 	if p == nil {

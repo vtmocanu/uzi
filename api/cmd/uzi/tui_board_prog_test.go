@@ -85,8 +85,8 @@ func TestTUIBoardProgWidthShedding(t *testing.T) {
 	sawBarless, sawNone := false, false
 	for w := 60; w <= 200; w++ {
 		m := progBoard(t, w, run)
-		if m.boardShowProgBar() && !m.boardShowProg() {
-			t.Fatalf("width %d: PROG bar shown without MILES", w)
+		if m.boardShowProg() && !m.boardShowMile() {
+			t.Fatalf("width %d: PROG shown without MILES", w)
 		}
 		line := progLine(m, "cccccccc")
 		if line == "" {
@@ -104,6 +104,34 @@ func TestTUIBoardProgWidthShedding(t *testing.T) {
 	}
 	if !sawBarless || !sawNone {
 		t.Errorf("expected a bar-less band (%v) and a width without PROG (%v)", sawBarless, sawNone)
+	}
+}
+
+// The PROG column and its bar never flap: widening the terminal only ever turns them on, for
+// the own board with and without the credential column and the admin board.
+func TestTUIBoardProgMonotonicInWidth(t *testing.T) {
+	pct := 70
+	run := progRun("gggggggg", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
+	for _, cfg := range []struct {
+		name        string
+		admin, cred bool
+	}{{"own", false, false}, {"own+cred", false, true}, {"admin", true, false}} {
+		prevProg, prevBar := false, false
+		for w := 80; w <= 220; w++ {
+			m := progBoard(t, w, run)
+			m.board.admin = cfg.admin
+			if cfg.cred {
+				m.tokenCount = 2
+			}
+			prog, bar := m.boardShowProg(), m.boardShowProgBar()
+			if prevProg && !prog {
+				t.Errorf("%s width %d: PROG went on -> off as the terminal widened", cfg.name, w)
+			}
+			if prevBar && !bar {
+				t.Errorf("%s width %d: PROG bar went on -> off as the terminal widened", cfg.name, w)
+			}
+			prevProg, prevBar = prog, bar
+		}
 	}
 }
 
@@ -181,7 +209,7 @@ func TestTUIBoardProgTitleFloor(t *testing.T) {
 				i := strings.Index(line, "abcdefghij")
 				tw := 0
 				for _, r := range line[i:] {
-					if r < 'a' && r < '0' || r > 'z' {
+					if r < '0' || r > 'z' {
 						break
 					}
 					tw++

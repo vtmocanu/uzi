@@ -630,8 +630,7 @@ func boardMilestones(dark bool, now time.Time) string {
 func boardProgress(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
-	m.width = 116
-	m.renderer, _ = newTUIRenderer(m.transcriptWidth(), dark)
+	m = step(m, tea.WindowSizeMsg{Width: 116, Height: frameHeight})
 	pct := 70
 	mk := func(id, status, title string, age time.Duration, p *apitypes.RunProgress) apitypes.RunListItemDTO {
 		return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status, IssueTitle: title, CreatedAt: now.Add(-age),
