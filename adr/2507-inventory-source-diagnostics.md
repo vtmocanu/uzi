@@ -5,7 +5,9 @@ Refs: #2507
 
 ## Context
 
-Guarded recovery previously recorded only `inventory_source_not_quiescent`, obscuring which source proof refused FINAL. The observed automatic hold-release failure still requires live evidence. This change adds diagnostic evidence while preserving verified/unknown decisions, custody protection, immutable archive and FINAL identities, and the existing #2458 cleared-journal and #2433 missing-parent fixes.
+Guarded recovery previously recorded only `inventory_source_not_quiescent`, obscuring which source proof refused FINAL. The diagnostic stage did not establish the live cause of the observed automatic
+hold-release failure. The 2026-10-09 amendment below records the subsequently
+implemented release policy; live acceptance remains unproven here. This change adds diagnostic evidence while preserving verified/unknown decisions, custody protection, immutable archive and FINAL identities, and the existing #2458 cleared-journal and #2433 missing-parent fixes.
 
 ## Decision
 
@@ -39,8 +41,72 @@ The exact live retry set retains `capture_error`, `restart_upload_failed`, `uplo
 
 Recognized source refusals retain exponential live backoff, its existing ceiling, and the same request and archive. Diagnostic reasons remain MAC-covered by the existing journal authentication. They describe the last failed attempt, not a claim about the source's current state, and can remain after a later successful FINAL.
 
-Older workers can authenticate these records, but their needs-action allowlist does not recognize the new suffixes, so retry of those records stops on downgrade. This compatibility risk is accepted. No protocol, API, server DTO or CLI transport changes are made. CLI presentation is deferred because the server DTO carries no local diagnostic; any later exposure requires its own contract.
+Older workers can authenticate these records, but their needs-action allowlist does not recognize the new suffixes, so retry of those records stops on downgrade. This compatibility risk is accepted. The original diagnostic stage made no protocol, API, server DTO or CLI transport
+changes. CLI presentation of the local source-boundary diagnostic was deferred
+because the server DTO carried no such diagnostic. The later completed-publication
+receipt and reason below are a separate contract, not exposure of local diagnostics.
 
 ## Validation and follow-up
 
-Focused reader, runner and coordinator regressions cover failure classification, initial/final proof failures, observer isolation, sibling ordering, authenticated persistence, completed issue and MR-rework provenance, exact retry matching, repeated backoff and immutable replay. Live worker evidence and the original automatic release fix remain follow-up work outside this diagnostic change.
+Focused reader, runner and coordinator regressions cover failure classification, initial/final proof failures, observer isolation, sibling ordering, authenticated persistence, completed issue and MR-rework provenance, exact retry matching, repeated backoff and immutable replay. At the original diagnostic stage, live worker evidence and the automatic release
+fix remained follow-up work. The release policy is now implemented as recorded
+below; this ADR does not claim production, live acceptance or deployment evidence.
+
+## Amendment 2026-10-09 — maintainer decision: completed-publication release
+
+**Status**: Implemented in API and worker. The archive diagnostics above remain
+in force, including failed/cancelled foreground `execution_tail_present`.
+They describe source-boundary refusal on the archive path, not a prerequisite
+for successful completed-publication custody release.
+
+With `recovery_completed_publication_v1` negotiated by worker and API, a
+guarded COMPLETED `issue`, `mr_rework` or `self_improve` run can release
+its exact completing-generation hold synchronously. Completion and immutable
+identity commit first. The API proves that the recorded MR in the own repository
+names the server-derived branch, BranchHead H equals MR HeadSHA, and
+`CompareAncestry(H, finalSHA)` proves containment or equality of the durably
+reported final SHA. Issue authority is `agentIssueBranch(issue)`, MR-rework
+authority is the frozen `pipeline_ref` candidate, and self-improvement
+authority is `selfImproveBranch(runID)` (`uzi/self-improve/<run-id>`), not
+its tracking issue, pipeline or a worker-reported branch.
+
+Success atomically stores and ACKs `completed_publication_receipt`.
+Missing, mismatched, unknown, erroring or drifting evidence retains custody
+with `completed_publication_reason`. Exact stored-receipt replay precedes
+mutable run/forge eligibility. A matching own-repository copy qualifies without
+a non-fork or branch-protection guarantee; later user deletion or rewriting
+is outside scope. Healthy release adds no heartbeat prerequisite.
+
+The worker preserves its fixed original terminal outcome before preparation
+when durable outbox storage is available. A valid receipt skips capture, WIP,
+freeze and clean-source proof, including with existing available/thin/needs-action
+captures. It must be persisted and read back in an existing MAC-authenticated
+generation recovery record before protected report retirement. Other responses
+use original capture fallback, including mixed versions or an API that
+advertises the feature but excludes the kind. Lost ACK plus capture refusal
+cannot fail/reopen completion or authorize cleanup; original completion replay
+recovers the receipt. No-outbox/reserve attempted-send guards prevent false
+failure without a new durable journal.
+
+Physical destruction stays separate: quiescence, credential isolation,
+exact canonical owned path, expected SHA and attribution, execution/adoption
+exclusion through destruction and bare locks remain required. Eligible
+dirty/untracked completing-source leftovers may be discarded; siblings, shared
+pins, consumed metadata, foreign/unknown inventory and quarantine are retained.
+Metadata follows actual disposal with one bounded EIO retry; the existing
+retired-attempt ledger can finish exact old-journal clearing, while lost proof
+retains remaining artifacts without new crash discovery. No standalone
+receipt or tombstone is introduced and archive retention is unchanged.
+
+Owner hold DTOs and state ACKs expose the receipt/reason fields. CLI recovery
+shows bounded refusal reasons and exact-run final SHA, observed head, branch
+and MR independently of archive availability and physical retirement; JSON
+fields are additive and older APIs may omit them. Older/successor holds and
+unstamped older completions, including earlier self runs, gain no authority.
+Failed/cancelled/parked runs and `ci_fix`/`prompt`/`task` remain unchanged.
+This adds no intent, endpoint, discovery, driver or E2E mechanism. #2544 quota,
+#2545 failed publication and #2506 failed thin release are excluded.
+
+See [ADR-1296](1296-durable-run-recovery.md#amendment-2026-10-09--2507-synchronous-completed-publication-release)
+for proof bindings and [ADR-2417](2417-guarded-local-retention.md#amendment-2026-10-09--completed-publication-receipt-authority)
+for physical cleanup and protected report retirement.

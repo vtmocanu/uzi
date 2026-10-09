@@ -4813,6 +4813,25 @@ export interface RecoveryArchiveSummary {
 // checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
 // superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
+  // Publication proof is independent of capture coverage and physical retirement.
+  // Older servers omit both fields.
+  completed_publication_receipt?: {
+    hold_id: string;
+    run_id: string;
+    owner_id: string;
+    worker_id: string;
+    generation: number;
+    final_head: string;
+    repo_id: string;
+    connection_id: string;
+    project_id: number;
+    forge_type: string;
+    base_url: string;
+    branch: string;
+    mr_iid: number | null;
+    observed_branch_head: string;
+  };
+  completed_publication_reason?: string;
   inventory_guarded: boolean;
   final_receipt?: { kind: string; capture_id?: string; source_sha?: string; coverage_digest: string };
   terminal_record_rejection?: string;

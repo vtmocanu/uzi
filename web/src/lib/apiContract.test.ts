@@ -1191,6 +1191,24 @@ it("recorded nested checker metadata always has the nullable member", () => {
   void _recoveryCustodyHoldFull;
 }
 
+it("recovery publication receipt matches the Go contract and permits older servers", () => {
+  const full: RecoveryCustodyHold = recoveryCustodyHoldFull;
+  const older: RecoveryCustodyHold = recoveryCustodyHoldZero;
+  expect(full.completed_publication_reason).toBe("x");
+  expect(full.completed_publication_receipt).toEqual({
+    hold_id: "x", run_id: "x", owner_id: "x", worker_id: "x", generation: 1,
+    final_head: "x", repo_id: "x", connection_id: "x", project_id: 1,
+    forge_type: "x", base_url: "x", branch: "x", mr_iid: 1,
+    observed_branch_head: "x",
+  });
+  expect(older.completed_publication_receipt).toBeUndefined();
+  expect(older.completed_publication_reason).toBeUndefined();
+  const withoutMR: NonNullable<RecoveryCustodyHold["completed_publication_receipt"]> = {
+    ...full.completed_publication_receipt!, mr_iid: null,
+  };
+  expect(withoutMR.mr_iid).toBeNull();
+});
+
 // ── RecoveryCustodyAggregate (PRD #1349 M1) ──────────────────────────────────
 // All four fields are ints, so the zero.json carries no null (declared nullable:false).
 {

@@ -34,7 +34,7 @@ func (f *completionRouteForge) GetMergeRequestSummary(context.Context, int64, in
 	return forge.MergeRequestSummary{SourceBranch: f.branch, HeadSHA: settleHead}, nil
 }
 func TestCompletedPublicationHandlerLiveDB(t *testing.T) {
-	for _, kind := range []string{"issue", "self_improve"} {
+	for _, kind := range []string{"issue", "mr_rework", "self_improve"} {
 		t.Run(kind, func(t *testing.T) { completedPublicationHandler(t, kind) })
 	}
 }
@@ -48,6 +48,10 @@ func completedPublicationHandler(t *testing.T, kind string) {
 	repo := rmSeedRepo(t, pool, conn, 2507, true)
 	run := rmSeedRun(t, pool, owner, repo, "running")
 	branch := "agent/issue-7"
+	if kind == "mr_rework" {
+		branch = "agent/rework-7"
+		cliMustExec(t, pool, "UPDATE runs SET kind='mr_rework',pipeline_ref=$2,mr_iid=17,target_run_id=$1,branch='agent/prior-poison' WHERE id=$1", run, branch)
+	}
 	if kind == "self_improve" {
 		branch = "uzi/self-improve/" + run.String()
 		cliMustExec(t, pool, "UPDATE runs SET kind='self_improve',branch='agent/prior-poison',pipeline_ref='agent/pipeline-poison' WHERE id=$1", run)
@@ -75,7 +79,7 @@ func completedPublicationHandler(t *testing.T, kind string) {
 		t.Fatal(err)
 	}
 	body := string(wire.Request)
-	if kind == "self_improve" {
+	if kind == "self_improve" || kind == "mr_rework" {
 		var request map[string]any
 		if err := json.Unmarshal(wire.Request, &request); err != nil {
 			t.Fatal(err)

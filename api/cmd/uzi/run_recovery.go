@@ -36,8 +36,13 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"owner-wide custody summary. With a run id, show that run's retained holds: each hold's exact id, " +
 			"claim generation, server-derived disposition, and the latest capture's state.\n\n" +
 			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
-			"archive: recover it with `run export`; the hold releases itself once the archive is " +
-			"durable. A `source_only` or `needs_action` hold retains local inventory and awaits your " +
+			"archive: recover it with `run export`. An unguarded hold can release when the archive is " +
+			"durable; guarded inventory requires verified final coverage or an explicit disposition. " +
+			"Eligible guarded COMPLETED issue/mr_rework/self_improve runs may instead release after " +
+			"the API proves publication of the fixed final SHA on the branch and MR. This exception " +
+			"does not backfill old runs; failed/cancelled/parked runs and ci_fix/prompt/task are unchanged. " +
+			"Publication releases custody, independently of capture availability or physical retirement. " +
+			"A `source_only` or `needs_action` hold retains local inventory and awaits your " +
 			"decision to discard it with `run discard <run-id> --hold <hold-id> --yes`. " +
 			"Archive availability is independent of attention: export an available archive even for a " +
 			"decision hold; it may not cover the latest work. A latest preparing/uploading capture is " +
@@ -162,6 +167,9 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		p.Printf("no open custody holds\n")
 	}
 	for _, h := range open {
+		if line := completedPublicationReasonLine(h); line != "" {
+			p.Printf("%s\n", line)
+		}
 		if copy := terminalRejectionCopy(h); copy != "" {
 			p.Printf("run %s hold %s gen %d: %s\n", cellText(h.RunID), cellText(h.ID), h.Generation, copy)
 		}
@@ -183,6 +191,33 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		printRecoveryHint(p, exportable, decisionNeeded, "<run-id>")
 	}
 	return nil
+}
+
+// completedPublicationReasonLine bounds and sanitizes the API's refusal diagnostic.
+func completedPublicationReasonLine(h apitypes.RecoveryCustodyHoldDTO) string {
+	if reason := cellText(h.CompletedPublicationReason); reason != "" {
+		return fmt.Sprintf("run %s hold %s gen %d: completed publication refused: %s",
+			cellText(h.RunID), cellText(h.ID), h.Generation, reason)
+	}
+	return ""
+}
+
+// completedPublicationLine keeps publication proof separate from capture and retirement.
+func completedPublicationLine(h apitypes.RecoveryCustodyHoldDTO) string {
+	r := h.CompletedPublicationReceipt
+	if r == nil {
+		return ""
+	}
+	custody := "custody release not confirmed"
+	if h.State == "released" {
+		custody = "custody released"
+	}
+	mr := "-"
+	if r.MRIID != nil {
+		mr = strconv.FormatInt(*r.MRIID, 10)
+	}
+	return fmt.Sprintf("hold %s completed publication: fixed final SHA %s; observed branch head %s; branch %s; MR %s; %s; archive available: %t; physical retirement not confirmed",
+		cellText(h.ID), cellText(r.FinalHead), cellText(r.ObservedBranchHead), cellText(r.Branch), mr, custody, h.HasAvailableCapture)
 }
 
 const terminalMACFailureCopy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
@@ -346,6 +381,12 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		return err
 	}
 	for _, h := range holds {
+		if line := completedPublicationReasonLine(h); line != "" {
+			p.Printf("%s\n", line)
+		}
+		if line := completedPublicationLine(h); line != "" {
+			p.Printf("%s\n", line)
+		}
 		if copy := terminalRejectionCopy(h); copy != "" {
 			p.Printf("run %s hold %s gen %d: %s\n", cellText(h.RunID), cellText(h.ID), h.Generation, copy)
 		}

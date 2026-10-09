@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
   Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
 
+- **Completed issue, MR-rework and self-improvement runs can release guarded custody after verified publication ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
+  With worker and API support, completion commits before the API verifies the fixed final commit against the run's recorded branch and MR, releasing only the exact completing-generation hold and returning a replayable receipt; no new archive is required, and existing archives retain their normal policy. CLI recovery shows the receipt or bounded refusal reason separately from archive availability. Physical cleanup still requires authenticated receipt persistence, quiescence, exact source attribution and execution/adoption exclusion, retaining sibling, shared, unknown or quarantined evidence. Failed, cancelled, parked and other run kinds keep their existing rules, and older completed holds are not backfilled.
+
 ### Changed
 
 - **A Codex lead's plan is now cross-checked by a read-only Claude checker ([#2460](https://github.com/vtmocanu/uzi/issues/2460)).**
