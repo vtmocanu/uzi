@@ -11,6 +11,7 @@ import { BODY_CAP_CHARS, REGION_CAP_BYTES, renderRegion, renderBody } from "../s
 import { editorRequest, editorStageTransport, evaluateEditorResponse, evalLog, loadEditorFixtures, sanitizeEditorFields } from "../src/pr-description-eval.js";
 import { parseEvalArgs, runEvalCli } from "../src/pr-description-eval-cli.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 
 const checkout = path.resolve("..");
 const fixture = async () => (await loadEditorFixtures(checkout))[0]!;
@@ -24,6 +25,7 @@ const args = (harness = "claude", mode = "revised", model = "haiku") =>
 const env = { CLAUDE_CODE_OAUTH_TOKEN: ["fixture-", "oauth-no-authority"].join(""), OPENAI_API_KEY: ["sk-", "fixture-no-authority"].join("") };
 
 async function localAssets(run: (root: string, dir: string) => Promise<void>) {
+  await fs.mkdir(path.join(checkout, ".uzi/scratch"), { recursive: true });
   const root = await fs.mkdtemp(path.join(checkout, ".uzi/scratch/eval-input-test-"));
   const dir = path.join(root, "fixtures/pr-description-editor");
   try {
@@ -252,7 +254,7 @@ test("actual Claude seam retains responses over 64 KiB with silent output and SD
     yield { type: "result", subtype: "success", is_error: false };
   }) as SdkQueryFn;
   const signals = new EventEmitter();
-  await runEvalCli(args(), { checkout, env, signals, queryFn, write: (row) => rows.push(row) });
+  await runEvalCli(args(), { checkout, env, signals, queryFn, teardownTestDeps: portableTeardownTestDeps, write: (row) => rows.push(row) });
   assert.equal(rows.length, 5);
   assert.ok(JSON.parse(rows[0]!).would_publish);
   assert.ok(rows.every((r) => !r.includes("Cache") && !r.includes(env.CLAUDE_CODE_OAUTH_TOKEN) && !r.includes(env.OPENAI_API_KEY)));
@@ -299,7 +301,7 @@ for (const scenario of ["error", "timeout", "SIGINT", "SIGTERM", "SIGHUP"] as co
       assert.ok(controller.signal.aborted);
       yield { type: "result", subtype: "success", is_error: false };
     }) as SdkQueryFn;
-    await runEvalCli(args(), { checkout, env, signals, timeoutMs: scenario === "timeout" ? 100 : 1000, queryFn, write: (r) => rows.push(r) });
+    await runEvalCli(args(), { checkout, env, signals, timeoutMs: scenario === "timeout" ? 100 : 1000, queryFn, teardownTestDeps: portableTeardownTestDeps, write: (r) => rows.push(r) });
     assert.equal(JSON.parse(rows[0]!).error, scenario === "error" ? "provider_failed" : scenario === "timeout" ? "timeout" : "interrupted");
     for (const home of homes) await assert.rejects(fs.stat(home));
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) assert.equal(signals.listenerCount(name), 0);

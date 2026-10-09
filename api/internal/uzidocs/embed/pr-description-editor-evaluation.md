@@ -15,6 +15,8 @@ Use the repository's Node 24 runtime and installed agent dependencies, including
 
 Claude reads only CLAUDE_CODE_OAUTH_TOKEN for provider authentication and uses the unchanged runReadOnlyModelPass, buildSdkEnv and ClaudeAdviceHarness SDK query. Codex reads only OPENAI_API_KEY and uses the sanctioned evaluator factory, actual CodexAdviceHarness and production api_key login RPC. Supply credentials through the process environment; never include them in arguments or result attachments. This does not change production model selection.
 
+Run live evaluations on Linux. The Claude pass reuses production HOME cleanup, which removes the SDK HOME through a descriptor-pinned helper and refuses other hosts; on macOS, run the commands inside the worker image (it carries Node 24, Go and the pinned Codex executable) with the checkout mounted and the credentials passed as environment variables. The Go helper reuses the caller's effective GOPATH, GOCACHE and GOMODCACHE, resolved before its HOME is replaced.
+
 From the agent directory, maintainers run these four comparisons:
 
 ```sh

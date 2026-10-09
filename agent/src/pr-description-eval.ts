@@ -80,6 +80,31 @@ export async function editorRequest(checkout: string, fixture: EditorFixture, op
   };
 }
 
+/** The caller's effective Go cache paths, resolved before the helper's HOME is replaced so the
+ * default caches stay visible. Only tool coordinates reach `go env`; on any failure the helper
+ * falls back to caches under the scratch HOME.
+ */
+async function goCacheDirs(): Promise<Record<string, string>> {
+  const callerEnv: NodeJS.ProcessEnv = {};
+  for (const key of ["HOME", "PATH", "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE", "XDG_CACHE_HOME"] as const) {
+    if (process.env[key]) callerEnv[key] = process.env[key];
+  }
+  const output = await new Promise<string>((resolve) => {
+    execFile("go", ["env", "-json", "GOPATH", "GOCACHE", "GOMODCACHE"], {
+      env: callerEnv, timeout: 30_000, maxBuffer: 64 * 1024,
+    }, (error, stdout) => resolve(error ? "" : stdout));
+  });
+  const dirs: Record<string, string> = {};
+  try {
+    const value: unknown = JSON.parse(output);
+    for (const key of ["GOPATH", "GOCACHE", "GOMODCACHE"] as const) {
+      const dir = value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
+      if (typeof dir === "string" && path.isAbsolute(dir)) dirs[key] = dir;
+    }
+  } catch { /* fall back to the scratch HOME's defaults */ }
+  return dirs;
+}
+
 /** One bounded helper process, no retries. Failure blocks this fixture, not sibling fixtures.
  * Replacement environment contains tool/cache coordinates only, never model or worker auth.
  */
@@ -87,7 +112,7 @@ export async function sanitizeEditorFields(checkout: string, fields: RawPrDescri
   const input = JSON.stringify({ fields });
   if (Buffer.byteLength(input) > 4 * 1024 * 1024) throw new Error("helper_failed");
   const scratch = path.join(checkout, ".uzi/scratch");
-  const env: NodeJS.ProcessEnv = { HOME: scratch, GOFLAGS: "-buildvcs=false" };
+  const env: NodeJS.ProcessEnv = { HOME: scratch, GOFLAGS: "-buildvcs=false", ...(await goCacheDirs()) };
   for (const key of ["PATH", "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE"] as const) {
     if (process.env[key]) env[key] = process.env[key];
   }

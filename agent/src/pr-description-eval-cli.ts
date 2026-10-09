@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { runReadOnlyModelPass } from "./model-pass.js";
 import { defaultQueryFn } from "./sdk-messages.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
+import type { TeardownTestDeps } from "./rmtree.js";
 import { makePrDescriptionEvalCodexFactory } from "./codex/codex-executor.js";
 import {
   editorRequest, evaluateEditorResponse, evalLog, loadEditorFixtures,
@@ -21,6 +22,8 @@ export interface EvalCliDeps {
   };
   timeoutMs?: number;
   queryFn?: SdkQueryFn;
+  /** Test-only teardown seam, passed to runReadOnlyModelPass; production keeps pinned Linux cleanup. */
+  teardownTestDeps?: TeardownTestDeps;
   codexFactory?: typeof makePrDescriptionEvalCodexFactory;
   pass?: (request: PassRequest, opts: EvalOptions, signal: AbortSignal) => Promise<string>;
 }
@@ -78,6 +81,7 @@ async function runEditorPass(request: PassRequest, opts: EvalOptions, signal: Ab
     ...request, token: deps.env.CLAUDE_CODE_OAUTH_TOKEN, homeRoot: path.join(deps.checkout, ".uzi/scratch"),
     homePrefix: "uzi-summary-eval-", label: "summary", timeoutMs, queryFn,
     denyReason: "the summary runner is read-only and runs no tools", log: evalLog,
+    teardownTestDeps: deps.teardownTestDeps,
   });
 }
 
