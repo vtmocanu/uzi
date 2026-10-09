@@ -195,6 +195,26 @@ func TestRunnerDefaultsAndRealTimerCancellation(t *testing.T) {
 	}
 }
 
+func TestRunnerRealTimerInvokesCheck(t *testing.T) {
+	checked := make(chan struct{}, 1)
+	rn := &Runner{
+		settings:  &fakeSettings{interval: time.Hour},
+		bootDelay: time.Nanosecond,
+		logger:    quietLogger(),
+		check: checkerFunc(func(context.Context) (Result, error) {
+			checked <- struct{}{}
+			return Result{Status: statusOK}, nil
+		}),
+	}
+	stop := startRunner(t, rn)
+	select {
+	case <-checked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("real timer elapsed without invoking the scheduled check")
+	}
+	stop()
+}
+
 func TestRunnerPositiveIntervalAndBootDelay(t *testing.T) {
 	w := newManualWait()
 	set := &fakeSettings{interval: 30 * time.Second}
