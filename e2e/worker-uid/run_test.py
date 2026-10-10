@@ -100,6 +100,23 @@ sys.exit(rc)
         self.assertEqual(run[run.index("--test-name-pattern") + 1], "^suite leaf$")
         self.assertIn("--test-timeout=120000", run)
         self.assertIn("--test-reporter=junit", run)
+        self.assertEqual([arg for arg in run if arg.startswith("/app/test/") and arg.endswith(".test.ts")], [
+            "/app/test/codex-launcher.test.ts", "/app/test/codex-executor.test.ts",
+            "/app/test/codex-shared-dir.test.ts", "/app/test/entrypoint-migration.test.ts",
+            "/app/test/git-planning-diff.test.ts",
+        ])
+        self.assertEqual(run[run.index("--entrypoint") + 1], "/usr/local/sbin/uzi-entrypoint")
+        self.assertEqual(run[run.index("--network") + 1], "none")
+        self.assertEqual(run[run.index("--cap-drop") + 1], "ALL")
+        self.assertEqual([run[index + 1] for index, arg in enumerate(run) if arg == "--cap-add"],
+                         ["CHOWN", "DAC_OVERRIDE", "SETPCAP", "SETUID", "SETGID"])
+        self.assertEqual(run[run.index("--security-opt") + 1], "no-new-privileges")
+        self.assertEqual([run[index + 1] for index, arg in enumerate(run) if arg == "--tmpfs"],
+                         ["/data", "/nix"])
+        self.assertEqual(run[run.index("--entrypoint") + 2:run.index("--test")], [
+            "fixture-image", "/usr/local/bin/node", "--import", "tsx",
+            "--import", "/app/test/setup/hermetic-proc.ts",
+        ])
         return result, calls
 
     def test_success_and_build(self):
