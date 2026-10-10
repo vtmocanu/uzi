@@ -397,19 +397,19 @@ not a reproduction on the operator's deployment.
 > or a refusal history. Count refusals without a capture row are not covered.
 >
 > Regression evidence: U1's same
-> [live recovery](../agent/test/issue-1995-live-recovery.test.ts) and
-> [inventory](../agent/test/recovery-inventory.test.ts) selection produced
+> [live recovery](https://github.com/vtmocanu/uzi/blob/4adc57f5f2148de389652f3a2566321e1a550aa0/agent/test/issue-1995-live-recovery.test.ts) and
+> [inventory](https://github.com/vtmocanu/uzi/blob/4adc57f5f2148de389652f3a2566321e1a550aa0/agent/test/recovery-inventory.test.ts) selection produced
 > 6 behavioral failures / 301 passes with the fix absent (compile passed),
 > and 307 passes after restoration.
-> [Guarded producer](../agent/test/recovery-guarded-producer.test.ts)
+> [Guarded producer](https://github.com/vtmocanu/uzi/blob/4adc57f5f2148de389652f3a2566321e1a550aa0/agent/test/recovery-guarded-producer.test.ts)
 > controls separately passed 12 tests.
 > U2's
-> [TestRecoveryStorageAccountingLiveDB and TestRecoveryStorageUploadRefusalHealthLiveDB](../api/internal/handler/recovery_storage_health_livedb_test.go)
+> [TestRecoveryStorageAccountingLiveDB and TestRecoveryStorageUploadRefusalHealthLiveDB](https://github.com/vtmocanu/uzi/blob/c7a7bdac9237f800ee79adae1a264181231ae2fc/api/internal/handler/recovery_storage_health_livedb_test.go)
 > establish a real HTTP 507 and persisted marker before testing warning and
 > byte accounting.
-> [TestAdminHealthAuthLiveDB](../api/internal/handler/health_admin_livedb_test.go)
+> [TestAdminHealthAuthLiveDB](https://github.com/vtmocanu/uzi/blob/c7a7bdac9237f800ee79adae1a264181231ae2fc/api/internal/handler/health_admin_livedb_test.go)
 > and
-> [TestRecoveryInventoryExpiryHandoffLiveDB](../api/internal/recovery/inventory_livedb_test.go)
+> [TestRecoveryInventoryExpiryHandoffLiveDB](https://github.com/vtmocanu/uzi/blob/c7a7bdac9237f800ee79adae1a264181231ae2fc/api/internal/recovery/inventory_livedb_test.go)
 > provide auth and retention controls. Changing only the warning branch to
 > `sevOK` compiled (exit 0) but failed the warning assertions (exit 1);
 > restoration passed the identical 13 named RUN entries, zero skips,
@@ -438,4 +438,3 @@ not a reproduction on the operator's deployment.
 > [#2625](https://github.com/vtmocanu/uzi/issues/2625), capacity-share warning
 > [#2623](https://github.com/vtmocanu/uzi/issues/2623) and source-only custody
 > [#2507](https://github.com/vtmocanu/uzi/issues/2507) remain separate.
-
