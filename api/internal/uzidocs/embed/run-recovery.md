@@ -177,13 +177,28 @@ operator-configurable environment variable on the API:
 | Limit | Default | Meaning |
 |---|---|---|
 | Max bundle size | 64 MiB | A larger archive is refused, not truncated. Guarded capture may fall back to a capped thin bundle; if capture still fails, the source stays retained. Historical oversized captures are not automatically reproduced. |
-| Ready payload per owner | 1 GiB | Total bytes of *your* ready (downloadable) archives. |
-| Instance byte quota | 4 GiB | Total ready bytes across the whole deployment (scoped to the owner who breached it, never a global stop). |
+| Ready payload per owner | 1 GiB | Your available archive bytes plus preparing/uploading reservations. |
+| Instance byte quota | 4 GiB | Available archive bytes plus preparing/uploading reservations across the deployment; a refusal retains the affected source. |
 | Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. |
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
-| Retained captures per owner | 256 | Total captures you can have on file at once. |
+| Retained captures per owner | 256 | Non-discarded captures on file, including expired metadata. |
 | Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+
+A byte refusal keeps the source retained. The archive's **Needs action**
+reason can read `storage quota exceeded`; current workers preserve a typed
+API quota refusal as `storage_quota_exceeded` and retry with backoff.
+An untyped HTTP 507 remains a generic transient failure.
+`uzi run recovery` joins hold and capture identities but omits capture
+reason in both human and JSON output; read the web archive or owner archive
+API for that reason. A new capture can also be refused at a capture-count
+ceiling before a capture row exists.
+
+For exact limits, byte accounting, custody counts and a read-only
+reproduction, see [Recovery storage diagnosis](./recovery-storage-diagnosis.md).
+Admins can use [Recovery storage health](./admin-health.md#recovery-storage)
+to find current persisted quota-refused captures. This warning does not
+show historical refusals or measure physical disk capacity.
 
 ### Shared stored-file budget
 
@@ -191,7 +206,7 @@ Recovery archives and [job files](./jobs.md#job-files) live in the same database
 
 - When a recovery upload would not fit the budget, uzi first reclaims job files to make room, in this order: files already past their expiry, then the oldest `available` job files (those of finished jobs). It **never** reclaims a file attached to a job that is still running, a file whose upload is in flight, or an unattached upload still inside its one-hour window. A reclaimed job file becomes expired: its bytes are deleted and a later download is a 410.
 - Admission itself deletes nothing: it only checks that enough reclaimable job-file bytes exist. The reclaim runs once the upload's size and checksum have verified, and only for the bytes that upload actually delivered, so a worker that declares a size and never sends the bytes cannot expire anyone's files.
-- Only if reclaiming everything reclaimable still would not fit is the archive refused, exactly as an over-quota archive is refused above. Job files never reclaim recovery archives; a job-file upload over the budget is refused 507 `storage_quota_exceeded`.
+- Shared-budget admission refuses if reclaimable job bytes cannot cover the declared excess. After size/checksum verification, bind sizes reclaim from committed bytes plus the verified archive size, excluding reservations; it then checks committed bytes after reclaim plus reserved job bytes plus the verified size. That later check can also refuse, rolling back reclaim and the upload. Job files do not reclaim recovery archives; a job-file upload over the budget is refused 507 `storage_quota_exceeded`.
 
 The owner and instance recovery quotas in the table above still apply on top of the shared budget. If you raise the budget or either store's quota, size the database volume for the budget plus your ordinary data ([Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909)). The design is recorded in [ADR-1909](../adr/1909-stored-file-budget.md).
 

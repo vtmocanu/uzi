@@ -57,6 +57,7 @@ import type {
   CodexAdminRateLimitRow,
   HealthDoc,
   BuildInfo,
+  ReleaseCheckStatus,
   Product,
   ProductOAuthClient,
   OAuthAuthorizeRequest,
@@ -76,6 +77,8 @@ import type {
 
 import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
 import buildInfoFull from "../../../fixtures/api-contract/build_info.full.json";
+import releaseCheckStatusZero from "../../../fixtures/api-contract/release_check_status.zero.json";
+import releaseCheckStatusFull from "../../../fixtures/api-contract/release_check_status.full.json";
 import runZero from "../../../fixtures/api-contract/run.zero.json";
 import runFull from "../../../fixtures/api-contract/run.full.json";
 import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.json";
@@ -276,6 +279,15 @@ void _buildInfoMissing;
 void _buildInfoExtra;
 void _buildInfoZero;
 void _buildInfoFull;
+
+const _releaseCheckStatusMissing: never = null as unknown as Exclude<keyof ReleaseCheckStatus, keyof typeof releaseCheckStatusFull>;
+const _releaseCheckStatusExtra: never = null as unknown as Exclude<keyof typeof releaseCheckStatusFull, keyof ReleaseCheckStatus>;
+const _releaseCheckStatusZero: ZeroOf<ReleaseCheckStatus> = releaseCheckStatusZero;
+const _releaseCheckStatusFull: Widen<ReleaseCheckStatus> = releaseCheckStatusFull;
+void _releaseCheckStatusMissing;
+void _releaseCheckStatusExtra;
+void _releaseCheckStatusZero;
+void _releaseCheckStatusFull;
 
 // ── Run ─────────────────────────────────────────────────────────────────────
 // ZeroOf exemptions for Run (all normalized to [] by a mapper in runToDTO):
@@ -1521,6 +1533,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // normalizes to []), so its zero.json carries nulls.
   { stem: "health_doc", nullable: true },
   { stem: "build_info", nullable: false },
+  { stem: "release_check_status", nullable: false },
   // PRD #1907 M1: every product/product-token DTO has a present-as-null pointer or a
   // nil-slice scopes in its zero.json, so all five are nullable:true.
   { stem: "product", nullable: true },
@@ -1626,4 +1639,9 @@ describe("issue-input history contract", () => {
     expect(cardFull.latest_run.auto_approve_blocked_reasons).toEqual(["x"]);
     expect(boardFull.cards[0].latest_run.auto_approve_blocked_reasons).toEqual(["x"]);
   });
+});
+
+it("release-check partial is omitted at zero and true when populated", () => {
+  expect(releaseCheckStatusZero).not.toHaveProperty("partial");
+  expect(releaseCheckStatusFull.partial).toBe(true);
 });

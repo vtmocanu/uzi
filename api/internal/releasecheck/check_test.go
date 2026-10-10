@@ -119,6 +119,9 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	rec := NewReconciler(st, set, nil, nil)
 
 	res, err := rec.CheckForUpdate(context.Background())
+	if res.Partial {
+		t.Error("Partial = true, want false")
+	}
 	if err != nil {
 		t.Fatalf("CheckForUpdate err = %v", err)
 	}
@@ -174,6 +177,9 @@ func TestCheckForUpdatePersistFailureReportsError(t *testing.T) {
 	rec := NewReconciler(st, set, nil, nil)
 
 	res, err := rec.CheckForUpdate(context.Background())
+	if res.Partial {
+		t.Error("Partial = true, want false")
+	}
 	if err != nil {
 		t.Fatalf("CheckForUpdate err = %v", err)
 	}
@@ -225,6 +231,9 @@ func TestCheckForUpdateDisabled(t *testing.T) {
 	rec := NewReconciler(st, set, nil, nil)
 
 	res, err := rec.CheckForUpdate(context.Background())
+	if res.Partial {
+		t.Error("Partial = true, want false")
+	}
 	if err != nil {
 		t.Fatalf("CheckForUpdate err = %v", err)
 	}
@@ -263,6 +272,9 @@ func TestCheckForUpdateEnableReadErrorFailsClosed(t *testing.T) {
 	rec := NewReconciler(st, set, nil, nil)
 
 	res, err := rec.CheckForUpdate(context.Background())
+	if res.Partial {
+		t.Error("Partial = true, want false")
+	}
 	if err != nil {
 		t.Fatalf("CheckForUpdate err = %v", err)
 	}
@@ -298,6 +310,9 @@ func TestCheckForUpdateErrorPreservesLastGood(t *testing.T) {
 	rec := NewReconciler(st, set, nil, nil)
 
 	res, err := rec.CheckForUpdate(context.Background())
+	if res.Partial {
+		t.Error("Partial = true, want false")
+	}
 	if err != nil {
 		t.Fatalf("CheckForUpdate err = %v", err)
 	}

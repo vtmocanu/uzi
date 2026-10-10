@@ -74,6 +74,9 @@ func (s *wiringStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
 	}
 	return ids, nil
 }
+func (s *wiringStore) RecoveryStorageHealth(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
+	return []store.RecoveryStorageHealthRow{{}}, nil
+}
 func (s *wiringStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
 	return nil, nil
 }

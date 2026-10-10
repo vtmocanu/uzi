@@ -399,6 +399,7 @@ const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "capture_error",
   "restart_upload_failed",
   "upload_transient",
+  "storage_quota_exceeded",
   "credential_rejected",
   "inventory_source_not_quiescent",
   "inventory_source_not_quiescent:inventory_read_not_verified",
@@ -550,7 +551,7 @@ async function runCaptureCycle<T>(
 
 /** The typed disposition of a failed reserve/upload RPC (issue #1995). */
 export type UploadFailureClass =
-  | { kind: "transient" }
+  | { kind: "transient"; reason?: "storage_quota_exceeded" }
   | { kind: "permanent"; reason: string }
   | { kind: "credential"; reason: "credential_rejected" };
 
@@ -618,6 +619,7 @@ export async function classifyUploadFailure(err: unknown, record?: RecoveryRecor
     case "integrity":
       return integrity();
     case "quota":
+      return { kind: "transient", reason: "storage_quota_exceeded" };
     case "busy":
     case "internal":
       return { kind: "transient" };
@@ -1188,7 +1190,7 @@ export class RecoveryCoordinator {
       const reconciled = await this.reconcileInventory(record, prove, observedStatus);
       if (reconciled) return reconciled;
       return { state: record.state, captureId: record.captureId,
-        reason: cls.kind === "transient" ? "upload_transient" : cls.reason };
+        reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
     }
   }
 
@@ -1610,9 +1612,10 @@ export class RecoveryCoordinator {
    * issue #1995: every journal write is guarded (a removed record is never recreated, a newer
    * state is never overwritten), the record's existence is re-checked before the reserve and
    * right before the stream opens, and an RPC failure is classified ({@link classifyUploadFailure}):
-   * permanent and credential dispositions are journaled as such, a transient one under the mode's
-   * retry reason (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds
-   * the record's capture-cycle lock.
+   * permanent and credential dispositions are journaled as such. A transient failure preserves
+   * its typed quota reason when present, otherwise using the mode's retry reason
+   * (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds the record's
+   * capture-cycle lock.
    */
   private async uploadJournaledBundle(
     record: RecoveryRecord,
@@ -1734,7 +1737,7 @@ export class RecoveryCoordinator {
       { run_id: record.runId, capture_id: record.captureId, disposition: cls.kind, error: errText(err) },
     );
     if (cls.kind === "credential") this.credentialBlockedAt = this.now();
-    const reason = cls.kind === "transient" ? TRANSIENT_UPLOAD_REASON[mode] : cls.reason;
+    const reason = cls.kind === "transient" ? cls.reason ?? TRANSIENT_UPLOAD_REASON[mode] : cls.reason;
     return this.markFailure(record, reason, mode === "capture");
   }
 

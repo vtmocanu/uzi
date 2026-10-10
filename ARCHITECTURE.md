@@ -1260,7 +1260,9 @@ chain in the diagram above, with no intervening `running`.
   glyph; every other failed run, plan rejections and an escalated or no-live-worker auto-stop
   included, posts a ❌ Failed message with its reason. The DM is not gated on `stop_kind`.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
-  pruned (200 rows/user), write-only event log (`notifysvc.Notify`). Incidental
+  pruned (nominal retention of 200 rows/user), write-only event log
+  (`notifysvc.Notify`). Pending durable rows are exempt and rows tied at the
+  retention timestamp boundary remain, so 200 is not a hard row limit. Incidental
   findings no longer send Slack DMs or create new latch rows (#2271); existing
   rows remain subject to pruning. One exception (#1675): the two halt
   DMs ("CI auto-fix stopped", "MR rework stopped") store their DM render in
@@ -1269,7 +1271,15 @@ chain in the diagram above, with no intervening `running`.
   no confirmed Slack link; the `notification_slack_redeliver` sweeper pass
   (`notifysvc.Redeliverer`) re-enqueues undelivered rows every 5 minutes, up to
   288 attempts (about 24h), then gives up; the per-user prune spares
-  undelivered rows under the cap. A rare duplicate DM is accepted (post
+  undelivered durable rows below that attempt cap, independently of the
+  retention target. Best-effort per-user pruning runs after inserts, successful
+  delivery stamps (including terminal no-link outcomes), and final retry claims
+  before render decoding, including corrupt renders (#2076). When pruning succeeds,
+  eligible older rows are removed without a later `Notify`, so idle users can
+  converge toward the retention target, subject to pending exemptions and timestamp
+  ties. Logged prune failures do not undo delivery settlement or attempt exhaustion;
+  there is no historical settled-backlog sweep or unconditional cleanup guarantee.
+  A rare duplicate DM is accepted (post
   succeeded but the mark failed, or the latch write failed after the notify),
   as is a late DM after a Slack outage; during a rolling deploy an old replica's
   prune can still delete a pending row. Every other kind stays best-effort.
