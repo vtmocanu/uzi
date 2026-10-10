@@ -62,6 +62,8 @@ COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
 COPY fixtures/run-question-answer.json /app/fixtures/run-question-answer.json
 # PlanPanel.test.tsx statically imports this typed JSON fixture.
 COPY fixtures/plan-revision/ /app/fixtures/plan-revision/
+# runProgressParity.test.ts and mocks/runProgress.test.ts import the run-progress parity fixture (#2602).
+COPY fixtures/run-progress/ /app/fixtures/run-progress/
 RUN npm run build
 
 # --- runtime stage ---

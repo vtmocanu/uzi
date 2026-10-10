@@ -7,7 +7,7 @@ import { SdkExecutor } from "../src/sdk-executor.js";
 import { SteeringChannel } from "../src/steering.js";
 import { StubExecutor } from "../src/executor.js";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
 import { forceIncompleteHomeHelper } from "./forced-home-helper.js";
 import { scanRunProcesses, reapRunProcesses } from "../src/run-procs.js";
 import { api, client, fx, git, installHarness } from "./runner-harness.js";
@@ -108,15 +108,19 @@ describe("shutdown at an observed plan gate", () => {
           stopped();
           return drain;
         });
+        let gateObserved!: () => void;
+        const gateReady = new Promise<void>((resolve) => { gateObserved = resolve; });
         api.onState(s.runId, (body) => {
           if (body.status !== "awaiting_approval" || !holdFirstGate) return;
           holdFirstGate = false;
+          gateObserved();
           gateReads = api.inputGets.get(s.runId) ?? 0;
           heldGet = api.holdNextInputGet(s.runId, gateReads);
           if (failHeldGet) api.failInputGets(s.runId, 1, 503);
         });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
-        assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
+        await waitForTestEvent(Promise.race([gateReady, flight.done]), "first held-GET gate observed");
+        assert.ok(s.gates(flight).length > 0, "the plan gate was observed");
         const firstGate = s.gates(flight)[0]!;
         assert.equal(firstGate.plan_md, PLAN_V1, "the submitted plan was offered for approval");
         assert.ok(firstGate.presentation_id, "the observed gate has a presentation id");
@@ -162,14 +166,19 @@ describe("shutdown at an observed plan gate", () => {
 
         const claim = session === "kept" ? s.resumeClaim("kept", api.gateResumeFields(s.runId)) : s.resumeClaim("none");
         assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
+        let resumedGateObserved!: () => void;
+        const resumedGateReady = new Promise<void>((resolve) => { resumedGateObserved = resolve; });
+        // onState has one slot; replace the first-flight hook after that flight ended.
+        api.onState(s.runId, (body) => { if (body.status === "awaiting_approval") resumedGateObserved(); });
         const resumed = s.start(claim);
-        assert.ok(await until(() => s.gates(resumed).length > 0 || resumed.finished, 3_000), s.statuses(resumed).join(","));
+        await waitForTestEvent(Promise.race([resumedGateReady, resumed.done]), "resumed held-GET gate observed");
+        assert.ok(s.gates(resumed).length > 0 || resumed.finished, s.statuses(resumed).join(","));
         const { gate: nextGate, content: retainedWork } = readRetainedGateWork(s, resumed,
           git.runnerClonePath(bare, `issue-${s.base.issue_iid}`));
         assert.equal(retainedWork,
           "committed before gate shutdown\n", "the resumed clone retains the committed work");
         if (session === "kept") {
-          await s.finish(resumed);
+          await waitForTestEvent(resumed.done, "resumed held-GET flight completed");
           assert.equal(nextGate.plan_md, PLAN_V1, "the submitted plan is re-presented");
           assert.deepEqual(nextGate.milestones, V1_MILESTONES, "the candidate milestones are re-presented");
           assert.equal(nextGate.presentation_id, persisted.presentationId, "the same gate id is retained");
@@ -187,7 +196,7 @@ describe("shutdown at an observed plan gate", () => {
           assertNoApproval(s);
           assert.equal(resumed.finished, false, "the fresh gate requires a fresh approval");
           const [fresh] = s.send(s.input("approve_plan"));
-          await s.finish(resumed);
+          await waitForTestEvent(resumed.done, "resumed held-GET flight completed");
           assert.ok(api.isApplied(s.runId, fresh!.id), "the fresh approval is applied");
           assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
         }

@@ -104,7 +104,9 @@ it("#2507 runner distinguishes final-read identity drift from later proof drift"
 });
 
 for (const failure of ["process", "dirty", "unreadable"] as const) {
-  it(`#2507 second sibling ${failure} refuses and first failure follows existing status order`, async () => {
+  it(`#2507 second sibling ${failure} refuses and first failure follows existing status order`, {
+    skip: process.platform !== "linux" && "physical source proof deliberately refuses non-Linux before sibling quiescence",
+  }, async () => {
     const visited: string[] = [], diagnostics: InventorySourceDiagnostic[] = [];
     const r = runner({ run: async () => { throw new Error("unreached"); } }, fakeGitlab().gitlab,
       undefined, { quiesceRun: async req => {
@@ -176,7 +178,9 @@ it("#2507 runner observer cannot throw, reject, delay proof or leak first failur
   assert.equal(boundary.inventoryReservations.size, 0);
 });
 
-for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unverified", "clean-unverified", "dirty-quiescent", "foreground-wip"] as const) it(`${source} physical custody through runner ${mode} recovery`, async t => {
+for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unverified", "clean-unverified", "dirty-quiescent", "foreground-wip"] as const) it(`${source} physical custody through runner ${mode} recovery`, {
+  skip: process.platform !== "linux" && "physical source FINAL proof requires Linux process attribution",
+}, async t => {
   const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
   const cmd = (dir:string, args:string[]) => execFileSync("git", ["-C", dir, ...args], {env:cleanEnv, encoding:"utf8", timeout:10000}).trim();
   const claim = gitlabClaim(2997, {claim_generation:37, inventory_guarded:true});

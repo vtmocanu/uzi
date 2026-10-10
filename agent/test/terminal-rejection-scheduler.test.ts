@@ -7,7 +7,7 @@ import { WorkerClient } from "../src/client.js";
 import { TerminalRejectionCoordinator } from "../src/terminal-rejections.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
 import type { TerminalRejectionCustodyResponse } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
 import { sleep } from "../src/util.js";
 import os from "node:os";
 import { realpathSync } from "node:fs";
@@ -52,7 +52,7 @@ async function rig(generations = [3], physical = run, generationWidth = 0) {
     async clean(loop: Promise<void>) { controller.abort(); await loop; await fs.rm(root, { recursive: true, force: true }); } };
 }
 
-test("long aliases exceeding page metadata budget report all 310 generations despite failed POST/custody", async () => {
+test("long aliases exceeding page metadata budget report all 310 generations despite failed POST/custody", async (t) => {
   const r = await rig(Array.from({ length: 310 }, (_, i) => i + 1), run, 241);
   const page = await r.outbox.scanTerminalObservationsPage();
   assert.ok(page.observations.length <= 256);
@@ -61,6 +61,17 @@ test("long aliases exceeding page metadata budget report all 310 generations des
   const posted = new Set<number>();
   const reads = new Set<number>();
   let settle = false;
+  let inventoryObserved!: () => void;
+  const inventoryReady = new Promise<void>((resolve) => { inventoryObserved = resolve; });
+  const observeInventory = () => { if (posted.size === 310 && reads.size === 310) inventoryObserved(); };
+  let removed = 0;
+  let deletionObserved!: () => void;
+  const deletionReady = new Promise<void>((resolve) => { deletionObserved = resolve; });
+  const unlink = fs.unlink.bind(fs);
+  t.mock.method(fs, "unlink", async (file: Parameters<typeof fs.unlink>[0]) => {
+    await unlink(file);
+    if (path.dirname(String(file)) === path.dirname(r.file()) && ++removed === 310) deletionObserved();
+  });
   globalThis.fetch = async (url, init) => {
     if (init?.method === "POST") {
       const raw = String(init.body);
@@ -72,22 +83,25 @@ test("long aliases exceeding page metadata budget report all 310 generations des
         assert.deepEqual(Object.keys(tuple).sort(), ["claim_generation", "reason", "run_id"]);
         posted.add(tuple.claim_generation);
       }
+      observeInventory();
       throw new Error("lost diagnostic ACK");
     }
     const generation = Number(new URL(String(url)).searchParams.get("generation"));
     reads.add(generation);
+    observeInventory();
     if (!settle) throw new Error("temporary custody failure");
     return Response.json(custody(generation));
   };
   const coordinator = new TerminalRejectionCoordinator(r.outbox, r.client, nullLogger(), undefined, undefined, 2, 50);
   const loop = coordinator.loop(worker, r.controller.signal);
   try {
-    await until(() => posted.size === 310 && reads.size === 310);
+    await waitForTestEvent(inventoryReady, "all long-alias generations observed");
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), true);
     assert.equal((await fs.readdir(path.dirname(r.file()))).length, 310);
     settle = true;
     coordinator.queueReconciliation();
-    await until(async () => (await fs.readdir(path.dirname(r.file()))).length === 0);
+    await waitForTestEvent(deletionReady, "all long-alias terminals removed");
+    assert.equal((await fs.readdir(path.dirname(r.file()))).length, 0);
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), false);
   } finally { await r.clean(loop); }
 });

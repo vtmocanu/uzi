@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Full-screen TUI footers keep help and quit keys visible ([#2194](https://github.com/vtmocanu/uzi/issues/2194)).**
+  At 80 columns and wider, the board, CI and pulls footers shed lower-priority hints before help and quit; the board retains its partial-cost cue and client-only version fallback.
+
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
 

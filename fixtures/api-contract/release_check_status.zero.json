@@ -1,0 +1,11 @@
+{
+  "release_check_enabled": false,
+  "release_check_banner_enabled": false,
+  "interval": "",
+  "running_version": "",
+  "update_available": false,
+  "far_behind": false,
+  "security": false,
+  "banner_snoozed": false,
+  "status": ""
+}

@@ -5,7 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { GitCache, ScratchPublicationError, type FetchAgentBranchOptions } from "../src/git.js";
 import { makeFixture } from "./fixture-repo.js";
-import { noProofReseed, nullLogger } from "./helpers.js";
+import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
 const branch = "agent/issue-2404";
 function git(cwd: string, ...args: string[]): string {
@@ -24,7 +24,7 @@ async function fixture() {
   git(writer, "commit", "--allow-empty", "-m", "P");
   git(writer, "push", "origin", branch);
   const P = git(writer, "rev-parse", "HEAD");
-  const cache = new GitCache(fx.dataDir, nullLogger());
+  const cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const bare = await cache.ensureClone(remote);
   const clone = await cache.createOrAttachRunnerClone(bare, 2404, noProofReseed);
   git(clone.path, "commit", "--allow-empty", "-m", "H");
