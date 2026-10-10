@@ -17,6 +17,8 @@ import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
 resetResidueQuarantineAfterEach();
+const linux = process.platform === "linux";
+const linuxDisposal = { skip: linux ? false : "physical disposal requires Linux proof" };
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
 const wire = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8"));
 const literal: CompletedPublicationReceipt = wire.ack.completed_publication_receipt;
@@ -119,8 +121,14 @@ async function fixture(shared = false, attempted = false, receipted = true, fore
   const retained = async () => {
     assert.equal(cmd(clone, ["rev-parse", "HEAD"]), head, "retained completing clone keeps its exact committed head");
     assert.equal(await fs.readFile(path.join(clone, "untracked.txt"), "utf8"), "untracked remainder\n");
+    assert.equal(await fs.readFile(path.join(clone, "work.txt"), "utf8"), "dirty remainder\n");
     assert.ok(await fs.stat(journal), "retention keeps authenticated receipt authority");
-    assert.ok(await fs.stat(bundle), "retention keeps completing-generation bundle");
+    assert.equal(await fs.readFile(bundle, "utf8"), "attributed generation bundle");
+    const authenticated = (await make().recovery.inspect(runId)).find(r => r.captureId === record.captureId);
+    assert.ok(authenticated, "fresh inspect authenticates the retained journal");
+    assert.deepEqual(authenticated.completionSource, completingRecord.completionSource);
+    assert.deepEqual(authenticated.completionReceipt, receipted
+      ? { ...literal, final_head: head, observed_branch_head: head } : undefined);
     assert.equal(rpc, 0, "persisted receipt cleanup never calls custody RPCs");
   };
   return { root, git, bare, clone, context, head, cmd, runId, generation, branch, journal, bundle,
@@ -158,10 +166,12 @@ it("persisted receipt removes actual dirty own clone, generation bundle and jour
     assert.equal(f.completingRecord.finalAcknowledged, undefined);
     assert.equal(f.completingRecord.coverageDigest, undefined);
     await f.sweep();
-    for (const target of [f.clone, f.journal, f.bundle]) {
-      await assert.rejects(fs.stat(target), { code: "ENOENT" }, "receipt retires its attributed physical source");
-    }
-    assert.deepEqual(await f.restarted.recovery.inspect(f.runId), []);
+    if (linux) {
+      for (const target of [f.clone, f.journal, f.bundle]) {
+        await assert.rejects(fs.stat(target), { code: "ENOENT" }, "receipt retires its attributed physical source");
+      }
+      assert.deepEqual(await f.restarted.recovery.inspect(f.runId), []);
+    } else await f.retained();
     assert.equal(f.rpc(), 0);
   } finally { await f.close(); }
 });
@@ -174,12 +184,14 @@ it("active execution retains receipt source then permits cleanup when the execut
     await f.retained();
     f.restarted.executionTails.delete(f.runId);
     await f.sweep();
-    await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
-    await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
+    if (linux) {
+      for (const target of [f.clone, f.journal, f.bundle])
+        await assert.rejects(fs.stat(target), { code: "ENOENT" });
+    } else await f.retained();
   } finally { await f.close(); }
 });
 
-it("actual active child retains receipt source until exit permits real physical cleanup", async () => {
+it("actual active child retains receipt source until exit permits real physical cleanup", linuxDisposal, async () => {
   const f = await fixture();
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: f.clone, env: {}, stdio: "ignore",
@@ -253,12 +265,15 @@ it("nonquiescent process proof retains receipt source until both process checks 
     } });
     await blocked.recovery.resumePending(undefined, f.snapshot);
     await f.retained();
-    assert.deepEqual(sites, ["completion_source"]);
+    assert.deepEqual(sites, linux ? ["completion_source"] : []);
     quiescent = true;
     await blocked.recovery.resumePending(undefined, f.snapshot);
-    assert.deepEqual(sites.slice(1), ["completion_source", "completion_source:after_git"]);
-    await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
-    await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
+    assert.deepEqual(sites.slice(1), linux
+      ? ["completion_source", "completion_source:after_git"] : []);
+    if (linux) {
+      for (const target of [f.clone, f.journal, f.bundle])
+        await assert.rejects(fs.stat(target), { code: "ENOENT" });
+    } else await f.retained();
   } finally { await f.close(); }
 });
 
@@ -311,20 +326,22 @@ it("receipt cleanup preserves shared owed pin and sibling generation bytes", asy
     assert.ok(before.some(c => c.sha === f.head && c.contexts.some(x => x.generation === f.generation)));
     assert.ok(before.some(c => c.sha === f.head && c.contexts.some(x => x.generation === f.generation + 1)));
     await f.sweep();
-    await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
-    await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
+    if (linux) {
+      for (const target of [f.clone, f.journal, f.bundle])
+        await assert.rejects(fs.stat(target), { code: "ENOENT" });
+    } else await f.retained();
     assert.equal(await fs.readFile(f.siblingJournal!, "utf8"), journalBytes, "sibling authority is byte-for-byte preserved");
     assert.equal(await fs.readFile(f.siblingBundle!, "utf8"), "successor bundle");
     const after = await f.git.enumerateOwedCandidates(f.bare, f.runId);
     assert.ok(after.some(c => c.sha === f.head && c.contexts.some(x => x.generation === f.generation + 1)),
       "shared physical owed pin remains discoverable for successor");
-    assert.equal(after.some(c => c.contexts.some(x => x.generation === f.generation)), false,
-      "only completing generation candidate attribution retires");
+    assert.equal(after.some(c => c.contexts.some(x => x.generation === f.generation)), !linux,
+      "completing attribution retires only after Linux physical disposal");
     assert.equal(f.rpc(), 0);
   } finally { await f.close(); }
 });
 
-it("paused physical disposal excludes actual successor clone admission until the bare lock releases", async t => {
+it("paused physical disposal excludes actual successor clone admission until the bare lock releases", linuxDisposal, async t => {
   const f = await fixture();
   let resume!: () => void;
   let entered!: () => void;
@@ -399,8 +416,10 @@ it("completed generation finalize must retire after receipt cleanup", async () =
       { ...wire.request, completion_final_head: f.head },
       { applied: true, completedPublicationReceipt: { ...literal, final_head: f.head, observed_branch_head: f.head } });
     await current.recovery.resumePending(undefined, f.snapshot);
-    await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
-    await assert.rejects(fs.stat(f.journal), { code: "ENOENT" });
+    if (linux) {
+      for (const target of [f.clone, f.journal, f.bundle])
+        await assert.rejects(fs.stat(target), { code: "ENOENT" });
+    } else await f.retained();
     assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation), false);
     assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation + 1), true,
       "receipt success is scoped to the exact generation");
@@ -413,7 +432,7 @@ it("completed generation finalize must retire after receipt cleanup", async () =
 
 for (const failure of ["ledger", "journal-clear"] as const) {
   for (const permanent of [false, true]) {
-    it((permanent ? "permanent " : "transient ") + failure + " EIO after actual disposal preserves retirement authority", async t => {
+    it((permanent ? "permanent " : "transient ") + failure + " EIO after actual disposal preserves retirement authority", linuxDisposal, async t => {
       const f = await fixture(false, true);
       const rawGit = f.git as unknown as {
         runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string>;
@@ -477,8 +496,23 @@ for (const conflict of ["foreign", "successor", "unknown", "canonical", "quarant
       return runGit(...args);
     });
     try {
-      await f.sweep();
-      assert.equal(failures, 2);
+      if (linux) {
+        await f.sweep();
+        assert.equal(failures, 2);
+      } else {
+        // Model a restart on a non-Linux host after an earlier Linux disposal:
+        // real Git holds the exact durable retirement, with the old journal still owed.
+        const key = f.cmd(f.bare, ["config", "--local", "--name-only", "--get-regexp", "^uzi-attempts\\."]);
+        assert.equal(key.split("\n").length, 1);
+        const entry = JSON.parse(f.cmd(f.bare, ["config", "--local", "--get-all", key]).split("\n").at(-1)!);
+        assert.equal(entry.attemptId, f.completingRecord.completionSource!.attemptId);
+        assert.equal(entry.runId, f.runId);
+        assert.equal(entry.clonePath, f.clone);
+        assert.equal(entry.state, "live");
+        f.cmd(f.bare, ["config", "--local", "--add", key, JSON.stringify({ ...entry, state: "retired" })]);
+        await fs.rm(f.clone, { recursive: true });
+        assert.equal(failures, 0, "fixture setup never invokes disposal metadata hooks");
+      }
       t.mock.restoreAll();
       if (conflict === "foreign" || conflict === "successor") {
         await f.git.markRecoveryCapture(f.bare, f.clone, f.branch,
@@ -499,6 +533,10 @@ for (const conflict of ["foreign", "successor", "unknown", "canonical", "quarant
       if (conflict === "exclusion")
         t.mock.method(f.git, "hasPhysicalTerminalProtection", async () => true);
       const before = f.cmd(f.bare, ["config", "--local", "--get-regexp", "^uzi-recovery\\."]);
+      const proof = () => f.git.completionSourceAlreadyRetired(f.bare, f.branch, f.runId, f.clone,
+        f.completingRecord.completionSource!.attemptId);
+      if (conflict === "unknown") await assert.rejects(proof(), SyntaxError);
+      else assert.equal(await proof(), false, "durable retirement cannot bypass current protection on any host");
       await f.make().recovery.resumePending();
       assert.equal(f.cmd(f.bare, ["config", "--local", "--get-regexp", "^uzi-recovery\\."]), before);
       assert.ok(await fs.stat(f.journal));
@@ -510,7 +548,7 @@ for (const conflict of ["foreign", "successor", "unknown", "canonical", "quarant
 }
 
 for (const code of ["EIO", "EBUSY"]) {
-  it(code + " completion disposal restores exact attempt attribution for a fresh coordinator retry", async t => {
+  it(code + " completion disposal restores exact attempt attribution for a fresh coordinator retry", linuxDisposal, async t => {
     const f = await fixture(true, true);
     const remove = fs.rm.bind(fs);
     let holding = "";
@@ -548,7 +586,7 @@ for (const code of ["EIO", "EBUSY"]) {
 }
 
 for (const failure of ["partial", "rollback", "successor"] as const) {
-  it("completion disposal " + failure + " failure retains receipt and residue without overwriting a canonical occupant", async t => {
+  it("completion disposal " + failure + " failure retains receipt and residue without overwriting a canonical occupant", linuxDisposal, async t => {
     const f = await fixture(false, true);
     const remove = fs.rm.bind(fs);
     const rename = fs.rename.bind(fs);
@@ -582,6 +620,93 @@ for (const failure of ["partial", "rollback", "successor"] as const) {
       if (failure === "successor")
         assert.equal(await fs.readFile(path.join(f.clone, "successor.txt"), "utf8"), "retain occupant");
       else await assert.rejects(fs.stat(f.clone), { code: "ENOENT" });
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+}
+
+it("non-Linux active child and exited child both retain authenticated receipt source", {
+  skip: linux ? "paired non-Linux retention case" : false,
+}, async () => {
+  const f = await fixture();
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: f.clone, env: {}, stdio: "ignore",
+  });
+  const exited = once(child, "exit");
+  let scans = 0;
+  const checked = f.make({ quiesceRun: async () => {
+    scans++;
+    throw new Error("non-Linux completion must not request procfs proof");
+  } });
+  try {
+    await once(child, "spawn");
+    await checked.recovery.resumePending(undefined, f.snapshot);
+    await f.retained();
+    assert.equal(child.exitCode, null);
+    assert.equal(child.signalCode, null);
+    assert.equal(child.kill("SIGTERM"), true);
+    await exited;
+    await checked.recovery.resumePending(undefined, f.snapshot);
+    await f.retained();
+    assert.equal(scans, 0, "neither a live child nor its exit authorizes a non-Linux process proof");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    await exited;
+    await f.close();
+  }
+});
+
+for (const hook of [
+  "paused disposal", "transient ledger EIO", "permanent ledger EIO",
+  "transient journal-clear EIO", "permanent journal-clear EIO",
+  "EIO retry", "EBUSY retry", "partial disposal", "rollback disposal", "successor disposal",
+]) {
+  it("non-Linux retains source without entering " + hook, {
+    skip: linux ? "paired non-Linux retention case" : false,
+  }, async t => {
+    const f = await fixture(true, true);
+    const remove = fs.rm.bind(fs), rename = fs.rename.bind(fs);
+    const rawGit = f.git as unknown as {
+      runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string>;
+    };
+    const runGit = rawGit.runGit.bind(rawGit);
+    let hooks = 0;
+    const unexpected = (): never => {
+      hooks++;
+      throw Object.assign(new Error("unsupported host entered " + hook), { code: "EIO" });
+    };
+    t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (path.dirname(String(args[0])) === (f.git as unknown as { runnerHoldingRoot: string }).runnerHoldingRoot)
+        unexpected();
+      return remove(...args);
+    });
+    t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+      if (String(args[0]) === f.clone) unexpected();
+      return rename(...args);
+    });
+    t.mock.method(rawGit, "runGit", async (...args: Parameters<typeof runGit>) => {
+      const command = args[1];
+      if (command[0] === "config" && (
+        command[2] === "--add" && command[3]?.startsWith("uzi-attempts.") && command[4]?.includes("retired") ||
+        command[2]?.startsWith("uzi-recovery.") && command[3] === ""
+      )) unexpected();
+      return runGit(...args);
+    });
+    try {
+      const sibling = await fs.readFile(f.siblingJournal!, "utf8");
+      await f.sweep();
+      await f.retained();
+      await f.make().recovery.resumePending();
+      await f.retained();
+      assert.equal(hooks, 0, "retention never enters disposal, rollback, or metadata hooks");
+      assert.equal(f.restarted.runner.isExecuting(f.runId), false, "retention leaves no execution reservation");
+      assert.equal(await fs.readFile(f.siblingJournal!, "utf8"), sibling);
+      assert.equal(await fs.readFile(f.siblingBundle!, "utf8"), "successor bundle");
+      // A real bare-lock operation completes without waiting for a disposal barrier.
+      await f.git.markRecoveryCapture(f.bare, f.clone, f.branch, f.runId,
+        f.completingRecord.completionSource!.attemptId);
+      await f.retained();
+      assert.ok((await f.git.enumerateOwedCandidates(f.bare, f.runId))
+        .some(c => c.sha === f.head && c.contexts.some(x => x.generation === f.generation + 1)));
     } finally { t.mock.restoreAll(); await f.close(); }
   });
 }

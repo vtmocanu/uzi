@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Recovery cleanup tests respect the host platform.**
+  Cleanup checks prove physical deletion on Linux and retention of authenticated recovery sources on other hosts, while keeping custody and conflict checks active on both.
+
 - **Workers report terminal failure after a proven unapplied completion refusal.**
   An unjournaled completion rejected before mutation can follow the ordinary failure path; lost acknowledgements and journaled originals still preserve the selected completion for replay.
 
