@@ -1399,6 +1399,69 @@ for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
   });
 }
 
+for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
+  it(`retained discovery backoff: ${outcome} after the backoff began stops before a second discovery`, async () => {
+    const { claim, bare, clone } = await seed();
+    client.protocolFeatures = ["claim_generation_fence"];
+    const before = readJournal(bare, clone.branch);
+    const discover = git.discoverRetainedRecovery.bind(git);
+    const operation = git.withRecoveryOperation.bind(git);
+    let discoveries = 0, operations = 0, models = 0;
+    git.discoverRetainedRecovery = async (...args) => {
+      if (++discoveries === 1) throw errnoError("EMFILE", -24);
+      return discover(...args);
+    };
+    git.withRecoveryOperation = (async (...args: Parameters<typeof operation>) => {
+      operations++;
+      return operation(...args);
+    }) as typeof git.withRecoveryOperation;
+    const log = recordingLogger();
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: outcome === "fence" ? 200 : 5000 });
+    const waits: { cancelStopsWait: unknown }[] = [];
+    const snapshot: { discoveries?: number; operations?: number; at?: number } = {};
+    const wait = (r as any).waitRecoveryRetry.bind(r);
+    (r as any).waitRecoveryRetry = (flight: any, cancelStopsWait?: boolean, waitMs?: number) => {
+      waits.push({ cancelStopsWait });
+      // The original has started its first sleep slice, so the trigger lands after the backoff began.
+      const pending = wait(flight, cancelStopsWait, waitMs);
+      snapshot.discoveries = discoveries;
+      snapshot.operations = operations;
+      snapshot.at = Date.now();
+      setImmediate(() => {
+        if (outcome === "owner cancel") flight.steering.route("cancel", undefined, 1, false, undefined);
+        else if (outcome === "shutdown") r.shutdown();
+        else (flight.steering as any).endFencedFlight("stale");
+      });
+      return pending;
+    };
+    await r.execute(claim);
+    const elapsed = Date.now() - snapshot.at!;
+    assert.equal(waits.length, 1, "the backoff ran once");
+    assert.equal(waits[0]!.cancelStopsWait, true);
+    assert.equal(log.lines.filter(line => (line as { msg: string }).msg ===
+      "retained recovery discovery failed; retrying within the bounded per-claim allowance").length, 1);
+    // Holds because flight.barePath stays unset after the failed first attempt, so the teardown
+    // recovery operation after the lifecycle stop is skipped.
+    assert.equal(discoveries, 1, "no second discovery");
+    assert.equal(discoveries, snapshot.discoveries);
+    assert.equal(operations, snapshot.operations, "no second recovery operation was entered");
+    assert.equal(models, 0);
+    if (outcome === "owner cancel") {
+      const terminals = api.states.filter(s => s.body.status === "failed");
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0]!.body.failure_reason, "run cancelled");
+      assert.equal(api.states.some(s => /Retained recovery blocked/.test(s.body.failure_reason ?? "")
+        || (s.body.failure_reason ?? "").includes(STORAGE_BUSY)), false);
+      assert.deepEqual(readJournal(bare, clone.branch), before);
+    } else {
+      assert.equal(api.states.some(s => ["failed", "cancelled", "completed", "recovery_wait"].includes(s.body.status)), false);
+    }
+    if (outcome !== "fence") assert.ok(elapsed < 2500, `the stop did not sleep out the backoff (${elapsed}ms)`);
+    assert.ok(fs.existsSync(clone.path));
+  });
+}
+
 it("missing-source blocker persistence failure still reports retained terminal failure", async () => {
   const { claim, bare, clone } = await seed();
   const before = readJournal(bare, clone.branch);
