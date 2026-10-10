@@ -11,6 +11,7 @@ import (
 
 func TestProgressRow(t *testing.T) {
 	pct := 70
+	over, under := 150, -5
 	since := time.Date(2026, 10, 9, 16, 41, 0, 0, time.UTC)
 	ms := []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
 	cases := []struct {
@@ -25,6 +26,12 @@ func TestProgressRow(t *testing.T) {
 		{"no active milestone", apitypes.RunDTO{Milestones: ms,
 			Progress: &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 3}},
 			"≈70% · 2 of 3 done"},
+		{"pct above 100 clamps", apitypes.RunDTO{Milestones: ms,
+			Progress: &apitypes.RunProgress{State: "percent", Pct: &over, MilestoneDone: 2, MilestoneTotal: 3}},
+			"≈100% · 2 of 3 done"},
+		{"pct below 0 clamps", apitypes.RunDTO{Milestones: ms,
+			Progress: &apitypes.RunProgress{State: "percent", Pct: &under, MilestoneDone: 2, MilestoneTotal: 3}},
+			"≈0% · 2 of 3 done"},
 		{"stalled", apitypes.RunDTO{HealthSince: &since, Progress: &apitypes.RunProgress{State: "stalled"}}, "stalled · since 16:41"},
 		{"stalled no time", apitypes.RunDTO{Progress: &apitypes.RunProgress{State: "stalled"}}, "stalled"},
 		{"plan gate", apitypes.RunDTO{Status: "awaiting_approval", Progress: &apitypes.RunProgress{State: "waiting"}}, "waits on you · plan gate"},
@@ -64,6 +71,13 @@ func TestProgressRowBlockedByHint(t *testing.T) {
 	r.Progress.MaybeBlockedByRunID = &hostile
 	if row := progressRow(r); strings.ContainsAny(row[1], "\x1b\x07\u202e") {
 		t.Errorf("hostile id reached the row: %q", row[1])
+	}
+	// none and an unknown state draw the blocked-by hint alone.
+	for _, state := range []string{"none", "future"} {
+		r := apitypes.RunDTO{Status: "running", Progress: &apitypes.RunProgress{State: state, MaybeBlockedByRunID: &id}}
+		if row := progressRow(r); len(row) != 2 || row[0] != "PROGRESS" || row[1] != "may be blocked by fca7a801" {
+			t.Errorf("state %q: got %v, want PROGRESS %q", state, row, "may be blocked by fca7a801")
+		}
 	}
 }
 
