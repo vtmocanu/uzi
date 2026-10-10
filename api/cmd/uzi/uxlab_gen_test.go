@@ -743,19 +743,11 @@ func withLiveStream(m tuiModel) tuiModel {
 }
 
 func detailRunning(dark bool, now time.Time) string {
-	return detailRunningScene(dark, now, nil)
+	return detailRunningSceneH(dark, now, nil, 0)
 }
 
-// detailRunningWithNote is detailRunning (light theme) with the PROGRESS block's Now note drawn.
-func detailRunningWithNote(now time.Time, text string, at time.Time) string {
-	return detailRunningScene(false, now, &apitypes.ProgressNote{Text: text, At: at})
-}
-
-func detailRunningScene(dark bool, now time.Time, note *apitypes.ProgressNote) string {
-	return detailRunningSceneH(dark, now, note, 0)
-}
-
-// detailRunningWithNoteH is detailRunningWithNote at a chosen terminal height (width stays 100).
+// detailRunningWithNoteH is detailRunning (light theme) with the PROGRESS block's Now note drawn, at a
+// chosen terminal height (width stays 100); an empty text draws no note.
 func detailRunningWithNoteH(now time.Time, text string, at time.Time, height int) string {
 	var note *apitypes.ProgressNote
 	if text != "" {
