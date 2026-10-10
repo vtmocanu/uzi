@@ -113,7 +113,7 @@ export function decodeCodeCrossCheckDispositions(v: unknown, findings?: CodeFind
       || Buffer.byteLength(d.reason) > 1024
       || (d.disposition === "not_reported"
         ? known === undefined || d.reason !== ""
-        : !["addressed", "declined"].includes(d.disposition as string) || d.reason.trim() === "")) return invalid();
+        : !["addressed", "declined"].includes(d.disposition as string) || /^\p{White_Space}*$/u.test(d.reason))) return invalid();
     seen.add(d.finding_id);
   }
   return v as CodeCrossCheckDisposition[];

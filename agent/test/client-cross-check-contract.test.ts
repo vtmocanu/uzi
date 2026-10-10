@@ -340,6 +340,58 @@ it("code dispositions validate generation, ASCII IDs and UTF-8 reason bytes befo
   assert.equal(fetch.mock.callCount(), 1, "invalid batches never reach HTTP");
 });
 
+// Unicode White_Space, the set used by Go strings.TrimSpace (not JavaScript trim).
+const goWhitespace = [
+  "\u0009", "\u000a", "\u000b", "\u000c", "\u000d", "\u0020", "\u0085", "\u00a0",
+  "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005", "\u2006",
+  "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000",
+];
+
+it("code dispositions refuse all Go whitespace including U+0085 before HTTP and in persisted status", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json(finalizedCodeWire()));
+  const c = client();
+  for (const reason of ["", "\u0085", ...goWhitespace, goWhitespace.join("")]) {
+    for (const kind of ["addressed", "declined"] as const) {
+      await assert.rejects(c.reportCodeCrossCheckDispositions("lead", 3,
+        [{ ...disposition, disposition: kind, reason }]), /invalid code cross-check dispositions/);
+      assert.equal(fetch.mock.callCount(), 0, "Go-blank reasons never reach HTTP");
+    }
+  }
+  for (const reason of ["", ...goWhitespace, goWhitespace.join("")]) {
+    for (const kind of ["addressed", "declined"] as const) {
+      t.mock.method(globalThis, "fetch", async () => Response.json({
+        ...finalizedCodeWire(), dispositions: [{ ...disposition, disposition: kind, reason }],
+      }));
+      await assert.rejects(c.codeCrossCheckStatus("lead", 3), /invalid code cross-check dispositions/);
+    }
+  }
+});
+
+it("code dispositions preserve U+FEFF and Unicode whitespace edges exactly in POST and persisted status", async (t) => {
+  const c = client();
+  for (const reason of ["\ufeff", goWhitespace.join("") + "\ufeff" + goWhitespace.join(""),
+    ...goWhitespace.map(space => space + "normal reason" + space)]) {
+    for (const kind of ["addressed", "declined"] as const) {
+      const d = { ...disposition, disposition: kind, reason };
+      const body = { ...finalizedCodeWire(), dispositions: [d] };
+      const fetch = t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+        if (init?.method === "POST")
+          assert.deepEqual(JSON.parse(init.body as string), { claim_generation: 3, dispositions: [d] });
+        return Response.json(body);
+      });
+      for (const call of [() => c.reportCodeCrossCheckDispositions("lead", 3, [d]),
+        () => c.codeCrossCheckStatus("lead", 3)]) {
+        await assert.doesNotReject(async () => {
+          const status = await call();
+          assert.ok("dispositions" in status);
+          assert.deepEqual(status.dispositions, [d]);
+        });
+      }
+      assert.equal(fetch.mock.callCount(), 2);
+    }
+  }
+});
+
 it("code status keeps M1 rollout compatibility and interrupted worker projection", async (t) => {
   for (const body of [
     { ...codeWire(), dispositions: undefined, finalized_at: undefined },
