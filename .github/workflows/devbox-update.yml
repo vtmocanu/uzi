@@ -147,6 +147,11 @@ jobs:
             git --no-pager diff -- agent/devbox-global/devbox.lock
           fi
 
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        if: steps.delta.outputs.changed == 'true'
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - name: Set up buildx
         if: steps.delta.outputs.changed == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
