@@ -166,8 +166,8 @@ changelog_unreleased_body() {
 # shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
 # a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
 # a docs/skill/prd/build-only commit after the RC must NOT force a next candidate that ships
-# nothing (it would leave an empty [X] section and, with an empty [Unreleased], fail the main
-# half and roll the stable tag back). Counting raw `git log` commits conflated the two.
+# nothing (with an empty [Unreleased] and no draft, preflight would refuse the promotion).
+# Counting raw `git log` commits conflated the two.
 shipping_commits_since() {
   local sha f shipping files_fd files_pid
   while IFS= read -r sha; do
@@ -680,8 +680,8 @@ echo "=== release-cut $TAG (op=$OP) on $DEFBRANCH ==="
 # --- promote half (before touching main) --------------------------------------
 PROMOTED_TAG=""; PROMOTE_FINALIZED=0
 # The promote half tags a LOCAL (unpushed) stable vB before the main half runs. If the
-# main half then fails (an empty [Unreleased] with no --changelog-file, a bad oracle,
-# anything), roll that tag back so a re-run starts clean instead of refusing with "tag
+# main half then fails (a bad supplied changelog draft, a bad oracle, anything),
+# roll that tag back so a re-run starts clean instead of refusing with "tag
 # vB already exists". The tag is not pushed, so deleting it loses nothing; a successful
 # run sets PROMOTE_FINALIZED=1 first so the guard is a no-op.
 promote_guard() {
@@ -720,8 +720,8 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
   # to cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless. We
   # count SHIPPING first-parent commits, not raw commits: a docs/skill/prd/build-only commit
   # after the RC (e.g. a `docs(...) [skip ci]` anchor refresh) must still take promote-only,
-  # not drop through to the main half and fail on an empty [Unreleased] (which would roll the
-  # stable tag back). "Shipping" is is_shipping, the same predicate the coverage oracle uses.
+  # not require entries for a next candidate. "Shipping" is is_shipping, the same
+  # path predicate the coverage oracle uses.
   if ! SHIPPING_SHAS="$(shipping_commits_since "$INFLIGHT")"; then
     exit 3
   fi
@@ -732,6 +732,17 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
 $SHIPPING_SHAS
 EOF
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
+  # A combined promotion must have notes for the next candidate before tagging the stable.
+  # Dependency-only shipping work also requires notes here; plain cuts still autocite it.
+  if [ "$OP" = promote ] && [ "$merges" -gt 0 ] && [ -z "$unrel" ] && [ -z "$CL_FILE" ]; then
+    {
+      echo "release-cut: --promote REFUSED -- shipping commits landed since $INFLIGHT but [Unreleased] is empty and no --changelog-file given."
+      echo "  Shipping SHAs:"
+      printf '    %s\n' "$SHIPPING_SHAS"
+      echo "  Either write next candidate entries under [Unreleased] OR pass --changelog-file with a drafted ## [$BASE] section, then re-run."
+    } >&2
+    exit 3
+  fi
   trap promote_guard EXIT
   promote_inflight
   # --promote-only: the lead asked for the stable alone. Stop here whatever main carries:
