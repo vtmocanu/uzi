@@ -99,6 +99,13 @@ type FakeClient struct {
 	ListRunsCalls      int
 	AdminListRunsCalls int
 
+	// ListRunSummariesCalls / AdminListRunSummariesCalls count the compact-view calls
+	// the TUI board polls (issue #2661); LastListRunSummariesCtx is the ctx of the
+	// most recent ListRunSummaries call (the per-poll deadline assertion).
+	ListRunSummariesCalls      int
+	AdminListRunSummariesCalls int
+	LastListRunSummariesCtx    context.Context
+
 	// LastListRunsCtx / LastGetRunCtx capture the context.Context the most recent
 	// ListRuns / GetRun call was handed (PRD #1130 M2). Purely additive — they let a
 	// test assert the per-poll deadline the board / detail-meta closures derive

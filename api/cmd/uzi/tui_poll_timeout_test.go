@@ -36,7 +36,7 @@ func TestTUIBoardPollDerivesShortDeadline(t *testing.T) {
 		t.Fatalf("fetchRunsCmd produced %T, want boardRunsMsg", msg)
 	}
 
-	ctx := fake.LastListRunsCtx
+	ctx := fake.LastListRunSummariesCtx
 	if ctx == nil {
 		t.Fatal("ListRuns was handed a nil ctx; the board poll did not pass its derived context")
 	}
