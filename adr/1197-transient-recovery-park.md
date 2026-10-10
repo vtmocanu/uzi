@@ -219,12 +219,13 @@ Pre-clone retained discovery used to fail the claim on any error that was not
 a foreign-retained rejection, so an operation deadline while waiting on the
 bare lock failed a run whose local work was intact. It now retries only
 confirmed operational errors: the operation deadline, identified by an elapsed
-absolute attempt deadline plus abort evidence (the lock-wait abort message or
-a "recovery deadline exhausted" error in the cause chain), and the resource
+absolute attempt deadline plus positive deadline evidence (the lock-wait
+abort message or a "recovery deadline exhausted" error in the cause chain), and the resource
 errnos EAGAIN, EMFILE, ENFILE and ENOMEM. A bare abort without that evidence
 is terminal. Typed errors and known corruption markers are rejected before
 any deadline-text match, and every other error is terminal unless positively
-identified as retryable; all of them keep custody. Git spawn exhaustion is
+identified as retryable; all of them except a foreign-retained rejection
+keep custody. Git spawn exhaustion is
 wrapped without a code, so it stays terminal.
 
 The allowance is at most 2 retries per claim, shared across both discovery
