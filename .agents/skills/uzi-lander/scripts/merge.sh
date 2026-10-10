@@ -162,7 +162,7 @@ closes_read() {
   { printf '%s\n' "$meta"; printf '%s\n' "$n"; printf '%s\n' "$pages"; } | jq -ser --arg repo "$REPO" '
     def norm($o; $num): if ($o // "") == "" or (($o|ascii_downcase) == ($repo|ascii_downcase))
       then ($num|tonumber|tostring) else "\($o)#\($num|tonumber)" end;
-    def kw: [scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s*:?\\s*([\\w.-]+/[\\w.-]+)?#([0-9]+)") | norm(.[0]; .[1])];
+    def kw: [scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b(?:\\s*:\\s*|\\s+|(?=#))([\\w.-]+/[\\w.-]+)?#([0-9]+)") | norm(.[0]; .[1])];
     .[0] as $meta | .[1] as $n | ((.[2] // []) | add // []) as $cs
     | if (($meta|type) != "object") or ($meta|has("closingIssuesReferences")|not) or ($meta|has("title")|not)
          or (($n|type) != "number") or (($cs|length) != $n) then error("incomplete") else . end

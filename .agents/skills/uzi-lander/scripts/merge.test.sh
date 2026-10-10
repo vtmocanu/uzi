@@ -528,6 +528,13 @@ merge_run closes_title
 [ "$rc" -eq 11 ] || fail "a closing keyword in the PR title did not refuse, rc=$rc: $(cat "$WORK/m.closes_title")"
 grep -q 'merging would close \[44\]' "$WORK/m.closes_title" || fail "title closing ref not named: $(cat "$WORK/m.closes_title")"
 unset PR_TITLE
+# A keyword must end at a word boundary before its separator: an owner named fixes/ or
+# closed/ in a Refs line is not a keyword (it was parsed as "fix" + "es/repo#7").
+export COMMITS_JSON='[{"commit":{"message":"Refs fixes/repo#7 and closed/repo#8\nfixes #10, close:#11, Resolved\t#12, fix#13"}}]'
+MERGE_ARGS=(--expect-closes '10,11,12,13')
+merge_run closes_owner_names
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "owner names fixes/ closed/ parsed as keywords, or a separator form missed: $(cat "$WORK/m.closes_owner_names")"
+grep -q 'CLOSES=10,11,12,13' "$WORK/m.closes_owner_names" || fail "unexpected parse: $(cat "$WORK/m.closes_owner_names")"
 unset CLOSES_JSON COMMITS_JSON; MERGE_ARGS=()
 # --confirm-only never reads the run list.
 MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
