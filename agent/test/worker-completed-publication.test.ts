@@ -181,7 +181,7 @@ for (const inventory of ["pending", "absent"] as const) {
         await discardInventory(f, inventory);
         assert.equal((await f.outbox!.journalFinalize(f.receipt.run_id, 1)).written, true);
         if (actor === "runner") await f.terminal();
-        else await f.outbox!.journalTerminal(f.receipt.run_id, 1, "running", 7, f.body);
+        else await f.outbox!.journalTerminal(f.receipt.run_id, 1, "running", 7, { ...f.body });
         f.retirement(terminalOwnership(), discardAuthority(f, "released"));
         const run = actor === "runner" ? f.run : f.freshRunner();
         const worker = discardWorker(f, run);
@@ -218,7 +218,7 @@ for (const inventory of ["pending", "absent"] as const) {
         f.refuse();
         await discardInventory(f, inventory);
         assert.equal((await f.outbox!.journalFinalize(f.receipt.run_id, 1)).written, true);
-        await f.outbox!.journalTerminal(f.receipt.run_id, 1, "running", 7, f.body);
+        await f.outbox!.journalTerminal(f.receipt.run_id, 1, "running", 7, { ...f.body });
         // In particular, legacy absence must have no process-local guarded claim history.
         const client = await f.freshClient();
         const run = f.freshRunner(client);
