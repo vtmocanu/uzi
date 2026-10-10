@@ -381,6 +381,8 @@ func run() error {
 		// PRD #1867 failed-run salvage: the forge kinds whose failed runs the run_salvage
 		// pass enqueues (UZI_SALVAGE_FORGES). Empty is off; it gates only the enqueue.
 		SalvageForges: cfg.SalvageForges,
+		// Issue #2545 held-work publication step A switch (UZI_HELD_PUBLICATION, default on).
+		HeldPublication: cfg.HeldPublication,
 	})
 
 	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker

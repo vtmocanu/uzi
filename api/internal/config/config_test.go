@@ -1072,6 +1072,45 @@ func TestLoadSalvageForges(t *testing.T) {
 	}
 }
 
+// TestLoadHeldPublication pins UZI_HELD_PUBLICATION (issue #2545): default ON, "off"/"false"
+// disable it, and an unrecognised value refuses to start rather than keeping the default.
+func TestLoadHeldPublication(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if !cfg.HeldPublication {
+		t.Fatal("HeldPublication default = false, want on")
+	}
+	for raw, want := range map[string]bool{
+		"": true, "on": true, "ON": true, " true ": true, "1": true, "yes": true,
+		"off": false, "OFF": false, "false": false, " False ": false, "0": false, "no": false,
+	} {
+		t.Setenv("UZI_HELD_PUBLICATION", raw)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_HELD_PUBLICATION=%q: %v", raw, err)
+		}
+		if cfg.HeldPublication != want {
+			t.Errorf("UZI_HELD_PUBLICATION=%q -> %v, want %v", raw, cfg.HeldPublication, want)
+		}
+	}
+	for _, raw := range []string{"disabled", "of", "2", "enable", "tru"} {
+		t.Setenv("UZI_HELD_PUBLICATION", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_HELD_PUBLICATION") {
+			t.Errorf("UZI_HELD_PUBLICATION=%q: Load() err = %v, want a UZI_HELD_PUBLICATION error", raw, err)
+		}
+	}
+}
+
 // TestNormalizeTrustedBotBaseURLMatchesConfig pins settings.NormalizeTrustedBotBaseURL (a copy,
 // because this package imports settings) to NormalizeForgeBaseURL: the trusted review-bot
 // allowlist is matched against the connection's normalized base URL, so the two must agree.

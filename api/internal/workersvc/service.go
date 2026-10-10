@@ -1589,6 +1589,13 @@ type Params struct {
 	// the list, and a pending row there settles 'disabled' after a CAS delete of any unrecorded
 	// copy. Empty (the zero value) is off.
 	SalvageForges []string
+
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is whether step A of held-work
+	// publication is enabled. It gates step A only: the release step and the cleanup sweep run
+	// whatever it says, so nothing recorded while it was on is stranded by turning it off. The
+	// zero value is off (a Params literal that omits it never publishes); the default-on lives in
+	// config.go where the env is read.
+	HeldPublication bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to

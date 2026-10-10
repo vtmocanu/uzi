@@ -801,6 +801,14 @@ type Config struct {
 	// on a forge that left the list is settled 'disabled' (after a CAS delete of any
 	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
+
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) gates STEP A only: whether a failed run's
+	// held work may be published to refs/uzi-held/<run-id>/<generation>. Default ON; "off",
+	// "false", "0", "no" disable it (true/on/1/yes/empty enable it, case-insensitive), and any
+	// other value refuses to start. It is advertised to workers as a server feature, so an API with
+	// it off makes workers take the archive path. The release step and the cleanup sweep always
+	// run, so rows and holds recorded while it was on are never stranded by turning it off.
+	HeldPublication bool
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1403,6 +1411,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SalvageForges = salvageForges
+
+	heldPublication, err := parseOnOff("UZI_HELD_PUBLICATION", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.HeldPublication = heldPublication
 
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
@@ -2252,6 +2266,22 @@ func parseBool(key string, def bool) (bool, error) {
 		return false, fmt.Errorf("%s must be a boolean (true/false), got %q", key, raw)
 	}
 	return v, nil
+}
+
+// parseOnOff parses a switch that operators write either as a boolean or as on/off. Empty or
+// unset returns def; true/on/1/yes and false/off/0/no are accepted case-insensitively. Anything
+// else is an error, so a typo fails boot instead of silently keeping the default.
+func parseOnOff(key string, def bool) (bool, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch raw {
+	case "":
+		return def, nil
+	case "true", "on", "1", "yes", "t", "y":
+		return true, nil
+	case "false", "off", "0", "no", "f", "n":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be on/off or true/false, got %q", key, os.Getenv(key))
 }
 
 // parsePositiveInt parses a strictly-positive integer env var. Empty/unset returns

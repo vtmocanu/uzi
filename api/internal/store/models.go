@@ -795,6 +795,7 @@ type RecoveryCustodyHold struct {
 	CompletionIdentity          []byte             `json:"completion_identity"`
 	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
 	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
+	FinalPublicationID          pgtype.UUID        `json:"final_publication_id"`
 }
 
 type RecoveryCustodyHoldFact struct {
@@ -1112,6 +1113,33 @@ type RunGatePresentation struct {
 	PresentationID uuid.UUID          `json:"presentation_id"`
 	Revision       int64              `json:"revision"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunHeldPublication struct {
+	ID              uuid.UUID          `json:"id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	Generation      int64              `json:"generation"`
+	HoldID          uuid.UUID          `json:"hold_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          uuid.UUID          `json:"repo_id"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	LiveRunID       pgtype.UUID        `json:"live_run_id"`
+	Ref             string             `json:"ref"`
+	Tip             string             `json:"tip"`
+	CoverageDigest  string             `json:"coverage_digest"`
+	State           string             `json:"state"`
+	Attempts        int32              `json:"attempts"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	CreateInvokedAt pgtype.Timestamptz `json:"create_invoked_at"`
+	RefCreatedAt    pgtype.Timestamptz `json:"ref_created_at"`
+	AcknowledgedAt  pgtype.Timestamptz `json:"acknowledged_at"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	OwnerExpiredAt  pgtype.Timestamptz `json:"owner_expired_at"`
+	DeletedAt       pgtype.Timestamptz `json:"deleted_at"`
+	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError       pgtype.Text        `json:"last_error"`
+	RefusalReason   pgtype.Text        `json:"refusal_reason"`
 }
 
 type RunMessage struct {
