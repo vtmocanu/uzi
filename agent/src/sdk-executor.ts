@@ -3677,8 +3677,8 @@ export class SdkExecutor implements Executor {
   /**
    * Issue #2686: wait up to `intentSettleBoundMs` for the intent pass to finish on its own,
    * WITHOUT aborting it. Resolves true when it settled (or none exists, or it was already
-   * abandoned: an abandoned pass never settles, so waiting again would only add a bound), false
-   * at the bound.
+   * abandoned: it was aborted and its late usage is dropped, so waiting again could only add a
+   * bound), false at the bound.
    */
   private async waitIntentSummary(): Promise<boolean> {
     const flight = this.intentFlight;
@@ -3716,7 +3716,7 @@ export class SdkExecutor implements Executor {
    * it to finish naturally (bounded) so a "gave_up" run, which continues in place on the old
    * token, still posts its intent summary; only a pass still running at the bound is aborted and
    * settled. Residual: such a pass is cancelled, so its summary is not posted on a later give-up
-   * (any usage it already observed is still reported).
+   * (usage it reports before the settle bound is still emitted).
    */
   private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
     if (!ctx.attemptCredentialSwitch) return undefined;
