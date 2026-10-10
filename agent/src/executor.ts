@@ -462,8 +462,13 @@ export interface RunContext {
    * (`could not report progress`) and swallowed — an informational field never fails a run
    * (#122 additive-optional). Absent on the stub/test executors, in which case the executor
    * still folds the value into `latestProgress` and the turn-boundary report carries it.
+   *
+   * PRD #2603: the optional `frozen` is the frozen milestone list the progress is over (the
+   * observer's own list, which is the gate's list or the claim's on a pre-approved resume). The
+   * runner hands it to the Now-summary controller, which needs the titles and the order; it does
+   * not change the report.
    */
-  reportProgress?(progress: MilestoneProgress): Promise<void>;
+  reportProgress?(progress: MilestoneProgress, frozen?: readonly Milestone[]): Promise<void>;
   /**
    * PRD #122 M6: durably checkpoint the run's committed work at a milestone boundary.
    * The executor calls it from the implement loop when a milestone completes.

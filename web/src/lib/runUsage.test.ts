@@ -1380,3 +1380,48 @@ describe("m2 accounting attribution", () => {
     expect(d.total).toMatchObject({ fresh: 70, cached: 30, out: 12 });
   });
 });
+
+describe("deriveRunUsage: progress_note cost comes from the server-resolved entry", () => {
+  const entry = (extra: Record<string, unknown>) => ({
+    inputTokens: 400,
+    outputTokens: 40,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    ...extra,
+  });
+  const note = (...entries: Record<string, unknown>[]) =>
+    entries.map((e, i) => msg("progress_note", "lead", { text: "x", model_usage: { [`m${i}`]: e } }));
+
+  it("adds a metered entry's stored cost and reports metered", () => {
+    seq = 0;
+    const d = deriveRunUsage(note(entry({ costUSD: 0.0006, costStatus: "metered" })));
+    expect(d.noteTotal.costUsd).toBe(0.0006);
+    expect(d.noteTotal.costStatus).toBe("metered");
+    expect(d.total.costUsd).toBe(0.0006);
+  });
+
+  it("treats an unreported entry as unavailable: tokens counted, no dollars", () => {
+    seq = 0;
+    const d = deriveRunUsage(note(entry({ costStatus: "unreported" })));
+    expect(d.noteTotal.out).toBe(40);
+    expect(d.noteTotal.costUsd).toBe(0);
+    expect(d.noteTotal.costStatus).toBe("");
+  });
+
+  it("ignores a costUSD on a non-metered entry and on a metered entry without a finite one", () => {
+    seq = 0;
+    expect(deriveRunUsage(note(entry({ costUSD: 5, costStatus: "subscription" }))).noteTotal).toMatchObject({
+      costUsd: 0,
+      costStatus: "subscription",
+    });
+    expect(deriveRunUsage(note(entry({ costStatus: "metered" }))).noteTotal).toMatchObject({ costUsd: 0, costStatus: "" });
+  });
+
+  it("is unavailable when metered and unreported entries mix, and neutral with no entries", () => {
+    seq = 0;
+    const mixed = deriveRunUsage(note(entry({ costUSD: 0.01, costStatus: "metered" }), entry({ costStatus: "unreported" })));
+    expect(mixed.noteTotal.costUsd).toBe(0.01);
+    expect(mixed.noteTotal.costStatus).toBe("");
+    expect(deriveRunUsage([]).noteTotal.costStatus).toBe("");
+  });
+});

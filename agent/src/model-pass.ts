@@ -42,6 +42,7 @@ import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // t
 import type {
   AdviceRequest,
   AdviceResultPolicy,
+  AdviceUsageSnapshot,
 } from "./harness.js"; // type-only — erased at runtime; harness.ts has no SDK import, so no cycle
 
 /** Options for runReadOnlyModelPass — one tool-less, repo-isolated model turn. */
@@ -60,9 +61,25 @@ export interface ReadOnlyModelPassOpts {
   homeRoot: string;
   /** mkdtemp prefix, e.g. "uzi-judge-" | "uzi-review-" | "uzi-summary-". */
   homePrefix: string;
-  /** "judge" | "review" | "summary" — used in the timeout + generic-error messages. */
+  /** "judge" | "review" | "summary" | "now" — used in the timeout + generic-error messages. */
   label: string;
   timeoutMs: number;
+  /** PRD #2603: output-token cap for this one call. Applied to the request only when set;
+   *  the Claude harness enforces it through CLAUDE_CODE_MAX_OUTPUT_TOKENS. Existing callers
+   *  pass none. */
+  maxOutputTokens?: number;
+  /** PRD #2603: "disabled" turns extended thinking off. Applied only when set. */
+  thinking?: "disabled";
+  /** PRD #2603: an EXTERNAL abort. Linked into the pass's own AbortController so aborting it
+   *  cancels the SDK query and rejects the pass at once (the same path as the wall-clock
+   *  timeout), after which the bounded `graceMs` settle and the HOME teardown still run. Never
+   *  waits for the timeout. Existing callers pass none. */
+  signal?: AbortSignal;
+  /** PRD #2603: called EXACTLY ONCE, in the finally after the bounded settle, with the latest
+   *  non-empty per-model usage snapshot the harness observed, on success, error, timeout and
+   *  abort alike. Not called when no usage evidence arrived. A throw is logged, never raised.
+   *  Existing callers pass none. */
+  onUsage?(modelUsage: AdviceUsageSnapshot): void;
   /** Bounded grace, after the wall-clock abort, to wait for the SDK query to settle
    *  before the ephemeral HOME is removed — so cleanup does not race the aborted CLI
    *  while it is still exiting and may still touch $HOME. Defaults to
@@ -92,6 +109,9 @@ export interface ReadOnlyModelPassOpts {
     readonly runId: string;
     readonly binding: CodexBinding;
     readonly buildHarness: CodexAdviceHarnessFactory;
+    /** PRD #2603: "deny" ⇒ the call may not refresh the shared credential (see
+     *  CodexAdviceHarnessBuildParams.refresh). Existing callers pass none. */
+    readonly refresh?: "deny";
   };
 }
 
@@ -136,6 +156,58 @@ async function awaitQuerySettled(query: Promise<unknown>, graceMs: number): Prom
   } finally {
     if (graceTimer) clearTimeout(graceTimer);
   }
+}
+
+/** PRD #2603: link an external AbortSignal into a pass. Returns a promise that rejects the
+ *  moment the signal aborts (after aborting the pass's own controller, which cancels the SDK
+ *  query), plus the unlink step. Undefined when no signal was supplied, so the race of a caller
+ *  without one is exactly what it was. */
+function linkExternalAbort(
+  signal: AbortSignal | undefined,
+  abort: AbortController,
+  label: string,
+): { aborted: Promise<never>; unlink(): void } | undefined {
+  if (!signal) return undefined;
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      abort.abort();
+      reject(new Error(`${label} model call aborted`));
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // The race may already have settled when the signal fires; never an unhandled rejection.
+  aborted.catch(() => {});
+  return { aborted, unlink: () => onAbort && signal.removeEventListener("abort", onAbort) };
+}
+
+/** PRD #2603: the usage-evidence latch of one pass. `observe` keeps the latest snapshot until
+ *  `flush`, which delivers it to `onUsage` at most once and closes the latch, so a late
+ *  observation after the pass returned can never produce a second delivery. */
+function usageLatch(opts: ReadOnlyModelPassOpts): {
+  observe: ((snapshot: AdviceUsageSnapshot) => void) | undefined;
+  flush(): void;
+} {
+  const onUsage = opts.onUsage;
+  if (!onUsage) return { observe: undefined, flush: () => {} };
+  let latest: AdviceUsageSnapshot | undefined;
+  let closed = false;
+  return {
+    observe: (snapshot) => {
+      if (!closed && Object.keys(snapshot).length > 0) latest = snapshot;
+    },
+    flush: () => {
+      if (closed) return;
+      closed = true;
+      if (latest === undefined) return;
+      try {
+        onUsage(latest);
+      } catch (e) {
+        opts.log.warn(`${opts.label} usage callback failed`, { error: errMessage(e) });
+      }
+    },
+  };
 }
 
 /**
@@ -184,6 +256,8 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   // so a hung/retrying model call can never wedge the run — the pass settles within
   // timeoutMs and the caller falls back.
   const abort = new AbortController();
+  const external = linkExternalAbort(opts.signal, abort, opts.label);
+  const usage = usageLatch(opts);
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
@@ -211,6 +285,9 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     signal: abort.signal,
     timeoutMs: opts.timeoutMs,
     graceMs: opts.graceMs,
+    ...(opts.maxOutputTokens !== undefined ? { maxOutputTokens: opts.maxOutputTokens } : {}),
+    ...(opts.thinking !== undefined ? { thinking: opts.thinking } : {}),
+    ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
   const runPromise = new ClaudeAdviceHarness({
     token,
@@ -224,15 +301,19 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     .run(request, policy)
     .then((r) => r.text);
   try {
-    return await Promise.race([runPromise, timeout]);
+    return await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
+    external?.unlink();
     // Defer HOME cleanup until the query settles (bounded by a grace after abort): on the
     // timeout path the race rejects as soon as `abort.abort()` fires, but the SDK
     // terminates the CLI asynchronously, so removing HOME here immediately could race the
     // aborted CLI while it is still exiting and may still touch $HOME. On the success path
     // the query has already settled, so this returns without waiting.
     await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
+    // PRD #2603: the usage evidence gathered up to here, delivered once. After the bounded
+    // settle so a result frame that arrives in the grace is still counted.
+    usage.flush();
     // Best-effort HOME cleanup. The startup sweep (PRD #108 M6) never collects this
     // directory: it is named `uzi-<label>-*`, not a run UUID. The running disk reclaim
     // (PRD #1809 D7, disk-reclaim.ts) collects a stranded one once no pass in this process
@@ -273,6 +354,8 @@ async function runCodexAdviceModelPass(
   codex: NonNullable<ReadOnlyModelPassOpts["codex"]>,
 ): Promise<string> {
   const abort = new AbortController();
+  const external = linkExternalAbort(opts.signal, abort, opts.label);
+  const usage = usageLatch(opts);
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
@@ -295,16 +378,30 @@ async function runCodexAdviceModelPass(
     signal: abort.signal,
     timeoutMs: opts.timeoutMs,
     graceMs: opts.graceMs,
+    ...(opts.maxOutputTokens !== undefined ? { maxOutputTokens: opts.maxOutputTokens } : {}),
+    ...(opts.thinking !== undefined ? { thinking: opts.thinking } : {}),
+    ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
   const runPromise = (async (): Promise<string> => {
-    const harness = await codex.buildHarness({ runId: codex.runId, binding: codex.binding, signal: abort.signal });
+    const harness = await codex.buildHarness({
+      runId: codex.runId,
+      binding: codex.binding,
+      signal: abort.signal,
+      ...(codex.refresh ? { refresh: codex.refresh } : {}),
+    });
     const result = await harness.run(request, policy);
     return result.text;
   })();
   try {
-    return await Promise.race([runPromise, timeout]);
+    return await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
+    external?.unlink();
+    // PRD #2603: the same bounded settle as the Claude path, so usage the harness observed
+    // while it was winding down is counted and a harness that never settles after abort
+    // cannot hold the caller past graceMs.
+    await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
+    usage.flush();
   }
 }
 

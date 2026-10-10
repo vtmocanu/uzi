@@ -26,8 +26,8 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("expected header and two cells: %s", out)
+	if len(lines) != 4 || lines[3] != "Now summary: on (default)" {
+		t.Fatalf("expected header, two cells and the Now summary line: %s", out)
 	}
 	want := []string{
 		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
@@ -66,7 +66,7 @@ func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 3 {
+	if len(lines) != 4 {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
@@ -94,7 +94,7 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 2 ||
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 3 ||
 		len(out) > 3000 || !strings.Contains(out, "unknown") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe or unbounded output: %q", out)
 	}
@@ -150,5 +150,27 @@ func TestSettingsReadOnlyAndErrors(t *testing.T) {
 	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "settings", "get")
 	if code != 0 || !strings.Contains(out, "STORED MODEL") {
 		t.Fatalf("empty settings: exit %d, output %s", code, out)
+	}
+}
+
+func TestSettingsGetNowSummaryLine(t *testing.T) {
+	on, off := true, false
+	for _, c := range []struct {
+		name string
+		v    *bool
+		want string
+	}{{"default", nil, "Now summary: on (default)"}, {"on", &on, "Now summary: on"}, {"off", &off, "Now summary: off"}} {
+		fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{NowSummaryEnabled: c.v}}
+		out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+		if code != 0 {
+			t.Fatalf("%s: exit %d: %s", c.name, code, stderr)
+		}
+		if !strings.Contains(out, "\n"+c.want+"\n") {
+			t.Errorf("%s: missing %q in %q", c.name, c.want, out)
+		}
+		jout, _, _ := runCLI(t, fakeEnv(fc), "settings", "get", "--json")
+		if strings.Contains(jout, "Now summary:") {
+			t.Errorf("%s: JSON carries the human line: %s", c.name, jout)
+		}
 	}
 }

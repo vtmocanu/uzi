@@ -96,6 +96,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #700 M6: MR review watcher per-user opt-in. null = the default-ON state;
   // an explicit false opts the account out.
   mr_rework_enabled: null,
+  // PRD #2603: the per-user Now-line switch; null reads as ON.
+  now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
 };
@@ -136,6 +138,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_daily_budget: "0",
   // PRD #914: instance-wide CI-autofix kill-switch, default ON.
   ci_autofix_enabled: "true",
+  // PRD #2603: instance kill-switch for the model-written Now line, default ON.
+  now_summary_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
@@ -248,6 +252,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
+    (u.now_summary_enabled === undefined || u.now_summary_enabled === null || typeof u.now_summary_enabled === "boolean") &&
     (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // PRD #1167 "Lights on" m2: the four raw appearance overrides, each null-or-string
@@ -296,6 +301,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
     // from the seed default ("haiku") on load.
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
+    // PRD #2603: a blob that predates now_summary_enabled (undefined) is filled from the
+    // seed ("true") on load; a malformed non-string is refused.
+    (a.now_summary_enabled === undefined || typeof a.now_summary_enabled === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     // issue #2046: accept a legacy blob that predates health_tool_call_seconds (undefined);
@@ -809,6 +817,7 @@ export const settingsApi = {
         key === "judge_enabled" ||
         key === "judge_enforce_all" ||
         key === "ephemeral_workers_enabled" ||
+        key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
         key === "health_enabled" ||
@@ -1322,6 +1331,10 @@ export const settingsApi = {
       // present-null clears back to the default-ON state (stored as null). Mirrors
       // the server treating an absent/null value as ON.
       next = { ...next, mr_rework_enabled: patch.mr_rework_enabled ?? null };
+    }
+    if (patch.now_summary_enabled !== undefined) {
+      // Tri-state like mr_rework_enabled (PRD #2603): null clears back to the default ON.
+      next = { ...next, now_summary_enabled: patch.now_summary_enabled ?? null };
     }
     if (patch.default_harness !== undefined) {
       // Tri-state (PRD #1429 M1/D3, review fix M4a): present-null clears to "no

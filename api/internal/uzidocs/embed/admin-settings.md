@@ -149,9 +149,22 @@ once or twice per run, so the default favors speed and cost over depth). Each us
 can override it for their own runs from **Settings → Run defaults → Run
 summaries → Summary model**; the admin default only applies while they
 haven't. Summary generation always spends the run owner's own Anthropic
-token, never the admin's, same as the judge above — there's no kill-switch
-here, since a failed or slow summary is skipped silently and never blocks a
-run.
+token, never the admin's, same as the judge above. There's no kill-switch
+for the intent and plan summaries, since a failed or slow summary is skipped
+silently and never blocks a run.
+
+**Model-written Now line** (`now_summary_enabled`, on by default) is the
+instance kill switch for the [Now summary](./run-activity.md#now-summary): the
+one-sentence "what the run is doing right now" line on the run progress card,
+the TUI detail and `uzi run get`. It is a checkbox in the same **Run
+summaries** card as the Summary model. Off stops the summary for every user,
+whatever their own **Settings → Run defaults → Run summaries** choice; on lets
+each user's own setting decide (also on by default). The effective setting
+for a run is the admin switch AND the run owner's setting, and reaches a
+running run on the worker's next input poll, so turning it off stops further
+calls and removes the line from the run page. Each call spends the run
+owner's own credential (Claude `haiku`, Codex `gpt-6-luna`) and counts
+toward the run's usage; it is not the admin's.
 
 ## Self-improvement
 

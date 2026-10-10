@@ -316,6 +316,9 @@ tasks:
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
       # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
       - task: test:docker-pull-fallback
+      # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
+      # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
+      - task: test:web-nginx-cleanup
       # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
       # fake `go install` failing then succeeding, no real gitleaks and no network,
       # proving a transient proxy failure is retried while a broken scan is not.
@@ -1002,6 +1005,11 @@ tasks:
     desc: hermetic mirror-first, Docker Hub fallback contract for CI image pulls (fake docker, no network)
     cmds:
       - ./scripts/docker-pull-fallback.test.sh
+
+  test:web-nginx-cleanup:
+    desc: hermetic cleanup-ownership contract for assert-web-nginx.sh (fake docker/helm/yq, no network)
+    cmds:
+      - ./scripts/assert-web-nginx.test.sh
 
   test:sqlc-drift-gate:
     desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)
@@ -2806,6 +2814,18 @@ tasks:
     # tree's agent/src against it, and CQ_BUILD_ARGS="--network host" where the build needs it.
     cmds:
       - ./e2e/clone-quiescence/run.sh
+
+  test:web-nginx:
+    desc: Opt-in assert the three web nginx configs gzip and cache static assets and keep security headers (#2662)
+    # Runs the digest-pinned nginx image from web/Dockerfile once per config (web/nginx.conf,
+    # web/nginx.mock.conf and the chart's rendered web-configmap.yaml) beside a stub api, and
+    # checks gzip, Cache-Control and security headers on real responses. Requires a working
+    # docker daemon plus helm, yq and curl. NOT wired into gate, gate:repo or gate:web
+    # (gate:repo does not require Docker or Helm); CI wiring is the maintainer-local
+    # follow-up #2663. Exit 2 means the instrument is broken, 1 means a property failed, and
+    # task reports either failure as 201.
+    cmds:
+      - ./scripts/assert-web-nginx.sh
 
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)

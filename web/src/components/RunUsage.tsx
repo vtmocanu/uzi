@@ -150,7 +150,7 @@ export function RunUsagePanel({
   harness?: Harness | null;
 }) {
   if (!usage.hasLiveTokens && !usage.hasConfirmed) return null;
-  const { hasConfirmed, hasLiveTokens, total, model, phases, agents, agentTotal, agentModels } = usage;
+  const { hasConfirmed, hasLiveTokens, total, noteTotal, model, phases, agents, agentTotal, agentModels } = usage;
   const { liveByModel, liveByAgent, liveTotal } = usage;
   const cost = costDisplay(costStatus, total.costUsd);
   // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
@@ -257,6 +257,16 @@ export function RunUsagePanel({
                   <Td>{costCellText(costDisplay(costStatus, p.costUsd))}</Td>
                 </tr>
               ))}
+              {(noteTotal.fresh + noteTotal.cached + noteTotal.out > 0 || noteTotal.costUsd > 0) && (
+                <tr>
+                  <Td left>Now summaries</Td>
+                  <Td>—</Td>
+                  <Td>{formatTokens(noteTotal.fresh)}</Td>
+                  <Td>{formatTokens(noteTotal.cached)}</Td>
+                  <Td>{formatTokens(noteTotal.out)}</Td>
+                  <Td>{costCellText(costDisplay(noteTotal.costStatus, noteTotal.costUsd))}</Td>
+                </tr>
+              )}
               <tr>
                 <Td left total>Run total</Td>
                 <Td total>{total.turns ?? "—"}</Td>

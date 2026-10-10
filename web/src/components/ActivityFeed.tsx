@@ -1,4 +1,4 @@
-import { isAccountingStatus } from "../lib/accountingStatus";
+import { isAccountingStatus, isProgressNote } from "../lib/accountingStatus";
 import { planCheckEventText } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -584,7 +584,7 @@ export function ActivityFeed({
     prefs.set(VIEW_KEY, next);
   };
 
-  const presentationMessages = useMemo(() => messages.filter((m) => !isAccountingStatus(m)), [messages]);
+  const presentationMessages = useMemo(() => messages.filter((m) => !isAccountingStatus(m) && !isProgressNote(m)), [messages]);
   const toolIndex = useMemo(() => buildToolIndex(presentationMessages), [presentationMessages]);
 
   const capped = presentationMessages.length > CAP_TRIGGER && !showAll;

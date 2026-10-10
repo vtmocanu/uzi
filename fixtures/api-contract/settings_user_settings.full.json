@@ -22,6 +22,7 @@
   "summary_model": "x",
   "theme": "x",
   "mr_rework_enabled": true,
+  "now_summary_enabled": true,
   "sidebar_token_ids": [
     "x"
   ],

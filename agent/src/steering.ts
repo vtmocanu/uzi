@@ -592,6 +592,17 @@ export class SteeringChannel {
     return this.fence;
   }
 
+  /** PRD #2603: the run's effective Now-summary setting from the newest successful /inputs poll.
+   *  False until a poll says true, and false again the moment one omits it. */
+  private nowSummary = false;
+  /** The last value handed to the onNowSummaryChange callback (PRD #2603). */
+  private notifiedNowSummary = false;
+  private nowSummaryChangeCb: (() => void) | undefined;
+
+  nowSummaryEnabled(): boolean {
+    return this.nowSummary;
+  }
+
   /** The earliest live anchor: the held batch's routing, or the ready lane's first ready id. Works
    *  while `held` is undefined. */
   private receiptRemainingMs(): number {
@@ -1545,6 +1556,13 @@ export class SteeringChannel {
     this.pauseNowInterrupt = cb;
   }
 
+  /** PRD #2603: register a callback fired when a poll changes the Now-summary setting. Last-wins.
+   *  It runs after the tick's inputs are routed, in its own try/catch, so a throw never skips
+   *  routing or counts as an input-poll failure. */
+  onNowSummaryChange(cb: () => void): void {
+    this.nowSummaryChangeCb = cb;
+  }
+
   /** Register the re-armable credential-switch interrupt (see credentialSwitchInterrupt, PRD #1247
    *  M5b). Last-wins; the runner wires it to the executor's per-run trip so a held-state switch
    *  drops the current turn even after the shared abort controller has been spent. */
@@ -2402,8 +2420,10 @@ export class SteeringChannel {
       try {
         if (!this.held && !this.stopped) {
           this.requestStage = "get";
-          const { inputs: read, credentialSwitch, receipts } = await this.client.getInputs(this.runId);
+          const { inputs: read, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId);
           if (!validBatch(read)) throw new InvalidInputResponse("invalid input GET response");
+          // PRD #2603: the newest poll's Now-summary setting; absent ⇒ off.
+          this.nowSummary = nowSummary === true;
           // Issue #1604: a plan-gate input awaiting its result stays unapplied, so every GET
           // returns it again; it is neither re-ACKed nor re-routed.
           const inputs = receipts ? read.filter((input) => !this.isGateReceiptId(input.id)) : read;
@@ -2464,6 +2484,16 @@ export class SteeringChannel {
           run_id: this.runId,
           error: errMessage(err),
         });
+      }
+      // PRD #2603: tell the Now-summary controller a poll flipped its setting, only after this
+      // tick's routing, and never as an input-poll failure.
+      if (this.nowSummary !== this.notifiedNowSummary) {
+        this.notifiedNowSummary = this.nowSummary;
+        try {
+          this.nowSummaryChangeCb?.();
+        } catch (e) {
+          this.log.warn("steering: now summary change callback failed", { run_id: this.runId, error: errMessage(e) });
+        }
       }
       // Service the parked waiters on EVERY tick, OUTSIDE the try above, so a getInputs
       // failure cannot starve them (PRD #517 M5). serviceGate/serviceAnswer/serviceFollowUp

@@ -18,7 +18,8 @@ import (
 
 // ListRuns returns the current user's runs, newest first. Optional ?repo_id= and
 // ?issue_iid= narrow the list (repo scope for the board attention strip, repo +
-// issue for the in-app issue history); a malformed value is a 400.
+// issue for the in-app issue history); a malformed value is a 400. ?view=summary serves
+// the compact rows (see writeRunList); any other view value is the full legacy rows.
 func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -125,11 +126,12 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item)
 	}
 	h.overlayListCodexAccountActions(r, out)
-	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
+	writeRunList(w, r, out)
 }
 
 // AdminListRuns returns every non-terminal run across all users (admin-only,
-// gated by RequireAdmin on the route). Powers the Agents-status overview.
+// gated by RequireAdmin on the route). Powers the Agents-status overview. ?view=summary
+// serves the compact rows exactly as ListRuns does.
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.wsvc.ListActiveRunsAll(r.Context())
 	if err != nil {
@@ -188,6 +190,23 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item)
 	}
 	h.overlayListCodexAccountActions(r, out)
+	writeRunList(w, r, out)
+}
+
+// writeRunList writes the decorated run list. With ?view=summary (issue #2661) each row is
+// projected through apitypes.RunSummaryOf, which drops plan_md, repo_agents,
+// issue_description and preserved_patch; every other view value serves the full rows. Both
+// handlers call it after all reads and decoration, so the two views cannot differ in rows
+// or order, only in the keys per row.
+func writeRunList(w http.ResponseWriter, r *http.Request, out []apitypes.RunListItemDTO) {
+	if r.URL.Query().Get("view") == "summary" {
+		summaries := make([]apitypes.RunSummaryItemDTO, 0, len(out))
+		for _, item := range out {
+			summaries = append(summaries, apitypes.RunSummaryOf(item))
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"runs": summaries})
+		return
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
 }
 

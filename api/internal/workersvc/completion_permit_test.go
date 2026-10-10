@@ -85,7 +85,7 @@ func frozenJSON(t *testing.T, ids ...string) []byte {
 // split-state hazard.
 func TestComputeUnmetCriteria(t *testing.T) {
 	rev := pgtype.Int4{Int32: 1, Valid: true}
-	frozen := frozenJSON(t, "m1", "m2", "m3") // used only for the fail-closed frozen-id fallback
+	frozen := frozenJSON(t, "m1", "m2", "m3") // drives the fail-closed frozen-id fallback and the coverage check
 
 	t.Run("some unmet", func(t *testing.T) {
 		run := store.Run{
@@ -153,6 +153,54 @@ func TestComputeUnmetCriteria(t *testing.T) {
 			t.Fatal("a corrupt contract must be NOT verifiable (fail-closed)")
 		}
 	})
+
+	// A stored contract that parses but carries no usable criteria must not read as complete
+	// while milestones were frozen (issue #2259).
+	for _, tc := range []struct {
+		name     string
+		contract []byte
+	}{
+		{"JSON null", []byte("null")},
+		{"empty object", []byte("{}")},
+		{"criteria null", []byte(`{"profile":"structural","revision":1,"criteria":null}`)},
+		{"criterion missing for a frozen milestone", contractJSON(t, "m1", "m2")},
+	} {
+		t.Run("fail-closed: "+tc.name, func(t *testing.T) {
+			run := store.Run{
+				CompletionContractVersion: rev,
+				CompletionContract:        tc.contract,
+				MilestonesFrozen:          frozen,
+			}
+			unmet, verifiable := computeUnmetCriteria(run)
+			if verifiable {
+				t.Fatal("must be NOT verifiable (fail-closed)")
+			}
+			if len(unmet) != 3 || unmet[0] != "m1" || unmet[1] != "m2" || unmet[2] != "m3" {
+				t.Fatalf("unmet = %v, want [m1 m2 m3]", unmet)
+			}
+		})
+	}
+
+	// Null criteria fail closed even with no frozen milestones (the coverage check is skipped
+	// there): only an explicit criteria:[] is the milestone-less vacuous shape (issue #2259).
+	for _, contract := range []string{`null`, `{}`, `{"profile":"structural","revision":1,"criteria":null}`} {
+		for _, fz := range []struct {
+			name string
+			raw  []byte
+		}{{"nil", nil}, {"empty", []byte("[]")}} {
+			t.Run("fail-closed: "+contract+" with frozen "+fz.name, func(t *testing.T) {
+				run := store.Run{
+					CompletionContractVersion: rev,
+					CompletionContract:        []byte(contract),
+					MilestonesFrozen:          fz.raw,
+				}
+				unmet, verifiable := computeUnmetCriteria(run)
+				if verifiable || len(unmet) != 0 {
+					t.Fatalf("got unmet=%v verifiable=%v, want [] false", unmet, verifiable)
+				}
+			})
+		}
+	}
 }
 
 // interlockedRun builds a running interlocked run owned by wkr with the given revision/contract.

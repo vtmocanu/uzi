@@ -96,6 +96,7 @@
 // the React components are thin.
 
 import type { RunMessage } from "./api";
+import type { CostStatus } from "./apiTypes";
 import { isAccountingStatus } from "./accountingStatus";
 
 export interface PhaseUsage {
@@ -170,6 +171,16 @@ export interface RunUsage {
     durationMs: number | null;
     phaseCount: number;
   };
+  /** PRD #2603: the Now-summary notes' usage, ALREADY INCLUDED in `total` but absent from
+   *  every phase row; the panel renders it as its own row so Run total equals the sum of
+   *  the displayed rows. All zero when the run has no note usage.
+   *
+   *  `costUsd` sums only the entries the server stored as `costStatus: "metered"` (the
+   *  server-resolved cost, so it matches run_usage; the client has no price table).
+   *  `costStatus` is the display status of that sum: "metered" when every entry is metered,
+   *  "subscription" when every entry is subscription, "" (rendered as unavailable) for a
+   *  mix, any unreported entry, or no entries at all. */
+  noteTotal: { fresh: number; cached: number; out: number; costUsd: number; costStatus: CostStatus | "" };
   /** cached / (fresh + cached) in [0,1] — the UNROUNDED truth.
    *
    *  NOT what the strip renders: `Math.round(this * 100)` reads "100% from cache" at
@@ -341,6 +352,9 @@ interface ModelFigures {
   out: number; // outputTokens
   costUsd: number; // costUSD, quantized to microdollars (see quantizeCost)
 }
+
+/** `maxProgressNoteModels` (progress_note.go): model_usage entries kept per note. */
+const MAX_NOTE_MODELS = 4;
 
 const ZERO_MODEL: ModelFigures = { input: 0, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 };
 
@@ -615,6 +629,14 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
   // derived from this map.
   const modelSums = new Map<string, ModelFigures>();
   let implIteration = 0;
+  // PRD #2603: the Now-summary notes' usage. It joins the model sums and the billed total
+  // below but never a phase row or a per-agent row. `seenNoteSeqs` makes a replayed note
+  // (ws -> REST overlap) count once, as the server's per-seq row does.
+  const noteTotal: RunUsage["noteTotal"] = { fresh: 0, cached: 0, out: 0, costUsd: 0, costStatus: "" };
+  let noteEntries = 0;
+  let noteMetered = 0;
+  let noteSubscription = 0;
+  const seenNoteSeqs = new Set<number>();
   // Whether ANY init frame has been seen yet: the run's FIRST init never opens a new
   // lineage (lineage 0 is the initial session whether or not its first init is flagged).
   let sawInit = false;
@@ -638,6 +660,53 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       prevByModel.clear();
       if (payload["fresh_session"] === true && sawInit) lineageR.clear();
       sawInit = true;
+    }
+
+    // PRD #2603: a progress_note's model_usage folds under `progress_note:<model>`, one
+    // row per note (the server's lineage_epoch is the note's own seq), so it is summed,
+    // never max-merged with the run's own frame of the same model. It never reaches the
+    // per-agent branch below.
+    if (m.kind === "progress_note") {
+      if (seenNoteSeqs.has(m.seq)) continue;
+      seenNoteSeqs.add(m.seq);
+      const nu = rec(payload?.["model_usage"]);
+      if (!nu) continue;
+      // The stored payload is already normalised by the server (normalizeProgressNotePayload);
+      // this re-cap to the first MAX_NOTE_MODELS in sorted name order is only defensive.
+      const names = Object.keys(nu).filter((k) => k !== "").sort().slice(0, MAX_NOTE_MODELS);
+      for (const raw of names) {
+        const e = rec(nu[raw]);
+        if (!e) continue;
+        const noteMeteredCost =
+          e["costStatus"] === "metered" && typeof e["costUSD"] === "number" && Number.isFinite(e["costUSD"]);
+        const cur: ModelFigures = {
+          input: tokens(e["inputTokens"]),
+          cacheCreation: tokens(e["cacheCreationInputTokens"]),
+          cached: tokens(e["cacheReadInputTokens"]),
+          out: tokens(e["outputTokens"]),
+          // The server stores the cost it resolved (its standard table for an unpriced
+          // Claude note) as costStatus + costUSD, so only a "metered" entry carries a
+          // dollar figure; anything else adds tokens and no cost, and is shown unavailable.
+          costUsd: noteMeteredCost ? quantizeCost(e["costUSD"]) : 0,
+        };
+        noteEntries++;
+        if (noteMeteredCost) noteMetered++;
+        else if (e["costStatus"] === "subscription") noteSubscription++;
+        const key = capModelID(`progress_note:${raw}`);
+        const sum = modelSums.get(key) ?? ZERO_MODEL;
+        modelSums.set(key, {
+          input: sum.input + cur.input,
+          cacheCreation: sum.cacheCreation + cur.cacheCreation,
+          cached: sum.cached + cur.cached,
+          out: sum.out + cur.out,
+          costUsd: sum.costUsd + cur.costUsd,
+        });
+        noteTotal.fresh += cur.input + cur.cacheCreation;
+        noteTotal.cached += cur.cached;
+        noteTotal.out += cur.out;
+        noteTotal.costUsd += cur.costUsd;
+      }
+      continue;
     }
 
     if (isResultFrame(m)) {
@@ -813,6 +882,14 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     { fresh: 0, cached: 0, out: 0, costUsd: 0, turns: 0, durationMs: 0, phaseCount: 0 },
   );
 
+  if (noteEntries > 0 && noteMetered === noteEntries) noteTotal.costStatus = "metered";
+  else if (noteEntries > 0 && noteSubscription === noteEntries) noteTotal.costStatus = "subscription";
+
+  total.fresh += noteTotal.fresh;
+  total.cached += noteTotal.cached;
+  total.out += noteTotal.out;
+  total.costUsd += noteTotal.costUsd;
+
   const inTotal = total.fresh + total.cached;
   const agents: AgentUsage[] = [...agentMap.values()].map((a) => ({ ...a, ...primaryModel(a.modelCounts) }));
   const agentTotal = agents.reduce(
@@ -843,6 +920,7 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     hasConfirmed: phases.length > 0,
     phases,
     total,
+    noteTotal,
     modelTotals,
     cacheHitRatio: inTotal > 0 ? total.cached / inTotal : 0,
     model,

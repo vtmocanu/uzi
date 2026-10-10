@@ -400,3 +400,28 @@ func TestAccountingUXLabScene(t *testing.T) {
 		})
 	}
 }
+
+func TestProgressNoteKindHidden(t *testing.T) {
+	if !isAccountingMessage("progress_note", json.RawMessage(`{"text":"x"}`)) {
+		t.Error("progress_note must be hidden")
+	}
+	if isAccountingMessage("text", json.RawMessage(`{"text":"x"}`)) {
+		t.Error("ordinary text hidden")
+	}
+	frames := []laneFrame{{Kind: "progress_note", Payload: json.RawMessage(`{"text":"x"}`)}, {Kind: "text", Payload: json.RawMessage(`{}`)}}
+	if got := presentationFrames(frames); len(got) != 1 || got[0].Kind != "text" {
+		t.Errorf("presentationFrames kept the note: %v", got)
+	}
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{"r1": {
+		{Seq: 1, Kind: "progress_note", Payload: json.RawMessage(`{"text":"hidden-note-text"}`)},
+		msgDTO(2, "text", "lead", "", "", "visible text", time.Now()),
+	}}}
+	out, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if strings.Contains(out, "hidden-note-text") || !strings.Contains(out, "visible text") {
+		t.Errorf("human logs: %s", out)
+	}
+	jout, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--json")
+	if !strings.Contains(jout, "hidden-note-text") {
+		t.Errorf("JSON mode must keep the note: %s", jout)
+	}
+}

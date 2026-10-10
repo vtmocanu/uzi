@@ -6,6 +6,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -675,5 +677,151 @@ func TestRunUsageFixtureDiscriminates(t *testing.T) {
 	if !disagrees {
 		t.Fatal("fixture broken: no frame's top-level usage disagrees with its modelUsage -- the two " +
 			"readings this contract exists to separate are indistinguishable on it")
+	}
+}
+
+// --- PRD #2603: the notes pair (progress_note usage rows) -------------------------------
+//
+// result-frames-notes.json / run-usage-notes.json: one Claude leg holding the lead's result
+// frame (which names claude-haiku-4-5-20251001) and two progress_note frames that also used
+// haiku. The rollup is authored by hand (see the fixtures README, "The notes pair").
+
+// foldRecordedNotesFrames drives the REAL AppendMessages path over the frames and merges the
+// upserts per (model, lineage_epoch) the way UpsertRunUsage's ON CONFLICT does.
+func foldRecordedNotesFrames(t *testing.T, frames []recordedFrame) map[legKey]store.UpsertRunUsageParams {
+	t.Helper()
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Harness: harnessClaude, SessionID: pgconv.TextOrNull("sess-notes")}}
+	svc := New(fs, newBox(t), testParams())
+	msgs := make([]IncomingMessage, 0, len(frames))
+	for _, f := range frames {
+		msgs = append(msgs, IncomingMessage{Seq: f.Seq, Kind: f.Kind, Agent: "lead", Payload: f.Payload})
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages over the notes frames: %v", err)
+	}
+	merged := map[legKey]store.UpsertRunUsageParams{}
+	for _, u := range fs.upsertedUsage {
+		k := legKey{model: u.Model, epoch: u.LineageEpoch}
+		prev, ok := merged[k]
+		if !ok {
+			merged[k] = u
+			continue
+		}
+		prev.InputTokens = max64(prev.InputTokens, u.InputTokens)
+		prev.OutputTokens = max64(prev.OutputTokens, u.OutputTokens)
+		prev.CacheReadTokens = max64(prev.CacheReadTokens, u.CacheReadTokens)
+		prev.CacheCreationTokens = max64(prev.CacheCreationTokens, u.CacheCreationTokens)
+		if costFloat(t, u.CostUsd) > costFloat(t, prev.CostUsd) {
+			prev.CostUsd = u.CostUsd
+		}
+		merged[k] = prev
+	}
+	return merged
+}
+
+// TestRunUsageNotesFoldMatchesAuthoredRollup: the shipped fold, replayed over the notes frames,
+// must reproduce the authored per-(model, epoch) rows and their SUM as the run total.
+func TestRunUsageNotesFoldMatchesAuthoredRollup(t *testing.T) {
+	var frames recordedFrames
+	readFixture(t, "result-frames-notes.json", &frames)
+	var rollup recordedLegRollup
+	readFixture(t, "run-usage-notes.json", &rollup)
+
+	got := foldRecordedNotesFrames(t, frames.Frames)
+	if len(got) != len(rollup.Rows) {
+		t.Fatalf("fold produced %d (model, epoch) rows, the rollup records %d -- a note row was dropped, invented or collapsed", len(got), len(rollup.Rows))
+	}
+	var sumIn, sumCR, sumCW, sumOut int64
+	var sumCost float64
+	for _, want := range rollup.Rows {
+		g, ok := got[legKey{model: want.Model, epoch: want.LineageEpoch}]
+		if !ok {
+			t.Fatalf("fold produced no row for (model %q, epoch %d), which the rollup holds", want.Model, want.LineageEpoch)
+		}
+		if g.InputTokens != want.InputTokens || g.OutputTokens != want.OutputTokens ||
+			g.CacheReadTokens != want.CacheReadTokens || g.CacheCreationTokens != want.CacheCreationTokens {
+			t.Errorf("(model %s, epoch %d) tokens disagree:\n got in=%d out=%d cr=%d cw=%d\nwant in=%d out=%d cr=%d cw=%d",
+				want.Model, want.LineageEpoch, g.InputTokens, g.OutputTokens, g.CacheReadTokens, g.CacheCreationTokens,
+				want.InputTokens, want.OutputTokens, want.CacheReadTokens, want.CacheCreationTokens)
+		}
+		if d := math.Abs(costFloat(t, g.CostUsd) - want.CostUSD); d > 5e-7 {
+			t.Errorf("(model %s, epoch %d) cost disagrees: got %v, want %v", want.Model, want.LineageEpoch, costFloat(t, g.CostUsd), want.CostUSD)
+		}
+		if g.CostStatus != costStatusMetered || g.UsageBasis != usageBasisPerLeg || g.LineageIndex != 0 {
+			t.Errorf("(model %s, epoch %d) status/basis/lineage = %s/%s/%d, want metered/per_leg/0", want.Model, want.LineageEpoch, g.CostStatus, g.UsageBasis, g.LineageIndex)
+		}
+		sumIn += want.InputTokens
+		sumCR += want.CacheReadTokens
+		sumCW += want.CacheCreationTokens
+		sumOut += want.OutputTokens
+		sumCost += want.CostUSD
+	}
+	if rollup.Totals.InputTokens != sumIn || rollup.Totals.CacheReadTokens != sumCR ||
+		rollup.Totals.CacheCreationTokens != sumCW || rollup.Totals.OutputTokens != sumOut ||
+		math.Abs(rollup.Totals.CostUSD-sumCost) > 5e-6 {
+		t.Fatalf("fixture broken: totals are not the SUM of the rows (rows in=%d cr=%d cw=%d out=%d cost=%v)", sumIn, sumCR, sumCW, sumOut, sumCost)
+	}
+}
+
+// TestRunUsageNotesFixtureDiscriminates: collapsing the note rows into the lead's haiku group
+// (no prefix, init-count epoch) must NOT reproduce the totals, so the pair can tell the keys apart.
+func TestRunUsageNotesFixtureDiscriminates(t *testing.T) {
+	var rollup recordedLegRollup
+	readFixture(t, "run-usage-notes.json", &rollup)
+	collapsed := map[legKey]recordedLegRow{}
+	for _, r := range rollup.Rows {
+		k := legKey{model: strings.TrimPrefix(r.Model, progressNoteModelPrefix), epoch: 1}
+		c := collapsed[k]
+		c.InputTokens = max64(c.InputTokens, r.InputTokens)
+		c.OutputTokens = max64(c.OutputTokens, r.OutputTokens)
+		collapsed[k] = c
+	}
+	var sumIn, sumOut int64
+	for _, c := range collapsed {
+		sumIn += c.InputTokens
+		sumOut += c.OutputTokens
+	}
+	if sumIn == rollup.Totals.InputTokens || sumOut == rollup.Totals.OutputTokens {
+		t.Fatalf("fixture broken: the collapsed (prefix-less, init-epoch) reading in=%d out=%d equals the true totals in=%d out=%d",
+			sumIn, sumOut, rollup.Totals.InputTokens, rollup.Totals.OutputTokens)
+	}
+}
+
+// TestRunUsageStoredNotesFixtureMatchesNormalization: stored-frames-notes.json is
+// result-frames-notes.json with each progress_note payload as the server stores it (the claude
+// normalisation, carrying the resolved cost), and every other frame unchanged. The web contract
+// test reads the stored file, so this keeps the two fixtures from drifting apart.
+func TestRunUsageStoredNotesFixtureMatchesNormalization(t *testing.T) {
+	var in, stored recordedFrames
+	readFixture(t, "result-frames-notes.json", &in)
+	readFixture(t, "stored-frames-notes.json", &stored)
+	if len(in.Frames) != len(stored.Frames) {
+		t.Fatalf("frame counts differ: %d input, %d stored", len(in.Frames), len(stored.Frames))
+	}
+	notes := 0
+	for i, f := range in.Frames {
+		s := stored.Frames[i]
+		if f.Seq != s.Seq || f.Kind != s.Kind {
+			t.Fatalf("frame %d: seq/kind %d/%s vs stored %d/%s", i, f.Seq, f.Kind, s.Seq, s.Kind)
+		}
+		want := f.Payload
+		if f.Kind == KindProgressNote {
+			notes++
+			want = normalizeProgressNotePayload(f.Payload, harnessClaude)
+		}
+		var a, b any
+		if err := json.Unmarshal(want, &a); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(s.Payload, &b); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(a, b) {
+			t.Errorf("frame seq %d: stored fixture payload drifted from the server's normalisation\n got %s\nwant %s", f.Seq, s.Payload, want)
+		}
+	}
+	if notes == 0 {
+		t.Fatal("fixture broken: no progress_note frames")
 	}
 }

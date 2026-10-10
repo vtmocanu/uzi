@@ -665,7 +665,10 @@ export function buildJudgePrompt(
 // for a normal run, but the implement opening with NO gate for a SEEDED run (PRD #209,
 // whose plan was authored at create time), and the tail holds the delivery; head+tail
 // captures the opening and the outcome either way.
-function sampleMessages(messages: WorkerRunMessage[]): string {
+function sampleMessages(allMessages: WorkerRunMessage[]): string {
+  // PRD #2603: a progress_note is a model-written Now line (or an empty usage-only/clear note),
+  // not evidence of what the run did; it never reaches the judge's input.
+  const messages = allMessages.filter((m) => m.kind !== "progress_note");
   const render = (m: WorkerRunMessage): string => {
     const who = m.agent ? `${m.kind}/${m.agent}` : m.kind;
     let body: string;

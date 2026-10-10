@@ -3,8 +3,62 @@ package main
 import (
 	"strings"
 
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 )
+
+// nowLabel is the hanging-indent label of the wrapped model summary; nowMaxRows bounds its height.
+const (
+	nowLabel   = "now "
+	nowMaxRows = 3
+)
+
+// wrapWords greedily word-wraps already-sanitized single-line text to width columns and at most
+// maxRows rows; text that does not fit ends its last row with an ellipsis. A word wider than a
+// row is split across rows.
+func wrapWords(text string, width, maxRows int) []string {
+	if width < 2 || maxRows < 1 {
+		return nil
+	}
+	var rows []string
+	cur := ""
+	flush := func() {
+		if cur != "" {
+			rows = append(rows, cur)
+			cur = ""
+		}
+	}
+	for _, word := range strings.Fields(text) {
+		for visualWidth(word) > width {
+			flush()
+			// ansi.Truncate cuts on grapheme-cluster boundaries, so a CJK pair or a VS16 emoji
+			// ("\u2764\ufe0f") is never split or mis-measured per rune.
+			head := ansi.Truncate(word, width, "")
+			cut := len(head)
+			if cut == 0 || cut >= len(word) {
+				return rows
+			}
+			rows = append(rows, word[:cut])
+			word = word[cut:]
+		}
+		switch {
+		case cur == "":
+			cur = word
+		case visualWidth(cur)+1+visualWidth(word) <= width:
+			cur += " " + word
+		default:
+			flush()
+			cur = word
+		}
+	}
+	flush()
+	if len(rows) <= maxRows {
+		return rows
+	}
+	return append(rows[:maxRows-1], clampVisual(rows[maxRows-1]+" "+rows[maxRows], width))
+}
 
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
@@ -30,7 +84,8 @@ func (m tuiModel) renderProgress() string {
 			break
 		}
 		// MILESTONES draws position, title and bar just below, so this is the compact two-row form
-		// that keeps the crew roster unfolded on the standard running scene.
+		// that keeps the crew roster unfolded on the standard running scene when there is no Now note;
+		// with a note the roster may auto-fold on short terminals (railAutoFolded), the graceful degrade.
 		top := head + " " + paintSeg(m.pal.tungsten, nil, true, "≈"+itoa(min(max(*p.Pct, 0), 100))+"%")
 		if p.MilestoneTotal > 0 {
 			top += faint(" · " + itoa(p.MilestoneDone) + "/" + itoa(p.MilestoneTotal))
@@ -38,6 +93,9 @@ func (m tuiModel) renderProgress() string {
 		lines = append(lines, top)
 		if p.Phase != "" {
 			lines = append(lines, faint("phase ▸ ")+m.renderer.Plain(p.Phase, laneRailWidth-visualWidth("phase ▸ ")))
+		}
+		if p.NowNote != nil {
+			lines = append(lines, m.nowNoteLines(p.NowNote, faint)...)
 		}
 	case runprogress.StateStalled:
 		lines = append(lines, head+" "+paintSeg(m.pal.stall, nil, false, "◼ stalled"))
@@ -86,4 +144,40 @@ func (m tuiModel) renderProgress() string {
 		return ""
 	}
 	return strings.Join(lines, "\n")
+}
+
+// nowNoteLines draws the model-written (untrusted) Now summary (PRD #2603 mock 4) inside the rail:
+// the text wraps under a `now` label, capped at nowMaxRows rows, and `model summary · <age> ago`
+// rides the last text row when it fits laneRailWidth, else its own faint row, so the marking is
+// never clamped away by joinColumns. It returns nil for a blank note.
+func (m tuiModel) nowNoteLines(note *apitypes.ProgressNote, faint func(string) string) []string {
+	indent := strings.Repeat(" ", visualWidth(nowLabel))
+	rowW := laneRailWidth - visualWidth(nowLabel)
+	text := m.renderer.Plain(note.Text, rowW*nowMaxRows+nowMaxRows)
+	wrapped := wrapWords(text, rowW, nowMaxRows)
+	if len(wrapped) == 0 {
+		return nil
+	}
+	tag := "model summary"
+	if !note.At.IsZero() {
+		tag += " · " + relAge(note.At) + " ago"
+	}
+	last := len(wrapped) - 1
+	// The label and the hanging indent are the same width, so one test covers every row count.
+	inline := visualWidth(indent)+visualWidth(wrapped[last])+3+visualWidth(tag) <= laneRailWidth
+	var lines []string
+	for i, row := range wrapped {
+		prefix := indent
+		if i == 0 {
+			prefix = faint(nowLabel)
+		}
+		if i == last && inline {
+			row += faint(" · " + tag)
+		}
+		lines = append(lines, prefix+row)
+	}
+	if !inline {
+		lines = append(lines, faint(tag))
+	}
+	return lines
 }

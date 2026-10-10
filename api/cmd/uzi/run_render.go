@@ -898,14 +898,26 @@ func progressRow(r apitypes.RunDTO) []string {
 			return row("")
 		}
 		out := fmt.Sprintf("≈%d%%", min(max(*p.Pct, 0), 100))
+		pos := fmt.Sprintf("%s · %d of %d done", out, p.MilestoneDone, p.MilestoneTotal)
 		if p.ActiveMilestoneID != "" {
 			for i, m := range r.Milestones {
 				if m.ID == p.ActiveMilestoneID {
-					return row(fmt.Sprintf("%s · milestone %d of %d", out, i+1, p.MilestoneTotal))
+					pos = fmt.Sprintf("%s · milestone %d of %d", out, i+1, p.MilestoneTotal)
+					break
 				}
 			}
 		}
-		return row(fmt.Sprintf("%s · %d of %d done", out, p.MilestoneDone, p.MilestoneTotal))
+		// PRD #2603: the model-written Now summary is untrusted text, so it goes through cellText.
+		if p.NowNote != nil {
+			if text := cellText(p.NowNote.Text); strings.TrimSpace(text) != "" {
+				pos += " · now: " + text + " (model summary"
+				if !p.NowNote.At.IsZero() {
+					pos += ", " + relAge(p.NowNote.At) + " ago"
+				}
+				pos += ")"
+			}
+		}
+		return row(pos)
 	case runprogress.StateStalled:
 		if r.HealthSince != nil {
 			return row("stalled · since " + r.HealthSince.UTC().Format("15:04"))

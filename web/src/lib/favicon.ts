@@ -16,7 +16,8 @@ import type { StopKind } from "./api";
 export type FaviconState = "failed" | "attention" | "running" | "idle";
 
 // FaviconRun is the minimal run shape the derivation reads — satisfied by
-// RunListItem, so the hook can pass its poll result straight through without a map.
+// RunListItem and by RunSummaryItem (the hook now polls summary rows), so the hook can
+// pass its poll result straight through without a map.
 // is_revising (issue #750) rides along so the attention check can classify from the
 // EFFECTIVE status: a run re-planning after a revise must not light the attention dot.
 export type FaviconRun = {

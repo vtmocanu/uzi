@@ -8,6 +8,11 @@ const EVENTS = new Set(["started", "snapshot", "dispose", "child_exit", "abnorma
 const STATES = new Set(["drained", "unconfirmed"]);
 const CLASSIFICATIONS = new Set(["failure", "not_clean"]);
 const MAX_OUTPUT_BYTES = 16384;
+export type AdviceTeardownPhase = "mutation_start" | "mutation_end" | "provider_ready" | "provider_not_ready" | "dispose_start" | "dispose_end";
+const PHASES: ReadonlySet<string> = new Set<AdviceTeardownPhase>([
+  "mutation_start", "mutation_end", "provider_ready", "provider_not_ready", "dispose_start", "dispose_end",
+]);
+const EXIT_STATUSES = new Set(["zero", "nonzero", "signalled", "unknown"]);
 const REASONS = new Set([
   "thrown_or_unavailable", "drain_unconfirmed", "drain_deadline", "drain_contradicted",
   "supervisor_exit_nonzero", "supervisor_exit_unconfirmed", "control_unavailable",
@@ -40,6 +45,34 @@ export class AdviceTeardownDiagnostic {
     const ordinal = ++this.sequence;
     if (this.events.length < 64) this.events.push({ ordinal, event, ...fields });
     else this.truncated = true;
+  }
+
+  /** Records a fixed-enum phase mark in the shared ordinal sequence. An unknown
+   * phase is ignored: diagnostics never replace the assertion. */
+  mark(phase: AdviceTeardownPhase): void {
+    if (!PHASES.has(phase)) return;
+    this.record("phase", { phase });
+  }
+
+  /** True when any recorded supervisor evidence reports a provider child_exit, before or after dispose_start. */
+  providerChildExitObserved(): boolean {
+    return this.events.some((e) => e.event === "evidence" && e.category === "child_exit");
+  }
+
+  private failureSignature(warnings: Record<string, unknown>[]): Record<string, unknown> {
+    const disposeStart = this.events.find((e) => e.event === "phase" && e.phase === "dispose_start");
+    const known = disposeStart !== undefined && !this.truncated;
+    const before = (e: Record<string, unknown>): boolean => (e.ordinal as number) < (disposeStart?.ordinal as number);
+    let childExit: boolean | "unknown" = "unknown";
+    let exitStatus = "unknown";
+    if (known) {
+      childExit = this.events.some((e) => e.event === "evidence" && e.category === "child_exit" && before(e));
+      const exit = this.events.find((e) => e.event === "exit" && before(e));
+      exitStatus = exit ? (EXIT_STATUSES.has(String(exit.status)) ? String(exit.status) : "unknown") : "none";
+    }
+    const warning = warnings[0]?.category;
+    return { child_exit_before_dispose: childExit, exit_status_before_dispose: exitStatus,
+      warning: warning === "retained" || warning === "cleanup_failed" ? warning : "none" };
   }
 
   observe(child: import("node:child_process").ChildProcess): void {
@@ -138,6 +171,7 @@ export class AdviceTeardownDiagnostic {
     for (const root of this.roots) roots.push({ role: root.role, initial: root.initial, current: await this.metadata(root.target) });
     const removed = roots.some((root) => root.role === "data" && root.initial.existence === "present" && root.current.existence === "absent");
     return { node_version: process.version, events: this.events, truncated: this.truncated, roots, warnings,
+      failure_signature: this.failureSignature(warnings),
       cleanup_attempted_observation: warnings.some((w) => w.category === "cleanup_failed") ? "failure_warning" : "unavailable",
       cleanup_attempted_inference: warnings.some((w) => w.category === "retained") ? false : removed ? true : "unknown" };
   }

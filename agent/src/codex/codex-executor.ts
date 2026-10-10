@@ -1019,6 +1019,7 @@ export async function makeCodexAdviceHarness(
   launchRoot: LaunchAdviceRootSeam,
   log: Logger,
   signal?: AbortSignal,
+  refresh?: "deny",
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1031,8 +1032,8 @@ export async function makeCodexAdviceHarness(
   // built). It seeds the app-server login credential; the token flows over the login RPC, never env.
   const initial = await bridge.release(signal);
   registerToken(initial);
-  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, log });
+  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1088,6 +1089,7 @@ function buildAdviceAuthConfig(
   bridge: CodexAdviceCredentialBridge,
   initial: string,
   registerToken: (token: string) => void,
+  denyRefresh = false,
 ): CodexAppServerAuthConfig {
   if (bridge.authMode !== "subscription") {
     return { mode: "api_key", apiKey: initial };
@@ -1100,7 +1102,11 @@ function buildAdviceAuthConfig(
   return {
     mode: "subscription",
     initial: { accessToken: initial, accountId },
-    bridge: bridge.buildSubscriptionRefreshBridge(registerToken),
+    // PRD #2603: the Now summary shares the RUN's credential, so its advice call must never
+    // advance the run's committed generation: a refresh request fails the (advisory) call instead.
+    bridge: denyRefresh
+      ? { refresh: () => Promise.reject(new Error("codex advice refresh is denied for this call")) }
+      : bridge.buildSubscriptionRefreshBridge(registerToken),
   };
 }
 
@@ -1243,6 +1249,9 @@ export interface CodexAdviceHarnessBuildParams {
   readonly runId: string;
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
+  /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
+   *  refreshCodex, for a caller that shares the run's credential (the Now summary). */
+  readonly refresh?: "deny";
 }
 
 /** The injected judge/review advice-harness seam (PRD #1429 M3): built ONLY here and in
@@ -1265,10 +1274,10 @@ export function makeProductionCodexAdviceHarnessFactory(
   log: Logger,
   homeRoot: string,
 ): CodexAdviceHarnessFactory {
-  return async ({ runId, binding, signal }: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
+  return async ({ runId, binding, signal, refresh }: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
     const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal);
+    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh);
   };
 }
 

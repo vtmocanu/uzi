@@ -20,6 +20,7 @@ const ASTRA = "gpt-6-astra";
 const SOL = "gpt-5.6-sol";
 const SOL6 = "gpt-6-sol";
 const SOL61 = "gpt-6.1-sol";
+const LUNA = "gpt-6-luna";
 // A clock well before any promotional review boundary — the "priceable" default for these tests.
 const BEFORE_SOL_REVIEW = new Date("2026-01-01T00:00:00Z");
 
@@ -41,6 +42,28 @@ function micro(usd: number | undefined): number | undefined {
   return usd === undefined ? undefined : Math.round(usd * 1e6);
 }
 
+describe("GPT-6 Luna Standard pricing", () => {
+  it("prices every low-tier bucket", () => {
+    assert.equal(micro(priceCodexResponse(LUNA, bd({ inputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 10_000); // 100000 * 0.10
+    assert.equal(micro(priceCodexResponse(LUNA, bd({ inputTokens: 100_000, cachedInputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 1_000); // * 0.01
+    assert.equal(micro(priceCodexResponse(LUNA, bd({ inputTokens: 100_000, cacheWriteInputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 12_500); // * 0.125
+    assert.equal(micro(priceCodexResponse(LUNA, bd({ outputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 50_000); // * 0.50
+  });
+  it("exactly 272000 input is the low tier, 272001 the high tier", () => {
+    const at = bd({ inputTokens: 272_000, outputTokens: 100 });
+    const over = bd({ inputTokens: 272_001, outputTokens: 100 });
+    // low: 272000 * $0.10/M = 27_200 µ$ + 100 * $0.50/M = 50 µ$.
+    assert.equal(micro(priceCodexResponse(LUNA, at, BEFORE_SOL_REVIEW)), 27_250);
+    // high: 272001 * $0.20/M = 54_400.2 µ$ + 100 * $0.75/M = 75 µ$ (rounded to a µ$).
+    assert.equal(micro(priceCodexResponse(LUNA, over, BEFORE_SOL_REVIEW)), 54_475);
+  });
+  it("prices the high-tier cache buckets", () => {
+    const over = bd({ inputTokens: 272_001, cachedInputTokens: 1000, cacheWriteInputTokens: 1000 });
+    // 270001 * 0.20 + 1000 * 0.02 + 1000 * 0.25 = 54_000.2 + 20 + 250 µ$.
+    assert.equal(micro(priceCodexResponse(LUNA, over, BEFORE_SOL_REVIEW)), 54_270);
+  });
+});
+
 describe("GPT-6.1 Sol Standard pricing", () => {
   it("prices every low-tier bucket and keeps its cheaper cache distinct from GPT-6 Sol", () => {
     assert.equal(micro(priceCodexResponse(SOL61, bd({ inputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 200_000);
@@ -59,7 +82,7 @@ describe("GPT-6.1 Sol Standard pricing", () => {
 
 describe("codex-pricing: the version id and boundary constants are the pinned D5 values", () => {
   it("records the table version and the Sol review boundary with the table", () => {
-    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-10-01");
+    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-10-09");
     assert.equal(SOL_PROMO_REVIEW_DATE, "2026-11-21");
     assert.equal(CODEX_INPUT_TIER_THRESHOLD_TOKENS, 272_000);
   });
