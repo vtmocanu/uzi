@@ -9557,7 +9557,7 @@ const listRunUsageFrames = `-- name: ListRunUsageFrames :many
 
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
-WHERE run_id = $1 AND kind IN ('status', 'error', 'progress_note')
+WHERE run_id = $1 AND kind IN ('status', 'error', 'progress_note', 'summary_usage')
 ORDER BY seq ASC
 `
 
@@ -9568,9 +9568,10 @@ ORDER BY seq ASC
 // per-leg rows. 00188 added runs.usage_refolded (DEFAULT true, set false for every
 // non-chat row that existed at migration time), which scopes the job to history and
 // makes it converge: a post-migration run is born refolded and never selected here.
-// A run's full status/error/progress_note frame history in seq order — the exact frame shape
+// A run's full status/error/progress_note/summary_usage frame history in seq order — the exact frame shape
 // foldUsageFrames folds (never tool/text traffic). progress_note (PRD #2603) carries the usage of
-// a Now-summary call, so the refold MUST read it or it would drop spend the incremental fold
+// a Now-summary call, and summary_usage (issue #2686) that of an intent/plan/PR-description
+// summary pass, so the refold MUST read both or it would drop spend the incremental fold
 // recorded. Column order matches
 // ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 // the `init` markers CountRunInitFramesBefore counts and the success result frames;
@@ -20332,8 +20333,8 @@ type UpdateRunLastSeqParams struct {
 // legacy caller (NULL) advances unconditionally, byte-identical to before.
 //
 // PRD #2603: @quiet_activity true advances the high-water mark but LEAVES last_activity_at
-// untouched. appendMessages passes it for a batch made only of progress_note messages (the
-// worker's Now summary), so a summary note neither revives a stalled run nor hides its stall.
+// untouched. appendMessages passes it for a batch made only of progress_note or summary_usage messages (the
+// worker's Now summary and summary-pass accounting), so a summary note neither revives a stalled run nor hides its stall.
 // The zero value (false) is the historical behaviour, so every other caller is unchanged.
 func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateRunLastSeq,

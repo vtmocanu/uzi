@@ -4749,8 +4749,8 @@ WHERE runs.id = @id AND runs.user_id = @user_id
 -- legacy caller (NULL) advances unconditionally, byte-identical to before.
 --
 -- PRD #2603: @quiet_activity true advances the high-water mark but LEAVES last_activity_at
--- untouched. appendMessages passes it for a batch made only of progress_note messages (the
--- worker's Now summary), so a summary note neither revives a stalled run nor hides its stall.
+-- untouched. appendMessages passes it for a batch made only of progress_note or summary_usage messages (the
+-- worker's Now summary and summary-pass accounting), so a summary note neither revives a stalled run nor hides its stall.
 -- The zero value (false) is the historical behaviour, so every other caller is unchanged.
 UPDATE runs SET last_seq = GREATEST(last_seq, @seq),
     last_activity_at = CASE WHEN @quiet_activity::boolean THEN last_activity_at ELSE now() END
@@ -8032,16 +8032,17 @@ ORDER BY u.id;
 -- makes it converge: a post-migration run is born refolded and never selected here.
 
 -- name: ListRunUsageFrames :many
--- A run's full status/error/progress_note frame history in seq order — the exact frame shape
+-- A run's full status/error/progress_note/summary_usage frame history in seq order — the exact frame shape
 -- foldUsageFrames folds (never tool/text traffic). progress_note (PRD #2603) carries the usage of
--- a Now-summary call, so the refold MUST read it or it would drop spend the incremental fold
+-- a Now-summary call, and summary_usage (issue #2686) that of an intent/plan/PR-description
+-- summary pass, so the refold MUST read both or it would drop spend the incremental fold
 -- recorded. Column order matches
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
-WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note')
+WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note', 'summary_usage')
 ORDER BY seq ASC;
 
 -- name: ListRunsPendingUsageRefold :many

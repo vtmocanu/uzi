@@ -23,6 +23,9 @@ fixtures/run-usage/run-usage-02854d5e.json       the per-leg rows an independent
 fixtures/run-usage/result-frames-notes.json      authored worker input for the Now-summary notes (PRD #2603)
 fixtures/run-usage/stored-frames-notes.json      the same frames with the notes as the server stores them
 fixtures/run-usage/run-usage-notes.json          the authored rollup for the notes pair
+fixtures/run-usage/result-frames-summary.json    authored worker input for the summary-pass usage (issue #2686)
+fixtures/run-usage/stored-frames-summary.json    the same frames with the accounting payloads as the server stores them
+fixtures/run-usage/run-usage-summary.json        the authored rollup for the summary pair
 fixtures/run-usage/README.md                     this file
 ```
 
@@ -393,5 +396,43 @@ server's normalisation of the input (claude harness) or any other frame differs.
 | Go unit | `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageNotesFoldMatchesAuthoredRollup`) | `rows` and `totals` through `AppendMessages` over `result-frames-notes.json` |
 | Go unit | `run_usage_contract_test.go` (`TestRunUsageStoredNotesFixtureMatchesNormalization`) | `stored-frames-notes.json` = normalised input |
 | vitest | `web/src/lib/runUsageContract.test.ts` | `totals` (cost included) and `noteTotal` via `deriveRunUsage` over `stored-frames-notes.json` |
+
+The Go half needs `-count=1` (this directory is outside the `api` module).
+
+## The `summary` pair: summary-pass usage rows (issue #2686)
+
+`result-frames-summary.json` / `run-usage-summary.json` pins how the usage of the SummaryRunner
+model passes (the intent, plan and PR-description summaries, the `summary_usage` message kind)
+folds. Both files are **authored**, and the rollup is an independent hand reduction, not either
+production fold.
+
+One Claude leg: an `init` (seq 1), a lead result frame (seq 5) whose `modelUsage` includes
+`claude-haiku-4-5-20251001`, one `progress_note` on the same model (seq 6), and FOUR
+`summary_usage` frames in the same leg: intent (seq 7), plan (seq 8) and two `pr_description`
+passes (seq 11 and 14, a PR-description regeneration runs a second pass). The fold rule:
+
+- a pass's `model_usage` is folded under `model = "summary_pass:<model>"` and
+  `lineage_epoch = <the frame's own seq>`, `lineage_index 0`, `usage_basis per_leg`;
+- so the lead's haiku row, the note row and each pass row are separate groups, and the
+  `run_usage_totals` MAX-per-group sums them all: input 11800, output 3990, cache_read 64000,
+  cache_creation 3000, cost 1.52095. The two `pr_description` rows are two rows that sum;
+- the frames carry no `costUSD`, so the server prices them from the standard Anthropic table
+  (haiku: $1 per million input, $5 per million output, $0.10 per million cache read) and writes
+  the resolved cost into the stored entry (`costStatus`, plus `costUSD` when metered);
+- a `summary_usage` payload has `pass` and `model_usage` only: no `event`, no `usage` key, so
+  no result-frame reader counts it. `pass` is one of `intent`, `plan`, `pr_description`.
+
+The discriminator: dropping the prefixes (or keying by the init count) collapses all the haiku
+rows into one group and under-counts the input total (4500 instead of 11800).
+
+`stored-frames-summary.json` is the same frames with the `progress_note` and `summary_usage`
+payloads as the server STORES them. Do not hand-edit the stored file:
+`TestRunUsageStoredSummaryFixtureMatchesNormalization` fails if those payloads differ from the
+server's normalisation of the input (claude harness) or any other frame differs.
+
+| | reads | asserts |
+|---|---|---|
+| Go unit | `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageSummaryFoldMatchesAuthoredRollup`) | `rows` and `totals` through `AppendMessages` over `result-frames-summary.json` |
+| Go unit | `run_usage_contract_test.go` (`TestRunUsageStoredSummaryFixtureMatchesNormalization`) | `stored-frames-summary.json` = normalised input |
 
 The Go half needs `-count=1` (this directory is outside the `api` module).

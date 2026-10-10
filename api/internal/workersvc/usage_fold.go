@@ -388,6 +388,11 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		if m.Kind == KindProgressNote {
 			m.Payload = normalizeProgressNotePayload(m.Payload, run.Harness)
 		}
+		// Issue #2686: a summary_usage payload is rebuilt the same way, from only {pass,
+		// model_usage}, so `event` and `usage` can never reach the usage tail or the web fold.
+		if m.Kind == KindSummaryUsage {
+			m.Payload = normalizeSummaryUsagePayload(m.Payload, run.Harness)
+		}
 		if c.any() {
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
 				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,
@@ -505,7 +510,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// last_activity_at. A Now-summary is the worker talking about the run, not the run
 		// working, so it must not turn a stalled run healthy, show a Now line on it, or make the
 		// stall nudge flap. Any other message in the batch restores the normal bump.
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen), QuietActivity: onlyProgressNotes(msgs)}); err != nil {
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen), QuietActivity: onlyUsageSideChannel(msgs)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two
 			}
@@ -631,6 +636,14 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 		// result frame, so it takes this branch before the status/error gate below.
 		if m.Kind == KindProgressNote {
 			if err := foldProgressNoteUsage(ctx, q, run, sessionID, m); err != nil {
+				return err
+			}
+			continue
+		}
+		// Issue #2686: a summary pass's usage folds under summary_pass:<model>, likewise not a
+		// result frame.
+		if m.Kind == KindSummaryUsage {
+			if err := foldSummaryUsage(ctx, q, run, sessionID, m); err != nil {
 				return err
 			}
 			continue
@@ -916,14 +929,15 @@ func nonNegTokens(n int64) int64 {
 	return n
 }
 
-// onlyProgressNotes reports whether a non-empty batch holds nothing but progress_note
-// messages (PRD #2603): such a batch must not count as run activity.
-func onlyProgressNotes(msgs []IncomingMessage) bool {
+// onlyUsageSideChannel reports whether a non-empty batch holds nothing but progress_note
+// (PRD #2603) or summary_usage (issue #2686) messages: such a batch is accounting written by
+// a side-channel model call and must not count as run activity.
+func onlyUsageSideChannel(msgs []IncomingMessage) bool {
 	if len(msgs) == 0 {
 		return false
 	}
 	for _, m := range msgs {
-		if m.Kind != KindProgressNote {
+		if m.Kind != KindProgressNote && m.Kind != KindSummaryUsage {
 			return false
 		}
 	}
