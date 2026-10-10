@@ -611,7 +611,13 @@ func (q *Queries) ReassignCredentialDisabledRun(ctx context.Context, arg Reassig
 
 const recordScheduleHeldFire = `-- name: RecordScheduleHeldFire :execrows
 UPDATE run_schedules
-SET last_fire = $1, updated_at = now()
+SET last_fire = $1,
+    -- recent_fires (issue #2519): same append rule as AdvanceSchedule (matched > 0, newest 10).
+    recent_fires = CASE
+      WHEN $1::jsonb @@ '$.matched > 0'
+      THEN jsonb_path_query_array(jsonb_build_array($1::jsonb) || recent_fires, '$[0 to 9]')
+      ELSE recent_fires END,
+    updated_at = now()
 WHERE id = $2 AND timing = 'once' AND status = 'active'
 `
 
