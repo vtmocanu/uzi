@@ -143,6 +143,29 @@ describe("RunUsagePanel", () => {
     expect(unpriced?.[5]).not.toMatch(/\$0/);
   });
 
+  it("shows Plan & PR summaries as its own row so Run total equals the sum of the rows", () => {
+    seq = 0;
+    const msgs: RunMessage[] = [
+      m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+      result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+      m("summary_usage", "lead", {
+        pass: "plan",
+        model_usage: { "claude-haiku-4-5": { inputTokens: 400, outputTokens: 50, cacheReadInputTokens: 100, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered" } },
+      }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+    );
+    expect(rows.find((r) => r[0] === "Plan & PR summaries")).toEqual(["Plan & PR summaries", "—", "400", "100", "50", "$0.01"]);
+    expect(rows.find((r) => r[0] === "Run total")?.slice(2, 5)).toEqual(["1.4k", "2.1k", "350"]);
+  });
+
+  it("omits the Plan & PR summaries row when no pass carried usage", () => {
+    const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
+    expect(queryByText("Plan & PR summaries")).toBeNull();
+  });
+
   it("omits the Now summaries row when no note carried usage", () => {
     const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
     expect(queryByText("Now summaries")).toBeNull();

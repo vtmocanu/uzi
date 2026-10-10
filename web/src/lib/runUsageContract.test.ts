@@ -588,3 +588,58 @@ describe("deriveRunUsage matches the server's fold of progress_note usage", () =
     expect(again.total.out).toBe(notes.totals.output_tokens);
   });
 });
+
+// Issue #2686: the `summary` pair. summary_usage frames (one per SummaryRunner pass) fold
+// under `summary_pass:<model>`, one row per frame (lineage_epoch = seq), so passes SUM;
+// they join the totals, never a phase or agent row. The fixture also carries a
+// progress_note, so the two kinds are asserted apart.
+describe("deriveRunUsage matches the server's fold of summary_usage", () => {
+  const frames = (JSON.parse(read("stored-frames-summary.json")) as { frames: Frame[] }).frames;
+  const summary = JSON.parse(read("run-usage-summary.json")) as { rows: EpochRow[]; totals: Totals };
+  const msgs: RunMessage[] = frames.map((f) => ({
+    seq: f.seq,
+    kind: f.kind,
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: f.payload,
+    created_at: "2026-10-09T00:00:00Z",
+  }));
+  const passRows = summary.rows.filter((r) => r.model.startsWith("summary_pass:"));
+
+  it("equals the fixture totals", () => {
+    const d = deriveRunUsage(msgs);
+    expect(d.total.fresh).toBe(summary.totals.input_tokens + summary.totals.cache_creation_tokens);
+    expect(d.total.cached).toBe(summary.totals.cache_read_tokens);
+    expect(d.total.out).toBe(summary.totals.output_tokens);
+    expect(d.total.costUsd).toBeCloseTo(summary.totals.cost_usd, 6);
+    expect(d.summaryTotal.fresh).toBe(passRows.reduce((n, r) => n + r.input_tokens + r.cache_creation_tokens, 0));
+    expect(d.summaryTotal.cached).toBe(passRows.reduce((n, r) => n + r.cache_read_tokens, 0));
+    expect(d.summaryTotal.out).toBe(passRows.reduce((n, r) => n + r.output_tokens, 0));
+    expect(d.summaryTotal.costUsd).toBeCloseTo(passRows.reduce((n, r) => n + r.cost_usd, 0), 6);
+    expect(d.summaryTotal.costStatus).toBe("metered");
+  });
+
+  it("sums the passes under summary_pass:<model>, apart from the note and the lead row", () => {
+    const d = deriveRunUsage(msgs);
+    const pass = d.modelTotals.find((t) => t.model === "summary_pass:claude-haiku-4-5-20251001");
+    expect(pass?.input).toBe(passRows.reduce((n, r) => n + r.input_tokens, 0));
+    expect(pass?.cached).toBe(passRows.reduce((n, r) => n + r.cache_read_tokens, 0));
+    expect(pass?.out).toBe(passRows.reduce((n, r) => n + r.output_tokens, 0));
+    expect(d.modelTotals.find((t) => t.model === "progress_note:claude-haiku-4-5-20251001")?.input).toBe(400);
+    expect(d.modelTotals.find((t) => t.model === "claude-haiku-4-5-20251001")?.input).toBe(700);
+    expect(d.noteTotal.out).toBe(40);
+  });
+
+  it("makes no phase or agent row from the summary frames", () => {
+    const d = deriveRunUsage(msgs);
+    expect(d.phases).toHaveLength(1);
+    expect(d.agents).toHaveLength(0);
+  });
+
+  it("counts a replayed summary_usage once", () => {
+    const again = deriveRunUsage([...msgs, ...msgs.filter((m) => m.kind === "summary_usage")]);
+    expect(again.total.out).toBe(summary.totals.output_tokens);
+    expect(again.summaryTotal.out).toBe(deriveRunUsage(msgs).summaryTotal.out);
+  });
+});
