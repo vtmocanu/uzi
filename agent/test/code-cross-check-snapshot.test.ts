@@ -78,36 +78,60 @@ it("code snapshot ref survives until child settlement and is deleted by exact na
     runGit(f.bare, "update-ref", "refs/heads/live", f.head);
     t.mock.method(f.git, "ensureClone", async () => { assert.fail("code child must not prepare origin"); });
     let checkerHome: string | undefined;
+    let modelRan = false;
+    let modelHead: string | undefined;
+    let modelPin: string | undefined;
+    let readerState: string | undefined;
+    let homeCleanupConfirmed = false;
+    const readerCleanupPins: (string | undefined)[] = [];
+    const readerCleanupVerdicts: unknown[][] = [];
+    const homeCleanupPins: (string | undefined)[] = [];
+    const deletionObservations: { homeCleanupConfirmed: boolean; homeExists: boolean | undefined }[] = [];
     const rm = fsPromises.rm.bind(fsPromises);
     t.mock.method(fsPromises, "rm", async (target: Parameters<typeof fsPromises.rm>[0], opts: Parameters<typeof fsPromises.rm>[1]) => {
-      if (checkerHome && target === checkerHome)
-        assert.equal(await f.git.codeSnapshotTip(f.bare, "lead"), f.head, "pin survives through HOME cleanup");
+      if (checkerHome && target === checkerHome) {
+        homeCleanupPins.push(await f.git.codeSnapshotTip(f.bare, "lead").catch(() => undefined));
+        await rm(target, opts);
+        homeCleanupConfirmed = !fs.existsSync(checkerHome);
+        return;
+      }
       return rm(target, opts);
     });
     const deleteSnapshot = f.git.deleteCodeSnapshot.bind(f.git);
     t.mock.method(f.git, "deleteCodeSnapshot", async (bare: string, lead: string, head: string, proof?: CodeSnapshotRetirementProof) => {
-      assert.ok(checkerHome);
-      assert.equal(fs.existsSync(checkerHome), false, "home cleanup precedes ref deletion");
+      deletionObservations.push({ homeCleanupConfirmed,
+        homeExists: checkerHome === undefined ? undefined : fs.existsSync(checkerHome) });
       await deleteSnapshot(bare, lead, head, proof);
     });
     const remove = f.git.removeRunnerClone.bind(f.git);
     t.mock.method(f.git, "removeRunnerClone", async (checkout: string) => {
-      assert.equal(await f.git.codeSnapshotTip(f.bare, "lead"), f.head, "pin survives through reader cleanup");
-      assert.equal(f.verdicts.length, 1, "settlement precedes reader cleanup");
+      readerCleanupPins.push(await f.git.codeSnapshotTip(f.bare, "lead").catch(() => undefined));
+      readerCleanupVerdicts.push([...f.verdicts]);
       await remove(checkout);
     });
     await new CrossCheckRunner(f.client, f.git, nullLogger(), {
       homeRoot: f.fx.dataDir, pollMs: 1, model: { run: async (claim, checkout, home, _signal, _usage, cleanupConfirmed) => {
+        modelRan = true;
         checkerHome = home;
-        assert.equal(runGit(checkout, "rev-parse", "HEAD"), f.head);
-        assert.equal(await f.git.codeSnapshotTip(f.bare, "lead"), f.head, "live reader keeps ref");
-        assert.equal(JSON.parse(fs.readFileSync(metadataPath(f.bare), "utf8")).readers[0].state, "OPEN",
-          "reader is durably OPEN before provider launch");
+        modelHead = runGit(checkout, "rev-parse", "HEAD");
+        modelPin = await f.git.codeSnapshotTip(f.bare, "lead").catch(() => undefined);
+        readerState = JSON.parse(fs.readFileSync(metadataPath(f.bare), "utf8")).readers[0].state;
         assert.match(claim.cross_check?.stage === "code" ? claim.cross_check.code_diff! : "", /checked/);
         cleanupConfirmed?.();
         return '{"findings":[]}';
       } },
     }).execute(f.claim);
+    assert.equal(modelRan, true, "model actually inspected the code snapshot");
+    assert.equal(modelHead, f.head, "model checkout is exact H");
+    assert.equal(modelPin, f.head, "live reader keeps ref");
+    assert.equal(readerState, "OPEN", "reader is durably OPEN before provider launch");
+    const completed = [{ outcome: "completed", findings: [] }];
+    assert.deepEqual(f.verdicts, completed, "child settles successfully");
+    assert.deepEqual(readerCleanupVerdicts, [completed], "settlement precedes reader cleanup");
+    assert.deepEqual(readerCleanupPins, [f.head], "pin survives through reader cleanup");
+    assert.deepEqual(homeCleanupPins, [f.head], "pin survives through HOME cleanup");
+    assert.deepEqual(deletionObservations, [{ homeCleanupConfirmed: true, homeExists: false }],
+      "confirmed HOME cleanup precedes ref deletion");
     await assert.rejects(f.git.codeSnapshotTip(f.bare, "lead"));
     assert.equal(await f.git.codeSnapshotTip(f.bare, "unknown"), f.head);
     assert.equal(runGit(f.bare, "rev-parse", "refs/heads/live"), f.head);
