@@ -1458,7 +1458,7 @@ export class WorkerClient {
           if (this.completionReservations.has(key)) this.completionClaims.set(key, null);
           else {
             for (const bit of this.ineligibleCompletionClaimBits(key)) {
-              this.ineligibleCompletionClaims[bit >>> 3] |= 1 << (bit & 7);
+              this.ineligibleCompletionClaims[bit >>> 3] = (this.ineligibleCompletionClaims[bit >>> 3] ?? 0) | (1 << (bit & 7));
             }
           }
         } else if (this.allowCompletionBinding(key)) {
@@ -2062,7 +2062,7 @@ export class WorkerClient {
     const prior = this.completionReservations.get(key);
     if (prior) { prior.live = true; return true; }
     if (this.ineligibleCompletionClaimBits(key).every(bit =>
-      (this.ineligibleCompletionClaims[bit >>> 3] & (1 << (bit & 7))) !== 0)) return false;
+      ((this.ineligibleCompletionClaims[bit >>> 3] ?? 0) & (1 << (bit & 7))) !== 0)) return false;
     if (this.completionReservations.size * 2 >= COMPLETION_BINDINGS_MAX) return false;
     this.completionReservations.set(key, { live: true, tickets: new Set() });
     return true;
