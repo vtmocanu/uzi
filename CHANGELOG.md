@@ -26,6 +26,8 @@ through `[0.52.0]`.)
 
 - **The lead context meter reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)).**
   It skips the per-category token-count API calls the full reading made each turn; the summary answers from the last response's usage plus local estimates, and the meter's fields and timeout are unchanged.
+- **A run requeued because its worker went stale is held for that worker's return, and the wait is explained ([#2705](https://github.com/vtmocanu/uzi/issues/2705)).**
+  `WORKER_STALE_REQUEUE_GRACE` (default `10m`, `0` disables) keeps such a run pinned to its previous worker while that worker's row exists, so a worker killed and restarted resumes its own run from local recovery state instead of a peer starting cold; `WORKER_AFFINITY_CEILING` still releases it and a deleted worker row falls open at once. Ephemeral provisioning does not count a held run as demand. Health shows `waiting_worker` with "waiting until <time> for its previous worker <name> to return; another worker may take it after that", `uzi run get` shows `HEALTH_REASON`, and the TUI crew rail shows a `queued` line. `queue.waiting` and `fleet.capacity` exclude held runs, so for an owner whose only worker died `fleet.capacity` fires about the grace plus 5m after the requeue (15m by default) instead of 5m, and a genuinely dead owner whose row remains delays takeover by up to the grace. Limitation: a Codex account park and promotion renews both the grace and the ceiling, so there is no global bound across cycles. The variable is in `docker-compose.yml` and `.env.example`; the chart is unchanged.
 
 ### Fixed
 

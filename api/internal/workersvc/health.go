@@ -126,8 +126,8 @@ const (
 	// reasonStaleRequeuePinPrefix (issue #2705) opens the queued reason for a run the stale-worker
 	// sweeper requeued and ClaimRun is still holding for its returning worker. Unlike its fixed
 	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
-	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns carries the same literal in SQL
-	// (pinned in sync by a workersvc test,
+	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
+	// the same literal in SQL (pinned in sync by a workersvc test,
 	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). No other reason starts with it.
 	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle

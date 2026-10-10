@@ -1100,6 +1100,12 @@ chain in the diagram above, with no intervening `running`.
   2h of queue dwell after promotion). A deleted worker, a stale non-draining
   worker, or an expired ceiling lets another eligible worker claim it.
   `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
+  A run the stale-worker sweeper requeued is additionally held for its previous
+  worker, while that worker's row exists, for `WORKER_STALE_REQUEUE_GRACE` (default
+  10m, `0` disables; issue #2705), so a restarted worker can resume from its own
+  local recovery source; the ceiling still releases it, ephemeral provisioning does
+  not count a held run as demand, and health explains the wait
+  ([ADR-628](adr/0628-cross-worker-resume-durability.md) D3a, issue #2705 amendment).
   uzi currently keeps SDK transcripts only on the owning worker, under its per-run
   HOME at `.claude/projects/<encoded-cwd>/<session-id>.jsonl`; Git checkpoints
   recover code but do not transfer the conversation. The worker preflights the

@@ -9030,7 +9030,9 @@ type ListOwnersWaitingNoCapacityRow struct {
 // is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 // usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 // other causes (vault locked, custody limit, all workers busy) — those surface through
-// queue.waiting by age instead. Expected plan cross-check waits are excluded:
+// queue.waiting by age instead. Rows held for a returning worker (issue #2705, the
+// 'waiting until ' stale-requeue pin reason) are excluded, see the predicate below.
+// Expected plan cross-check waits are excluded:
 // an owned check finishing is not a lead waiting for worker admission.
 func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwnersWaitingNoCapacityParams) ([]ListOwnersWaitingNoCapacityRow, error) {
 	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.HeartbeatCutoff)

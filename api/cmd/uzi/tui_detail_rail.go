@@ -99,8 +99,9 @@ func (m tuiModel) railWorkerLine() string {
 }
 
 // railWaitingMaxRows bounds the waiting explanation's height on the rail. Five rows keep the
-// stale-requeue pin reason's deadline AND the previous worker's name visible at laneRailWidth
-// (issue #2705: the name is often shown nowhere else once the run is queued).
+// stale-requeue pin reason's deadline AND a typical previous worker's name (up to about 50
+// characters) visible at laneRailWidth (issue #2705: the name is often shown nowhere else once
+// the run is queued); a longer user-chosen name is ellipsized.
 const railWaitingMaxRows = 5
 
 // railWaitingLabel leads the waiting explanation and stays faint; the reason follows it.

@@ -10672,7 +10672,9 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
--- queue.waiting by age instead. Expected plan cross-check waits are excluded:
+-- queue.waiting by age instead. Rows held for a returning worker (issue #2705, the
+-- 'waiting until ' stale-requeue pin reason) are excluded, see the predicate below.
+-- Expected plan cross-check waits are excluded:
 -- an owned check finishing is not a lead waiting for worker admission.
 SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
        (COALESCE(r.health_reason = @roll_reason::text, false))::boolean AS has_roll_reason
