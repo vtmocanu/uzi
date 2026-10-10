@@ -5,6 +5,10 @@ import { PlanningFixtureIO, planningEnv, planningExec, planningGitEnv } from "./
 import { RUNNER_UID, runnerPath, runnerTmpdir, uidSplitActive } from "../src/runner-uid.js";
 import os from "node:os";
 
+// Linux filenames are raw bytes, so cover an invalid UTF-8 name there; macOS (APFS)
+// rejects it with EILSEQ, so other hosts use a valid non-ASCII UTF-8 name.
+const name = process.platform === "linux" ? Buffer.from([0xff]) : Buffer.from("\u00e9", "utf8");
+
 for (const ipc of [false, true]) {
   // Native is only the single-UID path; forced IPC always runs, including on single UID.
   it(`planning fixture IO preserves filesystem values (IPC=${ipc})`, {
@@ -17,11 +21,11 @@ for (const ipc of [false, true]) {
       finally { await io.close(); }
     });
     root = await io.temporaryDirectory("planning-io-");
-    const raw = Buffer.concat([Buffer.from(root + "/"), Buffer.from([0xff])]);
+    const raw = Buffer.concat([Buffer.from(root + "/"), name]);
     const bytes = Buffer.from([0xff, 0, 0x80, 10]);
     await io.fs.writeFile(raw, bytes);
     assert.deepEqual(await io.fs.readFile(raw), bytes);
-    assert.deepEqual(await io.fs.readdir(root, { encoding: "buffer" }), [Buffer.from([0xff])]);
+    assert.deepEqual(await io.fs.readdir(root, { encoding: "buffer" }), [name]);
     const stat = await io.fs.stat(raw, { bigint: true });
     assert.equal(stat.size, 4n);
     assert.equal(typeof stat.ino, "bigint");
@@ -36,7 +40,7 @@ for (const ipc of [false, true]) {
     assert.equal(stat.isBlockDevice(), false);
     assert.equal(stat.isCharacterDevice(), false);
     await io.fs.mkdir(path.join(root, "private"), { mode: 0o700 });
-    await io.fs.symlink(Buffer.from([0xff]), path.join(root, "link"));
+    await io.fs.symlink(name, path.join(root, "link"));
     assert.equal((await io.fs.lstat(path.join(root, "link"))).isSymbolicLink(), true);
     if (process.platform !== "win32") {
       await planningExec("mkfifo", [path.join(root, "fifo")], { timeout: 5000 });
@@ -45,7 +49,7 @@ for (const ipc of [false, true]) {
     const entries = await io.fs.readdir(root, { withFileTypes: true, encoding: "buffer" });
     assert.equal(entries.find(e => e.name.equals(Buffer.from("private")))!.isDirectory(), true);
     assert.equal(entries.find(e => e.name.equals(Buffer.from("link")))!.isSymbolicLink(), true);
-    assert.equal(entries.find(e => e.name.equals(Buffer.from([0xff])))!.isFile(), true);
+    assert.equal(entries.find(e => e.name.equals(name))!.isFile(), true);
     assert.equal((await io.fs.stat(root)).mode & 0o777, 0o700);
     assert.equal((await io.fs.stat(path.join(root, "private"))).mode & 0o777, 0o700);
     const missing = path.join(root, "missing");
