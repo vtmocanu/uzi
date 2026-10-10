@@ -651,10 +651,11 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       entry: () => entry, entryError: () => entryError, calls, events: logs.events, runner };
   }
 
-  function assertEntry(s: Seed, e: ReturnType<typeof execution>, enabled: boolean, expectReclaimProof = true): void {
+  function assertEntry(s: Seed, e: ReturnType<typeof execution>, enabled: boolean, expectReclaimProof = true,
+    expectedReason = s.attemptId ? "retained-in-place" : "quarantined"): void {
     if (expectReclaimProof) assertSafeEvents(e.events, [s.clonePath]);
     if (expectReclaimProof) assert.equal(e.events.filter((event) => event.event === "orphan_reclaim_succeeded").at(-1)?.reason,
-      s.attemptId ? "retained-in-place" : "quarantined");
+      expectedReason);
     assert.equal(e.entryError(), undefined, "predecessor bytes survived through model entry");
     const entry = e.entry();
     assert.ok(entry, "successor model entered");
@@ -801,10 +802,8 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       try { await retry.run(); } finally { seam.runGit = real; }
       assert.ok(clearedDuringClone.every((capture) => capture?.runId !== s.claimant), "retry never clears successor custody during clone preparation");
       if (stage === "canonical-journal") {
-        assert.equal(retry.entry(), undefined, "missing known source refuses successor execution");
-        assert.deepEqual(configValues(s.bare, `uzi-recovery.${branch}.clone`), journal);
+        assertEntry(s, retry, true, true, "source-already-absent");
         assert.equal(fs.existsSync(s.clonePath), false, "no canonical source overwrite");
-        assert.ok(api.states.some(state => state.runId === s.claimant && state.body.status === "failed"));
       } else {
         assertEntry(s, retry, true, true);
       }
