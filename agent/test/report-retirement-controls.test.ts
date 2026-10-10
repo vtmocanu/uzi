@@ -18,23 +18,23 @@ it("older generation archive cannot retire generation 2's cancelled report", asy
 it("unresolved terminal or archive status retains the unchanged covered source", async t => {
   const f = await reportRetirementFixture(t);
   for (const mode of ["unknown", "throw"] as const) {
-    await t.test(`ownership is ${mode}`, async () => {
-      f.ownership.mode = mode;
-      try { await f.replay(); await f.assertPending(); }
-      finally { f.ownership.mode = "healthy"; }
-    });
+    f.ownership.mode = mode;
+    try {
+      await assert.doesNotReject(async () => { await f.replay(); await f.assertPending(); },
+        `ownership is ${mode}`);
+    } finally { f.ownership.mode = "healthy"; }
   }
-  await t.test("ownership is a newer generation", async () => {
-    f.ownership.generation = 3;
-    try { await f.replay(); await f.assertPending(); }
-    finally { f.ownership.generation = 2; }
-  });
+  f.ownership.generation = 3;
+  try {
+    await assert.doesNotReject(async () => { await f.replay(); await f.assertPending(); },
+      "ownership is a newer generation");
+  } finally { f.ownership.generation = 2; }
   for (const mode of ["throw", "expired", "unbound", "checksum"] as const) {
-    await t.test(`capture status is ${mode}`, async () => {
-      f.capture.mode = mode;
-      try { await f.replay(); await f.assertPending(); }
-      finally { f.capture.mode = "healthy"; }
-    });
+    f.capture.mode = mode;
+    try {
+      await assert.doesNotReject(async () => { await f.replay(); await f.assertPending(); },
+        `capture status is ${mode}`);
+    } finally { f.capture.mode = "healthy"; }
   }
 });
 
@@ -102,7 +102,7 @@ it("unknown physical source inventory cannot authorize report retirement", async
   await f.assertPending();
 });
 
-it("an unreadable authenticated coverage journal retains the report despite available server bytes", async t => {
+it("a parseable coverage journal with an invalid MAC retains the report despite available server bytes", async t => {
   const f = await reportRetirementFixture(t, { invalidJournal: true });
   await f.replay();
   await f.assertPending();

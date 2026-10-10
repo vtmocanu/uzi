@@ -50,9 +50,11 @@ export async function reportRetirementFixture(t: TestContext, options: {
       sibling_complete: true, outcome: "retained",
     });
   });
-  workerId = (await client.register("test")).worker_id;
-  assert.ok(workerId);
-  client.getRunOwnership = async () => {
+  const registeredWorkerId = (await client.register("test")).worker_id;
+  assert.ok(registeredWorkerId);
+  workerId = registeredWorkerId;
+  client.getRunOwnership = async runId => {
+    assert.equal(runId, claim.run_id);
     if (ownership.mode === "throw") throw new Error("ownership unavailable");
     return { status: ownership.mode === "unknown" ? "unknown" : status,
       claim_generation: ownership.generation, inventory_guarded: true };
@@ -80,7 +82,9 @@ export async function reportRetirementFixture(t: TestContext, options: {
     manifest = m;
     return { capture_id: captureId, state: "available", manifest_bound: true };
   };
-  client.getRecoveryCaptureStatus = async () => {
+  client.getRecoveryCaptureStatus = async (runId, requestedCapture) => {
+    assert.equal(runId, claim.run_id);
+    assert.equal(requestedCapture, captureId);
     if (capture.mode === "throw") throw new Error("capture status unavailable");
     return { capture_id: captureId, state: "available",
       manifest_bound: capture.mode !== "unbound",
@@ -196,8 +200,13 @@ export async function reportRetirementFixture(t: TestContext, options: {
   assert.equal(calls.cloneCleanup, 0);
   assert.deepEqual(reserved, { sourceSha: archive.sourceSha, digest: archive.coverageDigest,
     generation: archive.generation });
-  if (options.invalidJournal) fs.appendFileSync(
-    path.join(git.recoveryRoot, claim.run_id, archive.captureId + ".json"), "\ninvalid journal bytes");
+  if (options.invalidJournal) {
+    const journalPath = path.join(git.recoveryRoot, claim.run_id, archive.captureId + ".json");
+    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    assert.match(journal.mac, /^[0-9a-f]{64}$/);
+    journal.mac = "0".repeat(64);
+    fs.writeFileSync(journalPath, JSON.stringify(journal));
+  }
   assert.equal(r.isExecuting(claim.run_id), options.liveFlight === true);
   const refs = cmd(bare, ["show-ref"]);
   const files = new Map<string, Buffer>();
