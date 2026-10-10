@@ -1761,6 +1761,7 @@ export class Outbox {
     signal: AbortSignal,
     expectedIdentity: Readonly<object>,
     reauthenticate = false,
+    proofBudget?: { signal: AbortSignal; deadline: number },
   ): Promise<void> {
     if (this.disabled) return;
     await this.withRunLock(runId, async () => {
@@ -1770,11 +1771,12 @@ export class Outbox {
           rs.terminals.size > 0 || signal.aborted || !eligible()) return;
       const file = path.join(this.runDir(runId), finalizeFileName(claimGeneration));
       if (reauthenticate) {
-        const parsed = await this.readAuthed(file, MAC_DOMAIN_FINALIZE);
+        const parsed = await this.readAuthed(file, MAC_DOMAIN_FINALIZE, proofBudget);
         const authenticated = parsed && coerceFinalize(parsed, runId, claimGeneration);
         const meta = rs.finalizes.get(claimGeneration);
         if (!authenticated || !meta || authenticated.since !== meta.since ||
-            meta !== expectedIdentity || signal.aborted || !eligible()) return;
+            meta !== expectedIdentity || signal.aborted || proofBudget?.signal.aborted ||
+            (proofBudget && Date.now() >= proofBudget.deadline) || !eligible()) return;
         await fs.unlink(file);
       } else await fs.rm(file, { force: true });
       rs.finalizes.delete(claimGeneration);
@@ -2284,13 +2286,45 @@ export class Outbox {
   /** Read + authenticate a record file. Returns the parsed body (minus `mac`) when
    *  the MAC verifies, else null (a missing file, a symlink refused by O_NOFOLLOW,
    *  an unparseable body, or a MAC mismatch — the last two are logged). */
-  private async readAuthed(filePath: string, domain: string): Promise<Record<string, unknown> | null> {
+  private async readAuthed(filePath: string, domain: string,
+    proofBudget?: { signal: AbortSignal; deadline: number },
+  ): Promise<Record<string, unknown> | null> {
     if (!this.key) return null;
     let raw: Buffer;
     try {
-      const fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const check = () => {
+        proofBudget?.signal.throwIfAborted();
+        if (proofBudget && Date.now() >= proofBudget.deadline) throw new Error("finalize proof deadline");
+      };
+      check();
+      const fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
+        (proofBudget ? fsConstants.O_NONBLOCK : 0));
       try {
-        raw = await fh.readFile();
+        if (!proofBudget) raw = await fh.readFile();
+        else {
+          const cap = 1024 * 1024;
+          const before = await fh.stat();
+          if (!before.isFile() || before.size > cap) return null;
+          const same = (a: typeof before, b: typeof before) => b.isFile() &&
+            a.dev === b.dev && a.ino === b.ino && a.size === b.size &&
+            a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+          if (!same(before, await fs.lstat(filePath))) return null;
+          const bytes = Buffer.alloc(cap + 1);
+          let used = 0;
+          // At most cap+1 bytes and cap+2 reads (including EOF); a short read is
+          // not EOF. Any failed read stops this single record proof.
+          while (used < bytes.length) {
+            check();
+            const { bytesRead } = await fh.read(bytes, used, Math.min(64 * 1024, bytes.length - used), used);
+            check();
+            if (bytesRead === 0) break;
+            used += bytesRead;
+          }
+          if (used > cap || !same(before, await fh.stat()) ||
+              !same(before, await fs.lstat(filePath))) return null;
+          check();
+          raw = bytes.subarray(0, used);
+        }
       } finally {
         await fh.close();
       }

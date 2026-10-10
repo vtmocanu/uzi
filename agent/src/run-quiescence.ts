@@ -1164,6 +1164,11 @@ async function reapProcessesViaHelper(
   } catch (err) {
     return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
   }
+  // Owned temporary cleanup needs a fresh maintenance budget: an aborted proof signal
+  // cannot finish rm. This budget grants no report authority, and runFixedAsRunner
+  // still awaits CLOSE if its cleanup deadline fires after the command starts.
+  const cleanupBudget = () => ({ signal: new AbortController().signal,
+    deadline: Date.now() + HELPER_TMP_REMOVE_TIMEOUT_MS });
   const removeTmp = (): void => {
     // Best effort, not awaited (the verdict does not wait on cleanup): a leftover private dir is
     // harmless, and a synchronous throw or a rejection is swallowed alike.
@@ -1174,7 +1179,7 @@ async function reapProcessesViaHelper(
     }
   };
   if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
-    await Promise.resolve().then(() => helperTmp.remove(tmpDir, opts.reportBudget)).catch(() => undefined);
+    await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
     return unverified("report helper setup expired");
   }
   const wrapped = runnerCommand(process.execPath, argv);
@@ -1190,7 +1195,7 @@ async function reapProcessesViaHelper(
       if (opts.reportBudget) {
         // Settlement includes the already-started cleanup; expiry never releases
         // source or journal boundaries while a helper command is still running.
-        Promise.resolve().then(() => helperTmp.remove(tmpDir, opts.reportBudget)).then(
+        Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).then(
           () => resolve(opts.reportBudget!.signal.aborted || Date.now() >= opts.reportBudget!.deadline
             ? unverified("report helper cleanup expired") : r),
           () => resolve(unverified("report helper cleanup failed")));

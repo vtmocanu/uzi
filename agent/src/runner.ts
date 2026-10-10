@@ -4007,7 +4007,7 @@ export class RunRunner {
             !outbox.hasUndrainedMessages(runId) && !outbox.isTerminalResolveHeld(runId, generation);
           if (kind === "terminal") await outbox.retireTerminalIfEligible(runId, generation,
             { ...context, ...budget, eligible });
-          else await outbox.retireFinalizeIfEligible(runId, generation, eligible, budget.signal, context.expectedIdentity!, true);
+          else await outbox.retireFinalizeIfEligible(runId, generation, eligible, budget.signal, context.expectedIdentity!, true, budget);
         });
     } catch (err) {
       this.log.debug("recovery: report retained", { run_id: runId, generation, error: errMessage(err) });

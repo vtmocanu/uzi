@@ -4220,7 +4220,12 @@ export class GitCache {
    * Runner config is never consulted, and every traversed component rejects symlinks. */
   async readInventoryCloneHeads(barePath: string, runId: string, underLock = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
     if (underLock) return this.readInventoryCloneHeadsUnderLock(barePath, runId);
-    return this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
+    try {
+      return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
+    } catch (err) {
+      if (this.reportProofs.getStore()) throw err;
+      return { kind: "unknown", cause: "other" };
+    }
   }
 
   /** Observational variant: the caller already holds B. */
@@ -4273,7 +4278,7 @@ export class GitCache {
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
         const heads = new Set<string>();
-        const clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }> = [];
+        const clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }> = [];
         clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
@@ -4289,12 +4294,20 @@ export class GitCache {
           for (const dir of [root, path.dirname(clone)]) {
             let st: Stats;
             try { st = await fs.lstat(dir); }
-            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; cause = "clone_ancestor_invalid"; throw err; }
+            catch (err) {
+              if ((err as NodeJS.ErrnoException).code === "ENOENT" && !this.reportProofs.getStore()) continue clonePaths;
+              cause = "clone_ancestor_invalid"; throw err;
+            }
             if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_ancestor_invalid", "unsafe clone parent");
           }
           let st: Stats;
           try { st = await fs.lstat(clone); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; cause = "git_or_filesystem_error"; throw err; }
+          catch (err) {
+            // A report content proof cannot treat a missing attributed clone as inspected.
+            // Ordinary inventory cleanup retains its historical missing-clone behavior.
+            if ((err as NodeJS.ErrnoException).code === "ENOENT" && !this.reportProofs.getStore()) continue;
+            cause = "git_or_filesystem_error"; throw err;
+          }
           if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
           const head = await atFailure("clone_head_unreadable", async () => {
             const gitdir = path.join(clone, ".git");
@@ -4332,7 +4345,8 @@ export class GitCache {
             return head;
           });
           heads.add(head);
-          clones.push({ clonePath: clone, ...owner, head, identity: `${st.dev}:${st.ino}` });
+          clones.push({ clonePath: clone, ...owner,
+            ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
       }

@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { reapRunProcesses, type ScanRequest } from "../src/run-quiescence.js";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { reapRunProcesses, runnerHelperTmp, type ScanRequest } from "../src/run-quiescence.js";
 const request: ScanRequest = { mode: "capture", targetUid: process.getuid?.() ?? 0,
   targetKey: "fixture", targetPaths: ["/fixture"], liveMarkers: [], liveRoots: [], workerNonce: "fixture" };
 function deferred() {
@@ -28,7 +31,10 @@ for (const failure of ["cancel", "expiry", "error", "overflow", "cleanup cancel"
       helperTmp: {
         make: received => { assert.equal(received, budget); return "/fixture/private"; },
         remove: async (_dir, received) => {
-          assert.equal(received, budget); entered.resolve(); await release.promise;
+          assert.notEqual(received, budget); assert.equal(received?.signal.aborted, false);
+          entered.resolve();
+          if (received) received.deadline = Date.now() - 1;
+          await release.promise;
         },
       },
     }).then(result => { settled = true; return result; });
@@ -64,7 +70,8 @@ it("stalled setup settles and cleans up without late helper authorization", asyn
         assert.equal(received, budget); entered.resolve(); await release.promise; return "/fixture/private";
       },
       remove: async (_dir, received) => {
-        assert.equal(received, budget); cleanup.resolve(); await finish.promise;
+        assert.notEqual(received, budget); assert.equal(received?.signal.aborted, false);
+        cleanup.resolve(); await finish.promise;
       },
     },
   }).then(result => { settled = true; return result; });
@@ -86,6 +93,36 @@ it("expired budget starts neither setup nor scan", async () => {
   assert.equal(result.state, "unverified");
   assert.equal(calls, 0);
 });
+for (const fault of ["cancel", "expiry"] as const) {
+  it(`production runnerHelperTmp removes owned directory after report ${fault}`, async t => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), "report-helper-"));
+    t.after(() => fs.rm(base, { recursive: true, force: true }));
+    const child = fakeChild(), abort = new AbortController();
+    const budget = { signal: abort.signal, deadline: Date.now() + 5000 };
+    let owned = "";
+    const ready = deferred();
+    const wrap = (command: string, args: string[]) => ({ command, args });
+    const pending = reapRunProcesses(request, {
+      viaHelper: true, reportBudget: budget,
+      helperTmp: {
+        make: async received => {
+          owned = await runnerHelperTmp(base, wrap, { budget: received }).make();
+          return owned;
+        },
+        remove: (dir, received) => runnerHelperTmp(base, wrap, { budget: received }).remove(dir),
+      },
+      spawnHelper: () => { ready.resolve(); return child; },
+    });
+    await ready.promise;
+    await fs.stat(owned);
+    if (fault === "cancel") abort.abort();
+    else budget.deadline = Date.now() - 1;
+    child.stdout!.emit("data", Buffer.from(JSON.stringify({ state: "quiescent", processes: [], killed: [], detail: "" })));
+    child.emit("close", 0, null);
+    assert.equal((await pending).state, "unverified");
+    await assert.rejects(fs.stat(owned), { code: "ENOENT" });
+  });
+}
 it("synchronous report cleanup failure settles as unverified", async () => {
   const child = fakeChild();
   const pending = reapRunProcesses(request, {
