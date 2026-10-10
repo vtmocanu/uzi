@@ -430,14 +430,14 @@ class BoundaryStepTracker {
  *  {@link isCodexBoundaryError} it reads only the error's `name` and its `deferral` field (never
  *  `instanceof`, never the message text), so the runner never imports agent/src/codex/**. Returns
  *  the fixed deferral only for its matching error name and field. */
-function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | "credential_release_unavailable" | undefined {
+function codexDeferralOf(err: unknown): "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" | undefined {
   if (!(err instanceof Error)) return undefined;
   if (err.name === "CodexInitialCredentialUnavailableError") {
     return (err as { deferral?: unknown }).deferral === "credential_release_unavailable" ? "credential_release_unavailable" : undefined;
   }
   if (err.name !== "CodexBoundaryError" && err.name !== "CodexCredentialDeferredError") return undefined;
   const deferral = (err as { deferral?: unknown }).deferral;
-  return deferral === "vault_locked" || deferral === "refresh_unknown" ? deferral : undefined;
+  return deferral === "vault_locked" || deferral === "refresh_unknown" || deferral === "account_unavailable" ? deferral : undefined;
 }
 
 /** Issue #1766: the steering channel gave up on an operator input's applied receipt
@@ -513,7 +513,7 @@ interface ExecutionRejection {
 
 type RecoveryParkCause =
   | { kind: "transient" }
-  | { kind: "vault_locked" | "refresh_unknown" | "credential_release_unavailable" }
+  | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean };
 
 /** What {@link RunRunner.captureRecoveryRestorePoint} reports. `residueBlocked` (issue #1783 M3)
@@ -551,6 +551,16 @@ const VAULT_PARK_FEED = {
     "The run owner's vault is locked. Could not record the pause yet; keeping the local work and session and retrying.",
   held:
     "The run owner's vault is locked and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
+} as const;
+
+/** Account state comes only from the typed boundary reply; notices contain no identity or credential. */
+const ACCOUNT_PARK_FEED = {
+  ...CREDENTIAL_PARK_FEED,
+  published: "Paused: this run's Codex account was unavailable at its checkpoint. The recovery checkpoint is published; the run resumes automatically once the account is usable again, and the run page shows whether a re-login is needed.",
+  local: "Paused: this run's Codex account was unavailable at its checkpoint. The recovery checkpoint is saved only on this worker; the run resumes automatically once the account is usable again, and the run page shows whether a re-login is needed.",
+  confirmUnknown: "This run's Codex account was unavailable. Could not confirm this run is still running; keeping the local work and session and retrying before pausing.",
+  reportFailed: "This run's Codex account was unavailable. Could not record the pause yet; keeping the local work and session and retrying.",
+  held: "This run's Codex account was unavailable and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
 
 /** An unavailable initial release carries no inferred vault cause. */
@@ -13249,8 +13259,9 @@ export class RunRunner {
    *   - it settles the executor credential-free before capture, and retries (no park) until the
    *     settle is observed empty;
    *   - the capture publishes with no overlay and no boundary (credentialFree);
-   *   - only a confirmed vault lock is typed `recovery_cause: "vault_locked"` when the api advertises
-   *     `recovery_cause_vault_locked`; the other credential deferrals are untyped with neutral notices;
+   *   - confirmed vault lock and account unavailability send `vault_locked` and
+   *     `codex_account_unavailable` respectively, only with the matching advertised recovery-cause feature;
+   *     other credential deferrals are untyped with neutral notices;
    *   - it never runs the credentialed reap-then-settle (which would retry the deferred credential
    *     operation and could release custody), so the custody hold is kept;
    *   - a cancel captures, then reports `run cancelled` without the credentialed pre-report reap;
@@ -13271,9 +13282,9 @@ export class RunRunner {
   ): Promise<boolean> {
     // Credential deferrals share the credential-free proof/custody posture.
     // Unknown outcomes never imply a locked vault or send an API recovery cause.
-    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown" || cause.kind === "credential_release_unavailable";
+    let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown" || cause.kind === "account_unavailable" || cause.kind === "credential_release_unavailable";
     if (credentialDeferred) flight.keepGuardedInventoryOpen = true;
-    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : cause.kind === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+    let feed = cause.kind === "vault_locked" ? VAULT_PARK_FEED : cause.kind === "account_unavailable" ? ACCOUNT_PARK_FEED : cause.kind === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
     // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
     // stop's counted one). The transient park's steps, with the typed cause on the park report and
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
@@ -13592,7 +13603,7 @@ export class RunRunner {
               cause = { kind: deferral };
               credentialDeferred = true;
               flight.keepGuardedInventoryOpen = true;
-              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : deferral === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
+              feed = deferral === "vault_locked" ? VAULT_PARK_FEED : deferral === "account_unavailable" ? ACCOUNT_PARK_FEED : deferral === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
               settled = false;
             }
@@ -13718,7 +13729,9 @@ export class RunRunner {
           const parkBody: StateRequest = {
             ...(cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
-              : disk
+              : cause.kind === "account_unavailable" && this.client.protocolFeatures.includes("recovery_cause_codex_account_unavailable")
+                ? { status: "recovery_wait", recovery_cause: "codex_account_unavailable" }
+                : disk
                 ? this.diskParkBody(claim, disk.preventive)
                 : { status: "recovery_wait" }),
             // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before
@@ -14228,6 +14241,9 @@ export class RunRunner {
         this.terminalDiskInterruption(flight);
         if (canonicalRecoveryInterruption(e)) throw e;
       }
+      // A quarantine refusal must reach handleRecoveryExhausted, which preserves custody
+      // and checks cancellation/shutdown before reporting worker_residue_blocked.
+      if (e instanceof ResidueQuarantinedError) throw e;
       runLog.warn("recovery capture: fetch-back failed", { error: errMessage(e) });
       return { verified: false, published: false };
     }

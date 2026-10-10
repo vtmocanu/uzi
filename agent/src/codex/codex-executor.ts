@@ -893,7 +893,7 @@ export function buildRunLaneReconcile(
   return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
     const deadlineAt = Date.now() + request.deadlineMs;
     const signal = lifecycleSignal ? AbortSignal.any([boundarySignal, lifecycleSignal]) : boundarySignal;
-    const blocked = (deferral?: "vault_locked" | "refresh_unknown"): ReconcileOutcome => ({
+    const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
       kind: "blocked",
       errors: [{ category: "authorization", message: deferral === "refresh_unknown"
         ? "codex subscription boundary reconcile deferred: refresh outcome unknown"
@@ -948,6 +948,10 @@ export function buildRunLaneReconcile(
             if (codexDeferralReason(err) === "vault_locked") {
               return { kind: "blocked", errors: [{ category: "authorization",
                 message: "codex subscription boundary reconcile deferred: vault locked" }], deferral: "vault_locked" };
+            }
+            if (codexDeferralReason(err) === "account_unavailable") {
+              return { kind: "blocked", errors: [{ category: "authorization",
+                message: "codex subscription boundary reconcile deferred: account unavailable" }], deferral: "account_unavailable" };
             }
             const failure = codexRefreshFailure(err);
             // The boundary deadline after a send cannot prove whether the provider spent the token.

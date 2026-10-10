@@ -12262,6 +12262,57 @@ function vaultLocked409(route: "refresh" | "release"): RequestError {
   );
 }
 
+describe("W2/W10 account boundary reconcile and unchanged bridge", () => {
+  const refusal = () => new RequestError("POST", "/x", 409, JSON.stringify({
+    error: "private-account-body", reason: "codex_account_unavailable",
+  }));
+  for (const ambiguous of [false, true]) {
+    it(`W2: typed account refusal terminates immediately; frozen tuple survives (ambiguous=${ambiguous})`, async () => {
+      const requests: unknown[] = [];
+      const client = { refreshCodex: async (_id: string, request: unknown) => {
+        requests.push(request);
+        if (ambiguous && requests.length === 1) throw new RequestError("POST", "/x", 500, "private-body");
+        throw refusal();
+      }};
+      const committed = { value: 3 };
+      const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION),
+        () => assert.fail("no credential"), committed);
+      const first = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(first.kind === "blocked" && first.deferral, "account_unavailable");
+      assert.equal(requests.length, ambiguous ? 2 : 1);
+      committed.value = 99;
+      const second = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(second.kind === "blocked" && second.deferral, "account_unavailable");
+      assert.equal(requests.length, ambiguous ? 3 : 2);
+      for (const request of requests) assert.deepEqual(request, requests[0]);
+      assert.doesNotMatch(JSON.stringify(first), /private-account-body/);
+    });
+  }
+  it("W2: lifecycle abort accompanying typed refusal wins", async () => {
+    const lifecycle = new AbortController();
+    let calls = 0;
+    const client = { refreshCodex: async () => { calls++; lifecycle.abort(); throw refusal(); }};
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION),
+      () => assert.fail("no credential"), { value: 3 }, undefined, lifecycle.signal);
+    const outcome = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(outcome.kind === "blocked" && outcome.deferral, undefined);
+    assert.equal(calls, 1);
+  });
+  it("W10: account refusal preserves original RequestError without latch/callback or suppressing following API call", async () => {
+    const error = refusal();
+    let calls = 0;
+    let callbacks = 0;
+    const client = { refreshCodex: async () => { calls++; throw error; }};
+    const bridge = buildAppServerRefreshBridge("run-1", client as never, bindingOf(SUBSCRIPTION),
+      { value: 3 }, () => assert.fail("no credential"), () => { callbacks++; });
+    const operation = { operationId: "account-bridge-op", signal: RECONCILE_SIGNAL };
+    await assert.rejects(bridge.refresh(operation), (caught) => caught === error);
+    await assert.rejects(bridge.refresh({ ...operation, operationId: "following-op" }), (caught) => caught === error);
+    assert.equal(calls, 2);
+    assert.equal(callbacks, 0);
+  });
+});
+
 describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
   it("buildRunLaneReconcile: a 409 vault_locked refresh → blocked + deferral, secret-free", async () => {
     const client = {

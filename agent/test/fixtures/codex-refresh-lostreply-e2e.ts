@@ -86,6 +86,8 @@ const forge = new GitLabClient({
 type Snapshot = {
   status: string; cause: string | null; session: string | null; slot: boolean;
   coord: string; generation: number; holds: number; captures: number;
+  claim_generation: number; worker_id: string; hold_generations: number[];
+  reauth_required: boolean; cap_revoked: boolean; fail_free: boolean;
   issued: number; consumed: number; permit_requests: number; inputs: string[]; discover: number;
 };
 async function control(action: string): Promise<Snapshot> {
@@ -185,9 +187,9 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
   codexBoundaryDeadlineMs: 30_000, codexFinalizeBoundaryDeadlineMs: 30_000,
 });
 try {
-  await client.register("lostreply", undefined, 1, [], [
+  const registration = await client.register("lostreply", undefined, 1, [], [
     "codex_harness_v1", "codex_runtime_v2", "codex_completion_interlock_v1", "completion_interlock_v1",
-    "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1",
+    "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "codex_account_park_v1",
   ]);
   const first = await client.claimRun();
   assert.ok(first);
@@ -196,22 +198,47 @@ try {
   await runner.execute(first);
   const parked = await control("inspect");
   assert.equal(parked.status, "recovery_wait");
-  assert.equal(parked.cause, cfg.variant === "drop-first" ? "vault_locked" : null);
+  assert.equal(parked.cause, cfg.variant === "account-unavailable" ? "codex_account_unavailable" : cfg.variant === "drop-first" ? "vault_locked" : null);
+  assert.equal(parked.claim_generation, first.claim_generation);
+  assert.equal(parked.worker_id, registration.worker_id);
+  assert.deepEqual(parked.hold_generations, [first.claim_generation]);
+  assert.equal(parked.fail_free, true);
+  if (cfg.variant === "account-unavailable") {
+    assert.equal(parked.coord, "quarantined");
+    assert.equal(parked.generation, 0);
+    assert.equal(parked.reauth_required, true);
+    assert.equal(parked.cap_revoked, true);
+    assert.ok(parked.captures > 0);
+  }
   assert.equal(parked.session, session);
   assert.deepEqual(parked.inputs, ["0"], "operation X spent the provider refresh exactly once");
   assert.equal(parked.discover, 0, "no sweep before pre-sweep assertions");
-  assert.equal(parked.slot, cfg.variant !== "pending-retention");
+  assert.equal(parked.slot, cfg.variant !== "pending-retention" && cfg.variant !== "account-unavailable");
   assert.equal(parked.issued, 0);
   assert.equal(parked.permit_requests, 0);
   assert.ok(parked.holds > 0);
   assert.equal(mrCreates, 0);
   assert.equal(successfulBoundaries, 0, "blocked reconcile minted no action authority");
   assert.equal(await CodexSessionStore.inspectSession(path.join(home, "codex-session-store"), session), "present");
-  await control("recover");
+  const recovered = await control("recover");
+  assert.equal(recovered.worker_id, parked.worker_id);
+  assert.equal(recovered.claim_generation, parked.claim_generation);
+  assert.deepEqual(recovered.hold_generations, parked.hold_generations);
+  assert.equal(recovered.generation, 1);
+  assert.equal(recovered.fail_free, true);
+  assert.equal(recovered.issued, 0);
+  assert.equal(recovered.permit_requests, 0);
   const resumed = await client.claimRun();
   assert.ok(resumed);
   assert.equal(resumed.run_id, first.run_id);
-  assert.ok((resumed.claim_generation ?? 0) > (first.claim_generation ?? 0));
+  assert.equal(resumed.claim_generation, (first.claim_generation ?? 0) + 1);
+  const reclaimed = await control("inspect");
+  assert.equal(reclaimed.worker_id, parked.worker_id);
+  assert.equal(reclaimed.claim_generation, resumed.claim_generation);
+  assert.equal(reclaimed.generation, 1);
+  assert.equal(reclaimed.fail_free, true);
+  assert.equal(reclaimed.issued, 0);
+  assert.equal(reclaimed.permit_requests, 0);
   assert.equal(resumed.secrets.codex?.auth_mode, "subscription");
   assert.ok(resumed.secrets.codex && "generation" in resumed.secrets.codex);
   assert.equal(resumed.secrets.codex.generation, 1);
@@ -229,6 +256,9 @@ try {
   assert.ok(completed.inputs.length >= 2);
   assert.equal(completed.inputs[1], "1", "resume refreshed promoted lineage");
   assert.ok(description.includes("Closes #1770"), "exact-head verified full delivery");
+  assert.equal(gitAt(cfg.origin, ["show", finalHead + ":COMMITTED.txt"]), "committed before refresh");
+  assert.equal(gitAt(cfg.origin, ["show", finalHead + ":DIRTY.txt"]), "dirty before refresh");
+  assert.equal(gitAt(cfg.origin, ["merge-base", "--is-ancestor", committedHead, finalHead]), "", "published head includes the recovered source");
   const logs = lines.join("\n");
   for (const canary of ["access-canary-", "refresh-canary-", cfg.token, first.secrets.codex?.capability ?? "", resumed.secrets.codex.capability]) {
     if (canary) assert.ok(!logs.includes(canary), "no credential canary in worker logs");

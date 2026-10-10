@@ -2521,12 +2521,14 @@ export interface StateRequest {
    *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`),
    *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
    *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
-   *  park) and, PRD #1809 D6, "data_volume_full" (a write to the worker's data volume stayed
+   *  park), "codex_account_unavailable" (a boundary account deferral, gated on
+   *  `recovery_cause_codex_account_unavailable` and server-decided under lock), and, PRD #1809 D6,
+   *  "data_volume_full" (a write to the worker's data volume stayed
    *  disk-full after a reclaim and one retry, or the claim preflight found the volume full; gated
    *  on `recovery_cause_data_volume_full`, an api without it gets the untyped park; the api 400s
    *  this cause without `claim_generation`, so it is never sent for a chat claim). The api
    *  validates it against its own enum
-   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|data_volume_full) before any SQL
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|codex_account_unavailable|data_volume_full) before any SQL
    *  and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
