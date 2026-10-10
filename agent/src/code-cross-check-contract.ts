@@ -8,6 +8,14 @@ export interface CodeFinding {
   title: string;
   detail: string;
 }
+export interface CodeCrossCheckDisposition {
+  finding_id: string;
+  disposition: "addressed" | "declined" | "not_reported";
+  reason: string;
+}
+export type CodeCrossCheckDispositionBatch = Array<Omit<CodeCrossCheckDisposition, "disposition"> & {
+  disposition: "addressed" | "declined";
+}>;
 export interface CodeCrossCheckRecord {
   stage: "code";
   round: 1;
@@ -23,7 +31,9 @@ export interface CodeCrossCheckRecord {
   reason_class: string | null;
   findings: CodeFinding[];
   interrupted_at: string | null;
-  finalized_at: string | null;
+  // Optional for existing M1 worker fixtures; decoded legacy statuses normalize to null.
+  dispositions?: CodeCrossCheckDisposition[] | null;
+  finalized_at?: string | null;
   deadline_at: string;
 }
 export type CodeCrossCheckStatus = CodeCrossCheckRecord | { stage: "code"; result: "no_row" };
@@ -88,12 +98,33 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
   return v as unknown as ClaimPlanCrossCheck;
 }
 
+const codeFindingID = (v: unknown): v is string =>
+  typeof v === "string" && /^[A-Za-z0-9_-]{1,64}(?![\s\S])/.test(v);
+
+export function decodeCodeCrossCheckDispositions(v: unknown, findings?: CodeFinding[]): CodeCrossCheckDisposition[] {
+  const invalid = (): never => { throw new Error("invalid code cross-check dispositions"); };
+  if (!Array.isArray(v) || v.length > 20) return invalid();
+  const known = findings === undefined ? undefined : new Set(findings.map(f => f.id));
+  const seen = new Set<string>();
+  for (const d of v) {
+    if (!record(d) || Object.keys(d).sort().join(",") !== "disposition,finding_id,reason"
+      || !codeFindingID(d.finding_id) || seen.has(d.finding_id)
+      || (known !== undefined && !known.has(d.finding_id)) || !utf8(d.reason)
+      || Buffer.byteLength(d.reason) > 1024
+      || (d.disposition === "not_reported"
+        ? known === undefined || d.reason !== ""
+        : !["addressed", "declined"].includes(d.disposition as string) || d.reason.trim() === "")) return invalid();
+    seen.add(d.finding_id);
+  }
+  return v as CodeCrossCheckDisposition[];
+}
+
 export function decodeCodeFindings(v: unknown): CodeFinding[] {
   const invalid = (): never => { throw new Error("invalid code cross-check findings"); };
   if (!Array.isArray(v) || v.length > 20 || Buffer.byteLength(JSON.stringify(v)) > 32768) return invalid();
   const seen = new Set<string>();
   for (const f of v) {
-    if (!record(f) || typeof f.id !== "string" || !/^[A-Za-z0-9_-]{1,64}(?![\s\S])/.test(f.id) || seen.has(f.id)
+    if (!record(f) || !codeFindingID(f.id) || seen.has(f.id)
       || !["critical", "major", "minor"].includes(f.severity as string)
       || !utf8(f.path) || !utf8(f.title) || !utf8(f.detail)
       || !Number.isSafeInteger(f.line) || (f.line as number) < 0 || (f.line as number) > 2147483647
@@ -114,7 +145,7 @@ export function decodeCodeCrossCheckStatus(v: unknown): CodeCrossCheckStatus {
   const date = (s: unknown) => typeof s === "string" && Number.isFinite(Date.parse(s));
   if ((v.reason_class === "interrupted" && !date(v.interrupted_at)) || v.round !== 1 || !Number.isSafeInteger(v.candidate_generation) || (v.candidate_generation as number) < 1
     || !["pending", "completed", "failed"].includes(v.outcome as string) || !date(v.deadline_at)
-    || (v.interrupted_at !== null && !date(v.interrupted_at)) || (v.finalized_at !== null && !date(v.finalized_at))
+    || (v.interrupted_at !== null && !date(v.interrupted_at)) || (v.finalized_at !== undefined && v.finalized_at !== null && !date(v.finalized_at))
     || !["checker_run_id", "checker_harness", "checker_model", "checker_effort", "reason_class"].every(
       (k) => v[k] === null || utf8(v[k]))
     || !utf8(v.candidate_digest)) return invalid();
@@ -125,5 +156,15 @@ export function decodeCodeCrossCheckStatus(v: unknown): CodeCrossCheckStatus {
   const findings = decodeCodeFindings(v.findings);
   if (v.outcome !== "completed" && findings.length !== 0) return invalid();
   if (v.outcome === "completed" && v.reason_class !== null && v.reason_class !== "interrupted") return invalid();
-  return { ...v, findings } as unknown as CodeCrossCheckRecord;
+  // M1 statuses predate dispositions. They cannot establish a finalized repair pass.
+  const finalized_at = v.dispositions === undefined ? null : v.finalized_at ?? null;
+  let dispositions: CodeCrossCheckDisposition[] | null = null;
+  if (v.dispositions !== undefined && v.dispositions !== null) {
+    dispositions = decodeCodeCrossCheckDispositions(v.dispositions, findings);
+    if (v.interrupted_at !== null || v.outcome !== "completed" || finalized_at === null
+      || dispositions.length !== findings.length) return invalid();
+  } else if (v.dispositions === null && finalized_at !== null && v.interrupted_at === null) return invalid();
+  // WorkerCodeCrossCheckStatus hides superseded findings and dispositions.
+  if (v.interrupted_at !== null && findings.length !== 0) return invalid();
+  return { ...v, findings, dispositions, finalized_at } as unknown as CodeCrossCheckRecord;
 }

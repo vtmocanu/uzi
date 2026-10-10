@@ -279,3 +279,126 @@ it("strict checked state rejects missing negotiation or generation without sendi
     await assert.rejects(c.reportPlanCrossCheckGateState("run", { status: "running", claim_generation }));
   assert.equal(fetch.mock.callCount(), 0);
 });
+
+const codeFinding = { id: "F_1-", severity: "major" as const, path: "src/code.ts", line: 1,
+  title: "defect", detail: "details" };
+const disposition = { finding_id: codeFinding.id, disposition: "addressed" as const, reason: "fixed" };
+const codeWire = () => ({ stage: "code", round: 1, candidate_generation: 3,
+  base_commit: "a".repeat(40), head_commit: "b".repeat(40), candidate_digest: "c".repeat(64),
+  checker_run_id: "22222222-2222-4222-8222-222222222222", checker_harness: "codex",
+  checker_model: "fixture-model", checker_effort: "high", outcome: "completed",
+  reason_class: null, findings: [codeFinding], dispositions: null,
+  interrupted_at: null, finalized_at: null, deadline_at: "2030-01-01T00:00:00Z" });
+const finalizedCodeWire = () => ({ ...codeWire(), dispositions: [disposition],
+  finalized_at: "2030-01-01T00:00:00Z" });
+
+it("code disposition POST sends literal keys, allows empty finalizer, and preserves abort", async (t) => {
+  const controller = new AbortController();
+  t.mock.method(globalThis, "fetch", async (url: unknown, init?: RequestInit) => {
+    assert.equal(String(url), "http://example.com/api/worker/runs/lead/cross-checks/code/dispositions");
+    assert.equal(init?.method, "POST");
+    const body = JSON.parse(init!.body as string);
+    assert.deepEqual(body, { claim_generation: 3, dispositions: [disposition] });
+    assert.ok(init?.signal);
+    controller.abort();
+    assert.equal(init.signal.aborted, true);
+    return Response.json(finalizedCodeWire());
+  });
+  const result = await client().reportCodeCrossCheckDispositions("lead", 3, [disposition], controller.signal);
+  assert.ok("dispositions" in result);
+  assert.deepEqual(result.dispositions, [disposition]);
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    assert.deepEqual(JSON.parse(init!.body as string), { claim_generation: 3, dispositions: [] });
+    return Response.json({ ...finalizedCodeWire(),
+      dispositions: [{ finding_id: codeFinding.id, disposition: "not_reported", reason: "" }] });
+  });
+  const empty = await client().reportCodeCrossCheckDispositions("lead", 3, []);
+  assert.ok("dispositions" in empty);
+  assert.equal(empty.dispositions?.[0]?.disposition, "not_reported");
+});
+
+it("code dispositions validate generation, ASCII IDs and UTF-8 reason bytes before HTTP", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json(finalizedCodeWire()));
+  const c = client();
+  const exact = "é".repeat(512);
+  await c.reportCodeCrossCheckDispositions("lead", 3, [{ ...disposition, reason: exact }]);
+  assert.equal(Buffer.byteLength(exact), 1024);
+  for (const generation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])
+    await assert.rejects(c.reportCodeCrossCheckDispositions("lead", generation, []), /invalid code/);
+  const bad = [
+    [disposition, disposition], [{ ...disposition, reason: exact + "a" }],
+    [{ ...disposition, reason: " " }], [{ ...disposition, reason: "\uD800" }],
+    [{ ...disposition, disposition: "not_reported", reason: "" }],
+    [{ ...disposition, id: codeFinding.id }], null, {},
+    Array.from({ length: 21 }, (_, i) => ({ ...disposition, finding_id: String(i) })),
+    ...["", "é", "a".repeat(65), "F1\n", "F1\r", "F1\u0000", "F1\u001b", "F1\u202e", " F1"]
+      .map(finding_id => [{ ...disposition, finding_id }]),
+  ];
+  for (const batch of bad)
+    await assert.rejects(c.reportCodeCrossCheckDispositions("lead", 3,
+      batch as Parameters<WorkerClient["reportCodeCrossCheckDispositions"]>[2]), /invalid code/);
+  assert.equal(fetch.mock.callCount(), 1, "invalid batches never reach HTTP");
+});
+
+it("code status keeps M1 rollout compatibility and interrupted worker projection", async (t) => {
+  for (const body of [
+    { ...codeWire(), dispositions: undefined, finalized_at: undefined },
+    { ...codeWire(), dispositions: undefined, finalized_at: "2030-01-01T00:00:00Z" },
+    codeWire(),
+    { ...finalizedCodeWire(), findings: [], dispositions: null, reason_class: "interrupted",
+      interrupted_at: "2030-01-01T00:00:00Z" },
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(body));
+    const status = await client().codeCrossCheckStatus("lead", 3);
+    assert.ok("findings" in status);
+    assert.equal(status.dispositions, null);
+    if (body.interrupted_at) assert.deepEqual(status.findings, []);
+    else assert.equal(status.finalized_at, null);
+  }
+});
+
+it("code response refuses invalid, incomplete or unknown persisted dispositions through real clients", async (t) => {
+  const exact = "é".repeat(512);
+  const invalid = [
+    { ...finalizedCodeWire(), dispositions: null },
+    { ...finalizedCodeWire(), dispositions: [] },
+    { ...finalizedCodeWire(), dispositions: [disposition, disposition] },
+    { ...finalizedCodeWire(), dispositions: {} },
+    { ...finalizedCodeWire(), finalized_at: null },
+    { ...finalizedCodeWire(), finalized_at: "invalid" },
+    { ...finalizedCodeWire(), outcome: "failed", findings: [] },
+    { ...finalizedCodeWire(), interrupted_at: "2030-01-01T00:00:00Z", findings: [] },
+    ...["unknown", "", "é", "a".repeat(65), "F1\n", "F1\r", "F1\u0000", "F1\u001b", "F1\u202e"]
+      .map(finding_id => ({ ...finalizedCodeWire(), dispositions: [{ ...disposition, finding_id }] })),
+    ...["", " ", exact + "a", "\uD800"].map(reason =>
+      ({ ...finalizedCodeWire(), dispositions: [{ ...disposition, reason }] })),
+    { ...finalizedCodeWire(), dispositions: [{ ...disposition, disposition: "unknown" }] },
+    { ...finalizedCodeWire(), dispositions: [{ ...disposition, disposition: "not_reported" }] },
+    { ...finalizedCodeWire(), dispositions: [{ ...disposition, id: codeFinding.id }] },
+  ];
+  for (const call of [
+    (c: WorkerClient) => c.codeCrossCheckStatus("lead", 3),
+    (c: WorkerClient) => c.submitCodeCrossCheck("lead", 3, { base_commit: "a".repeat(40), head_commit: "b".repeat(40) }),
+    (c: WorkerClient) => c.reportCodeCrossCheckDispositions("lead", 3, [disposition]),
+  ]) {
+    for (const body of invalid) {
+      t.mock.method(globalThis, "fetch", async () => Response.json(body));
+      await assert.rejects(call(client()), /invalid code cross-check/);
+    }
+    for (const d of [{ ...disposition, reason: exact }, { ...disposition, disposition: "declined", reason: exact },
+      { ...disposition, disposition: "not_reported", reason: "" }]) {
+      t.mock.method(globalThis, "fetch", async () => Response.json({ ...finalizedCodeWire(), dispositions: [d] }));
+      const status = await call(client());
+      assert.ok("dispositions" in status);
+      assert.deepEqual(status.dispositions, [d]);
+    }
+  }
+});
+
+it("code disposition response uses the bounded reader despite false Content-Length", async (t) => {
+  const stream = streamedAck(ackMaxBytes + 1, "1");
+  const fetch = t.mock.method(globalThis, "fetch", async () => stream.response);
+  await assert.rejects(client().reportCodeCrossCheckDispositions("lead", 3, []), /response body exceeds/);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(stream.cancellations(), 1);
+});

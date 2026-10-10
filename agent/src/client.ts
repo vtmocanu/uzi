@@ -96,7 +96,7 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
-import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding } from "./code-cross-check-contract.js";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch } from "./code-cross-check-contract.js";
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -1554,6 +1554,14 @@ export class WorkerClient {
     signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
     return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
       { stage: "code", claim_generation: generation, ...snapshot }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+  }
+
+  async reportCodeCrossCheckDispositions(lead: string, generation: number,
+    batch: CodeCrossCheckDispositionBatch, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("invalid code cross-check generation");
+    decodeCodeCrossCheckDispositions(batch);
+    return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${lead}/cross-checks/code/dispositions`,
+      { claim_generation: generation, dispositions: batch }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
   }
 
   async reportCodeCrossCheckVerdict(runId: string, generation: number,
