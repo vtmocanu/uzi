@@ -70,8 +70,9 @@ export function writePrivateRunnerFile(target: string): void {
   uidScript(runnerCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1]+'/private',{mode:0o700});fs.writeFileSync(process.argv[1]+'/private/keep','keep');fs.chmodSync(process.argv[1]+'/private',0o555)", target);
 }
 
-/** The advice leaves mutate the owned root only after the app-server answered, because a
- * mutation between spawn and readiness can make the provider exit (issue #2397). */
+/** The advice leaves mutate the owned root only after the app-server answered `initialize`.
+ * On the real worker-UID lane this prevented the reproduced teardown failures (issue #2397);
+ * that a mutation during provider startup is the exact cause remains inferred. */
 export async function awaitAdviceProviderReady(transport: CodexTransport, diagnostic: AdviceTeardownDiagnostic): Promise<void> {
   try {
     await transport.request("initialize", {

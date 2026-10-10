@@ -346,7 +346,7 @@ In every batch the genuine-unclean control passed, retaining data with the retai
   `child_exit` event does.
 
 **Observations (a) and (c).**
-- (a): mutating the root before the supervisor spawns never disrupted the provider. All leaves
+- (a): mutating the root before the supervisor spawns did not disrupt the provider in these three iterations. All leaves
   were clean, and the victim directory held only `keep`.
 - (c): with readiness confirmed before the mutation, all 40 iterations were clean. Every record
   for the three test leaves read `started > provider_ready > mutation_start > mutation_end > dispose_start >
