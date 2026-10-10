@@ -36,6 +36,9 @@ through `[0.52.0]`.)
 - **Completed publication serializes safely with worker updates.**
   Persistent workers complete under the same worker-before-run lock order as claims and registration, even with leasing disabled. A worker capability downgrade still completes and consumes its matching permit without stamping a publication head or custody identity. Completion migrations also support schema rollback and reapplication while keeping released custody released.
 
+- **Settled halt notifications can be pruned without a later notification ([#2076](https://github.com/vtmocanu/uzi/issues/2076)).**
+  Best-effort per-user pruning now follows a successful Slack delivery stamp (including terminal no-link outcomes) and the final retry claim, even for a corrupt stored render, so an idle user's log can converge toward the nominal 200-row retention target when pruning succeeds. Pending durable rows below the attempt cap stay exempt, timestamp ties may retain more than 200 rows, and logged prune failures do not undo delivery settlement or retry exhaustion. There is no historical settled-backlog sweep or unconditional cleanup guarantee.
+
 - **Full-screen TUI footers keep help and quit keys visible ([#2194](https://github.com/vtmocanu/uzi/issues/2194)).**
   At 80 columns and wider, the board, CI and pulls footers shed lower-priority hints before help and quit; the board retains its partial-cost cue and client-only version fallback.
 

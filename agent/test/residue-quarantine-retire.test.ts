@@ -101,7 +101,9 @@ describe("worker residue quarantine latching inside the git release methods (#22
     assert.ok(fs.existsSync(path.join(s.clonePath, "OWNER.txt")));
   });
 
-  it("a latch during pinned teardown preparation keeps the standalone clone", async () => {
+  it("a latch during pinned teardown preparation keeps the standalone clone", {
+    skip: process.platform !== "linux" && "pinned removal refuses non-Linux before opening the parent",
+  }, async () => {
     const s = await seed(22992);
     const origOpen = fsp.open.bind(fsp);
     let fired = false;

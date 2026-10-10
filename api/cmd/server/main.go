@@ -641,6 +641,7 @@ func run() error {
 	// the browser and Slack. PublishState never blocks (it enqueues); a Slack
 	// failure is logged redacted and never affects the run. Unconfigured users are
 	// dropped silently, so this is a strict no-op until linking is set up.
+	const notificationUserCap = notifysvc.DefaultUserCap
 	slackNotifier := slacksvc.NewNotifier(
 		q,
 		slackPoster,
@@ -649,6 +650,7 @@ func run() error {
 		// PRD #1189 M4: the near-timeout DM names the run's wall-clock deadline (needs the
 		// instance RUN_TIMEOUT for a run on the global default) and offers the `run extend`
 		// command unless the extension cap is exhausted or extending is disabled (cap 0).
+		slacksvc.WithNotificationUserCap(notificationUserCap),
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
@@ -659,11 +661,11 @@ func run() error {
 	// event log with durable halt delivery; the Slack DM is what
 	// the user sees. Every producer below (handler, poller detectors, scheduler,
 	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
-	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
+	notifier := notifysvc.New(q, slackNotifier, notificationUserCap, slog.Default())
 	// Slack redelivery (issue #1675): the halt DMs opt into durable delivery, and this
 	// re-enqueues the ones whose in-memory enqueue was dropped or whose post failed, via the
 	// sweeper pass registered below.
-	redeliverer := notifysvc.NewRedeliverer(q, slackNotifier, slog.Default())
+	redeliverer := notifysvc.NewRedeliverer(q, slackNotifier, slog.Default(), notifysvc.WithRedeliveryUserCap(notificationUserCap))
 
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
