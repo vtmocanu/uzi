@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Cancelled runs stop counting as active once their exact generation's archive covers retained source ([#2652](https://github.com/vtmocanu/uzi/issues/2652)).**
+  After execution ends, workers can retire an authenticated terminal or finalize report when fresh terminal ownership and a verified archive cover the same generation and its current clean source. Uncertain, changed or dirty sources retain the report; retirement keeps custody holds, source pins and clone cleanup protections intact.
+
 - **Recovery quota refusals retain a retry diagnostic and appear in Admin Health ([#2544](https://github.com/vtmocanu/uzi/issues/2544)).**
   Workers preserve typed recovery API quota as transient `storage_quota_exceeded` while retaining source, bundle bytes and capture identity for retry; untyped 507 remains generic. The owner-scoped `recovery.storage` health check warns on current persisted `needs_action` captures with the exact server reason `storage quota exceeded`, with logical byte accounting, effective limits and bounded owner examples; read failures are unknown. An admitted retry clears that capture’s quota marker before upload succeeds, and reserve refusals without a capture row are absent. The [operator diagnosis](docs/recovery-storage-diagnosis.md) separates byte/count/custody limits and read-only reclaim simulation; no quota, expiry, custody, bundle or capacity-warning policy changes are included.
 

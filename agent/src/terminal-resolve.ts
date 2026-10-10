@@ -27,7 +27,7 @@
 
 import { RequestError, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
-import type { Outbox } from "./outbox.js";
+import type { Outbox, ReportRetirementContext } from "./outbox.js";
 import { canonicalizeTerminalBody } from "./outbox.js";
 import type { MessageGapsResponse, OutgoingMessage, StateAck, StateRequest } from "./protocol.js";
 import { errMessage } from "./util.js";
@@ -117,6 +117,7 @@ interface ResolveArgs {
    * already driving the journal, and the next heartbeat retries).
    */
   ifBusy?: "wait" | "skip";
+  retirementContext?: ReportRetirementContext;
 }
 
 /** Issue #1512: the in-flight resolves, keyed by the outbox instance (shared by the Worker and every
@@ -271,7 +272,13 @@ export async function resolvePendingTerminal(deps: TerminalOutboxDeps, args: Res
 async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: ResolveArgs): Promise<void> {
   const { outbox, log } = deps;
   const { runId, claimGeneration, send, signal } = args;
-  const journal = await outbox.readTerminalJournal(runId, claimGeneration);
+  const captured = typeof outbox.readTerminalJournalForRetirement === "function"
+    ? await outbox.readTerminalJournalForRetirement(runId, claimGeneration, {
+      ...args.retirementContext, signal: args.retirementContext?.signal ?? signal,
+    }) : undefined;
+  const journal = typeof outbox.readTerminalJournalForRetirement === "function"
+    ? captured?.journal : await outbox.readTerminalJournal(runId, claimGeneration);
+  if (captured) args = { ...args, retirementContext: captured.context };
   if (!journal) return; // already retired / never installed / unreadable — nothing to resolve
   if (journal.blocked) return; // permanently blocked (D13): owner-resolved, never auto-retried here
   let ack: StateAck;
@@ -301,7 +308,7 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
   const { runId, claimGeneration } = args;
   if (ack.applied) {
     // 200: the transition landed. Retire the journal (the outcome is the run's outcome now).
-    await outbox.retireTerminal(runId, claimGeneration);
+    await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
   if (ack.staleClaim) {
@@ -318,7 +325,7 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
   if (ack.status !== undefined && TERMINAL_STATUSES.has(ack.status)) {
     // 409 whose returned status is terminal: the outcome already landed (a lost ack after a prior
     // commit, or a racing cancel). Retire.
-    await outbox.retireTerminal(runId, claimGeneration);
+    await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
   // Any other non-terminal 409 (running / claimed / paused / completion-permit mismatch) or an

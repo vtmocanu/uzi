@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { RECOVERY_BUNDLE_REF, readRecoveryBundleHeader } from "../src/git.js";
 import type { TestContext } from "node:test";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
@@ -20,6 +21,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   capturedWip?: boolean;
   invalidJournal?: boolean;
   liveFlight?: boolean;
+  thinArchive?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
   const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
@@ -129,8 +131,21 @@ export async function reportRetirementFixture(t: TestContext, options: {
       "-c", "commit.gpgsign=false", "commit", "-m", name]);
     return cmd(clone, ["rev-parse", "HEAD"]);
   };
+  if (options.thinArchive) {
+    // Real public history makes full-first exceed this test contract cap.
+    fs.writeFileSync(path.join(fx.originPath, "public-history.bin"), randomBytes(256 * 1024));
+    cmd(fx.originPath, ["add", "public-history.bin"]);
+    cmd(fx.originPath, ["commit", "-m", "public history"]);
+    fs.unlinkSync(path.join(fx.originPath, "public-history.bin"));
+    cmd(fx.originPath, ["add", "-u"]);
+    cmd(fx.originPath, ["commit", "-m", "public deletion"]);
+    const produce = git.produceRecoveryBundle.bind(git);
+    t.mock.method(git, "produceRecoveryBundle", (barePath: string, opts: Parameters<typeof produce>[1]) =>
+      produce(barePath, { ...opts, maxBytes: 32 * 1024 }));
+  }
   api.refuseStateWith409(claim.run_id);
   let foreground = true;
+  const processObservation = { killed: [] as number[], calls: 0 };
   const r = runner({ run: async ctx => {
     executions++;
     if (executions > 1) throw new Error("cancelled queued duplicate SDK flight");
@@ -148,10 +163,13 @@ export async function reportRetirementFixture(t: TestContext, options: {
     throw new Error("cancelled unpublished SDK error");
   } }, fakeGitlab().gitlab, token, { outbox, activeRuns: registry, checkpointIntervalMs: 1,
     // The foreground error retains its source. Later replay gets healthy physical quiescence.
-    quiesceRun: async () => ({
-      process: { state: foreground ? "unverified" : "quiescent", processes: [], killed: [], detail: "" },
-      docker: { state: "not_wired", removed: [], detail: "" },
-    }),
+    quiesceRun: async () => {
+      processObservation.calls++;
+      return {
+        process: { state: foreground ? "unverified" : "quiescent", processes: [], killed: [...processObservation.killed], detail: "" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      };
+    },
   });
   const flight = r.execute(claim);
   // Every test has bounded node-test timeout; cleanup releases both event barriers on assertion failure.
@@ -195,6 +213,18 @@ export async function reportRetirementFixture(t: TestContext, options: {
   assert.ok(archive.coverageDigest && archive.bundlePath && uploadedBytes);
   assert.deepEqual(fs.readFileSync(archive.bundlePath), uploadedBytes);
   cmd(bare, ["bundle", "verify", archive.bundlePath]);
+  if (options.thinArchive) {
+    const header = await readRecoveryBundleHeader(archive.bundlePath, archive.sourceSha);
+    assert.equal(header.selfContained, false);
+    assert.ok(header.prerequisiteShas.length > 0, "actual bundle has prerequisites");
+    const fresh = path.join(fx.dataDir, "thin-import");
+    cmd(fx.dataDir, ["clone", "--no-local", fx.originPath, fresh]);
+    assert.throws(() => cmd(fresh, ["cat-file", "-e", head]));
+    cmd(fresh, ["bundle", "verify", archive.bundlePath]);
+    cmd(fresh, ["fetch", archive.bundlePath, RECOVERY_BUNDLE_REF + ":refs/heads/recovered"]);
+    assert.equal(cmd(fresh, ["show", "recovered:unpublished.txt"]), "unpublished.txt");
+    cmd(fresh, ["merge-base", "--is-ancestor", head, "recovered"]);
+  }
   assert.equal(cmd(clone, ["status", "--porcelain"]), "", "clean captured source");
   assert.equal(calls.final, 0);
   assert.equal(calls.cloneCleanup, 0);
@@ -255,5 +285,5 @@ export async function reportRetirementFixture(t: TestContext, options: {
   };
   const liveFlight = { flight, release: leave.resolve, executions: () => executions };
   return { claim, generation, archive, outbox, registry, r, coordinator, replay, assertPending,
-    assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight };
+    assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }

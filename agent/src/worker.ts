@@ -42,7 +42,7 @@ const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
 // Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
 // and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
-const finalizeAuthorities = new Map<string, Promise<boolean>>();
+const finalizeAuthorities = new Map<string, Promise<void>>();
 type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
 const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
 
@@ -281,19 +281,28 @@ export class Worker {
     const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
     try {
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
-      const authority = Promise.resolve().then(() => this.hasFinalizeAuthority(entry, identity, registrationLower));
+      const authority = Promise.resolve().then(async () => {
+        const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
+          !this.admittedRunIds.has(entry.run_id) && !(this.activeRuns?.has(entry.run_id) ?? false);
+        if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
+          await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
+            expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
+          }, "finalize", outbox);
+        }
+        if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
+            !reportEligible()) return;
+        if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return;
+        const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
+        if (!eligible()) return;
+        await outbox.retireFinalizeIfEligible(
+          entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
+      });
       finalizeAuthorities.set(key, authority);
       const settled = () => {
         if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
       };
       void authority.then(settled, settled);
-      const authorized = await waitForFinalize(authority, authorityWait.signal);
-      if (authorized !== true) return;
-      const eligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
-        !this.isFinalizeRunLive(entry.run_id);
-      if (!eligible()) return;
-      await waitForFinalize(outbox.retireFinalizeIfEligible(
-        entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity), authorityWait.signal);
+      await waitForFinalize(authority, authorityWait.signal);
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),

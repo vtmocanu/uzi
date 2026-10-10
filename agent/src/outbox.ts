@@ -27,6 +27,19 @@
 // durability there. It protects against OUTAGES (and, on the split-UID runtime,
 // against the runner), not against the model. This is documented, not hidden.
 
+/** Per-call context; the opaque identity never crosses disk or protocol boundaries. */
+export interface ReportRetirementContext {
+  expectedIdentity?: Readonly<object>;
+  signal?: AbortSignal;
+  deadline?: number;
+  eligible?: () => boolean;
+}
+
+function terminalRetirementPayload(record: Record<string, unknown>): string {
+  return canonicalJson({ run: record.run_id, generation: record.claim_generation,
+    body: record.body, fence: record.messages_through_seq, phase: record.phase_at_journal });
+}
+
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import { constants as fsConstants, type Dir } from "node:fs";
@@ -1391,7 +1404,8 @@ export class Outbox {
         const existing = await this.readTerminalAuthed(runId, claimGeneration);
         const meta = existing && coerceTerminal(existing, runId, claimGeneration, this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName);
         if (!meta) return { journaled: false, reason: "reserve_exhausted" };
-        this.ensureInMemoryRun(runId, meta.since).terminals.set(claimGeneration, meta);
+        const rs = this.ensureInMemoryRun(runId, meta.since);
+        if (!rs.terminals.has(claimGeneration)) rs.terminals.set(claimGeneration, meta);
       }
       // Track it in memory. On an adopt (a first-writer already installed this generation) keep
       // the winner's metadata if we already loaded it; otherwise record ours (same generation).
@@ -1436,7 +1450,7 @@ export class Outbox {
 
   /** Retire a terminal journal (the api applied the transition on a 200, or answered a 409 whose
    *  returned status is terminal): unlink the file and drop it from the pending set (D3). */
-  async retireTerminal(runId: string, claimGeneration: number): Promise<void> {
+  async retireTerminal(runId: string, claimGeneration: number, _context?: ReportRetirementContext): Promise<void> {
     if (this.disabled) return;
     await this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return;
@@ -1518,6 +1532,46 @@ export class Outbox {
    * undefined when the run holds no such journal (already retired / never installed) or the file no
    * longer authenticates (a tampered/absent record proves nothing — never sent).
    */
+  /** Capture the authenticated send payload and its opaque lifetime identity under O. */
+  async readTerminalJournalForRetirement(runId: string, generation: number,
+    context: Omit<ReportRetirementContext, "expectedIdentity"> = {},
+  ): Promise<{ journal: PendingTerminalJournal; context: ReportRetirementContext } | undefined> {
+    if (this.disabled) return undefined;
+    return this.withRunLock(runId, async () => {
+      const parsed = await this.readTerminalAuthed(runId, generation);
+      const meta = this.runs.get(runId)?.terminals.get(generation);
+      const journal = parsed && coerceTerminalRecord(parsed, runId, generation);
+      if (!meta || !journal) return undefined;
+      const payload = terminalRetirementPayload(parsed!);
+      let binding = this.terminalRetirementIdentities.get(meta);
+      if (!binding || binding.payload !== payload) {
+        binding = { identity: Object.freeze({}), payload };
+        this.terminalRetirementIdentities.set(meta, binding);
+      }
+      return { journal, context: { ...context, expectedIdentity: binding.identity } };
+    }, context.signal);
+  }
+
+  private readonly terminalRetirementIdentities = new WeakMap<object, { identity: Readonly<object>; payload: string }>();
+
+  /** Report-only unlink: no asynchronous proof callback runs under O. Once unlink starts,
+   * its actual settlement owns O, even when the caller deadline expires. */
+  async retireTerminalIfEligible(runId: string, generation: number, context: ReportRetirementContext): Promise<void> {
+    if (this.disabled || !context.expectedIdentity) return;
+    await this.withRunLock(runId, async () => {
+      const meta = this.runs.get(runId)?.terminals.get(generation);
+      const binding = meta && this.terminalRetirementIdentities.get(meta);
+      if (!meta || !binding || binding.identity !== context.expectedIdentity || meta.blocked) return;
+      const parsed = await this.readTerminalAuthed(runId, generation);
+      if (!parsed || parsed.blocked || terminalRetirementPayload(parsed) !== binding.payload ||
+          this.runs.get(runId)?.terminals.get(generation) !== meta ||
+          context.signal?.aborted || (context.deadline !== undefined && Date.now() >= context.deadline) ||
+          context.eligible?.() === false) return;
+      await fs.unlink(path.join(this.runDir(runId), meta.fileName));
+      this.runs.get(runId)?.terminals.delete(generation);
+    }, context.signal);
+  }
+
   async readTerminalJournal(
     runId: string,
     claimGeneration: number,
@@ -1706,6 +1760,7 @@ export class Outbox {
     eligible: () => boolean,
     signal: AbortSignal,
     expectedIdentity: Readonly<object>,
+    reauthenticate = false,
   ): Promise<void> {
     if (this.disabled) return;
     await this.withRunLock(runId, async () => {
@@ -1713,7 +1768,15 @@ export class Outbox {
       if (!expectedIdentity || rs?.finalizes.get(claimGeneration) !== expectedIdentity ||
           !this.validRunId(runId) || !rs?.finalizes.has(claimGeneration) ||
           rs.terminals.size > 0 || signal.aborted || !eligible()) return;
-      await fs.rm(path.join(this.runDir(runId), finalizeFileName(claimGeneration)), { force: true });
+      const file = path.join(this.runDir(runId), finalizeFileName(claimGeneration));
+      if (reauthenticate) {
+        const parsed = await this.readAuthed(file, MAC_DOMAIN_FINALIZE);
+        const authenticated = parsed && coerceFinalize(parsed, runId, claimGeneration);
+        const meta = rs.finalizes.get(claimGeneration);
+        if (!authenticated || !meta || authenticated.since !== meta.since ||
+            meta !== expectedIdentity || signal.aborted || !eligible()) return;
+        await fs.unlink(file);
+      } else await fs.rm(file, { force: true });
       rs.finalizes.delete(claimGeneration);
     }, signal);
   }

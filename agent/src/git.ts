@@ -1482,6 +1482,18 @@ export class GitCache {
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number }>();
+
+  /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
+  withReportProofBudget<T>(budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>): Promise<T> {
+    return this.reportProofs.run({ ...budget, owedBytes: 0 }, action);
+  }
+
+  private checkReportProof(): void {
+    const budget = this.reportProofs.getStore();
+    budget?.signal.throwIfAborted();
+    if (budget && Date.now() >= budget.deadline) throw new Error("report proof deadline");
+  }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
   private readonly maxOwedCandidates: number;
@@ -1627,7 +1639,10 @@ export class GitCache {
     } catch {
       return undefined;
     }
-    if (!(await isBareRepo(barePath))) return undefined;
+    if (this.reportProofs.getStore()) {
+      try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
+      catch { return undefined; }
+    } else if (!(await isBareRepo(barePath))) return undefined;
     return barePath;
   }
 
@@ -4203,8 +4218,14 @@ export class GitCache {
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
-  async readInventoryCloneHeads(barePath: string, runId: string): Promise<
-    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
+  async readInventoryCloneHeads(barePath: string, runId: string, underLock = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
+    if (underLock) return this.readInventoryCloneHeadsUnderLock(barePath, runId);
+    return this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
+  }
+
+  /** Observational variant: the caller already holds B. */
+  async readInventoryCloneHeadsUnderLock(barePath: string, runId: string): Promise<
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
     let cause: InventoryReadCause = "other";
     function refuse(failure: InventoryReadCause, message: string): never {
@@ -4218,7 +4239,7 @@ export class GitCache {
     try {
       if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
           await atFailure("git_or_filesystem_error", () => this.resolveRecoveryBareDir(path.basename(barePath))) !== barePath) return { kind: "unknown", cause };
-      return await this.withLock(barePath, async () => {
+      {
         const paths = new Map<string, { branch: string; runId: string }>();
         const foreignOwners = new Set<string>();
         const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
@@ -4252,7 +4273,7 @@ export class GitCache {
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
         const heads = new Set<string>();
-        const clones: Array<{ clonePath: string; branch: string; runId: string }> = [];
+        const clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }> = [];
         clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
@@ -4311,10 +4332,10 @@ export class GitCache {
             return head;
           });
           heads.add(head);
-          clones.push({ clonePath: clone, ...owner });
+          clones.push({ clonePath: clone, ...owner, head, identity: `${st.dev}:${st.ino}` });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
-      });
+      }
     } catch {
       return { kind: "unknown", cause };
     }
@@ -5793,9 +5814,11 @@ export class GitCache {
       if (status.length !== 0) return null;
       const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
       if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
+      const report = this.reportProofs.getStore();
+      const args = ["-e", CANCEL_CONTENT_HELPER, cwd, ...(report ? [String(report.deadline)] : [])];
       const wrapped = this.boundaryProcesses.getStore()
-        ? { command: process.execPath, args: ["-e", CANCEL_CONTENT_HELPER, cwd] }
-        : runnerCommand(process.execPath, ["-e", CANCEL_CONTENT_HELPER, cwd]);
+        ? { command: process.execPath, args }
+        : runnerCommand(process.execPath, args);
       const input = JSON.stringify(manifest);
       if (Buffer.byteLength(input) > 2 * 1024 * 1024) return null;
       const proof = await this.execScoped(wrapped.command, wrapped.args, {
@@ -7642,6 +7665,9 @@ export class GitCache {
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
+    this.checkReportProof();
+    const report = this.reportProofs.getStore();
+    if (report) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, report.deadline - Date.now())) };
     const { input, ...execOptions } = options;
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
@@ -7649,13 +7675,21 @@ export class GitCache {
       assertNoCredentialedGitWhileQuarantined(options.env);
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
-      const pending = execFileAsync(command, args, execOptions);
+      const pending = execFileAsync(command, args, { ...execOptions,
+        ...(report ? { signal: report.signal, killSignal: "SIGKILL" as const } : {}) });
       if (input !== undefined) {
         pending.child.stdin?.on("error", () => undefined);
         pending.child.stdin?.end(input);
       }
-      const result = await pending;
-      return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      // AbortError may precede child close. Report boundaries remain held until
+      // the subprocess and its stdio actually settle.
+      const closed = report ? new Promise<void>(resolve => pending.child.once("close", () => resolve())) : undefined;
+      try {
+        const result = await pending;
+        return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      } finally {
+        if (closed) await closed;
+      }
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
@@ -7747,7 +7781,18 @@ export class GitCache {
     let terminal: { readonly code: number; readonly softTimedOut?: true };
     // A collector can close/error before a timed-out child is fully disposed.
     // Keep the bare lock until the safety owner has verified full-root reap.
+    let reportCancellation: Promise<void> | undefined;
+    const cancelReportChild = () => {
+      reportCancellation ??= Promise.resolve().then(() => process.cancel());
+      // Observe rejection immediately; completion below remains the settlement proof.
+      void reportCancellation.catch(() => undefined);
+    };
+    report?.signal.addEventListener("abort", cancelReportChild, { once: true });
+    if (report?.signal.aborted) cancelReportChild();
     const settled = await Promise.allSettled([collect(process.stdout), collect(process.stderr), process.completed] as const);
+    report?.signal.removeEventListener("abort", cancelReportChild);
+    if (reportCancellation) await reportCancellation;
+    this.checkReportProof();
     if (settled[2].status === "rejected") {
       throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
     }
@@ -8349,10 +8394,25 @@ export class GitCache {
       if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > 65536) {
         throw new Error("unsafe owed metadata file");
       }
+      const before = await file.stat({ bigint: true });
       const buf = Buffer.alloc(65537);
-      const { bytesRead } = await file.read(buf, 0, buf.length, 0);
-      if (bytesRead > 65536) throw new Error("oversized owed metadata");
-      return JSON.parse(buf.toString("utf8", 0, bytesRead)) as unknown;
+      let length = 0;
+      // At most cap+1 nonempty reads; only complete EOF permits JSON parsing.
+      while (length < buf.length) {
+        this.checkReportProof();
+        const { bytesRead } = await file.read(buf, length, buf.length - length, null);
+        if (!bytesRead) break;
+        length += bytesRead;
+        const budget = this.reportProofs.getStore();
+        if (budget && (budget.owedBytes += bytesRead) > 32 * 1024 * 1024) throw new Error("owed byte budget");
+      }
+      if (length > 65536) throw new Error("oversized owed metadata");
+      const after = await file.stat({ bigint: true });
+      const named = await fs.lstat(path.join(dir, name), { bigint: true });
+      if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
+          before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+          before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) throw new Error("owed metadata changed");
+      return JSON.parse(buf.toString("utf8", 0, length)) as unknown;
     } finally { await file.close(); }
   }
 
@@ -8698,7 +8758,22 @@ export class GitCache {
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
         throw new Error("unsafe owed discovery directory");
       }
-      const names = await fs.readdir(dir);
+      const names: string[] = [];
+      if (this.reportProofs.getStore()) {
+        const directory = await fs.opendir(dir);
+        try {
+          for (;;) {
+            this.checkReportProof();
+            const entry = await directory.read();
+            if (!entry) break;
+            if (names.length >= 1024) throw new Error("owed entry budget");
+            names.push(entry.name);
+          }
+        } finally { await directory.close(); }
+        const after = await fs.lstat(dir);
+        if (st.dev !== after.dev || st.ino !== after.ino || st.mtimeMs !== after.mtimeMs ||
+            st.ctimeMs !== after.ctimeMs) throw new Error("owed directory changed");
+      } else names.push(...await fs.readdir(dir));
       for (const name of names) {
         if (!/^(?:context-[0-9a-f]{64}|candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-[0-9a-f]{64}|(?:governed|receipt)-[0-9a-f]{64})\.json$/.test(name) &&
             !/^\.tmp-[0-9a-f-]{36}$/.test(name)) throw new Error("unknown owed metadata entry");
@@ -8735,7 +8810,7 @@ export class GitCache {
     return { names, contexts, records };
   }
 
-  private async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
+  async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
     const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath);
     const records = loaded.records.filter((r) => r.runId === runId);
     const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
@@ -9030,7 +9105,10 @@ export class GitCache {
    * let a later mutation overtake the holder and violate serialization. */
   private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
-    const scope = this.boundaryProcesses.getStore();
+    const boundaryScope = this.boundaryProcesses.getStore();
+    const report = this.reportProofs.getStore();
+    const scope = report ? { ...boundaryScope, signal: boundaryScope
+      ? AbortSignal.any([boundaryScope.signal, report.signal]) : report.signal } : boundaryScope;
     let started = false;
     let settled = false;
     let removeAbortListener = (): void => {};
@@ -9099,7 +9177,7 @@ const CANCEL_CONTENT_HELPER = String.raw`
 const fs = require("node:fs");
 const { createHash } = require("node:crypto");
 const C = fs.constants, O_PATH = 0x200000;
-const root = process.argv[1], deadline = Date.now() + 28000;
+const root = process.argv[1], deadline = process.argv[2] === undefined ? Date.now() + 28000 : Number(process.argv[2]);
 const fds = new Set();
 let total = 0;
 function check() { if (Date.now() > deadline) throw Error("content deadline"); }

@@ -82,6 +82,8 @@ it("captured WIP marker fixture has a clean source whose tree is in the actual a
   assert.match(f.cmd(f.clone, ["log", "-1", "--format=%s"]), /^wip\(park\):/);
   assert.equal(f.cmd(f.clone, ["status", "--porcelain"]), "");
   assert.equal(f.cmd(f.bare, ["show", f.archive.sourceSha + ":marker.txt"]), "captured WIP");
+  await f.replay();
+  assert.equal(await f.outbox.readTerminalJournal(f.claim.run_id, 2), undefined);
   await f.assertCustody();
 });
 
@@ -111,12 +113,53 @@ it("a parseable coverage journal with an invalid MAC retains the report despite 
 it("late dirty source hook remains available across the proof's asynchronous read seam", async t => {
   const f = await reportRetirementFixture(t);
   const read = git.credentialFreeCancelCleanHead.bind(git);
-  // M2 must reach and revalidate this seam. Base retains before it needs local archive authority.
+  let reached = 0;
   t.mock.method(git, "credentialFreeCancelCleanHead", async (clone: string, bare: string, head: string) => {
     const clean = await read(clone, bare, head);
-    if (clone === f.clone) fs.writeFileSync(path.join(clone, "late-hook.txt"), "late source mutation\n");
+    if (clone === f.clone) {
+      assert.equal(clean, f.head, "original strict reader returned the covered clean head");
+      reached++;
+      fs.writeFileSync(path.join(clone, "late-hook.txt"), "late source mutation\n");
+    }
     return clean;
   });
   await f.replay();
+  assert.ok(reached > 0, "dirty hook reached after positive strict inspection");
+  assert.equal(fs.readFileSync(path.join(f.clone, "late-hook.txt"), "utf8"), "late source mutation\n");
   await f.assertPending();
 });
+
+for (const mutation of ["swap", "addition"] as const) {
+  it(`physical source ${mutation} after positive byte proof refuses final read`, async t => {
+    const f = await reportRetirementFixture(t);
+    const read = git.credentialFreeCancelCleanHead.bind(git);
+    const saved = f.clone + "-saved";
+    const extra = path.join(f.clone, "late-addition.txt");
+    let reached = false;
+    t.mock.method(git, "credentialFreeCancelCleanHead", async (...args: Parameters<typeof read>) => {
+      const head = await read(...args);
+      if (!reached && args[0] === f.clone) {
+        assert.equal(head, f.head);
+        reached = true;
+        if (mutation === "swap") {
+          fs.renameSync(f.clone, saved);
+          fs.cpSync(saved, f.clone, { recursive: true });
+        } else fs.writeFileSync(extra, "new source after positive inspection\\n");
+      }
+      return head;
+    });
+    const restore = () => {
+      if (fs.existsSync(saved)) {
+        fs.rmSync(f.clone, { recursive: true, force: true });
+        fs.renameSync(saved, f.clone);
+      }
+      fs.rmSync(extra, { recursive: true, force: true });
+    };
+    t.after(restore);
+    await f.replay();
+    assert.equal(reached, true, "real strict content inspection succeeded before identity mutation");
+    assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), true);
+    restore();
+    await f.assertPending();
+  });
+}
