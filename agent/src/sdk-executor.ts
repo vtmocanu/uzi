@@ -781,7 +781,7 @@ export class SdkExecutor implements Executor {
    *  shared provisioning HOME, a writable data-volume path — never the clone); tests
    *  inject a fake. Only used by the advisory summary hooks. */
   private readonly summaryRunner: SummaryRunner;
-  /** Issue #2686: the bound for {@link settleIntentSummary}. */
+  /** Issue #2686: the bound for {@link waitIntentSummary} and {@link settleIntentSummary}. */
   private readonly intentSettleBoundMs: number;
   /** Issue #2686: this run's in-flight intent-summary pass, undefined when none started. */
   private intentFlight: IntentFlight | undefined;
@@ -3676,11 +3676,13 @@ export class SdkExecutor implements Executor {
 
   /**
    * Issue #2686: wait up to `intentSettleBoundMs` for the intent pass to finish on its own,
-   * WITHOUT aborting it. Resolves true when it settled (or none exists), false at the bound.
+   * WITHOUT aborting it. Resolves true when it settled (or none exists, or it was already
+   * abandoned: an abandoned pass never settles, so waiting again would only add a bound), false
+   * at the bound.
    */
   private async waitIntentSummary(): Promise<boolean> {
     const flight = this.intentFlight;
-    if (flight === undefined) return true;
+    if (flight === undefined || flight.abandoned) return true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<false>((resolve) => {
       timer = setTimeout(() => resolve(false), this.intentSettleBoundMs);
@@ -3714,7 +3716,7 @@ export class SdkExecutor implements Executor {
    * it to finish naturally (bounded) so a "gave_up" run, which continues in place on the old
    * token, still posts its intent summary; only a pass still running at the bound is aborted and
    * settled. Residual: such a pass is cancelled, so its summary is not posted on a later give-up
-   * (its usage is still reported).
+   * (any usage it already observed is still reported).
    */
   private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
     if (!ctx.attemptCredentialSwitch) return undefined;
