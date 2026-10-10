@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Checkpoint publication tolerates extra flush packets after a plain receive-pack report ([#2703](https://github.com/vtmocanu/uzi/issues/2703)).**
+  A plain (non-sideband) receive-pack report followed by one or more bare flush packets is still read as the complete report, so publication no longer fails with "missing or incomplete receive-pack acknowledgement"; data or contradictory packets after the report are still rejected.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

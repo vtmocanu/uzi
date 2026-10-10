@@ -327,3 +327,45 @@ func TestRawHTTPObservesOnlyReceivePackBody(t *testing.T) {
 		})
 	}
 }
+
+// Scope guard: it passes on code without the plain-report flush tolerance too. It
+// pins that an extra flush inside a sideband channel-1 stream stays invalid, so
+// the tolerance is never moved into reportPacket.
+func TestRawReportSidebandExtraInnerFlushInvalid(t *testing.T) {
+	const ref = "refs/uzi-checkpoints/main"
+	inner := rawFixtureWire(t, "unpack ok", "ok "+ref)
+	outer := func(t *testing.T, packets ...[]byte) []byte {
+		t.Helper()
+		var b bytes.Buffer
+		enc := pktline.NewEncoder(&b)
+		for _, p := range packets {
+			if err := enc.Encode(append([]byte{1}, p...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := enc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	for _, tc := range []struct {
+		name string
+		wire []byte
+		ok   bool
+	}{
+		{"control", outer(t, inner), true},
+		{"form A one packet", outer(t, append(append([]byte(nil), inner...), "0000"...)), false},
+		{"form B two packets", outer(t, inner, []byte("0000")), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := &rawReport{ref: ref, sideband: true}
+			raw.feed(tc.wire)
+			if tc.ok && (!raw.complete() || raw.invalid) {
+				t.Fatalf("control not complete: %+v", raw)
+			}
+			if !tc.ok && (raw.complete() || !raw.invalid) {
+				t.Fatalf("extra inner flush accepted: %+v", raw)
+			}
+		})
+	}
+}
