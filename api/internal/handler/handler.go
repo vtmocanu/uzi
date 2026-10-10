@@ -1364,6 +1364,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/archives/reserve", h.WorkerRecoveryReserve)
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
 		r.Post("/runs/{id}/archives/{captureID}/reconcile", h.WorkerRecoveryReconcile)
+		// Issue #2625: a completed run's archive may expire early on the api's own forge proof that
+		// every retained object is already on the published branch. The worker supplies the inventory
+		// claim only. Each call that passes the local checks spends the OWNER's forge quota (a
+		// summary, a branch head and one compare per distinct commit), so it rides the per-worker
+		// proposal limiter in its own route bucket, and a refused claim is memoized for an hour.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/archives/{captureID}/redundancy", h.WorkerRecoveryArchiveRedundancy)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
 		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.

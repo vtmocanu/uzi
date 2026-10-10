@@ -400,7 +400,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 func protocolFeatures(activeSnapshotEnabled bool) []string {
 	groups := [][]string{
 		{"dind_maintenance_v1"},
-		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1"}, // PRD #1392 M1
+		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
 		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
 		{"claim_generation_fence"},    // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker

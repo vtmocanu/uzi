@@ -935,3 +935,56 @@ FROM workers w
 JOIN recovery_custody_holds h ON h.live_worker_id = w.id AND h.user_id = w.user_id
 JOIN recovery_custody_hold_facts f ON f.id = h.id AND f.user_id = h.user_id
 WHERE w.id = ANY(@worker_ids::uuid[]) AND h.state = 'open';
+
+-- name: GetArchiveRedundancyView :one
+-- Issue #2625: everything the published-redundancy claim is checked against, in one read: the
+-- capture, its hold with the frozen completion identity, and the run. No lock of its own; the
+-- service takes the worker, run, hold and capture locks first and reads this under them.
+SELECT c.id AS capture_id, c.run_id, c.user_id, c.original_worker_id AS capture_worker_id,
+    c.state AS capture_state, c.reason AS capture_reason, c.manifest_bound, c.source_sha, c.coverage_digest,
+    COALESCE(c.prerequisite_shas, '{}')::text[] AS prerequisite_shas,
+    c.redundancy_proof, c.redundancy_refused_at, c.redundancy_refusal,
+    h.id AS hold_id, h.generation AS hold_generation, h.state AS hold_state,
+    h.inventory_guarded, h.original_worker_id AS hold_worker_id, h.repo_id,
+    h.completion_identity,
+    r.status AS run_status, r.claim_generation AS run_generation, r.worker_id AS run_worker_id,
+    r.completion_final_head, r.mr_iid AS run_mr_iid
+FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id AND h.run_id = c.run_id AND h.user_id = c.user_id
+JOIN runs r ON r.id = c.run_id AND r.user_id = c.user_id
+WHERE c.id = @capture_id AND c.run_id = @run_id AND c.user_id = @user_id
+    AND c.original_worker_id = @worker_id::uuid;
+
+-- name: ExpireRedundantCapture :many
+-- Issue #2625: the ONLY statement that writes reason 'published_redundant'. The caller holds the
+-- worker, run, hold and capture locks and has re-verified the claim. Same shape as
+-- FenceUnacceptedInventoryCapture: the guarded UPDATE returns the ids it flipped and the DELETE
+-- removes chunks for those ids alone, so a row the guard or the WHERE refuses loses no bytes.
+-- LEAST keeps expires_at in the past, so later updates of the expired final capture never trip the
+-- guard's window arm; the local replica marker is cleared because the proof replaces it.
+WITH flipped AS (
+    UPDATE recovery_captures c
+    SET state = 'expired', reason = 'published_redundant', reserved_bytes = NULL,
+        expires_at = LEAST(c.expires_at, now()), local_replica_worker_id = NULL,
+        redundancy_proof = @proof::jsonb, updated_at = now()
+    WHERE c.id = @id AND c.hold_id = @hold_id AND c.run_id = @run_id AND c.user_id = @user_id
+      AND c.original_worker_id = @worker_id::uuid AND c.state = 'available' AND c.manifest_bound
+      AND c.coverage_digest = @coverage_digest::text AND c.source_sha = @source_sha::text
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+        WHERE h.id = c.hold_id AND h.original_worker_id = @worker_id::uuid AND h.generation = @generation
+          AND h.inventory_guarded AND h.state = 'released' AND h.completion_identity = @identity::jsonb
+          AND r.status = 'completed' AND r.claim_generation = h.generation AND r.worker_id = h.original_worker_id
+          AND r.completion_final_head = h.completion_identity->>'final_head')
+    RETURNING c.id
+), deleted AS (
+    DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM flipped)
+    RETURNING capture_id
+)
+SELECT id FROM flipped WHERE (SELECT count(*) FROM deleted) >= 0;
+
+-- name: RecordArchiveRedundancyRefusal :execrows
+-- Issue #2625: remember a forge-derived refusal so a repeat claim inside the cool-down is answered
+-- without a forge call. Touches nothing else; the capture stays available under its own TTL.
+UPDATE recovery_captures SET redundancy_refused_at = now(), redundancy_refusal = @reason::text
+WHERE id = @id AND run_id = @run_id AND user_id = @user_id AND state = 'available'
+    AND coverage_digest = @coverage_digest::text;
