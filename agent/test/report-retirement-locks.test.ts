@@ -6,7 +6,10 @@ import { reportRetirementFixture } from "./report-retirement-fixture.js";
 
 installHarness();
 for (const boundary of ["J", "B", "O"] as const) {
-  it(`integrated retireRecoveryReport cancellation propagates through queued ${boundary}`, async t => {
+  it(`integrated retireRecoveryReport cancellation propagates through queued ${boundary}`, {
+    skip: boundary === "O" && process.platform !== "linux" &&
+      "integrated O requires Linux procfs/no-follow report content proof",
+  }, async t => {
     const f = await reportRetirementFixture(t);
     const retirement = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, 2))!;
     // The runner owns a separate coordinator over the same process-wide journal queue.

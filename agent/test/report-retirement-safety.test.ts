@@ -14,9 +14,13 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import { nullLogger } from "./helpers.js";
 
 installHarness();
+// Archive report retirement needs Linux procfs/no-follow content inspection.
+// Other hosts deliberately retain reports; portable checks still run below.
 
 for (const blocker of ["messages", "held", "fence", "messages+held"] as const) {
-  it(`worker final eligibility retains ${blocker} after positive archive inspection`, async t => {
+  it(`worker final eligibility retains ${blocker} after positive archive inspection`, {
+    skip: process.platform !== "linux" && "requires Linux procfs/no-follow proof before final eligibility hook",
+  }, async t => {
     const f = await reportRetirementFixture(t);
     await f.replayPositive();
     await f.outbox.journalFinalize(f.claim.run_id, 2);
@@ -65,7 +69,11 @@ function retirementWorker(f: Awaited<ReturnType<typeof reportRetirementFixture>>
 
 it("worker archive branch rotates past overflow and an unsettled slow sibling", async t => {
   const f = await reportRetirementFixture(t);
-  await f.replayPositive();
+  if (process.platform === "linux") await f.replayPositive();
+  else {
+    await f.replay();
+    await f.assertPending();
+  }
   const release = deferred();
   const slow = "00000000-0000-4000-8000-000000000000";
   const real = f.r.retireRecoveryReport.bind(f.r);
@@ -85,16 +93,27 @@ it("worker archive branch rotates past overflow and an unsettled slow sibling", 
   await w.sweepPendingFinalizes();
   assert.equal(attempts.length, 16, "existing sixteen-candidate cap");
   assert.equal(slowAttempts, 1);
-  await w.sweepPendingFinalizes();
+  if (process.platform === "linux") {
+    await f.positiveStage("rotated archive sibling retirement", () => w.sweepPendingFinalizes(),
+      () => !f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), f.assertFinalizePending);
+    assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined,
+      "real archive branch retires valid sibling in the next fair pass");
+  } else {
+    await w.sweepPendingFinalizes();
+    assert.ok(attempts.includes("00000000-0000-4000-8000-000000000017"),
+      "fair pass reaches overflow sibling while pending terminal fences its own run");
+    await f.assertFinalizePending();
+    await f.assertPending();
+  }
   assert.equal(slowAttempts, 1, "unsettled whole authority remains keyed after deadline");
-  assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined,
-    "real archive branch retires valid sibling in the next fair pass");
   release.resolve();
   await new Promise<void>(r => setImmediate(r));
   await f.assertCustody();
 });
 
-it("worker quarantine includes started archive unlink beyond deadline", async t => {
+it("worker quarantine includes started archive unlink beyond deadline", {
+  skip: process.platform !== "linux" && "unlink barrier requires Linux procfs/no-follow report content proof",
+}, async t => {
   const f = await reportRetirementFixture(t);
   await f.replayPositive();
   await f.outbox.journalFinalize(f.claim.run_id, 2);
@@ -152,7 +171,9 @@ it("missing server capture provenance retains report", async t => {
   await f.assertPending();
 });
 
-it("writer killed only after positive source inspection retains report", async t => {
+it("writer killed only after positive source inspection retains report", {
+  skip: process.platform !== "linux" && "requires Linux procfs/no-follow positive source inspection hook",
+}, async t => {
   const f = await reportRetirementFixture(t);
   const read = git.credentialFreeCancelCleanHead.bind(git);
   let reached = false;
@@ -169,7 +190,9 @@ it("writer killed only after positive source inspection retains report", async t
   await f.assertPending();
 });
 
-it("duplicate queued during ended-flight report reservation replaces its exact tail", async t => {
+it("duplicate queued during ended-flight report reservation replaces its exact tail", {
+  skip: process.platform !== "linux" && "requires Linux procfs/no-follow report reservation proof hook",
+}, async t => {
   const f = await reportRetirementFixture(t);
   const read = git.credentialFreeCancelCleanHead.bind(git);
   let queued: Promise<void> | undefined;
@@ -221,6 +244,11 @@ it("remove and reinstall identical terminal bytes refuses old lifetime proof", a
   assert.notEqual(replacement.context.expectedIdentity, first.context.expectedIdentity);
   await f.r.retireRecoveryReport(f.claim.run_id, 2, first.context);
   await f.assertPending();
+  if (process.platform !== "linux") {
+    await f.replay();
+    await f.assertPending();
+    return;
+  }
   await f.replayPositive();
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
   await f.assertCustody();
@@ -256,13 +284,20 @@ for (const gapFill of [false, true]) {
     assert.notEqual((await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, 2))!
       .context.expectedIdentity, first.context.expectedIdentity);
     await f.assertPending();
+    if (process.platform !== "linux") {
+      await f.replay();
+      await f.assertPending();
+      return;
+    }
     await f.replayPositive();
     assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
     await f.assertCustody();
   });
 }
 
-it("unlink failure retains pending map and next replay succeeds", async t => {
+it("unlink failure retains pending map and next replay succeeds", {
+  skip: process.platform !== "linux" && "unlink hook requires Linux procfs/no-follow report content proof",
+}, async t => {
   const f = await reportRetirementFixture(t);
   const unlink = fs.unlink.bind(fs);
   let attempts = 0;
@@ -279,7 +314,9 @@ it("unlink failure retains pending map and next replay succeeds", async t => {
   await f.assertCustody();
 });
 
-it("started unlink retains reservation beyond deadline until actual settlement", async t => {
+it("started unlink retains reservation beyond deadline until actual settlement", {
+  skip: process.platform !== "linux" && "unlink barrier requires Linux procfs/no-follow report content proof",
+}, async t => {
   const f = await reportRetirementFixture(t);
   const unlink = fs.unlink.bind(fs);
   const entered = deferred(), release = deferred();
@@ -332,6 +369,13 @@ it("authenticated restart redoes archive proof before retiring report", async t 
   await f.r.retireRecoveryReport(f.claim.run_id, 2, captured.context, "terminal", restarted);
   assert.equal(restarted.hasPendingTerminal(f.claim.run_id, 2), true);
   f.capture.mode = "healthy";
+  if (process.platform !== "linux") {
+    const fresh = (await restarted.readTerminalJournalForRetirement(f.claim.run_id, 2))!;
+    await f.r.retireRecoveryReport(f.claim.run_id, 2, fresh.context, "terminal", restarted);
+    assert.ok(await restarted.readTerminalJournal(f.claim.run_id, 2));
+    await f.assertPending();
+    return;
+  }
   await f.positiveStage("authenticated restart retirement", async () => {
     const fresh = (await restarted.readTerminalJournalForRetirement(f.claim.run_id, 2))!;
     await f.r.retireRecoveryReport(f.claim.run_id, 2, fresh.context, "terminal", restarted);
@@ -345,7 +389,11 @@ it("authenticated restart redoes archive proof before retiring report", async t 
 
 it("worker finalize archive proof respects admission fence then retires under own reservation", async t => {
   const f = await reportRetirementFixture(t);
-  await f.replayPositive();
+  if (process.platform === "linux") await f.replayPositive();
+  else {
+    await f.replay();
+    await f.assertPending();
+  }
   await f.outbox.journalFinalize(f.claim.run_id, 2);
   const identity = f.outbox.finalizeRecordIdentity(f.claim.run_id, 2);
   const w = new Worker({} as Config, client, f.r, {} as ChatRunner, {} as JudgeRunner,
@@ -362,6 +410,12 @@ it("worker finalize archive proof respects admission fence then retires under ow
   await w.sweepPendingFinalizes();
   assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), identity, "active fence is independent of admission");
   f.registry.remove(f.claim.run_id);
+  if (process.platform !== "linux") {
+    await w.sweepPendingFinalizes();
+    await f.assertFinalizePending();
+    await f.assertPending();
+    return;
+  }
   await f.positiveStage("unfenced worker finalize", () => w.sweepPendingFinalizes(),
     () => !f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), f.assertFinalizePending);
   assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined);

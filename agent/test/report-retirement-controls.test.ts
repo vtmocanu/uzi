@@ -6,6 +6,8 @@ import { git, installHarness } from "./runner-harness.js";
 import { reportRetirementFixture } from "./report-retirement-fixture.js";
 
 installHarness();
+// Archive report retirement needs Linux procfs/no-follow content inspection.
+// Other hosts deliberately retain reports; portable checks still run below.
 
 it("older generation archive cannot retire generation 2's cancelled report", async t => {
   const f = await reportRetirementFixture(t, { archiveGeneration: 1 });
@@ -82,6 +84,11 @@ it("captured WIP marker fixture has a clean source whose tree is in the actual a
   assert.match(f.cmd(f.clone, ["log", "-1", "--format=%s"]), /^wip\(park\):/);
   assert.equal(f.cmd(f.clone, ["status", "--porcelain"]), "");
   assert.equal(f.cmd(f.bare, ["show", f.archive.sourceSha + ":marker.txt"]), "captured WIP");
+  if (process.platform !== "linux") {
+    await f.replay();
+    await f.assertPending();
+    return;
+  }
   await f.replayPositive();
   assert.equal(await f.outbox.readTerminalJournal(f.claim.run_id, 2), undefined);
   await f.assertCustody();
@@ -110,7 +117,9 @@ it("a parseable coverage journal with an invalid MAC retains the report despite 
   await f.assertPending();
 });
 
-it("late dirty source hook remains available across the proof's asynchronous read seam", async t => {
+it("late dirty source hook remains available across the proof's asynchronous read seam", {
+  skip: process.platform !== "linux" && "requires Linux procfs/no-follow report content proof",
+}, async t => {
   const f = await reportRetirementFixture(t);
   const read = git.credentialFreeCancelCleanHead.bind(git);
   let reached = 0;
@@ -130,7 +139,9 @@ it("late dirty source hook remains available across the proof's asynchronous rea
 });
 
 for (const mutation of ["swap", "addition"] as const) {
-  it(`physical source ${mutation} after positive byte proof refuses final read`, async t => {
+  it(`physical source ${mutation} after positive byte proof refuses final read`, {
+    skip: process.platform !== "linux" && "requires Linux procfs/no-follow report content proof",
+  }, async t => {
     const f = await reportRetirementFixture(t);
     const read = git.credentialFreeCancelCleanHead.bind(git);
     const saved = f.clone + "-saved";

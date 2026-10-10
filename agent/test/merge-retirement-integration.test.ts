@@ -185,7 +185,9 @@ it("inventory proof reads attributed heads while the bare lock is already held",
   await f.assertCustody();
 });
 
-it("worker notifies exactly once after successful archive finalize unlink, never after failed unlink", async t => {
+it("worker notifies exactly once after successful archive finalize unlink, never after failed unlink", {
+  skip: process.platform !== "linux" && "actual archive unlink requires Linux procfs/no-follow report content proof",
+}, async t => {
   const f = await reportRetirementFixture(t);
   await f.replayPositive();
   await f.outbox.journalFinalize(f.claim.run_id, 2);

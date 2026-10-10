@@ -7,6 +7,8 @@ import path from "node:path";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
 installHarness();
+// Archive report retirement needs Linux procfs/no-follow content inspection.
+// Other hosts deliberately retain reports; portable checks still run below.
 it("cancelled exact-generation archived report retires without releasing source custody", async t => {
   const f = await reportRetirementFixture(t);
   assert.equal(f.r.isExecuting(f.claim.run_id), false);
@@ -22,6 +24,11 @@ it("cancelled exact-generation archived report retires without releasing source 
   await f.assertCustody();
   // The logical one-second budget includes cancellation; actual settlement can
   // exceed 1000ms. Fresh attempts retain that deadline rather than extending it.
+  if (process.platform !== "linux") {
+    await f.replay();
+    await f.assertPending();
+    return;
+  }
   const attempts = await f.replayPositive();
   assert.equal(f.calls.sends, attempts);
   assert.equal(f.calls.cancelledAcks, attempts);
@@ -40,6 +47,11 @@ it("cancelled exact-generation archived report retires without releasing source 
 
 it("real thin archive retires exact-generation report with source custody held", async t => {
   const f = await reportRetirementFixture(t, { thinArchive: true });
+  if (process.platform !== "linux") {
+    await f.replay();
+    await f.assertPending();
+    return;
+  }
   await f.replayPositive();
   assert.equal(await f.outbox.readTerminalJournal(f.claim.run_id, 2), undefined);
   await f.assertCustody();
@@ -47,6 +59,17 @@ it("real thin archive retires exact-generation report with source custody held",
 
 it("finalize retirement consumes the exact archived report while keeping source custody", async t => {
   const f = await reportRetirementFixture(t);
+  if (process.platform !== "linux") {
+    await f.replay();
+    await f.assertPending();
+    await f.outbox.journalFinalize(f.claim.run_id, 2);
+    const identity = f.outbox.finalizeRecordIdentity(f.claim.run_id, 2)!;
+    await f.r.retireRecoveryReport(f.claim.run_id, 2, {
+      expectedIdentity: identity, signal: new AbortController().signal, deadline: Date.now() + 1_000,
+    }, "finalize", f.outbox);
+    await f.assertFinalizePending();
+    return;
+  }
   await f.replayPositive();
   assert.equal(await f.outbox.readTerminalJournal(f.claim.run_id, 2), undefined);
   assert.equal((await f.outbox.journalFinalize(f.claim.run_id, 2)).written, true);
@@ -66,6 +89,12 @@ it("fresh positive replay succeeds after a deterministic first proof budget expi
   assert.equal(expiry.expired, true);
   assert.equal(f.calls.cancelledAcks, 1);
   await f.assertPending();
+  if (process.platform !== "linux") {
+    await f.replay();
+    assert.equal(f.calls.cancelledAcks, 2);
+    await f.assertPending();
+    return;
+  }
   const attempts = await f.replayPositive();
   assert.equal(f.calls.cancelledAcks, 1 + attempts);
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
