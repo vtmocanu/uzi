@@ -78,6 +78,9 @@ through `[0.52.0]`.)
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
 
+- **`uzi job create --prompt-file` and `--input` keep the failure reason visible for long paths ([#2608](https://github.com/vtmocanu/uzi/issues/2608)).**
+  A missing, unreadable or non-regular prompt or input file now reports the reason before the path, so the CLI’s bounded error line preserves it for deeply nested files.
+
 - **Label sweep help includes bot-assignment eligibility.**
   The schedule modal clarifies that selector candidates can fire with the configured eligibility label or assignment to the uzi bot.
 
