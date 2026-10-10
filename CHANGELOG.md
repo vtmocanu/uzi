@@ -54,6 +54,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **TUI run detail fits narrow terminals ([#2591](https://github.com/vtmocanu/uzi/issues/2591)).**
+  The run detail and answer views' crew and transcript rows are now clipped to the terminal width instead of overflowing it; the crew rail keeps its width and the transcript column is what is cut.
+
 - **Retained recovery continues after a refused immediate or wall pause.**
   Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
 
