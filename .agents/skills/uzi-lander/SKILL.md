@@ -332,6 +332,9 @@ changes it); trust it over a handover's claim.
    when unsure, decide with the buddy (*Buddy*). Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+   Prepare lazily: run `land-prep.sh` only on a PR that is next in the merge order, after
+   its blocker has merged. Defer base-only preparation of a held PR: its push would only be
+   redone after the blocker lands, at a full CI run per push.
    A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
    `mergeable` before waiting on checks.
    A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows
