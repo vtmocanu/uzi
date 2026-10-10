@@ -175,8 +175,9 @@ changes it); trust it over a handover's claim.
 ## The loop
 
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
-   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_input,paused 60 MAX`,
-   with `MAX` polls covering the run's remaining budget (`budget_total_seconds` minus
+   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
+   with `SEQ` the approved plan's seq (`uzi run logs RUN --json | jq -rs '[.[]|select(.kind=="plan")|.seq]|max // 0'`,
+   or `0` for a seeded run), so the stale gate is ignored but a NEW plan stops it, and `MAX` polls covering the run's remaining budget (`budget_total_seconds` minus
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
    `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
@@ -188,8 +189,9 @@ changes it); trust it over a handover's claim.
    surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
    *Watching*; a completion question about a milestone
    the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
-   a plain answer cannot exempt it, then open the PR); `awaiting_approval` → the plan gate
-   is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
+   a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
+   (usually a lost worker resumed from the default branch): before steering the new gate with
+   `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (they resume on their own). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
