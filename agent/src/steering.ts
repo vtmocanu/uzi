@@ -592,6 +592,14 @@ export class SteeringChannel {
     return this.fence;
   }
 
+  /** PRD #2603: the run's effective Now-summary setting from the newest successful /inputs poll.
+   *  False until a poll says true, and false again the moment one omits it. */
+  private nowSummary = false;
+
+  nowSummaryEnabled(): boolean {
+    return this.nowSummary;
+  }
+
   /** The earliest live anchor: the held batch's routing, or the ready lane's first ready id. Works
    *  while `held` is undefined. */
   private receiptRemainingMs(): number {
@@ -2402,8 +2410,10 @@ export class SteeringChannel {
       try {
         if (!this.held && !this.stopped) {
           this.requestStage = "get";
-          const { inputs: read, credentialSwitch, receipts } = await this.client.getInputs(this.runId);
+          const { inputs: read, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId);
           if (!validBatch(read)) throw new InvalidInputResponse("invalid input GET response");
+          // PRD #2603: the newest poll's Now-summary setting; absent ⇒ off.
+          this.nowSummary = nowSummary === true;
           // Issue #1604: a plan-gate input awaiting its result stays unapplied, so every GET
           // returns it again; it is neither re-ACKed nor re-routed.
           const inputs = receipts ? read.filter((input) => !this.isGateReceiptId(input.id)) : read;

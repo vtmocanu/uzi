@@ -1939,13 +1939,14 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean }> {
+  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
     // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     // Issue #1673: `receipts` is the server's per-reply declaration of receipt mode.
-    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true };
+    // PRD #2603: `now_summary` is the run's effective Now-summary setting; absent ⇒ off.
+    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
   }
 
   async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {

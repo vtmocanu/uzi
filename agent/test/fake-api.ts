@@ -88,6 +88,9 @@ export class FakeApi {
   /** Issue #1604: a credential_switch signal for another claim generation that rides every GET
    *  WITHOUT fencing it (the rows still drain): a superseded claim's switch. */
   private readonly foreignSwitchSignal = new Map<string, number>();
+  /** PRD #2603: the per-run `now_summary` value GET /inputs carries. A run with no entry omits the
+   *  field, which the worker reads as OFF (an older api, or an early-return reply). */
+  readonly nowSummary = new Map<string, boolean>();
   /** Issue #1604: stamp created_at on input rows as the real server does. Off by default so the
    *  wire-shape tests that deep-compare rows keep their exact fixtures; the #1604 interruption
    *  suite turns it on (resume_plan_at is compared against it). */
@@ -1300,6 +1303,7 @@ export class FakeApi {
           inputs: pending,
           receipts: true,
           ...(signal !== undefined ? { credential_switch: { generation: signal } } : {}),
+          ...(this.nowSummary.has(runId) ? { now_summary: this.nowSummary.get(runId) } : {}),
         });
       }
     }

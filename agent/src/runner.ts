@@ -197,6 +197,10 @@ import {
 } from "./pr-description-publisher.js";
 import { renderCompletionBlock, type KindSection } from "./pr-description.js";
 import type { SummaryRunner } from "./summary-runner.js";
+import { NowSummaryController, holdContextCallbacks } from "./now-summary.js";
+import { runReadOnlyModelPass } from "./model-pass.js";
+import type { SdkQueryFn } from "./sdk-executor.js";
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
@@ -2108,6 +2112,16 @@ export interface RunnerOptions {
   /** PRD #1798 M6: how long the description publisher waits before re-reading a PR whose head is
    *  not yet the landed head (a forge may lag a push by a moment). Default 2 s; tests pass 0. */
   prDescriptionHeadLagMs?: number;
+  /** PRD #2603: the collaborators of the model-written "Now" summary (now-summary.ts), on the same
+   *  SDK HOME root and query function as the other advice passes. There is NO default: without it
+   *  the run makes no summary call (main.ts omits it under the stub executor, so an e2e spends
+   *  nothing). `codexAdviceHarnessFactory` is the injected production factory a later Codex
+   *  milestone threads through; M1 (Claude) does not call it and this adds no Codex construction. */
+  nowSummary?: {
+    homeRoot: string;
+    queryFn: SdkQueryFn;
+    codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
+  };
 }
 
 /**
@@ -2208,6 +2222,8 @@ export class RunRunner {
   private readonly setTickTimer: (cb: () => void, ms: number) => () => void;
   /** PRD #1798 M5: see {@link RunRunner.deliverySummaryRunner}. */
   private readonly deliverySummary: SummaryRunner | null;
+  /** PRD #2603: see RunnerOptions.nowSummary. */
+  private readonly nowSummaryOpts: RunnerOptions["nowSummary"];
   /** PRD #1798 M6: see RunnerOptions.prDescriptionHeadLagMs. */
   private readonly prDescriptionHeadLagMs: number | undefined;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
@@ -2406,6 +2422,7 @@ export class RunRunner {
     // must never run (stub).
     this.deliverySummary = opts.skipDeliverySummary ? null : (opts.summaryRunner ?? null);
     this.prDescriptionHeadLagMs = opts.prDescriptionHeadLagMs;
+    this.nowSummaryOpts = opts.nowSummary;
   }
 
   /** PRD #1798 M5: the SummaryRunner the finalize path runs the PR-description editor pass on, or
@@ -9675,6 +9692,31 @@ export class RunRunner {
       if (checkedHuman) checkedHuman.phase = "terminal";
       throw new PlanCrossCheckFailure(reason, { cause: error });
     };
+    // PRD #2603: the model-written "Now" summary. Absent collaborators (the stub executor, a test)
+    // or a claim that is not an issue run on the Claude harness with a token ⇒ no controller and
+    // not a single summary call. The controller only reads steering state and the frames the run
+    // already emits; everything it does is advisory and swallowed (now-summary.ts).
+    const nowSummary =
+      this.nowSummaryOpts !== undefined
+        ? new NowSummaryController({
+            steering,
+            claim: {
+              issueRun: resolveRunKind(claim.kind) === "issue",
+              claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
+            },
+            emit: (m) => batcher.emit(m),
+            runPass: runReadOnlyModelPass,
+            pass: {
+              token: claim.secrets.anthropic_oauth_token,
+              homeRoot: this.nowSummaryOpts.homeRoot,
+              queryFn: this.nowSummaryOpts.queryFn,
+            },
+            now: this.now,
+            setTimer: (fn, ms) => this.setTimer(fn, ms),
+            clearTimer: (cancel) => (cancel as () => void)(),
+            log: runLog,
+          })
+        : undefined;
     const ctx: RunContext = {
       runId,
       claimGeneration: claim.claim_generation,
@@ -9710,7 +9752,10 @@ export class RunRunner {
       // threaded to prompt-build time so both builders name it on a run with a published
       // floor. Absent (fresh branch) ⇒ no note.
       publishedTip: flight.publishedTip,
-      emit: (m) => batcher.emit(m),
+      emit: (m) => {
+        batcher.emit(m);
+        nowSummary?.observeFrame(m);
+      },
       // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
       usage: batcher.usage,
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
@@ -10230,6 +10275,9 @@ export class RunRunner {
       // spirit: reportState has bounded retries, and the try/catch here guarantees a
       // failed report returns undefined ("no budget update") rather than failing the run.
       reportIteration: async (iteration, progress) => {
+        // PRD #2603: the turn-boundary snapshot also feeds the Now summary (the claim's frozen list
+        // is the fallback when the controller has not seen one yet).
+        if (progress) nowSummary?.observeProgress(progress, claim.milestones ?? undefined);
         try {
           // PRD #1064 M1: enqueue onto the per-run chain so any still-in-flight immediate
           // push (from the prior turn's scan loop) is sent BEFORE this turn-boundary report
@@ -10319,7 +10367,8 @@ export class RunRunner {
       // it serializes with the turn-boundary `reportIteration` and the checkpoint report)
       // and this returns IMMEDIATELY — the scan loop must never block on a network report.
       // A failure is logged and swallowed; an informational field never fails a run.
-      reportProgress: (progress) => {
+      reportProgress: (progress, frozen) => {
+        nowSummary?.observeProgress(progress, frozen);
         void enqueueRunningReport(() =>
           reportState({
             status: "running",
@@ -10459,6 +10508,8 @@ export class RunRunner {
           claim.config ?? null,
         ),
     };
+    // PRD #2603: no summary call starts, and a result is discarded, while any of these is pending.
+    if (nowSummary) holdContextCallbacks(ctx, nowSummary);
 
     // PRD #1064 M1: drain the per-run running-report chain before this phase yields control,
     // so any still-in-flight immediate `reportProgress` push reaches the api BEFORE the
@@ -10495,6 +10546,10 @@ export class RunRunner {
       try {
         this.diskGovernor?.leftLoop(flight.runId, diskParked);
         await ticker?.stop();
+        // PRD #2603: abort an in-flight summary and post the usage it already delivered, before the
+        // report chain drains and before anything after the executor can close the batcher. Bounded
+        // (never the call's own timeout) and never throws.
+        await nowSummary?.stop();
         await runningReportChain;
       } catch (settlementError) {
         executionRejection.rejected = false;
@@ -10503,6 +10558,7 @@ export class RunRunner {
     };
     try {
       this.diskGovernor?.enterRun(flight.runId);
+      nowSummary?.start();
       try {
         result = await executor.run(ctx);
       } catch (value) {

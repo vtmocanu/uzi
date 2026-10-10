@@ -128,6 +128,13 @@ export type MessageKind =
    *  human files or dismisses it later from the backlog. All fields are model-authored
    *  from attacker-influenceable repo content: escaped sinks only (web M7). */
   | "finding"
+  /** PRD #2603: a worker-written one-sentence "Now" summary of the active milestone plus the
+   *  usage of the small-model call that wrote it. Payload `{ text, milestone_id, model_usage }`.
+   *  An EMPTY `text` is a usage-only note (the text was discarded but the call's spend still
+   *  counts) or a "clear" note (the setting went off); every reader ignores empty notes. The
+   *  payload never carries `event` or `usage` keys: the usage readers would take them for a
+   *  result frame or count the usage twice. */
+  | "progress_note"
   /** Revision feedback at the approval gate: human payload `{ feedback: string }`;
    *  automatic advice adds `{ automatic: true, cross_check_round: number }` and
    *  carries no human input receipt. Echoed so the revision is auditable. */
@@ -2742,6 +2749,10 @@ export interface InputsResponse {
    *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
    *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
   credential_switch?: { generation: number };
+  /** PRD #2603: the run's effective "Now summary" setting (admin switch AND the owner's user
+   *  setting). Absent means OFF: a new worker against an older api, or a reply that took an
+   *  early return, never spends tokens on a summary. */
+  now_summary?: boolean;
   /** Issue #1673: true when the reply is a read-only replay the worker must ACK and apply. Absent
    *  on a consume-on-read reply (an older api pod mid-roll), which the worker routes at once. */
   receipts?: boolean;
