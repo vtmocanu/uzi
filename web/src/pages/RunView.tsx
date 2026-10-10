@@ -58,7 +58,7 @@ import { activityAge, latestActivity } from "../lib/runActivity";
 import { RunProgressCard } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
-import { deriveRunUsage } from "../lib/runUsage";
+import { deriveRunUsage, hasSideUsage } from "../lib/runUsage";
 import { statusSinceIso } from "../lib/statusSince";
 import { firstStartIso } from "../lib/runDuration";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
@@ -3188,7 +3188,7 @@ export function RunView() {
         refreshRun={refreshRun}
       />
 
-      {(usage.hasLiveTokens || usage.hasConfirmed) && (
+      {(usage.hasLiveTokens || usage.hasConfirmed || hasSideUsage(usage)) && (
         <Card className="p-4">
           {/* PRD #1429 M4b (D7): the server-truthed per-run cost_status, distinct from
               the client-derived `usage` above — "" on a pre-M1 run reads defensively

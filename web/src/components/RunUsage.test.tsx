@@ -799,3 +799,46 @@ describe("m2 honest usage presentation", () => {
     expect(r.getByText("Estimated attribution from deduplicated assistant usage; identical usage records on the same lane may collapse, and attribution may be incomplete. Output is not attributed.")).toBeTruthy();
   });
 });
+
+describe("RunUsagePanel side-only spend (no result frame)", () => {
+  const entry = (over: Record<string, unknown> = {}) => ({
+    "claude-haiku-4-5": { inputTokens: 400, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered", ...over },
+  });
+  const rowsOf = (table: HTMLElement) =>
+    Array.from(table.querySelectorAll("tbody tr")).map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""));
+
+  it("shows the summaries row and Run total when a summary pass is the only spend", () => {
+    seq = 0;
+    const msgs = [m("summary_usage", "lead", { pass: "plan", model_usage: entry() })];
+    const { getByRole, queryByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = rowsOf(getByRole("table", { name: "Summary usage" }));
+    expect(rows).toEqual([
+      ["Intent, plan & PR summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+    expect(queryByRole("group", { name: "Run usage totals" })).toBeNull();
+    expect(queryByRole("table", { name: "Per-phase usage" })).toBeNull();
+    expect(queryByRole("table", { name: "Per-agent usage" })).toBeNull();
+  });
+
+  it("shows the Now summaries row and Run total when a Now note is the only spend", () => {
+    seq = 0;
+    const msgs = [m("progress_note", "lead", { text: "Reading the code", model_usage: entry() })];
+    const { getByRole, queryByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    expect(rowsOf(getByRole("table", { name: "Summary usage" }))).toEqual([
+      ["Now summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+    expect(queryByRole("table", { name: "Per-phase usage" })).toBeNull();
+  });
+
+  it("never shows a dollar figure for unpriced side spend, even when the run-level status is metered", () => {
+    seq = 0;
+    const msgs = [m("summary_usage", "lead", { pass: "plan", model_usage: entry({ costUSD: 0, costStatus: "unreported" }) })];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = rowsOf(getByRole("table", { name: "Summary usage" }));
+    expect(rows[0]?.[5]).toBe("n/a");
+    expect(rows[1]?.[5]).toBe("n/a");
+    expect(rows.flat().join(" ")).not.toMatch(/\$0/);
+  });
+});

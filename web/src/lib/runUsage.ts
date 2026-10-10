@@ -585,6 +585,19 @@ function primaryModel(counts: Record<string, number>): { model: string | null; o
   return { model: entries[0][0], otherModels: entries.length - 1 };
 }
 
+/** True when a side total (Now notes or intent/plan/PR summaries) recorded any spend: the
+ *  one predicate behind the panel's side rows and `hasSideUsage`, so they cannot drift. */
+export function hasSpend(t: RunUsage["noteTotal"]): boolean {
+  return t.fresh + t.cached + t.out > 0 || t.costUsd > 0;
+}
+
+/** True when the run's only recorded spend may be side spend: a summary pass or a Now note
+ *  carried usage. `hasConfirmed` is left alone (it means a result frame landed), so a
+ *  lead that failed before any result frame still earns the usage panel through this. */
+export function hasSideUsage(usage: RunUsage): boolean {
+  return hasSpend(usage.noteTotal) || hasSpend(usage.summaryTotal);
+}
+
 /**
  * Reduce a run's message list into its usage surfaces. Pure: same messages (and
  * `opts`) → same result, so React just re-runs it as the stream grows (Decision 9
