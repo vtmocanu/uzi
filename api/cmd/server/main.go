@@ -1655,13 +1655,18 @@ func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UU
 // on to their slacksvc translations, keeping slacksvc free of a workersvc import:
 // ErrReviseCapReached (PRD #41, the "revision limit reached" ephemeral), ErrInvalidSelection
 // (PRD #37 M7, the gate stays open) and *GateRevisionMismatchError (PRD #1795 M5, the card's
-// revision is no longer the run's gate: the superseded notice). Any other error passes through.
+// revision is no longer the run's gate: the superseded notice), plus ErrApprovalMilestonesMoved (#2680,
+// mapped to the same superseded notice). Any other error passes through.
 func translateGateSubmitErr(err error) error {
 	var mismatch *workersvc.GateRevisionMismatchError
 	switch {
 	case err == nil:
 		return nil
 	case errors.As(err, &mismatch):
+		return slacksvc.ErrGateRevisionMismatch
+	case errors.Is(err, workersvc.ErrApprovalMilestonesMoved):
+		// Issue #2680: the plan's milestones moved under the approve, so the card no longer shows
+		// the plan on screen: the same superseded notice as a revision mismatch.
 		return slacksvc.ErrGateRevisionMismatch
 	case errors.Is(err, workersvc.ErrReviseCapReached):
 		return slacksvc.ErrReviseCapReached

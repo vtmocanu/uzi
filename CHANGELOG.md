@@ -60,6 +60,9 @@ through `[0.52.0]`.)
 - **TUI run detail fits narrow terminals ([#2591](https://github.com/vtmocanu/uzi/issues/2591)).**
   The run detail and answer views' crew and transcript rows are now clipped to the terminal width instead of overflowing it; the crew rail keeps its width and the transcript column is what is cut.
 
+- **An approval no longer freezes a milestone list its completion contract was not built from ([#2680](https://github.com/vtmocanu/uzi/issues/2680)).**
+  When a plan was republished between the approve reading the milestone list and writing it, the run could freeze the new list beside a contract whose criteria came from the old one, so it could never satisfy its own completion check. The write now refuses unless the list it freezes is the one the contract was built from, and an approve without an expected gate revision re-reads and retries up to three times (re-checking that the run is still awaiting approval and, unless the owner overrides capabilities, the capability gate). If the list keeps moving, or the run left the gate, nothing is written and the API answers 409 with reason `approval_milestones_moved` (Slack shows the superseded-card notice); an approve bound to a gate revision is answered as a gate-revision mismatch. Runs without the completion contract, and approvals of an already-frozen contract, are unchanged.
+
 - **Retained recovery continues after a refused immediate or wall pause.**
   Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
 

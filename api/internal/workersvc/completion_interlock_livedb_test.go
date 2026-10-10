@@ -263,6 +263,7 @@ func TestCompletionContractFreezesAtApprovalLiveDB(t *testing.T) {
 	approveParams := store.CreateApprovePlanInputParams{
 		RunID: runID, Body: pgtype.Text{String: "{}", Valid: true},
 		CompletionContract:       contract,
+		ContractSource:           candidate, // issue #2680: the list the contract was built from
 		RunMaxIterations:         5,
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		RunTimeoutSeconds:        7200,

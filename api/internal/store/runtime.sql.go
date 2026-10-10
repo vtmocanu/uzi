@@ -2915,6 +2915,24 @@ WITH selected AS (
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND ($11::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = $11::bigint))
+      -- Issue #2680: the completion_contract above is built IN GO from a snapshot read of the
+      -- milestone source, and this statement freezes the source as it is at WRITE time, so a
+      -- candidate republished between the two would freeze list B beside a contract built from
+      -- list A. @contract_source is the exact bytes the Go contract was built from (NULL = the
+      -- caller saw no source). The first three conjuncts are the completion_contract CASE
+      -- condition above, so the predicate binds only when this statement WOULD freeze the
+      -- contract: a legacy run (version NULL), an already-frozen contract (re-approve, re-gate
+      -- resume) and a run with no source are untouched. A mismatch writes NOTHING (no selection,
+      -- freeze, budget or input row: the INSERT selects FROM the CTE) and returns no row; the
+      -- caller (workersvc.submitApproval) re-reads and retries. jsonb compare (semantic, not
+      -- textual); every conjunct is IS [NOT] NULL / IS DISTINCT FROM, so NOT(...) is never NULL.
+      -- Runs-row columns only, no subquery in the qual (see CreateRunReviseInputIfUnderCap, #106).
+      -- Under READ COMMITTED an UPDATE that waited on the row lock re-evaluates this qual
+      -- against the new row version, so the comparison and the freeze read the same tuple.
+      AND NOT (runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
+               AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
+               AND COALESCE(runs.milestones_frozen, runs.milestones_candidate)
+                   IS DISTINCT FROM $12::jsonb)
     RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
 INSERT INTO run_user_inputs (run_id, kind, body, gate_binding, gate_revision)
@@ -2941,6 +2959,7 @@ type CreateApprovePlanInputParams struct {
 	BudgetWallCeilingSeconds int32       `json:"budget_wall_ceiling_seconds"`
 	RunID                    uuid.UUID   `json:"run_id"`
 	ExpectedGateRevision     pgtype.Int8 `json:"expected_gate_revision"`
+	ContractSource           []byte      `json:"contract_source"`
 }
 
 // Enqueue an approve_plan verdict for the live worker AND record the agent
@@ -2970,6 +2989,7 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 		arg.BudgetWallCeilingSeconds,
 		arg.RunID,
 		arg.ExpectedGateRevision,
+		arg.ContractSource,
 	)
 	var i RunUserInput
 	err := row.Scan(

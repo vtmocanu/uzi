@@ -136,6 +136,10 @@ var (
 	// param) bypasses ONLY this guard, never the active-run gate.
 	ErrOpenMRExists = errors.New("issue already has an open MR")
 	ErrRunTerminal  = errors.New("run has already finished")
+	// ErrApprovalMilestonesMoved is the unbound approve's answer (issue #2680) when the plan's
+	// milestone list kept changing between the contract build and the freeze, or the run left the
+	// plan gate while the approve retried: nothing was written. → 409 approval_milestones_moved.
+	ErrApprovalMilestonesMoved = errors.New("the plan's milestones changed while approving; re-read the plan and approve again")
 	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
 	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
 	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /

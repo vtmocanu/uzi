@@ -91,6 +91,14 @@ func (s *Service) reviseNotWritten(ctx context.Context, userID, runID uuid.UUID,
 // carrying the re-read's revision, even when that revision matches again (a publication and a
 // verdict can interleave around the re-read): the verdict was not written, and the client must
 // refetch rather than read success. Without one it returns fallback, the seam's own answer.
+//
+// The CreateApprovePlanInput seam has a third refusal (issue #2680): the contract-source
+// predicate, which refuses while the milestone list moved since the contract was built. BOUND, it
+// is always a *GateRevisionMismatchError here, including the supported Current == Expected case
+// (a candidate can move without a gate_revision bump). UNBOUND, submitApproval retries itself and
+// returns ErrApprovalMilestonesMoved on exhaustion, so that ErrNoRows never reaches this
+// function; its fallback (ErrRunNotFound) is reached only for a refusal the seam did not retry (a
+// vanished run).
 func (s *Service) verdictNotWritten(ctx context.Context, userID, runID uuid.UUID, expected *int64, fallback error) error {
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {

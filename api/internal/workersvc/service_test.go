@@ -443,6 +443,13 @@ type fakeStore struct {
 	reviseCapArg       *store.CreateRunReviseInputIfUnderCapParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
+	// approvals records EVERY CreateApprovePlanInput call (createdApproval keeps only the last):
+	// issue #2680's bounded retry makes the attempt count observable. approvalHook, when set,
+	// runs on each call with its 1-based number BEFORE the result is chosen and may mutate the
+	// fake (move freezeSnapshot, replace runByID) to model a concurrent publication; a non-nil
+	// return is that call's refusal (typically pgx.ErrNoRows, the 0-row CTE).
+	approvals    []store.CreateApprovePlanInputParams
+	approvalHook func(f *fakeStore, call int) error
 	// freezeSnapshot is what GetRunMilestoneFreezeSnapshot returns (PRD #260/#1226). The zero
 	// value has empty milestone columns (the prior hardcoded behavior); a test sets its
 	// MilestonesFrozen/MilestonesCandidate to drive the approve-time completion-contract build,
@@ -1632,6 +1639,12 @@ func (f *fakeStore) CreateExtendInput(_ context.Context, arg store.CreateExtendI
 }
 func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
 	f.createdApproval = &arg
+	f.approvals = append(f.approvals, arg)
+	if f.approvalHook != nil {
+		if err := f.approvalHook(f, len(f.approvals)); err != nil {
+			return store.RunUserInput{}, err
+		}
+	}
 	if f.approvalErr != nil {
 		return store.RunUserInput{}, f.approvalErr
 	}
