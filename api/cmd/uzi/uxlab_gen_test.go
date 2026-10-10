@@ -154,6 +154,40 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"split-filtering":           func(d bool) string { return splitScene(d, now, "filtering") },
 	}
 
+	for _, scene := range []string{"board", "board-versioned", "board-marked", "board-admin", "ci", "pulls-linked"} {
+		scenes["footer-80-"+scene] = func(dark bool) string {
+			if scene == "board-versioned" {
+				oldVersion := version
+				version = "v0.84.0"
+				defer func() { version = oldVersion }()
+			}
+			m := uxModel(&uzicli.FakeClient{}, "", dark)
+			m.width, m.height, m.splitMode = 80, 34, "off"
+			m.renderer, _ = newTUIRenderer(m.transcriptWidth(), dark)
+			m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo(), oneRepo()}})
+			m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: boardRuns(now)})
+			m.board.admin = scene == "board-admin"
+			m.showVersion = scene == "board-versioned"
+			m.serverVersion = "0.85.0"
+			if scene == "board-marked" {
+				m.selfUsageReady = true
+				m.selfUsage.Last7SubscriptionRunCount = 1
+			}
+			if scene == "ci" {
+				m.setListView(viewCI)
+				m.ci.runs, m.ci.loaded = sampleCIRuns(now), true
+			}
+			if scene == "pulls-linked" {
+				m.setListView(viewPulls)
+				m.pulls.pulls, m.pulls.loaded = samplePulls(now), true
+				if len(m.pulls.pulls) > 0 {
+					m.pulls.pulls[0].RunID = sp("footer-linked-run")
+				}
+			}
+			return m.View().Content
+		}
+	}
+
 	for _, name := range append(append([]string{}, workerSceneNames...), workerDetailSceneNames...) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}

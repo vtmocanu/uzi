@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { makeClaim, nullLogger, testGitCacheOptions, waitForTestEvent } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
@@ -299,6 +299,15 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
     it(`checkpoints before awaiting_input and withholds MR finalize until fresh done: ${schedule}`, async () => {
       const tick = clarificationTimer();
       const answerDeadline = clarificationTimer();
+      let answerArmed!: () => void;
+      const answerReady = new Promise<void>((resolve) => { answerArmed = resolve; });
+      let tickObserved!: () => void;
+      const tickReady = new Promise<void>((resolve) => { tickObserved = resolve; });
+      let freshStarted!: () => void;
+      const freshReady = new Promise<void>((resolve) => { freshStarted = resolve; });
+      let cleaningUp = false;
+      let primaryFailure: { error: unknown } | undefined;
+      let cleanupFailure: { error: unknown } | undefined;
       const tickOutcomes: string[] = [];
       const claim = claimFor(2284, { kind: "issue", plan_approved: true,
         plan_md: "approved", plan_source: "seeded", config: { max_iterations: 1 },
@@ -327,7 +336,7 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         t.push(clarificationTool(3, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }));
         t.push(clarificationTerminal());
       });
-      const fresh = new ClarificationTransport(() => {});
+      const fresh = new ClarificationTransport(() => { freshStarted(); });
       const selection = selectCodexBinding({ codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null } });
       assert.equal(selection.kind, "codex");
       if (selection.kind !== "codex") throw new Error("missing Codex binding");
@@ -401,10 +410,16 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         // Fix the answer budget and keep the checkpoint time gate closed for pendingPublish.
         now: () => 1_700_000_000_000,
         setTickTimer: tick.arm,
-        checkpointTestHooks: { onTickOutcome: (outcome) => { tickOutcomes.push(outcome); } },
+        checkpointTestHooks: { onTickOutcome: (outcome) => { tickOutcomes.push(outcome); tickObserved(); } },
         setTimer: (cb, ms) => {
           // Hold only the answer deadline; tick deadlines retain their real bounded timers.
-          if (ms === 3000) return answerDeadline.arm(cb, ms);
+          if (ms === 3000) {
+            const cancelAnswerTimer = answerDeadline.arm(cb, ms);
+            answerArmed();
+            // An observation can fail before the park arms; never strand a late timer.
+            if (cleaningUp) answerDeadline.fire();
+            return cancelAnswerTimer;
+          }
           const timer = setTimeout(cb, ms);
           timer.unref();
           return () => clearTimeout(timer);
@@ -415,22 +430,20 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         } }),
       });
       const running = runner.execute(claim).finally(() => { settled = true; });
-      const wait = async (condition: () => boolean): Promise<void> => {
-        const deadline = Date.now() + 5000;
-        while (!condition() && !settled) {
-          if (Date.now() >= deadline) throw new Error("clarification observation deadline");
-          await new Promise((resolve) => setImmediate(resolve));
-        }
-        assert.ok(condition(), "clarification run settled before the expected observation");
-      };
+      const observe = (event: Promise<void>, label: string) => waitForTestEvent(Promise.race([
+        event,
+        running.then(() => { throw new Error(`clarification settled before ${label}: ${failureReason(claim.run_id)}`); }),
+      ]), label);
       try {
-        await wait(() => !!questionId && answerDeadline.delay() !== undefined);
+        await observe(answerReady, "clarification answer timer armed");
+        assert.ok(questionId, "the question was persisted before its timer armed");
         const parked = { questionId, checkpointAtAsk, reapsAtAsk, persistsAtAsk, launches, turns: first.turns, settled, mrCalls };
         assert.equal(answerDeadline.delay(), 3000, "the answer deadline is controlled while pending");
         if (schedule === "tick published before answer") {
           assert.equal(tick.delay(), 1000, "the deferred checkpoint armed its short kick");
           tick.fire();
-          await wait(() => tickOutcomes.length === 1 && publishes === 1);
+          await observe(tickReady, "clarification checkpoint outcome");
+          assert.equal(publishes, 1);
           assert.deepEqual(tickOutcomes, ["published"]);
         } else {
           assert.deepEqual(tickOutcomes, [], "the quick answer schedule fires no tick");
@@ -442,11 +455,12 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
           { launches: 1, turns: 1, freshTurns: 0, settled: false, mrCalls: 0 },
           "checkpoint publication does not start a provider turn or finalize an MR while the answer is pending");
         api.setInputs(claim.run_id, [answerInput(questionId, "server")]);
-        await wait(() => fresh.turns === 1);
+        await observe(freshReady, "clarification fresh provider turn");
+        assert.equal(fresh.turns, 1);
         const answered = { launches, resumed: fresh.resumed, prompt: fresh.prompts[0], mrCalls, settled, publishes };
         fresh.push(clarificationTool(4, "signal_done"));
         fresh.push(clarificationTerminal());
-        await running;
+        await waitForTestEvent(running, "clarification completion");
         assert.ok(parked.questionId, JSON.stringify(api.states));
         // Overlay-less Codex checkpoints fetch back locally and defer the remote scan/publish
         // outside the permit. A deferred checkpoint does not grant MR finalization.
@@ -469,16 +483,33 @@ describe("Codex RunRunner clarification completion (#2284)", () => {
         assert.equal(mrCalls, 1, JSON.stringify({ states: api.states, messages: api.messages(claim.run_id), logs }));
         assert.equal(statuses(claim.run_id).at(-1), "completed", failureReason(claim.run_id));
         assert.deepEqual(questionMessageIds(claim.run_id), [questionId]);
+      } catch (error) {
+        primaryFailure = { error };
       } finally {
-        // A failed observation releases the controlled park rather than waiting forever.
+        cleaningUp = true;
+        if (!settled) runner.shutdown();
         if (answerDeadline.delay() !== undefined) answerDeadline.fire();
-        fresh.push(clarificationTool(5, "signal_done"));
-        fresh.push(clarificationTerminal());
-        await running;
-        client.publishCheckpoint = publish;
-        client.releaseCodex = release;
-        client.refreshCodex = refresh;
+        await first.close();
+        await fresh.close();
+        try {
+          await waitForTestEvent(running, "clarification cleanup");
+        } catch (error) {
+          cleanupFailure = { error };
+        } finally {
+          client.publishCheckpoint = publish;
+          client.releaseCodex = release;
+          client.refreshCodex = refresh;
+        }
       }
+      if (primaryFailure) {
+        if (cleanupFailure) {
+          throw new AggregateError([primaryFailure.error, cleanupFailure.error],
+            primaryFailure.error instanceof Error ? primaryFailure.error.message : "clarification observation failed",
+            { cause: primaryFailure.error });
+        }
+        throw primaryFailure.error;
+      }
+      if (cleanupFailure) throw cleanupFailure.error;
     });
   }
 });
