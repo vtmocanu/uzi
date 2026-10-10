@@ -2211,11 +2211,12 @@ Kubernetes access). A pgx query tracer on the pool
 replica and in memory, and the `db` check is danger for five minutes after it.
 `db.size` compares `pg_database_size` to the operator-declared
 `DB_STORAGE_CAPACITY_BYTES` (rendered by the chart from the database storage
-size), warning at 75% and danger at 85% (the episode opens on the second consecutive
-failing tick, the usual debounce), cached 60 seconds per replica; it is a
-database-size budget, not volume usage, and excludes WAL. When the episode open,
-the notice claim or the notification insert itself fails with `53100`, the
-episode reconciler posts the admin Slack notice straight from memory
+size), warning at 75% and danger at 85% (the episode opens on the first danger tick
+and the admin notice goes out on the next still-danger tick, the usual debounce),
+cached 60 seconds per replica; it is a database-size budget, not volume usage,
+and excludes WAL. When the episode open (on the second consecutive tick whose
+open fails), the notice claim or the notification insert itself fails with
+`53100`, the episode reconciler posts the admin Slack notice straight from memory
 (`api/internal/healthsvc/emergency.go`) with a per-replica 30-minute cooldown.
 See [Database storage signals](docs/admin-health.md#database-storage-signals)
 for the blind spots and limits.
