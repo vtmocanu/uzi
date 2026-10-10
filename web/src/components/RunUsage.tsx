@@ -14,7 +14,7 @@ import { cx } from "./ui";
 // client-side from the message stream (lib/runUsage.ts), so they fold in live as
 // new result frames arrive (Decision 9) with no accumulator.
 //
-// TWO states, gated by two independent flags off deriveRunUsage:
+// Three states, gated off deriveRunUsage:
 //   • CONFIRMED (`hasConfirmed`, once a result frame carried per-model usage): the
 //     billed totals — the 4-stat strip, per-phase table and cost — plus estimated
 //     deduplicated per-agent input attribution.
@@ -25,7 +25,10 @@ import { cx } from "./ui";
 //     would be wrong by ~25-100x (see runUsage.ts). Once `hasConfirmed` flips true the
 //     confirmed surfaces take over and this disappears — we never show the deduped
 //     live table beside the confirmed attribution table.
-// A pre-feature run has neither flag, so this renders nothing rather than a fabricated 0.
+//   • SIDE-ONLY (`hasSideUsage && !hasConfirmed`, issue #2686): a summary pass or Now note
+//     recorded spend before any result frame. Only those rows and their Run total render,
+//     beside the live view when that is also present.
+// A pre-feature run has none of these, so this renders nothing rather than a fabricated 0.
 
 const K_CLASS = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
 

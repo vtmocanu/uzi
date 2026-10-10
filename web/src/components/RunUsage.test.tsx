@@ -841,4 +841,19 @@ describe("RunUsagePanel side-only spend (no result frame)", () => {
     expect(rows[1]?.[5]).toBe("n/a");
     expect(rows.flat().join(" ")).not.toMatch(/\$0/);
   });
+
+  it("shows the Run total cost as unavailable when a metered note sits beside an unpriced summary", () => {
+    seq = 0;
+    const msgs = [
+      m("progress_note", "lead", { text: "Reading the code", model_usage: entry() }),
+      m("summary_usage", "lead", { pass: "plan", model_usage: entry({ costUSD: 0, costStatus: "unreported" }) }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = rowsOf(getByRole("table", { name: "Summary usage" }));
+    expect(rows.map((r) => [r[0], r[5]])).toEqual([
+      ["Now summaries", "$0.01"],
+      ["Intent, plan & PR summaries", "n/a"],
+      ["Run total", "n/a"],
+    ]);
+  });
 });

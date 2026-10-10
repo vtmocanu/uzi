@@ -591,8 +591,7 @@ export function hasSpend(t: RunUsage["noteTotal"]): boolean {
   return t.fresh + t.cached + t.out > 0 || t.costUsd > 0;
 }
 
-/** True when the run's only recorded spend may be side spend: a summary pass or a Now note
- *  carried usage. `hasConfirmed` is left alone (it means a result frame landed), so a
+/** True when a summary pass or a Now note recorded spend, whether or not a result frame did. `hasConfirmed` is left alone (it means a result frame landed), so a
  *  lead that failed before any result frame still earns the usage panel through this. */
 export function hasSideUsage(usage: RunUsage): boolean {
   return hasSpend(usage.noteTotal) || hasSpend(usage.summaryTotal);
