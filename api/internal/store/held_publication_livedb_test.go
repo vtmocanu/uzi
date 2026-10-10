@@ -269,6 +269,20 @@ func TestHeldPublicationHoldGuardLiveDB(t *testing.T) {
 		}
 		assertHoldOpen(ctx, t, pool, f.hold)
 	})
+	// repo_id is immutable and carries no foreign key, so a row of another repo must be built
+	// directly; only the guard's p.repo_id = OLD.repo_id binding can then refuse the release.
+	t.Run("publication of another repo", func(t *testing.T) {
+		f := heldNewHoldFixture(ctx, t, pool, true, "failed", str("agent_failure"))
+		mustExec(ctx, t, pool, `INSERT INTO run_held_publications
+			(id,run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state)
+			VALUES($1,$2,1,$3,$4,$5,$6,$2,'refs/uzi-held/'||$2::uuid::text||'/1',$7,$8,'prepared')`,
+			f.pub, f.run, f.hold, f.user, uuid.New(), f.worker, heldTip, heldDigest)
+		f.setState(ctx, t, "created")
+		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 0 {
+			t.Fatalf("foreign-repo publication: rows=%d err=%v", n, err)
+		}
+		assertHoldOpen(ctx, t, pool, f.hold)
+	})
 	t.Run("publication of another hold", func(t *testing.T) {
 		f := heldNewFixture(ctx, t, pool, true, "failed", str("agent_failure"))
 		g := heldNewFixture(ctx, t, pool, true, "failed", str("agent_failure"))

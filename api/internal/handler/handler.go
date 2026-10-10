@@ -123,6 +123,7 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
+	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service
@@ -1230,6 +1231,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// limiter-argument-order tests — so it is left as a follow-up rather than folded
 		// into this hardening pass.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/publish", h.WorkerRunPublish)
+
+		// Held-work publication, step A (issue #2545): the worker of a FAILED run uploads one pack
+		// and the api creates refs/uzi-held/<run-id>/<generation> with the stored credential. It
+		// extends its own read/write deadlines (worker_held_publication.go); the body is capped
+		// at maxPackBytes. Eligibility is checked before the body is read.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/held-publication", h.WorkerRunHeldPublication)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences

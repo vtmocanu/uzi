@@ -357,7 +357,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled),
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
 		"register_nonce":    registerNonce,
 		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
 		// returned at register so the worker can size its own pending-outcome quota to match the
@@ -393,11 +393,14 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // through it — so advertising the token tells a fence-capable worker it may send the field. Returns
 // a fresh slice so a caller cannot mutate the advertised set.
 //
+// `recovery_held_publication_v1` (issue #2545) is appended last, in its own group, only while
+// heldPublicationEnabled (= cfg.HeldPublication, UZI_HELD_PUBLICATION).
+//
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
 // worker never sends the snapshot — the same shape an old worker sees.
-func protocolFeatures(activeSnapshotEnabled bool) []string {
+func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
 		{"dind_maintenance_v1"},
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1"}, // PRD #1392 M1
@@ -435,6 +438,12 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
+	}
+	if heldPublicationEnabled {
+		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from
+		// the worker capability of the same name, and omitted when UZI_HELD_PUBLICATION is off so
+		// a worker defers nothing and takes the archive path. Step B needs no advertisement.
+		groups = append(groups, []string{"recovery_held_publication_v1"})
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)

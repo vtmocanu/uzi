@@ -1591,8 +1591,8 @@ type Params struct {
 	SalvageForges []string
 
 	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) carries config.Config.HeldPublication.
-	// Nothing in workersvc reads it yet. The zero value is off; the default-on lives in config.go
-	// where the env is read.
+	// It gates step A only (held_publish.go). The zero value is off; the default-on lives in
+	// config.go where the env is read.
 	HeldPublication bool
 }
 
@@ -1916,7 +1916,17 @@ type Service struct {
 	salvageCreateRefFn   func(ctx context.Context, o pushbroker.CreateRefOptions) error
 	salvageDeleteRefFn   func(ctx context.Context, o pushbroker.DeleteOptions) error
 	salvagePassBudget    time.Duration
-	salvageLeadPending   bool
+	// heldPrepareFn / heldSendFn / heldListFn are step A's broker seams (issue #2545): the
+	// read-only pack pre-verify, the single create-only push and the reconcile listing. They
+	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
+	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
+	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
+	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
+	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
+	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	heldSlots          chan struct{}
+	heldOutcomeHook    func() error
+	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
 	// Defaults to pushbroker.CreateRef (set in New); tests stub it with an in-memory forge.
@@ -2224,6 +2234,10 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		salvageListRefTipsFn: pushbroker.ListRefTips,
 		salvageCreateRefFn:   pushbroker.CreateRef,
 		salvageDeleteRefFn:   pushbroker.Delete,
+		heldPrepareFn:        pushbroker.PrepareHeldPack,
+		heldSendFn:           pushbroker.SendHeldCreate,
+		heldListFn:           pushbroker.ListRefTips,
+		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
 		background:           func(fn func()) { go fn() },

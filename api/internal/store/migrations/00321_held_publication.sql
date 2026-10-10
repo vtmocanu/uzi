@@ -287,6 +287,7 @@ BEGIN
                         AND r.user_id = OLD.user_id AND r.claim_generation = OLD.generation
                         AND r.worker_id = OLD.original_worker_id
                         AND p.hold_id = OLD.id AND p.run_id = OLD.run_id AND p.user_id = OLD.user_id
+                        AND p.repo_id = OLD.repo_id
                         AND p.generation = OLD.generation AND p.worker_id = OLD.original_worker_id
                         AND p.ref = 'refs/uzi-held/' || OLD.run_id::text || '/' || OLD.generation::text
                         AND p.coverage_digest = NEW.final_coverage_digest
