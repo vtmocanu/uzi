@@ -714,3 +714,54 @@ func noticeDoc(status string, checks []apitypes.HealthCheckDTO) Doc {
 	}
 	return d
 }
+
+// A db.size danger check is instance-scoped, so it opens an episode and, after the two-tick
+// debounce, reaches the admin notice body with its title and summary.
+func TestEpisodeNotice_DBSizeDangerNotifies(t *testing.T) {
+	a1 := uuid.New()
+	ep := uuid.New()
+	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: ep, admins: []uuid.UUID{a1}}
+	nf := &fakeEpisodeNotifier{}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{
+		dangerCheckDTO("db.size", "Database size", "Database is using 86% of its configured storage capacity."),
+	})}
+	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+
+	r.Reconcile(context.Background()) // opener tick
+	if len(nf.sent) != 0 {
+		t.Fatalf("notices after opener tick = %d, want 0", len(nf.sent))
+	}
+	r.Reconcile(context.Background()) // second tick fans out
+	if len(nf.sent) != 1 {
+		t.Fatalf("notices after second tick = %d, want 1", len(nf.sent))
+	}
+	body, _ := nf.sent[0].Payload.(map[string]any)["body"].(string)
+	for _, want := range []string{"Database size", "Database is using 86% of its configured storage capacity."} {
+		if !strings.Contains(body, want) {
+			t.Errorf("notice body missing %q; got %q", want, body)
+		}
+	}
+}
+
+// The notice body carries the summary the real db.size check produces, not a hand-written one.
+func TestEpisodeNotice_DBSizeRealCheckBody(t *testing.T) {
+	a1 := uuid.New()
+	st := &fakeEpisodeStore{openErr: pgx.ErrNoRows, openReturn: uuid.New(), admins: []uuid.UUID{a1}}
+	nf := &fakeEpisodeNotifier{}
+	svc := dbSizeSvc(1000, sizeProbe(860))
+	real := svc.checkDBSize(context.Background(), fixedNow)
+	if real.Severity != sevDanger {
+		t.Fatalf("real check severity = %q, want danger", real.Severity)
+	}
+	ev := &mutEvaluator{doc: noticeDoc(sevDanger, []apitypes.HealthCheckDTO{real})}
+	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+	r.Reconcile(context.Background())
+	r.Reconcile(context.Background())
+	if len(nf.sent) != 1 {
+		t.Fatalf("notices = %d, want 1", len(nf.sent))
+	}
+	body, _ := nf.sent[0].Payload.(map[string]any)["body"].(string)
+	if !strings.Contains(body, real.Summary) || !strings.Contains(body, "86%") {
+		t.Errorf("notice body %q lacks the real summary %q", body, real.Summary)
+	}
+}

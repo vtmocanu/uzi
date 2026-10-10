@@ -3021,6 +3021,23 @@ WHERE id = @id AND worker_id = @worker_id
   AND (sqlc.narg('claim_generation')::bigint IS NULL
        OR claim_generation = sqlc.narg('claim_generation')::bigint);
 
+-- name: ParkRunningCodexAccountUnavailable :execrows
+-- The running checkpoint park retains worker affinity, custody, counters and pause requests.
+-- The caller re-derives the hold under run -> alias -> account locks.
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    recovery_wait_cause = 'codex_account_unavailable',
+    recovery_retry_not_before = NULL,
+    started_at = NULL, budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = @claim_generation
+  AND status = 'running' AND claim_released_at IS NULL
+  AND kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework');
+
 -- name: ParkRunForgeUnreachable :one
 -- PRD #1392 M1 (D2/D3): the FORGE pre-clone park writer. It is the typed sibling of
 -- SetRunRecoveryWait — same 'recovery_wait' transition, same backoff-shaping
@@ -3132,8 +3149,8 @@ FOR UPDATE;
 -- budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
 -- over-credited — both exactly as PromoteLimitWaitRuns does. NULL <= @now is UNKNOWN, so a
 -- run whose recovery_retry_not_before is NULL is never promoted. Every timer-driven park
--- writes a finite stamp; both writers of cause codex_account_unavailable
--- (ParkRunCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
+-- writes a finite stamp; all three writers of cause codex_account_unavailable
+-- (ParkRunCodexAccountUnavailable, ParkRunningCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
 -- cause fence below is what keeps this timer promoter off that cause, whatever its stamp: that
 -- hold is resumed only by the account (PromoteCodexAccountWaitRun, PRD #1590 D3).
 --
@@ -4920,7 +4937,7 @@ WHERE runs.id = @id AND runs.status = 'claimed'
 -- Called under the exact-claim row lock, after settling this generation's hold.
 -- recovery_retry_not_before is cleared: this cause is resumed by the account, never by the
 -- timer (PromoteRecoveryWaitRuns skips it). The SET list is
--- ParkQueuedCodexAccountUnavailablePage's (the other writer of this cause) plus one extra
+-- ParkQueuedCodexAccountUnavailablePage's plus one extra
 -- column: this exact-claim park also rewrites worker_id to the newest open custody holder (D4),
 -- while the queued park leaves worker_id alone.
 UPDATE runs SET
@@ -4958,7 +4975,7 @@ RETURNING *;
 --
 -- The SET list is the M1 exact-claim park's, minus the worker_id affinity rewrite: a queued run
 -- has no claim of this pass's making, so claim_generation and worker_id are left alone and no
--- custody hold is opened or released. Both writers clear recovery_retry_not_before because this
+-- custody hold is opened or released. All three writers clear recovery_retry_not_before because this
 -- cause is resumed by the account, never by the timer (PromoteRecoveryWaitRuns skips it).
 --
 -- Returns one row even when nothing parks: page_size (rows examined), last_scanned_id (the nil

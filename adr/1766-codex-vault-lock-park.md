@@ -46,6 +46,60 @@ can receive `vault_locked` even after unlock, before the recovery sweep promotes
 That cause describes why sealing failed; it is not a statement of current vault state and grants
 no working credential, ready result, boundary permit or merge-request authority.
 
+## Account-unavailable boundary amendment (issue #1595, 2026-10-10)
+
+[PRD #1595](../prds/1595-codex-boundary-account-park.md) extends this typed-409,
+credential-free park mechanism to a running Codex **subscription** run's durability-boundary
+reconcile. M1/M2 are implemented and reviewed on the issue branch; maintainer-hosted
+acceptance is pending. The hold classifier and same-identity re-admission remain owned by
+[ADR-1590](1590-codex-binding-same-identity-readmission.md).
+
+The API computes an advisory hold hint from its own account and alias state after checking
+worker ownership, capability epoch/hash and the unreleased claim. It uses the unchanged
+claim-time classifier: quarantine at the frozen identity and credential revision, or a
+same-alias re-login in flight. Eligible kinds are `issue`, `ci_fix`, `self_improve`,
+`prompt`, `task` and `mr_rework`, without an egress profile. An eligible refusal to a
+worker advertising `codex_account_park_v1` answers HTTP 409 with
+`{"error":"codex credential is not available","reason":"codex_account_unavailable"}`.
+Message text, a generic refusal or the worker's account interpretation grants no authority.
+
+The worker interprets this boundary reply as `account_unavailable` and uses D3's
+credential-free ordering: confirm running ownership, settle execution, WIP commit,
+fetch-back into the bare tracking ref, verify, attempt publication, then report the park.
+Publication is best-effort, not a promise of an available server archive. Until capture
+and acknowledgement are verified, local work and session are retained and retried with
+capped backoff. After the park ACK, the tracking ref and session remain recovery sources;
+the live clone may retire under the independent quiescence checks. The custody hold is
+not settled by this path, and `worker_id` remains the source worker. Resume prefers that
+worker under the existing affinity rules, rather than guaranteeing it in every case.
+
+The worker sends `recovery_cause: "codex_account_unavailable"` only when the API
+advertises `recovery_cause_codex_account_unavailable`; otherwise it reports an untyped
+`recovery_wait`. Admission requires `codex_account_park_v1` and `claim_generation`;
+missing capability or generation returns 400 before state mutation. The API re-decides
+in a transaction: lock the run, check generation/unreleased claim and running status,
+honour a stamped stop, then classify under alias and account `FOR SHARE NOWAIT` locks.
+A hold writes the typed park and revokes the capability in the same SQL statement
+(`codex_cap_hash=NULL`, epoch incremented). Thus this cause is **never written on the
+worker's word**, and the typed hold has no live credential capability. A changed verdict
+writes the existing untyped park with an explicit NULL cause through the transaction's
+queries. Exhausted NOWAIT retries use a fresh transaction for that untyped fallback.
+Custody remains held in either case.
+
+The typed hold has no expiry or recovery timer. ADR-1590's account-driven promoter and
+verified same-alias, same-identity re-admission resume it; definite binding changes still
+fail `credential_unavailable` with custody retained. Old workers receive the original
+untyped error bodies; an old API supplies neither the reason nor the feature. If API
+rollback leaves a stale advertised feature and rejects the typed report with 400, the
+worker retains source/session and retries rather than releasing custody.
+
+The mid-turn app-server bridge and startup-release latch remain `vault_locked`-only.
+Excluded kinds, egress-profile runs, non-credential boundary faults, transient or ambiguous
+refresh faults, and a restored account with an unrecoverable old operation keep their
+handling. This amendment does not establish that the unconfirmed original boundary
+failure would have been saved. The PRD records diagnostics, regression evidence and
+the pending hosted acceptance.
+
 ## Context
 
 Before this issue, a Codex credential call that hit a locked vault had no typed signal, and the two
@@ -146,11 +200,12 @@ operation metadata or raw response errors reach the feed. The typed vault park's
 `recovery_cause_vault_locked` feature check is separate from the first-response compatibility flag
 described below.
 
-The blocked-proof retention exception is limited to `vault_locked` and `refresh_unknown`.
+The blocked-proof retention exception covers `vault_locked`, `refresh_unknown` and
+`account_unavailable` (the #1595 amendment above).
 Settlement must still be observed empty; quiescence, WIP commit, fetch-back, tracking-ref
 verification, canonical and foreign-residue checks, and completion proofs remain required.
 A blocked proof retains the clone, session and custody with capped waits and no terminal
-blocked-capture cap for these two deferrals; it does not permit a park or completion without the
+blocked-capture cap for these three deferrals; it does not permit a park or completion without the
 proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Cancellation,
 shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
 semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`).

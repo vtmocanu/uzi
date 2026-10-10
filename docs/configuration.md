@@ -572,6 +572,14 @@ See [Jobs](jobs.md#job-files) for what a job file is and [Agent skills](skills.m
 
 **Helm.** None of these has a first-class chart value. Set them in the freeform `api.config` map (rendered into the api ConfigMap by `deploy/chart/templates/api-configmap.yaml`), for example `api.config.UZI_JOB_FILES_RETENTION: "72h"`.
 
+### Database storage capacity
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DB_STORAGE_CAPACITY_BYTES` | *(unset)* | The database-size budget, in bytes, that the [admin health](admin-health.md#database-storage-signals) `db.size` check measures `pg_database_size(current_database())` against: `warn` at 75%, `danger` at 85%. A positive base-10 integer of at most 1 EiB (1152921504606846976). Unset is ignored; a nonpositive, unparseable or over-the-bound value is ignored with one warning at boot. Either way `db.size` reads `na`. It is a budget you declare, not a measurement of the volume, and excludes WAL; see [Database storage signals](admin-health.md#database-storage-signals) for its blind spots and the recommended infrastructure free-space alert. |
+
+**Helm.** The chart renders `DB_STORAGE_CAPACITY_BYTES` itself from `database.simple.storage.size` (simple mode) or `postgres.cluster.storage.size` (`database.mode: cnpg`), converting the Kubernetes quantity (`8Gi`, `500M`, `8e9`, a plain byte count) to bytes, rounded up. The render fails for an invalid quantity, a nonpositive one, one above 1 EiB, or when `api.config` also sets the key (a duplicate ConfigMap key). With `database.mode: external` the chart cannot know the size: set `api.config.DB_STORAGE_CAPACITY_BYTES` as a quoted string (`DB_STORAGE_CAPACITY_BYTES: "107374182400"`); an unquoted number is parsed by Helm as a float and renders as `1.073741824e+11`, which the api rejects (`db.size` reads `na`, with only a boot warning). In simple mode the PVC comes from a StatefulSet volume claim template, so the rendered capacity is the size at creation; after expanding the PVC by hand follow the steps in the comment above `database.simple.storage.size` in `deploy/chart/values.yaml`. `task render:db-capacity-check` asserts the rendering offline (needs `helm` and `yq`; CI runs it through `task render:openshift-check`). Docker Compose: `docker-compose.yml` does not pass the variable through, so `db.size` reads `na` until you add `DB_STORAGE_CAPACITY_BYTES` to the api service's `environment`, set to the size you want to budget for the `pgdata` volume.
+
 ## Run-usage history refold (PRD #1079)
 
 Each Claude Agent SDK `query()` call reports only its own leg's cost, not a session

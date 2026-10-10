@@ -120,13 +120,23 @@ the run at any point during these retries ends it `cancelled`, as usual.
 
 ## Codex account unavailable
 
-A `recovery_wait` park can also come from the Codex subscription account
-itself: it is quarantined (a safety state, not a defect) or it needs a fresh
-login, so uzi holds a Codex subscription run here instead of failing it.
-Only the run kinds that hold custody of your source — issue, ci_fix,
-self_improve, prompt, task and mr_rework — are held this way; a Codex chat
-run still fails immediately (you're present to react to it), and so does a
-judge run (it's advisory).
+A Codex subscription run can enter `recovery_wait` before it starts, or
+while running at a milestone checkpoint, done checkpoint, finalize or
+recovery-capture boundary. The API must confirm that its account is
+quarantined at the run's frozen identity and credential revision, or that
+a re-login on the same credential is being verified. That account state
+holds the run instead of failing it. This applies to issue, ci_fix,
+self_improve, prompt, task and mr_rework runs without an egress profile;
+chat, judge, job, cross_check and egress-profile runs keep their handling.
+
+For a running run, uzi settles execution without requesting another Codex
+credential, commits unfinished work, fetches it back into the worker's
+tracking ref and verifies it **before** reporting the park. Publishing the
+recovery checkpoint is best-effort: the feed says whether it was published
+or saved on this worker. The source custody hold and session stay available
+for recovery; this does not promise an available server archive or permanent
+local clone. If capture or the park report cannot be verified, the worker
+retains the local work and session and retries rather than claiming a park.
 
 The run card, `uzi run get`, `uzi run list`/`uzi admin runs`, and the TUI
 board each name one of four states (a state this client does not recognise
@@ -143,8 +153,9 @@ reads **Codex account unavailable**):
   confirming the new login belongs to the same account before releasing
   anything.
 - **Codex account available again** — the account cleared; the run is going
-  back into the queue and will pick up where it left off. When the hold
-  began at claim time, it prefers the worker that held its source.
+  back into the queue and will pick up where it left off. It prefers the
+  worker that holds its source, including when the hold began at a running
+  checkpoint; normal worker-affinity limits still apply.
 
 A successful same-credential re-login re-admits the run: the activity feed
 records the re-admission, naming the credential and what changed.
@@ -156,6 +167,13 @@ no countdown. It lasts until the account recovers, you log in again, or you
 cancel. Cancel works exactly as it does for any `recovery_wait` run.
 
 ### When it fails instead
+
+This checkpoint protection needs an upgraded API and worker. An account
+refusal during a turn's app-server refresh, or during startup credential
+release, does not gain this account-park handling; their vault-lock handling
+stays unchanged. Transient or ambiguous refreshes and non-credential
+boundary faults keep their existing handling. A generic credential error
+is not evidence of an account hold.
 
 Logging in with a different ChatGPT account does not resume the run: it
 fails with `credential_unavailable` and a reason naming the change. The
