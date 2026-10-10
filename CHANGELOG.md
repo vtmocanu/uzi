@@ -36,6 +36,12 @@ through `[0.52.0]`.)
 - **Retained recovery continues after a refused immediate or wall pause.**
   Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
 
+- **Recovery quota refusals retain a retry diagnostic and appear in Admin Health ([#2544](https://github.com/vtmocanu/uzi/issues/2544)).**
+  Workers preserve typed recovery API quota as transient `storage_quota_exceeded` while retaining source, bundle bytes and capture identity for retry; untyped 507 remains generic. The owner-scoped `recovery.storage` health check warns on current persisted `needs_action` captures with the exact server reason `storage quota exceeded`, with logical byte accounting, effective limits and bounded owner examples; read failures are unknown. An admitted retry clears that capture’s quota marker before upload succeeds, and reserve refusals without a capture row are absent. The [operator diagnosis](docs/recovery-storage-diagnosis.md) separates byte/count/custody limits and read-only reclaim simulation; no quota, expiry, custody, bundle or capacity-warning policy changes are included.
+
+- **Settled halt notifications can be pruned without a later notification ([#2076](https://github.com/vtmocanu/uzi/issues/2076)).**
+  Best-effort per-user pruning now follows a successful Slack delivery stamp (including terminal no-link outcomes) and the final retry claim, even for a corrupt stored render, so an idle user's log can converge toward the nominal 200-row retention target when pruning succeeds. Pending durable rows below the attempt cap stay exempt, timestamp ties may retain more than 200 rows, and logged prune failures do not undo delivery settlement or retry exhaustion. There is no historical settled-backlog sweep or unconditional cleanup guarantee.
+
 - **Full-screen TUI footers keep help and quit keys visible ([#2194](https://github.com/vtmocanu/uzi/issues/2194)).**
   At 80 columns and wider, the board, CI and pulls footers shed lower-priority hints before help and quit; the board retains its partial-cost cue and client-only version fallback.
 

@@ -314,6 +314,7 @@ These are bounded observations, not a globally ordered snapshot:
 | `schedules.paused` | A user with a [pause-all](scheduling.md#pausing-everything-at-once) in force while still owning enabled schedules — their labelled issues look queued but will not fire | any such user | — | — |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
 | `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `na` when custody admission is disabled |
+| `recovery.storage` | Current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any matching capture | — | `unknown` when the read fails or exceeds four seconds |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
 | `pricing.codex` | Recent Codex usage on models without a currently valid price in this release's table | any such model | — | `unknown` when the usage query fails or exceeds its five-second deadline |
 
@@ -321,6 +322,41 @@ These are bounded observations, not a globally ordered snapshot:
 check reading `unknown` means its observation is missing, stale, unreadable,
 or turned off, and a check reading `na` means it genuinely does not apply here (no
 hosted workers, no Slack). Neither is ever folded into, or displayed as, `ok`.
+
+### Recovery storage
+
+`recovery.storage` is an owner-scoped housekeeping check for
+[#2544](https://github.com/vtmocanu/uzi/issues/2544). It is `warn` when
+the current persisted capture count is greater than zero for the exact pair
+`state = needs_action`, `reason = storage quota exceeded`; otherwise it
+is `ok`. A failed read, missing aggregate or four-second read deadline
+is `unknown`. There is no danger or percentage-capacity band.
+
+Evidence reports global bytes and counts across owners: available recovery
+captures, preparing/uploading reservations, non-expired job files, quota
+refusals and owners, plus reclaimable job bytes, recovery/shared totals and
+the effective owner/instance/shared byte limits (`<= 0` reads disabled).
+At most eight owner examples follow, ordered by refusal count then owner
+ID, with an omitted-owner count. The totals are computed before this cap;
+the cap does not narrow the global accounting.
+
+Custody release does not remove a persisted refusal, so a released hold can
+still warn. An admitted retry clears the marker as it becomes uploading,
+**before success**, so a cleared warning is not proof of an available archive.
+Discard, a nonquota reason or a stalled-upload reason replacing the quota
+marker also removes that capture from the warning. Capture-count reserve
+refusals that create no capture row are absent from this signal.
+
+Upload-failure recording is best-effort. The check observes current state,
+not history, and its logical byte totals are not PostgreSQL/PVC physical
+capacity. It adds no quota, retention or custody policy.
+See [Recovery storage diagnosis](./recovery-storage-diagnosis.md) for
+snapshot SQL and the evidence needed to distinguish owner, instance,
+shared and count refusals; `uzi run recovery` alone omits capture reason.
+
+Implementation:
+[checkRecoveryStorage](../api/internal/healthsvc/recovery_storage.go) and
+[RecoveryStorageHealth](../api/internal/store/queries/recovery_storage_health.sql).
 
 ### Codex price coverage
 

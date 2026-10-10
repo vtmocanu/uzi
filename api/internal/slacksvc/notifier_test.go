@@ -71,13 +71,23 @@ type fakeNotifStore struct {
 	secretErr   error
 	secretAsked []store.GetSecretEnablementParams
 	// Issue #1675: MarkNotificationSlackDelivered calls, in order; markErr fails each.
-	marked  []uuid.UUID
-	markErr error
+	pruned          []store.PruneNotificationsForUserParams
+	pruneErr        error
+	settlementOrder []string
+	marked          []uuid.UUID
+	markErr         error
 }
 
 func (f *fakeNotifStore) MarkNotificationSlackDelivered(_ context.Context, id uuid.UUID) error {
+	f.settlementOrder = append(f.settlementOrder, "stamp")
 	f.marked = append(f.marked, id)
 	return f.markErr
+}
+
+func (f *fakeNotifStore) PruneNotificationsForUser(_ context.Context, a store.PruneNotificationsForUserParams) (int64, error) {
+	f.settlementOrder = append(f.settlementOrder, "prune")
+	f.pruned = append(f.pruned, a)
+	return 0, f.pruneErr
 }
 
 func (f *fakeNotifStore) GetSecretEnablement(_ context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {

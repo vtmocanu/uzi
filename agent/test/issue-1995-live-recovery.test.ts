@@ -95,6 +95,7 @@ class FakeClient implements RecoveryArchiveClient {
   reserveEntered = new Counter();
   uploadEntered = new Counter();
   holdReserve: Promise<void> | undefined;
+  reserveError: unknown;
   holdUpload: Promise<void> | undefined;
   /** When set, `holdUpload` only holds uploads of this run. */
   holdUploadRun: string | undefined;
@@ -110,6 +111,7 @@ class FakeClient implements RecoveryArchiveClient {
     this.reserveCalls.push(req);
     this.reserveEntered.inc();
     if (this.holdReserve) await this.holdReserve;
+    if (this.reserveError) throw this.reserveError;
     return { capture_id: this.serverCaptureId, state: "preparing" };
   }
   async getRecoveryCaptureStatus(_runId: string, captureId: string): Promise<RecoveryCaptureStatusResponse> {
@@ -344,6 +346,68 @@ describe("live recovery re-drive through the Worker heartbeat (issue #1995)", ()
     }
   });
 });
+
+for (const phase of ["reserve-count", "upload"] as const) {
+  it(`U1 legacy ${phase} quota survives capture live and restart until success`, async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    let coord = makeCoord(client, git);
+    const refuse = () => {
+      if (phase === "reserve-count") client.reserveError = typed(507, "quota");
+      else client.uploadFailures.push({ error: typed(507, "quota") });
+    };
+    refuse();
+    const pinned = await pinRec(coord, FIN);
+    const outcome = await cap(coord, pinned);
+    assert.equal(outcome.reason, "storage_quota_exceeded");
+    const before = await current(coord);
+    assert.equal(before.state, "needs_action");
+    assert.equal(before.reason, "storage_quota_exceeded");
+    assert.equal(before.serverCaptureId, phase === "reserve-count" ? undefined : client.serverCaptureId);
+    const bytes = fs.readFileSync(before.bundlePath!);
+    const assertRetained = async () => {
+      assert.deepEqual(await current(coord), before, "refusals preserve every journal fact and server identity");
+      assert.deepEqual(fs.readFileSync(before.bundlePath!), bytes);
+      assert.equal(git.produceCalls, 1);
+      assert.equal(client.releaseCalls, 0);
+    };
+    refuse();
+    await live(coord);
+    await assertRetained();
+    const attempts = () => phase === "reserve-count" ? client.reserveCalls.length : client.uploadCalls.length;
+    assert.equal(attempts(), 2, "quota is eligible for live retry");
+    await live(coord);
+    assert.equal(attempts(), 2, "an immediate retry is spaced");
+    clock.t += 2;
+    refuse();
+    await live(coord);
+    assert.equal(attempts(), 3);
+    await assertRetained();
+    clock.t += 3;
+    await live(coord);
+    assert.equal(attempts(), 3, "a second refusal doubles the delay");
+
+    coord = makeCoord(client, git);
+    refuse();
+    await coord.resumePending();
+    assert.equal(attempts(), 4, "restart retries the authenticated quota journal");
+    await assertRetained();
+    client.reserveError = undefined;
+    await live(coord);
+    const after = await current(coord);
+    assert.equal(after.state, "uploaded");
+    assert.equal(after.reason, undefined, "success clears the quota diagnostic");
+    for (const key of ["captureId", "sourceSha", "bundlePath", "checksum", "byteSize", "chunkCount", "generation"] as const) {
+      assert.equal(after[key], before[key], key);
+    }
+    assert.equal(after.serverCaptureId, client.serverCaptureId);
+    assert.equal(fs.existsSync(after.bundlePath!), false, "successful legacy upload retires the local bytes");
+    assert.equal(git.produceCalls, 1);
+    assert.equal(client.releaseCalls, 0, "legacy upload does not release custody");
+    assert.ok(client.reserveCalls.every(request => request.idempotency_key === before.captureId));
+    assert.ok(client.uploadCalls.every(call => call.captureId === client.serverCaptureId && call.bytes.equals(BYTES)));
+  });
+}
 
 // ── 2/3. one producer, one stream, immutable bytes ───────────────────────────────
 
@@ -1030,7 +1094,14 @@ describe("classifyUploadFailure (issue #1995)", () => {
       ["503 busy", typed(503, "busy"), transient, undefined],
       ["500 internal", typed(500, "internal"), transient, undefined],
       ["502 untyped", reqErr(502), transient, undefined],
-      ["507 quota", typed(507, "quota"), transient, undefined],
+      ["507 quota", typed(507, "quota"), { kind: "transient", reason: "storage_quota_exceeded" }, undefined],
+      ["401 quota", typed(401, "quota"), { kind: "credential", reason: "credential_rejected" }, undefined],
+      ["507 unknown reason", typed(507, "mystery"), transient, undefined],
+      ["507 non-string reason", reqErr(507, JSON.stringify({ reason: 507 })), transient, undefined],
+      ["507 malformed body", reqErr(507, "{"), transient, undefined],
+      ["507 oversize", typed(507, "oversize"), permanent("archive_constraint"), undefined],
+      ["507 not_authorized", typed(507, "not_authorized"), permanent("stale_ownership"), undefined],
+      ["507 integrity, altered bytes", typed(507, "integrity"), permanent("local_bundle_mismatch"), altered],
       ["507 untyped", reqErr(507), transient, undefined],
     ];
     for (const [name, err, want, record] of table) {

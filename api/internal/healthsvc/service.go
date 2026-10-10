@@ -71,6 +71,7 @@ const (
 // it structurally, so healthsvc never depends on the concrete Queries and its severity
 // logic is driven by a fake in unit tests.
 type Store interface {
+	RecoveryStorageHealth(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error)
 	ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error)
 	// fleet.roll + fleet.disk read every worker with its roll-health join.
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
@@ -152,6 +153,10 @@ type Config struct {
 	// CustodyHoldLimit is workersvc.CustodyHoldLimit, the admission ceiling custody.holds
 	// keys on.
 	CustodyHoldLimit int32
+	// Effective admission limits; non-positive values disable the respective ceiling.
+	RecoveryReadyPayloadPerOwner int64
+	RecoveryInstanceBytes        int64
+	StoredFilesBudgetBytes       int64
 	// BootTime is the api process start (the handler's startedAt). controller.report uses
 	// it for the first-5-minutes-after-boot grace: with no report yet it degrades to
 	// `unknown` rather than `danger` for that window. Zero (a struct-literal test handler
@@ -280,6 +285,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkSchedulesPaused(ctx, now),
 		s.checkBoardDrift(ctx, now),
 		s.checkCustodyHolds(ctx, now),
+		s.checkRecoveryStorage(ctx, now),
 		s.checkReleaseCheck(ctx, now),
 		s.checkCodexPricing(ctx, now),
 	}
