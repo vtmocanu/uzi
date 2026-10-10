@@ -54,7 +54,7 @@ func ephemeralPinKinds() []ephemeralPinKind {
 				rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
 					BackgroundGraceCutoff: pgtype.Timestamptz{Time: evalAt.Add(-15 * time.Minute), Valid: true},
 					StaleRequeueCutoff:    stale, AffinityCutoff: affinity,
-					EphemeralLease: leaseInterval(0), MaxPerUser: 1000, MaxRows: 50,
+					EphemeralLease: leaseInterval(0), MaxPerUser: 1000, MaxRows: 10000,
 					CrossCheckEvaluatedAt:    planCrossCheckTime(evalAt),
 					CrossCheckAffinityCutoff: planCrossCheckTime(evalAt.Add(-2 * time.Minute)),
 				})
@@ -84,9 +84,9 @@ func ephemeralPinKinds() []ephemeralPinKind {
 				rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
 					BackgroundGraceCutoff: pgtype.Timestamptz{Time: evalAt.Add(-15 * time.Minute), Valid: true},
 					StaleRequeueCutoff:    stale, AffinityCutoff: affinity,
-					// A 1m debounce: every case's status_since is at least 5m old.
+					// A 1m debounce: every case's status_since is at least 2m old.
 					SaturationDelay: leaseInterval(time.Minute),
-					EphemeralLease:  leaseInterval(0), MaxPerUser: 1000, MaxRows: 50,
+					EphemeralLease:  leaseInterval(0), MaxPerUser: 1000, MaxRows: 10000,
 					CrossCheckEvaluatedAt:    planCrossCheckTime(evalAt),
 					CrossCheckAffinityCutoff: planCrossCheckTime(evalAt.Add(-2 * time.Minute)),
 				})
@@ -130,6 +130,9 @@ func TestEphemeralTriggersExcludeStaleRequeuePinLiveDB(t *testing.T) {
 				`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, required_capabilities, claim_generation, stale_requeue_generation)
 				 VALUES ($1, $2, $3, $4, 't', 'd', 'queued', $5, $6, 1, 1)`,
 				run, fx.userID, fx.repoID, fx.nextIID(), owner, k.caps)
+			// The database is shared across tests: delete the run so it cannot crowd a later
+			// run's fixture out of a LIMIT window (the lists above take MaxRows 10000 for the same reason).
+			t.Cleanup(func() { _, _ = fx.pool.Exec(fx.ctx, `DELETE FROM runs WHERE id = $1`, run) })
 
 			// pinned restores the effective-pin state: generations match, status_since and
 			// updated_at 5m ago (inside the 10m grace and the 30m ceiling).

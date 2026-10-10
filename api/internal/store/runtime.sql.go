@@ -8056,6 +8056,11 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol,
+       COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
+                AND runs.worker_id IS NOT NULL
+                AND runs.stale_requeue_generation = runs.claim_generation
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
+       COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT a.terminal_pending_since FROM worker_active_runs a
          WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
@@ -8135,6 +8140,8 @@ type ListActiveRunsForHealthRow struct {
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
 	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	JobProtocol               pgtype.Int2        `json:"job_protocol"`
+	StaleRequeuePinnable      bool               `json:"stale_requeue_pinnable"`
+	StaleRequeueWorkerName    string             `json:"stale_requeue_worker_name"`
 	CrossCheckPinRequired     bool               `json:"cross_check_pin_required"`
 	TerminalPendingSince      pgtype.Timestamptz `json:"terminal_pending_since"`
 	CodexCustomRoot           bool               `json:"codex_custom_root"`
@@ -8198,6 +8205,13 @@ type ListActiveRunsForHealthRow struct {
 // Issue #1994: terminal_pending_since is the first-seen time of the run's CURRENT-owner, CURRENT-
 // generation, unexpired terminal-pending snapshot row (NULL otherwise), so the health ladder can
 // flag an outcome journaled on its worker that has stayed undelivered across lease renewals.
+// Issue #2705 M3: stale_requeue_pinnable and stale_requeue_worker_name project the NON-time half
+// of ClaimRun's stale-requeue pin (a queued, non-cross_check run whose owner row still exists and
+// whose stale_requeue_generation equals claim_generation); the time half (status_since + the
+// grace, capped by updated_at + the affinity ceiling) is computed in Go (staleRequeuePin)
+// from the status_since and updated_at already projected here. COALESCE keeps a NULL
+// stale_requeue_generation false rather than NULL. The name is the owner worker's, ” when the
+// owner row is gone (COALESCE keeps the scan target a plain string).
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModels []string) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth, codexCuratedModels)
 	if err != nil {
@@ -8237,6 +8251,8 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.ReleasedWorkerID,
 			&i.EgressProfileID,
 			&i.JobProtocol,
+			&i.StaleRequeuePinnable,
+			&i.StaleRequeueWorkerName,
 			&i.CrossCheckPinRequired,
 			&i.TerminalPendingSince,
 			&i.CodexCustomRoot,
@@ -10838,6 +10854,11 @@ FROM runs
 WHERE health = 'waiting_worker'
   AND kind <> 'cross_check'
   AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+  -- Issue #2705 M3: a run held for its returning worker (workersvc reasonStaleRequeuePinPrefix,
+  -- 'waiting until ...') is expected waiting, not a queue.waiting age signal. Only a positively
+  -- identified pin row is excluded; waiting_worker rows with a NULL health_reason must stay
+  -- included, which is why this is NOT COALESCE(LIKE, false) and not a bare NOT LIKE (NULL).
+  AND NOT COALESCE(health_reason LIKE 'waiting until %', false)
 ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id
 `
 

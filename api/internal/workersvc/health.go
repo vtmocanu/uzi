@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -122,6 +123,12 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
+	// reasonStaleRequeuePinPrefix (issue #2705) opens the queued reason for a run the stale-worker
+	// sweeper requeued and ClaimRun is still holding for its returning worker. Unlike its fixed
+	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
+	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns carries the same literal in SQL
+	// (pinned in sync by a store test). No other reason starts with it.
+	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
 	// waiting for a SLOT to free — not for a worker to come online — and the
@@ -409,7 +416,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// episode) DMs the owner, and only if the cooldown has elapsed since the last
 		// nudge. The sweeper is the single writer of health_notified_at, so it stamps
 		// it here — in the same SetRunHealth write — exactly when it emits a nudge.
-		nudge := target != healthOK && r.Health == healthOK &&
+		// Issue #2705: a run leaving the stale-requeue pin explanation for another flag starts a
+		// new episode, as if it came from ok: nudge-eligible again (cooldown still applies) and
+		// health_since restamped. Without it a run that stays stuck after the grace would never
+		// nudge (its flag was already waiting_worker) and would carry the grace in its "stuck for".
+		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
+		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -437,11 +450,21 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// Issue #2705: the pin reason is expected waiting for a worker that is likely coming back
+		// within the grace; a "waiting for a worker" nudge would be noise. Keyed off the reason
+		// prefix because the reason embeds the deadline and worker name.
+		if isStaleRequeuePinReason(reason) {
+			nudge = false
+		}
 		// A live plan cross-check is expected waiting. A worker-pickup nudge would
 		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
 		if reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
 			nudge = false
+		}
+		since := healthSince(now, target, r)
+		if leftPin {
+			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
@@ -450,7 +473,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		n, err := s.q.SetRunHealth(ctx, store.SetRunHealthParams{
 			Health:           target,
 			HealthReason:     pgconv.TextOrNull(reason),
-			HealthSince:      healthSince(now, target, r),
+			HealthSince:      since,
 			HealthNotifiedAt: notifiedAt, // NULL → COALESCE preserves the existing stamp
 			ID:               r.ID,
 			Status:           r.Status, // exit-race scope: no-ops if the run left this status
@@ -491,7 +514,13 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// here (Decision 8); 'queued' gains only a flag, timed from the last
 		// transition into queued (status_since — issue #190: updated_at conflated a
 		// real status change with an incidental row write and reset this clock).
-		if th.queued == 0 || !olderThan(now, r.StatusSince, th.queued) {
+		if th.queued == 0 {
+			return healthOK, ""
+		}
+		// Issue #2705: a run held for its returning worker is explained from the first tick of
+		// the hold, not after the queued threshold: it bypasses the age gate and queuedReason
+		// resolves it (th.queued == 0 above still switches every queued flag off).
+		if _, pinned := s.staleRequeuePin(now, r); !pinned && !olderThan(now, r.StatusSince, th.queued) {
 			return healthOK, ""
 		}
 		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
@@ -1003,6 +1032,12 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
 	}
+	// Issue #2705: ClaimRun is holding this stale-requeued run for its returning worker, so no
+	// fleet reason below is the cause. After every fundamental block above (none of which a
+	// returning worker clears) and before the cross_check and fleet rungs.
+	if until, pinned := s.staleRequeuePin(now, r); pinned {
+		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
+	}
 	// Read the capability-aware kill-switch ONCE and thread the same value into both the
 	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
 	// counts and the claim path can never disagree on whether capabilities are enforced.
@@ -1506,6 +1541,46 @@ func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, bu
 // olderThan reports whether ts is valid and at least d in the past relative to now.
 func olderThan(now time.Time, ts pgtype.Timestamptz, d time.Duration) bool {
 	return ts.Valid && now.Sub(ts.Time) >= d
+}
+
+// staleRequeuePin reports whether ClaimRun is holding this queued run for its returning worker
+// right now (issue #2705) and, if so, the instant the hold ends. It is the Go mirror of the
+// effective pin E the provisioning queries use: the non-time half (stale_requeue_pinnable) comes
+// from the projection, the time half is status_since + WorkerStaleRequeueGrace, capped by
+// updated_at + WorkerAffinityCeiling, which is where ClaimRun lets any worker take the run
+// regardless. A zero grace never pins. The grace bound is exclusive and the ceiling bound
+// inclusive, matching the SQL comparisons (status_since > cutoff, updated_at >= affinity cutoff).
+func (s *Service) staleRequeuePin(now time.Time, r store.ListActiveRunsForHealthRow) (time.Time, bool) {
+	if s.p.WorkerStaleRequeueGrace <= 0 || !r.StaleRequeuePinnable || !r.StatusSince.Valid || !r.UpdatedAt.Valid {
+		return time.Time{}, false
+	}
+	graceEnd := r.StatusSince.Time.Add(s.p.WorkerStaleRequeueGrace)
+	ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling)
+	if !now.Before(graceEnd) || now.After(ceilingEnd) {
+		return time.Time{}, false
+	}
+	if ceilingEnd.Before(graceEnd) {
+		return ceilingEnd, true
+	}
+	return graceEnd, true
+}
+
+// staleRequeuePinReason renders the waiting reason for a pinned run. The deadline leads so a
+// clamped render keeps it, and the text is a pure function of (until, name), so it is stable
+// across ticks for one episode and the detector does not rewrite it.
+func staleRequeuePinReason(until time.Time, workerName string) string {
+	who := "its previous worker"
+	if workerName != "" {
+		who += " " + workerName
+	}
+	return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for " + who +
+		" to return; another worker may take it after that"
+}
+
+// isStaleRequeuePinReason reports whether a stored health reason is the stale-requeue pin
+// explanation. Prefix-matched because the reason embeds the deadline and worker name.
+func isStaleRequeuePinReason(reason string) bool {
+	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix)
 }
 
 // healthSince decides the health_since to write. It stamps now when a flag is raised
