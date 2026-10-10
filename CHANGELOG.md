@@ -57,6 +57,9 @@ through `[0.52.0]`.)
 - **The split TUI footer keeps its key hints beside the restart hint ([#2609](https://github.com/vtmocanu/uzi/issues/2609)).**
   When "vX installed, restart uzi to use it" shows, the split footer no longer collapses to `? keys · q quit` on wide terminals: it drops the optional hints only as far as needed and right-aligns the full restart text, falling back to the short footer when the hints cannot fit beside it.
 
+- **TUI run detail fits narrow terminals ([#2591](https://github.com/vtmocanu/uzi/issues/2591)).**
+  The run detail and answer views' crew and transcript rows are now clipped to the terminal width instead of overflowing it; the crew rail keeps its width and the transcript column is what is cut.
+
 - **Retained recovery continues after a refused immediate or wall pause.**
   Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
 
@@ -80,6 +83,9 @@ through `[0.52.0]`.)
 
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
+
+- **`uzi job create --prompt-file` and `--input` keep the failure reason visible for long paths ([#2608](https://github.com/vtmocanu/uzi/issues/2608)).**
+  A missing, unreadable or non-regular prompt or input file now reports the reason before the path, so the CLI’s bounded error line preserves it for deeply nested files.
 
 - **Label sweep help includes bot-assignment eligibility.**
   The schedule modal clarifies that selector candidates can fire with the configured eligibility label or assignment to the uzi bot.

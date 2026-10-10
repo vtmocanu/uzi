@@ -154,13 +154,14 @@ type CompletionAttemptResult struct {
 // set of the run's contract criteria whose milestone_id is NOT present in milestones_completed
 // (the server's union-merged declared-complete set). It NEVER trusts a worker claim.
 //
-// It returns (unmet, verifiable). verifiable is FALSE — the fail-closed split-state hazard —
-// when the interlocked run's completion_contract is NULL (or corrupt) while milestones were
-// frozen: the permit path must DENY (contract_not_frozen), and to keep the attempt path
-// fail-closed too the returned unmet is then the FULL frozen milestone id set (nothing reads as
-// done). Two further parseable-but-damaged shapes fail closed the same way (issue #2259): a
-// contract whose criteria are absent or null (JSON null, {} or {"criteria":null}, as distinct
-// from an explicit criteria:[]), and one lacking a criterion for some frozen milestone. A
+// It returns (unmet, verifiable). verifiable is FALSE — fail closed — when the interlocked run's
+// completion_contract is NULL (the split-state hazard) or corrupt, whether or not milestones
+// were frozen: the permit path must DENY (contract_not_frozen), and to keep the attempt path
+// fail-closed too the returned unmet is then the FULL frozen milestone id set (empty when none
+// were frozen; nothing reads as done). Two further parseable-but-damaged shapes fail closed
+// the same way (issue #2259): a contract whose criteria are absent or null (JSON null, {} or
+// {"criteria":null}, as distinct from an explicit criteria:[]), and one lacking a criterion
+// for some frozen milestone. A
 // genuinely milestone-less run has a NON-NULL contract with criteria:[], so it returns
 // (empty, true) — vacuously complete. That contract exists only because the freeze sees a
 // non-NULL milestone source: the worker omits an empty milestone list, so the server reads an

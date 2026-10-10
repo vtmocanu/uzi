@@ -658,7 +658,9 @@ func transcriptText(f laneFrame) string {
 // rail TALLER than that — a run with many lanes plus a long milestone block — is truncated to
 // it rather than pushing the total past the terminal height and clipping the footer below the
 // body (issue #379: the footer carries pane nav / esc / ? and must always render). A shorter
-// rail is padded, which is what fills the divider to the bottom.
+// rail is padded, which is what fills the divider to the bottom. Each joined row is bounded to
+// the terminal width (issue #2591); the rail keeps its fixed width, the right column is what is
+// clipped.
 func (m tuiModel) joinColumns(left, right string, width int) string {
 	l := strings.Split(left, "\n")
 	r := strings.Split(right, "\n")
@@ -673,7 +675,11 @@ func (m tuiModel) joinColumns(left, right string, width int) string {
 		if i < len(r) {
 			rv = r[i]
 		}
-		sb.WriteString(padVisual(clampVisual(lv, width), width) + div + rv + "\n")
+		row := padVisual(clampVisual(lv, width), width) + div + rv
+		if m.width > 0 {
+			row = clampVisual(row, m.width)
+		}
+		sb.WriteString(row + "\n")
 	}
 	return sb.String()
 }
