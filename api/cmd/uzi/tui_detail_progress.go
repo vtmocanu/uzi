@@ -6,8 +6,61 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 )
 
-// nowNoteMaxWidth caps the drawn model summary (the server already limits it to 120 runes).
-const nowNoteMaxWidth = 120
+// nowLabel is the hanging-indent label of the wrapped model summary; nowMaxRows bounds its height.
+const (
+	nowLabel   = "now "
+	nowMaxRows = 4
+)
+
+// wrapWords greedily word-wraps already-sanitized single-line text to width columns and at most
+// maxRows rows; text that does not fit ends its last row with an ellipsis. A word wider than a
+// row is split across rows.
+func wrapWords(text string, width, maxRows int) []string {
+	if width < 2 || maxRows < 1 {
+		return nil
+	}
+	var rows []string
+	cur := ""
+	flush := func() {
+		if cur != "" {
+			rows = append(rows, cur)
+			cur = ""
+		}
+	}
+	for _, word := range strings.Fields(text) {
+		for visualWidth(word) > width {
+			flush()
+			cut, w := 0, 0
+			for i, r := range word {
+				rw := visualWidth(string(r))
+				if w+rw > width {
+					break
+				}
+				w += rw
+				cut = i + len(string(r))
+			}
+			if cut == 0 {
+				return rows
+			}
+			rows = append(rows, word[:cut])
+			word = word[cut:]
+		}
+		switch {
+		case cur == "":
+			cur = word
+		case visualWidth(cur)+1+visualWidth(word) <= width:
+			cur += " " + word
+		default:
+			flush()
+			cur = word
+		}
+	}
+	flush()
+	if len(rows) <= maxRows {
+		return rows
+	}
+	return append(rows[:maxRows-1], clampVisual(rows[maxRows-1]+" "+rows[maxRows], width))
+}
 
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
@@ -43,16 +96,25 @@ func (m tuiModel) renderProgress() string {
 			lines = append(lines, faint("phase ▸ ")+m.renderer.Plain(p.Phase, laneRailWidth-visualWidth("phase ▸ ")))
 		}
 		if p.NowNote != nil {
-			// PRD #2603 mock 4: `now  <text> · model summary · 2m ago`. The text is model-written
-			// (untrusted), so it goes through renderer.Plain with a cap; the label and suffix are faint.
-			note := *p.NowNote
-			text, noAt := m.renderer.Plain(note.Text, nowNoteMaxWidth), note.At.IsZero()
-			if strings.TrimSpace(text) != "" {
-				suffix := " · model summary"
-				if !noAt {
-					suffix += " · " + relAge(note.At) + " ago"
+			// PRD #2603 mock 4: the model-written (untrusted) summary wraps under a `now` label inside the
+			// rail, then `model summary · <age> ago` rides its own faint row so the marking is never clamped
+			// away by joinColumns. The cap is the most the four wrapped rows can draw.
+			indent := strings.Repeat(" ", visualWidth(nowLabel))
+			rowW := laneRailWidth - visualWidth(nowLabel)
+			text := m.renderer.Plain(p.NowNote.Text, rowW*nowMaxRows+nowMaxRows)
+			if wrapped := wrapWords(text, rowW, nowMaxRows); len(wrapped) > 0 {
+				for i, row := range wrapped {
+					if i == 0 {
+						lines = append(lines, faint(nowLabel)+row)
+					} else {
+						lines = append(lines, indent+row)
+					}
 				}
-				lines = append(lines, faint("now  ")+text+faint(suffix))
+				tag, at := "model summary", p.NowNote.At
+				if !at.IsZero() {
+					tag += " · " + relAge(at) + " ago"
+				}
+				lines = append(lines, faint(tag))
 			}
 		}
 	case runprogress.StateStalled:

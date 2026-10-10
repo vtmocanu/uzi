@@ -896,7 +896,8 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		// id is not in the frozen list, the hostile id itself; Phase and the blocked-by id are server
 		// strings from untrusted text. All four go through renderer.Plain.
 		Progress: &apitypes.RunProgress{State: "percent", Pct: &pct40, MilestoneDone: 0, MilestoneTotal: 2,
-			ActiveMilestoneID: "m1", Phase: nasty + "phasesafe", MaybeBlockedByRunID: sptr("\u202E\x07\x01\x1bblk1")},
+			ActiveMilestoneID: "m1", Phase: nasty + "phasesafe", MaybeBlockedByRunID: sptr("\u202E\x07\x01\x1bblk1"),
+			NowNote: &apitypes.ProgressNote{Text: nasty + "nowsafe", At: now}},
 		// A hostile per-milestone agent attribution (PRD #1224 M6). With m1 in progress AND
 		// attributed, the effective-attribution branch (D8) draws the DECLARED role
 		// (MilestoneAgent.Agent) and label (MilestoneAgent.AgentLabel) via railMilestoneAgentLines,
@@ -930,7 +931,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// via railMilestoneAgentLines' render of the attributed milestone's label (the title yields "safe",
 	// the account label "credsafe"). Its presence proves the PRD #1224 attribution render path ran and,
 	// paired with assertNoRawControls above, that it folded the hostile Agent/AgentLabel it drew.
-	if !strings.Contains(detailOut, "phasesafe") || !strings.Contains(detailOut, "blk1") {
+	if !strings.Contains(detailOut, "phasesafe") || !strings.Contains(detailOut, "blk1") || !strings.Contains(detailOut, "nowsafe") {
 		t.Fatalf("the crew rail PROGRESS block is not drawing Phase/MaybeBlockedByRunID, so this test is not exercising the PRD #2602 render path\n%s", detailOut)
 	}
 	if !strings.Contains(detailOut, "milesafe") {

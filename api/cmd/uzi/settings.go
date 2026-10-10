@@ -1,8 +1,6 @@
 package main
 
 import (
-	"fmt"
-
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -35,8 +33,8 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			// PRD #2603: nil means the per-user switch was never set, which reads as on.
-			_, err = fmt.Fprintln(env.Stdout, settingsNowSummaryLine(settings))
-			return err
+			p.Println(settingsNowSummaryLine(settings))
+			return nil
 		},
 	})
 	return cmd

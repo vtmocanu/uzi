@@ -197,23 +197,52 @@ func TestDetailRailProgressNowLine(t *testing.T) {
 		return m.renderProgress()
 	}
 	raw := render(&apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneTotal: 3, NowNote: note})
-	if got := stripANSI(raw); !strings.Contains(got, "now  running the agent gate · model summary · 2m ago") {
-		t.Errorf("now line missing:\n%s", got)
+	if got := stripANSI(raw); !strings.Contains(got, "now running the agent") || !strings.Contains(got, "model summary · 2m ago") {
+		t.Errorf("now block missing:\n%s", got)
 	}
 	for name, p := range map[string]*apitypes.RunProgress{
 		"stalled": {State: "stalled", NowNote: note},
 		"blank":   {State: "percent", Pct: &pct, NowNote: &apitypes.ProgressNote{Text: " ", At: note.At}},
 		"absent":  {State: "percent", Pct: &pct},
 	} {
-		if strings.Contains(stripANSI(render(p)), "now  ") {
+		if strings.Contains(stripANSI(render(p)), "model summary") {
 			t.Errorf("%s: now line drawn", name)
 		}
 	}
 	for _, hostile := range []string{"\x1b[31mred\x1b[0m", "\x1b[2Jclear", "\u202Ebidi", "bel\x07", "<img src=x onerror=1>"} {
 		raw := render(&apitypes.RunProgress{State: "percent", Pct: &pct, NowNote: &apitypes.ProgressNote{Text: hostile, At: note.At}})
-		assertNoRawControls(t, "now line", strings.ReplaceAll(raw, "\x1b[", "\x1b["))
-		if strings.ContainsAny(stripANSI(raw), "\x1b\x07\u202e") {
-			t.Errorf("hostile %q reached the block: %q", hostile, raw)
+		// Only the palette's own SGR may remain: the same block with a benign note of the same
+		// shape carries the identical escape count, so any extra ESC is the model's injected byte.
+		benign := render(&apitypes.RunProgress{State: "percent", Pct: &pct, NowNote: &apitypes.ProgressNote{Text: "benign", At: note.At}})
+		if got, want := strings.Count(raw, "\x1b"), strings.Count(benign, "\x1b"); got != want || strings.ContainsAny(raw, "\x07\u202e") {
+			t.Errorf("hostile %q reached the block (%d ESC, want %d): %q", hostile, got, want, raw)
+		}
+		assertNoRawControls(t, "now line", raw)
+	}
+}
+
+// TestDetailViewNowNoteWrapsInsideRail drives the composed View: a 120-char note must show a
+// substantial prefix, the model-summary marking and its age, and no rail row may exceed the rail.
+func TestDetailViewNowNoteWrapsInsideRail(t *testing.T) {
+	pct := 40
+	text := strings.Repeat("verifying the migration ordering ", 4)[:120]
+	run := apitypes.RunDTO{ID: "r-wrap", Kind: "issue", Status: "running", Health: "ok", IssueTitle: "t",
+		Progress: &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneTotal: 2,
+			NowNote: &apitypes.ProgressNote{Text: text, At: time.Now().Add(-2 * time.Minute)}}}
+	for _, width := range []int{80, 120} {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+		next, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 40})
+		m = applyDetail(next.(tuiModel), run, nil)
+		frame := stripANSI(m.View().Content)
+		for _, want := range []string{"model summary", "2m ago", "verifying the", "migration"} {
+			if !strings.Contains(frame, want) {
+				t.Errorf("width %d: frame missing %q:\n%s", width, want, frame)
+			}
+		}
+		for _, row := range strings.Split(stripANSI(m.renderProgress()), "\n") {
+			if w := visualWidth(row); w > laneRailWidth {
+				t.Errorf("width %d: progress row %q is %d cols, over laneRailWidth=%d", width, row, w, laneRailWidth)
+			}
 		}
 	}
 }
