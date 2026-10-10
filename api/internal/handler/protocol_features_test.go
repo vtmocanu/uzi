@@ -21,7 +21,7 @@ import (
 // recovery_completed_publication_v1 beside the recovery inventory feature.
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true)
-	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot"}
+	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(true) = %v, want exactly %v", got, want)
 	}
@@ -37,7 +37,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // worker never sends the snapshot) while every other landed token stays exactly as it was.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false)
-	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report"}
+	want := []string{"dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false) = %v, want exactly %v", got, want)
 	}

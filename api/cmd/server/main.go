@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/dbdiskfull"
 	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
@@ -198,7 +199,10 @@ func run() error {
 		return err
 	}
 
-	pool, err := store.OpenPool(ctx, cfg.DatabaseURL)
+	// diskFull records SQLSTATE 53100 write failures seen on the api pool; the admin
+	// health db check reads it.
+	diskFull := dbdiskfull.New(time.Now)
+	pool, err := store.OpenPool(ctx, cfg.DatabaseURL, store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}))
 	if err != nil {
 		return err
 	}
@@ -1098,6 +1102,8 @@ func run() error {
 		ResidueQuarantine:            wsvc.ResidueQuarantineFor,
 		Store:                        q,
 		Pool:                         pool,
+		DiskFull:                     diskFull,
+		DBStorageCapacityBytes:       cfg.DBStorageCapacityBytes,
 		Settings:                     settingsCache,
 		SlackState:                   slackManager.State,
 		Now:                          time.Now,
@@ -1120,7 +1126,10 @@ func run() error {
 	// and the health-notification enablement gate (settingsCache.HealthEnabled — the SAME
 	// gate the custody-episode reconciler reuses, no new enable flag, D10). notifier and
 	// settingsCache are the same collaborators wired into custodyEpisodeRec above.
-	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default())
+	// WithEmergencySlack adds the in-memory disk-full DM for a database that refuses the
+	// episode-open/claim/persist writes (SQLSTATE 53100); see EpisodeReconciler for its limits.
+	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default()).
+		WithEmergencySlack(slackNotifier, diskFull)
 	healthEpisodeInterval := time.Minute
 	bgWG.Add(1)
 	go func() {

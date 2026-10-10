@@ -910,7 +910,16 @@ chain in the diagram above, with no intervening `running`.
   Codex uses accepted structured per-turn account-window evidence, with the latest
   selected reset or bounded fallback, not provider prose, account reads or polling.
   If that account is unavailable after promotion, Claim refuses it and Sweep holds
-  it at `recovery_wait` / `codex_account_unavailable`. Recovered approved work
+  it at `recovery_wait` / `codex_account_unavailable`. The account hold and
+  same-identity re-admission are defined by [PRD #1590](prds/1590-codex-quarantine-claim-hold.md)
+  and [ADR-1590](adr/1590-codex-binding-same-identity-readmission.md).
+  [PRD #1595](prds/1595-codex-boundary-account-park.md) extends this hold to eligible
+  running subscription boundary reconciles: a negotiated worker captures source
+  credential-free before requesting a park; the API re-classifies under claim fences
+  and run → alias → account locks, revokes the capability, and retains custody and
+  source-worker affinity. The mechanism is owned by
+  [ADR-1766's amendment](adr/1766-codex-vault-lock-park.md#account-unavailable-boundary-amendment-issue-1595-2026-10-10);
+  maintainer-hosted acceptance is pending. Recovered approved work
   resumes without another plan gate. Two independent guards keep the on-disk
   state alive (the runner's teardown carve-out and `home-reclaim`'s
   terminal-status check); losing either loses the transcript. See
@@ -2244,7 +2253,7 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 rationale, and the deferred items (version skew, per-connection sync freshness).
 
 The health registry supplies each check's `scope` (#2293): `db`,
-`controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
+`db.size`, `controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
@@ -2254,6 +2263,22 @@ the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
 sends no admin DM and raises no banner; owner run-health routing is unchanged.
+
+Database storage has two signals, both from inside the api (no volume or
+Kubernetes access). A pgx query tracer on the pool
+(`api/internal/dbdiskfull`) remembers the last SQLSTATE `53100` the api saw, per
+replica and in memory, and the `db` check is danger for five minutes after it.
+`db.size` compares `pg_database_size` to the operator-declared
+`DB_STORAGE_CAPACITY_BYTES` (rendered by the chart from the database storage
+size), warning at 75% and danger at 85% (the episode opens on the first danger tick
+and the admin notice goes out on the next still-danger tick, the usual debounce),
+cached 60 seconds per replica; it is a database-size budget, not volume usage,
+and excludes WAL. When the episode open (on the second consecutive tick whose
+open fails), the notice claim or the notification insert itself fails with
+`53100`, the episode reconciler posts the admin Slack notice straight from memory
+(`api/internal/healthsvc/emergency.go`) with a per-replica 30-minute cooldown.
+See [Database storage signals](docs/admin-health.md#database-storage-signals)
+for the blind spots and limits.
 
 `pricing.codex` compares recent Codex usage folds against the API's embedded
 release price table. `codexprice.PricedModels` filters the usage query and

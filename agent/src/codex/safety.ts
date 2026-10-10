@@ -107,10 +107,10 @@ export type ReconcileOutcome =
   | {
       kind: "blocked";
       errors: readonly HarnessError[];
-      /** A confirmed vault lock or unresolved subscription refresh outcome defers the
+      /** A confirmed vault lock, account unavailability or unresolved refresh outcome defers the
        *  reconcile. This field never grants authority: the boundary still poisons and throws,
        *  and the runner must prove credential-free capture before parking for recovery. */
-      deferral?: "vault_locked" | "refresh_unknown";
+      deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable";
     };
 
 /** Issue #1766: the result of {@link CodexExecutionSafetyImpl.settleForCredentialFreeCapture}.
@@ -245,9 +245,9 @@ export class CodexBoundaryError extends Error {
    *  "preserve primary failure and cleanup evidence separately"). It is also set as
    *  the standard `cause`. Undefined when the action itself did not throw. */
   readonly actionError?: unknown;
-  /** Set when a reconcile block carries a vault-lock or unresolved-refresh deferral.
+  /** Set when a reconcile block carries a credential deferral.
    *  The registry is still poisoned; the runner may preserve it for later recovery. */
-  readonly deferral?: "vault_locked" | "refresh_unknown";
+  readonly deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable";
   /** Issue #1864: the boundary and the checkpoint sink that requested it, when known. */
   readonly boundary?: SafeBoundary;
   readonly sink?: BoundarySink;
@@ -263,7 +263,7 @@ export class CodexBoundaryError extends Error {
     readonly stage: "reconcile" | "quiesce" | "reap" | "action",
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
-    deferral?: "vault_locked" | "refresh_unknown",
+    deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable",
     context?: { boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep },
   ) {
     super(

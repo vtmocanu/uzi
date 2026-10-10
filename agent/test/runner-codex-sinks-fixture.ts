@@ -220,6 +220,7 @@ export function codexRig(
      *  409 `vault_locked` RequestError (a locked owner vault after authorization). */
     vaultLocked?: () => boolean;
     refreshUnknown?: boolean;
+    accountUnavailable?: () => boolean;
     /** Issue #1784: while this answers true, refreshCodex/releaseCodex throw the api's 409 "codex
      *  credential is not available" (the server refuses a reconcile for a `paused` run). */
     refuseReconcile?: () => boolean;
@@ -246,6 +247,7 @@ export function codexRig(
       _req: { capability: string; operation_id: string; observed_generation: number },
     ) => {
       refreshCalls += 1;
+      if (opts.accountUnavailable?.()) throw new RequestError("POST", "/x", 409, JSON.stringify({ reason: "codex_account_unavailable", error: VAULT_BODY_SENTINEL }));
       if (opts.refreshUnknown) throw new CodexRequestFailure("transport");
       if (opts.refuseReconcile?.()) throw notAvailableError("refresh");
       if (opts.vaultLocked?.()) throw vaultLockedError("refresh");

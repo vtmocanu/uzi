@@ -17,7 +17,7 @@ func (s *Service) checkCodexPricing(ctx context.Context, now time.Time) apitypes
 	s.pricingMu.Lock()
 	defer s.pricingMu.Unlock()
 	if s.pricingInitialized && now.Sub(s.pricingRefreshedAt) < pricingCacheTTL {
-		return copyPricingCheck(s.pricingResult)
+		return copyCheck(s.pricingResult)
 	}
 	c := s.base("pricing.codex")
 	// A refresh makes one query with a five-second deadline. Its failure replaces
@@ -54,11 +54,11 @@ func (s *Service) checkCodexPricing(ctx context.Context, now time.Time) apitypes
 	s.pricingResult = c
 	s.pricingRefreshedAt = now
 	s.pricingInitialized = true
-	return copyPricingCheck(c)
+	return copyCheck(c)
 }
 
-// copyPricingCheck keeps all mutable DTO storage private to each caller.
-func copyPricingCheck(c apitypes.HealthCheckDTO) apitypes.HealthCheckDTO {
+// copyCheck keeps all mutable DTO storage private to each caller.
+func copyCheck(c apitypes.HealthCheckDTO) apitypes.HealthCheckDTO {
 	evidence := make([]apitypes.HealthEvidenceDTO, len(c.Evidence))
 	copy(evidence, c.Evidence)
 	c.Evidence = evidence

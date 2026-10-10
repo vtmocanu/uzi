@@ -16,7 +16,7 @@ import (
 
 func TestEvaluateScopes(t *testing.T) {
 	want := map[string]string{
-		"fleet.roll": "instance", "controller.report": "instance", "db": "instance", "loops": "instance",
+		"fleet.roll": "instance", "controller.report": "instance", "db": "instance", "db.size": "instance", "loops": "instance",
 		"fleet.capacity": "owner", "fleet.disk": "owner", "fleet.rundisk": "owner",
 		"fleet.quarantine": "owner",
 		"queue.waiting":    "owner", "queue.undispatched": "owner", "forge.sync": "owner",

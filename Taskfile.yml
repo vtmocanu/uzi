@@ -1373,12 +1373,23 @@ tasks:
       - ./scripts/assert-worker-tag-decoupled.sh
 
   render:openshift-check:
-    desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) render as documented
+    desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) and the DB capacity render as documented
     cmds:
       # Offline (the CNPG subchart is stripped), needs helm + yq. Not in gate:repo (the
       # lint job lacks helm); CI runs it in the helm-chart job. See the script header and
-      # docs/openshift.md.
+      # docs/openshift.md. Also runs the DB capacity render check (the api's
+      # DB_STORAGE_CAPACITY_BYTES derived from the database storage size), so CI's
+      # helm-chart job enforces it without a workflow edit.
       - ./scripts/assert-openshift-render.sh
+      - ./scripts/assert-db-capacity-render.sh
+
+  render:db-capacity-check:
+    desc: assert the chart renders the api's DB_STORAGE_CAPACITY_BYTES from the database storage size
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-db-capacity-render.sh
 
   render:drain-knobs-check:
     desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)
