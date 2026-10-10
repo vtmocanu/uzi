@@ -9,9 +9,9 @@ package workersvc
 //  1. INGEST (normalizeSummaryUsagePayload): the stored payload is rebuilt from scratch with
 //     only {pass, model_usage}, each usage entry carrying the server-resolved costStatus (and
 //     costUSD when metered). `pass` must be one of the allowlisted names, anything else is "".
-//     Any other key is dropped, in particular `event` (a payload that says event:"result"
-//     would be read by the usage tail and the web fold as the end of a leg) and `usage` (the
-//     web fold would count it a second time).
+//     Any other key is dropped, in particular `usage` (the web fold's per-agent branch reads
+//     it without checking the kind, so it would be counted a second time) and `event` (defense
+//     in depth: every leg-end reader gates on kind status/error first, so it is harmless today).
 //  2. USAGE FOLD (foldSummaryUsage): the pass's model_usage is folded into run_usage under its
 //     OWN key so it can neither collapse into, nor be collapsed by, the run's own result frames
 //     or a progress_note naming the same model in the same leg
@@ -62,7 +62,7 @@ func normalizeSummaryUsagePayload(raw json.RawMessage, harness string) json.RawM
 	if json.Unmarshal(in["model_usage"], &usage) == nil {
 		out.ModelUsage = normalizeModelUsageMap(usage, harness, summaryPassModelPrefix, KindSummaryUsage)
 	}
-	b, err := json.Marshal(out)
+	b, err := json.Marshal(out) //nolint:gosec // G117: "pass" names a summary pass (intent/plan/pr_description), not a password
 	if err != nil {
 		// Unreachable: every field is a string, an int64 or a sanitised raw number.
 		return json.RawMessage(`{"pass":""}`)

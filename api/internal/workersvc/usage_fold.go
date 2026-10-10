@@ -506,7 +506,8 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// (unreleased) claim — a released claim is now rejected even for a generation-less (legacy)
 		// report; a live claim still honours a NULL generation.
 		//
-		// PRD #2603: a batch of ONLY progress_note messages advances last_seq WITHOUT bumping
+		// PRD #2603 / issue #2686: a batch of ONLY progress_note or summary_usage messages
+		// (onlyUsageSideChannel) advances last_seq WITHOUT bumping
 		// last_activity_at. A Now-summary is the worker talking about the run, not the run
 		// working, so it must not turn a stalled run healthy, show a Now line on it, or make the
 		// stall nudge flap. Any other message in the batch restores the normal bump.

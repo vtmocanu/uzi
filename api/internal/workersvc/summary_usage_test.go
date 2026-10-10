@@ -91,7 +91,7 @@ func TestSummaryUsagePassAllowlist(t *testing.T) {
 		{"pr_description", "pr_description"},
 		{"Plan", ""},
 		{"now", ""},
-		{"intent‮", ""},
+		{"intent\u202e", ""},
 		{"", ""},
 	}
 	for _, c := range cases {
