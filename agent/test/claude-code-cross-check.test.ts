@@ -329,17 +329,22 @@ it("reader shutdown failure cannot confirm cleanup even if every native group is
   assert.equal(callback, false);
 });
 
-for (const clean of [true, false]) it("runner selects production Claude with local H/diff and " + (clean ? "releases" : "retains") + " snapshot", async () => {
+for (const truncated of [false, true]) for (const clean of [true, false]) it("runner selects production Claude with local H/" + (truncated ? "truncated diff" : "diff") + " and " + (clean ? "releases" : "retains") + " snapshot", async () => {
   const root = await fs.mkdtemp(path.join(scratch, "claude-runner-code-"));
   const calls: unknown[][] = [];
   const decisions: any[] = [];
   const states: string[] = [];
   let closed = 0;
   let stopped = false;
+  let prompt = "";
+  const expectedDiff = truncated
+    ? "Diff exceeds 1 MiB; inspect committed files through Read, Grep and Glob."
+    : "committed patch";
   const c = claim();
   const model = checker(p => (async function* () {
     try {
       p.options.spawnClaudeCodeProcess!({ command: "fixture", args: [], env: {}, signal: new AbortController().signal });
+      for await (const frame of p.prompt) prompt += JSON.stringify(frame);
       yield init; yield result(output([finding]));
     } finally { stopped = true; }
   })(), { spawn: () => ({ pid: 123456789 }), groupPresent: () => clean ? false : undefined });
@@ -355,9 +360,12 @@ for (const clean of [true, false]) it("runner selects production Claude with loc
     ensureClone: async () => { assert.fail("code must not prepare origin"); },
     barePathFor: () => "/local-bare",
     runnerCloneAtCommit: async (...args: unknown[]) => { calls.push(args); return root; },
-    readBare: async (_bare: string, args: unknown[], opts: any) => {
+    readBare: async (bare: string, args: unknown[], opts: any) => {
+      assert.equal(bare, "/local-bare");
       assert.deepEqual(args, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "a".repeat(40) + "..." + "b".repeat(40)]);
-      assert.equal(opts.maxBytes, 1024 * 1024); return { text: "committed patch", truncated: false };
+      assert.equal(opts.maxBytes, 1024 * 1024);
+      assert.ok(opts.signal instanceof AbortSignal);
+      return { text: "committed patch", truncated };
     },
     removeRunnerClone: async () => { assert.ok(stopped); },
     closeCodeSnapshotReader: async () => { assert.ok(stopped); closed++; },
@@ -366,6 +374,8 @@ for (const clean of [true, false]) it("runner selects production Claude with loc
   try {
     await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1, modelTimeoutMs: 1000,
       claudeModel: model, model: { run: async () => { assert.fail("wrong family"); } } }).execute(c);
+    assert.equal(c.cross_check?.stage === "code" && c.cross_check.code_diff, expectedDiff, "Claude committed diff uses its selected family tool names");
+    assert.ok(prompt.includes(expectedDiff), "production Claude prompt carries the committed diff notice");
     assert.deepEqual(calls, [["/local-bare", "b".repeat(40), "child", "lead", 7]]);
     assert.equal(decisions.at(-1).outcome, clean ? "completed" : "failed");
     if (clean) assert.deepEqual(decisions.at(-1).findings, [finding]);

@@ -170,7 +170,9 @@ export class CrossCheckRunner {
           ["diff", "--no-ext-diff", "--no-textconv", "--no-color", `${code.base_commit}...${code.head_commit}`],
           { maxBytes: 1024 * 1024, signal: cancel.signal });
         // Never present a truncated patch as a complete diff; file tools still see exact H.
-        code.code_diff = diff.truncated ? "Diff exceeds 1 MiB; inspect committed files through read-only tools." : diff.text;
+        code.code_diff = diff.truncated ? (checker === this.claudeModel
+          ? "Diff exceeds 1 MiB; inspect committed files through Read, Grep and Glob."
+          : "Diff exceeds 1 MiB; inspect committed files through Read and Search.") : diff.text;
       } else checkout = await this.git.runnerCloneAtCommit(bare, candidate.base_commit, runId);
       cancel.signal.throwIfAborted();
       await fs.mkdir(this.opts.homeRoot ?? os.tmpdir(), { recursive: true });
