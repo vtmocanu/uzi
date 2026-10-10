@@ -4070,7 +4070,10 @@ export class RunRunner {
     try {
       const state = await this.recovery.inventoryCleanupState(runId, generation);
       if (state === "acknowledged") return false;
-      if (this.attemptedPublicationTerminals.has(this.completionKey(runId, generation))) return true;
+      // Attempted publication requires confirmed discard even with absent local inventory:
+      // absent-mode authority also permits released/legacy custody, forbidden for this attempt.
+      if (this.attemptedPublicationTerminals.has(this.completionKey(runId, generation)))
+        return !(await this.client.hasRecoveryRetirementAuthority(runId, generation, "pending"));
       if (state === "absent" || state === "pending" || this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) {
         return !(await this.client.hasRecoveryRetirementAuthority(runId, generation, state === "absent" ? "absent" : "pending"));
       }

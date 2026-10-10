@@ -30,6 +30,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   const sent: StateRequest[] = [];
   let loseResponse = false, refuse = false, enabled = true, released = false;
   let workerId = literal.worker_id;
+  let retirement: { ownership: unknown; custody: unknown } | undefined;
   const branch = kind === "self_improve" ? "uzi/self-improve/" + literal.run_id : literal.branch;
   const receipt = { ...literal, branch };
   const claim = makeClaim({ run_id: receipt.run_id, claim_generation: 1, inventory_guarded: true,
@@ -38,8 +39,13 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(String(input));
       if (url.pathname.endsWith("/register")) return Response.json({ worker_id: workerId,
-        protocol_features: ["claim_generation_fence", "recovery_inventory_v1", ...(enabled ? [feature] : [])] });
+        protocol_features: ["claim_generation_fence", "recovery_inventory_v1", "terminal_rejection_report", ...(enabled ? [feature] : [])] });
       if (url.pathname.endsWith("/claim")) return Response.json(claim);
+      if (url.pathname.endsWith("/ownership")) return Response.json(retirement?.ownership ?? {});
+      if (url.pathname.endsWith("/terminal-rejection-custody")) {
+        events.push("custody");
+        return Response.json(retirement?.custody ?? {});
+      }
       if (url.pathname.endsWith("/recovery-holds")) return Response.json({ run_id: receipt.run_id,
         holds: released ? [] : [{ hold_id: receipt.hold_id, generation: receipt.generation, inventory_guarded: true, has_available_capture: false }] });
       if (url.pathname.endsWith("/state")) {
@@ -105,6 +111,15 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     outbox: outbox!, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger(),
   }), { runId: receipt.run_id, claimGeneration: receipt.generation, send });
   return { root, events, sent, receipt, recovery, record, run, flight, body, terminal, replay, outbox, client,
+    retirement: (ownership: unknown, custody: unknown) => { retirement = { ownership, custody }; },
+    freshClient: async () => {
+      const fresh = new WorkerClient("http://completion.test", "completion-worker-fixture", "test", nullLogger(),
+        { sleep: async () => {}, terminalRetrySchedule: [1] });
+      await fresh.register("fresh");
+      return fresh;
+    },
+    freshRunner: (c: WorkerClient = client) => new RunRunner(c, git,
+      () => { throw new Error("not executing"); }, nullLogger(), 1, "completion-worker-fixture", { recovery, outbox }),
     registerAs: async (id: string) => {
       workerId = id; receipt.worker_id = id;
       await client.register("identity-change");
@@ -120,6 +135,121 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     lose: (value: boolean) => { loseResponse = value; }, refuse: () => { refuse = true; },
     disable: async () => { enabled = false; await client.register("fixture"); },
     close: async () => { mock.restoreAll(); await fs.rm(root, { recursive: true, force: true }); } };
+}
+
+type CompletionFixture = Awaited<ReturnType<typeof fixture>>;
+
+function discardAuthority(f: CompletionFixture, state = "discarded") {
+  return {
+    run_id: f.receipt.run_id, worker_id: f.receipt.worker_id, generation: 1,
+    outcome: "settled", complete: true, exact_complete: true, sibling_complete: true,
+    exact_count: 1, sibling_count: 0,
+    exact_holds: [{ id: f.receipt.hold_id, state }], sibling_holds: [],
+  };
+}
+
+function terminalOwnership(inventoryGuarded = true) {
+  return { status: "completed", claim_generation: 1, inventory_guarded: inventoryGuarded };
+}
+
+function discardWorker(f: CompletionFixture, run: RunRunner, client = f.client) {
+  return new Worker({ gapFillMax: 100, outboxTerminalMaxBytes: 1 << 20 } as Config,
+    client, run, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(),
+    () => ({ ok: true, missing: [] }), f.outbox, new Map()) as unknown as {
+      resolveBootTerminals(signal: AbortSignal): Promise<void>;
+      sweepPendingTerminals(signal: AbortSignal): Promise<void>;
+      sweepPendingFinalizes(signal: AbortSignal): Promise<void>;
+    };
+}
+
+async function discardInventory(f: CompletionFixture, inventory: "pending" | "absent") {
+  if (inventory === "absent")
+    await fs.rm(path.join(f.root, "recovery", f.receipt.run_id), { recursive: true, force: true });
+}
+
+function assertAttempted(run: RunRunner, f: CompletionFixture) {
+  assert.equal((Reflect.get(run, "attemptedPublicationTerminals") as Set<string>)
+    .has(f.receipt.run_id + ":1"), true, "replay restores attempted publication marker");
+}
+
+for (const inventory of ["pending", "absent"] as const) {
+  for (const actor of ["runner", "Worker boot"] as const) {
+    it("discard regression: " + actor + " retires terminal and finalize with " + inventory + " inventory", async () => {
+      const f = await fixture();
+      try {
+        f.refuse();
+        await discardInventory(f, inventory);
+        assert.equal((await f.outbox!.journalFinalize(f.receipt.run_id, 1)).written, true);
+        if (actor === "runner") await f.terminal();
+        else await f.outbox!.journalTerminal(f.receipt.run_id, 1, "running", 7, f.body);
+        f.retirement(terminalOwnership(), discardAuthority(f, "released"));
+        const run = actor === "runner" ? f.run : f.freshRunner();
+        const worker = discardWorker(f, run);
+        if (actor === "Worker boot") await worker.resolveBootTerminals(new AbortController().signal);
+        assertAttempted(run, f);
+        assert.equal(await run.recoveryInventoryPending(f.receipt.run_id, 1), true);
+        assert.ok(await f.outbox!.readTerminalJournal(f.receipt.run_id, 1));
+        await worker.sweepPendingFinalizes(new AbortController().signal);
+        assert.equal(f.outbox!.listPendingFinalizeGenerations(true).length, 1,
+          "finalize journal installed before attempted completion remains before discard");
+
+        f.retirement(terminalOwnership(), discardAuthority(f));
+        assert.equal(await run.recoveryInventoryPending(f.receipt.run_id, 1), false);
+        if (actor === "runner") {
+          await f.replay();
+          await (run as unknown as {
+            retireFinalizeRecord(flight: unknown, site: string): Promise<void>;
+          }).retireFinalizeRecord(f.flight, "discard regression");
+        } else {
+          await worker.sweepPendingTerminals(new AbortController().signal);
+          await worker.sweepPendingFinalizes(new AbortController().signal);
+        }
+        assert.equal(await f.outbox!.readTerminalJournal(f.receipt.run_id, 1), undefined);
+        assert.equal(f.outbox!.listPendingFinalizeGenerations(true).length, 0);
+        assert.equal(await f.recovery.hasPersistedCompletionReceipt(f.receipt.run_id, 1), false);
+      } finally { await f.close(); }
+    });
+  }
+
+  for (const authority of ["released", "missing", "unknown", "wrong generation", "wrong worker", "incomplete", "legacy"] as const) {
+    it("discard regression: attempted completion retains " + authority + " authority with " + inventory + " inventory", async () => {
+      const f = await fixture();
+      try {
+        f.refuse();
+        await discardInventory(f, inventory);
+        assert.equal((await f.outbox!.journalFinalize(f.receipt.run_id, 1)).written, true);
+        await f.outbox!.journalTerminal(f.receipt.run_id, 1, "running", 7, f.body);
+        // In particular, legacy absence must have no process-local guarded claim history.
+        const client = await f.freshClient();
+        const run = f.freshRunner(client);
+        assert.equal(client.knowsInventoryGuardedClaim(f.receipt.run_id, 1), false);
+        let custody: unknown = discardAuthority(f);
+        if (authority === "released") custody = discardAuthority(f, "released");
+        if (authority === "missing") custody = {};
+        if (authority === "unknown") custody = { ...discardAuthority(f), outcome: "unknown",
+          exact_count: 0, exact_holds: [] };
+        if (authority === "wrong generation") custody = { ...discardAuthority(f), generation: 2 };
+        if (authority === "wrong worker") custody = { ...discardAuthority(f), worker_id: literal.owner_id };
+        if (authority === "incomplete") custody = { ...discardAuthority(f), complete: false,
+          exact_complete: false, exact_count: 257,
+          exact_holds: Array.from({ length: 256 }, (_, n) => ({
+            id: n.toString(16).padStart(8, "0") + "-aaaa-4aaa-8aaa-aaaaaaaaaaaa", state: "discarded",
+          })) };
+        if (authority === "legacy") custody = {};
+        f.retirement(terminalOwnership(authority !== "legacy"), custody);
+        if (authority === "legacy" && inventory === "absent")
+          assert.equal(await client.hasRecoveryRetirementAuthority(f.receipt.run_id, 1, "absent"), true,
+            "exact explicit legacy ownership authorizes ordinary absence");
+        const worker = discardWorker(f, run, client);
+        await worker.resolveBootTerminals(new AbortController().signal);
+        assertAttempted(run, f);
+        assert.equal(await run.recoveryInventoryPending(f.receipt.run_id, 1), true);
+        await worker.sweepPendingFinalizes(new AbortController().signal);
+        assert.ok(await f.outbox!.readTerminalJournal(f.receipt.run_id, 1));
+        assert.equal(f.outbox!.listPendingFinalizeGenerations(true).length, 1);
+      } finally { await f.close(); }
+    });
+  }
 }
 
 for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
