@@ -45,7 +45,7 @@ func TestCodeCrossCheckDispositionsRoutesStateLiveDB(t *testing.T) {
 		router.ServeHTTP(rec, req)
 		return rec
 	}
-	batch := `{"claim_generation":1,"dispositions":[{"id":"F-1","disposition":"addressed","reason":"` + strings.Repeat("é", 512) + `"}]}`
+	batch := `{"claim_generation":1,"dispositions":[{"finding_id":"F-1","disposition":"addressed","reason":"` + strings.Repeat("é", 512) + `"}]}`
 	if rec := call("POST", path, batch, "", false); rec.Code != 401 {
 		t.Fatalf("unauthenticated: %d", rec.Code)
 	}
@@ -57,7 +57,8 @@ func TestCodeCrossCheckDispositionsRoutesStateLiveDB(t *testing.T) {
 		t.Fatalf("verdict route: %d %s", rec.Code, rec.Body.String())
 	}
 	for _, body := range []string{
-		`{"claim_generation":1,"dispositions":[{"id":"F-1","disposition":"addressed","reason":"fixed","extra":true}]}`,
+		strings.Replace(batch, `"finding_id"`, `"id"`, 1),
+		`{"claim_generation":1,"dispositions":[{"finding_id":"F-1","disposition":"addressed","reason":"fixed","extra":true}]}`,
 		`{"claim_generation":1,"dispositions":[],"approval":true}`,
 		`{"claim_generation":1,"dispositions":null}`,
 		`{"dispositions":[]}`,
@@ -72,7 +73,7 @@ func TestCodeCrossCheckDispositionsRoutesStateLiveDB(t *testing.T) {
 		strings.Replace(batch, "F-1", "f-1", 1),
 		strings.Replace(batch, "F-1", "unknown", 1),
 		strings.Replace(batch, strings.Repeat("é", 512), strings.Repeat("é", 512)+"x", 1),
-		`{"claim_generation":1,"dispositions":[{"id":"F-1","disposition":"addressed","reason":"fixed"},{"id":"F-1","disposition":"declined","reason":"no"}]}`,
+		`{"claim_generation":1,"dispositions":[{"finding_id":"F-1","disposition":"addressed","reason":"fixed"},{"finding_id":"F-1","disposition":"declined","reason":"no"}]}`,
 		strings.Replace(batch, `"claim_generation":1`, `"claim_generation":2`, 1),
 	} {
 		if rec := call("POST", path, body, token, true); rec.Code != 409 {
@@ -80,7 +81,7 @@ func TestCodeCrossCheckDispositionsRoutesStateLiveDB(t *testing.T) {
 		}
 	}
 	for _, id := range []string{"", strings.Repeat("x", 65), "white space", "new\nline", "ansi\x1b[31m", "control\x00", "bidi\u202e", "unknown"} {
-		body, err := json.Marshal(map[string]any{"claim_generation": 1, "dispositions": []map[string]string{{"id": id, "disposition": "declined", "reason": "verified"}}})
+		body, err := json.Marshal(map[string]any{"claim_generation": 1, "dispositions": []map[string]string{{"finding_id": id, "disposition": "declined", "reason": "verified"}}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -93,7 +94,7 @@ func TestCodeCrossCheckDispositionsRoutesStateLiveDB(t *testing.T) {
 	}
 	tooMany := make([]map[string]string, 21)
 	for i := range tooMany {
-		tooMany[i] = map[string]string{"id": "F-1", "disposition": "addressed", "reason": "fixed"}
+		tooMany[i] = map[string]string{"finding_id": "F-1", "disposition": "addressed", "reason": "fixed"}
 	}
 	oversized, _ := json.Marshal(map[string]any{"claim_generation": 1, "dispositions": tooMany})
 	if rec := call("POST", path, string(oversized), token, true); rec.Code != 400 {
@@ -111,7 +112,10 @@ func TestCodeCrossCheckDispositionsRoutesStateLiveDB(t *testing.T) {
 	if err := json.Unmarshal(first.Body.Bytes(), &got); err != nil || got.FinalizedAt == nil || got.Outcome != "completed" {
 		t.Fatalf("finalized response: %+v %v", got, err)
 	}
-	var ds []struct{ ID, Disposition, Reason string }
+	var ds []struct {
+		ID                  string `json:"finding_id"`
+		Disposition, Reason string
+	}
 	if err := json.Unmarshal(got.Dispositions, &ds); err != nil || len(ds) != 2 || ds[0].ID != "F-1" || ds[0].Disposition != "addressed" || ds[1].ID != "F_2" || ds[1].Disposition != "not_reported" || ds[1].Reason != "" {
 		t.Fatalf("persisted missing disposition: %s %v", got.Dispositions, err)
 	}

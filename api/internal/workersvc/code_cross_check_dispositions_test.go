@@ -14,6 +14,36 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+func TestCodeCrossCheckDispositionJSONContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		refused    bool
+	}{
+		{"finding_id", `{"finding_id":"F-1","disposition":"addressed","reason":"fixed"}`, false},
+		{"legacy id", `{"id":"F-1","disposition":"addressed","reason":"fixed"}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got CodeCrossCheckDisposition
+			decoder := json.NewDecoder(strings.NewReader(tc.body))
+			decoder.DisallowUnknownFields()
+			err := decoder.Decode(&got)
+			if tc.refused {
+				if err == nil {
+					t.Fatal("legacy disposition key accepted")
+				}
+				return
+			}
+			if err != nil || got.ID != "F-1" {
+				t.Fatalf("finding_id request: %+v %v", got, err)
+			}
+			raw, err := json.Marshal(got)
+			if err != nil || string(raw) != tc.body {
+				t.Fatalf("persisted disposition: %s %v", raw, err)
+			}
+		})
+	}
+}
+
 // Exercise the public service with a transaction double; the LiveDB tests
 // separately prove PostgreSQL's write-once marker and custody predicates.
 func TestCodeCrossCheckDispositionsBatchAndRetry(t *testing.T) {
@@ -41,7 +71,7 @@ func TestCodeCrossCheckDispositionsBatchAndRetry(t *testing.T) {
 			worker := store.Worker{ID: uuid.New(), UserID: uuid.New()}
 			lead := store.Run{ID: uuid.New(), UserID: worker.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: 1, Status: "running"}
 			cc := store.CrossCheck{LeadRunID: lead.ID, LeadClaimGeneration: 1, Outcome: pgconv.Text("completed"), DecidedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, Findings: []byte(`[{"id":"F-1"},{"id":"F_2"}]`)}
-			missing := `[{"id":"F-1","disposition":"not_reported","reason":""},{"id":"F_2","disposition":"not_reported","reason":""}]`
+			missing := `[{"finding_id":"F-1","disposition":"not_reported","reason":""},{"finding_id":"F_2","disposition":"not_reported","reason":""}]`
 			if tc.finalized {
 				cc.FinalizedAt = cc.DecidedAt
 				cc.Dispositions = []byte(missing)

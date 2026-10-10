@@ -34,17 +34,17 @@ BEGIN
     OR EXISTS (
       SELECT 1 FROM jsonb_array_elements(NEW.dispositions) d
       WHERE jsonb_typeof(d) IS DISTINCT FROM 'object'
-       OR jsonb_typeof(d->'id') IS DISTINCT FROM 'string'
-       OR (d->>'id') !~ '^[A-Za-z0-9_-]{1,64}$'
+       OR jsonb_typeof(d->'finding_id') IS DISTINCT FROM 'string'
+       OR (d->>'finding_id') !~ '^[A-Za-z0-9_-]{1,64}$'
        OR jsonb_typeof(d->'reason') IS DISTINCT FROM 'string'
        OR octet_length(d->>'reason') > 1024
        OR jsonb_typeof(d->'disposition') IS DISTINCT FROM 'string'
        OR (d->>'disposition') NOT IN ('addressed','declined','not_reported')
        OR ((d->>'disposition') = 'not_reported' AND (d->>'reason') <> '')
        OR ((d->>'disposition') IN ('addressed','declined') AND btrim(d->>'reason') = '')
-       OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.findings) f WHERE f->>'id' = d->>'id')
+       OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(NEW.findings) f WHERE f->>'id' = d->>'finding_id')
     )
-    OR (SELECT count(DISTINCT d->>'id') FROM jsonb_array_elements(NEW.dispositions) d)
+    OR (SELECT count(DISTINCT d->>'finding_id') FROM jsonb_array_elements(NEW.dispositions) d)
        <> jsonb_array_length(NEW.dispositions) THEN
    RAISE EXCEPTION 'invalid code dispositions';
   END IF;

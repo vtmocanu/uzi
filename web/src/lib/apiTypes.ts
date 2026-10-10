@@ -3512,6 +3512,8 @@ export interface CodeCrossCheckSummary {
   outcome: string;
   reason_class: string | null;
   findings: unknown;
+  /** Older APIs may omit this field; validate its untrusted contents before display. */
+  dispositions?: unknown;
   interrupted_at: string | null;
   finalized_at: string | null;
   deadline_at: string;

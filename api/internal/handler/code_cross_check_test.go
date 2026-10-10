@@ -63,7 +63,7 @@ func TestCodeCrossCheckWorkerInterruptedProjection(t *testing.T) {
 			tx := &codeStatusTx{lead: store.Run{ID: uuid.New(), UserID: worker.UserID, Status: "running", ClaimGeneration: 2},
 				check: store.CrossCheck{Stage: "code", Round: 1, LeadClaimGeneration: 1, Outcome: pgtype.Text{String: "failed", Valid: true},
 					ReasonClass: pgtype.Text{String: reason, Valid: true}, InterruptedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-					Findings: []byte(`[{"id":"F-1"}]`), Dispositions: []byte(`[{"id":"F-1","disposition":"declined","reason":"verified"}]`)}}
+					Findings: []byte(`[{"id":"F-1"}]`), Dispositions: []byte(`[{"finding_id":"F-1","disposition":"declined","reason":"verified"}]`)}}
 			if reason == "superseded" {
 				tx.check.HeadCommit = pgtype.Text{String: strings.Repeat("a", 40), Valid: true}
 				tx.check.BaseCommit = tx.check.HeadCommit
@@ -87,7 +87,7 @@ func TestCodeCrossCheckWorkerInterruptedProjection(t *testing.T) {
 			if reason != "superseded" && (got.HeadCommit != nil || got.BaseCommit != nil) {
 				t.Fatal("invented snapshot")
 			}
-			if string(tx.check.Findings) != `[{"id":"F-1"}]` || string(tx.check.Dispositions) != `[{"id":"F-1","disposition":"declined","reason":"verified"}]` {
+			if string(tx.check.Findings) != `[{"id":"F-1"}]` || string(tx.check.Dispositions) != `[{"finding_id":"F-1","disposition":"declined","reason":"verified"}]` {
 				t.Fatal("worker projection changed durable evidence")
 			}
 		})

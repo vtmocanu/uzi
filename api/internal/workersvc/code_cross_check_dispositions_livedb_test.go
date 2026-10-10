@@ -143,7 +143,7 @@ func TestCodeCrossCheckDispositionsCurrentCustodyEvenRetryLiveDB(t *testing.T) {
 func TestCodeCrossCheckDispositionsEmptyBatchDurableMissingLiveDB(t *testing.T) {
 	f, w, _ := completedDispositionFixture(t)
 	cc, err := f.svc.FinalizeCodeCrossCheckDispositions(f.env.ctx, w, f.lead, 1, []CodeCrossCheckDisposition{})
-	want := `[{"id":"F-1","disposition":"not_reported","reason":""},{"id":"F_2","disposition":"not_reported","reason":""}]`
+	want := `[{"finding_id":"F-1","disposition":"not_reported","reason":""},{"finding_id":"F_2","disposition":"not_reported","reason":""}]`
 	var got, expected []CodeCrossCheckDisposition
 	if err != nil || !cc.FinalizedAt.Valid || json.Unmarshal(cc.Dispositions, &got) != nil || json.Unmarshal([]byte(want), &expected) != nil || !reflect.DeepEqual(got, expected) {
 		t.Fatalf("empty batch: %s %v", cc.Dispositions, err)

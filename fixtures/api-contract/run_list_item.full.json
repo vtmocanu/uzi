@@ -82,6 +82,7 @@
     "outcome": "x",
     "reason_class": "x",
     "findings": {},
+    "dispositions": {},
     "interrupted_at": "2020-01-02T03:04:05Z",
     "finalized_at": "2020-01-02T03:04:05Z",
     "deadline_at": "2020-01-02T03:04:05Z",

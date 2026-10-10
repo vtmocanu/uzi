@@ -56,16 +56,18 @@ export function CrossCheckDefaults({ settings, onSaved }: {
         <thead><tr><th scope="col">Cross-check</th><th scope="col">Claude cross-checker</th><th scope="col">Codex cross-checker</th></tr></thead>
         <tbody>{stages.map(stage => <tr key={stage}><th scope="row">{stage === "plan" ? "Plan" : "Code"} cross-check</th>{families.map(harness => {
           const key = `${stage}/${harness}` as const;
+          const idPrefix = stage === "plan" ? `checker-${harness}` : `checker-code-${harness}`;
+          const labelPrefix = `${stage === "code" ? "Code " : ""}${harness === "claude" ? "Claude" : "Codex"}`;
           const workerModel = settings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness)?.worker_default_model;
           const workerEffort = (harness === "claude" ? settings.default_effort : settings.default_codex_effort) || "medium";
           const change = (field: "model" | "effort", value: string) => setDraft(d => ({ ...d, [key]: { ...d[key], [field]: value } }));
           return <td key={harness} className="min-w-56 align-top p-2">
-            <label htmlFor={`checker-${stage}-${harness}-model`}>{harness === "claude" ? "Claude" : "Codex"} checker model</label>
-            <ModelSelect id={`checker-${stage}-${harness}-model`} harness={harness} allowCustom value={draft[key].model}
-              customAriaLabel={`Custom ${stage} ${harness} checker model ID`} onChange={v => change("model", v)}
+            <label htmlFor={`${idPrefix}-model`}>{labelPrefix} checker model</label>
+            <ModelSelect id={`${idPrefix}-model`} harness={harness} allowCustom value={draft[key].model}
+              customAriaLabel={`Custom ${stage === "code" ? "code " : ""}${harness} checker model ID`} onChange={v => change("model", v)}
               defaultLabel={`Default · ${workerModel === undefined || (workerModel === null && harness === "codex") ? "Unavailable" : workerModel ?? "SDK/account default"} (worker default)`} />
-            <label htmlFor={`checker-${stage}-${harness}-effort`}>{harness === "claude" ? "Claude" : "Codex"} checker effort</label>
-            <EffortSelect id={`checker-${stage}-${harness}-effort`} value={draft[key].effort} onChange={v => change("effort", v)}
+            <label htmlFor={`${idPrefix}-effort`}>{labelPrefix} checker effort</label>
+            <EffortSelect id={`${idPrefix}-effort`} value={draft[key].effort} onChange={v => change("effort", v)}
               defaultLabel={`Default · ${workerEffort} (worker default)`} />
           </td>;
         })}</tr>)}</tbody>

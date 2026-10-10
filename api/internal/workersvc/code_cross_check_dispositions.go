@@ -16,7 +16,7 @@ import (
 
 // CodeCrossCheckDisposition records advice accepted or declined by the lead.
 type CodeCrossCheckDisposition struct {
-	ID          string `json:"id"`
+	ID          string `json:"finding_id"`
 	Disposition string `json:"disposition"`
 	Reason      string `json:"reason"`
 }

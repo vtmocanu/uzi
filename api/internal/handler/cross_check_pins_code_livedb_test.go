@@ -49,6 +49,9 @@ func TestCrossCheckFourIndependentPinCellsLiveDB(t *testing.T) {
 	}
 	// Legacy omission and a plan-only patch continue to preserve code cells.
 	pins = save(`{"cross_check_pins":[{"stage":"plan","harness":"claude","effort":"medium"}]}`, 200)
+	if len(pins) != 4 || pins[0].ResolvedEffort != "medium" || pins[2].Model != nil || pins[2].ResolvedEffort != "low" || *pins[3].Model != "gpt-6-sol" {
+		t.Fatal("plan-only patch lost independent code pins")
+	}
 	pins = save("{}", 200)
 	if *pins[3].Model != "gpt-6-sol" || pins[3].ResolvedEffort != "medium" || pins[0].ResolvedEffort != "medium" {
 		t.Fatal("stage-local patch/omission lost code pins")
