@@ -26,7 +26,7 @@ describe("approved policy tag categories (#2321)", () => {
   });
 });
 
-describe("Codex 0.159.3 error tags", () => {
+describe("Codex 0.160.0 error tags", () => {
   it("recognizes new scalar tags while rejecting attacker-shaped objects", () => {
     assert.deepEqual(normalizeCodexErrorInfo("flexUnavailable"), {
       classification: "flexUnavailable", category: "transport",

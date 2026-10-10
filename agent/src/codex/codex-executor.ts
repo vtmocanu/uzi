@@ -3680,6 +3680,8 @@ export class CodexExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: import("../harness.js").HarnessTerminal | undefined;
+    let processedEvents = 0;
+    let result: ReducedTurnResult;
     // #1593: capture root-thread text by frame origin, independently of displayed
     // attribution. The planning loop uses this bounded, scrubbed tail as finalText
     // to distinguish a prose-only turn from an empty one.
@@ -3720,6 +3722,7 @@ export class CodexExecutor implements Executor {
       let sawModelEvidence = false;
       for (; !first.done; first = await events.next()) {
         const event = first.value;
+        if (evidencesModelProcessing(event)) processedEvents++;
         if (!sawModelEvidence && evidencesModelProcessing(event)) {
           sawModelEvidence = true;
           try {
@@ -3749,8 +3752,13 @@ export class CodexExecutor implements Executor {
           sawTerminal = true;
           terminal = event.terminal;
           if (terminal.policyRefusal) await ctx.emit({ kind: "status", agent: "worker", payload: { ...terminal.policyRefusal } });
-          turn.requestStop("terminal");
-          break;
+          if (terminal.outcome !== "success") {
+            turn.requestStop("terminal");
+            break;
+          }
+          // Resume this same iterator through the harness's pendingToolCalls settlement
+          // and final projection drain. Cancel delegations while trip handlers stay live.
+          effectsAbort.abort();
         }
       }
       if (terminal?.policyRefusal) {
@@ -3768,13 +3776,12 @@ export class CodexExecutor implements Executor {
       }
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
-      const result = reducer.finish(end).result;
+      result = reducer.finish(end).result;
       // The capture (not the emitted feed frames, which the batcher redacts) is scrubbed of the
       // claim secrets and the runtime-released Codex tokens before it leaves the turn. It wins
       // over any reducer-set finalText, so the only lead text a Codex turn returns is this
       // bounded, scrubbed tail.
       if (rootText) result.finalText = scrubLeadText(rootText);
-      return result;
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
       if (tripReason) throw this.tripError(tripReason, tripToken!);
@@ -3789,6 +3796,16 @@ export class CodexExecutor implements Executor {
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
       if (vaultLock.activeTurnTrip === trip) vaultLock.activeTurnTrip = undefined;
     }
+    // No await separates cleanup from this live-state check and notification entry.
+    // The async notification owner must recheck its ownership before journaling.
+    if (tripReason) throw this.tripError(tripReason, tripToken!);
+    if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
+        !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !vaultLock.latched &&
+        this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
+        registry.inFlightCallbackCountSince(callbackCursor) === 0) {
+      await ctx.onModelTurnSettled?.(processedEvents);
+    }
+    return result;
   }
 
   /**

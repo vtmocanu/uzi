@@ -44,6 +44,7 @@ async function fixture(shared = false, attempted = false, receipted = true, fore
   const bare = await git.ensureClone(seed);
   await fs.chmod(path.dirname(bare), 0o700);
   await fs.chmod(bare, 0o700);
+  await fs.chmod(path.join(bare, "config"), 0o600);
   const base = cmd(bare, ["rev-parse", "refs/remotes/origin/main"]);
   const runId = literal.run_id, generation = literal.generation, branch = literal.branch;
   const attemptId = attempted ? `20261009T000000Z-g${generation}-1234567890abcdef` : undefined;
@@ -282,9 +283,10 @@ for (const owner of ["foreign", "successor"] as const) {
   it(owner + " clone ownership excludes completing receipt cleanup", async () => {
     const f = await fixture();
     try {
-      await f.git.markRecoveryCapture(f.bare, f.clone, f.branch,
-        owner === "foreign" ? "22222222-2222-4222-8222-222222222222" : f.runId,
-        owner === "successor" ? "20261009T000000Z-g2-1234567890abcdef" : undefined);
+      f.cmd(f.bare, ["config", `uzi-recovery.${f.branch}.clone`, JSON.stringify({
+        clonePath: f.clone, runId: owner === "foreign" ? "22222222-2222-4222-8222-222222222222" : f.runId,
+        ...(owner === "successor" ? { attemptId: "20261009T000000Z-g2-1234567890abcdef" } : {}),
+      })]);
       await f.sweep();
       await f.retained();
     } finally { await f.close(); }
@@ -516,9 +518,10 @@ for (const conflict of ["foreign", "successor", "unknown", "canonical", "quarant
       }
       t.mock.restoreAll();
       if (conflict === "foreign" || conflict === "successor") {
-        await f.git.markRecoveryCapture(f.bare, f.clone, f.branch,
-          conflict === "foreign" ? "22222222-2222-4222-8222-222222222222" : f.runId,
-          conflict === "successor" ? "20261009T000001Z-g2-fedcba0987654321" : undefined);
+        f.cmd(f.bare, ["config", `uzi-recovery.${f.branch}.clone`, JSON.stringify({
+          clonePath: f.clone, runId: conflict === "foreign" ? "22222222-2222-4222-8222-222222222222" : f.runId,
+          ...(conflict === "successor" ? { attemptId: "20261009T000001Z-g2-fedcba0987654321" } : {}),
+        })]);
       }
       if (conflict === "unknown") {
         const keys = f.cmd(f.bare, ["config", "--local", "--name-only", "--get-regexp", "^uzi-recovery\\."]);
@@ -720,3 +723,160 @@ it("worker quarantine retains receipt authority and dirty clone", async () => {
     await f.retained();
   } finally { await f.close(); }
 });
+
+for (const count of [1, 2]) {
+  it(`persisted completion receipt retires report while retaining ${count} physical predecessors`, async t => {
+    const f = await fixture(false, true, false);
+    try {
+      const attemptId = f.completingRecord.completionSource!.attemptId!;
+      const predecessors: { runId: string; clonePath: string; attemptId?: string; restoreTip: string }[] = [];
+      const canonical = f.clone.slice(0, f.clone.indexOf(".attempt-"));
+      for (let i = 0; i < count; i++) {
+        const priorAttempt = i ? `20261008T000000Z-g${f.generation}-${"0".repeat(15)}${i}` : undefined;
+        const clonePath = priorAttempt ? canonical + ".attempt-" + priorAttempt : canonical;
+        await fs.cp(f.clone, clonePath, { recursive: true });
+        await fs.writeFile(path.join(clonePath, "predecessor.txt"), `predecessor ${i} dirty bytes`);
+        predecessors.push({ runId: f.runId, clonePath, ...(priorAttempt ? { attemptId: priorAttempt } : {}), restoreTip: f.head });
+        if (priorAttempt) f.cmd(f.bare, ["config", "--add", `uzi-attempts.${f.branch}.entry`,
+          JSON.stringify({ attemptId: priorAttempt, runId: f.runId, clonePath, state: "abandoned" })]);
+      }
+      const journalKey = `uzi-recovery.${f.branch}.clone`;
+      const pending = JSON.parse(f.cmd(f.bare, ["config", "--get", journalKey]));
+      f.cmd(f.bare, ["config", journalKey, JSON.stringify({ ...pending, retainedSources: predecessors })]);
+      const pin = `refs/uzi-recovery-episode/${f.runId}/${f.head}`;
+      f.cmd(f.bare, ["update-ref", pin, f.head]);
+      const outbox = new Outbox({ root: path.join(f.root, "outbox"), log: nullLogger(),
+        runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+      await outbox.init();
+      assert.equal((await outbox.journalFinalize(f.runId, f.generation)).written, true);
+      const current = f.make({ outbox });
+      await current.runner.observeSettlementTerminalAck(f.runId, f.generation,
+        { ...wire.request, completion_final_head: f.head },
+        { applied: true, completedPublicationReceipt: { ...literal, final_head: f.head, observed_branch_head: f.head } });
+      assert.equal(await current.recovery.hasPersistedCompletionReceipt(f.runId, f.generation), true);
+      assert.equal(await current.recovery.inventoryCleanupState(f.runId, f.generation), "pending",
+        "receipt-only authority never satisfies archive FINAL");
+      const config = await fs.readFile(path.join(f.bare, "config"));
+      const receiptBytes = await fs.readFile(f.journal);
+      const descriptors = await Promise.all(predecessors.map(src => fs.stat(src.clonePath)));
+      let moves = 0;
+      const rename = fs.rename.bind(fs);
+      t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+        if (String(args[0]) === f.clone) moves++;
+        return rename(...args);
+      });
+      assert.equal((await outbox.journalTerminal(f.runId, f.generation, "completed", 0,
+        { ...wire.request, completion_final_head: f.head })).journaled, true);
+      const protectedDeps = current.runner.protectRecoveryTerminalDeps({ outbox } as
+        Parameters<RunRunner["protectRecoveryTerminalDeps"]>[0]);
+      assert.equal(await protectedDeps.outbox.retireTerminal(f.runId, f.generation), true,
+        "persisted receipt permits protected retirement of its exact completed report");
+      await current.recovery.resumePending();
+      assert.equal(moves, 0);
+      assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
+      assert.deepEqual(await fs.readFile(f.journal), receiptBytes);
+      assert.equal(f.cmd(f.clone, ["rev-parse", "HEAD"]), f.head);
+      assert.equal(await fs.readFile(path.join(f.clone, "untracked.txt"), "utf8"), "untracked remainder\n");
+      for (const [i, src] of predecessors.entries()) {
+        assert.equal(await fs.readFile(path.join(src.clonePath, "predecessor.txt"), "utf8"), `predecessor ${i} dirty bytes`);
+        assert.equal((await fs.stat(src.clonePath)).ino, descriptors[i]!.ino);
+      }
+      assert.equal(f.cmd(f.bare, ["rev-parse", pin]), f.head);
+      assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation), false);
+      await (current.runner as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
+        .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation }, "completion-predecessor-regression");
+      assert.deepEqual(await outbox.listPendingFinalizes(), []);
+      assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
+      assert.deepEqual(await fs.readFile(f.journal), receiptBytes);
+      assert.ok(attemptId);
+      assert.equal(f.rpc(), 0);
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+}
+
+it("predecessor-free already-retired helper clears only its matching journal", async () => {
+  const f = await fixture(false, true);
+  try {
+    const attemptId = f.completingRecord.completionSource!.attemptId!;
+    f.cmd(f.bare, ["config", "--add", `uzi-attempts.${f.branch}.entry`,
+      JSON.stringify({ runId: f.runId, clonePath: f.clone, attemptId, state: "retired" })]);
+    await fs.rm(f.clone, { recursive: true });
+    assert.equal(await f.git.completionSourceAlreadyRetired(f.bare, f.branch, f.runId, f.clone, attemptId), true);
+    assert.equal(f.cmd(f.bare, ["config", "--get", `uzi-recovery.${f.branch}.clone`]), "");
+  } finally { await f.close(); }
+});
+
+for (const seam of ["metadata", "rollback"] as const) for (const exdev of [false, true]) {
+  it(`completion ${seam} holds bare lock against actual successor admission EXDEV=${exdev}`, linuxDisposal, async t => {
+    const f = await fixture();
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let injected = false, queued = false, admittedLock = false;
+    const raw = f.git as unknown as {
+      runGit(repo: string, args: string[]): Promise<string>;
+      withLock<T>(key: string, action: () => Promise<T>): Promise<T>;
+      runnerHoldingRoot: string;
+    };
+    const runGit = raw.runGit.bind(raw), withLock = raw.withLock.bind(raw);
+    const rename = fs.rename.bind(fs), remove = fs.rm.bind(fs);
+    const holding = (value: string) => path.dirname(value) === raw.runnerHoldingRoot ||
+      path.basename(path.dirname(value)).startsWith(".retire-");
+    t.mock.method(raw, "withLock", <T,>(key: string, action: () => Promise<T>) => withLock(key, async () => {
+      if (queued) admittedLock = true;
+      return action();
+    }));
+    t.mock.method(raw, "runGit", async (repo: string, args: string[]) => {
+      if (seam === "metadata" && !injected && args[0] === "config" && args[2] === `uzi-recovery.${f.branch}.clone` && args[3] === "") {
+        injected = true; entered(); await barrier;
+      }
+      return runGit(repo, args);
+    });
+    t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+      if (exdev && String(args[0]) === f.clone && path.dirname(String(args[1])) === raw.runnerHoldingRoot)
+        throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+      if (seam === "rollback" && String(args[1]) === f.clone && holding(String(args[0]))) {
+        entered(); await barrier;
+      }
+      return rename(...args);
+    });
+    t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+      if (seam === "rollback" && !injected && (holding(String(args[0])) || path.basename(String(args[0])).startsWith(".retire-"))) {
+        injected = true; throw Object.assign(new Error("disposal interrupted"), { code: "EIO" });
+      }
+      return remove(...args);
+    });
+    const cleanup = f.sweep();
+    let successor: Promise<unknown> | undefined;
+    const bounded = <T,>(promise: Promise<T>) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      return Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("completion seam or competitor did not settle")), 5000);
+      })]).finally(() => clearTimeout(timer));
+    };
+    try {
+      await bounded(paused);
+      queued = true;
+      successor = f.git.runnerCloneForBranch(f.bare, f.branch, "issue-7", noProofReseed,
+        "22222222-2222-4222-8222-222222222222").then(value => ({ value }), error => ({ error }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(admittedLock, false);
+      release(); await bounded(cleanup);
+      const result = await bounded(successor) as { value?: unknown; error?: unknown };
+      assert.equal(admittedLock, true);
+      if (seam === "metadata") assert.ok(result.value);
+      else {
+        assert.ok(result.error, "restored journal still guards the completing source");
+        await f.retained();
+      }
+      assert.equal(injected, true);
+    } finally {
+      release();
+      try {
+        await bounded(Promise.allSettled([cleanup, ...(successor ? [successor] : [])]));
+      } finally {
+        t.mock.restoreAll(); await f.close();
+      }
+    }
+  });
+}

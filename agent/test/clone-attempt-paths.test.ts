@@ -8,11 +8,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
-import { CapturePathMismatchError, GitCache, type AttemptSeedOptions } from "../src/git.js";
+import { CapturePathMismatchError, GitCache, type AttemptSeedOptions, type RecoveryJournalEntry } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
 import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { formatAttemptId, parseAttemptPath } from "../src/attempt-path.js";
+import { InvalidRecoveryClonePathError } from "../src/recovery-progress.js";
 import {
   LiveAttemptRegistry,
   mintAttemptId,
@@ -270,9 +271,40 @@ function configGetAll(key: string): string[] {
   }
 }
 
-function readJournal(iid: number): { runId: string; clonePath: string; attemptId?: string } | undefined {
+function readJournal(iid: number): RecoveryJournalEntry | undefined {
   const raw = configGetAll(`uzi-recovery.agent/issue-${iid}.clone`).at(-1);
-  return raw ? (JSON.parse(raw) as { runId: string; clonePath: string; attemptId?: string }) : undefined;
+  return raw ? (JSON.parse(raw) as RecoveryJournalEntry) : undefined;
+}
+
+function assertChargedSource(iid: number, source: RecoveryJournalEntry, blocker?: string): void {
+  const journal = readJournal(iid);
+  assert.ok(journal?.recovery);
+  assert.equal(journal.runId, source.runId);
+  assert.equal(journal.clonePath, source.clonePath);
+  assert.equal(journal.attemptId, source.attemptId);
+  assert.deepEqual(journal.recovery.source, source);
+  assert.equal(journal.recovery.version, 1);
+  assert.equal(journal.recovery.attempts, 1, "reservation is charged before ownership/proof");
+  assert.equal(journal.recovery.deadline - journal.recovery.startedAt, 300_000);
+  assert.equal(journal.recovery.stage, blocker ? "blocked" : "capturing");
+  assert.equal(journal.recovery.blocker, blocker);
+}
+
+function assertRetainedSuccess(iid: number, runId: string, pred: { clonePath: string; attemptId?: string }, fresh: string): void {
+  const journal = readJournal(iid);
+  assert.ok(journal?.recovery);
+  assert.equal(journal.clonePath, fresh);
+  assert.equal(journal.runId, runId);
+  assert.equal(journal.recovery.attempts, 1);
+  assert.equal(journal.recovery.stage, "ready-for-model");
+  assert.deepEqual(journal.recovery.source, { runId, clonePath: pred.clonePath, ...(pred.attemptId ? { attemptId: pred.attemptId } : {}) });
+  assert.deepEqual(journal.recovery.successor, { runId, clonePath: fresh, attemptId: journal.attemptId, restoreTip: journal.recovery.restoreTip });
+  assert.ok(journal.retainedSources?.some(s => s.clonePath === pred.clonePath && s.runId === runId && s.attemptId === pred.attemptId));
+  assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+  if (pred.attemptId) assert.equal(readLedger(iid).get(pred.attemptId)?.state, "live");
+  assert.ok(trackingHas(iid, "ONLY_COPY.txt"));
+  assert.match(journal.recovery.restoreTip ?? "", /^[0-9a-f]{40}$/);
+  assert.equal(execFileSync("git", ["-C", bare(), "rev-parse", `refs/uzi-recovery-episode/${runId}/${journal.recovery.restoreTip}`], { env: GIT_ENV, encoding: "utf8" }).trim(), journal.recovery.restoreTip);
 }
 
 type LedgerEntry = { attemptId: string; runId: string; clonePath: string; state: string };
@@ -357,6 +389,7 @@ async function seedPredecessor(iid: number, runId: string, opts: { attempt: bool
   const clone = await git.createOrAttachRunnerClone(b, iid, noProofReseed, runId, false, undefined, attemptId ? fixtureSeed(attemptId) : undefined);
   fs.writeFileSync(path.join(clone.path, "ONLY_COPY.txt"), "must survive recovery\n");
   await git.markRecoveryCapture(b, clone.path, `agent/issue-${iid}`, runId, clone.attemptId);
+  api.setOwnershipStatus(runId, "running", 2);
   return { clonePath: clone.path, attemptId };
 }
 
@@ -587,101 +620,107 @@ describe("issue #1783 M2 P-resume-after-park / P-late-create", { skip: !HAS_PROC
 // ─── P-resume-unverified ───────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-resume-unverified (C′)", { skip: !HAS_PROCFS }, () => {
-  it("captures the journaled predecessor behind a predecessor-scoped capture proof, releases it in place, then seeds fresh", async () => {
-    const iid = 2021;
-    const runId = randomUUID();
-    const pred = await seedPredecessor(iid, runId, { attempt: true });
-    const { calls, quiesceRun } = recorded(fastQuiesce);
-    const { factory, started } = transientFactory();
-    const claim = gitlabClaim(iid, { run_id: runId, session_id: randomUUID() });
-    // A restarted worker (empty live set) meets the journal.
-    const { runner } = restartedWorker(factory, { quiesceRun });
-    await runner.execute(claim);
-
-    assert.equal(started(), 0, "no model ever runs in (or for) the predecessor");
-    assert.equal(calls[0]?.mode, "capture", "the first proof is a capture-mode sweep");
-    assert.deepEqual(calls[0]?.targetPaths, [pred.clonePath], "scoped to the predecessor path alone");
-    assert.equal(calls[0]?.attempt, undefined, "the predecessor is never quiesced as this flight's own attempt");
-    assert.ok(calls.every((c) => c.mode === "capture" && c.targetPaths.length === 1 && c.targetPaths[0] === pred.clonePath),
-      "every proof of the capture (its re-proofs and the pre-settle reap too) is predecessor-scoped");
-    assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 1, "the capture verified and parked");
-    assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true, "released IN PLACE: the path is still there");
-    assert.equal(readJournal(iid), undefined, "the journal is cleared after the verified capture");
-    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "abandoned");
-    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the captured work is in the tracking ref");
-
-    // The requeued run seeds a FRESH path and gets the journaled work from the tracking ref.
-    let fresh = "";
-    let recovered = "";
-    const next = transientFactory((ctx) => {
-      fresh = ctx.worktreePath;
-      recovered = fs.readFileSync(path.join(ctx.worktreePath, "ONLY_COPY.txt"), "utf8");
-    });
-    await restartedWorker(next.factory).runner.execute(claim);
-    assert.equal(next.started(), 1);
-    assert.notEqual(fresh, pred.clonePath);
-    assert.ok(parseAttemptPath(fresh, path.join(fx.dataDir, "runner")));
-    assert.equal(recovered, "must survive recovery\n");
-    assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true, "the successor never touched the predecessor");
-  });
-});
-
-describe("issue #1856: incomplete terminal disposal retains a predecessor journal", { skip: !HAS_PROCFS }, () => {
-  it("does not release a verified predecessor in place after incomplete disposal", async () => {
-    const iid = 18564;
-    const runId = randomUUID();
-    const pred = await seedPredecessor(iid, runId, { attempt: true });
-    const before = readJournal(iid);
-    const { factory: baseFactory, started } = codexFactory();
-    const factory: ExecutorFactory = (id) => {
-      const built = baseFactory(id);
-      built.executor.safety!.dispose = async () => ({
-        kind: "incomplete", errors: [{ category: "timeout", message: "predecessor drain unverified" }],
+  for (const unwired of [false, true]) {
+    it(`verified retained capture seeds fresh within the claim (${unwired ? "unwired" : "wired"})`, async () => {
+      const iid = unwired ? 2024 : 2021;
+      const runId = randomUUID();
+      const pred = await seedPredecessor(iid, runId, { attempt: true });
+      const { calls, quiesceRun } = recorded(fastQuiesce);
+      let fresh = "";
+      let session: string | null | undefined;
+      let recovered = "";
+      let admittedJournal: RecoveryJournalEntry | undefined;
+      const { factory, started } = transientFactory((ctx) => {
+        fresh = ctx.worktreePath;
+        session = ctx.sessionId;
+        recovered = fs.readFileSync(path.join(fresh, "ONLY_COPY.txt"), "utf8");
+        admittedJournal = readJournal(iid);
       });
-      return built;
-    };
-    const { logger, lines } = recordingLogger();
-    const quiesceRun = async (): Promise<QuiesceRunOutcome> => ({
-      process: { state: "quiescent", processes: [], killed: [], detail: "verified" },
-      docker: { state: "not_wired", removed: [], detail: "" },
+      const claim = gitlabClaim(iid, { run_id: runId, claim_generation: 2, session_id: randomUUID() });
+      const { runner } = restartedWorker(factory, { quiesceRun, ...(unwired ? { dockerHost: undefined } : {}) });
+      await runner.execute(claim);
+      assert.equal(started(), 1, "the same claim admits a fresh model");
+      assert.notEqual(fresh, pred.clonePath);
+      assert.equal(session, undefined, "fresh cwd drops the predecessor session");
+      assert.equal(recovered, "must survive recovery\n");
+      assert.equal(admittedJournal?.recovery?.stage, "ready-for-model");
+      assert.equal(calls[0]?.mode, "capture");
+      const captures = calls.filter(c => c.mode === "capture");
+      assert.ok(captures.length > 0);
+      for (const c of captures) {
+        assert.deepEqual(c.targetPaths, [pred.clonePath]);
+        assert.equal(c.attempt, undefined);
+      }
+      assert.match(fresh, /-g2-[0-9a-f]{16}$/);
+      assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+      assertRetainedSuccess(iid, runId, pred, fresh);
     });
-    const { runner } = restartedWorker(factory, { quiesceRun }, logger);
-    await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
-    assert.equal(started(), 0, "predecessor capture ends before a fresh model runs");
-    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), true, "the predecessor capture verified work before disposal");
-    assert.ok(lines.some((line) => JSON.stringify(line).includes("predecessor drain unverified")), "the disposal reason is logged");
-    assert.deepEqual(readJournal(iid), before, "incomplete disposal keeps the predecessor journal");
-    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "predecessor is not released");
-    assert.equal(fs.existsSync(pred.clonePath), true);
-  });
+  }
 });
 
-describe("issue #1783 M2 C′: the journal is cleared ONLY after a verified capture", { skip: !HAS_PROCFS }, () => {
-  it("a run that turns terminal before its predecessor capture verified leaves journal, ledger and path as found", async () => {
+describe("issue #1856 / #2512: unproven settlement retains a charged predecessor journal", { skip: !HAS_PROCFS }, () => {
+  for (const unsupported of [false, true]) {
+    it(`${unsupported ? "unsupported" : "incomplete"} settlement blocks capture and model admission`, async () => {
+      const iid = 18564;
+      const runId = randomUUID();
+      const pred = await seedPredecessor(iid, runId, { attempt: true });
+      const before = readJournal(iid);
+      const { factory: baseFactory, started } = codexFactory();
+      const factory: ExecutorFactory = (id) => {
+        const built = baseFactory(id);
+        if (unsupported) delete built.executor.settleForCredentialFreeCapture;
+        else built.executor.settleForCredentialFreeCapture = async () => ({
+          kind: "incomplete", errors: [{ category: "timeout", message: "predecessor drain unverified" }],
+        });
+        return built;
+      };
+      const { logger } = recordingLogger();
+      const quiesceRun = async (): Promise<QuiesceRunOutcome> => ({
+        process: { state: "quiescent", processes: [], killed: [], detail: "verified" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      });
+      const { runner } = restartedWorker(factory, { quiesceRun }, logger);
+      await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2, session_id: randomUUID() }));
+      assert.equal(started(), 0, "predecessor capture ends before a fresh model runs");
+      assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "unproven settlement blocks before capture");
+      assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+      assertChargedSource(iid, before!, "quiescence_failed");
+      assert.equal(api.states.filter(s => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+      assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "predecessor is not released");
+      assert.equal(fs.existsSync(pred.clonePath), true);
+    });
+  }
+});
+
+describe("issue #2512: terminal ownership retains the charged source", { skip: !HAS_PROCFS }, () => {
+  it("terminal ownership stops before capture while retaining identity, ledger and path", async () => {
     const iid = 2022;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
     const journalBefore = readJournal(iid);
     api.setOwnershipStatus(runId, "cancelled");
     const { factory, started } = transientFactory();
-    await wired(factory).execute(gitlabClaim(iid, { run_id: runId }));
+    await wired(factory).execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
     assert.equal(started(), 0);
-    assert.deepEqual(readJournal(iid), journalBefore, "no verified capture, so the journal stays");
+    assertChargedSource(iid, journalBefore!);
     assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "and nothing is released");
     assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true);
   });
 });
 
-describe("issue #1783 M2 × #1766: a vault-lock park's exit capture releases a predecessor in place", { skip: !HAS_PROCFS }, () => {
-  it("a verified exit capture on a terminal ownership read marks the predecessor abandoned and clears the journal; the path is untouched", async () => {
+describe("issue #2512 × #1766: dead ownership never enters the automatic vault park", { skip: !HAS_PROCFS }, () => {
+  it("terminal ownership never invokes the vault park or predecessor release", async () => {
     const iid = 2023;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
     const { factory, started } = transientFactory();
     const runner = wired(factory);
-    // Seam: the predecessor-capture flight parks through handleRecoveryExhausted with the transient
-    // cause; drive that same park with the #1766 vault_locked cause, so the loop's terminal
-    // ownership read exits through captureForVaultExit.
+    let releases = 0;
+    git.releaseAttemptInPlace = async () => {
+      releases++;
+      throw new Error("dead ownership must not release the predecessor");
+    };
+    // Trap the former automatic vault-park hook: retained recovery must never enter it.
     type Park = (...a: unknown[]) => Promise<boolean>;
     const target = runner as unknown as { handleRecoveryExhausted: Park };
     const orig = target.handleRecoveryExhausted;
@@ -694,22 +733,74 @@ describe("issue #1783 M2 × #1766: a vault-lock park's exit capture releases a p
     };
     // The running confirmation is acked `running`; the loop's ownership read is terminal.
     api.setOwnershipStatus(runId, "cancelled");
-    await runner.execute(gitlabClaim(iid, { run_id: runId }));
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
 
-    assert.deepEqual(causes, ["vault_locked"], "the predecessor flight parked vault-locked, once");
+    assert.deepEqual(causes, [], "dead ownership never invokes the automatic park hook");
+    assert.equal(releases, 0, "dead ownership never invokes predecessor release");
     assert.equal(started(), 0, "no model ever runs in (or for) the predecessor");
     assert.equal(api.states.some((s) => s.body.status === "recovery_wait"), false, "a terminal run is never parked");
-    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the exit capture verified the predecessor's work into the tracking ref");
-    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "abandoned", "released in place: the ledger says abandoned");
-    assert.equal(readJournal(iid), undefined, "the journal is cleared after the verified exit capture");
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "dead ownership stops before capture mutation");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "dead ownership retains the source ledger");
+    assertChargedSource(iid, { runId, ...pred });
     assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n", "the path is untouched");
+  });
+});
+
+describe("issue #2512: exact ownership and durable recovery budget", () => {
+  for (const generation of [undefined, 3]) {
+    it(`ownership generation ${generation ?? "missing"} stops before proof or mutation`, async () => {
+      const iid = generation === undefined ? 2025 : 2026;
+      const runId = randomUUID();
+      const pred = await seedPredecessor(iid, runId, { attempt: true });
+      const before = treeHash(pred.clonePath);
+      const source = readJournal(iid)!;
+      api.setOwnershipStatus(runId, "running", generation);
+      const { factory, started } = transientFactory();
+      const { calls, quiesceRun } = recorded(fastQuiesce);
+      await restartedWorker(factory, { quiesceRun }).runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+      assert.equal(started(), 0);
+      assert.deepEqual(calls, [], "no quiescence or mutation authority on a stale claim");
+      assertChargedSource(iid, source);
+      assert.equal(treeHash(pred.clonePath), before);
+      assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live");
+      assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false);
+      assert.equal(api.states.some(s => s.body.status === "recovery_wait" || s.body.status === "failed"), false);
+    });
+  }
+
+  it("three unverified captures are precharged and exhaustion retains the source without parking", async () => {
+    const iid = 2027;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = treeHash(pred.clonePath);
+    const { factory, started } = transientFactory();
+    const { runner, git: rg } = restartedWorker(factory);
+    const charges: number[] = [];
+    rg.worktreeStatus = async () => {
+      charges.push(readJournal(iid)?.recovery?.attempts ?? 0);
+      return null;
+    };
+    assert.equal(await boundedExecute(runner, gitlabClaim(iid, { run_id: runId, claim_generation: 2 })), false);
+    assert.deepEqual(charges, [1, 2, 3], "each operation sees its persisted reservation");
+    assert.equal(started(), 0);
+    const journal = readJournal(iid);
+    assert.equal(journal?.recovery?.attempts, 3);
+    assert.equal(journal?.recovery?.stage, "blocked");
+    assert.equal(journal?.recovery?.blocker, "budget_exhausted");
+    assert.deepEqual(journal?.recovery?.source, { runId, ...pred });
+    assert.equal(journal?.clonePath, pred.clonePath);
+    assert.equal(treeHash(pred.clonePath), before);
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live");
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+    assert.match(failureOf(runId), /Retained recovery blocked: budget exhausted.*local work and custody retained/);
+    assert.notEqual(api.states.filter(s => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
   });
 });
 
 // ─── P-capture-blocked ─────────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
-  it("survivors: an env-scrubbed process in the predecessor blocks the fetch-back; journal, ledger and path untouched", { skip: realTableSkip("P-capture-blocked: survivors") }, async () => {
+  it("survivors: an env-scrubbed process in the predecessor blocks the fetch-back; charged journal with ledger and path retained", { skip: realTableSkip("P-capture-blocked: survivors") }, async () => {
     const iid = 2031;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
@@ -718,14 +809,14 @@ describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
     const pid = orphanIn(pred.clonePath);
     const { factory, started } = transientFactory();
     const { calls, quiesceRun } = recorded(fastQuiesce);
-    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId }));
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
     assert.equal(timedOut, false, "the capture is refused up front, never retried to the bound");
     assert.equal(calls[0]?.site, "predecessor_capture", "the first proof is the up-front capture proof");
     const failed = api.states.filter((s) => s.body.status === "failed").at(-1)?.body;
     assert.equal(failed?.fail_origin, "worker_residue_blocked");
     assert.equal(started(), 0);
     assert.equal(alive(pid), true, "an unattributed in-scope process is a survivor, never killed");
-    assert.deepEqual(readJournal(iid), journalBefore, "the journal is untouched");
+    assertChargedSource(iid, journalBefore!, "quiescence_failed");
     assert.deepEqual([...readLedger(iid).values()], ledgerBefore, "the ledger is untouched");
     assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "no fetch-back ran");
@@ -740,12 +831,12 @@ describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
     const ledgerBefore = [...readLedger(iid).values()];
     const { factory, started } = transientFactory();
     const { calls, quiesceRun } = recorded(captureAnswers("unverified"));
-    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId }));
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
     assert.equal(timedOut, false, "the capture is refused up front, never retried to the bound");
     assert.equal(calls[0]?.site, "predecessor_capture");
     assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
     assert.equal(started(), 0);
-    assert.deepEqual(readJournal(iid), journalBefore);
+    assertChargedSource(iid, journalBefore!, "quiescence_failed");
     assert.deepEqual([...readLedger(iid).values()], ledgerBefore);
     assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true);
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false);
@@ -769,7 +860,7 @@ describe("issue #1783 hermetic: an unreadable_unattributed process on a fake pro
     return withQuiescenceView({ procRoot: root }, fn, FILE_VIEW).finally(() => fs.rmSync(root, { recursive: true, force: true }));
   }
 
-  it("capture: the predecessor capture is refused (worker_residue_blocked); journal, ledger and path untouched", { skip: LINUX_ONLY }, async () => {
+  it("capture: the predecessor capture is refused (worker_residue_blocked); charged journal with ledger and path retained", { skip: LINUX_ONLY }, async () => {
     const iid = 2041;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
@@ -777,29 +868,30 @@ describe("issue #1783 hermetic: an unreadable_unattributed process on a fake pro
     const ledgerBefore = [...readLedger(iid).values()];
     const { factory, started } = transientFactory();
     const { calls, quiesceRun } = recorded(fastQuiesce);
-    const timedOut = await withUnreadable(() => boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId })));
+    const timedOut = await withUnreadable(() => boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId, claim_generation: 2 })));
     assert.equal(timedOut, false);
     assert.equal(calls[0]?.site, "predecessor_capture");
     assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
     assert.equal(started(), 0, "no model started");
-    assert.deepEqual(readJournal(iid), journalBefore);
+    assertChargedSource(iid, journalBefore!, "quiescence_failed");
     assert.deepEqual([...readLedger(iid).values()], ledgerBefore);
     assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true);
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "no fetch-back ran");
   });
 
-  it("control: the same capture over an EMPTY fake root verifies, fetches back and parks", async () => {
+  it("control: an EMPTY fake root verifies capture and admits a fresh successor", async () => {
     const iid = 2042;
     const runId = randomUUID();
-    await seedPredecessor(iid, runId, { attempt: true });
-    const { factory, started } = transientFactory();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    let fresh = "";
+    const { factory, started } = transientFactory(ctx => { fresh = ctx.worktreePath; });
     const root = makeFakeProcRoot();
-    const timedOut = await withQuiescenceView({ procRoot: root }, () => boundedExecute(wired(factory), gitlabClaim(iid, { run_id: runId })), FILE_VIEW);
+    const timedOut = await withQuiescenceView({ procRoot: root }, () => boundedExecute(wired(factory), gitlabClaim(iid, { run_id: runId, claim_generation: 2 })), FILE_VIEW);
     fs.rmSync(root, { recursive: true, force: true });
     assert.equal(timedOut, false);
-    assert.equal(started(), 0);
-    assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 1, "the capture verified and parked");
-    assert.equal(readJournal(iid), undefined, "the journal is cleared after the verified capture");
+    assert.equal(started(), 1);
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+    assertRetainedSuccess(iid, runId, pred, fresh);
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), true, "the predecessor's work was fetched back");
   });
 
@@ -930,6 +1022,7 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
     await wired(factory).execute(c1769);
     assert.equal(started(), 0);
     assert.match(failureOf(c1769.run_id), /recovery journal points at a different clone path/);
+    assert.notEqual(api.states.filter(s => s.runId === c1769.run_id && s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked", "path mismatch is not a quiescence failure");
     assert.equal(fs.existsSync(path.join(other, "FOREIGN.txt")), true);
     assert.equal(readJournal(1769)?.clonePath, other);
 
@@ -943,12 +1036,16 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
       `${path.sep}${path.basename(runnerRepoDir())}${path.sep}..${path.sep}${path.basename(runnerRepoDir())}${path.sep}`,
     );
     assert.ok(traversal.includes(`${path.sep}..${path.sep}`), `a traversal path: ${traversal}`);
-    await git.markRecoveryCapture(b, traversal, `agent/issue-${iid}`, owner, tid);
+    await assert.rejects(git.markRecoveryCapture(b, traversal, `agent/issue-${iid}`, owner, tid), InvalidRecoveryClonePathError);
+    execFileSync("git", ["-C", b, "config", "--local", `uzi-recovery.agent/issue-${iid}.clone`,
+      JSON.stringify({ runId: owner, clonePath: traversal, attemptId: tid })], { env: GIT_ENV, stdio: "pipe" });
     terminalOwner(owner, iid);
-    const ct = gitlabClaim(iid);
+    const ct = gitlabClaim(iid, { claim_generation: 2 });
+    api.setOwnershipStatus(ct.run_id, "running", 2);
     await wired(factory).execute(ct);
     assert.equal(started(), 0);
-    assert.match(failureOf(ct.run_id), /recovery journal points at a different clone path/);
+    assert.match(failureOf(ct.run_id), /Retained recovery blocked: corrupt journal or unsafe local recovery storage/);
+    assert.notEqual(api.states.filter(s => s.runId === ct.run_id && s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked", "corrupt identity is not a quiescence failure");
     assert.equal(fs.existsSync(path.join(real, "FOREIGN.txt")), true);
     assert.equal(readJournal(iid)?.clonePath, traversal);
   });
@@ -957,28 +1054,22 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
 // ─── P-legacy ──────────────────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-legacy", { skip: !HAS_PROCFS }, () => {
-  it("a canonical-path journal on a newly wired worker is captured, released in place and never reused", async () => {
+  it("a canonical predecessor retains its descriptor and seeds a fresh successor", async () => {
     const iid = 2051;
     const runId = randomUUID();
     const legacy = await seedPredecessor(iid, runId, { attempt: false });
     assert.equal(legacy.clonePath, canonicalFor(iid));
-    assert.equal(readJournal(iid)?.attemptId, undefined, "an older worker's journal carries no attempt id");
-    const { factory, started } = transientFactory();
-    const claim = gitlabClaim(iid, { run_id: runId });
-    await wired(factory).execute(claim);
-    assert.equal(started(), 0);
-    assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 1);
-    assert.equal(fs.existsSync(path.join(legacy.clonePath, "ONLY_COPY.txt")), true, "released in place");
-    assert.equal(readJournal(iid), undefined);
-    assert.equal(readLedger(iid).size, 0, "a canonical path has no attempt identity to ledger");
-
+    assert.equal(readJournal(iid)?.attemptId, undefined);
     let fresh = "";
-    const next = transientFactory((ctx) => {
-      fresh = ctx.worktreePath;
-    });
-    await wired(next.factory).execute(claim);
-    assert.ok(parseAttemptPath(fresh, path.join(fx.dataDir, "runner")), "the canonical path is never reused");
-    assert.equal(fs.existsSync(path.join(legacy.clonePath, "ONLY_COPY.txt")), true);
+    const { factory, started } = transientFactory(ctx => { fresh = ctx.worktreePath; });
+    await wired(factory).execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assert.equal(started(), 1);
+    assert.ok(parseAttemptPath(fresh, path.join(fx.dataDir, "runner")));
+    assert.notEqual(fresh, legacy.clonePath);
+    assertRetainedSuccess(iid, runId, legacy, fresh);
+    assert.equal(readJournal(iid)?.recovery?.source.attemptId, undefined, "no fabricated canonical attempt identity");
+    assert.equal(readLedger(iid).size, 1, "only the fresh successor has a ledger identity");
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
   });
 });
 
@@ -1147,6 +1238,7 @@ function codexFactory(onRun: (ctx: RunContext) => void = () => {}): { factory: E
     homeDir: path.join(homeDir, runId),
     executor: {
       safety,
+      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" as const }),
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         started++;
         onRun(ctx);
@@ -1179,90 +1271,61 @@ describe("issue #1783 M2 review: a Codex run's seed and capture sweeps scan proc
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
     const journalBefore = readJournal(iid);
-    orphanIn(pred.clonePath);
+    const pid = orphanIn(pred.clonePath);
+    const ledgerBefore = [...readLedger(iid).values()];
     const { calls, quiesceRun } = recorded(fastQuiesce);
     const { factory, started } = codexFactory();
-    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId }));
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
     assert.equal(timedOut, false);
     const capture = calls.filter((c) => c.mode === "capture");
     assert.ok(capture.length > 0 && capture.every((c) => c.processes === true), "every capture sweep scans processes");
+    assert.equal(alive(pid), true);
+    assert.deepEqual([...readLedger(iid).values()], ledgerBefore);
+    assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
     assert.equal(started(), 0);
     assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
-    assert.deepEqual(readJournal(iid), journalBefore);
+    assertChargedSource(iid, journalBefore!, "quiescence_failed");
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "no fetch-back ran");
   });
 });
 
-describe("issue #1783 M2 review: the predecessor release warning names what actually happened", { skip: !HAS_PROCFS }, () => {
-  it("a failed ledger append keeps the journal, and the warning says so", async () => {
-    const iid = 2091;
-    const runId = randomUUID();
-    const pred = await seedPredecessor(iid, runId, { attempt: true });
-    const { logger, lines } = recordingLogger();
-    const { runner, git: rg } = restartedWorker(transientFactory().factory, {}, logger);
-    const seam = rg as unknown as { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
-    const realRunGit = seam.runGit.bind(rg);
-    seam.runGit = async (cwd, args, ...rest) => {
-      if (args[0] === "config" && args.includes("--add") && args.some((a) => a.startsWith("uzi-attempts.")) && args.some((a) => a.includes('"abandoned"'))) {
-        throw new Error("injected ledger append failure");
-      }
-      return realRunGit(cwd, args, ...rest);
-    };
-    await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
-    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the capture itself verified");
-    const warn = lines.find((l) => ((l as { msg?: string }).msg ?? "").startsWith("predecessor attempt release"));
-    assert.equal((warn as { msg?: string } | undefined)?.msg, "predecessor attempt release failed at the ledger append; journal kept");
-    assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal IS kept, as the warning says");
-    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release recorded");
-  });
-
-  it("issue #2213: a latched worker keeps the verified predecessor's journal (the in-place release is gated)", async () => {
-    const iid = 2094;
-    const runId = randomUUID();
-    const pred = await seedPredecessor(iid, runId, { attempt: true });
-    const { runner, git: rg } = restartedWorker(transientFactory().factory, {});
-    const seam = rg as unknown as { releaseAttemptInPlace: (...a: unknown[]) => Promise<void> };
-    const releases: unknown[][] = [];
-    const real = seam.releaseAttemptInPlace.bind(rg);
-    seam.releaseAttemptInPlace = async (...a: unknown[]) => {
-      releases.push(a);
-      return real(...a);
-    };
-    // The latch lands after the capture verified (as the run's park report goes out, before the finally).
-    api.onState(runId, (body) => {
-      if (body.status !== "running") latchResidueQuarantine({ cause: "c", runId, site: "terminal_drive" }, nullLogger());
-    });
-    await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
-    assert.ok(trackingHas(iid, "ONLY_COPY.txt"), "the capture itself verified");
-    assert.deepEqual(releases, [], "no in-place release ran while latched");
-    assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal is kept");
-    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live", "no release recorded");
-  });
-
-  // NB5: the "refused" message is keyed on the mismatch class; every other pre-write failure (the
-  // bare-lock wait, the journal read, its parse) gets an accurate generic message.
-  for (const kind of ["mismatch", "generic"] as const) {
-    it(`a ${kind === "mismatch" ? "journal mismatch" : "pre-write (lock / config read / parse)"} failure is named as such`, async () => {
-      const iid = kind === "mismatch" ? 2092 : 2093;
+describe("issue #2512: protected recovery never invokes predecessor release", { skip: !HAS_PROCFS }, () => {
+  for (const kind of ["append", "mismatch", "config", "latched"] as const) {
+    it(`retains source and journal despite an injected ${kind} release fault`, async () => {
+      const iid = { append: 2091, mismatch: 2092, config: 2093, latched: 2094 }[kind];
       const runId = randomUUID();
       const pred = await seedPredecessor(iid, runId, { attempt: true });
+      let fresh = "";
+      const { factory, started } = transientFactory(ctx => {
+        fresh = ctx.worktreePath;
+        if (kind === "latched") latchResidueQuarantine({ cause: "c", runId, site: "terminal_drive" }, nullLogger());
+      });
       const { logger, lines } = recordingLogger();
-      const { runner, git: rg } = restartedWorker(transientFactory().factory, {}, logger);
-      const seam = rg as unknown as { releaseAttemptInPlace: (...a: unknown[]) => Promise<void> };
-      seam.releaseAttemptInPlace = async () => {
+      const { runner, git: rg } = restartedWorker(factory, {}, logger);
+      let releases = 0;
+      rg.releaseAttemptInPlace = async () => {
+        releases++;
         throw kind === "mismatch"
           ? new CapturePathMismatchError("", pred.clonePath, `agent/issue-${iid}`, runId)
-          : new Error("injected: could not read the bare config");
+          : new Error(`injected ${kind} release failure`);
       };
-      await runner.execute(gitlabClaim(iid, { run_id: runId, session_id: randomUUID() }));
-      const warn = lines.find((l) => ((l as { msg?: string }).msg ?? "").startsWith("predecessor attempt release"));
-      assert.equal(
-        (warn as { msg?: string } | undefined)?.msg,
-        kind === "mismatch"
-          ? "predecessor attempt release refused (the journal no longer names this attempt); nothing released"
-          : "predecessor attempt release failed before any write (bare-lock wait, journal read or parse); nothing released, journal kept as found",
-      );
-      assert.equal(readJournal(iid)?.clonePath, pred.clonePath, "the journal is kept");
+      const seam = rg as unknown as { runGit: (cwd: string | undefined, args: string[], ...rest: unknown[]) => Promise<string> };
+      const real = seam.runGit.bind(rg);
+      let abandonedAppends = 0;
+      seam.runGit = async (cwd, args, ...rest) => {
+        if (args[0] === "config" && args.includes("--add") && args.some(a => a.startsWith("uzi-attempts.")) && args.some(a => a.includes('"abandoned"'))) {
+          abandonedAppends++;
+          throw new Error("injected ledger append failure");
+        }
+        return real(cwd, args, ...rest);
+      };
+      await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2, session_id: randomUUID() }));
+      assert.equal(started(), 1, "protected capture admits the fresh successor");
+      assert.equal(releases, 0, "finally never calls the release helper");
+      assert.equal(abandonedAppends, 0, "no abandoned ledger append attempted");
+      assert.equal(lines.some(l => ((l as { msg?: string }).msg ?? "").startsWith("predecessor attempt release")), false);
+      assertRetainedSuccess(iid, runId, pred, fresh);
+      assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
     });
   }
 });
@@ -1304,11 +1367,13 @@ describe("issue #1783 M2 review (N6): seed availability under an unattributable 
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
     const { factory, started } = transientFactory();
-    const timedOut = await boundedExecute(wired(factory, { quiesceRun: scriptedAt("predecessor_capture", [unreadable]) }), gitlabClaim(iid, { run_id: runId }));
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun: scriptedAt("predecessor_capture", [unreadable]) }), gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
     assert.equal(timedOut, false);
     assert.equal(started(), 0);
     assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
-    assert.equal(readJournal(iid)?.clonePath, pred.clonePath);
+    assertChargedSource(iid, { runId, ...pred }, "quiescence_failed");
+    assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "live");
+    assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false);
   });
 });
@@ -1351,6 +1416,256 @@ describe("issue #1783 M2 review: checkpoint adoption on a wired resume that seed
       assert.match(parseAttemptPath(seen.worktree, path.join(fx.dataDir, "runner"))?.attemptId ?? "", /-g3-/, "a fresh attempt path");
       assert.equal(seen.m1, own, own ? "the checkpoint's milestone is in the fresh attempt" : "a foreign/unowned checkpoint is not adopted");
       if (own) assert.equal(seen.head, tip, "seeded at the checkpoint tip");
+    });
+  }
+});
+
+
+describe("missing-source restarted worker ordering", () => {
+  const command = (...args: string[]) => execFileSync("git", ["-C", bare(), ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+  const pins = () => command("for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi");
+
+  async function missingPrimary(iid: number, owner: string, attempt: boolean, episode: boolean) {
+    const pred = await seedPredecessor(iid, owner, { attempt });
+    if (episode) await git.reserveRecoveryIteration(bare(), `agent/issue-${iid}`, `issue-${iid}`, { runId: owner, ...pred }, 5);
+    const siblingId = mintAttemptId(2);
+    const sibling = `${canonicalFor(iid)}.attempt-${siblingId}`;
+    fs.cpSync(pred.clonePath, sibling, { recursive: true });
+    command("config", "--add", `uzi-attempts.agent/issue-${iid}.entry`,
+      JSON.stringify({ attemptId: siblingId, runId: owner, clonePath: sibling, state: "live" }));
+    const journal = { ...readJournal(iid)!, retainedSources: [{ runId: owner, clonePath: sibling, attemptId: siblingId }] };
+    command("config", `uzi-recovery.agent/issue-${iid}.clone`, JSON.stringify(journal));
+    const tip = command("rev-parse", "refs/remotes/origin/main");
+    for (const family of ["uzi-recovery-episode", "uzi-owed"]) command("update-ref", `refs/${family}/${owner}/${tip}`, tip);
+    fs.rmSync(pred.clonePath, { recursive: true });
+    return { pred, sibling, journal, hash: treeHash(sibling), pinSnapshot: pins() };
+  }
+
+  it("missing-source ledger-recorded foreign attempt after restart reclaim", async t => {
+    const iid = 25130, owner = randomUUID(), claimant = randomUUID();
+    const pred = await seedPredecessor(iid, owner, { attempt: true });
+    fs.rmSync(pred.clonePath, { recursive: true });
+    terminalOwner(owner, iid);
+    const { logger, lines } = recordingLogger();
+    let entryChecked = false;
+    const { factory, started } = transientFactory(ctx => {
+      assert.notEqual(ctx.worktreePath, pred.clonePath);
+      assert.ok(parseAttemptPath(ctx.worktreePath, path.join(fx.dataDir, "runner")));
+      assert.equal(fs.existsSync(path.join(ctx.worktreePath, "ONLY_COPY.txt")), false);
+      assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "README.md"), "utf8"), "# fixture\n");
+      assert.equal(readJournal(iid)?.runId, claimant);
+      assert.equal(readJournal(iid)?.clonePath, ctx.worktreePath);
+      entryChecked = true;
+    });
+    const worker = restartedWorker(factory, {}, logger);
+    const release = worker.git.releaseAttemptInPlace.bind(worker.git);
+    let reclaimed = false;
+    t.mock.method(worker.git, "releaseAttemptInPlace", async (...args: Parameters<typeof release>) => {
+      const result = await release(...args);
+      if (args[1] === pred.clonePath && args[3] === owner && args[4] === "reclaimed") {
+        assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed");
+        reclaimed = true;
+      }
+      return result;
+    });
+    await worker.runner.execute(gitlabClaim(iid, { run_id: claimant }));
+    assert.equal(started(), 1);
+    assert.equal(entryChecked, true, "all fresh claimant entry assertions ran");
+    assert.equal(reclaimed, true, "observe release before seed compacts missing ledger entries");
+    assert.ok(lines.some(l => (l as { msg?: string; owner_id?: string }).msg === "orphan_reclaim_succeeded"
+      && (l as { owner_id?: string }).owner_id === owner));
+  });
+
+  for (const attempt of [false, true]) {
+    for (const episode of [false, true]) {
+      it(`missing-source terminal ${attempt ? "attempt" : "canonical"} primary with surviving sibling ${episode ? "episode" : "legacy"} reclaim`, async t => {
+        const iid = 25131, owner = randomUUID(), claimant = randomUUID();
+        const s = await missingPrimary(iid, owner, attempt, episode);
+        terminalOwner(owner, iid);
+        const { logger, lines } = recordingLogger();
+        let releases = 0;
+        for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+          t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+        }
+        let entryChecked = false;
+        const { factory, started } = transientFactory(ctx => {
+          assert.notEqual(ctx.worktreePath, s.pred.clonePath);
+          assert.notEqual(ctx.worktreePath, s.sibling);
+          assert.ok(parseAttemptPath(ctx.worktreePath, path.join(fx.dataDir, "runner")));
+          assert.equal(fs.existsSync(path.join(ctx.worktreePath, "ONLY_COPY.txt")), false);
+          assert.equal(readJournal(iid)?.runId, claimant);
+          assert.equal(readJournal(iid)?.clonePath, ctx.worktreePath);
+          assert.deepEqual(JSON.parse(configGetAll(`uzi-retained.${owner}.journal`)[0]!), {
+            version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal: s.journal,
+          });
+          entryChecked = true;
+        });
+        const worker = restartedWorker(factory, { dockerHost: undefined }, logger);
+        assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { run_id: claimant })), false);
+        assert.equal(started(), 1);
+        assert.equal(entryChecked, true, "all fresh claimant entry assertions ran");
+        assert.equal(releases, 0);
+        assert.deepEqual(JSON.parse(configGetAll(`uzi-retained.${owner}.journal`)[0]!).journal, s.journal);
+        assert.equal(fs.existsSync(s.pred.clonePath), false, "missing owner source is never reconstructed");
+        assert.equal(treeHash(s.sibling), s.hash);
+        assert.equal(pins(), s.pinSnapshot);
+        assert.ok(lines.some(l => (l as { msg?: string }).msg === "orphan_reclaim_succeeded"));
+      });
+    }
+
+    for (const refusal of ["nonterminal", "404", "503", "quiescence"] as const) {
+      it(`missing-source retained ${attempt ? "attempt" : "canonical"} ${refusal} refusal`, async t => {
+        const iid = 25133, owner = randomUUID(), claimant = randomUUID();
+        const s = await missingPrimary(iid, owner, attempt, true);
+        const envelope = JSON.stringify({ version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal: s.journal });
+        command("config", `uzi-retained.${owner}.journal`, envelope);
+        if (refusal === "404") api.setOrphanNotFound(owner);
+        else if (refusal === "503") api.failOrphanClassification(owner, 503);
+        else if (refusal === "quiescence") terminalOwner(owner, iid);
+        else api.setOrphanClassification(owner, {
+          status: "running", repo_id: "r1", kind: "issue", issue_iid: iid,
+          branch: null, pipeline_ref: null, pipeline_id: null,
+        });
+        let releases = 0, seeded = 0;
+        for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+          t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+        }
+        const { factory, started } = transientFactory();
+        const worker = restartedWorker(factory, {
+          dockerHost: undefined,
+          quiesceRun: async req => req.site === "orphan_reclaim" && refusal === "quiescence" ? {
+            process: { state: "survivors", processes: [], killed: [], detail: "retained sibling writer" },
+            docker: { state: "not_wired", removed: [], detail: "" },
+          } : fastQuiesce(req),
+        });
+        const seed = worker.git.runnerCloneForBranch.bind(worker.git);
+        t.mock.method(worker.git, "runnerCloneForBranch", async (...args: Parameters<typeof seed>) => {
+          const clone = await seed(...args);
+          seeded++;
+          return clone;
+        });
+        const paths = fs.readdirSync(runnerRepoDir()).sort();
+        const ledger = configGetAll(`uzi-attempts.agent/issue-${iid}.entry`);
+        assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { run_id: claimant })), false);
+        assert.equal(started(), 0);
+        assert.equal(seeded, 0);
+        assert.equal(releases, 0);
+        assert.deepEqual(readJournal(iid), s.journal);
+        assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), [envelope]);
+        assert.deepEqual(configGetAll(`uzi-attempts.agent/issue-${iid}.entry`), ledger);
+        assert.equal(pins(), s.pinSnapshot);
+        assert.equal(treeHash(s.sibling), s.hash);
+        assert.deepEqual(fs.readdirSync(runnerRepoDir()).sort(), paths);
+      });
+    }
+
+    it(`missing-source own ${attempt ? "attempt" : "canonical"} runner refusal`, async t => {
+      const iid = 25132, owner = randomUUID();
+      const s = await missingPrimary(iid, owner, attempt, false);
+      const envelope = JSON.stringify({ version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal: s.journal });
+      command("config", `uzi-retained.${owner}.journal`, envelope);
+      let releases = 0;
+      for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+        t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+      }
+      const { factory, started } = transientFactory();
+      const worker = restartedWorker(factory, attempt ? {} : { dockerHost: undefined });
+      const paths = fs.readdirSync(runnerRepoDir()).sort();
+      assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { run_id: owner, claim_generation: 2 })), false);
+      assert.equal(started(), 0);
+      assert.equal(releases, 0);
+      const after = readJournal(iid)!;
+      assert.equal(after.runId, owner);
+      assert.equal(after.clonePath, s.pred.clonePath);
+      assert.equal(after.attemptId, s.pred.attemptId);
+      assert.deepEqual(after.retainedSources, s.journal.retainedSources);
+      assert.deepEqual(after.recovery?.source, { runId: owner, clonePath: s.pred.clonePath, ...(s.pred.attemptId ? { attemptId: s.pred.attemptId } : {}) });
+      assert.equal(after.recovery?.blocker, "source_missing");
+      assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), [envelope]);
+      assert.equal(pins(), s.pinSnapshot);
+      assert.equal(treeHash(s.sibling), s.hash);
+      assert.deepEqual(fs.readdirSync(runnerRepoDir()).sort(), paths);
+    });
+  }
+});
+
+describe("Unit 2 terminal retained descriptors", { skip: !HAS_PROCFS }, () => {
+  async function retained(iid: number, attempt: boolean) {
+    const owner = randomUUID();
+    const pred = await seedPredecessor(iid, owner, { attempt });
+    await git.reserveRecoveryIteration(bare(), `agent/issue-${iid}`, `issue-${iid}`, { runId: owner, ...pred }, 5);
+    return { owner, pred, journal: readJournal(iid)! };
+  }
+
+  for (const attempt of [true, false]) {
+    it(`terminal retained ${attempt ? "attempt" : "canonical"} detaches custody and permits next issue run`, async () => {
+      const iid = attempt ? 25121 : 25122;
+      const { owner, pred, journal } = await retained(iid, attempt);
+      terminalOwner(owner, iid);
+      const { factory, started } = transientFactory(ctx => {
+        assert.notEqual(ctx.worktreePath, pred.clonePath);
+        assert.ok(parseAttemptPath(ctx.worktreePath, path.join(fx.dataDir, "runner")));
+        assert.notEqual(readJournal(iid)?.runId, owner);
+      });
+      for (let generation = 2; generation <= 3; generation++) {
+        const worker = restartedWorker(factory, { dockerHost: undefined });
+        assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { claim_generation: generation })), false);
+        assert.equal(started(), generation - 1, "actual next executor entry");
+        const protectedRaw = configGetAll(`uzi-retained.${owner}.journal`);
+        assert.equal(protectedRaw.length, 1);
+        assert.deepEqual(JSON.parse(protectedRaw[0]!), { version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal });
+        assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+        if (pred.attemptId) assert.equal(readLedger(iid).get(pred.attemptId)?.state, "reclaimed");
+        const inventory = await worker.git.readInventoryCloneHeads(bare(), owner);
+        assert.equal(inventory.kind, "verified");
+        if (inventory.kind === "verified") assert.ok(inventory.clones.some(c => c.clonePath === pred.clonePath));
+      }
+    });
+  }
+
+  it("live retained owner refuses descriptor detachment", async () => {
+    const iid = 25123;
+    const { owner, journal } = await retained(iid, true);
+    const { factory, started } = transientFactory();
+    await restartedWorker(factory).runner.execute(gitlabClaim(iid));
+    assert.equal(started(), 0);
+    assert.deepEqual(readJournal(iid), journal);
+    assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), []);
+  });
+
+  for (const canonical of [false, true]) {
+    it(canonical ? "unwired canonical writer refuses terminal descriptor detachment" : "retained sibling writer refuses terminal descriptor detachment", async () => {
+      const iid = canonical ? 25125 : 25124;
+      const { owner, pred, journal } = await retained(iid, !canonical);
+      let writerPath = pred.clonePath;
+      if (!canonical) {
+        const siblingId = mintAttemptId(1);
+        const sibling = await git.createOrAttachRunnerClone(bare(), iid + 1, noProofReseed, owner, false, undefined, fixtureSeed(siblingId));
+        // Attribute a same-key predecessor with a real clone and matching ledger.
+        writerPath = `${canonicalFor(iid)}.attempt-${siblingId}`;
+        fs.renameSync(sibling.path, writerPath);
+        execFileSync("git", ["-C", bare(), "config", "--local", "--unset-all", `uzi-attempts.agent/issue-${iid + 1}.entry`], { env: GIT_ENV });
+        execFileSync("git", ["-C", bare(), "config", "--local", "--add", `uzi-attempts.agent/issue-${iid}.entry`,
+          JSON.stringify({ attemptId: siblingId, runId: owner, clonePath: writerPath, state: "live" })], { env: GIT_ENV });
+        journal.retainedSources = [{ runId: owner, clonePath: writerPath, attemptId: siblingId }];
+        execFileSync("git", ["-C", bare(), "config", "--local", `uzi-recovery.agent/issue-${iid}.clone`, JSON.stringify(journal)], { env: GIT_ENV });
+      }
+      terminalOwner(owner, iid);
+      const { factory, started } = transientFactory();
+      const requests: QuiesceRunRequest[] = [];
+      const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+        requests.push(req);
+        if (req.targetPaths?.includes(writerPath)) return {
+          process: { state: "survivors", processes: [], killed: [], detail: "writer still present" },
+          docker: { state: "not_wired", removed: [], detail: "" },
+        };
+        return fastQuiesce(req);
+      };
+      await restartedWorker(factory, { dockerHost: undefined, quiesceRun }).runner.execute(gitlabClaim(iid));
+      assert.ok(requests.some(r => r.targetPaths?.includes(writerPath)), "proof includes writer path");
+      assert.equal(started(), 0);
+      assert.deepEqual(readJournal(iid), journal);
+      assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), []);
     });
   }
 });

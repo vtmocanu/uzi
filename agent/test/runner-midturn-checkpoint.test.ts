@@ -583,7 +583,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     assert.equal(off.recovered, false, "without the tick worker B cold-starts without A's commit");
   });
 
-  it("(b) same-worker adoption: a failed publish still leaves the tick's fetch-back in the bare, which a re-claim adopts", async () => {
+  it("(b) same-worker missing source: a failed publish retains fetch-back but a re-claim cannot seed without its known source", async () => {
     const tmp = scratchDir("same");
     const shim = writeShim(tmp, "detect");
     const ctl = control();
@@ -613,19 +613,48 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       assert.equal(await ctl.fire(), "publish_failed:rejected");
       const bare = g.barePathFor(fx.originPath);
       assert.equal(refOr(bare, `refs/uzi-runner/${branch}`), sha, "the tick fetched the commit into the bare");
-      // The runner clone is lost (e.g. an emptyDir on a pod roll); the bare survives.
+      const retained = await g.discoverRetainedRecovery(fx.originPath, branch, `issue-${iid}`, claim.run_id);
+      assert.ok(retained, "the worker journal attributes the retained source");
+      const journalBefore = retained.journal;
+      assert.equal(fs.readFileSync(path.join(journalBefore.clonePath, "SAME.txt"), "utf8"), "same-worker work\n");
+      // The known source is lost; cached objects alone do not authorize reseeding.
       fs.rmSync(path.join(dataDir, "runner"), { recursive: true, force: true });
-      let adopted = false;
+      // A remains suspended with its manual tick stopped, modeling abrupt source loss.
+      // Its shutdown is deferred to teardown so graceful retirement cannot erase the journal.
+      const claimB = { ...claim, claim_generation: 2, last_seq: api.messages(claim.run_id).at(-1)?.seq ?? 0 };
+      api.setOwnershipStatus(claim.run_id, "running", 2);
+      let modelRan = false;
+      const { logger, lines } = recordingLogger();
       const runnerB = mkRunner(
         mkGit(dataDir, shim),
-        turn(async (ctx) => {
-          adopted = fs.existsSync(path.join(ctx.worktreePath, "SAME.txt"));
+        turn(async () => {
+          modelRan = true;
         }),
         undefined,
         { checkpointTickIntervalMs: 0 },
+        logger,
       );
-      await runnerB.execute(claim);
-      assert.equal(adopted, true, "the re-claim seeded from refs/uzi-runner/<branch> (the tick's fetch-back)");
+      await runnerB.execute(claimB);
+      assert.equal(modelRan, false, "a missing known source prevents model execution");
+      assert.equal(fs.existsSync(path.join(dataDir, "runner")), false, "the re-claim did not reseed");
+      assert.equal(refOr(bare, `refs/uzi-runner/${branch}`), sha, "cached work remains pinned");
+      assert.equal(gitIn(bare, ["show", `${sha}:SAME.txt`]), "same-worker work");
+      const journalAfter = JSON.parse(gitIn(bare, ["config", `uzi-recovery.${branch}.clone`]));
+      const { recovery, ...identity } = journalAfter;
+      assert.deepEqual(identity, journalBefore, "source identity and pins remain attributed");
+      assert.equal(recovery.stage, "blocked");
+      assert.equal(recovery.blocker, "source_missing");
+      assert.equal(recovery.attempts, 3, "missing source exhausts the durable budget");
+      assert.equal(recovery.deadline - recovery.startedAt, 300_000);
+      assert.equal(recovery.backoffMs, 0);
+      assert.equal(recovery.source.runId, claim.run_id);
+      assert.equal(recovery.source.clonePath, journalBefore.clonePath);
+      assert.equal(await g.recoveryAttemptMode(fx.originPath, `issue-${iid}`), true);
+      assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "recovery_wait"), false);
+      assert.equal(finalStatus(claim.run_id), "failed");
+      assert.ok((lines as Array<Record<string, unknown>>).some(line =>
+        line.msg === "run failed" && line.error === "Retained recovery blocked: required source is missing; local work and custody retained"),
+      "the exact missing-source failure is visible");
     } finally {
       pub.restore();
       runnerA.shutdown();

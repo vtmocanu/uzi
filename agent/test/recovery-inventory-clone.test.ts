@@ -39,6 +39,41 @@ async function withJournalInventory(check: (f: {
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 
+for (const damage of ["EIO", "EACCES", "symlink"] as const) {
+  it("custody isolation inventory keeps foreign " + damage + " evidence attributed and refuses own incomplete source", async () => {
+    await withJournalInventory(async f => {
+      const head = await f.ownClone();
+      const own = f.cache.runnerClonePath(f.bare, "issue-current");
+      const foreign = f.cache.runnerClonePath(f.bare, "issue-foreign");
+      await fs.mkdir(foreign);
+      const journal = { runId: "run-foreign", clonePath: foreign,
+        retainedSources: [{ runId: "run-foreign", clonePath: foreign }] };
+      const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+      execFileSync("git", ["-C", f.bare, "config", "--local", "uzi-retained.run-foreign.journal",
+        JSON.stringify({ version: 1, branch: "foreign", key: "issue-foreign", journal })], { env, stdio: "pipe" });
+      if (damage === "symlink") await fs.symlink(f.bare, path.join(foreign, ".git"));
+      const real = fs.lstat;
+      fs.lstat = (async (target, ...rest) => {
+        if (damage !== "symlink" && String(target) === path.join(foreign, ".git")) {
+          throw Object.assign(new Error("private failure content"), { code: damage });
+        }
+        return Reflect.apply(real, fs, [target, ...rest]);
+      }) as typeof fs.lstat;
+      try {
+        const result = await f.cache.readInventoryCloneHeads(f.bare, "run-current");
+        assert.equal(result.kind, "verified");
+        if (result.kind === "verified") {
+          assert.deepEqual(result.heads, [head]);
+          assert.deepEqual(result.foreignOwners, ["run-foreign"]);
+          assert.ok(result.clones.some(c => c.clonePath === own));
+        }
+        assert.deepEqual(await f.cache.readInventoryCloneHeads(f.bare, "run-foreign"),
+          { kind: "unknown", cause: "clone_head_unreadable" });
+      } finally { fs.lstat = real; }
+    });
+  });
+}
+
 for (const withOwnClone of [false, true]) {
   for (const staleValue of [false, true]) {
     it(`cleared journal leaves inventory verified (own clone=${withOwnClone}, stale value=${staleValue})`, async () => {
@@ -240,6 +275,36 @@ for (const shape of ["canonical key", "outside root", "unnormalized", "clone fil
   });
 }
 
+for (const site of ["source", "successor", "retained"] as const) {
+  it(`inventory identifies nested invalid clone path in ${site}`, async () => {
+    const f = await inventoryFixture(false);
+    try {
+      const source = { runId: inventoryRun, clonePath: f.clone };
+      const invalid = { ...source, clonePath: f.parent + "/../" + path.basename(f.parent) + "/" + path.basename(f.clone) };
+      f.journal({ ...source, ...(site === "retained" ? { retainedSources: [invalid] } : {
+        recovery: { version: 1, source: site === "source" ? invalid : source,
+          ...(site === "successor" ? { successor: invalid } : {}),
+          attempts: 1, startedAt: 0, deadline: 300_000, backoffMs: 1, stage: "capturing" },
+      }) });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "clone_path_invalid" });
+    } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
+for (const metadata of ["run id", "progress"] as const) {
+  it(`inventory keeps corrupt nonpath ${metadata} attribution unreadable`, async () => {
+    const f = await inventoryFixture(false);
+    try {
+      const source = { runId: inventoryRun, clonePath: f.clone };
+      f.journal(metadata === "run id" ? { ...source, runId: "invalid run id" } : {
+        ...source, recovery: { version: 1, source, attempts: 4, startedAt: 0,
+          deadline: 300_000, backoffMs: 1, stage: "capturing" },
+      });
+      assert.deepEqual(await f.read(), { kind: "unknown", cause: "attribution_unreadable" });
+    } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
 it("#2507 clone-leaf IO remains distinct from ancestor and HEAD IO", async t => {
   const f = await inventoryFixture(false);
   try {
@@ -341,6 +406,51 @@ async function inventoryFixture(attempt: boolean) {
   } catch (err) {
     await fs.rm(root, { recursive: true, force: true });
     throw err;
+  }
+}
+
+for (const evidence of ["active", "protected", "overlap"] as const) {
+  for (const missing of ["runner", "parent", "predecessor"] as const) {
+    it(`inventory refuses retained ${missing} disappearing after physical prepass (${evidence})`, async t => {
+      const f = await inventoryFixture(true);
+      const predecessor = f.canonical;
+      const predecessorGit = path.join(predecessor, ".git");
+      const target = missing === "predecessor" ? predecessor : f[missing];
+      const prepasses = evidence === "overlap" ? 2 : 1;
+      let completedPrepasses = 0, removed = false;
+      const original = fs.lstat;
+      try {
+        for (const clone of [f.clone, predecessor]) {
+          await fs.mkdir(path.join(clone, ".git"), { recursive: true });
+          await fs.writeFile(path.join(clone, ".git", "HEAD"), "a".repeat(40));
+        }
+        const journal = { runId: inventoryRun, clonePath: f.clone, attemptId: inventoryAttempt,
+          retainedSources: [{ runId: inventoryRun, clonePath: predecessor }] };
+        if (evidence === "protected") {
+          f.git(["-C", f.bare, "config", "--local", "--unset-all", "uzi-recovery.task.clone"]);
+        } else f.journal(journal);
+        if (evidence !== "active") {
+          f.git(["-C", f.bare, "config", "--local", "uzi-retained." + inventoryRun + ".journal",
+            JSON.stringify({ version: 1, branch: "task", key: "issue-2433", journal })]);
+        }
+        const stub = t.mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
+          const probe = String(args[0]);
+          if (!removed && completedPrepasses === prepasses && probe === target) {
+            removed = true;
+            await fs.rm(target, { recursive: true });
+          }
+          const stat = await original(...args);
+          if (probe === predecessorGit) completedPrepasses++;
+          return stat;
+        }) as typeof fs.lstat);
+        try {
+          assert.deepEqual(await f.read(), { kind: "unknown",
+            cause: missing === "predecessor" ? "clone_path_invalid" : "clone_ancestor_invalid" });
+          assert.equal(removed, true, "source was removed during final traversal");
+          assert.equal(completedPrepasses, prepasses);
+        } finally { stub.mock.restore(); }
+      } finally { await fs.rm(f.root, { recursive: true, force: true }); }
+    });
   }
 }
 

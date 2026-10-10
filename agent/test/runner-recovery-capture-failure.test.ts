@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, CapturePathMismatchError } from "../src/git.js";
+import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, CapturePathMismatchError, type RecoveryJournalEntry } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
@@ -161,17 +161,40 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       },
       "a different clone key cannot bypass the retained branch ownership journal",
     );
-    let modelStarted = false;
+    let modelPath = "";
+    let modelSession: string | null | undefined;
+    let admittedJournal: RecoveryJournalEntry | undefined;
     const restarted = new RunRunner(client, restartedGit, () => ({
       homeDir: fixture.runHome,
-      executor: { run: async () => { modelStarted = true; throw new Error("must capture first"); } },
+      executor: { run: async (ctx) => {
+        modelPath = ctx.worktreePath;
+        modelSession = ctx.sessionId;
+        admittedJournal = JSON.parse(gitRead(bare, "config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`)) as RecoveryJournalEntry;
+        throw new Error("fixture stops after model admission");
+      } },
     }), nullLogger(), 20, undefined, { pollMs: 5, gitlab, recoveryRetryMs: 5 });
-    await restarted.execute(claim);
-    assert.equal(modelStarted, false, "the retained source is captured before any new SDK run");
-    assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 1);
-    const reseeded = await restartedGit.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
-    assert.equal(fs.readFileSync(path.join(reseeded.path, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
-    assert.equal(reseeded.wipRecovered, true);
+    const successor = { ...claim, claim_generation: 2, session_id: "predecessor-session" };
+    api.setOwnershipStatus(claim.run_id, "running", 2);
+    await restarted.execute(successor);
+    assert.ok(modelPath, "verified local capture starts the successor model in the fenced claim");
+    assert.notEqual(modelPath, fixture.clone());
+    assert.match(modelPath, /\.attempt-.*-g2-/);
+    assert.equal(modelSession, undefined, "the successor starts a fresh model session");
+    assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 0);
+    assert.equal(fs.readFileSync(path.join(modelPath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+    assert.equal(fs.existsSync(path.join(modelPath, ".uzi", "scratch", "capture.log")), false, "old scratch is not adopted");
+    assert.equal(fs.readFileSync(scratchArtifact, "utf8"), "retained during capture\n");
+    assert.equal(fs.readFileSync(path.join(fixture.clone(), "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+    assert.equal(fs.readFileSync(path.join(fixture.runHome, "session"), "utf8"), "transcript");
+    assert.equal(admittedJournal?.clonePath, modelPath);
+    assert.equal(admittedJournal?.runId, claim.run_id);
+    assert.equal(admittedJournal?.recovery?.stage, "ready-for-model");
+    assert.equal(admittedJournal?.recovery?.attempts, 1, "model admission preserves the charged iteration");
+    assert.ok(admittedJournal?.retainedSources?.some(source => source.clonePath === fixture.clone() && source.runId === claim.run_id));
+    const retained = JSON.parse(gitRead(bare, "config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`)) as RecoveryJournalEntry;
+    assert.equal(retained.recovery?.attempts, 1, "an interrupted model does not reset the episode");
+    assert.equal(retained.recovery?.stage, "ready-for-model");
+    assert.ok(gitRead(bare, "for-each-ref", "--format=%(refname)", `refs/uzi-recovery-episode/${claim.run_id}/`), "episode pins retain custody");
   });
 
   it("a failed park report retries while the worker stays alive", async () => {

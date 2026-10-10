@@ -56,7 +56,7 @@ import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
-import type { CodexLaunchRootResult, CodexProviderConfig } from "../src/codex/codex-harness.js";
+import { CodexHarness, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
@@ -2744,6 +2744,130 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /run cancelled/);
     assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
   });
+
+  it("settled model recovery notification preserves the shared transport for a second model turn", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const id = `tn-${c.turnStartCount}`;
+        c.transport.push(agentMessage(`model turn ${c.turnStartCount}`));
+        if (c.turnStartCount === 2) c.transport.push(signalDone("th-1", id));
+        c.transport.push(turnCompleted("completed", "th-1", id));
+        return { turn: { id } };
+      }
+      return {};
+    } });
+    let notifications = 0;
+    const { ctx } = makeCtx({
+      config: { max_iterations: 2 },
+      onModelTurnSettled: async count => {
+        assert.ok(count > 0);
+        assert.equal(rig.transport.closes, 0, "per-turn settlement must retain the provider transport");
+        notifications++;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "two settled turns");
+    assert.equal(rig.transport.turnStartCount, 2);
+    assert.equal(rig.providerLaunches(), 1);
+    assert.equal(notifications, 2);
+  });
+
+  for (const mode of ["success", "abort", "reject"] as const) {
+    it(`settled model recovery notification waits for deferred delegation settlement (${mode})`, async () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) {
+            c.transport.push(agentMessage("real root output"));
+            c.transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help" }, "th-1", "tn-1", "c-spawn"));
+            return { turn: { id: "tn-1" } };
+          }
+          c.transport.push(toolCall(11, "uzi_bash", { command: "echo child work" }, "th-child", "tn-child", "c-bash"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      } });
+      let shellStarted = false;
+      let shellSettled = false;
+      let effectsStopped = false;
+      let releaseShell!: () => void;
+      const shellGate = new Promise<void>(resolve => { releaseShell = resolve; });
+      rig.deps = { ...rig.deps, spawnCommand: async (_argv, opts) => {
+        shellStarted = true;
+        opts.signal?.addEventListener("abort", () => { effectsStopped = true; }, { once: true });
+        await shellGate;
+        shellSettled = true;
+        return { code: 0, stdout: "late", stderr: "" };
+      } };
+      const abort = new AbortController();
+      let notifications = 0;
+      const { ctx } = makeCtx({
+        terminalLifecycleSignal: abort.signal,
+        agents: [
+          { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+          { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+        ],
+        onModelTurnSettled: async () => {
+          assert.equal(shellSettled, true);
+          assert.ok(rig.transport.responses.some(r => r.requestId === 1), "delegation reply precedes notification");
+          notifications++;
+        },
+      });
+      let releaseTail!: () => void;
+      const tailGate = new Promise<void>(resolve => { releaseTail = resolve; });
+      let tailReached = false;
+      // Defer completion after the real harness tail, including its delegation reply.
+      const originalStart = CodexHarness.prototype.startTurn;
+      const startMock = mock.method(CodexHarness.prototype, "startTurn", function (this: CodexHarness, ...args: Parameters<typeof originalStart>) {
+        const turn = originalStart.apply(this, args);
+        return { ...turn, events: (async function* () {
+          yield* turn.events;
+          tailReached = true;
+          await tailGate;
+          if (mode === "reject") throw new Error("settlement closure rejected");
+        })() };
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const outcome = running.catch(error => error);
+      try {
+        await waitFor(() => shellStarted, "delegation shell admitted");
+        rig.transport.push(signalDone()).push(turnCompleted("completed"));
+        await waitFor(() => effectsStopped, "successful terminal cancels delegation effects");
+        assert.equal(notifications, 0, "pending delegation cannot notify");
+        if (mode === "abort") abort.abort();
+        releaseShell();
+        await waitFor(() => shellSettled && tailReached && rig.transport.responses.some(r => r.requestId === 11), "child callback and real harness tail settled");
+        assert.equal(notifications, 0, "iterator completion still pending");
+        releaseTail();
+        const result = await withTimeout(outcome, 3000, "deferred settlement");
+        if (mode === "reject") assert.match(String(result), /settlement closure rejected/);
+        if (mode === "success") assert.ok(!(result instanceof Error), String(result));
+        assert.equal(notifications, mode === "success" ? 1 : 0);
+      } finally {
+        releaseShell();
+        releaseTail();
+        await outcome;
+        startMock.mock.restore();
+      }
+    });
+  }
+
+  for (const completion of ["completed", "failed", "EOF", "interrupted"] as const) {
+    it(`settled model recovery notification requires successful terminal (${completion})`, async () => {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(agentMessage("actual model output"));
+      if (completion !== "EOF") rig.transport.push(turnCompleted(completion === "failed" ? "failed" : "completed"));
+      rig.transport.end();
+      const { ctx } = makeCtx();
+      let notifications = 0;
+      const abort = new AbortController();
+      ctx.terminalLifecycleSignal = abort.signal;
+      if (completion === "interrupted") ctx.emit = () => abort.abort();
+      ctx.onModelTurnSettled = async count => { assert.ok(count > 0); notifications++; };
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "settlement evidence").catch(() => undefined);
+      assert.equal(notifications, completion === "completed" ? 1 : 0);
+    });
+  }
 
   it("(9) a clean-EOF terminal returns and emits the accumulated result", async () => {
     const rig = makeRig();

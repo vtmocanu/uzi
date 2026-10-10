@@ -628,3 +628,117 @@ The GPT-6.1 Sol Standard row was verified against the official model page on
 2026-10-01: input/cached/cache-write/output are 2.00/0.10/2.50/10.00 per million
 tokens, and 4.00/0.20/5.00/15.00 above 272K input, applying to the full response.
 See https://developers.openai.com/api/docs/models/gpt-6.1-sol.
+
+## Amendment: coordinated runtime 0.160.0 (2026-10-10)
+
+The native package advances from 0.159.3, source
+`01fc69f4026735edfdf6789820549727a4867b11`, to 0.160.0, source
+`a956835d020762cb2b570053af06f643a11c0ecc`. Both official musl archives'
+SHA-256 hashes were checked against downloaded bytes and the release identity.
+The installer still uses its existing manifest, member and SHA checks.
+
+A lock-only upgrade changes the installer destination but leaves the production
+launcher pointing at the old version root. The candidate coordinates that path,
+the fail-closed probe's version and both architecture digests, active test
+fixtures, and M4 version assertions and evidence. A Docker-free regression imports
+the actual launcher and probe and inspects the actual M4 assertions/evidence
+against the lock; it was observed failing on the lock-only tree and passing after
+coordination. It proves coordinate agreement, not execution of the new runtime.
+No launcher authority, isolation, refusal, cleanup or installer behavior changes.
+
+### Upstream compatibility review
+
+Reviewed the official [0.160.0 release notes](https://github.com/openai/codex/releases/tag/rust-v0.160.0)
+and the full direct pinned-source delta, comprising 363 changed paths
+(296 modified, 65 added, two deleted). The linked
+[GitHub comparison](https://github.com/openai/codex/compare/01fc69f4026735edfdf6789820549727a4867b11...a956835d020762cb2b570053af06f643a11c0ecc)
+is a three-dot comparison from merge base `06971ec9aad037d7c32b7466031fbb8b3b407103`;
+it is not the direct old/new delta. The release notes' broader 0.159.0 comparison
+is context only.
+
+- Initialization/auth: the app-server protocol tree and account/initialize
+  processors are unchanged. `initialized` remains a notification without params;
+  API-key, experimental ChatGPT token login and server-initiated refresh shapes
+  remain unchanged. The new pin's
+  [serialization test](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server-protocol/src/protocol/common.rs#L2880)
+  confirms the absent params.
+- Trust/config: the unchanged thread processor still promotes unspecified trust
+  under its existing conditions; explicit project `untrusted` avoids that branch.
+  OpenAI still requires account auth, enables WebSockets and selects its endpoint
+  by auth mode. Provider merging retains `or_insert` for OpenAI despite its
+  Bedrock-specific override branch. See
+  [provider implementation](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/model-provider-info/src/lib.rs#L520).
+- Dynamic tools and token usage: consumed registration, request and response
+  wire types are unchanged. Camel-case total/last usage buckets still carry no
+  service tier. Existing accounting/pricing policy remains; the cold-resume
+  ordering characterization remains dated to 0.159.3.
+- Terminal errors: consumed app-server error variants are unchanged. Internal
+  SSE `content_filter` handling and sampling retry guidance changed, but upstream's
+  [bridge regression](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/codex-api/src/api_bridge_tests.rs#L15)
+  projects ContentFilter to the existing `other` wire tag. Sampling behavior is
+  not claimed unchanged.
+- Native exceptions: registration and async-question/UTC handlers are unchanged;
+  async questions still emit `delivery: "async"` and return `{"accepted":true}`.
+  UTC retains text and code-mode JSON forms. Uzi's native async exclusion in advice
+  and read-only UTC contract remain.
+- Persistence: rollout implementation is unchanged and compression remains
+  default off; uzi uses neither that feature nor `rollout/compress`. SQLite and
+  thread-store internals changed, so persistence as a whole is not claimed
+  unchanged.
+- Model catalogs: the bundled catalog is unchanged, including model defaults,
+  shell shapes and effort vocabulary used by uzi. Explicit `model_catalog_url`
+  now selects authoritative refresh/fallback/invalidation and exact-ID matching
+  behavior; fixed OpenAI leaves this field unset. This is a source branch
+  assessment, not new-package model-discovery proof.
+- The remaining delta covers TUI input/reconnect/navigation/presentation and
+  provider/project flows; core configuration, inherited environment, Guardian
+  handoff/history/budget, skills, isolation/MCP, compaction and execution;
+  app-server span logging/running-turn counts, plugin caches/configuration,
+  analytics/storage; and build dependencies, CLI doctor, Git-root helpers and
+  Windows/macOS execution changes. No required uzi adaptation beyond coordinates
+  was established by this audit. Native environment/Guardian changes are not
+  assumed to describe uzi's worker-created children.
+- Packaging: the npm CLI wrapper is unchanged. Both candidate archives retain
+  layout-version-1 manifests and the existing CLI, sibling code-mode host,
+  ripgrep, bwrap and zsh layout. This inspection does not prove installation,
+  execution or receipt/probe acceptance.
+
+### Upgrade evidence and durable checks
+
+The historical real worker-UID comparison held source/posture fixed:
+[0.159.3 control 38019285046](https://github.com/vtmocanu/uzi/actions/runs/38019285046)
+at `37e0a4e1` passed, while
+[lock-only 0.160.0 run 38019435933](https://github.com/vtmocanu/uzi/actions/runs/38019435933)
+at `9ed69ac7` failed. The old executable path was inconsistent with the new
+installer destination. This establishes a coordinate defect consistent with the
+refusal, not the historical failing syscall or errno. Local Alpine connectivity
+prevented the implementing worker's image build; that was infrastructure
+evidence, not a runtime regression.
+
+[Coordinated candidate CI 38037485971](https://github.com/vtmocanu/uzi/actions/runs/38037485971)
+at `93a4fd6b918236510ee093aebe18e50fd3efc7f7` installed the SHA-verified amd64
+package, wrote its 0.160.0 receipt and executed `codex-cli 0.160.0` as the runner
+UID. Its unchanged real worker-UID lane passed all 29 required leaves, including
+the seven historical launch failures and both EACCES leaves. Those failures
+cleared on the tested candidate; their historical errno and whether EACCES was
+launch fallout remain unproven. This receipt applies to that head, not an
+unobserved later revision.
+
+The production probe was then checked against a real installed tree: an arm64
+(`aarch64-unknown-linux-musl`) base image built from `73e794cba113b1cb627a109c81c2a3665dff228b`
+installed the SHA-verified arm64 package, wrote its 0.160.0 receipt (lock digest
+`7f0fe42ff22ecfa3a47bc4a34f5b22c4218b431a4ec0aba51c7d98299f07900c`), passed the
+runner-version guard, and `probeCodexRuntime()` run as the worker UID returned
+`capable: true`. This is one local build on one architecture; the amd64 receipt above
+comes from CI.
+
+Package installation and the runner-version guard are distinct from production
+receipt/probe capability acceptance. An upgrade must also check the real probe
+against its installed tree, rather than treating synthetic probe tests or
+coordinate equality as that evidence. Architecture-specific execution evidence
+must be identified separately from archive checksum/manifest verification.
+Keep the full worker-UID inventory, two-shard union, M4 once and required checks;
+never loosen refusal, isolation or retention to make an upgrade pass.
+
+The reusable procedure is [Coordinated Codex runtime upgrades](../docs/dev-conventions.md#coordinated-codex-runtime-upgrades).
+Broader runtime adaptations require their own verified cause and plan review.

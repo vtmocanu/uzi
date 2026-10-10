@@ -122,6 +122,7 @@ if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
     *mrrflat*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"hotfix","worker_id":"${WID:-w0rker}","mr_iid":7778,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *failed*) printf '%s' '{"status":"failed","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *cancelled*) printf '%s' '{"status":"cancelled","issue_iid":4242,"kind":"issue","worker_id":"${WID:-w0rker}","milestones":[],"milestones_completed":[]}' ;;
     *completed*) printf '%s' '{"status":"completed","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *noworker*) printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *queuedbound*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
@@ -650,6 +651,24 @@ journal run-4242 "$RB/issue-4242.attempt-$A1" "$A1"
 TEST_RUNNER_BASE="$RB//" expect_pick 18 "$RB/issue-4242.attempt-$A1" a1
 echo "PASS case18: trailing slash on the runner base ignored"
 
+# Retained canonical predecessor discovery after handoff: no invented ledger id.
+reset_layout
+make_clone "$RB/issue-4242" agent/issue-4242 retained-canonical
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-other successor
+git --git-dir="$BARE" config "$JKEY" \
+  "{\"runId\":\"run-4242\",\"clonePath\":\"$RB/issue-4242.attempt-$A2\",\"attemptId\":\"$A2\",\"retainedSources\":[{\"runId\":\"run-4242\",\"clonePath\":\"$RB/issue-4242\"}]}"
+expect_pick retained-canonical "$RB/issue-4242" retained-canonical
+echo "PASS retained-canonical: predecessor without ledger identity is discoverable"
+
+# Both paths are valid: current work wins over the earlier-listed predecessor
+# and a newer ledger-only attempt.
+rm -rf "$RB/issue-4242.attempt-$A2"
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 current-newer-bytes
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 ledger-newest
+ledger "$A3" run-4242 "$RB/issue-4242.attempt-$A3" live
+expect_pick current-over-retained "$RB/issue-4242.attempt-$A2" current-newer-bytes
+echo "PASS current-over-retained: current journal clone takes precedence"
+
 # case 19: a LIVE run whose clone is gone and whose every recorded attempt is retired or
 # abandoned says so on the BARE line; a ledger-less bare (case 4) and a mixed ledger say
 # `attempt state unknown`. The archive is kept in all of them.
@@ -722,5 +741,108 @@ grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19F/backup.log" \
   || fail "case19f: a trailing empty ledger row must read unknown; got: $(cat "$WORK/out.19f/latest-attempt/backup.log")"
 if grep -q 'attempt retired' "$L19F/backup.log"; then fail "case19f: retirement claimed past a trailing empty row"; fi
 echo "PASS case19e/f: empty ledger rows fail closed to attempt state unknown"
+
+# Protected terminal custody survives replacement of the branch's active slot.
+# Both canonical and attempt sources retain their exact identity; no canonical
+# attempt marker or invented ledger row is required.
+for status in failed completed cancelled; do
+  for layout in canonical attempt; do
+    reset_layout
+    rid="$status-protected-$layout"
+    pkey="uzi-retained.$rid.journal"
+    predecessor="$RB/issue-4242"
+    [ "$layout" = canonical ] || predecessor="$RB/issue-4242.attempt-$A1"
+    make_clone "$predecessor" agent/issue-4242 protected-predecessor
+    make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 protected-current
+    make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 unrelated-newest
+    ledger "$A2" "$rid" "$RB/issue-4242.attempt-$A2" reclaimed
+    ledger "$A3" newer-run "$RB/issue-4242.attempt-$A3" live
+    [ "$layout" = canonical ] || ledger "$A1" "$rid" "$predecessor" reclaimed
+    envelope="$(jq -cn --arg rid "$rid" --arg pred "$predecessor" --arg a1 "$A1" --arg a2 "$A2" \
+      --arg current "$RB/issue-4242.attempt-$A2" --arg layout "$layout" --arg tip "$MAIN" '
+      ({runId:$rid,clonePath:$pred} + (if $layout == "attempt" then {attemptId:$a1} else {} end)) as $source
+      | {runId:$rid,clonePath:$current,attemptId:$a2,restoreTip:$tip} as $successor
+      | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:($successor +
+          {retainedSources:[$source],recovery:{version:1,source:$source,attempts:2,
+            startedAt:1000,deadline:301000,backoffMs:10,stage:"ready-for-model",restoreTip:$tip,successor:$successor}})}')"
+    git --git-dir="$BARE" config "$pkey" "$envelope"
+    journal newer-run "$RB/issue-4242.attempt-$A3" "$A3"
+    dest="$WORK/out.protected-$rid"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "$rid: protected backup exit $rc"
+    tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+protected-current' \
+      || fail "$rid: protected current source was not captured"
+
+    # A missing primary still discovers the retained predecessor.
+    rm -rf "$RB/issue-4242.attempt-$A2"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "$rid: predecessor backup exit $rc"
+    tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+protected-predecessor' \
+      || fail "$rid: protected predecessor was not captured"
+
+    # Full descriptor validation happens before picking a source. Every refusal
+    # keeps the previously published backup and never captures the newer run.
+    original_ledger="$(git --git-dir="$BARE" config --get-all "$LKEY")"
+    for fault in malformed version key sibling counter conflict ledger duplicate empty crossbranch malformed-ledger; do
+      bad="$envelope"
+      case "$fault" in
+        malformed) bad='{' ;;
+        version) bad="$(printf '%s' "$envelope" | jq '.version=2')" ;;
+        key) bad="$(printf '%s' "$envelope" | jq '.key="issue-other"')" ;;
+        sibling) bad="$(printf '%s' "$envelope" | jq '.journal.retainedSources[0].clonePath="/outside/source"')" ;;
+        counter) bad="$(printf '%s' "$envelope" | jq '.journal.recovery.attempts=4')" ;;
+        conflict) git --git-dir="$BARE" config "$JKEY" "$(printf '%s' "$envelope" | jq '.journal | .recovery.attempts=3')" ;;
+        ledger) ledger "$A2" newer-run "$RB/issue-4242.attempt-$A2" live ;;
+        empty) bad='' ;;
+        crossbranch) git --git-dir="$BARE" config --add uzi-attempts.agent/other.entry \
+          "{\"attemptId\":\"$A2\",\"runId\":\"$rid\",\"clonePath\":\"$RB/issue-4242.attempt-$A2\",\"state\":\"reclaimed\"}" ;;
+        malformed-ledger) git --git-dir="$BARE" config --add "$LKEY" "" ;;
+      esac
+      git --git-dir="$BARE" config "$pkey" "$bad"
+      [ "$fault" != duplicate ] || git --git-dir="$BARE" config --add "$pkey" "$envelope"
+      rc=0
+      env UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$RB" \
+        UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
+        bash "$SCRIPT" "$rid" >/dev/null 2>&1 || rc=$?
+      [ "$rc" -ne 0 ] || fail "$rid/$fault: invalid evidence succeeded"
+      tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+protected-predecessor' \
+        || fail "$rid/$fault: previous latest lost"
+      git --git-dir="$BARE" config --unset-all "$pkey"
+      git --git-dir="$BARE" config "$pkey" "$envelope"
+      journal newer-run "$RB/issue-4242.attempt-$A3" "$A3"
+      if [ "$fault" = ledger ]; then
+        git --git-dir="$BARE" config --unset-all "$LKEY"
+        while IFS= read -r row; do
+          git --git-dir="$BARE" config --add "$LKEY" "$row"
+        done <<< "$original_ledger"
+      fi
+      [ "$fault" != crossbranch ] || git --git-dir="$BARE" config --unset-all uzi-attempts.agent/other.entry
+    done
+    git --git-dir="$BARE" config --unset-all "$pkey"
+    echo "PASS protected $status/$layout: exact sources and fail-closed full descriptor"
+  done
+done
+
+# Episode-free completed singleton: the primary is also its retained source.
+reset_layout
+rid="completed-protected-singleton"
+predecessor="$RB/issue-4242"
+make_clone "$predecessor" agent/issue-4242 singleton-old-dirty
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 singleton-new-active
+ledger "$A3" newer-run "$RB/issue-4242.attempt-$A3" live
+envelope="$(jq -cn --arg rid "$rid" --arg pred "$predecessor" '
+  {runId:$rid,clonePath:$pred} as $source
+  | {version:1,branch:"agent/issue-4242",key:"issue-4242",
+     journal:($source + {retainedSources:[$source]})}')"
+git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$envelope"
+journal newer-run "$RB/issue-4242.attempt-$A3" "$A3"
+dest="$WORK/out.protected-singleton"
+rc="$(backup_rc "$dest" "$rid")"
+[ "$rc" -eq 0 ] || fail "protected singleton: backup exit $rc"
+tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+singleton-old-dirty' \
+  || fail "protected singleton: newer active run hid old dirty bytes"
+tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.meta.txt | grep -qF "clone=$predecessor" \
+  || fail "protected singleton: original path missing"
+echo "PASS protected completed singleton: episode-free old dirty bytes survive newer active run"
 
 echo "ALL PASS"

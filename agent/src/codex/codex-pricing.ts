@@ -13,7 +13,7 @@
 // carries none. OpenAI then processes it at the API PROJECT's configured tier, which uzi cannot
 // see: a project set to priority is billed above these rates. The pinned Codex version
 // app-server `thread/tokenUsage/updated` notification (source commit
-// 01fc69f4026735edfdf6789820549727a4867b11, `codex-rs/app-server-protocol/src/protocol/v2/
+// a956835d020762cb2b570053af06f643a11c0ecc, `codex-rs/app-server-protocol/src/protocol/v2/
 // thread.rs`, as exposed by the pinned Codex version) carries NO service-tier field on either `total` or `last`, so the tier is NOT
 // observable here. Per D5's explicit fallback ("if the tier isn't observable in the pinned
 // protocol, price as Standard only for the two known models"), we price the known models as

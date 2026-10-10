@@ -24,7 +24,7 @@ test(LARGE_RESUME_TITLE, { timeout: 110_000, skip: P_LAYER_SKIP }, async () => {
   const config = await loadPackagedConfig();
   const accounting = await import(pathToFileURL(path.resolve(process.env.CODEX_M4_SRC ?? "src", "codex/token-accounting.ts")).href) as typeof import("../../agent/src/codex/token-accounting.js");
   const bin = resolveCodexBin().codexBin;
-  assertBinaryVersion(bin, "0.159.3");
+  assertBinaryVersion(bin, "0.160.0");
   const scratch = path.resolve("../.uzi/scratch");
   mkdirSync(scratch, { recursive: true });
   const base = mkdtempSync(path.join(scratch, "large-resume-"));
@@ -198,7 +198,7 @@ test(LARGE_RESUME_TITLE, { timeout: 110_000, skip: P_LAYER_SKIP }, async () => {
       } });
       assert.ok(coldMaxFrameBytes < CAP);
       const evidence = {
-        version: "0.159.3", nodeVersion: process.version, fullHistoryBytes, metadataBytes,
+        version: "0.160.0", nodeVersion: process.version, fullHistoryBytes, metadataBytes,
         warmMaxFrameBytes, coldMaxFrameBytes, restoredRequestBytes,
         statuses, historyMode: resumed.thread.historyMode, providerRequests: provider.requests.length,
         fullHistoryStatus: "production cap rejected", metadataResumeStatus: "success",

@@ -690,3 +690,20 @@ reachable in the demo, not merely covered by a unit test** —
 is realistic" in general is still a convention to uphold by hand, not a
 gate to rely on: the PRD #311 M3 guard covers one specific invariant on
 five named fixtures, nothing broader.
+
+## Coordinated Codex runtime upgrades
+
+The runtime is an image-baked native package, separate from worker-model preferences.
+A lock-only bump is insufficient: the installed versioned directory must agree
+with `CODEX_BIN`, the fail-closed runtime probe's version and architecture digests,
+and active M4 version assertions/evidence. Keep the lock's version, manifest,
+source commit and both architecture tag/hash pairs coordinated; preserve the
+installer's existing verification and the worker's isolation checks.
+
+Before accepting an upgrade, verify the official packages and the actual installed
+executable/receipt/probe on the supported architecture, then require the full real
+worker-UID lane and other required CI checks. Docker-free coordinate tests detect
+stale consumers but do not prove native execution or probe capability. Distinguish
+infrastructure failures from runtime RED, and record evidence on exact source
+heads. The [0.160.0 ADR amendment](../adr/1106-codex-harness.md#amendment-coordinated-runtime-01600-2026-10-10)
+records the compatibility audit and the observed upgrade comparison.

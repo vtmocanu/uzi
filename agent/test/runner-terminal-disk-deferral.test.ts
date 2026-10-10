@@ -10,6 +10,7 @@ import { PlanRejectedError } from "../src/executor.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { Outbox } from "../src/outbox.js";
+import type { RecoveryJournalEntry } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, installHarness, runnerWith } from "./runner-harness.js";
 import {
@@ -598,12 +599,15 @@ describe("terminal execution disk deferral", () => {
       git.commitWipMarker = marker;
       git.fetchAgentBranch = fetch;
       f.setRoomy();
-      // Retained predecessor capture must happen before the resumed executor can read the tree.
-      // A capture-only reclaim is allowed; a fresh next generation then reads BOTH sentinels.
+      // The fenced successor captures the predecessor and reads both sentinels in this claim.
       const { gitlab } = fakeGitlab();
       let resumedCalls = 0;
+      let modelPath = "";
+      let admittedJournal: RecoveryJournalEntry | undefined;
       const resumed = runnerWith(() => ({ homeDir: f.home, executor: { run: async (ctx) => {
         resumedCalls++;
+        modelPath = ctx.worktreePath;
+        admittedJournal = JSON.parse(readGit(git.barePathFor(fx.originPath), "config", "--local", "--get", "uzi-recovery.agent/issue-2201.clone")) as RecoveryJournalEntry;
         assert.notEqual(ctx.worktreePath, journal.clonePath, "successor executes in a fresh attempt path");
         assert.match(ctx.worktreePath, /\.attempt-/);
         assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
@@ -612,13 +616,25 @@ describe("terminal execution disk deferral", () => {
         throw new PlanRejectedError("stop after durability proof");
       } } }), gitlab, undefined, nullLogger(), { quiesceRun: async () => QUIESCENT, dockerHost: "unix:///fixture-no-daemon" });
       const next = { ...f.claim, claim_generation: 5 };
+      api.onState(next.run_id, body => api.setOwnershipStatus(next.run_id, body.status, next.claim_generation));
       api.setOwnershipStatus(next.run_id, "running", 5);
       await resumed.execute(next);
-      if (!resumedCalls) {
-        api.setOwnershipStatus(next.run_id, "running", 6);
-        await resumed.execute({ ...next, claim_generation: 6 });
-      }
-      assert.equal(resumedCalls, 1, "fresh resumed executor read both independently durable sentinels");
+      assert.equal(resumedCalls, 1, "the first fenced successor starts the model");
+      assert.notEqual(modelPath, journal.clonePath);
+      assert.match(modelPath, /\.attempt-.*-g5-/);
+      assert.equal(fs.readFileSync(path.join(modelPath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+      assert.equal(fs.readFileSync(path.join(modelPath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+      assert.equal(fs.readFileSync(path.join(journal.clonePath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+      assert.equal(fs.readFileSync(path.join(journal.clonePath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+      assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
+      assert.equal(parks().length, 1, "local recovery adds no automatic recovery_wait");
+      assert.equal(admittedJournal?.clonePath, modelPath);
+      assert.equal(admittedJournal?.recovery?.stage, "ready-for-model");
+      assert.equal(admittedJournal?.recovery?.attempts, 1, "the model sees the charged recovery episode");
+      assert.ok(admittedJournal?.retainedSources?.some(source => source.clonePath === journal.clonePath && source.attemptId === journal.attemptId));
+      const retained = JSON.parse(readGit(git.barePathFor(fx.originPath), "config", "--local", "--get", "uzi-recovery.agent/issue-2201.clone")) as RecoveryJournalEntry;
+      assert.equal(retained.recovery?.attempts, 1, "fixture interruption preserves the episode budget");
+      assert.ok(readGit(git.barePathFor(fx.originPath), "for-each-ref", "--format=%(refname)", `refs/uzi-recovery-episode/${next.run_id}/`), "episode pins retain custody");
     });
   }
 

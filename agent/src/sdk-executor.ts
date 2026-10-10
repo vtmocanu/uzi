@@ -3879,6 +3879,8 @@ export class SdkExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
+    let processedEvents = 0;
+    let result: TurnResult;
     // issue #1656: the session THIS turn actually runs, read off the turn's own events, and
     // whether an init reported a session other than the requested resume. Unlike the once-per-run
     // latch above, these see a later turn whose requested resume came back as a fresh session.
@@ -3920,6 +3922,7 @@ export class SdkExecutor implements Executor {
       const turn = this.harness.startTurn(request);
       let sawModelEvidence = false;
       for await (const event of turn.events) {
+        if (evidencesModelProcessing(event)) processedEvents++;
         if (!sawModelEvidence && evidencesModelProcessing(event)) {
           sawModelEvidence = true;
           try {
@@ -4026,7 +4029,7 @@ export class SdkExecutor implements Executor {
         sawTerminal && terminal
           ? { kind: "terminal", terminal }
           : { kind: "exhausted" };
-      return reducer.finish(end).result;
+      result = reducer.finish(end).result;
     } catch (err) {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
@@ -4044,6 +4047,15 @@ export class SdkExecutor implements Executor {
       this.disarmWall(state);
       state.currentAbort = undefined;
     }
+    // The for-await terminal break has closed the SDK iterator, and the finally above
+    // has debited the wall and cleared the turn's watchdog/abort state. The run's trip
+    // owns interruption precedence; ctx.signal may still carry a handled PauseNowSignal.
+    if (state.tripReason) throw this.tripError(state);
+    if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
+        !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && state.wallRemainingMs > 0) {
+      await ctx.onModelTurnSettled?.(processedEvents);
+    }
+    return result;
   }
 
   /**
