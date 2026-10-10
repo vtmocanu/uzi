@@ -1,5 +1,16 @@
 # Issue #2397: partial worker-UID investigation
 
+**Current status (2026-10-10).** See the three dated sections at the end of this file:
+- A controlled worker-UID RED was obtained on a worker's real lane for the owner-refusal,
+  symlink-refusal and single-uid advice teardown leaves.
+- A test-side readiness barrier made those leaves 40/40 GREEN on the same lane.
+- Production code is unchanged.
+- The other historical #2397 cases remain unproven, and the issue stays open (`Refs #2397`).
+
+Everything between this paragraph and those sections is earlier history, kept verbatim. Its
+statements were true when written. That includes the next paragraph, which records the earlier
+diagnostics-only disposition, superseded by those sections.
+
 The approved M3 diagnostics-only disposition is complete; cause diagnosis and
 fix are **not completed**. No controlled defect RED was found, M2 was not
 attempted, and there is no cause regression test. Privileged image acceptance
@@ -283,11 +294,14 @@ real lane, not in CI.
   `agent/templates/base/Dockerfile` at `0e356b9f`. The build used `docker build --network host`: this
   worker's bridge network has no egress, and the default build hung at `apk add`.
 - Runtime: Node v24.20.0 and Codex 0.159.3 (`/opt/uzi-codex/0.159.3`).
-- Container: the exact `docker run` from `e2e/worker-uid/run.sh`, i.e. `--network none`,
-  `--cap-drop ALL` plus its five cap-adds, `no-new-privileges`, and the `uzi-entrypoint` drop to
-  the worker UID. Only two things differed:
+- Container: the `docker run` from `e2e/worker-uid/run.sh`, with the same `--network none`,
+  `--cap-drop ALL` plus its five cap-adds, `no-new-privileges`, tmpfs mounts and
+  `uzi-entrypoint` drop to the worker UID. It differed in these ways:
   - It mounted a scratch export of `0e356b9f` with scratch-only patches.
+  - It passed only `/app/test/codex-executor.test.ts`, not `run.sh`'s four test files.
+  - It used the projection's `--test-name-pattern`.
   - Some batches added `--cpus 0.25`.
+  - It had its own container name, with a fixed 600s outer timeout.
 - Each run selected four leaves through a labelled scratch projection of the unmodified
   `inventory.mjs` output: owner refusal, symlink refusal, single-uid, and the genuine-unclean
   control. The unmodified `pattern.mjs` and `check.py` ran over that projection. The tracked
@@ -320,7 +334,11 @@ In every batch the genuine-unclean control passed, retaining data with the retai
   supervisor `child_exit` evidence event observed after `mutation_end`. That `child_exit` was
   followed by `abnormal` or a dispose report, and the warning was
   `retained / not_clean / other_unconfirmed`, `cleanup_attempted:false`. This matches the
-  natural CI record from run 38001555502.
+  signature of the natural CI record from run 38001555502 (job 114063389279, quoted in full
+  in the #2397 issue thread). That record shows the evidence order `started`, `child_exit`,
+  `abnormal`, exit `nonzero`, with no `dispose` evidence, and the warning
+  `retained / not_clean / other_unconfirmed` with `cleanup_attempted: false`. The CI record
+  carries no mutation marks, so its mutation timing is not known.
 - No passing leaf in any batch recorded a `child_exit`.
 - In three failing records the `child_exit` was observed after `dispose_start` but before the
   dispose evidence. The derived `failure_signature.child_exit_before_dispose` reads `false` in
@@ -330,8 +348,8 @@ In every batch the genuine-unclean control passed, retaining data with the retai
 **Observations (a) and (c).**
 - (a): mutating the root before the supervisor spawns never disrupted the provider. All leaves
   were clean, and the victim directory held only `keep`.
-- (c): with readiness confirmed before the mutation, all 40 iterations were clean. Every leaf
-  record read `started > provider_ready > mutation_start > mutation_end > dispose_start >
+- (c): with readiness confirmed before the mutation, all 40 iterations were clean. Every record
+  for the three test leaves read `started > provider_ready > mutation_start > mutation_end > dispose_start >
   dispose > exit_zero > dispose_end`. Owner and symlink logged the cleanup-failure warning,
   and single-uid removed the root without it.
 - Probe safety: the owner planted directory held only `keep` (`"keep"`), and the symlink
@@ -345,8 +363,17 @@ In every batch the genuine-unclean control passed, retaining data with the retai
 - In (b), the provider's exit was observed during or after the mutation window; the exact
   physical order is ambiguous.
 - **Inference, not proven:** the provider exits when its owned root is renamed after spawn but
-  before it is ready. Renaming before spawn or after readiness does not disrupt it. Which path
-  the app-server touches at startup was not observed.
+  before it is ready. Renaming before spawn (batch (a), only n=3 at default CPU) or after
+  readiness does not disrupt it. Which path the app-server touches at startup was not observed.
+- **Confound:** the barrier changes two things at once. It adds an active `initialize`
+  handshake, and it delays the mutation by about 300ms (median leaf time). The evidence cannot
+  separate "after readiness is safe" from "later is safe", or from "the handshake itself moves
+  startup work earlier". The fix relies only on the observed result: with the awaited answer
+  before the mutation, no disruption occurred in 80 iterations (40 in (c) and 40 for the fixed
+  leaves).
+- **Medians:** the (b) medians include failing runs; the (c) and fixed medians are passing runs
+  only. "Unprobed" in (b) means no readiness barrier; the `probe-safety` listing ran in every
+  batch.
 
 **Per-leaf gate (plan v3 M1 step 5).** Owner refusal, symlink refusal and single-uid each have
 an unforced named RED carrying the natural signature, a 20/20 barrier GREEN under throttle,
