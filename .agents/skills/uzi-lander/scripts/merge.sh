@@ -71,7 +71,8 @@ REPO=""; PR=""; EXPECT=""; EXPECT_CLOSES=""; METHOD="squash"; ADMIN=1; DELETE=1;
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-head) EXPECT="${2:?}"; shift 2;;
-    --expect-closes) EXPECT_CLOSES="${2:?}"; shift 2;;
+    --expect-closes) [ $# -ge 2 ] && [ -n "$2" ] || { echo "--expect-closes needs issue numbers or none" >&2; exit 2; }
+      EXPECT_CLOSES="$2"; shift 2;;
     --method) METHOD="${2:?}"; shift 2;;
     --no-admin) ADMIN=0; shift;;
     --no-delete-branch) DELETE=0; shift;;
@@ -135,8 +136,12 @@ echo "head=${head:0:8} mergeable=$mg mergeStateStatus=$ms"
 # Closing references, as GitHub will apply them on merge (negated prose counts too).
 want_closes=""
 if [ -n "$EXPECT_CLOSES" ] && [ "$EXPECT_CLOSES" != none ]; then
-  want_closes=$(printf '%s' "$EXPECT_CLOSES" | tr ',' '\n' | tr -d ' #' | grep -E '^[0-9]+$' | sort -n | paste -sd, -)
-  [ "$want_closes" = "$(printf '%s' "$EXPECT_CLOSES" | tr ',' '\n' | tr -d ' #' | sort -n | paste -sd, -)" ] \
+  # Each comma-separated token: optional surrounding blanks, one optional leading '#', digits.
+  want_closes=$(printf '%s\n' "$EXPECT_CLOSES" | awk -F, '{
+      for (i = 1; i <= NF; i++) { t = $i; gsub(/^[ \t]+|[ \t]+$/, "", t)
+        if (t !~ /^#?[0-9]+$/) { bad = 1; exit }
+        sub(/^#/, "", t); print t + 0 } }
+    END { if (bad) exit 1 }' | sort -n | paste -sd, -) \
     || { echo "bad --expect-closes '$EXPECT_CLOSES' (issue numbers, comma-separated, or none)" >&2; exit 2; }
 fi
 if closes=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences 2>/dev/null \

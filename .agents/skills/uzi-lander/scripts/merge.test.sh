@@ -471,10 +471,15 @@ MERGE_ARGS=(--expect-closes 7)
 merge_run closes_extra
 [ "$rc" -eq 11 ] || fail "an extra closing reference did not refuse, rc=$rc: $(cat "$WORK/m.closes_extra")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with an unexpected closing reference"
-MERGE_ARGS=(--expect-closes 'seven')
-merge_run closes_bad
-[ "$rc" -eq 2 ] || fail "a malformed --expect-closes did not refuse, rc=$rc"
-[ ! -e "$WORK/merge.log" ] || fail "merged on a malformed --expect-closes"
+for bad in 'seven' '1#2' '7,' ',7' '7,,12' '##7' '7 12' ''; do
+  MERGE_ARGS=(--expect-closes "$bad")
+  merge_run closes_bad
+  [ "$rc" -eq 2 ] || fail "malformed --expect-closes '$bad' did not refuse, rc=$rc: $(cat "$WORK/m.closes_bad")"
+  [ ! -e "$WORK/merge.log" ] || fail "merged on malformed --expect-closes '$bad'"
+done
+MERGE_ARGS=(--expect-closes ' #12 , 7 ')
+merge_run closes_blanks
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "surrounding blanks and a leading # blocked a matching set: $(cat "$WORK/m.closes_blanks")"
 export CLOSES_FAIL=1
 MERGE_ARGS=(--expect-closes none)
 merge_run closes_unreadable
