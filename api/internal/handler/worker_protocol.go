@@ -1075,8 +1075,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		// still carries the field. The worker's claim call has no strip-and-retry: the 400 fails
 		// that poll and the worker claims again on its next poll with a fresh snapshot (without
 		// the field once a rollback strip-and-retry on another wire has cleared the negotiated
-		// features);
-		// when enabled, parse the snapshot defensively (a malformed body drops to nil).
+		// features). When enabled, parse the snapshot defensively (a malformed body drops to nil).
 		var snapshot *workersvc.ActiveSnapshot
 		if h.cfg.ActiveSnapshotDisabled {
 			if req.ActiveSnapshot != nil {

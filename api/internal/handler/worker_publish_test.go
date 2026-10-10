@@ -363,46 +363,64 @@ func TestWorkerRunPublishSkipMappings(t *testing.T) {
 // run id, the mapped reason and the content-free detail, while the response body never carries
 // the detail.
 func TestWorkerRunPublishRefusalLogsDetail(t *testing.T) {
-	var logs bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	cases := []struct {
+		reason string
+		err    error
+		want   []string
+	}{
+		{"pack_too_large", fmt.Errorf("%w: %w", pushbroker.ErrPackTooLarge,
+			&packbudget.BudgetError{Bound: packbudget.BoundTotalBytes, Limit: 123}), []string{"total reconstructed size", "123"}},
+		{"pack_invalid", fmt.Errorf("%w: %w", pushbroker.ErrPackInvalid,
+			&packbudget.InvalidError{Check: "object header"}), []string{"object header"}},
+		{"tip_missing", fmt.Errorf("%w: zero declared tip", pushbroker.ErrTipMissing), []string{"zero declared tip"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
 
-	box := newBox(t)
-	sealed, _ := box.Seal([]byte("pat"))
-	st := &publishStore{ownedRun: issueRun(42), claim: issueClaimRow(sealed)}
-	publish := func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
-		return pushbroker.Result{}, fmt.Errorf("%w: %w", pushbroker.ErrPackTooLarge,
-			&packbudget.BudgetError{Bound: packbudget.BoundTotalBytes, Limit: 123})
-	}
-	h := newPublishHandler(t, st, box, func(string) bool { return true }, publish)
-	rec := httptest.NewRecorder()
-	runID := uuid.New()
-	h.WorkerRunPublish(rec, publishReq(runID, validTip, strings.NewReader("pack")))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
-	}
-	if strings.Contains(rec.Body.String(), "detail") {
-		t.Fatalf("response body leaks detail: %q", rec.Body.String())
-	}
-	var found int
-	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] != "worker run publish refused" {
-			continue
-		}
-		found++
-		detail, _ := rec["detail"].(string)
-		if rec["level"] != "WARN" || rec["run_id"] != runID.String() || rec["reason"] != "pack_too_large" ||
-			!strings.Contains(detail, "total reconstructed size") || !strings.Contains(detail, "123") {
-			t.Fatalf("log record = %v, want WARN with run_id, reason=pack_too_large and the bound in detail", rec)
-		}
-	}
-	if found != 1 {
-		t.Fatalf("found %d refusal records in %q, want 1", found, logs.String())
+			box := newBox(t)
+			sealed, _ := box.Seal([]byte("pat"))
+			st := &publishStore{ownedRun: issueRun(42), claim: issueClaimRow(sealed)}
+			publish := func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
+				return pushbroker.Result{}, tc.err
+			}
+			h := newPublishHandler(t, st, box, func(string) bool { return true }, publish)
+			rec := httptest.NewRecorder()
+			runID := uuid.New()
+			h.WorkerRunPublish(rec, publishReq(runID, validTip, strings.NewReader("pack")))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "detail") {
+				t.Fatalf("response body leaks detail: %q", rec.Body.String())
+			}
+			var found int
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var rec map[string]any
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					continue
+				}
+				if rec["msg"] != "worker run publish refused" {
+					continue
+				}
+				found++
+				detail, _ := rec["detail"].(string)
+				if rec["level"] != "WARN" || rec["run_id"] != runID.String() || rec["reason"] != tc.reason {
+					t.Fatalf("log record = %v, want WARN with run_id and reason=%s", rec, tc.reason)
+				}
+				for _, w := range tc.want {
+					if !strings.Contains(detail, w) {
+						t.Fatalf("detail %q lacks %q", detail, w)
+					}
+				}
+			}
+			if found != 1 {
+				t.Fatalf("found %d refusal records in %q, want 1", found, logs.String())
+			}
+		})
 	}
 }
 

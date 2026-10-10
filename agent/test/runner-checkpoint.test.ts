@@ -966,7 +966,7 @@ describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue
     );
   });
 
-  for (const label of ["tip_missing", "pack_too_large", "pack_invalid", "unsupported"] as const) {
+  for (const label of ["tip_missing", "pack_too_large", "pack_invalid", "superseded", "unsupported"] as const) {
     it(`a 2xx {published:false, skipped:${label}} surfaces the label on the feed, not "other"`, async () => {
       const { gitlab } = fakeGitlab();
       const claim = gitlabClaim(92);
