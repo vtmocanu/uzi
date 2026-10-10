@@ -26,6 +26,8 @@ through `[0.52.0]`.)
 
 - **Checkpoint publication tolerates extra flush packets after a plain receive-pack report ([#2703](https://github.com/vtmocanu/uzi/issues/2703)).**
   A plain (non-sideband) receive-pack report followed by one or more bare flush packets is still read as the complete report, so publication no longer fails with "missing or incomplete receive-pack acknowledgement"; data or contradictory packets after the report are still not treated as an acknowledgement.
+- **A transient storage or deadline error during pre-clone retained-recovery discovery no longer fails the claim ([#2613](https://github.com/vtmocanu/uzi/issues/2613)).**
+  Discovery now retries only confirmed operational errors (the operation deadline, identified by an elapsed deadline plus abort evidence, and EAGAIN, EMFILE, ENFILE or ENOMEM), at most twice per claim across both discovery callers with the existing exponential delay; typed, corruption and unsafe-storage errors stay terminal, and an exhausted allowance fails with "local recovery storage busy or unavailable after bounded retries" while keeping local work and custody. The allowance is in-memory, never parks, and does not touch the persisted episode budget; it adds about 2 x codexBoundaryDeadlineMs plus 3 x recoveryRetryMs of scheduled time (about 63 s at defaults), not a wall-clock guarantee. See [ADR-1197](adr/1197-transient-recovery-park.md).
 
 ## [0.86.0] - 2026-10-06
 

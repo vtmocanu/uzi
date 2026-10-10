@@ -971,6 +971,50 @@ class RetainedRecoveryMissingJournalError extends Error {
   constructor() { super("Retained recovery blocked: required journal is missing; local work and custody retained"); }
 }
 
+/** Per-claim retries of pre-clone retained discovery after a confirmed operational error. Shared by
+ *  both discoverRetained callers (pre-clone and the PendingRecoveryCaptureError branch). */
+const RETAINED_DISCOVERY_RETRIES = 2;
+
+/** Thrown inside discoverRetained when a retryable error has no allowance left; the catch maps it
+ *  to the "busy or unavailable after bounded retries" reason. Local, never escapes discoverRetained. */
+class RetainedDiscoveryExhaustedError extends Error {
+  constructor() { super("retained recovery discovery retries exhausted"); }
+}
+
+/** Message of the lock-wait abort in git.ts (GIT_LOCK_WAIT_ABORT_MESSAGE, not exported). */
+const RETAINED_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
+const RETAINED_DEADLINE_TEXT = "recovery deadline exhausted";
+const RETAINED_RETRYABLE_ERRNO = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]);
+const RETAINED_CORRUPTION_MARKERS = [
+  "invalid retained recovery clone journal", "invalid recovery", "unsafe recovery", "does not belong", "ledger",
+];
+
+/**
+ * Classifies a pre-clone retained-discovery failure. Typed and corruption rejections come first,
+ * before any deadline-text match, so a corrupt journal can never be retried as "busy". A deadline
+ * error is retryable only when the caller's absolute attempt deadline has elapsed AND the error
+ * carries positive deadline evidence; a bare AbortError is terminal.
+ */
+function classifyRetainedDiscoveryError(error: unknown, deadlineElapsed: boolean): "retryable" | "terminal" {
+  if (error instanceof RetainedRecoveryBlockedError || error instanceof RetainedRecoveryMissingJournalError ||
+      error instanceof ForeignRetainedRecoveryError || error instanceof RetainedRecoveryStop ||
+      error instanceof CredentialSwitchSignal || error instanceof SyntaxError) return "terminal";
+  const message = error instanceof Error ? error.message : "";
+  if (RETAINED_CORRUPTION_MARKERS.some(marker => message.includes(marker))) return "terminal";
+  const errno = error as { code?: unknown; syscall?: unknown } | null;
+  if (error instanceof Error && typeof errno?.code === "string" && typeof errno.syscall === "string") {
+    return RETAINED_RETRYABLE_ERRNO.has(errno.code) ? "retryable" : "terminal";
+  }
+  if (!deadlineElapsed) return "terminal";
+  if (error instanceof Error && error.name === "AbortError" && message === RETAINED_LOCK_WAIT_ABORT_MESSAGE) return "retryable";
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
+    if (current.message.includes(RETAINED_DEADLINE_TEXT)) return "retryable";
+    current = (current as { cause?: unknown }).cause;
+  }
+  return "terminal";
+}
+
 class CredentialSwitchRetainedStop extends Error {
   constructor() {
     super("credential switch unconfirmed; retaining work and stopping the flight");
@@ -1639,6 +1683,8 @@ interface RunFlight {
   retainedEpisodeCustody?: boolean;
   completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
+  /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
+  retainedDiscoveryRetries?: number;
   readonly runHome: string | undefined;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
@@ -8767,10 +8813,31 @@ export class RunRunner {
             }
           }
         };
-        if (typeof this.git.withRecoveryOperation === "function") {
-          await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs, discover);
-        } else {
-          await discover();
+        // The allowance is in-memory and separate from the persisted episode budget
+        // (reserveRecoveryIteration), which it never reads, resets or replaces. The extra time is
+        // scheduled time (attempt deadlines plus backoff), not a wall-clock guarantee.
+        for (;;) {
+          retainedJournal = undefined;
+          const attemptDeadline = Date.now() + this.codexBoundaryDeadlineMs;
+          try {
+            if (typeof this.git.withRecoveryOperation === "function") {
+              await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), attemptDeadline, discover);
+            } else {
+              await discover();
+            }
+            break;
+          } catch (attemptError) {
+            this.retainedLifecycleGuard(flight);
+            if (classifyRetainedDiscoveryError(attemptError, Date.now() >= attemptDeadline) !== "retryable") throw attemptError;
+            const retry = (flight.retainedDiscoveryRetries ?? 0) + 1;
+            if (retry > RETAINED_DISCOVERY_RETRIES) throw new RetainedDiscoveryExhaustedError();
+            flight.retainedDiscoveryRetries = retry;
+            flight.runLog.warn("retained recovery discovery failed; retrying within the bounded per-claim allowance", {
+              retry, error: sanitizeForLog(errMessage(attemptError)),
+            });
+            await this.waitRecoveryRetry(flight, true, this.recoveryRetryMs * 2 ** (retry - 1));
+            this.retainedLifecycleGuard(flight);
+          }
         }
         this.retainedLifecycleGuard(flight);
         if (required && !retainedJournal) throw new RetainedRecoveryMissingJournalError();
@@ -8795,7 +8862,9 @@ export class RunRunner {
           flight.keepGuardedInventoryOpen = true;
           flight.retainedLocalCustody = true;
           let reason = error instanceof RetainedRecoveryMissingJournalError ? error.message :
-            "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
+            error instanceof RetainedDiscoveryExhaustedError ?
+              "Retained recovery blocked: local recovery storage busy or unavailable after bounded retries; local work and custody retained" :
+              "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
           if (error instanceof RetainedRecoveryBlockedError) {
             flight.barePath = error.barePath;
             flight.worktreePath = error.journal.clonePath;
