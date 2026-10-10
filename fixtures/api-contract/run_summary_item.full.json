@@ -1,0 +1,424 @@
+{
+  "worker_recovery": {
+    "episode": 1,
+    "automatic_requeue_limit": 1,
+    "episode_used": 1,
+    "episode_remaining": 1,
+    "evidence": {
+      "checkpoint_tip": "x",
+      "available_capture": true,
+      "publication_uncertain": true,
+      "capture_uncertain": true,
+      "custody_uncertain": true,
+      "unknown": true,
+      "recorded_at": "2020-01-02T03:04:05Z"
+    }
+  },
+  "id": "x",
+  "repo_id": "x",
+  "forge_type": "x",
+  "kind": "x",
+  "issue_iid": 1,
+  "issue_title": "x",
+  "harness": "x",
+  "has_prd_link": true,
+  "title": "x",
+  "resume_of_run_id": "x",
+  "status": "x",
+  "requeue_count": 1,
+  "iteration_count": 1,
+  "is_planning": true,
+  "progress": {
+    "state": "x",
+    "pct": 1,
+    "milestone_done": 1,
+    "milestone_total": 1,
+    "active_milestone_id": "x",
+    "phase": "x",
+    "maybe_blocked_by_run_id": "x"
+  },
+  "auto_approve": true,
+  "auto_approve_blocked_reasons": [
+    "x"
+  ],
+  "issue_input_reason": "x",
+  "plan_cross_check_required": true,
+  "plan_cross_check_gate_reason": "x",
+  "plan_cross_check_diff_refusal": "x",
+  "plan_cross_check_summary": {
+    "checker_model_source": "x",
+    "checker_effort_source": "x",
+    "round": 1,
+    "verdict": "x",
+    "reason_class": "x",
+    "findings": {
+      "summary": "x",
+      "items": [
+        {
+          "file": "x",
+          "severity": "x",
+          "summary": "x",
+          "rationale": "x"
+        }
+      ]
+    },
+    "checker_run_id": "x",
+    "checker_model": "x",
+    "checker_effort": "x",
+    "usage": {
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "cost_usd": 1.5,
+      "cost_status": "x"
+    },
+    "historical": true
+  },
+  "trigger_source": "x",
+  "milestones": [
+    {
+      "id": "x",
+      "title": "x"
+    }
+  ],
+  "milestones_candidate": [
+    {
+      "id": "x",
+      "title": "x"
+    }
+  ],
+  "milestones_completed": [
+    "x"
+  ],
+  "milestones_in_progress": [
+    "x"
+  ],
+  "milestones_agents": [
+    {
+      "id": "x",
+      "agent": "x",
+      "agent_label": "x"
+    }
+  ],
+  "milestones_live": [
+    {
+      "milestone_id": "x",
+      "lanes": [
+        {
+          "agent": "x",
+          "agent_instance": "x",
+          "agent_label": "x",
+          "tool": "x",
+          "detail": "x",
+          "at": "2020-01-02T03:04:05Z"
+        }
+      ]
+    }
+  ],
+  "budget_max_iterations": 1,
+  "budget_wall_seconds": 1,
+  "budget_extension_seconds": 1,
+  "budget_extension_cap_seconds": 1,
+  "budget_finalize_seconds": 1,
+  "budget_total_seconds": 1,
+  "budget_used_seconds": 1,
+  "scope_ceiling": 1,
+  "pause_requested": true,
+  "completion_budget_exhausted": true,
+  "pause_requested_at": "2020-01-02T03:04:05Z",
+  "pause_mode": "x",
+  "pause_after_count": 1,
+  "checkpoint_tip_at": "2020-01-02T03:04:05Z",
+  "completion_interlock": true,
+  "completion_attempts": 1,
+  "completion_unmet": [
+    "x"
+  ],
+  "hold_reason": "x",
+  "hold_context": "x",
+  "can_stop_at_wall": true,
+  "completion_phase": "x",
+  "completion_revision": 1,
+  "completion_deferred": [
+    {
+      "milestone_id": "x",
+      "reason": "x",
+      "revision": 1
+    }
+  ],
+  "completion_accepted": [
+    {
+      "id": "x",
+      "milestone_id": "x",
+      "text": "x",
+      "reason": "x",
+      "revision": 1
+    }
+  ],
+  "worker_id": "x",
+  "branch": "x",
+  "base_branch": "x",
+  "open_mr": true,
+  "interactive": true,
+  "dispatched_at": "2020-01-02T03:04:05Z",
+  "mr_iid": 1,
+  "mr_web_url": "x",
+  "branch_has_active_run": true,
+  "branch_has_open_mr": true,
+  "issue_web_url": "x",
+  "mr_state": "x",
+  "failure_reason": "x",
+  "stop_kind": "x",
+  "stop_reason": "x",
+  "health": "x",
+  "health_reason": "x",
+  "health_since": "2020-01-02T03:04:05Z",
+  "deadline_at": "2020-01-02T03:04:05Z",
+  "plan_source": "x",
+  "gate_revision": 1,
+  "summary_intent": "x",
+  "summary_plan": "x",
+  "summary_deltas": [
+    {
+      "kind": "x",
+      "text": "x"
+    }
+  ],
+  "pr_description": {
+    "mr_iid": 1,
+    "source": "x",
+    "fields": {
+      "summary": "x",
+      "changes": [
+        "x"
+      ],
+      "scope_notes": [
+        {
+          "kind": "x",
+          "text": "x"
+        }
+      ],
+      "review_pointers": [
+        "x"
+      ],
+      "verification": [
+        {
+          "command": "x",
+          "result": "x",
+          "verified_at_sha": "x"
+        }
+      ],
+      "diagram": {
+        "kind": "x",
+        "title": "x",
+        "nodes": [
+          {
+            "key": "x",
+            "label": "x"
+          }
+        ],
+        "edges": [
+          {
+            "from": "x",
+            "to": "x",
+            "label": "x"
+          }
+        ]
+      }
+    },
+    "size": {
+      "unavailable": true,
+      "files": 1,
+      "code": {
+        "added": 1,
+        "deleted": 1
+      },
+      "tests": {
+        "added": 1,
+        "deleted": 1
+      },
+      "docs": {
+        "added": 1,
+        "deleted": 1
+      },
+      "config": {
+        "added": 1,
+        "deleted": 1
+      },
+      "generated": {
+        "added": 1,
+        "deleted": 1
+      },
+      "vendored": {
+        "added": 1,
+        "deleted": 1
+      }
+    },
+    "base_sha": "x",
+    "head_sha": "x",
+    "target_branch": "x",
+    "published_at": "2020-01-02T03:04:05Z",
+    "diagram_published": true
+  },
+  "pr_description_outcome": "x",
+  "job": {
+    "type": "x",
+    "inputs": [
+      {
+        "name": "x",
+        "size_bytes": 1
+      }
+    ],
+    "origin": {
+      "requested_by_label": "x",
+      "product_name": "x"
+    },
+    "result": {
+      "status": "x",
+      "report_md": "x",
+      "findings": [
+        {
+          "severity": "x",
+          "message_md": "x",
+          "url": "x",
+          "file": "x",
+          "line": 1
+        }
+      ]
+    }
+  },
+  "pipeline_ref": "x",
+  "pipeline_web_url": "x",
+  "fix_verdict": "x",
+  "report_only": true,
+  "report_md": "x",
+  "fail_origin": "x",
+  "landing_state": "x",
+  "salvage_state": "x",
+  "salvage_ref": "x",
+  "salvage_tip": "x",
+  "salvage_expires_at": "2020-01-02T03:04:05Z",
+  "salvage_last_error": "x",
+  "prd_done_path": "x",
+  "prd_patch_settled_at": "2020-01-02T03:04:05Z",
+  "claimed_at": "2020-01-02T03:04:05Z",
+  "started_at": "2020-01-02T03:04:05Z",
+  "first_started_at": "2020-01-02T03:04:05Z",
+  "finished_at": "2020-01-02T03:04:05Z",
+  "created_at": "2020-01-02T03:04:05Z",
+  "updated_at": "2020-01-02T03:04:05Z",
+  "status_since": "2020-01-02T03:04:05Z",
+  "agent_source": "x",
+  "agent_exclusions": [
+    "x"
+  ],
+  "own_agents": [
+    {
+      "name": "x",
+      "description": "x",
+      "folder": "x"
+    }
+  ],
+  "anthropic_secret_id": "x",
+  "anthropic_secret_label": "x",
+  "anthropic_select_reason": "x",
+  "anthropic_headroom_pct": 1,
+  "usage": {
+    "input_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "output_tokens": 1,
+    "cost_usd": 1.5,
+    "cost_status": "x"
+  },
+  "usage_estimated_tail": {
+    "input_tokens": 1,
+    "cache_read_tokens": 1,
+    "cache_creation_tokens": 1,
+    "output_tokens": 1,
+    "cost_usd": 1.5,
+    "cost_status": "x",
+    "price_table_version": "x",
+    "coverage": "x",
+    "coverage_reasons": [
+      "x"
+    ],
+    "models": [
+      {
+        "model": "x",
+        "input_tokens": 1,
+        "cache_read_tokens": 1,
+        "cache_creation_tokens": 1,
+        "output_tokens": 1,
+        "cost_usd": 1.5,
+        "cost_status": "x"
+      }
+    ]
+  },
+  "wait_on_limit": true,
+  "mr_rework_enabled": true,
+  "mr_rework_auto_cycles": 1,
+  "mr_rework_auto_cap": 1,
+  "limit_resets_at": "2020-01-02T03:04:05Z",
+  "retry_not_before": "2020-01-02T03:04:05Z",
+  "limit_wait_count": 1,
+  "rate_limit_type": "x",
+  "recovery_wait_cause": "x",
+  "codex_account_action": "x",
+  "codex_secret_id": "x",
+  "codex_secret_label": "x",
+  "recovery_retry_not_before": "2020-01-02T03:04:05Z",
+  "forge_park_count": 1,
+  "forge_park_max": 1,
+  "disk_park_count": 1,
+  "checkpoint_contains_latest": true,
+  "home_bytes": 1,
+  "cache_bytes": 1,
+  "disk_truncated": true,
+  "model": "x",
+  "override_subagent_model": true,
+  "priority": "x",
+  "required_capabilities": [
+    "x"
+  ],
+  "required_tools": [
+    "x"
+  ],
+  "size_class": "x",
+  "plan_changed_files": [
+    "x"
+  ],
+  "current_activity": {
+    "agent": "x",
+    "agent_instance": "x",
+    "agent_label": "x",
+    "tool": "x",
+    "detail": "x",
+    "at": "2020-01-02T03:04:05Z",
+    "seq": 1
+  },
+  "credential_override": {
+    "mode": "x",
+    "label": "x"
+  },
+  "credential_switch": "x",
+  "credential_epochs": [
+    {
+      "claim_generation": 1,
+      "secret_id": "x",
+      "label": "x",
+      "select_reason": "x",
+      "applied_at": "2020-01-02T03:04:05Z"
+    }
+  ],
+  "outcome_pending": {
+    "reason": "x"
+  },
+  "repo_path": "x",
+  "worker_name": "x",
+  "owner_email": "x",
+  "judge_verdict": "x",
+  "judge_todo_count": 1,
+  "is_revising": true
+}

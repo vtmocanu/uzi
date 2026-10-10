@@ -983,6 +983,1083 @@ type CredentialEpochDTO struct {
 	AppliedAt       time.Time `json:"applied_at"`
 }
 
+// RunSummaryItemDTO is the compact run row served by GET /api/runs?view=summary and
+// GET /api/admin/runs?view=summary (issue #2661): every RunListItemDTO key EXCEPT the four
+// heavy detail fields plan_md, repo_agents, issue_description and preserved_patch. Polling
+// clients (the TUI, the web Runs index) re-fetch the whole list every few seconds and render
+// none of those four, so the default list shipped megabytes of detail text per poll.
+//
+// It is deliberately a flat struct that lists every field explicitly, never an embedding of
+// RunDTO: a future RunDTO detail field then does NOT silently ride the summary and re-inflate
+// polling. TestRunSummaryItemDTOKeys fails until the new field is placed on purpose, and
+// RunSummaryOf is the one place that copies the fields. Json tags and Go types match the
+// RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
+// exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
+type RunSummaryItemDTO struct {
+	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
+
+	ID string `json:"id"`
+	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
+	// issue/ci_fix runs.
+	RepoID *string `json:"repo_id"`
+	// ForgeType is the run's forge ("gitlab"|"forgejo"|"github"), so the web picks the
+	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
+	// DTO paths, which never render the MR affordance in a browser; set on the
+	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
+	ForgeType string `json:"forge_type"`
+	// Kind is issue|ci_fix|chat|judge|self_improve|prompt|task|mr_rework. IssueIID is
+	// null for the issue-less kinds (ci_fix, chat, judge, prompt, task, mr_rework) and
+	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
+	// pipeline context, chat carries Title, and a task (uzi handoff) carries
+	// Branch/BaseBranch/OpenMr set at create.
+	Kind       string `json:"kind"`
+	IssueIID   *int64 `json:"issue_iid"`
+	IssueTitle string `json:"issue_title"`
+	// Harness is the run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored
+	// runs.harness — a closed enum, "claude" | "codex". Always on the wire (the column is NOT
+	// NULL DEFAULT 'claude', so store.Run.Harness is a plain string): a pre-feature run and
+	// every current run read "claude". The web renders Claude visually unmarked and Codex
+	// explicit; the model/effort vocabulary keys on it. A client must render an unrecognised
+	// value honestly — the API is deployed separately and a newer server can ship a harness
+	// this client has not heard of.
+	Harness string `json:"harness"`
+	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
+	// derived label-independently from the run's snapshotted issue description via
+	// the same detector the board card uses (forgesvc.HasPRDLink). False for
+	// issue-less run kinds (chat/ci_fix/etc.) whose description carries no prds link.
+	HasPRDLink bool `json:"has_prd_link"`
+	// Title is the chat conversation's display title (PRD #39), null for
+	// issue/ci_fix runs. ResumeOfRunID points a Continue chat at the ended chat it
+	// resumes (Decision 11), null otherwise.
+	Title          *string `json:"title"`
+	ResumeOfRunID  *string `json:"resume_of_run_id"`
+	Status         string  `json:"status"`
+	RequeueCount   int32   `json:"requeue_count"`
+	IterationCount int32   `json:"iteration_count"`
+	// IsPlanning is a server-computed display predicate (issue #321): true only while a
+	// run is in its pre-approval PLANNING turn (status running, iteration_count 0, no
+	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
+	// status value. A pre-feature api pod omits it; absent reads as not-planning.
+	IsPlanning bool `json:"is_planning"`
+	// Progress is the server-derived progress estimate (PRD #2602): a percent from the
+	// frozen milestone list, or a state flag when a percent would mislead. null for a
+	// terminal run. Derived in runToDTO (runprogress.Derive), never stored; Phase is
+	// filled only where current_activity is. A pre-feature api pod omits it.
+	Progress                  *RunProgress `json:"progress"`
+	AutoApprove               bool         `json:"auto_approve"`
+	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
+	IssueInputReason          *string      `json:"issue_input_reason"`
+	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
+	// setting at creation. It remains true after the approval gate is decided.
+	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
+	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
+	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
+	// Detail-only, populated only for the authenticated owner; omitted on other surfaces.
+	PlanCrossCheckSummary *PlanCrossCheckSummaryDTO `json:"plan_cross_check_summary,omitempty"`
+	// TriggerSource records what/how/who started the run (issue #857): one of
+	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
+	// task_review, then_fix, judge, judge_rerun, resume, cross_check. Always set (NOT NULL column,
+	// DEFAULT 'manual'); historical rows carry a best-effort backfilled value.
+	TriggerSource string `json:"trigger_source"`
+	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
+	// decoded from runs.milestones_frozen. A nil slice marshals to JSON null, which is
+	// the back-compat contract: a run with no milestones (every pre-feature run, and
+	// every run that never proposed a list) reads null and the web keeps rendering
+	// today's plain badge. Populated only where the store is in reach (the run reads);
+	// nil on the create/worker DTO paths. The pre-approval CANDIDATE list is never
+	// exposed here — only the frozen list is served.
+	Milestones []Milestone `json:"milestones"`
+	// MilestonesCandidate is the run's PRE-APPROVAL candidate milestone list (PRD #122 M3),
+	// decoded from runs.milestones_candidate. It is read-only and additive — the same
+	// {id,title} objects as Milestones, but the breakdown the worker PROPOSED, before a
+	// human approved it. A nil slice marshals to JSON null; the web renders it ONLY at the
+	// plan gate (status awaiting_approval), so the human approves the proposed breakdown,
+	// and ignores it everywhere else — a frozen run reads its approved list off Milestones.
+	// The titles are UNTRUSTED display text a consumer writing them to a terminal must
+	// sanitize, the same obligation Milestones and RepoAgent.Description carry. Populated
+	// wherever the store row is decoded through the shared runToDTO — the browser run reads
+	// AND the worker's own awaiting_approval report echo (which serialises the candidate the
+	// worker just submitted back to it); nil on the create DTO path, which has no store row.
+	MilestonesCandidate []Milestone `json:"milestones_candidate"`
+	// MilestonesCompleted and MilestonesInProgress are the run's live progress (PRD #122
+	// M2), decoded from runs.milestones_completed / _in_progress: arrays of frozen
+	// milestone IDS (not {id,title} objects — the titles live on Milestones above; these
+	// reference into it). completed is the server-unioned monotone done set; in_progress
+	// the latest-reported snapshot. A nil slice marshals to JSON null — the back-compat
+	// contract, so a run whose lead never reported progress reads null and the web derives
+	// nothing. Populated only on the run reads (where the store is in reach); nil on the
+	// create/worker DTO paths.
+	MilestonesCompleted  []string `json:"milestones_completed"`
+	MilestonesInProgress []string `json:"milestones_in_progress"`
+	// MilestonesAgents is the validated per-in-progress-milestone agent attribution (PRD
+	// #1224, Decision 6/8): the subset of the lead's declaration whose ids survived
+	// membership + in-progress validation. Nil ⇒ JSON null ⇒ no effective attribution (every
+	// pre-feature run and every run the lead did not attribute), which every renderer treats
+	// as "render exactly as today" (Decision 8). Each entry's id is also a member of
+	// MilestonesInProgress; renderers re-filter against the live set as defense in depth.
+	MilestonesAgents []MilestoneAgent `json:"milestones_agents"`
+	// MilestonesLive is the server-derived per-in-progress-milestone LIVE LANES (PRD #1353):
+	// for each in-progress milestone, the subagents working it right now, folded from their
+	// newest tool_use frames and back-joined to the lead's Agent dispatch by agent_instance.
+	// Server-authoritative and web-consumed, NEVER client-re-derived (D2/D8); populated ONLY
+	// on the run DETAIL read (GetRun) for a non-terminal run, and null on list/board and every
+	// terminal run (D9 — the board/list stay a single now-line). Nil ⇒ JSON null ⇒ render
+	// exactly as today (D5). Additive to MilestonesAgents.
+	MilestonesLive []MilestoneLive `json:"milestones_live"`
+	// BudgetMaxIterations and BudgetWallSeconds are the run's EFFECTIVE budget (PRD #122
+	// M2, Decision 5/5b), derived server-side from the frozen milestone count at freeze
+	// and persisted. Each is null when the run is on the GLOBAL default (a 0/1-milestone
+	// run, byte-for-byte today). This is load-bearing on the state-report ack, not just
+	// display: the worker reads these off the {run: RunDTO} response to learn its scaled
+	// turn ceiling and wall clock mid-run.
+	BudgetMaxIterations *int `json:"budget_max_iterations"`
+	BudgetWallSeconds   *int `json:"budget_wall_seconds"`
+	// BudgetExtensionSeconds is the owner-granted wall-clock extension (PRD #1189 M1) added ON
+	// TOP of the frozen budget; 0 for a run that was never extended. BudgetExtensionCapSeconds
+	// is the effective admin cap (run_extension_cap_seconds; 0 = extending disabled), served
+	// here so the Extend chooser and the CLI need no separate settings call. Both are always
+	// present (a non-pointer int): 0 is a meaningful value, not "unknown".
+	BudgetExtensionSeconds    int `json:"budget_extension_seconds"`
+	BudgetExtensionCapSeconds int `json:"budget_extension_cap_seconds"`
+	// BudgetFinalizeSeconds is the one-time finalize allowance the Stop action grants a wall-parked
+	// milestone issue run (PRD #1497 M1, D9): 1800 once granted, else 0. It lives OUTSIDE
+	// budget_extension_seconds (so the owner extension cap never sees it) and is the third term of
+	// budget_total_seconds. Always present (a plain int; 0 is meaningful, like the extension fields).
+	BudgetFinalizeSeconds int `json:"budget_finalize_seconds"`
+	// BudgetTotalSeconds is the run's total wall-clock budget: COALESCE(budget_wall_seconds,
+	// RUN_TIMEOUT) + budget_extension_seconds, computed server-side so a client never has to
+	// know RUN_TIMEOUT. Null for a kind/state that never times out (not running, chat/judge,
+	// interactive, or no started_at) — the same predicate RunDeadline uses. BudgetUsedSeconds
+	// is the ACTIVE time in the CURRENT budget leg (end - started_at - budget_paused_seconds,
+	// clamped at 0), the paused-aware "used" the header measures against the budget, NOT raw
+	// wall elapsed and NOT total working time: started_at resets on limit/recovery/pool
+	// resumes (see first_started_at for the never-reset start). end is
+	// status_since for a paused run, finished_at for a terminal run that has one (issue #2004:
+	// so a finished run's figure no longer drifts), else now; null when the run never started. A new SPA against an
+	// older api sees these undefined and falls back to plain elapsed (rollout-skew safe).
+	BudgetTotalSeconds *int `json:"budget_total_seconds"`
+	BudgetUsedSeconds  *int `json:"budget_used_seconds"`
+	// ScopeCeiling is the operator scope ceiling (PRD #634 M2): the count of milestones the
+	// run may complete over the immutable frozen list; NULL = unbounded. Like the budget
+	// fields it rides the running-report ACK and the claim payload (both built by runToDTO),
+	// so the worker honors it at the loop top and across a re-claim.
+	ScopeCeiling *int `json:"scope_ceiling"`
+	// PauseRequested is the SERVER-DECIDED pause boundary (PRD #1190 M1, Decision 4): true when
+	// the worker holding this run should park at its next boundary. It rides the running-report
+	// ACK exactly like ScopeCeiling (a worker-facing field, NOT owner-gated), and the boundary
+	// rule (pause_mode='now', or 'milestone' once the in-flight milestone completed) lives in
+	// ONE place (runToDTO's pauseRequestedRule). false whenever no pause is pending.
+	PauseRequested bool `json:"pause_requested"`
+	// CompletionBudgetExhausted is the SERVER-DECIDED served `budget_exhausted` steer (PRD #1226
+	// M4, D3): true when the server has stamped runs.completion_budget_exhausted_at, telling a
+	// LIVE post-attempt worker holding this run that its wall budget is exhausted and it should
+	// enter the completion hold. Like PauseRequested it is a worker-facing ACK boolean (NOT
+	// owner-gated) that rides the running-report ACK — the SAME delivery pause_requested uses — so
+	// the worker reads it off {run: RunDTO}. Computed as run.CompletionBudgetExhaustedAt.Valid;
+	// false whenever the column is NULL (the un-served state, cleared when the worker enters the
+	// hold via SetRunCompletionHold so a stale ACK cannot re-arm it).
+	CompletionBudgetExhausted bool `json:"completion_budget_exhausted"`
+	// PauseRequestedAt / PauseMode / PauseAfterCount describe a PENDING pause request on a
+	// still-running run (PRD #1190 M1): a flag, not a status (Decision 3). All null when no
+	// pause is pending. They carry an owner's intent, so they ride only the owner/admin RunDTO
+	// (GetRun, own-scoped ListRuns, admin AdminListRuns) — never the cross-user board card
+	// (latestRunDTO carries only the status). pause_after_count is len(milestones_completed) at
+	// request time (the count the milestone mode waits to exceed).
+	PauseRequestedAt *time.Time `json:"pause_requested_at"`
+	PauseMode        *string    `json:"pause_mode"`
+	PauseAfterCount  *int       `json:"pause_after_count"`
+	// CheckpointTipAt is when the run's branch tip was last checkpoint-published (PRD #1190 M1),
+	// null before the first publish. Not owner-gated — it is just a timestamp — and it drives the
+	// "work since the last checkpoint (Nm ago)" a `now` pause discards.
+	CheckpointTipAt *time.Time `json:"checkpoint_tip_at"`
+	// The HONEST-STATE completion fields (PRD #1226 M5, D8) — the wire contract the web + CLI
+	// render the completion-interlock states from. CompletionInterlock is the discriminator:
+	// true iff run.CompletionContractVersion is non-null (this run runs the structural
+	// completion protocol). A NON-interlocked run (legacy, rollout off, Codex or seeded) carries every
+	// field below at its inert default (0/[]/null/"") and renders exactly as today. All are
+	// always on the wire.
+	CompletionInterlock bool `json:"completion_interlock"`
+	// CompletionAttempts is how many structural completion attempts this run has recorded
+	// (int(run.CompletionAttempts)); 0 for a run that never attempted and every non-interlocked run.
+	CompletionAttempts int `json:"completion_attempts"`
+	// CompletionUnmet is the bounded still-unmet milestone-id list from the run's LATEST
+	// completion attempt, decoded from runs.latest_completion_attempt.unmet. A STABLE array,
+	// NEVER null: it is `[]` when there is no attempt or none are unmet, so a consumer reads a
+	// length without a null guard. The ids are server-validated milestone ids (safe keys, not
+	// free text), but a consumer writing them to a terminal still sanitizes at render — the same
+	// obligation Milestones carries.
+	CompletionUnmet []string `json:"completion_unmet"`
+	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
+	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
+	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
+	HoldReason *string `json:"hold_reason"`
+	// HoldContext is the D8 provider-context string a completion hold states: the constant
+	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
+	// 'completion_blocked'), else null. It exists so the UI/CLI state the hold's durability
+	// HONESTLY — the hold is same-worker-only and MUST NOT be rendered as cross-worker durable.
+	// Server-computed, not stored.
+	HoldContext *string `json:"hold_context"`
+	// CanStopAtWall is the SERVER-DERIVED gate for the Stop action on a wall park (PRD #1497 M1):
+	// true iff the run is in a 'budget_exhausted' hold on a milestone ISSUE run with at least one
+	// completed milestone AND the finalize allowance is unused (budget_finalize_seconds == 0). The
+	// client shows Stop only when this is true; false for every other run. Always on the wire.
+	CanStopAtWall bool `json:"can_stop_at_wall"`
+	// CompletionPhase is the SERVER-COMPUTED derived completion label (one of "checking" |
+	// "reworking" | "blocked" | ""): the SINGLE field the web and CLI both render D8's three
+	// states from ("Checking completion" / "Reworking unmet milestones" / "Completion blocked"),
+	// so the two surfaces cannot disagree. Computed in ONE place (completionPhaseRule, runs_dto.go),
+	// the pause_requested precedent; "" for a non-interlocked run and any run not in one of the
+	// three live states. Always on the wire.
+	CompletionPhase string `json:"completion_phase"`
+	// The OWNER-DECISION contract projection (PRD #1227 M1) — contract-derived, no extra DB read
+	// (runToDTO decodes the run's frozen completion_contract via workersvc.CompletionScopeView).
+	// CompletionRevision is the run's current contract_revision (int(run.ContractRevision.Int32)
+	// when frozen, else null): it bumps by 1 on each partial/accept decision. CompletionDeferred is
+	// the owner-deferred (out-of-scope) milestones from a `partial` decision; CompletionAccepted is
+	// the owner-accepted unmet criteria from an `accept` decision. Both are STABLE arrays, NEVER
+	// null — `[]` when the run has no such decision or is not interlocked (the completion_unmet
+	// convention), so a consumer reads a length without a null guard. All three always on the wire.
+	CompletionRevision *int                    `json:"completion_revision"`
+	CompletionDeferred []CompletionDeferredDTO `json:"completion_deferred"`
+	CompletionAccepted []CompletionAcceptedDTO `json:"completion_accepted"`
+	WorkerID           *string                 `json:"worker_id"`
+	Branch             *string                 `json:"branch"`
+	// BaseBranch and OpenMr are the task/handoff columns (PRD #400), meaningful only
+	// for a kind='task' run. BaseBranch is the source ref the task branched from (null
+	// when it inherited the caller's local HEAD, and on every non-task run); OpenMr is
+	// whether the worker opens an MR at the end (false by default and for every
+	// non-task run — a plain handoff produces commits on the branch, not an MR).
+	// For a handoff created without --base (issue #403 F3), BaseBranch is the resolved
+	// SEED COMMIT sha (the local HEAD the CLI pushed as the branch tip), which the
+	// auto-review uses as its diff base so it covers only the worker's commits, not the
+	// user's own seeded HEAD.
+	BaseBranch *string `json:"base_branch"`
+	OpenMr     bool    `json:"open_mr"`
+	// Interactive marks a long-lived, conversational task run (PRD #517 M1): the worker
+	// keeps it alive (parking in awaiting_followup) after signal_done rather than
+	// terminating. Set at create from --interactive; false by default and for every
+	// non-task run. Always on the wire, like OpenMr above.
+	Interactive bool `json:"interactive"`
+	// DispatchedAt is when the CLI stamped a task run's dispatch gate (PRD #400
+	// Decision 6) — the moment it became claimable, after its uzi/task/<id> branch was
+	// seeded. Null on every non-task run and on a task run not yet dispatched. Mapped
+	// like ClaimedAt (a nullable timestamp), read-only.
+	DispatchedAt *time.Time `json:"dispatched_at"`
+	MrIID        *int64     `json:"mr_iid"`
+	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
+	// creation (PRD #65 D8), null on runs created before it landed. The web renders
+	// it directly through isHttpsUrl and falls back to a forge-aware URL
+	// reconstruction for those null rows; it is preferred as the forge's own canonical URL.
+	MrWebURL *string `json:"mr_web_url"`
+	// BranchHasActiveRun and BranchHasOpenMr are server-computed `uzi handoff rm` preconditions
+	// (issue #403 F1/F6), stamped ONLY on the owner/admin GetRun detail read for a kind='task'
+	// run — false on every non-task run, on the list/create/worker DTO paths, and on a
+	// pre-feature api pod. A handoff's original task, its auto-review and its --then-fix fix run
+	// all share one uzi/task/<id> branch, so the CLI keys `rm` on these BRANCH-wide facts, not
+	// the passed run's own row: BranchHasActiveRun is true while ANY run on the branch is
+	// non-terminal (rm would race a live push); BranchHasOpenMr is true when the branch's owning
+	// task opened an MR (rm exempt — the MR needs its source branch). Always on the wire (bool).
+	BranchHasActiveRun bool `json:"branch_has_active_run"`
+	BranchHasOpenMr    bool `json:"branch_has_open_mr"`
+	// IssueWebURL is the forge-supplied issue web URL (PRD #411), nil for issue-less
+	// runs or when the issue is no longer cached; rendered through isHttpsUrl on the web.
+	IssueWebURL *string `json:"issue_web_url"`
+	// MrState is the last merge-request state the PRD #24 watcher observed for
+	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
+	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly
+	// and everything else as the plain open chip. Frozen per run — a superseded
+	// run's value can be stale, so freshness is scoped to the board card in the UI.
+	MrState       *string `json:"mr_state"`
+	FailureReason *string `json:"failure_reason"`
+	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5 and #517 M4):
+	// "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
+	// the SERVER stopped a run whose updates could not be saved, "stopped" for a graceful
+	// `uzi run stop` of an interactive task run, null for every other run. It — not the
+	// failure_reason text — is what clients read.
+	//
+	// Later values widen this set: "scope_capped" (PRD #634) and "scope_reduced" (PRD #1227)
+	// are completed-status scope dispositions, and "branch_moved" (issue #1117) is a
+	// cancelled-status disposition for mr_rework or ci_fix when a concurrent branch
+	// advance is proven. Detection may precede a wire push rejection; further publication
+	// stops, but a lost push response means the candidate may already have been published.
+	//
+	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
+	// open_mr — and reports completed); on the edge where that finalize throws (or a
+	// cancel-then-stop let the cancel win) the worker reports `failed` and the server routes
+	// it to `cancelled`, never `agent_failure` and never judged. So a "stopped" stop_kind
+	// rides a `completed` or a `cancelled` run, not a `failed` one.
+	//
+	// Consumers must NOT treat the three alike, and the web's isStoppedRun is the
+	// worked example: it styles the two human kinds calm/neutral because a deliberate
+	// stop is not breakage, and deliberately leaves "auto_stopped" looking like the
+	// breakage it is. `uzi run get` renders it as its own STOP_KIND row for the same
+	// reason — on the live-poller half the worker overwrites failure_reason with its
+	// own "run cancelled", so this field is the ONLY thing that distinguishes an
+	// auto-stop from a user cancel.
+	StopKind *string `json:"stop_kind"`
+	// StopReason carries an optional operator free-text cancel reason (PRD #503 M3,
+	// issue #525) or server-composed bounded diagnostics, such as a proven concurrent
+	// branch advance's cause and superseding tip. Null when no reason is recorded.
+	// Treated as free text like FailureReason, not like the StopKind enum.
+	StopReason *string `json:"stop_reason"`
+	// Run health (PRD #47). This DTO is owner-scoped (ListRuns owner-only,
+	// AdminListRuns admin-only, GetRun owner/admin), so health_reason rides
+	// unconditionally here, matching failure_reason — the owner-gating that the shared
+	// board applies is unnecessary. Health is the flag enum; HealthSince (when it was
+	// raised) drives the run-view "stuck for Xm".
+	Health       string     `json:"health"`
+	HealthReason *string    `json:"health_reason"`
+	HealthSince  *time.Time `json:"health_since"`
+	// DeadlineAt is the server-computed wall-clock deadline a running run will be
+	// stopped at (PRD #1170 D9): started_at + COALESCE(budget_wall_seconds, RUN_TIMEOUT)
+	// + budget_paused_seconds. Null when the run has no wall deadline (not running, a
+	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
+	// to it; the reason string stays static, so nothing stored ever ages (D4).
+	DeadlineAt *time.Time `json:"deadline_at"`
+	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
+	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
+	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
+	// (store.Run.PlanSource is a plain string), so it is always on the wire and never a
+	// pointer — a pre-feature run reads "agent". The SPA's SeededPlanPanel keys on it to
+	// surface a seeded run's plan, which the approval UI would otherwise never render.
+	PlanSource string `json:"plan_source"`
+	// GateRevision is the run's current plan-gate revision (PRD #1795 M1): the monotonic
+	// per-run number the server allocated when it published the gate whose plan_md this DTO
+	// carries. A client that shows the plan sends it back as expected_gate_revision; the
+	// server then writes the verdict only while the run still shows that revision and
+	// otherwise answers 409 gate_revision_mismatch (PRD #1795 M2). Omitted (0) for a run that
+	// never published a gate under an api that allocates (pre-migration gates, chat, judge).
+	GateRevision int64 `json:"gate_revision,omitempty"`
+	// Plain-English run summaries (PRD #362), all null until the worker generates and
+	// posts them (and null forever on any generation failure — summaries are advisory
+	// and never block a run). SummaryIntent ("what this run will implement") lands early
+	// in `running`; SummaryPlan ("what the proposed plan will do") + SummaryDeltas (how
+	// the plan diverged from the ask) land at the plan gate. SummaryDeltas is
+	// tolerated-with-fallback on READ (Decision 6): a malformed stored value renders as
+	// nil ("no deltas"), never a crash — runToDTO logs and drops it. A nil slice
+	// marshals to JSON null, the back-compat contract for every pre-feature run. The
+	// delta Text is UNTRUSTED display text (see RunSummaryDelta).
+	SummaryIntent *string           `json:"summary_intent"`
+	SummaryPlan   *string           `json:"summary_plan"`
+	SummaryDeltas []RunSummaryDelta `json:"summary_deltas"`
+	// PRD #1798: the published plain-English description of the run's PR (the version whose
+	// region is on the forge) and the PR's last description-write outcome. Set only by the
+	// GetRun detail read, best-effort (the list path and a lookup error leave both null); null
+	// for a run with no PR or no acknowledged write. The fields are api-sanitized, untrusted
+	// display text.
+	PrDescription        *RunPrDescriptionDTO `json:"pr_description"`
+	PrDescriptionOutcome *string              `json:"pr_description_outcome"`
+	// Job is the kind='job' block of the run detail (PRD #1908 D-D): the job type, its inputs
+	// (name and byte size, never the content), who requested it and the stored result. Present
+	// ONLY on the single-run detail read (GetRun) of a job run, under the same owner-or-admin
+	// authorization as the rest of the run; omitted for every other kind and on list reads.
+	Job *RunJobDTO `json:"job,omitempty"`
+	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
+	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
+	// (verified|fix_failed|not_code|null-while-unverified).
+	PipelineRef    *string `json:"pipeline_ref"`
+	PipelineWebURL *string `json:"pipeline_web_url"`
+	FixVerdict     *string `json:"fix_verdict"`
+	// ReportOnly marks a completed run that intentionally opened NO merge request
+	// (issue #279): its deliverable was a report/command-output/verification result,
+	// not a code change. False for a normal MR completion and every pre-feature run
+	// (the column is NOT NULL DEFAULT false). ReportMd is the lead's persisted findings
+	// summary, already scrubbed server-side; nil unless report_only.
+	ReportOnly bool    `json:"report_only"`
+	ReportMd   *string `json:"report_md"`
+	// FailOrigin is a read-only surfacing of runs.fail_origin (already coerced and
+	// allowlisted server-side at write time, see workersvc.CoerceFailOrigin), so a
+	// diagnosis can key on a stable typed field instead of matching a forge's free-text
+	// rejection message. Null when the run never set one.
+	FailOrigin *string `json:"fail_origin"`
+	// LandingState is a server-derived, read-only secondary presentation bucket (issue #1418)
+	// for a failed run whose committed work is human-landable: "needs_landing" when fail_origin
+	// is in the human-landable set AND an available recovery capture or a preserved_patch exists,
+	// "unrecoverable" when the origin is in that set but neither exists, "none" (default) otherwise.
+	// Derived by workersvc.DeriveLandingState; a worker cannot report it.
+	LandingState string `json:"landing_state"`
+	// The failed-run checkpoint salvage fields (PRD #1867 M4): a read-only surfacing of the
+	// run's run_salvage row, the bounded archive copy of its last published checkpoint at
+	// refs/uzi-salvage/<run-id>. All five are null when the run has no salvage row, and they
+	// are populated ONLY on the single-run detail read (GetRun) of a failed run; list reads
+	// leave them null. landing_state is independent of them. SalvageState is the row's state
+	// (pending, promoted, unavailable, refused, failed, skipped_secret, expired, disabled).
+	// SalvageRef is refs/uzi-salvage/<run-id>, set only while the state is promoted (the
+	// salvage copy exists and has not expired). SalvageTip is the checkpoint commit the copy
+	// is (or would be) pinned at, SalvageExpiresAt when the copy is removed (null until one
+	// exists), SalvageLastError the bounded (<=512), server-scrubbed last broker error.
+	// The branch checkpoint ref is never surfaced here: its retention is #1810's, not salvage's.
+	SalvageState     *string    `json:"salvage_state"`
+	SalvageRef       *string    `json:"salvage_ref"`
+	SalvageTip       *string    `json:"salvage_tip"`
+	SalvageExpiresAt *time.Time `json:"salvage_expires_at"`
+	SalvageLastError *string    `json:"salvage_last_error"`
+	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
+	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
+	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be
+	// reconciled after the run's merge request lands.
+	PrdDonePath *string `json:"prd_done_path"`
+	// PrdPatchSettledAt is when the PRD-link patch lifecycle settled (patched, no-match,
+	// MR closed unmerged, or superseded); null while the patch is still pending — which,
+	// with prd_done_path set, is the "declared a move, not yet reconciled" state.
+	PrdPatchSettledAt *time.Time `json:"prd_patch_settled_at"`
+	ClaimedAt         *time.Time `json:"claimed_at"`
+	StartedAt         *time.Time `json:"started_at"`
+	// FirstStartedAt is when the run FIRST reached running (runs.first_started_at, issue
+	// #2004). Unlike started_at (the budget/timeout anchor, reset by the resume paths that grant
+	// a fresh wall) no writer ever resets it, so it is the display anchor for the
+	// whole-run duration. Null until the run first starts.
+	FirstStartedAt *time.Time `json:"first_started_at"`
+	FinishedAt     *time.Time `json:"finished_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
+	// only by the statements that assign runs.status). The column is backfilled and NOT
+	// NULL (migration 00163_run_status_since.sql), so a current server always sends a
+	// timestamp; the pointer is null only defensively, and an older server omits the key.
+	// Clients fall back to updated_at when it is absent or null. updated_at keeps its
+	// "row changed at all" meaning, which drifts on unrelated writes. Distinct from
+	// pause_requested_at, which is a PENDING pause request, not the pause-entry instant.
+	StatusSince *time.Time `json:"status_since"`
+	// Per-run agent selection (PRD #37). The detected repo_agents roster is a detail field and is
+	// omitted from this summary; see RunDTO.RepoAgents. AgentSource/AgentExclusions stay null
+	// until a selection is made, at the gate or by an autopilot run's self-resolved default.
+	AgentSource     *string  `json:"agent_source"`
+	AgentExclusions []string `json:"agent_exclusions"`
+	// OwnAgents is the OWN-source subagent roster (name + description) the run's
+	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
+	// minus the lead. It is the single source of truth the plan-gate "My agent
+	// templates" picker reads, so an excludable chip always matches what the
+	// approve validator accepts and the count is exact (PRD #37 M4-fix). Populated
+	// only on the run-detail read (GetRun), where the store is in reach; null (a Go
+	// nil slice) on the list/create/worker DTOs, which never drive the picker.
+	OwnAgents []RepoAgent `json:"own_agents"`
+	// Which Anthropic credential this run's claim actually spent (PRD #111 M1) —
+	// the answer to "which account paid for this run?", which run_usage alone could
+	// never give. Both null for a run claimed before the feature landed, and for a
+	// run that has not been claimed yet.
+	//
+	// The two are NOT redundant and they go null independently. The label is a
+	// SNAPSHOT taken at claim time, so it survives the token being renamed or
+	// deleted; the id is live and goes null (ON DELETE SET NULL, migration 00086)
+	// when the token is deleted. So `id == null, label != null` is the normal state
+	// of a historical run whose credential is gone — render the label, and treat the
+	// id as a link target only when present.
+	//
+	// The label is USER-SUPPLIED text, so any consumer writing it to a terminal must
+	// sanitize; the CLI routes it through cellText and the web through
+	// lib/sanitizeLabel for exactly this.
+	//
+	// This used to say "validateSecretLabel permits Unicode Cf, including bidi
+	// overrides". PRD #111 M2 made that false: the validator now rejects Cf on write.
+	// The obligation is unchanged, because the validator governs writes and not
+	// history — labels stored before it landed are never re-validated, and nothing
+	// re-validates on read.
+	//
+	// This DTO is owner-or-admin scoped throughout (ListRuns owner-only,
+	// AdminListRuns admin-only, GetRun owner-or-admin), which is why the label rides
+	// unconditionally here as failure_reason does. The SHARED board is a different
+	// struct with a different rule — a token label names another user's billing
+	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
+	AnthropicSecretID    *string `json:"anthropic_secret_id"`
+	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// AnthropicSelectReason is the MODE that named that credential, and it is why
+	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
+	// fallback can name the SAME token, so "which account paid" and "why that account"
+	// are different questions — and PRD #104's compatibility path creates a row
+	// labelled literally `default`, so the label is not even a reliable hint.
+	//
+	// One of ten server-generated values (autoselect.Reason, closed by migration
+	// 00089's CHECK as widened by 00233): default, pinned, judge, auto, best_of_pool,
+	// pool_empty, pool_stale, open_failed, run_pinned, run_default.
+	// run_pinned/run_default are the per-run credential override reasons (PRD #1247).
+	// Null for a run claimed before M1.
+	//
+	// A CLOSED SERVER ENUM, not free text: it describes the OWNER'S OWN configuration
+	// and can carry no cross-tenant content, which is why it rides this DTO under the
+	// owner-or-admin scoping already in force rather than needing a gate of its own.
+	//
+	// Clients must render an UNRECOGNISED value honestly rather than dropping or
+	// guessing at it — the API is deployed separately, so a newer server can ship a
+	// ninth reason this client has never heard of.
+	AnthropicSelectReason *string `json:"anthropic_select_reason"`
+	// AnthropicHeadroomPct is the measured headroom of an AUTO pick, in percentage
+	// points, and null on every other lane because nothing measured them.
+	//
+	// The RAW min(100-five, 100-seven) — deliberately not the in-flight-penalised
+	// rank the selector actually ordered on. The raw number is the one a user can see
+	// in their own meters; the rank is an internal ordering key that appears nowhere
+	// else in the product and moves when somebody else's run starts.
+	//
+	// It is also null on D14's retry, where the pick would not open and the fallback
+	// was spent: the reading described the credential that FAILED, and attaching it to
+	// the one that succeeded would attribute a measurement to a token nothing measured.
+	//
+	// Derived from the owner's own gauge rows, so it carries no cross-tenant content
+	// either; an admin reading it is consistent with the admin rate-limits view.
+	AnthropicHeadroomPct *int `json:"anthropic_headroom_pct"`
+	// Usage is the run's rolled-up token/cost totals (PRD #40), present only when the
+	// run has usage rows — null for a pre-feature run so the UI shows nothing rather
+	// than a fabricated 0. Populated on the list (ListRuns) and detail (GetRun) reads;
+	// nil on the create/worker DTO paths, which never render usage.
+	//
+	// Since PRD #111 M1 it can finally be read TOGETHER with the two fields above:
+	// what a run cost, and which credential it cost it against.
+	Usage *UsageDTO `json:"usage,omitempty"`
+	// UsageEstimatedTail is the ESTIMATED usage of an interrupted Claude session's uncovered
+	// tail (issue #2014, ADR-2014), shown apart from the metered Usage above and never added to
+	// it. Present only when the run has recorded usage legs or a tail state (nil otherwise, so a
+	// pre-feature run and every run on an old worker omit it); filled on the single-run detail
+	// read (GetRun) only.
+	UsageEstimatedTail *UsageTailDTO `json:"usage_estimated_tail,omitempty"`
+	// Provider usage-limit park (PRDs #35/#2360). With waiting enabled and budget
+	// available, a recognized Claude or Codex subscription usage window parks at
+	// "limit_wait" and resumes after the reset or bounded fallback.
+	//
+	// WaitOnLimit is the run's waiting preference (default on), resolved at creation
+	// from the owner's default or an explicit override. It is on the DTO rather than inferred from the status
+	// because it is meaningful BEFORE any park — it is what a "will retry on limit"
+	// affordance renders, and what a per-run toggle reads back.
+	WaitOnLimit bool `json:"wait_on_limit"`
+	// MrReworkEnabled is the run's per-run MR-rework override (PRD #841 M1), tri-state:
+	// null = inherit the owner default, true/false = explicit override. Unlike
+	// WaitOnLimit (a resolved bool snapshotted at creation), this is nullable and read
+	// LIVE — the candidate query resolves COALESCE(run, owner) IS NOT FALSE — so null on
+	// the wire means "no per-run opinion", which the web renders as the effective
+	// inherited value. It is what the per-run checkbox / `uzi run mr-rework` read back.
+	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	// MrReworkAutoCycles and MrReworkAutoCap are the OWNER-ONLY view of the automatic
+	// rework loop guard (PRD #1202 D11), so the owner can see WHY the watcher stopped and
+	// decide whether to rework on demand. MrReworkAutoCycles is the ledger's attempt_count
+	// (automatic cycles spent, 0 when no row); MrReworkAutoCap is the live admin cap. Both
+	// are nullable and populated ONLY on the run-detail read (GetRun), and only when the
+	// viewer is the run's OWNER (GetRun reads through GetRunForViewer, so an admin sees any
+	// run — an owner-only field needs the explicit check), the run is a completed
+	// issue/prompt/self_improve run, and its MR is open; null otherwise (a non-owner, the
+	// wrong kind, or a non-open MR), so the pair leaks nothing about another user's MR.
+	// runToDTO stays pure — these are enriched in the GetRun caller.
+	MrReworkAutoCycles *int `json:"mr_rework_auto_cycles"`
+	MrReworkAutoCap    *int `json:"mr_rework_auto_cap"`
+	// LimitResetsAt is when the exhausted window reopens, as REPORTED by the worker
+	// off the SDK frame. RetryNotBefore is when the server will actually promote the
+	// run back to queued.
+	//
+	// The two are separate fields because they are separate facts and they routinely
+	// differ: RetryNotBefore carries jitter, is bounded by RUN_LIMIT_MAX_PARK, is
+	// cross-checked against the owner's own rate-limit gauge, and is pool-aware — a
+	// user with a second credential that still has headroom is promoted early, so
+	// RetryNotBefore can be far EARLIER than LimitResetsAt. Render the countdown off
+	// RetryNotBefore (that is when work resumes) and LimitResetsAt only as context.
+	// Both null for a run that has never parked.
+	//
+	// "Bounded by", not "clamped to", and the distinction is user-visible: PRD #35
+	// Decision 4 says a computed stamp beyond RUN_LIMIT_MAX_PARK FAILS the run with a
+	// clear reason rather than being pulled back to the ceiling. So a client will never
+	// see a RetryNotBefore sitting exactly at now+RUN_LIMIT_MAX_PARK as the result of a
+	// clamp — that run is `failed`, not parked. (Corrected 2026-07-27: this comment
+	// said "clamped", which would have a client render a wait that never happens.)
+	LimitResetsAt  *time.Time `json:"limit_resets_at"`
+	RetryNotBefore *time.Time `json:"retry_not_before"`
+	// LimitWaitCount is how many times this run has parked, capped server-side by
+	// RUN_LIMIT_MAX_WAITS. 0 for a run that has never parked.
+	//
+	// The CAP is deliberately NOT on this DTO: it is one server constant, and
+	// repeating it on every row of a list response is the wrong shape. Render
+	// "attempt N"; if the denominator is wanted, it belongs on /api/me.
+	LimitWaitCount int32 `json:"limit_wait_count"`
+	// RateLimitType is which window rejected the run ("five_hour", "seven_day", …),
+	// already allowlisted against the SDK union server-side with anything
+	// unrecognised coerced to "unknown" — so it is a safe enum by the time it is
+	// here, never worker free text. Null for a run that has never parked.
+	//
+	// Clients must still render an unrecognised value honestly rather than dropping
+	// it: the vocabulary is the SDK's and a newer server can ship a member this
+	// client has not heard of. Same rule as AnthropicSelectReason above.
+	RateLimitType *string `json:"rate_limit_type"`
+	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
+	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
+	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
+	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
+	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
+	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
+	// or about to fill; the run resumes at its next retry, see DiskParkCount);
+	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
+	// honestly (a newer server may ship a cause this client has not heard of), the same rule
+	// as RateLimitType.
+	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// CodexAccountAction is what a run held on its Codex subscription account needs next
+	// (PRD #1590 D6). It is non-null only for a 'recovery_wait' run whose RecoveryWaitCause is
+	// "codex_account_unavailable", and is derived at read time from the run's frozen binding
+	// plus its alias and account rows; it is never persisted. Values:
+	//   - "reconciling": the account is quarantined but recovering on its own (recovery
+	//     material at its current generation, or a live lease);
+	//   - "relogin_required": the owner must log in again (also the fallback for any state
+	//     the next promoter tick will end, e.g. a deleted alias or a changed binding);
+	//   - "verifying_login": a new login is being verified;
+	//   - "resuming": the account is usable again and the run resumes on the next sweep tick.
+	// Null on a read whose derivation failed (best effort). Clients render an unrecognised
+	// value honestly, the same rule as RecoveryWaitCause. It is a closed enum and carries no
+	// account label or identity; the label travels only in CodexSecretLabel.
+	CodexAccountAction *string `json:"codex_account_action"`
+	// CodexSecretID is the run's bound alias ID. Deleting the alias nulls this FK while
+	// retaining the snapshotted label, so consumers can mark the alias as deleted.
+	CodexSecretID *string `json:"codex_secret_id"`
+	// CodexSecretLabel is the run's snapshotted Codex alias label, available on every
+	// owner-or-admin run read regardless of status or CodexAccountAction. It is never
+	// read from the current alias row. The shared board has a separate DTO and does not
+	// expose credential labels. Null when the snapshot is empty.
+	//
+	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
+	// do AnthropicSecretLabel.
+	CodexSecretLabel *string `json:"codex_secret_label"`
+	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
+	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
+	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
+	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
+	// field. Null for a run that has never recovery-parked. Surfaced for EVERY recovery cause,
+	// not just the forge one (SC5).
+	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
+	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
+	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping
+	// recovery_wait_count. 0 for a run that has never forge-parked (including every empty-turn
+	// park, which never touches it, SC5). Rendered as the "N" in "N of MAX".
+	ForgeParkCount int `json:"forge_park_count"`
+	// ForgeParkMax is the EFFECTIVE forge-park cap (RUN_FORGE_UNREACHABLE_MAX_PARKS),
+	// server-computed from config and surfaced so the pill can render "N of MAX". 0 means
+	// UNLIMITED (the cap is disabled) — render it as "unlimited", never as a real ceiling of
+	// zero. It is one server constant, but unlike LimitWaitCount's cap it IS on the row because
+	// the forge wording ("N of MAX") needs the denominator inline.
+	ForgeParkMax int `json:"forge_park_max"`
+	// DiskParkCount is how many COUNTED 'data_volume_full' parks this run has taken in its
+	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
+	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
+	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// 0 for a run that has never taken a counted disk park.
+	DiskParkCount int `json:"disk_park_count"`
+	// CheckpointContainsLatest is the worker's report, on the run's latest park, of whether the
+	// checkpoint that park published contains the run's latest committed work (PRD #1809 M6, D8).
+	// false means it does not (the recovery pin or the fetch-back failed): the worker keeps the
+	// latest work under its custody hold. Absent when not reported (older worker, no checkpoint
+	// published on that park, or a server-side park, which never carries a report). It is cleared
+	// when the run is claimed again or reports running (ClaimRun, SetRunRunning), so it only ever
+	// describes the park that reported it; clients show it only while the run is parked.
+	// Display-only.
+	CheckpointContainsLatest *bool `json:"checkpoint_contains_latest,omitempty"`
+	// HomeBytes / CacheBytes are the run's HOME size on its CURRENT worker (runs.worker_id) and, of
+	// that, the rebuildable caches (PRD #1809 M6, D8), from that worker's run_disk heartbeat report
+	// measured (sampled_at) within the last 25 minutes. Another worker's report is never
+	// substituted, so a run with no current worker, or whose worker has not reported it recently,
+	// has them absent. SINGLE-RUN READ ONLY: set by GET /api/runs/{id} and absent on every list
+	// row (no per-row size lookup on a list). DiskTruncated means the worker's size walk was cut
+	// short, so both sizes are lower bounds. Display-only.
+	HomeBytes     *int64 `json:"home_bytes,omitempty"`
+	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
+	DiskTruncated bool   `json:"disk_truncated,omitempty"`
+	// Model is the model frozen onto the run at fire time by the schedule that created it
+	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
+	// read-only so a scheduled run's model is confirmable.
+	Model *string `json:"model"`
+	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
+	// at fire time by the schedule that created it (PRD #305): true means the run's model
+	// was applied to every subagent (overriding pins), false is today's default. Surfaced
+	// read-only so a scheduled run's fleet-wide model choice is confirmable.
+	OverrideSubagentModel bool `json:"override_subagent_model"`
+	// Priority is the run's DISPLAY priority class (PRD #320 D8), a non-empty enum in
+	// {normal, background, expedited, restored}, computed by the ONE SQL function
+	// fn_run_priority_class from the same demotion predicate ClaimRun's ORDER BY ranks
+	// by — so the pill and the claim order can never disagree. NOT omitempty: it is
+	// always a real value (never ""), so a client reads it unconditionally. `background`
+	// is a demoted judge/self_improve run still yielding; `restored` the same run past
+	// RUN_BACKGROUND_GRACE (fails open to normal rank); `expedited` a manual bump;
+	// `normal` everything else. runToDTO takes it as an explicit param and stays pure —
+	// no now()/config reaches into the mapper (D8).
+	Priority string `json:"priority"`
+	// The run's inferred/hinted scheduling requirements (PRD #84): RequiredCapabilities is
+	// the claim-gating capability set (M2 repo hint UNION-merged with M4 plan-time
+	// inference), RequiredTools the DISPLAY-ONLY provisionable toolchain families (M4 4b),
+	// and SizeClass the clamped s/m/l estimate (M4 4b). All three are surfaced RAW so the
+	// web/CLI (4d) derive the readiness/mismatch display from them plus the worker caps they
+	// already fetch — there is deliberately no server-computed "capability_block" field; the
+	// authoritative enforcement is the 409 the approval gate returns. Capability/tool slices
+	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
+	// inference never set it (the column is NOT NULL DEFAULT '').
+	RequiredCapabilities []string `json:"required_capabilities"`
+	RequiredTools        []string `json:"required_tools"`
+	SizeClass            string   `json:"size_class"`
+	// PlanChangedFiles is the git-status list surfaced at the approval gate (PRD #212).
+	// [] (never omitempty) like required_tools: a pre-#212 run's NULL column and a clean
+	// plan turn both map to []; renderers show the section only when non-empty.
+	PlanChangedFiles []string `json:"plan_changed_files"`
+	// CurrentActivity is the server-derived "now" line (PRD #1064 D3): the run's
+	// newest tool_use frame folded via runactivity.Latest. null for a terminal run (a
+	// finished run has no "now") and for a run with no tool_use frame — the back-compat
+	// contract, so a pre-feature run and a run that never ran a tool both read null and
+	// every surface renders exactly as today. Populated in runToDTO's callers (the GET
+	// path and both list builders) from a batched per-page lookup, not in runToDTO
+	// itself, which stays a pure function of its row.
+	CurrentActivity *RunActivity `json:"current_activity"`
+	// Per-run Anthropic credential override + attribution journal (PRD #1247 M1). All
+	// three are back-compat by construction: a run with no override reads
+	// credential_override == null and credential_switch == null, and a run claimed before
+	// M1 (or never claimed) reads credential_epochs == [].
+	//
+	// CredentialOverride is the run's per-run token choice: null = inherit the worker
+	// binding (today's behaviour), else {mode, label}. Mode is one of pinned/auto/default;
+	// Label is the snapshotted token name for a pinned override (null for auto/default,
+	// or when the token was deleted). Populated from the run row + an owner-scoped label
+	// lookup in the DTO builder's enrichment path.
+	CredentialOverride *CredentialOverrideDTO `json:"credential_override"`
+	// CredentialSwitch is the state of a pending held-state switch (PRD #1247, D14):
+	// null (none pending) | "requested" (stamped, not yet released) | "released"
+	// (released, awaiting reclaim). Distinct from CredentialOverride, which is the choice;
+	// this is the in-flight transition. Always null in M1 (nothing stamps it until M4/M5).
+	CredentialSwitch *string `json:"credential_switch"`
+	// CredentialEpochs is the applied-switch history (D7): one entry per claim, oldest
+	// generation first, each naming the token that claim spent and why. Never omitempty —
+	// [] over null — so a client reads it unconditionally. Populated from
+	// run_credential_epochs in the DTO builder's enrichment path.
+	CredentialEpochs []CredentialEpochDTO `json:"credential_epochs"`
+	// OutcomePending is set (PRD #1391 M3, D13) when the run's OWNING worker holds a
+	// finished terminal outcome its api could not land — a terminal journal the api
+	// permanently refused — so the owner can see the held outcome and resolve it with a
+	// discarding cancel. null (today's contract) for every run with no held outcome, which
+	// is every run until a worker reports a blocked terminal journal. It is NON-PURE
+	// telemetry (the outbox tracker, not the run row), so it is overlaid in the GetRun
+	// enrichment path, never in the pure runToDTO builder, and only for the single-run
+	// detail read — the list/board never carries it. Reason is one of a CLOSED enum
+	// (completion_permit_mismatch | gap_unrecoverable | reserve_exhausted), filtered
+	// server-side so untrusted worker text can never reach the client.
+	OutcomePending *OutcomePendingDTO `json:"outcome_pending"`
+	RepoPath       string             `json:"repo_path"`
+	// WorkerName is the list-level worker display name (see RunListItemDTO.WorkerName).
+	WorkerName *string `json:"worker_name"`
+	OwnerEmail *string `json:"owner_email,omitempty"`
+	// JudgeVerdict, JudgeTodoCount and IsRevising mirror the RunListItemDTO list-only fields.
+	JudgeVerdict   *string `json:"judge_verdict"`
+	JudgeTodoCount int     `json:"judge_todo_count"`
+	IsRevising     bool    `json:"is_revising"`
+}
+
+// RunSummaryOf projects a decorated list row onto the compact summary view (issue #2661). The
+// copy is explicit, field by field, so a new RunDTO field is never shipped by accident: the
+// key-set test in run_summary_test.go fails until the field is placed here on purpose.
+func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
+	return RunSummaryItemDTO{
+		WorkerRecovery:            item.RunDTO.WorkerRecovery,
+		ID:                        item.RunDTO.ID,
+		RepoID:                    item.RunDTO.RepoID,
+		ForgeType:                 item.RunDTO.ForgeType,
+		Kind:                      item.RunDTO.Kind,
+		IssueIID:                  item.RunDTO.IssueIID,
+		IssueTitle:                item.RunDTO.IssueTitle,
+		Harness:                   item.RunDTO.Harness,
+		HasPRDLink:                item.RunDTO.HasPRDLink,
+		Title:                     item.RunDTO.Title,
+		ResumeOfRunID:             item.RunDTO.ResumeOfRunID,
+		Status:                    item.RunDTO.Status,
+		RequeueCount:              item.RunDTO.RequeueCount,
+		IterationCount:            item.RunDTO.IterationCount,
+		IsPlanning:                item.RunDTO.IsPlanning,
+		Progress:                  item.RunDTO.Progress,
+		AutoApprove:               item.RunDTO.AutoApprove,
+		AutoApproveBlockedReasons: item.RunDTO.AutoApproveBlockedReasons,
+		IssueInputReason:          item.RunDTO.IssueInputReason,
+		PlanCrossCheckRequired:    item.RunDTO.PlanCrossCheckRequired,
+		PlanCrossCheckGateReason:  item.RunDTO.PlanCrossCheckGateReason,
+		PlanCrossCheckDiffRefusal: item.RunDTO.PlanCrossCheckDiffRefusal,
+		PlanCrossCheckSummary:     item.RunDTO.PlanCrossCheckSummary,
+		TriggerSource:             item.RunDTO.TriggerSource,
+		Milestones:                item.RunDTO.Milestones,
+		MilestonesCandidate:       item.RunDTO.MilestonesCandidate,
+		MilestonesCompleted:       item.RunDTO.MilestonesCompleted,
+		MilestonesInProgress:      item.RunDTO.MilestonesInProgress,
+		MilestonesAgents:          item.RunDTO.MilestonesAgents,
+		MilestonesLive:            item.RunDTO.MilestonesLive,
+		BudgetMaxIterations:       item.RunDTO.BudgetMaxIterations,
+		BudgetWallSeconds:         item.RunDTO.BudgetWallSeconds,
+		BudgetExtensionSeconds:    item.RunDTO.BudgetExtensionSeconds,
+		BudgetExtensionCapSeconds: item.RunDTO.BudgetExtensionCapSeconds,
+		BudgetFinalizeSeconds:     item.RunDTO.BudgetFinalizeSeconds,
+		BudgetTotalSeconds:        item.RunDTO.BudgetTotalSeconds,
+		BudgetUsedSeconds:         item.RunDTO.BudgetUsedSeconds,
+		ScopeCeiling:              item.RunDTO.ScopeCeiling,
+		PauseRequested:            item.RunDTO.PauseRequested,
+		CompletionBudgetExhausted: item.RunDTO.CompletionBudgetExhausted,
+		PauseRequestedAt:          item.RunDTO.PauseRequestedAt,
+		PauseMode:                 item.RunDTO.PauseMode,
+		PauseAfterCount:           item.RunDTO.PauseAfterCount,
+		CheckpointTipAt:           item.RunDTO.CheckpointTipAt,
+		CompletionInterlock:       item.RunDTO.CompletionInterlock,
+		CompletionAttempts:        item.RunDTO.CompletionAttempts,
+		CompletionUnmet:           item.RunDTO.CompletionUnmet,
+		HoldReason:                item.RunDTO.HoldReason,
+		HoldContext:               item.RunDTO.HoldContext,
+		CanStopAtWall:             item.RunDTO.CanStopAtWall,
+		CompletionPhase:           item.RunDTO.CompletionPhase,
+		CompletionRevision:        item.RunDTO.CompletionRevision,
+		CompletionDeferred:        item.RunDTO.CompletionDeferred,
+		CompletionAccepted:        item.RunDTO.CompletionAccepted,
+		WorkerID:                  item.RunDTO.WorkerID,
+		Branch:                    item.RunDTO.Branch,
+		BaseBranch:                item.RunDTO.BaseBranch,
+		OpenMr:                    item.RunDTO.OpenMr,
+		Interactive:               item.RunDTO.Interactive,
+		DispatchedAt:              item.RunDTO.DispatchedAt,
+		MrIID:                     item.RunDTO.MrIID,
+		MrWebURL:                  item.RunDTO.MrWebURL,
+		BranchHasActiveRun:        item.RunDTO.BranchHasActiveRun,
+		BranchHasOpenMr:           item.RunDTO.BranchHasOpenMr,
+		IssueWebURL:               item.RunDTO.IssueWebURL,
+		MrState:                   item.RunDTO.MrState,
+		FailureReason:             item.RunDTO.FailureReason,
+		StopKind:                  item.RunDTO.StopKind,
+		StopReason:                item.RunDTO.StopReason,
+		Health:                    item.RunDTO.Health,
+		HealthReason:              item.RunDTO.HealthReason,
+		HealthSince:               item.RunDTO.HealthSince,
+		DeadlineAt:                item.RunDTO.DeadlineAt,
+		PlanSource:                item.RunDTO.PlanSource,
+		GateRevision:              item.RunDTO.GateRevision,
+		SummaryIntent:             item.RunDTO.SummaryIntent,
+		SummaryPlan:               item.RunDTO.SummaryPlan,
+		SummaryDeltas:             item.RunDTO.SummaryDeltas,
+		PrDescription:             item.RunDTO.PrDescription,
+		PrDescriptionOutcome:      item.RunDTO.PrDescriptionOutcome,
+		Job:                       item.RunDTO.Job,
+		PipelineRef:               item.RunDTO.PipelineRef,
+		PipelineWebURL:            item.RunDTO.PipelineWebURL,
+		FixVerdict:                item.RunDTO.FixVerdict,
+		ReportOnly:                item.RunDTO.ReportOnly,
+		ReportMd:                  item.RunDTO.ReportMd,
+		FailOrigin:                item.RunDTO.FailOrigin,
+		LandingState:              item.RunDTO.LandingState,
+		SalvageState:              item.RunDTO.SalvageState,
+		SalvageRef:                item.RunDTO.SalvageRef,
+		SalvageTip:                item.RunDTO.SalvageTip,
+		SalvageExpiresAt:          item.RunDTO.SalvageExpiresAt,
+		SalvageLastError:          item.RunDTO.SalvageLastError,
+		PrdDonePath:               item.RunDTO.PrdDonePath,
+		PrdPatchSettledAt:         item.RunDTO.PrdPatchSettledAt,
+		ClaimedAt:                 item.RunDTO.ClaimedAt,
+		StartedAt:                 item.RunDTO.StartedAt,
+		FirstStartedAt:            item.RunDTO.FirstStartedAt,
+		FinishedAt:                item.RunDTO.FinishedAt,
+		CreatedAt:                 item.RunDTO.CreatedAt,
+		UpdatedAt:                 item.RunDTO.UpdatedAt,
+		StatusSince:               item.RunDTO.StatusSince,
+		AgentSource:               item.RunDTO.AgentSource,
+		AgentExclusions:           item.RunDTO.AgentExclusions,
+		OwnAgents:                 item.RunDTO.OwnAgents,
+		AnthropicSecretID:         item.RunDTO.AnthropicSecretID,
+		AnthropicSecretLabel:      item.RunDTO.AnthropicSecretLabel,
+		AnthropicSelectReason:     item.RunDTO.AnthropicSelectReason,
+		AnthropicHeadroomPct:      item.RunDTO.AnthropicHeadroomPct,
+		Usage:                     item.RunDTO.Usage,
+		UsageEstimatedTail:        item.RunDTO.UsageEstimatedTail,
+		WaitOnLimit:               item.RunDTO.WaitOnLimit,
+		MrReworkEnabled:           item.RunDTO.MrReworkEnabled,
+		MrReworkAutoCycles:        item.RunDTO.MrReworkAutoCycles,
+		MrReworkAutoCap:           item.RunDTO.MrReworkAutoCap,
+		LimitResetsAt:             item.RunDTO.LimitResetsAt,
+		RetryNotBefore:            item.RunDTO.RetryNotBefore,
+		LimitWaitCount:            item.RunDTO.LimitWaitCount,
+		RateLimitType:             item.RunDTO.RateLimitType,
+		RecoveryWaitCause:         item.RunDTO.RecoveryWaitCause,
+		CodexAccountAction:        item.RunDTO.CodexAccountAction,
+		CodexSecretID:             item.RunDTO.CodexSecretID,
+		CodexSecretLabel:          item.RunDTO.CodexSecretLabel,
+		RecoveryRetryNotBefore:    item.RunDTO.RecoveryRetryNotBefore,
+		ForgeParkCount:            item.RunDTO.ForgeParkCount,
+		ForgeParkMax:              item.RunDTO.ForgeParkMax,
+		DiskParkCount:             item.RunDTO.DiskParkCount,
+		CheckpointContainsLatest:  item.RunDTO.CheckpointContainsLatest,
+		HomeBytes:                 item.RunDTO.HomeBytes,
+		CacheBytes:                item.RunDTO.CacheBytes,
+		DiskTruncated:             item.RunDTO.DiskTruncated,
+		Model:                     item.RunDTO.Model,
+		OverrideSubagentModel:     item.RunDTO.OverrideSubagentModel,
+		Priority:                  item.RunDTO.Priority,
+		RequiredCapabilities:      item.RunDTO.RequiredCapabilities,
+		RequiredTools:             item.RunDTO.RequiredTools,
+		SizeClass:                 item.RunDTO.SizeClass,
+		PlanChangedFiles:          item.RunDTO.PlanChangedFiles,
+		CurrentActivity:           item.RunDTO.CurrentActivity,
+		CredentialOverride:        item.RunDTO.CredentialOverride,
+		CredentialSwitch:          item.RunDTO.CredentialSwitch,
+		CredentialEpochs:          item.RunDTO.CredentialEpochs,
+		OutcomePending:            item.RunDTO.OutcomePending,
+		RepoPath:                  item.RepoPath,
+		WorkerName:                item.WorkerName,
+		OwnerEmail:                item.OwnerEmail,
+		JudgeVerdict:              item.JudgeVerdict,
+		JudgeTodoCount:            item.JudgeTodoCount,
+		IsRevising:                item.IsRevising,
+	}
+}
+
+// ListItem is the inverse of RunSummaryOf for clients that render a summary row through the
+// RunListItemDTO shape (the TUI). The four omitted detail fields come back zero, and the
+// worker name lands on the list level only, exactly as the list path populates it.
+func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
+	return RunListItemDTO{
+		RunDTO: RunDTO{
+			WorkerRecovery:            s.WorkerRecovery,
+			ID:                        s.ID,
+			RepoID:                    s.RepoID,
+			ForgeType:                 s.ForgeType,
+			Kind:                      s.Kind,
+			IssueIID:                  s.IssueIID,
+			IssueTitle:                s.IssueTitle,
+			Harness:                   s.Harness,
+			HasPRDLink:                s.HasPRDLink,
+			Title:                     s.Title,
+			ResumeOfRunID:             s.ResumeOfRunID,
+			Status:                    s.Status,
+			RequeueCount:              s.RequeueCount,
+			IterationCount:            s.IterationCount,
+			IsPlanning:                s.IsPlanning,
+			Progress:                  s.Progress,
+			AutoApprove:               s.AutoApprove,
+			AutoApproveBlockedReasons: s.AutoApproveBlockedReasons,
+			IssueInputReason:          s.IssueInputReason,
+			PlanCrossCheckRequired:    s.PlanCrossCheckRequired,
+			PlanCrossCheckGateReason:  s.PlanCrossCheckGateReason,
+			PlanCrossCheckDiffRefusal: s.PlanCrossCheckDiffRefusal,
+			PlanCrossCheckSummary:     s.PlanCrossCheckSummary,
+			TriggerSource:             s.TriggerSource,
+			Milestones:                s.Milestones,
+			MilestonesCandidate:       s.MilestonesCandidate,
+			MilestonesCompleted:       s.MilestonesCompleted,
+			MilestonesInProgress:      s.MilestonesInProgress,
+			MilestonesAgents:          s.MilestonesAgents,
+			MilestonesLive:            s.MilestonesLive,
+			BudgetMaxIterations:       s.BudgetMaxIterations,
+			BudgetWallSeconds:         s.BudgetWallSeconds,
+			BudgetExtensionSeconds:    s.BudgetExtensionSeconds,
+			BudgetExtensionCapSeconds: s.BudgetExtensionCapSeconds,
+			BudgetFinalizeSeconds:     s.BudgetFinalizeSeconds,
+			BudgetTotalSeconds:        s.BudgetTotalSeconds,
+			BudgetUsedSeconds:         s.BudgetUsedSeconds,
+			ScopeCeiling:              s.ScopeCeiling,
+			PauseRequested:            s.PauseRequested,
+			CompletionBudgetExhausted: s.CompletionBudgetExhausted,
+			PauseRequestedAt:          s.PauseRequestedAt,
+			PauseMode:                 s.PauseMode,
+			PauseAfterCount:           s.PauseAfterCount,
+			CheckpointTipAt:           s.CheckpointTipAt,
+			CompletionInterlock:       s.CompletionInterlock,
+			CompletionAttempts:        s.CompletionAttempts,
+			CompletionUnmet:           s.CompletionUnmet,
+			HoldReason:                s.HoldReason,
+			HoldContext:               s.HoldContext,
+			CanStopAtWall:             s.CanStopAtWall,
+			CompletionPhase:           s.CompletionPhase,
+			CompletionRevision:        s.CompletionRevision,
+			CompletionDeferred:        s.CompletionDeferred,
+			CompletionAccepted:        s.CompletionAccepted,
+			WorkerID:                  s.WorkerID,
+			Branch:                    s.Branch,
+			BaseBranch:                s.BaseBranch,
+			OpenMr:                    s.OpenMr,
+			Interactive:               s.Interactive,
+			DispatchedAt:              s.DispatchedAt,
+			MrIID:                     s.MrIID,
+			MrWebURL:                  s.MrWebURL,
+			BranchHasActiveRun:        s.BranchHasActiveRun,
+			BranchHasOpenMr:           s.BranchHasOpenMr,
+			IssueWebURL:               s.IssueWebURL,
+			MrState:                   s.MrState,
+			FailureReason:             s.FailureReason,
+			StopKind:                  s.StopKind,
+			StopReason:                s.StopReason,
+			Health:                    s.Health,
+			HealthReason:              s.HealthReason,
+			HealthSince:               s.HealthSince,
+			DeadlineAt:                s.DeadlineAt,
+			PlanSource:                s.PlanSource,
+			GateRevision:              s.GateRevision,
+			SummaryIntent:             s.SummaryIntent,
+			SummaryPlan:               s.SummaryPlan,
+			SummaryDeltas:             s.SummaryDeltas,
+			PrDescription:             s.PrDescription,
+			PrDescriptionOutcome:      s.PrDescriptionOutcome,
+			Job:                       s.Job,
+			PipelineRef:               s.PipelineRef,
+			PipelineWebURL:            s.PipelineWebURL,
+			FixVerdict:                s.FixVerdict,
+			ReportOnly:                s.ReportOnly,
+			ReportMd:                  s.ReportMd,
+			FailOrigin:                s.FailOrigin,
+			LandingState:              s.LandingState,
+			SalvageState:              s.SalvageState,
+			SalvageRef:                s.SalvageRef,
+			SalvageTip:                s.SalvageTip,
+			SalvageExpiresAt:          s.SalvageExpiresAt,
+			SalvageLastError:          s.SalvageLastError,
+			PrdDonePath:               s.PrdDonePath,
+			PrdPatchSettledAt:         s.PrdPatchSettledAt,
+			ClaimedAt:                 s.ClaimedAt,
+			StartedAt:                 s.StartedAt,
+			FirstStartedAt:            s.FirstStartedAt,
+			FinishedAt:                s.FinishedAt,
+			CreatedAt:                 s.CreatedAt,
+			UpdatedAt:                 s.UpdatedAt,
+			StatusSince:               s.StatusSince,
+			AgentSource:               s.AgentSource,
+			AgentExclusions:           s.AgentExclusions,
+			OwnAgents:                 s.OwnAgents,
+			AnthropicSecretID:         s.AnthropicSecretID,
+			AnthropicSecretLabel:      s.AnthropicSecretLabel,
+			AnthropicSelectReason:     s.AnthropicSelectReason,
+			AnthropicHeadroomPct:      s.AnthropicHeadroomPct,
+			Usage:                     s.Usage,
+			UsageEstimatedTail:        s.UsageEstimatedTail,
+			WaitOnLimit:               s.WaitOnLimit,
+			MrReworkEnabled:           s.MrReworkEnabled,
+			MrReworkAutoCycles:        s.MrReworkAutoCycles,
+			MrReworkAutoCap:           s.MrReworkAutoCap,
+			LimitResetsAt:             s.LimitResetsAt,
+			RetryNotBefore:            s.RetryNotBefore,
+			LimitWaitCount:            s.LimitWaitCount,
+			RateLimitType:             s.RateLimitType,
+			RecoveryWaitCause:         s.RecoveryWaitCause,
+			CodexAccountAction:        s.CodexAccountAction,
+			CodexSecretID:             s.CodexSecretID,
+			CodexSecretLabel:          s.CodexSecretLabel,
+			RecoveryRetryNotBefore:    s.RecoveryRetryNotBefore,
+			ForgeParkCount:            s.ForgeParkCount,
+			ForgeParkMax:              s.ForgeParkMax,
+			DiskParkCount:             s.DiskParkCount,
+			CheckpointContainsLatest:  s.CheckpointContainsLatest,
+			HomeBytes:                 s.HomeBytes,
+			CacheBytes:                s.CacheBytes,
+			DiskTruncated:             s.DiskTruncated,
+			Model:                     s.Model,
+			OverrideSubagentModel:     s.OverrideSubagentModel,
+			Priority:                  s.Priority,
+			RequiredCapabilities:      s.RequiredCapabilities,
+			RequiredTools:             s.RequiredTools,
+			SizeClass:                 s.SizeClass,
+			PlanChangedFiles:          s.PlanChangedFiles,
+			CurrentActivity:           s.CurrentActivity,
+			CredentialOverride:        s.CredentialOverride,
+			CredentialSwitch:          s.CredentialSwitch,
+			CredentialEpochs:          s.CredentialEpochs,
+			OutcomePending:            s.OutcomePending,
+		},
+		RepoPath:       s.RepoPath,
+		WorkerName:     s.WorkerName,
+		OwnerEmail:     s.OwnerEmail,
+		JudgeVerdict:   s.JudgeVerdict,
+		JudgeTodoCount: s.JudgeTodoCount,
+		IsRevising:     s.IsRevising,
+	}
+}
+
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
 // overview: the run plus display context (repo path, worker name) and, for the
 // admin view, the owning user's email.
