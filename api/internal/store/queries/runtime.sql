@@ -864,7 +864,8 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- are the only claimant while the owner row exists and can still resume the run: it is
 -- draining/fenced, heartbeat-fresh, or (a stale requeue, #2705) inside
 -- WORKER_STALE_REQUEUE_GRACE via @stale_requeue_cutoff; the @affinity_cutoff ceiling
--- (now minus WORKER_AFFINITY_CEILING) bounds it; once the owner row is gone or the pin
+-- (now minus WORKER_AFFINITY_CEILING) bounds each queued episode (no global bound; see
+-- the in-arm comment); once the owner row is gone or the pin
 -- lapses any of the user's workers may claim it.
 -- FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 -- blocking. The kind<>'chat' predicate is what keeps
@@ -9791,6 +9792,25 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -9967,6 +9987,25 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
   AND now() - r.status_since > @saturation_delay::interval
   AND EXISTS (
       SELECT 1 FROM workers w

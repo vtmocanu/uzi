@@ -1174,9 +1174,10 @@ func Load() (Config, error) {
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
-	// #2705: a stale-requeued run stays pinned to its previous worker this long (from the
-	// requeue) while that worker's row exists; 0 disables the pin. The 2h WorkerAffinityCeiling
-	// still bounds it.
+	// #2705: a stale-requeued run stays pinned to its previous worker this long while that
+	// worker's row exists; 0 disables the pin. The pin runs from status_since (the requeue, or
+	// a later Codex account promotion, which opens a new queued episode). WORKER_AFFINITY_CEILING
+	// bounds each queued episode, not the total.
 	cfg.WorkerStaleRequeueGrace = parseNonNegDuration("WORKER_STALE_REQUEUE_GRACE", 10*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
 	// to its prior worker while its row exists and it is heartbeating or draining

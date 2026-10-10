@@ -1581,7 +1581,8 @@ type ClaimRunParams struct {
 // are the only claimant while the owner row exists and can still resume the run: it is
 // draining/fenced, heartbeat-fresh, or (a stale requeue, #2705) inside
 // WORKER_STALE_REQUEUE_GRACE via @stale_requeue_cutoff; the @affinity_cutoff ceiling
-// (now minus WORKER_AFFINITY_CEILING) bounds it; once the owner row is gone or the pin
+// (now minus WORKER_AFFINITY_CEILING) bounds each queued episode (no global bound; see
+// the in-arm comment); once the owner row is gone or the pin
 // lapses any of the user's workers may claim it.
 // FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 // blocking. The kind<>'chat' predicate is what keeps
@@ -10277,7 +10278,26 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
-  AND now() - r.status_since > $1::interval
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > $1::timestamptz
+    AND r.updated_at >= $2::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
+  AND now() - r.status_since > $3::interval
   AND EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -10285,16 +10305,16 @@ WHERE r.status = 'queued'
         AND NOT w.maintenance_fenced
         AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $2::timestamptz, $3::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $4::timestamptz, $5::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $4::interval, now(),
+                    $6::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $5::boolean, r.repo_id, r.kind, r.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false))
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $7::boolean, r.repo_id, r.kind, r.egress_profile_id, $8::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10311,9 +10331,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($7::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($7::text[])),
+                                  = ANY($9::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10350,16 +10370,16 @@ WHERE r.status = 'queued'
         AND NOT w.maintenance_fenced
         AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', $2::timestamptz, $3::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', $4::timestamptz, $5::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $4::interval, now(),
+                    $6::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $5::boolean, r.repo_id, r.kind, r.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false))
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $7::boolean, r.repo_id, r.kind, r.egress_profile_id, $8::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10376,9 +10396,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($7::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($7::text[])),
+                                  = ANY($9::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10428,12 +10448,14 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $8::int
-ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $9) DESC, r.status_since ASC
-LIMIT $10
+      ) < $10::int
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $11) DESC, r.status_since ASC
+LIMIT $12
 `
 
 type ListSaturationQueuedRunsForEphemeralParams struct {
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
+	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	SaturationDelay          pgtype.Interval    `json:"saturation_delay"`
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
@@ -10523,6 +10545,8 @@ type ListSaturationQueuedRunsForEphemeralRow struct {
 // equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
 func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg ListSaturationQueuedRunsForEphemeralParams) ([]ListSaturationQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral,
+		arg.StaleRequeueCutoff,
+		arg.AffinityCutoff,
 		arg.SaturationDelay,
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
@@ -10570,6 +10594,25 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > $1::timestamptz
+    AND r.updated_at >= $2::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -10577,7 +10620,7 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]))
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -10586,16 +10629,16 @@ WHERE r.status = 'queued'
         AND NOT w.maintenance_fenced
         AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $3::timestamptz, $4::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $5::timestamptz, $6::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $5::interval, now(),
+                    $7::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]) OR COALESCE(w.docker_enabled, false))
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10612,9 +10655,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($6::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($8::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($6::text[])),
+                                  = ANY($8::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10673,12 +10716,14 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $7::int
-ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $8) DESC, r.created_at ASC
-LIMIT $9
+      ) < $9::int
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $10) DESC, r.created_at ASC
+LIMIT $11
 `
 
 type ListUnplaceableQueuedRunsForEphemeralParams struct {
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
+	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	WorkerDockerEnabled      bool               `json:"worker_docker_enabled"`
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
@@ -10750,6 +10795,8 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 // @max_rows bounds the work per tick.
 func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg ListUnplaceableQueuedRunsForEphemeralParams) ([]ListUnplaceableQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listUnplaceableQueuedRunsForEphemeral,
+		arg.StaleRequeueCutoff,
+		arg.AffinityCutoff,
 		arg.WorkerDockerEnabled,
 		arg.DockerRepoAllowlist,
 		arg.CrossCheckEvaluatedAt,

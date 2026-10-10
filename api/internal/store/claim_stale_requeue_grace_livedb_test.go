@@ -65,6 +65,8 @@ func (fx *rollAffinityFixture) staleRequeuedRun(owner uuid.UUID) uuid.UUID {
 		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, claim_generation)
 		 VALUES ($1, $2, $3, $4, 't', 'd', 'claimed', $5, 1)`,
 		id, fx.userID, fx.repoID, fx.nextIID(), owner)
+	// RequeueRunsOfStaleWorkers is a global sweep over every stale worker in the database, so
+	// these tests must stay serial: never add t.Parallel to this file.
 	rows, err := fx.q.RequeueRunsOfStaleWorkers(fx.ctx, store.RequeueRunsOfStaleWorkersParams{
 		MaxRequeues: 3, Cutoff: pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
 	})
@@ -82,7 +84,7 @@ func (fx *rollAffinityFixture) staleRequeuedRun(owner uuid.UUID) uuid.UUID {
 	if err != nil {
 		fx.t.Fatalf("GetRunByID: %v", err)
 	}
-	if run.Status != "queued" || !run.WorkerID.Valid || !run.StaleRequeueGeneration.Valid ||
+	if run.Status != "queued" || !run.WorkerID.Valid || run.WorkerID.Bytes != owner || !run.StaleRequeueGeneration.Valid ||
 		run.StaleRequeueGeneration.Int64 != run.ClaimGeneration {
 		fx.t.Fatalf("after the stale requeue: status=%s worker=%v stale_gen=%v claim_gen=%d, want queued/kept/equal",
 			run.Status, run.WorkerID, run.StaleRequeueGeneration, run.ClaimGeneration)
@@ -158,6 +160,19 @@ func TestClaimRunStaleRequeueGraceExpiryReleasesLiveDB(t *testing.T) {
 	fx.mustBlock(p, staleGrace, staleCeiling, "9m into a 10m grace")
 	fx.age(run, 11*time.Minute, 11*time.Minute)
 	fx.mustClaim(p, run, staleGrace, staleCeiling, "11m into a 10m grace")
+}
+
+// The grace is anchored on status_since, not updated_at: unrelated writes (updated_at 1m ago)
+// must not extend it. status_since 11m ago is past the 10m grace, so a peer claims even though
+// updated_at is fresh and the ceiling is large.
+func TestClaimRunStaleRequeueGraceAnchoredOnStatusSinceLiveDB(t *testing.T) {
+	fx := newRollAffinityFixture(t)
+	w := fx.worker("W", 2*time.Minute, false)
+	p := fx.worker("P", 0, false)
+	run := fx.staleRequeuedRun(w)
+
+	fx.age(run, 11*time.Minute, time.Minute)
+	fx.mustClaim(p, run, staleGrace, 24*time.Hour, "status_since past the grace, updated_at fresh")
 }
 
 // (c) Owner row deleted (teardown): the peer claims at once, inside the grace.
