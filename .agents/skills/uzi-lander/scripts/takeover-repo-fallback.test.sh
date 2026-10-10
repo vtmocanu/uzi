@@ -15,8 +15,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# gh cannot reach GitHub: every call fails, `repo view` included.
+# gh cannot reach GitHub: every call fails, `repo view` included, unless GH_REPO_VIEW names
+# the repo it should report.
 echo "$*" >> "$GH_LOG"
+if [ "${1:-}" = repo ] && [ "${2:-}" = view ] && [ -n "${GH_REPO_VIEW:-}" ]; then echo "$GH_REPO_VIEW"; exit 0; fi
 exit 1
 STUB
 cat > "$WORK/bin/git" <<'STUB'
@@ -48,7 +50,7 @@ for url in https://github.com/own/rep https://github.com/own/rep.git \
   git@github.com:own/rep git@github.com:own/rep.git; do
   run "$url"
   printf '%s\n' "$OUT" | grep -qxF 'REPO=own/rep' || fail "$url: no REPO=own/rep: $OUT / $ERR"
-  grep -qF 'repo view' "$WORK/gh.log" || fail "$url: gh repo view was not tried first"
+  grep -qF 'repo view' "$WORK/gh.log" || fail "$url: gh repo view was not consulted"
   if printf '%s\n' "$ERR" | grep -qF 'cannot infer --repo'; then fail "$url: refused: $ERR"; fi
 done
 
@@ -66,5 +68,9 @@ printf '%s\n' "$OUT" | grep -qxF 'REPO=given/one' || fail "explicit --repo not u
 if grep -qF 'repo view' "$WORK/gh.log"; then fail "explicit --repo still consulted gh repo view"; fi
 if grep -qF 'remote get-url' "$WORK/git.log"; then fail "explicit --repo still read the origin remote"; fi
 grep -qF 'pr view 42 --repo given/one' "$WORK/gh.log" || fail "gh pr view did not use the explicit repo: $(cat "$WORK/gh.log")"
+
+GH_REPO_VIEW=gh/wins run https://github.com/own/rep
+printf '%s\n' "$OUT" | grep -qxF 'REPO=gh/wins' || fail "gh repo view's answer not used: $OUT / $ERR"
+if grep -qF 'remote get-url' "$WORK/git.log"; then fail "origin remote read although gh repo view succeeded"; fi
 
 echo "takeover-repo-fallback: all cases passed"
