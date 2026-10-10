@@ -2807,6 +2807,18 @@ tasks:
     cmds:
       - ./e2e/clone-quiescence/run.sh
 
+  test:web-nginx:
+    desc: Opt-in assert the three web nginx configs gzip and cache static assets and keep security headers (#2662)
+    # Runs the digest-pinned nginx image from web/Dockerfile once per config (web/nginx.conf,
+    # web/nginx.mock.conf and the chart's rendered web-configmap.yaml) beside a stub api, and
+    # checks gzip, Cache-Control and security headers on real responses. Requires a working
+    # docker daemon plus helm, yq and curl. NOT wired into gate, gate:repo or gate:web
+    # (gate:repo does not require Docker or Helm); CI wiring is the maintainer-local
+    # follow-up #2663. Exit 2 means the instrument is broken, 1 means a property failed, and
+    # task reports either failure as 201.
+    cmds:
+      - ./scripts/assert-web-nginx.sh
+
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)
     # Separate build and fixture targets permit reusing an existing image after source edits.
