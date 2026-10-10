@@ -272,3 +272,87 @@ lines and 16 KiB. The producer also limits each emitted snapshot to 16 KiB.
 A controlled failing helper on the real Node 24 reporter proves transport;
 passing leaves remain silent. This repairs diagnostic visibility, not the
 unproven disposal cause, and does not replace the privileged lane's evidence.
+
+## Controlled real-lane reproduction (2026-10-10, plan v3 M1)
+
+This run obtained a controlled worker-UID RED with no forcing. It was recorded on this worker's
+real lane, not in CI.
+
+**Posture.**
+- Image: `wuid-2134-base:local`, `sha256:300f2aa521c51894ee2cfc45ad8805c598af57d2a3922893d5c780a6b6a46057`, built from
+  `agent/templates/base/Dockerfile` at `0e356b9f`. The build used `docker build --network host`: this
+  worker's bridge network has no egress, and the default build hung at `apk add`.
+- Runtime: Node v24.20.0 and Codex 0.159.3 (`/opt/uzi-codex/0.159.3`).
+- Container: the exact `docker run` from `e2e/worker-uid/run.sh`, i.e. `--network none`,
+  `--cap-drop ALL` plus its five cap-adds, `no-new-privileges`, and the `uzi-entrypoint` drop to
+  the worker UID. Only two things differed:
+  - It mounted a scratch export of `0e356b9f` with scratch-only patches.
+  - Some batches added `--cpus 0.25`.
+- Each run selected four leaves through a labelled scratch projection of the unmodified
+  `inventory.mjs` output: owner refusal, symlink refusal, single-uid, and the genuine-unclean
+  control. The unmodified `pattern.mjs` and `check.py` ran over that projection. The tracked
+  inventory, checker and `run.sh` were unchanged.
+
+**Scratch patches** (never committed):
+- On a passing leaf, the diagnostic snapshot was also emitted under a different prefix.
+- A `probe-safety` line listed directory entries (names only): the victim directory for the
+  symlink leaf, and the planted directory for the owner leaf.
+- (a) Forced: the leaf's own mutation was moved inside a nested `child_process.spawn`
+  intercept, physically before the supervisor spawn.
+- (c) Barrier: each leaf awaited one `initialize` request on the advice transport before
+  `mutation_start`, using the params shape from `agent/src/codex/appserver-auth.ts`.
+
+| Batch | Iterations with any failing leaf | Wall total / mean |
+| --- | --- | --- |
+| (a) forced pre-spawn mutation, default CPU | 0 / 3 | 22.5s / 7.5s |
+| (b) unprobed, default CPU | 4 / 10 (owner 3, symlink 2, single-uid 2) | 71.7s / 7.2s |
+| (b) unprobed, `--cpus 0.25` | 6 / 20 (owner 2, symlink 2, single-uid 2) | 664.1s / 33.2s |
+| (c) awaited readiness barrier, default CPU | 0 / 20 | 172.3s / 8.6s |
+| (c) awaited readiness barrier, `--cpus 0.25` | 0 / 20 | 699.9s / 35.0s |
+
+In every batch the genuine-unclean control passed, retaining data with the retained warning.
+
+**Observations (b).**
+- Every failing leaf failed with its original named assertion. Owner and symlink lacked the
+  `Codex advice data cleanup failed` line. Single-uid failed `Missing expected rejection` from
+  `assertGone(owned)`.
+- Every failing record shows the supervisor's `started` observed before `mutation_start`, and a
+  supervisor `child_exit` evidence event observed after `mutation_end`. That `child_exit` was
+  followed by `abnormal` or a dispose report, and the warning was
+  `retained / not_clean / other_unconfirmed`, `cleanup_attempted:false`. This matches the
+  natural CI record from run 38001555502.
+- No passing leaf in any batch recorded a `child_exit`.
+- In three failing records the `child_exit` was observed after `dispose_start` but before the
+  dispose evidence. The derived `failure_signature.child_exit_before_dispose` reads `false` in
+  those records, so that field alone does not discriminate the defect. The presence of any
+  `child_exit` event does.
+
+**Observations (a) and (c).**
+- (a): mutating the root before the supervisor spawns never disrupted the provider. All leaves
+  were clean, and the victim directory held only `keep`.
+- (c): with readiness confirmed before the mutation, all 40 iterations were clean. Every leaf
+  record read `started > provider_ready > mutation_start > mutation_end > dispose_start >
+  dispose > exit_zero > dispose_end`. Owner and symlink logged the cleanup-failure warning,
+  and single-uid removed the root without it.
+- Probe safety: the owner planted directory held only `keep` (`"keep"`), and the symlink
+  victim held only `keep` (`"outside"`), identical to the clean unprobed runs.
+
+**Physical order vs observed order.**
+- `uidScript` is synchronous, so any evidence arriving during the mutation is only observed
+  after `mutation_end`.
+- Barrier-established: (c), where readiness physically preceded the mutation, and (a), where
+  the mutation physically preceded the spawn.
+- In (b), the provider's exit was observed during or after the mutation window; the exact
+  physical order is ambiguous.
+- **Inference, not proven:** the provider exits when its owned root is renamed after spawn but
+  before it is ready. Renaming before spawn or after readiness does not disrupt it. Which path
+  the app-server touches at startup was not observed.
+
+**Per-leaf gate (plan v3 M1 step 5).** Owner refusal, symlink refusal and single-uid each have
+an unforced named RED carrying the natural signature, a 20/20 barrier GREEN under throttle,
+and no probe-safety change. All three qualify for M2.
+
+Focused median leaf time at default CPU, unprobed (b) to barrier (c):
+- owner: 667ms to 963ms
+- symlink: 619ms to 987ms
+- single-uid: 670ms to 1029ms
