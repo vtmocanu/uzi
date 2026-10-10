@@ -59,7 +59,7 @@ CREATE TABLE run_held_publications (
     refusal_reason text CONSTRAINT run_held_publications_refusal_reason_check CHECK (refusal_reason IN (
         'create_refused', 'ref_missing', 'ref_mismatch', 'forge_timeout', 'not_failed',
         'excluded_origin', 'generation_mismatch', 'identity_changed', 'coverage_mismatch',
-        'foreign_tip')),
+        'foreign_tip', 'publication_missing', 'publication_not_created')),
     CONSTRAINT run_held_publications_run_generation_key UNIQUE (run_id, generation),
     CONSTRAINT run_held_publications_live_pointer_check
         CHECK ((state IN ('refused', 'deleted', 'abandoned')) = (live_run_id IS NULL)),
@@ -106,7 +106,8 @@ ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_held_pu
     CHECK (final_disposition IS DISTINCT FROM 'held_publication' OR COALESCE(
         state = 'released' AND release_evidence = 'held_publication' AND final_capture_id IS NULL
         AND final_source_sha ~ '^[0-9a-f]{40}([0-9a-f]{24})?$' AND final_coverage_digest IS NOT NULL
-        AND released_at IS NOT NULL AND live_worker_id IS NULL AND live_run_id IS NULL, false));
+        AND released_at IS NOT NULL AND live_worker_id IS NULL AND live_run_id IS NULL
+        AND inventory_guarded, false));
 
 -- +goose StatementBegin
 CREATE FUNCTION held_publication_guard() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -152,6 +153,33 @@ END $$;
 -- +goose StatementEnd
 CREATE TRIGGER held_publication_guard BEFORE UPDATE ON run_held_publications
     FOR EACH ROW EXECUTE FUNCTION held_publication_guard();
+
+-- A row is born prepared: no INSERT may carry a later state or either lifecycle marker, so the
+-- transition matrix above cannot be bypassed by inserting a row already past it.
+-- +goose StatementBegin
+CREATE FUNCTION held_publication_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.state <> 'prepared' OR NEW.create_invoked_at IS NOT NULL OR NEW.acknowledged_at IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    RETURN NEW;
+END $$;
+-- +goose StatementEnd
+CREATE TRIGGER held_publication_insert_guard BEFORE INSERT ON run_held_publications
+    FOR EACH ROW EXECUTE FUNCTION held_publication_insert_guard();
+
+-- A row that is, or may be, the only record of a remote ref is never deleted.
+-- +goose StatementBegin
+CREATE FUNCTION held_publication_delete_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.state IN ('invoked', 'created', 'create_unknown', 'acknowledged', 'delete_unknown') THEN
+        RETURN NULL;
+    END IF;
+    RETURN OLD;
+END $$;
+-- +goose StatementEnd
+CREATE TRIGGER held_publication_delete_guard BEFORE DELETE ON run_held_publications
+    FOR EACH ROW EXECUTE FUNCTION held_publication_delete_guard();
 
 -- A hold is never born released: no INSERT may carry the held classification.
 -- +goose StatementBegin
@@ -295,6 +323,8 @@ $$;
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
+-- Close the check-then-drop window: no live row may be inserted between the check and the DROP.
+LOCK TABLE run_held_publications IN SHARE ROW EXCLUSIVE MODE;
 -- A live publication row owns (or may own) a remote ref that nothing else records: refuse the
 -- rollback rather than forget it. Drain or delete the refs first.
 -- +goose StatementBegin
@@ -323,6 +353,8 @@ UPDATE recovery_custody_holds SET release_evidence = NULL WHERE release_evidence
 ALTER TABLE recovery_custody_holds DROP COLUMN final_publication_id;
 DROP TABLE run_held_publications;
 DROP FUNCTION held_publication_guard();
+DROP FUNCTION held_publication_insert_guard();
+DROP FUNCTION held_publication_delete_guard();
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_evidence_check;
 ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_release_evidence_check
     CHECK (release_evidence IS NULL OR release_evidence IN ('publication', 'archive', 'forge_no_output',

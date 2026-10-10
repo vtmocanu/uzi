@@ -23,8 +23,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 	q := store.New(pool)
 	failed := "agent_failure"
 	newRow := func() (heldFixture, store.RunHeldPublication) {
-		f := heldNewFixture(ctx, t, pool, true, "failed", &failed)
-		mustExec(ctx, t, pool, `DELETE FROM run_held_publications WHERE id=$1`, f.pub)
+		f := heldNewHoldFixture(ctx, t, pool, true, "failed", &failed)
 		row, err := q.UpsertHeldPublication(ctx, store.UpsertHeldPublicationParams{
 			RunID: f.run, Generation: 1, HoldID: f.hold, UserID: f.user, RepoID: f.repo, WorkerID: f.worker,
 			Ref: "refs/uzi-held/" + f.run.String() + "/1", Tip: heldTip, CoverageDigest: heldDigest,

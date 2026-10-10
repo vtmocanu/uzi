@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // These internal tests exercise the delta-aware inflation budget directly (the
@@ -179,6 +181,28 @@ func TestPublishRejectsDeltaBomb(t *testing.T) {
 	})
 	if !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("Publish err = %v, want ErrPackTooLarge", err)
+	}
+}
+
+// TestPrepareHeldPackRejectsDeltaBomb is the held-create twin of TestPublishRejectsDeltaBomb:
+// scanPackBudget runs before the remote is created or dialed, so the file:// CloneURL below is
+// never contacted and the bomb is refused with ErrPackTooLarge.
+func TestPrepareHeldPackRejectsDeltaBomb(t *testing.T) {
+	baseContent := []byte("base blob\n")
+	pack := assemblePack(t,
+		blobObject(t, baseContent),
+		refDeltaObject(t, blobOID(baseContent), deltaBody(uint64(len(baseContent)), 40<<20)),
+	)
+	p, err := PrepareHeldPack(context.Background(), HeldPackOptions{
+		CloneURL:   "file:///nonexistent/never-dialed.git",
+		RunID:      uuid.MustParse("3c1d7e52-9a4b-4f68-8d21-5e0b6a7c9d13"),
+		Generation: 1,
+		Branch:     "main",
+		Tip:        "1111111111111111111111111111111111111111",
+		Pack:       pack,
+	})
+	if !errors.Is(err, ErrPackTooLarge) || p != nil {
+		t.Fatalf("PrepareHeldPack = %v, %v; want nil, ErrPackTooLarge", p, err)
 	}
 }
 

@@ -49,6 +49,14 @@ func heldMigratedPool(t *testing.T, prefix string) (context.Context, string, *pg
 // for it. guarded selects recovery_inventory_hold_guard (true) or the CHECK-only backstop (false).
 func heldNewFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, guarded bool, status string, failOrigin *string) heldFixture {
 	t.Helper()
+	f := heldNewHoldFixture(ctx, t, pool, guarded, status, failOrigin)
+	f.insertPublication(ctx, t, "created")
+	return f
+}
+
+// heldNewHoldFixture is heldNewFixture without the publication row.
+func heldNewHoldFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, guarded bool, status string, failOrigin *string) heldFixture {
+	t.Helper()
 	f := heldFixture{pool: pool, user: uuid.New(), worker: uuid.New(), run: uuid.New(), hold: uuid.New(), pub: uuid.New()}
 	conn := uuid.New()
 	f.repo = uuid.New()
@@ -70,25 +78,26 @@ func heldNewFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, guard
 		 live_worker_id,live_run_id,inventory_guarded)
 		VALUES($1,$2,$3,$4,1,'open',$5,'held-worker',$5,$4,$6)`, f.hold, f.user, f.repo, f.run, f.worker, guarded)
 	mustExec(ctx, t, pool, `UPDATE runs SET status=$2, fail_origin=$3 WHERE id=$1`, f.run, status, failOrigin)
-	f.insertPublication(ctx, t, "created")
 	return f
 }
 
-// insertPublication inserts the (run, generation) publication directly in the given state.
+// insertPublication inserts the (run, generation 1) publication as prepared, as the INSERT guard
+// requires, then walks it to the given state through the guard-free setState.
 func (f *heldFixture) insertPublication(ctx context.Context, t *testing.T, state string) {
 	t.Helper()
-	invoked := "now()"
-	if state == "prepared" {
-		invoked = "NULL"
+	f.insertPreparedAt(ctx, t, f.pub, 1, f.worker)
+	if state != "prepared" {
+		f.setState(ctx, t, state)
 	}
-	live := "$3"
-	if state == "refused" || state == "deleted" || state == "abandoned" {
-		live = "NULL"
-	}
+}
+
+// insertPreparedAt inserts a prepared publication row of the fixture's run and hold.
+func (f heldFixture) insertPreparedAt(ctx context.Context, t *testing.T, id uuid.UUID, generation int, worker uuid.UUID) {
+	t.Helper()
 	mustExec(ctx, t, f.pool, `INSERT INTO run_held_publications
-		(id,run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state,create_invoked_at)
-		VALUES($1,$2,1,$4,$5,$6,$7,`+live+`,'refs/uzi-held/'||$2::uuid::text||'/1',$8,$9,$10,`+invoked+`)`,
-		f.pub, f.run, f.run, f.hold, f.user, f.repo, f.worker, heldTip, heldDigest, state)
+		(id,run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state)
+		VALUES($1,$2,$3::bigint,$4,$5,$6,$7,$2,'refs/uzi-held/'||$2::uuid::text||'/'||$3::bigint::text,$8,$9,'prepared')`,
+		id, f.run, generation, f.hold, f.user, f.repo, worker, heldTip, heldDigest)
 }
 
 // heldRelease attempts the guarded release of the fixture's hold and reports the rows affected.
@@ -119,8 +128,9 @@ func TestHeldPublicationHoldChecksLiveDB(t *testing.T) {
 		check string
 	}{
 		{"publication id without a disposition", `final_publication_id=$2`, "recovery_custody_holds_held_publication_tie_check"},
+		// The shape CHECK fires first on an unguarded hold; the tie CHECK is reached by the cases above.
 		{"released disposition without a publication id", `state='released',live_worker_id=NULL,live_run_id=NULL,final_disposition='held_publication',
-			release_evidence='held_publication',final_source_sha='` + heldTip + `',final_coverage_digest='` + heldDigest + `',released_at=now()`, "recovery_custody_holds_held_publication_tie_check"},
+			release_evidence='held_publication',final_source_sha='` + heldTip + `',final_coverage_digest='` + heldDigest + `',released_at=now()`, "recovery_custody_holds_held_publication_shape_check"},
 		{"evidence without a disposition", `release_evidence='held_publication'`, "recovery_custody_holds_held_publication_evidence_check"},
 		{"disposition and id with NULL evidence", `final_disposition='held_publication',final_publication_id=$2`, "recovery_custody_holds_held_publication_evidence_check"},
 		{"disposition and id with foreign evidence", `final_disposition='held_publication',final_publication_id=$2,release_evidence='archive'`, "recovery_custody_holds_held_publication_evidence_check"},
@@ -129,6 +139,9 @@ func TestHeldPublicationHoldChecksLiveDB(t *testing.T) {
 		{"released without a source sha", `state='released',live_worker_id=NULL,live_run_id=NULL,final_disposition='held_publication',
 			final_publication_id=$2,release_evidence='held_publication',final_coverage_digest='` + heldDigest + `',released_at=now()`, "recovery_custody_holds_held_publication_shape_check"},
 		{"released while still live", `state='released',final_disposition='held_publication',
+			final_publication_id=$2,release_evidence='held_publication',final_source_sha='` + heldTip + `',
+			final_coverage_digest='` + heldDigest + `',released_at=now()`, "recovery_custody_holds_held_publication_shape_check"},
+		{"complete tuple on an unguarded hold", `state='released',live_worker_id=NULL,live_run_id=NULL,final_disposition='held_publication',
 			final_publication_id=$2,release_evidence='held_publication',final_source_sha='` + heldTip + `',
 			final_coverage_digest='` + heldDigest + `',released_at=now()`, "recovery_custody_holds_held_publication_shape_check"},
 		{"released without a coverage digest", `state='released',live_worker_id=NULL,live_run_id=NULL,final_disposition='held_publication',
@@ -142,10 +155,10 @@ func TestHeldPublicationHoldChecksLiveDB(t *testing.T) {
 		})
 	}
 	// The complete tuple is accepted, so the refusals above are the constraints and not a fixture fault.
-	f := heldNewFixture(ctx, t, pool, false, "failed", nil)
+	f := heldNewFixture(ctx, t, pool, true, "failed", nil)
 	tag, err := pool.Exec(ctx, `UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,
 		final_disposition='held_publication',final_publication_id=$2,release_evidence='held_publication',
-		final_source_sha=$3,final_coverage_digest=$4,released_at=now() WHERE id=$1`, f.hold, other, heldTip, heldDigest)
+		final_source_sha=$3,final_coverage_digest=$4,released_at=now() WHERE id=$1`, f.hold, f.pub, heldTip, heldDigest)
 	if err != nil || tag.RowsAffected() != 1 {
 		t.Fatalf("complete held release: rows=%d err=%v", tag.RowsAffected(), err)
 	}
@@ -219,6 +232,40 @@ func TestHeldPublicationHoldGuardLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, `UPDATE run_held_publications SET state='deleted',live_run_id=NULL WHERE id=$1`, f.pub)
 		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 0 {
 			t.Fatalf("not-created publication: rows=%d err=%v", n, err)
+		}
+		assertHoldOpen(ctx, t, pool, f.hold)
+	})
+	t.Run("run claimed by another worker", func(t *testing.T) {
+		f := heldNewFixture(ctx, t, pool, true, "failed", str("agent_failure"))
+		other := uuid.New()
+		mustExec(ctx, t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status)
+			VALUES($1,$2,'held-other',$3,'online')`, other, f.user, other[:])
+		mustExec(ctx, t, pool, `UPDATE runs SET worker_id=$2 WHERE id=$1`, f.run, other)
+		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 0 {
+			t.Fatalf("release: rows=%d err=%v", n, err)
+		}
+		assertHoldOpen(ctx, t, pool, f.hold)
+	})
+	// The publication's identity columns are immutable, so each mismatch is a differently built row.
+	// A generation mismatch is also caught by the ref binding (the ref carries the generation), so
+	// this case pins the outcome; the worker case is the one only p.worker_id can refuse.
+	t.Run("publication of another generation", func(t *testing.T) {
+		f := heldNewHoldFixture(ctx, t, pool, true, "failed", str("agent_failure"))
+		gen2 := uuid.New()
+		f.insertPreparedAt(ctx, t, gen2, 2, f.worker)
+		f.pub = gen2
+		f.setState(ctx, t, "created")
+		if n, err := f.release(ctx, t, gen2, heldDigest, heldTip); err != nil || n != 0 {
+			t.Fatalf("generation-2 publication: rows=%d err=%v", n, err)
+		}
+		assertHoldOpen(ctx, t, pool, f.hold)
+	})
+	t.Run("publication of another worker", func(t *testing.T) {
+		f := heldNewHoldFixture(ctx, t, pool, true, "failed", str("agent_failure"))
+		f.insertPreparedAt(ctx, t, f.pub, 1, uuid.New())
+		f.setState(ctx, t, "created")
+		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 0 {
+			t.Fatalf("foreign-worker publication: rows=%d err=%v", n, err)
 		}
 		assertHoldOpen(ctx, t, pool, f.hold)
 	})
@@ -420,15 +467,78 @@ func TestHeldPublicationGuardLiveDB(t *testing.T) {
 	t.Run("unique per run and generation", func(t *testing.T) {
 		f := heldNewFixture(ctx, t, pool, false, "failed", nil)
 		_, err := pool.Exec(ctx, `INSERT INTO run_held_publications
-			(run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state,create_invoked_at)
-			VALUES($1::uuid,1,$2,$3,$4,$5,$1::uuid,'refs/uzi-held/'||$1::uuid::text||'/1',$6,$7,'invoked',now())`,
+			(run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state)
+			VALUES($1::uuid,1,$2,$3,$4,$5,$1::uuid,'refs/uzi-held/'||$1::uuid::text||'/1',$6,$7,'prepared')`,
 			f.run, f.hold, f.user, f.repo, f.worker, heldTip, heldDigest)
 		heldCheckName(t, err, "run_held_publications_run_generation_key")
 		_, err = pool.Exec(ctx, `INSERT INTO run_held_publications
-			(run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state,create_invoked_at)
-			VALUES($1::uuid,2,$2,$3,$4,$5,$1::uuid,'refs/uzi-held/elsewhere',$6,$7,'invoked',now())`,
+			(run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state)
+			VALUES($1::uuid,2,$2,$3,$4,$5,$1::uuid,'refs/uzi-held/elsewhere',$6,$7,'prepared')`,
 			f.run, f.hold, f.user, f.repo, f.worker, heldTip, heldDigest)
 		heldCheckName(t, err, "run_held_publications_ref_check")
+	})
+}
+
+// A terminal row is frozen, the INSERT guard admits only a prepared row, and the DELETE guard
+// keeps every row that is or may be the only record of a remote ref.
+func TestHeldPublicationLifecycleGuardsLiveDB(t *testing.T) {
+	ctx, _, pool := heldMigratedPool(t, "held_life_")
+	t.Run("terminal rows are frozen", func(t *testing.T) {
+		for _, term := range []string{"refused", "deleted", "abandoned"} {
+			f := heldNewFixture(ctx, t, pool, false, "failed", nil)
+			f.setState(ctx, t, term)
+			tag, err := pool.Exec(ctx, `UPDATE run_held_publications SET last_error='late' WHERE id=$1`, f.pub)
+			if err != nil || tag.RowsAffected() != 0 {
+				t.Errorf("%s row updated: rows=%d err=%v", term, tag.RowsAffected(), err)
+			}
+		}
+		// A live row still takes a same-state update, so the refusal above is the freeze.
+		f := heldNewFixture(ctx, t, pool, false, "failed", nil)
+		tag, err := pool.Exec(ctx, `UPDATE run_held_publications SET last_error='ok' WHERE id=$1`, f.pub)
+		if err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("live same-state update: rows=%d err=%v", tag.RowsAffected(), err)
+		}
+	})
+	t.Run("insert admits only a prepared row", func(t *testing.T) {
+		f := heldNewFixture(ctx, t, pool, false, "failed", nil)
+		for _, state := range []string{"invoked", "created", "acknowledged", "deleted"} {
+			live := "$1"
+			if state == "deleted" {
+				live = "NULL"
+			}
+			tag, err := pool.Exec(ctx, `INSERT INTO run_held_publications
+				(run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state,
+				 create_invoked_at,acknowledged_at,expires_at)
+				VALUES($1,9,$2,$3,$4,$5,`+live+`,'refs/uzi-held/'||$1::uuid::text||'/9',$6,$7,'`+state+`',
+				 now(),CASE WHEN '`+state+`' IN ('acknowledged','deleted') THEN now() END,
+				 CASE WHEN '`+state+`'='acknowledged' THEN now()+interval '1 day' END)`,
+				f.run, f.hold, f.user, f.repo, f.worker, heldTip, heldDigest)
+			if err != nil || tag.RowsAffected() != 0 {
+				t.Errorf("born-%s row inserted: rows=%d err=%v", state, tag.RowsAffected(), err)
+			}
+		}
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_held_publications WHERE run_id=$1`, f.run).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("rows for the run: %d %v", n, err)
+		}
+	})
+	t.Run("delete keeps live rows", func(t *testing.T) {
+		for _, live := range []string{"invoked", "created", "create_unknown", "acknowledged", "delete_unknown"} {
+			f := heldNewFixture(ctx, t, pool, false, "failed", nil)
+			f.setState(ctx, t, live)
+			tag, err := pool.Exec(ctx, `DELETE FROM run_held_publications WHERE id=$1`, f.pub)
+			if err != nil || tag.RowsAffected() != 0 {
+				t.Errorf("%s row deleted: rows=%d err=%v", live, tag.RowsAffected(), err)
+			}
+		}
+		for _, safe := range []string{"prepared", "refused", "deleted", "abandoned"} {
+			f := heldNewFixture(ctx, t, pool, false, "failed", nil)
+			f.setState(ctx, t, safe)
+			tag, err := pool.Exec(ctx, `DELETE FROM run_held_publications WHERE id=$1`, f.pub)
+			if err != nil || tag.RowsAffected() != 1 {
+				t.Errorf("%s row not deletable: rows=%d err=%v", safe, tag.RowsAffected(), err)
+			}
+		}
 	})
 }
 

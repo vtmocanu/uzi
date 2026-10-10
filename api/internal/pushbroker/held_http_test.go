@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
@@ -293,5 +294,38 @@ func TestHeldCreateGatewayErrorIsUnknownNotRefused(t *testing.T) {
 	}
 	if got := f.originRef(heldRefName()); got != "" {
 		t.Fatalf("held ref created at %s through a failed push", got)
+	}
+}
+
+// A complete report whose unpack failed and that carries no ng line for our command is a
+// rejection of the push but not an explicit refusal of the ref: SendHeldCreate may only call a
+// create Refused on an ng, so this stays Unknown (and a later listing decides).
+func TestHeldCreateUnpackFailureWithoutNgIsUnknownNotRefused(t *testing.T) {
+	f, remote, _, _, tip, pack := heldHTTPFixture(t)
+	inner := remote.srv.Config.Handler
+	front := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+			enc := pktline.NewEncoder(w)
+			_ = enc.EncodeString("unpack index-pack abnormal exit\n")
+			_ = enc.Flush()
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+	url := front.URL + "/" + filepath.Base(f.bare)
+
+	prep, err := pushbroker.PrepareHeldPack(context.Background(), heldOpts(url, tip, pack))
+	if err != nil {
+		t.Fatalf("PrepareHeldPack: %v", err)
+	}
+	out, err := pushbroker.SendHeldCreate(context.Background(), prep)
+	if out != pushbroker.HeldCreateUnknown || err == nil || errors.Is(err, pushbroker.ErrHeldCreateRefused) {
+		t.Fatalf("SendHeldCreate = %v, %v; want unknown, not refused", out, err)
+	}
+	if got := f.originRef(heldRefName()); got != "" {
+		t.Fatalf("held ref created at %s through a failed unpack", got)
 	}
 }

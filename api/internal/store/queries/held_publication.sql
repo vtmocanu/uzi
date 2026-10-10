@@ -54,7 +54,8 @@ RETURNING *;
 -- replay read and the pre-body gate. The locked read is GetFinalInventoryHold.
 SELECT * FROM recovery_custody_holds
 WHERE run_id = @run_id AND user_id = @user_id AND original_worker_id = @worker_id::uuid
-  AND generation = @generation AND inventory_guarded;
+  AND generation = @generation AND inventory_guarded
+ORDER BY id LIMIT 1;
 
 -- name: CountOpenHoldsForRun :one
 -- The cleanup exclusion: no ref is deleted while ANY hold of the run is open, whatever its
@@ -154,7 +155,7 @@ SELECT count(*) FROM run_held_publications s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
 JOIN forge_connections c ON c.id = p.connection_id
-WHERE r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid;
+WHERE s.repo_id = @repo_id::uuid AND r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid;
 
 -- name: ListLiveHeldPublicationRefsForRepo :many
 -- What the repo-removal 409 names: the run, its publication state and the held ref.
@@ -163,7 +164,7 @@ FROM run_held_publications s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
 JOIN forge_connections c ON c.id = p.connection_id
-WHERE r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid
+WHERE s.repo_id = @repo_id::uuid AND r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid
 ORDER BY s.created_at ASC, s.run_id ASC
 LIMIT @lim::int;
 

@@ -87,7 +87,7 @@ SELECT count(*) FROM run_held_publications s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
 JOIN forge_connections c ON c.id = p.connection_id
-WHERE r.repo_id = $1::uuid AND c.user_id = $2::uuid
+WHERE s.repo_id = $1::uuid AND r.repo_id = $1::uuid AND c.user_id = $2::uuid
 `
 
 type CountLiveHeldPublicationsForRepoParams struct {
@@ -198,6 +198,7 @@ const getHeldPublicationHold = `-- name: GetHeldPublicationHold :one
 SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id FROM recovery_custody_holds
 WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3::uuid
   AND generation = $4 AND inventory_guarded
+ORDER BY id LIMIT 1
 `
 
 type GetHeldPublicationHoldParams struct {
@@ -537,7 +538,7 @@ FROM run_held_publications s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
 JOIN forge_connections c ON c.id = p.connection_id
-WHERE r.repo_id = $1::uuid AND c.user_id = $2::uuid
+WHERE s.repo_id = $1::uuid AND r.repo_id = $1::uuid AND c.user_id = $2::uuid
 ORDER BY s.created_at ASC, s.run_id ASC
 LIMIT $3::int
 `

@@ -1031,8 +1031,10 @@ type forwardPackResult struct {
 	rejected bool
 	reason   string // Authoritative raw rejection only; never a transport error.
 	// ng is true only when a complete, finalized report carried an explicit "ng <ref> <reason>"
-	// line for this command. It is narrower than rejected, which also covers a failed unpack:
-	// SendHeldCreate refuses a held create only on an ng.
+	// line for this command. It is narrower than rejected, which also covers a failed unpack
+	// reported with no ng line; a real receive-pack also answers an unpacker failure with an ng
+	// line, which is classified as refused (safe: nothing was applied). SendHeldCreate refuses a
+	// held create only on an ng.
 	ng bool
 }
 

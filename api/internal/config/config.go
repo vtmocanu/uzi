@@ -802,12 +802,10 @@ type Config struct {
 	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
 
-	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) gates STEP A only: whether a failed run's
-	// held work may be published to refs/uzi-held/<run-id>/<generation>. Default ON; "off",
-	// "false", "0", "no" disable it (true/on/1/yes/empty enable it, case-insensitive), and any
-	// other value refuses to start. It is advertised to workers as a server feature, so an API with
-	// it off makes workers take the archive path. The release step and the cleanup sweep always
-	// run, so rows and holds recorded while it was on are never stranded by turning it off.
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is the held-work publication switch.
+	// Unset or empty means on. Accepted values, case-insensitive and trimmed: true, on, 1, yes, t,
+	// y (on) and false, off, 0, no, f, n (off); any other value fails startup. It is copied to
+	// workersvc.Params.HeldPublication; nothing reads it there yet.
 	HeldPublication bool
 }
 

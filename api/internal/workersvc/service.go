@@ -1590,11 +1590,9 @@ type Params struct {
 	// copy. Empty (the zero value) is off.
 	SalvageForges []string
 
-	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is whether step A of held-work
-	// publication is enabled. It gates step A only: the release step and the cleanup sweep run
-	// whatever it says, so nothing recorded while it was on is stranded by turning it off. The
-	// zero value is off (a Params literal that omits it never publishes); the default-on lives in
-	// config.go where the env is read.
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) carries config.Config.HeldPublication.
+	// Nothing in workersvc reads it yet. The zero value is off; the default-on lives in config.go
+	// where the env is read.
 	HeldPublication bool
 }
 
