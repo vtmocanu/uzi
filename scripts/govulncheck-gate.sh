@@ -202,8 +202,9 @@ esac
 # reachable in the shipped binary -- and the remedy is a dependency bump, exactly
 # as for any other exit-3 finding, NOT reverting the pin.
 
-# No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
-TMP="$(mktemp -d)"
+# An explicit template honors TMPDIR on BSD and GNU; bare -d ignores it on
+# macOS. Avoid -t, whose template semantics differ between platforms.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/govulncheck.XXXXXX")"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
 trap "rm -rf '$TMP'" EXIT INT TERM
 

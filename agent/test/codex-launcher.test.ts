@@ -829,7 +829,9 @@ describe("M1 controlled advice disposal ordering probe", () => {
   // inventory: privileged provisioning/parent metadata are scripted on this host.
   for (const ordering of ["exit_first", "evidence_first", "unclean"] as const) {
     for (const leaf of ["single_uid", "owner_refusal"] as const) {
-      it(ordering + " through actual executor " + leaf, async (t) => {
+      it(ordering + " through actual executor " + leaf, {
+        skip: process.platform !== "linux" && "actual advice cleanup requires Linux descriptor-pinned tree removal",
+      }, async (t) => {
         const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "advice-probe-"));
         const fake = newFake({ exitBeforeEvidence: ordering === "exit_first", exitCode: ordering === "unclean" ? 1 : 0 });
         const { logger, lines } = recordingLogger();

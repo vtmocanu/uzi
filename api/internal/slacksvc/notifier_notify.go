@@ -62,14 +62,23 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 }
 
 // markDelivered settles a durable notification (issue #1675); a zero deliveryID is a
-// no-op. A failure only logs: the row stays pending and a later redelivery repeats the DM
-// (at-least-once).
+// no-op. A stamp failure logs and leaves an unexhausted row eligible for redelivery,
+// which can repeat the DM (at-least-once). After a successful stamp, per-user pruning
+// is best-effort (issue #2076): a cleanup error logs without undoing settlement or
+// causing redelivery. Successful pruning removes eligible older rows without a later
+// Notify, subject to pending durable exemptions and timestamp ties.
 func (n *Notifier) markDelivered(ctx context.Context, ev notifyEvent) {
 	if ev.deliveryID == uuid.Nil {
 		return
 	}
 	if err := n.store.MarkNotificationSlackDelivered(ctx, ev.deliveryID); err != nil {
 		n.logf("mark notification delivered", err)
+		return
+	}
+	if _, err := n.store.PruneNotificationsForUser(ctx, store.PruneNotificationsForUserParams{
+		UserID: ev.userID, Keep: n.notificationUserCap, MaxAttempts: notifysvc.MaxSlackAttempts,
+	}); err != nil {
+		n.logf("prune delivered notification", err)
 	}
 }
 

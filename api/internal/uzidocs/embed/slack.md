@@ -291,6 +291,17 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   up to about a day, so you may rarely see one twice or a while after the
   halt; the override decision DM is not retried.
 
+  The internal notification event log has a nominal retention target of 200
+  rows per user. Pending halt DMs below the retry attempt cap are exempt;
+  rows tied at the retention timestamp boundary can also keep the total above
+  200. After a successful delivery stamp (including a terminal no-link outcome)
+  or the final retry claim, uzi attempts best-effort pruning of eligible older
+  rows, even if the final claim's stored render is corrupt. When pruning succeeds,
+  cleanup needs no later notification, so an idle user's log can converge toward
+  the target. Prune failures are logged without undoing delivery settlement or
+  retry exhaustion. There is no historical settled-backlog sweep or unconditional
+  cleanup guarantee.
+
 ## Markdown rendering
 
 The bodies an agent or model writes — chat answers, judge/self-improvement

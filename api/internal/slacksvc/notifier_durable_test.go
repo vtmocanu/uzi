@@ -46,6 +46,12 @@ func TestHandleNotifyDurableStamping(t *testing.T) {
 				if len(c.store.marked) != 1 || c.store.marked[0] != id {
 					t.Errorf("marked = %v, want [%s]", c.store.marked, id)
 				}
+				want := store.PruneNotificationsForUserParams{UserID: ev.userID, Keep: notifysvc.DefaultUserCap, MaxAttempts: notifysvc.MaxSlackAttempts}
+				if len(c.store.pruned) != 1 || c.store.pruned[0] != want {
+					t.Errorf("pruned = %+v, want %+v", c.store.pruned, want)
+				}
+			} else if len(c.store.pruned) != 0 {
+				t.Errorf("pruned unsettled notification: %+v", c.store.pruned)
 			} else if len(c.store.marked) != 0 {
 				t.Errorf("marked = %v, want none", c.store.marked)
 			}
@@ -58,7 +64,7 @@ func TestHandleNotifyMarkFailureDoesNotPanicOrRepost(t *testing.T) {
 	fp := &fakePoster{}
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleNotify(context.Background(), notifyEvent{userID: uuid.New(), title: "t", deliveryID: uuid.New()})
-	if len(fp.blocks) != 1 || len(fs.marked) != 1 {
+	if len(fp.blocks) != 1 || len(fs.marked) != 1 || len(fs.pruned) != 0 {
 		t.Errorf("posts=%d marks=%d, want 1/1", len(fp.blocks), len(fs.marked))
 	}
 }

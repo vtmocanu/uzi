@@ -57,7 +57,16 @@ func TestSplitReviewFooterNoteYieldsToExistingFrame(t *testing.T) {
 		control.splitMode = "off"
 		control.splitNote, control.splitOff = "", false
 		if got, want := m.View().Content, control.View().Content; got != want {
-			t.Errorf("%v note changed full-screen frame", view)
+			// Shedding can leave room for the restore note. It must not shed
+			// another hint to make room: the entire fitted legend survives.
+			gotLines, wantLines := strings.Split(got, "\n"), strings.Split(want, "\n")
+			footer := gotLines[len(gotLines)-1]
+			legend := wantLines[len(wantLines)-1]
+			if !strings.Contains(stripANSI(footer), "s split") ||
+				!strings.HasSuffix(footer, strings.TrimPrefix(legend, " ")) ||
+				strings.Join(gotLines[:len(gotLines)-1], "\n") != strings.Join(wantLines[:len(wantLines)-1], "\n") {
+				t.Errorf("%v note changed fitted hints or body", view)
+			}
 		}
 	}
 	// Every list's footer lets a split note yield to the existing footer.
