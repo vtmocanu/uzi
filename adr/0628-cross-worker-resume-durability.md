@@ -329,15 +329,21 @@ grace", even when the ceiling is shorter than the grace. Ephemeral provisioning 
 and saturation triggers) does not count an effectively pinned run as demand, since no new worker
 could claim it. Health shows `waiting_worker` with "waiting until <RFC3339 UTC> for its previous
 worker <name> to return; another worker may take it after that" and sends no nudge; below the
-queued-health threshold only this reason surfaces, and owner-account blockers (vault, custody,
-Codex account) still win past it. Leaving the pin is a new episode with a nudge and a restamped
-`health_since`.
+queued-health threshold only this reason surfaces; past it, the handoff setup, vault, custody,
+Codex account and isolated egress lane blockers (checked before the pin rung in `queuedReason`)
+still win. Leaving the pin is a new episode, nudge-eligible (the nudge cooldown and usual
+suppressions still apply), with a restamped `health_since`.
 
 **The `fleet.capacity` decision.** The plan left `fleet.capacity` unchanged. Review found that it
 would then report a danger for the expected wait, so `queue.waiting` **and** `fleet.capacity`
 (`ListWaitingWorkerRuns`, `ListOwnersWaitingNoCapacity`) exclude pin-reason rows. For an owner whose
-only worker died, `fleet.capacity` now fires about grace + 5m after the requeue (15m by default)
-instead of 5m.
+only worker died, leaving `fleet.capacity` unchanged would have fired it at about 5m and flapped.
+Before #2705, and with the grace at 0, a requeued run is flagged `waiting_worker` only once queued
+longer than `health_queued_seconds` (default 600s), `health_since` is stamped at that first flag,
+and the 5m danger is measured from it, so it fired about 15m after the requeue. With the
+exclusion, leaving the pin restamps `health_since`, so `fleet.capacity` fires about
+max(`WORKER_STALE_REQUEUE_GRACE`, `health_queued_seconds`) + 5m after the requeue: still about 15m
+at the defaults, later only when the grace exceeds the queued threshold.
 
 **The cost.** A genuinely dead owner whose worker row remains delays takeover by up to the grace.
 Accepted: the grace is short against the cold-start loss it prevents and is an operator knob.

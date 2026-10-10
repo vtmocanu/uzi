@@ -10684,9 +10684,11 @@ WHERE r.health = 'waiting_worker'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
   -- Issue #2705: during the stale-requeue grace a run is explicitly held for its returning owner
   -- (workersvc reasonStaleRequeuePinPrefix, 'waiting until ...'), so it is not a capacity failure
-  -- yet. health_since is stamped at the requeue, so without this the 5m danger threshold would fire
-  -- inside the grace, clear at the pin exit and fire again. Excluding the pin row makes the age run
-  -- from the pin-exit restamp. A NULL health_reason must stay included, hence the COALESCE.
+  -- yet. The pin reason is flagged from the first detector tick after the requeue (below the queued
+  -- threshold), so without this the 5m danger threshold would fire inside the grace, clear at the
+  -- pin exit and fire again. Excluding the pin row keeps today's timing: the age runs from the first
+  -- non-pin flag, about max(grace, health_queued_seconds) after the requeue. A NULL health_reason
+  -- must stay included, hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
   AND NOT EXISTS (
       SELECT 1 FROM workers w

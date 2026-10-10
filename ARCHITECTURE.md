@@ -1098,7 +1098,7 @@ chain in the diagram above, with no intervening `running`.
   run stays pinned to its prior worker while that worker's row exists and it is
   either draining or heartbeating, bounded by `WORKER_AFFINITY_CEILING` (default
   2h of queue dwell after promotion). A deleted worker, a stale non-draining
-  worker, or an expired ceiling lets another eligible worker claim it.
+  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it.
   `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
   A run the stale-worker sweeper requeued is additionally held for its previous
   worker, while that worker's row exists, for `WORKER_STALE_REQUEUE_GRACE` (default

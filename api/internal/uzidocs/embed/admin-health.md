@@ -202,12 +202,13 @@ A run requeued because its worker went stale is held for that worker for
 `WORKER_STALE_REQUEUE_GRACE` (default 10m, [configuration](configuration.md)), and shows
 `waiting_worker` with the reason "waiting until <time, RFC3339 UTC> for its previous worker
 <name> to return; another worker may take it after that". That wait is expected, so both
-`queue.waiting` and `fleet.capacity` exclude rows carrying that reason. For an owner whose only
-worker died, `fleet.capacity` therefore reports danger about the grace plus 5 minutes after the
-requeue (about 15 minutes by default) instead of 5 minutes. When the hold ends (the grace
-elapses, `WORKER_AFFINITY_CEILING` releases the run, or the worker row is deleted) the wait
-becomes a new episode and counts as a genuine wait again. With the grace set to `0` nothing is
-excluded and the 5-minute timing is unchanged.
+`queue.waiting` and `fleet.capacity` exclude rows carrying that reason, so the early explanation does not trip
+either alarm. Both keep their previous timing, measured from the end of the hold: for an owner
+whose only worker died, `fleet.capacity` reports danger about max(`WORKER_STALE_REQUEUE_GRACE`,
+`health_queued_seconds`) + 5 minutes after the requeue, which is about 15 minutes by default.
+When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the run, or the worker
+row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
+genuine wait again.
 
 Capacity runs first with a shared per-evaluation confirmation coordinator,
 memoized by run (including failed reads). It permits at most 200 distinct
