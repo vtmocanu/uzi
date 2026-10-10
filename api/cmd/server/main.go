@@ -337,6 +337,7 @@ func run() error {
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
+		WorkerStaleRequeueGrace:     cfg.WorkerStaleRequeueGrace,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
 		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
@@ -767,7 +768,9 @@ func run() error {
 	// store, box and settings cache already in scope, plus the ephemeral cap + default
 	// size knobs.
 	ephemeralProv := hostedsvc.NewEphemeralProvisioner(pool, q, box, settingsCache, hostedsvc.EphemeralConfig{
-		WorkerAffinityGrace: cfg.WorkerAffinityGrace,
+		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
+		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
+		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,

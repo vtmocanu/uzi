@@ -154,7 +154,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
-| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
+| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility; runs held for a returning worker (see below) are excluded | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
@@ -185,7 +185,7 @@ union, so an owner in both groups is counted once.
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
-| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
+| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains and runs held for a returning worker | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `queue.undispatched` | A queued task run that never got dispatched (the [#1367](https://github.com/vtmocanu/uzi/issues/1367) failure class) | — | any `kind = 'task'`, `status = 'queued'` run with no dispatch for 10+ minutes | — |
 
 The queue evaluates the full waiting population, including owners with usable
@@ -197,6 +197,18 @@ and current eligibility with `DrainingEligible > 0`, `NonDrainingEligible == 0`
 and `SuitableOwnDraining == 0`. An unconfirmed wait stays on the genuine path.
 Confirmed drains remain excluded from `queue.waiting` even when overdue;
 `fleet.capacity` owns the 24-hour overlap rule above.
+
+A run requeued because its worker went stale is held for that worker for
+`WORKER_STALE_REQUEUE_GRACE` (default 10m, [configuration](configuration.md)), and shows
+`waiting_worker` with the reason "waiting until <time, RFC3339 UTC> for its previous worker
+<name> to return; another worker may take it after that". That wait is expected, so both
+`queue.waiting` and `fleet.capacity` exclude rows carrying that reason, so the early explanation does not trip
+either alarm. Both keep their previous timing, measured from the end of the hold: for an owner
+whose only worker died, `fleet.capacity` reports danger about max(`WORKER_STALE_REQUEUE_GRACE`,
+`health_queued_seconds`) + 5 minutes after the requeue, which is about 15 minutes by default.
+When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the run, or the worker
+row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
+genuine wait again.
 
 Capacity runs first with a shared per-evaluation confirmation coordinator,
 memoized by run (including failed reads). It permits at most 200 distinct

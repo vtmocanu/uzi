@@ -2848,6 +2848,42 @@ func TestClaimPassesAffinityCeiling(t *testing.T) {
 	}
 }
 
+// #2705: the run-lane claim passes @stale_requeue_cutoff = now - WorkerStaleRequeueGrace, and
+// a zero grace passes the invalid (NULL) timestamp so the SQL never pins.
+func TestClaimPassesStaleRequeueCutoff(t *testing.T) {
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		grace     time.Duration
+		wantValid bool
+		want      time.Time
+	}{
+		{"grace set", 7 * time.Minute, true, fixed.Add(-7 * time.Minute)},
+		{"zero grace is NULL", 0, false, time.Time{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{claimErr: pgx.ErrNoRows}
+			p := testParams()
+			p.WorkerStaleRequeueGrace = tc.grace
+			svc := New(fs, newBox(t), p)
+			svc.now = func() time.Time { return fixed }
+			if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if fs.claimParams == nil {
+				t.Fatal("ClaimRun not called")
+			}
+			got := fs.claimParams.StaleRequeueCutoff
+			if got.Valid != tc.wantValid {
+				t.Fatalf("StaleRequeueCutoff.Valid = %v, want %v", got.Valid, tc.wantValid)
+			}
+			if tc.wantValid && !got.Time.Equal(tc.want) {
+				t.Fatalf("StaleRequeueCutoff = %v, want now-grace %v", got.Time, tc.want)
+			}
+		})
+	}
+}
+
 // -------------------------------------------------------------------------
 // Messages + state (fake worker reporting)
 // -------------------------------------------------------------------------

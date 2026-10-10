@@ -1419,6 +1419,10 @@ type Params struct {
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration
+	// WorkerStaleRequeueGrace (#2705): how long ClaimRun keeps a run the stale-worker sweeper
+	// requeued pinned to its previous worker (while that worker's row exists). Zero or negative
+	// disables the pin (NULL cutoff); the zero value keeps existing tests unaffected.
+	WorkerStaleRequeueGrace time.Duration
 	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
 	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
 	WorkerSpreadGrace time.Duration
@@ -3087,6 +3091,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
 		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		StaleRequeueCutoff:       StaleRequeueCutoff(claimNow, s.p.WorkerStaleRequeueGrace),
 		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
 		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:           isDocker,
