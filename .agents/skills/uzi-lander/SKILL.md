@@ -162,7 +162,7 @@ changes it); trust it over a handover's claim.
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
 | `migration_collision`, `conflict` | step 5; the `EVERY_AUTHOR=` line and its rows (threads, code-scanning alerts, unacked comments) print whatever `NEXT` is, so read them first |
-| `ci_red` | read the failing job; fix locally (step 4) or classify flake |
+| `ci_red` | read the failing job; fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_pending`, `review_pending` | step 2 |
@@ -186,7 +186,8 @@ changes it); trust it over a handover's claim.
    `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (a completion question about a milestone
-   the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate
+   the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
+   a plain answer cannot exempt it, then open the PR); `awaiting_approval` → the plan gate
    is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (they resume on their own). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
@@ -388,7 +389,7 @@ changes it); trust it over a handover's claim.
    passed, merge; do not ask (the user opts out per PR or per session by saying so):
 
    ```
-   S/merge.sh OWNER/REPO PR --expect-head <sha you watched>     # squash + delete-branch + admin
+   S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin
    ```
 
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
@@ -409,7 +410,8 @@ changes it); trust it over a handover's claim.
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
    file), 3 no run appeared, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
-   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line.
+   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line. Read
+   the poller's own `EXIT=` line before reporting any of them (*Waiting, uniformly*).
    A post-merge publish step (a workflow dispatch, tag push, or tap publish) follows
    references/merge-mechanics.md, *Post-merge publish steps*.
 8. **Finish.** Remove the worktrees and branches you or your local reviewer created
@@ -505,9 +507,12 @@ and they precede every merge (step 6):
   rework reports (deferred items, behaviour changes, follow-ups) reach the PR body only
   through you: `gh pr edit PR --body-file FILE`, keeping the existing text.
 - **The closing references match the outcome.** uzi does not honor prose-only non-closing
-  intent (#2172). If the approved scope and verified outcome require an issue to stay open,
-  remove every closing directive for it from the PR body (use `Refs #N`) and confirm it is
-  absent from `gh pr view PR --json closingIssuesReferences` before merging.
+  intent (#2172), and GitHub parses negated prose ("does not close #N") as a closing
+  keyword. If the approved scope and verified outcome require an issue to stay open, remove
+  every closing directive for it from the PR body, title and commit messages (use `Refs #N`;
+  title and commit messages reach `main` in the squash commit and close issues there) and
+  pass the expected set to `merge.sh --expect-closes` (`none` for a Refs-only PR), which
+  checks all three and refuses a mismatch.
 - **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
   lines near a known alert, compare rule and path with `main`'s alerts
   (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the

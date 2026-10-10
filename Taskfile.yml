@@ -313,6 +313,9 @@ tasks:
       # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
       # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
       - task: test:sqlc-drift-gate
+      # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
+      # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
+      - task: test:docker-pull-fallback
       # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
       # fake `go install` failing then succeeding, no real gitleaks and no network,
       # proving a transient proxy failure is retried while a broken scan is not.
@@ -393,6 +396,7 @@ tasks:
       # Sub-second, offline, index-only -- runs before `scan:secrets` too. A tree fact,
       # so it belongs in gate:repo.
       - task: check:mktemp-portability
+      - task: check:postgres-pin-parity
       # Over-cap SKILL.md guard: a repo skill whose SKILL.md exceeds the 65536-byte
       # runtime cap is dropped silently at run time (agent/src/repo-skills.ts:151), so it
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
@@ -994,6 +998,11 @@ tasks:
     cmds:
       - ./scripts/scan-secrets.test.sh
 
+  test:docker-pull-fallback:
+    desc: hermetic mirror-first, Docker Hub fallback contract for CI image pulls (fake docker, no network)
+    cmds:
+      - ./scripts/docker-pull-fallback.test.sh
+
   test:sqlc-drift-gate:
     desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)
     cmds:
@@ -1266,6 +1275,13 @@ tasks:
       # (instrument broken). The explicit canary arg makes this echo show what is scanned.
       # See the script header.
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
+
+  check:postgres-pin-parity:
+    desc: docker-compose.yml and ci.yml's mirrored postgres service pin the same tag and digest, with hermetic 0/1/2 fixtures
+    cmds:
+      # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
+      # renovate.json groups them (#2622) and this fails the gate if they still drift.
+      - ./scripts/check-postgres-pin-parity.test.sh
 
   check:mktemp-portability:
     desc: no tracked *.sh carries a `mktemp -t <name>` template with too few X's (dies on GNU coreutils), with a canary proving the detector fired

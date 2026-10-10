@@ -157,7 +157,10 @@ a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a q
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
-message) and answer with `uzi run answer`. A run at `limit_wait` is parked on an Anthropic
+message) and answer with `uzi run answer`. A completion-interlock question is different: a
+plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
+(`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
+live question or on a run already parked in the completion hold. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 

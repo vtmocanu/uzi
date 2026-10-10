@@ -204,13 +204,27 @@ while read -r sha; do
   # comments-only commit to upgrade.go was one of two hits.
   grep -qE '^docs(\([^)]*\))?:' "$SUBJECT_FILE" && continue
 
-  files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
+  # At most two listing attempts per SHA; drain even after classification, then
+  # require producer success before applying exemptions or checking citations.
+  exec {files_fd}< <(
+    listing_tmp="$(mktemp)" || exit 1
+    listing_rc=0
+    if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+       git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+      cat "$listing_tmp" || listing_rc=$?
+    else
+      listing_rc=$?
+    fi
+    rm -f "$listing_tmp"
+    exit "$listing_rc"
+  )
+  files_pid=$!
 
   touched_changelog=0
   touched_shipping=0
   touched_nonmeta=0
   shipping_example=""
-  while read -r f; do
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     if [ "$f" = "CHANGELOG.md" ]; then
       touched_changelog=1
@@ -224,9 +238,12 @@ while read -r sha; do
       CHANGELOG.md|deploy/chart/Chart.yaml|deploy/chart/values.yaml|scripts/assert-worker-tag-decoupled.sh) ;;
       *) touched_nonmeta=1 ;;
     esac
-  done <<EOF
-$files
-EOF
+  done <&"$files_fd"
+  exec {files_fd}<&-
+  if ! wait "$files_pid"; then
+    echo "assert-changelog-covers-release: could not list changed paths for $sha" >&2
+    exit 1
+  fi
 
   # A `chore(release):` commit is the release commit itself — a mechanical version bump —
   # and never cites an issue. Today's single-step cut always folds CHANGELOG, so it was

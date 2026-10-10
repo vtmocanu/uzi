@@ -64,6 +64,11 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
       [ "\$c" -ge 2 ] || oid= ;;
   esac
   case "\$*" in
+    *closingIssuesReferences*)
+      [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
+      printf '{"closingIssuesReferences":%s,"title":%s}\n' "\${CLOSES_JSON:-[]}" "\$(jq -n --arg t "\${PR_TITLE:-fix(x): y}" '\$t')"; exit 0 ;;
+  esac
+  case "\$*" in
     *'-q .state'*) printf '%s\n' "\$st" ;;
     *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
     *)     if [ -n "\$oid" ]; then
@@ -80,6 +85,8 @@ fi
 # (CS_MODE alert|broken), issue comments (COMMENTS_FILE) and reviews (none). Default: clear.
 if [ "\${1:-}" = api ]; then
   case "\$*" in
+    *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1; printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
+    *'/pulls/42 --jq .commits'*) printf '%s\n' "\${COMMIT_COUNT:-\$(printf '%s' "\${COMMITS_JSON:-[]}" | jq length)}"; exit 0 ;;
     *'/protection/required_status_checks'*)
       printf 'HTTP/2.0 %s Test\r\n\r\n' "\${CLASSIC_HTTP:-404}"
       if [ -n "\${CLASSIC_BODY:-}" ]; then printf '%s' "\$CLASSIC_BODY"; else printf '{"message":"Branch not protected"}'; fi
@@ -245,7 +252,7 @@ MERGE_STATE=OPEN; export MERGE_STATE
 merge_run() { # label -> rc, output in $WORK/m.<label>
   rm -f "$WORK/merge.log"
   set +e
-  bash "$SCRIPT" test/repo 42 --no-rework-check > "$WORK/m.$1" 2>&1
+  bash "$SCRIPT" test/repo 42 --no-rework-check ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} > "$WORK/m.$1" 2>&1
   rc=$?
   set -e
 }
@@ -447,6 +454,88 @@ merge_run capped
 [ "$rc" -eq 2 ] || fail "1,000 of total_count 1001 did not refuse, rc=$rc: $(cat "$WORK/m.capped")"
 [ ! -e "$WORK/merge.log" ] || fail "merged on a capped run listing"
 unset MAIN_RUNS_PAGE_FILE
+# --expect-closes: GitHub's closingIssuesReferences counts negated prose too (PR #2629's
+# "this PR does not close #1912" closed #1912 on merge). A mismatch refuses before the merge.
+export CLOSES_JSON='[{"number":1912}]'
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_negated
+[ "$rc" -eq 11 ] || fail "a Refs-only PR that GitHub would close #1912 with did not refuse, rc=$rc: $(cat "$WORK/m.closes_negated")"
+grep -q 'merging would close \[1912\], expected \[none\]' "$WORK/m.closes_negated" || fail "closing mismatch not named: $(cat "$WORK/m.closes_negated")"
+[ ! -e "$WORK/merge.log" ] || fail "merged although it would close an issue meant to stay open"
+MERGE_ARGS=(--expect-closes '#1912')
+merge_run closes_match
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "matching closing references blocked the merge: $(cat "$WORK/m.closes_match")"
+export CLOSES_JSON='[{"number":7},{"number":12}]'
+MERGE_ARGS=(--expect-closes '12,7')
+merge_run closes_set
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "an equal set in another order blocked the merge: $(cat "$WORK/m.closes_set")"
+MERGE_ARGS=(--expect-closes 7)
+merge_run closes_extra
+[ "$rc" -eq 11 ] || fail "an extra closing reference did not refuse, rc=$rc: $(cat "$WORK/m.closes_extra")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with an unexpected closing reference"
+for bad in 'seven' '1#2' '7,' ',7' '7,,12' '##7' '7 12' ''; do
+  MERGE_ARGS=(--expect-closes "$bad")
+  merge_run closes_bad
+  [ "$rc" -eq 2 ] || fail "malformed --expect-closes '$bad' did not refuse, rc=$rc: $(cat "$WORK/m.closes_bad")"
+  [ ! -e "$WORK/merge.log" ] || fail "merged on malformed --expect-closes '$bad'"
+done
+MERGE_ARGS=(--expect-closes ' #12 , 7 ')
+merge_run closes_blanks
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "surrounding blanks and a leading # blocked a matching set: $(cat "$WORK/m.closes_blanks")"
+export CLOSES_FAIL=1
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_unreadable
+[ "$rc" -eq 2 ] || fail "unreadable closing references did not refuse, rc=$rc: $(cat "$WORK/m.closes_unreadable")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with unreadable closing references"
+MERGE_ARGS=()
+merge_run closes_noflag
+grep -q 'CLOSES=unknown' "$WORK/m.closes_noflag" || fail "no-flag run did not report unknown closing references: $(cat "$WORK/m.closes_noflag")"
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "without --expect-closes an unreadable lookup must stay informational: $(cat "$WORK/m.closes_noflag")"
+unset CLOSES_FAIL
+# Commit messages and the PR title reach main in the squash commit and close issues there,
+# outside closingIssuesReferences (PR #2651's squash commit 4d64d9a4 quoted the negated phrase).
+export CLOSES_JSON='[]'
+export COMMITS_JSON='[{"commit":{"message":"skills(x): y\n\nGitHub parses \"this PR does not close #1912\" as a keyword."}}]'
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_commit
+[ "$rc" -eq 11 ] || fail "a closing keyword in a commit message did not refuse, rc=$rc: $(cat "$WORK/m.closes_commit")"
+grep -q 'merging would close \[1912\]' "$WORK/m.closes_commit" || fail "commit-message closing ref not named: $(cat "$WORK/m.closes_commit")"
+[ ! -e "$WORK/merge.log" ] || fail "merged although a commit message would close #1912"
+export COMMITS_JSON='[{"commit":{"message":"Fixes: test/repo#7\nRESOLVED #12\nRefs #99, prefix#5 not a ref"}}]'
+MERGE_ARGS=(--expect-closes '7,12')
+merge_run closes_grammar
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "keyword grammar (colon, same-repo OWNER/REPO#, case) not parsed as 7,12: $(cat "$WORK/m.closes_grammar")"
+export CLOSES_JSON='[{"number":12}]'
+merge_run closes_union
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "body and commit references were not unioned: $(cat "$WORK/m.closes_union")"
+# Another repository's issue is a different issue: it keeps its identity and never matches N.
+export CLOSES_JSON='[]' COMMITS_JSON='[{"commit":{"message":"Fixes other/repo#7"}}]'
+MERGE_ARGS=(--expect-closes 7)
+merge_run closes_foreign
+[ "$rc" -eq 11 ] || fail "a foreign other/repo#7 matched --expect-closes 7, rc=$rc: $(cat "$WORK/m.closes_foreign")"
+grep -q 'merging would close \[other/repo#7\]' "$WORK/m.closes_foreign" || fail "foreign ref identity not kept: $(cat "$WORK/m.closes_foreign")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with a foreign closing reference"
+# A commit list shorter than the PR's commit count (REST caps at 250) fails closed.
+export COMMITS_JSON='[{"commit":{"message":"x"}}]' COMMIT_COUNT=3
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_truncated
+[ "$rc" -eq 2 ] || fail "an incomplete commit list did not refuse, rc=$rc: $(cat "$WORK/m.closes_truncated")"
+[ ! -e "$WORK/merge.log" ] || fail "merged on an incomplete commit list"
+unset COMMIT_COUNT
+# The PR title alone can close an issue.
+export COMMITS_JSON='[]' PR_TITLE='Fixes #44 in the lander'
+merge_run closes_title
+[ "$rc" -eq 11 ] || fail "a closing keyword in the PR title did not refuse, rc=$rc: $(cat "$WORK/m.closes_title")"
+grep -q 'merging would close \[44\]' "$WORK/m.closes_title" || fail "title closing ref not named: $(cat "$WORK/m.closes_title")"
+unset PR_TITLE
+# A keyword must end at a word boundary before its separator: an owner named fixes/ or
+# closed/ in a Refs line is not a keyword (it was parsed as "fix" + "es/repo#7").
+export COMMITS_JSON='[{"commit":{"message":"Refs fixes/repo#7 and closed/repo#8\nfixes #10, close:#11, Resolved\t#12, fix#13"}}]'
+MERGE_ARGS=(--expect-closes '10,11,12,13')
+merge_run closes_owner_names
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "owner names fixes/ closed/ parsed as keywords, or a separator form missed: $(cat "$WORK/m.closes_owner_names")"
+grep -q 'CLOSES=10,11,12,13' "$WORK/m.closes_owner_names" || fail "unexpected parse: $(cat "$WORK/m.closes_owner_names")"
+unset CLOSES_JSON COMMITS_JSON; MERGE_ARGS=()
 # --confirm-only never reads the run list.
 MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
 seed_state
@@ -456,4 +545,4 @@ bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 MERGE_STATE=OPEN; export MERGE_STATE
 unset RUNS_FAIL CHECKS_JSON CHECKS_RC
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses; --expect-closes refuses a closing-reference mismatch"
