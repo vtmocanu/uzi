@@ -1307,7 +1307,7 @@ func (r gzipUserRow) Scan(dest ...any) error {
 }
 
 // TestListRunMessagesGzip proves the run-messages route is wired through chi's
-// Compress middleware (handler.go:1097): a request advertising `Accept-Encoding: gzip`
+// Compress middleware (the /runs/{id}/messages route in Routes): a request advertising `Accept-Encoding: gzip`
 // gets a `Content-Encoding: gzip` body that, once inflated, is byte-identical to the
 // uncompressed response. It drives the request through the REAL h.Routes() router, so
 // deleting `r.With(chimw.Compress(5))` in handler.go makes this test fail — a
@@ -1390,6 +1390,111 @@ func TestListRunMessagesGzip(t *testing.T) {
 	if !bytes.Equal(inflated, plainRec.Body.Bytes()) {
 		t.Fatalf("inflated gzip body differs from uncompressed body:\ngot  %q\nwant %q", inflated, plainRec.Body.Bytes())
 	}
+}
+
+// assertRouteGzip drives GET path through the REAL h.Routes() router as user (cookie
+// auth backed by gzipAuthDB) twice, with and without Accept-Encoding: gzip, and checks
+// the route is wrapped in Compress: plain stays unencoded and contains wantInBody, the
+// gzip one is Content-Encoding: gzip and inflates byte-for-byte to the plain body. The
+// clock is pinned so the derived run fields are identical between the two requests.
+func assertRouteGzip(t *testing.T, st *runsStore, user store.User, path, wantInBody string) {
+	t.Helper()
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	fixed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	h := &Handler{
+		q:    store.New(gzipAuthDB{user: user}),
+		cfg:  config.Config{JWTSecret: secret, AuthTokenTTL: time.Hour},
+		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{}),
+		hub:  hub.New(),
+		now:  func() time.Time { return fixed },
+	}
+	noLimit := mw.NewLimiter(100000, time.Minute, nil)
+	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
+
+	jwt, err := auth.IssueToken(secret, user.ID.String(), 0, time.Hour)
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+	do := func(acceptGzip bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
+		if acceptGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	plain := do(false)
+	if plain.Code != http.StatusOK {
+		t.Fatalf("plain %s = %d, want 200", path, plain.Code)
+	}
+	if ce := plain.Header().Get("Content-Encoding"); ce != "" {
+		t.Fatalf("plain request must not be gzip-encoded, got Content-Encoding %q", ce)
+	}
+	if !bytes.Contains(plain.Body.Bytes(), []byte(wantInBody)) {
+		t.Fatalf("plain body lacks %q: %.300s", wantInBody, plain.Body.Bytes())
+	}
+
+	gz := do(true)
+	if gz.Code != http.StatusOK {
+		t.Fatalf("gzip %s = %d, want 200", path, gz.Code)
+	}
+	if ce := gz.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip (Compress middleware must wrap %s)", ce, path)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(gz.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	inflated, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("gzip inflate: %v", err)
+	}
+	if !bytes.Equal(inflated, plain.Body.Bytes()) {
+		t.Fatalf("inflated gzip body differs from uncompressed body:\ngot  %q\nwant %q", inflated, plain.Body.Bytes())
+	}
+}
+
+// TestListRunsGzip proves GET /api/runs (the owner run list the TUI board and web Runs
+// page poll) is wrapped in Compress on the real router.
+func TestListRunsGzip(t *testing.T) {
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	started := pgtype.Timestamptz{Time: time.Date(2026, 1, 2, 1, 0, 0, 0, time.UTC), Valid: true}
+	rows := make([]store.ListRunsForUserRow, 0, 50)
+	for i := 0; i < 50; i++ {
+		rows = append(rows, store.ListRunsForUserRow{
+			Run: store.Run{
+				ID: uuid.New(), UserID: owner.ID, Status: "running",
+				IssueTitle: "gzip fixture issue title", StartedAt: started, CreatedAt: started,
+			},
+			RepoPath:   pgtype.Text{String: "grp/gzip-fixture-repo", Valid: true},
+			WorkerName: pgtype.Text{String: "worker-a", Valid: true},
+		})
+	}
+	st := &runsStore{ownerID: owner.ID, userRuns: rows}
+	assertRouteGzip(t, st, owner, "/api/runs", "gzip-fixture-repo")
+}
+
+// TestAdminListRunsGzip is TestListRunsGzip for GET /api/admin/runs, as an admin.
+func TestAdminListRunsGzip(t *testing.T) {
+	admin := store.User{ID: uuid.New(), IsActive: true, IsAdmin: true}
+	started := pgtype.Timestamptz{Time: time.Date(2026, 1, 2, 1, 0, 0, 0, time.UTC), Valid: true}
+	rows := make([]store.ListActiveRunsAllRow, 0, 50)
+	for i := 0; i < 50; i++ {
+		rows = append(rows, store.ListActiveRunsAllRow{
+			Run: store.Run{
+				ID: uuid.New(), UserID: uuid.New(), Status: "running",
+				IssueTitle: "gzip fixture issue title", StartedAt: started, CreatedAt: started,
+			},
+			RepoPath:   pgtype.Text{String: "grp/gzip-fixture-repo", Valid: true},
+			WorkerName: pgtype.Text{String: "worker-a", Valid: true},
+			OwnerEmail: "owner@gzip-fixture.example",
+		})
+	}
+	st := &runsStore{activeRuns: rows}
+	assertRouteGzip(t, st, admin, "/api/admin/runs", "owner@gzip-fixture.example")
 }
 
 func TestCreateRunInputIsOwnerOnly(t *testing.T) {
