@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -27,9 +29,14 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(settings)
 			}
-			return p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
+			if err := p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
 				"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"},
-				settingsCrossCheckRows(settings))
+				settingsCrossCheckRows(settings)); err != nil {
+				return err
+			}
+			// PRD #2603: nil means the per-user switch was never set, which reads as on.
+			_, err = fmt.Fprintln(env.Stdout, settingsNowSummaryLine(settings))
+			return err
 		},
 	})
 	return cmd
@@ -63,6 +70,16 @@ func settingsCrossCheckRows(s apitypes.UserSettingsDTO) [][]string {
 		}
 	}
 	return rows
+}
+
+func settingsNowSummaryLine(s apitypes.UserSettingsDTO) string {
+	switch {
+	case s.NowSummaryEnabled == nil:
+		return "Now summary: on (default)"
+	case *s.NowSummaryEnabled:
+		return "Now summary: on"
+	}
+	return "Now summary: off"
 }
 
 func settingsStoredPin(pin *string) string {

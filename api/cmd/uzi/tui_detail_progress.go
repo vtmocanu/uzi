@@ -6,6 +6,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 )
 
+// nowNoteMaxWidth caps the drawn model summary (the server already limits it to 120 runes).
+const nowNoteMaxWidth = 120
+
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
 // no-milestone run (renderMilestones returns "" for an empty frozen list). The rail is
@@ -38,6 +41,19 @@ func (m tuiModel) renderProgress() string {
 		lines = append(lines, top)
 		if p.Phase != "" {
 			lines = append(lines, faint("phase ▸ ")+m.renderer.Plain(p.Phase, laneRailWidth-visualWidth("phase ▸ ")))
+		}
+		if p.NowNote != nil {
+			// PRD #2603 mock 4: `now  <text> · model summary · 2m ago`. The text is model-written
+			// (untrusted), so it goes through renderer.Plain with a cap; the label and suffix are faint.
+			note := *p.NowNote
+			text, noAt := m.renderer.Plain(note.Text, nowNoteMaxWidth), note.At.IsZero()
+			if strings.TrimSpace(text) != "" {
+				suffix := " · model summary"
+				if !noAt {
+					suffix += " · " + relAge(note.At) + " ago"
+				}
+				lines = append(lines, faint("now  ")+text+faint(suffix))
+			}
 		}
 	case runprogress.StateStalled:
 		lines = append(lines, head+" "+paintSeg(m.pal.stall, nil, false, "◼ stalled"))

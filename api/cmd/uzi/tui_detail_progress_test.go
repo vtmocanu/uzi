@@ -187,3 +187,33 @@ func TestDetailRailProgressStripsHostileText(t *testing.T) {
 		})
 	}
 }
+
+func TestDetailRailProgressNowLine(t *testing.T) {
+	pct := 70
+	note := &apitypes.ProgressNote{Text: "running the agent gate", At: time.Now().Add(-2 * time.Minute)}
+	render := func(p *apitypes.RunProgress) string {
+		run := apitypes.RunDTO{ID: "r-now", Kind: "issue", Status: "running", Health: "ok", IssueTitle: "t", Progress: p}
+		m := applyDetail(tuiTestModel(t, &uzicli.FakeClient{}, run.ID), run, nil)
+		return m.renderProgress()
+	}
+	raw := render(&apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneTotal: 3, NowNote: note})
+	if got := stripANSI(raw); !strings.Contains(got, "now  running the agent gate · model summary · 2m ago") {
+		t.Errorf("now line missing:\n%s", got)
+	}
+	for name, p := range map[string]*apitypes.RunProgress{
+		"stalled": {State: "stalled", NowNote: note},
+		"blank":   {State: "percent", Pct: &pct, NowNote: &apitypes.ProgressNote{Text: " ", At: note.At}},
+		"absent":  {State: "percent", Pct: &pct},
+	} {
+		if strings.Contains(stripANSI(render(p)), "now  ") {
+			t.Errorf("%s: now line drawn", name)
+		}
+	}
+	for _, hostile := range []string{"\x1b[31mred\x1b[0m", "\x1b[2Jclear", "\u202Ebidi", "bel\x07", "<img src=x onerror=1>"} {
+		raw := render(&apitypes.RunProgress{State: "percent", Pct: &pct, NowNote: &apitypes.ProgressNote{Text: hostile, At: note.At}})
+		assertNoRawControls(t, "now line", strings.ReplaceAll(raw, "\x1b[", "\x1b["))
+		if strings.ContainsAny(stripANSI(raw), "\x1b\x07\u202e") {
+			t.Errorf("hostile %q reached the block: %q", hostile, raw)
+		}
+	}
+}
