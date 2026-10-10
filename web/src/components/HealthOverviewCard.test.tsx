@@ -37,7 +37,7 @@ function renderCard() {
 describe("HealthOverviewCard", () => {
   it("shows both Codex pricing reasons and operator docs as a nonblocking warning", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(18);
+    expect(doc.checks).toHaveLength(19);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
