@@ -225,7 +225,9 @@ jobs:
         # Pulled through mirror.gcr.io (Google's Docker Hub cache): runners share Docker
         # Hub's anonymous per-IP quota (toomanyrequests, 2026-10-09). Same digest, so the
         # same image; a service container cannot use the daemon mirror (it starts before
-        # any step), hence the explicit host.
+        # any step), hence the explicit host. For the same reason it has no Docker Hub
+        # fallback (scripts/docker-pull-fallback.sh needs a step): a mirror eviction of
+        # this digest fails the job until the image is cached again.
         image: mirror.gcr.io/library/postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
         env:
           POSTGRES_USER: uzi
@@ -340,6 +342,10 @@ jobs:
       - name: Install agent dependencies
         working-directory: agent
         run: npm ci --ignore-scripts
+      # run-store-it.sh skips its own pull when the image is present; this one falls back
+      # to Docker Hub (re-tagged under the mirror name) when mirror.gcr.io misses.
+      - name: Pre-pull the throwaway Postgres (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh postgres:17
       - name: Combined Codex lost refresh reply proof
         env:
           # Docker Hub's anonymous pull quota (toomanyrequests, 2026-10-09): pull the
@@ -608,6 +614,10 @@ jobs:
       - name: Install inventory parser
         working-directory: agent
         run: npm ci --ignore-scripts
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -921,6 +931,10 @@ jobs:
     if: needs.changes.outputs.api == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -942,6 +956,10 @@ jobs:
     if: needs.changes.outputs.web == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -964,6 +982,10 @@ jobs:
     if: needs.changes.outputs.web == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -984,6 +1006,10 @@ jobs:
     if: needs.changes.outputs.controller == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -1033,6 +1059,10 @@ jobs:
         template: [base, jvm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |

@@ -183,6 +183,10 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -242,6 +246,10 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -291,6 +299,10 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -376,6 +388,10 @@ jobs:
       queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -540,6 +556,10 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
@@ -585,6 +605,10 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
