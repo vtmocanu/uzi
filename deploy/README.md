@@ -113,8 +113,8 @@ D8); it survives below only as the rollback/other-cluster note). Only the tag pu
 anything. Step 1 (the chart-version
 bump) can land **two ways** — a **direct-to-`main` commit** or an **MR**. **Direct-to-`main`
 is the default and preferred at this early dev stage**; the MR way is there for when you want
-the change reviewed. Step 2 (the tag) is identical either way. Both repos (`vtmocanu/uzi` and
-`argo-apps`) permit direct pushes to `main`.
+the change reviewed. Step 2 (the tag) is identical either way. The repository admin role can bypass the
+main ruleset for the release metadata push.
 
 **Auto-tracking does not mean instant.** ArgoCD only notices the new chart on its next
 reconcile poll (default ~3 min) — and a **normal** refresh reuses the cached resolved
@@ -136,28 +136,27 @@ is an independent roll against flaky tests. The trade is that the release commit
 independent pre-land review; that is low risk because it only bumps `Chart.yaml` + CHANGELOG on
 code every feature PR already gated.
 
-**🔴 Unlike the old GitLab tag pipeline, `release.yml` does NOT re-run the full gate.** It runs
-only `assert-version` + `assert-changelog`, then publishes — the heavy test/lint/build gates are
-ASSUMED green on the tagged commit. So **confirm `main`'s `ci.yml` run is green on the exact
-commit you are about to tag BEFORE tagging** (`gh run watch` it if the release commit was just
-pushed); there is no post-tag gate to catch a red `main`. There is no separate "main pipeline"
-to cancel and no warm/cold image cache to reason about — GitHub Actions builds each release fresh.
+**Release publication proves CI coverage without repeating the full gate.**
+`assert-ci-coverage` requires successful main-push CI and smoke on the tagged SHA or its
+immediate parent across a strict metadata-only diff. It rejects known failures on the
+tagged SHA. Tagged-tree metadata checks validate the chart and bundled changelog; the
+real tagged KinD smoke must succeed before chart publication. Agent runtime bases and
+registry layers are reused when their inputs match; release image identity checks still run.
 
-1. **Bump the chart version and write the CHANGELOG on the release commit.**
-   Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z` (they must be
-   equal), and fold `CHANGELOG.md`'s `[Unreleased]` into a new `[X.Y.Z]` section with its
-   date — in the **same** commit. Then land it one of two ways:
-
-   - **Direct to `main` (default).** `git checkout main && git pull --rebase`, commit the
-     bump, `git push origin main`, then **wait for `main`'s `ci.yml` run to go GREEN on that
-     commit before tagging** (step 2). Unlike the old GitLab tag pipeline, `release.yml` does
-     NOT re-run the test/lint/build gate (see the note above), so the tag has no safety net and
-     tagging a red `main` publishes a broken release. `ci.yml`'s `concurrency` cancels any
-     superseded `main` run automatically, so there is nothing to cancel by hand.
-   - **Via an MR (when you want it reviewed).** Open an MR, let CI go green, merge to `main`.
+1. **Wait for the exact main tip, then cut and review the release metadata.**
+   Work in the existing main worktree. Fetch `origin/main` and fast-forward with
+   `git merge --ff-only origin/main`; wait for that exact tip's CI and KinD smoke to succeed
+   before running `.agents/skills/uzi-release/scripts/release-cut.sh X.Y.Z`.
+   Pushing a release commit while parent CI is running cancels the parent's run and
+   destroys its inheritance evidence. The cutter refuses a non-green exact tip.
+   Follow the [release skill](../.agents/skills/uzi-release/SKILL.md) for candidate and
+   promotion options, review `git show HEAD`, then push main. Full main CI still runs
+   on the release commit, but the tag can follow immediately using the enforced parent
+   coverage. A manually prepared metadata bump can also land through an MR; publication
+   requires the same exact-SHA or strict-parent coverage proof.
 
    **Re-check the CHANGELOG just before tagging, whichever way you landed it.**
-   `release.yml`'s `assert-changelog` job fails the publish if any merge since the previous tag
+   `release.yml`'s `assert-changelog` job fails the publish if any merge since the previous stable tag
    changed shipping code without being cited in the new version's section. Run it yourself
    first — `bash scripts/assert-changelog-covers-release.sh main` — because the failure mode
    it guards is invisible in the release commit's own diff (MR or direct): **anything that
@@ -167,16 +166,15 @@ to cancel and no warm/cold image cache to reason about — GitHub Actions builds
    with genuinely nothing to announce is exempted with a `Changelog: none` line in its
    commit message.
 
-2. **Tag that commit (now on `main`) and push the tag.**
+2. **Tag the reviewed release commit and push the tag.**
 
    ```sh
-   git checkout main && git pull
-   git tag -a v0.1.0 -m "uzi 0.1.0"   # == Chart.yaml version/appVersion
-   git push origin v0.1.0
+   git tag -a v0.1.0-rc.1 -m "uzi 0.1.0-rc.1" HEAD  # use the tag printed by release-cut
+   git push origin v0.1.0-rc.1
    ```
 
    The push triggers `release.yml`: it asserts the version equality (`assert-version`) and
-   CHANGELOG coverage (`assert-changelog`), then builds + pushes each image
+   CHANGELOG coverage (`assert-changelog`), CI coverage and tagged metadata, then builds + pushes each image
    (`ghcr.io/vtmocanu/uzi/{api,web,controller,agent-base,agent-jvm}:<tag>` + `:<short-sha>`) and
    the OCI chart (`oci://ghcr.io/vtmocanu/uzi/uzi:<tag>`, published LAST). Homebrew is a separate
    `v*`-triggered run (`brew.yml`).
@@ -219,11 +217,25 @@ image rebuild; old versions stay in GHCR). Because `0.*` would otherwise re-adva
 bad version, resuming auto-tracking means cutting a **fix release** (`0.Y.Z+1`) first, then
 setting `targetRevision` back to `0.*`.
 
-**Hotfix** is a separate, documented **manual** procedure — not a `release-cut` verb: worktree
-at the promoted stable `vB`, cherry-pick the already-merged fix commit(s), a `## [B.1]`
-CHANGELOG section citing them, `deploy/chart/Chart.yaml` bumped to `B.1`, tag `vB.1`, and push.
-See [ADR-1265](../adr/1265-rc-release-train.md) (D4) and `.agents/skills/uzi-release/SKILL.md`
-for the exact steps.
+**Hotfix** remains a manual procedure. Start a worktree at the previous stable patch
+(for example `v0.85.2` for `v0.85.3`), cherry-pick the already-merged fixes, add a cited
+CHANGELOG section and bump both chart version fields. Run
+`scripts/worker-tag-autobump.sh 0.85.3` before committing the metadata so an agent runtime
+fix also advances the worker pin. Run the affected component gates
+and `task check:release-metadata` locally. Since this off-main tree has no main-push CI,
+use an annotated stable patch tag with an explicit exception:
+
+```sh
+git tag -a v0.85.3 -m "v0.85.3" -m "CI-Coverage: hotfix-uncovered" HEAD
+```
+
+The gate reports **UNVERIFIED hotfix: no full CI evidence**. This preserves the existing
+hotfix path; it does not claim those local checks are CI proof. The tag must target an
+off-main descendant of the immediately previous stable patch on its first-parent chain.
+A lightweight tag or missing marker cannot use this exception. Known main CI failures
+still block it; tagged metadata, version/changelog, worker-image checks and real tagged
+KinD smoke before chart publication remain required. Push under the usual tag authority.
+See [ADR-1265](../adr/1265-rc-release-train.md) (D4) for the separate coverage window.
 
 ## Platform-admin prerequisites (one-time)
 

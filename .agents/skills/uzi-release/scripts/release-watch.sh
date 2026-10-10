@@ -19,7 +19,8 @@
 #
 # TRANSIENT vs REAL, signature-independent by design. A failed job is auto-rerun
 # ONLY if it is not a deterministic GATE — the gates are `assert-version`,
-# `assert-changelog` and `prep`, which fail for a real reason (wrong Chart version,
+# `assert-changelog`, `assert-ci-coverage`, `assert-release-metadata`,
+# `assert-tag-smoke` and `prep`, which fail for a real reason (wrong Chart version,
 # an uncited merge) that a rerun cannot clear. Every other job (publish-*, the
 # chart publish, publish-release, brew's build) is idempotent and rerunnable. This
 # keys on the JOB'S ROLE, not on an exit code or a step name, so it survives the
