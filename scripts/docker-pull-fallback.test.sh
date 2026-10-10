@@ -71,8 +71,12 @@ run noarg 2
 run digest 2 postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
 run host 2 ghcr.io/vtmocanu/uzi:1
 run two 2 postgres:17 alpine
-for c in noarg digest host two; do
+run hostport 2 localhost:5000/postgres:17
+run domainport 2 registry.example:5000/repo:tag
+run localhost 2 localhost/postgres:17
+run emptytag 2 postgres:
+for c in noarg digest host two hostport domainport localhost emptytag; do
   [ ! -s "$TMP/$c.log" ] || fail "$c: docker was called on a usage error"
 done
 
-echo "docker-pull-fallback.test.sh: PASS (8 cases)"
+echo "docker-pull-fallback.test.sh: PASS (12 cases)"

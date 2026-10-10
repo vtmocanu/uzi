@@ -25,14 +25,20 @@ ref=$1
 case "$ref" in
   ''|*@*|*' '*) usage ;;
 esac
-name=${ref%%:*}
-tag=${ref#"$name"}
-tag=${tag#:}
-[ -n "$tag" ] || tag=latest
-# A first path component with a dot or colon is a registry host, not a Docker Hub repo.
-case "${name%%/*}" in
-  *.*|*:*) [ "$name" = "${name%%/*}" ] || usage ;;
+# Docker's rule: a first path component holding a dot or a colon, or equal to
+# `localhost`, is a registry host, not a Docker Hub repo. Check it before any tag split.
+case "$ref" in
+  */*)
+    case "${ref%%/*}" in
+      *.*|*:*|localhost) usage ;;
+    esac ;;
 esac
+# The tag is whatever follows the last colon (no host is left to hold one).
+case "$ref" in
+  *:*) name=${ref%:*}; tag=${ref##*:} ;;
+  *)   name=$ref; tag=latest ;;
+esac
+[ -n "$name" ] && [ -n "$tag" ] || usage
 case "$name" in
   */*) path=$name ;;
   *) path=library/$name ;;
