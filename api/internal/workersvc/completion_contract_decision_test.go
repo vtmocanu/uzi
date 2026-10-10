@@ -324,6 +324,38 @@ func TestSubmitApprovalRetryRereadsRun(t *testing.T) {
 	}
 }
 
+// The re-read also runs on the LAST refused attempt: a run that vanished or finished there is
+// classified as such, never as source contention.
+func TestSubmitApprovalLastRefusalStillRereadsRun(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(f *fakeStore)
+		want error
+	}{
+		{"terminal", func(f *fakeStore) { f.runByID.Status = "completed" }, ErrRunTerminal},
+		{"vanished", func(f *fakeStore) { f.runByIDErr = pgx.ErrNoRows }, ErrRunNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, svc, user, runID := interlockedApproveFixture(t, []Milestone{{ID: "a1", Title: "A"}})
+			move := moveSource(t, 100, []Milestone{{ID: "b1", Title: "B"}}, []Milestone{{ID: "a1", Title: "A"}})
+			fs.approvalHook = func(f *fakeStore, call int) error {
+				if call == approveMilestoneAttempts {
+					tc.mut(f)
+				}
+				return move(f, call)
+			}
+			_, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if len(fs.approvals) != approveMilestoneAttempts {
+				t.Fatalf("write attempts = %d, want %d", len(fs.approvals), approveMilestoneAttempts)
+			}
+		})
+	}
+}
+
 // A legacy run passes no ContractSource (the predicate never binds) and an ErrNoRows is not
 // retried: it is the pre-#2680 answer.
 func TestSubmitApprovalLegacyRunPassesNoSourceAndIsNotRetried(t *testing.T) {

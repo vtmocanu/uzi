@@ -831,16 +831,18 @@ func (s *Service) submitApproval(ctx context.Context, userID uuid.UUID, run stor
 			}
 			// An unbound refusal on a refusable attempt is the #2680 source predicate (the
 			// unbound path has no other refusal besides a vanished run, which the re-read below
-			// tells apart). Out of attempts: the milestone list keeps moving.
-			if attempt >= approveMilestoneAttempts {
-				return SubmitInputResult{}, store.RunUserInput{}, ErrApprovalMilestonesMoved
-			}
+			// tells apart). The re-read runs on every refusal, the last included, so a run that
+			// vanished or finished is classified as such rather than as source contention.
 			refreshed, gerr := s.GetRun(ctx, userID, run.ID)
 			if gerr != nil {
 				return SubmitInputResult{}, store.RunUserInput{}, gerr // ErrRunNotFound stays a 404
 			}
 			if terminalStatuses[refreshed.Status] {
 				return SubmitInputResult{}, store.RunUserInput{}, ErrRunTerminal
+			}
+			// Out of attempts: the milestone list keeps moving.
+			if attempt >= approveMilestoneAttempts {
+				return SubmitInputResult{}, store.RunUserInput{}, ErrApprovalMilestonesMoved
 			}
 			if refreshed.Status != "awaiting_approval" {
 				// The run left the gate mid-approve: the caller must re-read and decide again.
