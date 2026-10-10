@@ -175,6 +175,7 @@ cat > "$WORK/matrix.txt" <<'MATRIX'
 1234567890123456789m	1234567890123457
 0.000000000000000000001Ei	1
 1Ei	1152921504606846976
+12e-1	2
 MATRIX
 while IFS="	" read -r q want; do
   expect_bytes "(f) size=$q" "$want" --set-string "database.simple.storage.size=$q"
@@ -185,7 +186,7 @@ expect_bytes "(f) YAML int 10737418240" 10737418240 -f "$WORK/int.yaml"
 expect_bytes "(f) --set int 1073741824" 1073741824 --set database.simple.storage.size=1073741824
 
 # --- (g) invalid quantities fail the render --------------------------------------------------
-for q in 8GB abc 0 0.0Gi -1Gi 2Ei 1025Pi; do
+for q in 8GB abc 0 0.0Gi -1Gi 2Ei 1025Pi 1152921504606846976.5 1152921504606846977 1e99999999; do
   expect_fail "(g) size=$q" "database.simple.storage.size must be a positive Kubernetes quantity" \
     --set-string "database.simple.storage.size=$q"
 done

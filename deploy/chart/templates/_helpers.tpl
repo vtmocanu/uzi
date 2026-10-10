@@ -711,10 +711,12 @@ true
   Method: value = D x 10^p x 2^k, D a digit string with no leading or trailing zeros
   (the fraction digit count, the SI exponent and any explicit exponent fold into the
   one power of ten p). Exact; no precision limit on the mantissa.
-    1. k > 0 (binary suffix): D is multiplied by 1024^(k/10) as a digit string
-       (uzi.decMul1024); this is the only multiplication, so nothing can overflow.
-    2. If len(D) + p > 19 the value is >= 10^19 > 2^60: rejected before any zero
-       padding is built, so an absurd exponent never allocates.
+    1. If len(D) + p > 19 the value is >= 10^19 > 2^60: rejected first, before any
+       multiplication or zero padding, so an absurd exponent or length never allocates.
+       Fraction digits past 64 are then cut with a sticky flag (see the in-body proof),
+       bounding D to at most 83 digits.
+    2. Binary suffix: D is multiplied by 1024^n as a digit string (uzi.decMul1024); this
+       is the only multiplication, so nothing can overflow.
     3. p >= 0: the integer part is D followed by p zeros. p < 0: it is the leading
        len(D)+p digits of D (empty = 0) and the rest is the discarded fraction; the
        result is rounded up when any discarded digit is nonzero.
@@ -755,36 +757,54 @@ true
 {{- $p := sub $tz (len $fpart) -}}
 {{- $bin := dict "Ki" 1 "Mi" 2 "Gi" 3 "Ti" 4 "Pi" 5 "Ei" 6 -}}
 {{- $si := dict "n" -9 "u" -6 "m" -3 "" 0 "k" 3 "M" 6 "G" 9 "T" 12 "P" 15 "E" 18 -}}
+{{- $k := 0 -}}
 {{- if hasKey $bin $suffix -}}
-{{- range $i := until (int (get $bin $suffix)) -}}
-{{- $m = include "uzi.decMul1024" $m -}}
-{{- end -}}
+{{- $k = int (get $bin $suffix) -}}
 {{- else if hasKey $si $suffix -}}
 {{- $p = add $p (get $si $suffix) -}}
 {{- else -}}
-{{- /* explicit exponent; magnitudes past 6 digits clamp to 999999, which already decides the outcome */ -}}
+{{- /* explicit exponent. Digits past 18 clamp to 18 nines (int64-safe for atoi). Outcome-preserving: the other terms of p (the fraction and trailing-zero counts, at most the input length, far below 10^17) and len(D) cannot offset an exponent of magnitude >= 10^18 - 1, so p has the exponent's sign and |p| > 10^17 clamped or not. A large positive p fails the bound check below; a large negative p leaves no integer digits and only the round-up flag. */ -}}
 {{- $es := regexFind "[0-9]+$" $suffix -}}
 {{- $es = regexReplaceAll "^0+" $es "" -}}
-{{- if gt (len $es) 6 -}}
-{{- $es = "999999" -}}
+{{- if gt (len $es) 18 -}}
+{{- $es = "999999999999999999" -}}
 {{- end -}}
-{{- $ev := int (atoi (default "0" $es)) -}}
+{{- $ev := int64 (atoi (default "0" $es)) -}}
 {{- if hasPrefix "-" (substr 1 (len $suffix) $suffix) -}}
 {{- $ev = sub 0 $ev -}}
 {{- end -}}
 {{- $p = add $p $ev -}}
 {{- end -}}
+{{- /* Over-bound reject BEFORE any work: the binary multiplication only grows the value, and D x 10^p >= 10^(len(D)+p-1), so len(D)+p > 19 means >= 10^19 > 2^60. */ -}}
+{{- if gt (add (len $m) $p) 19 -}}
+{{- fail $help -}}
+{{- end -}}
+{{- /* Fraction truncation, exact. Let x = D x 10^p (p < 0), s = 10k <= 60 the binary shift, K = 64 >= s. Write x = xh + t, xh = x cut to K fraction digits, 0 <= t < 10^-K. y = xh x 2^s = A x 2^s / 10^K is a multiple of 2^s/10^K, so if y is not an integer it is at least 2^s/10^K (K >= s) below the next integer, while t x 2^s < 2^s/10^K: ceil(y + t x 2^s) = ceil(y). If y is an integer the result is y, plus 1 when t > 0. So computing ceil(y) with a sticky "tail was nonzero" flag ORed into the round-up flag gives exactly ceil(x x 2^s). D has no trailing zero, so any dropped digit makes t > 0. After this, len(D) <= 19 + 64, so the work below is bounded whatever the input length. */ -}}
+{{- $tail := false -}}
+{{- if lt $p -64 -}}
+{{- $drop := int (sub (sub 0 $p) 64) -}}
+{{- $tail = true -}}
+{{- if ge $drop (len $m) -}}
+{{- $m = "" -}}
+{{- else -}}
+{{- $m = substr 0 (int (sub (len $m) $drop)) $m -}}
+{{- end -}}
+{{- $p = -64 -}}
+{{- end -}}
+{{- range $i := until $k -}}
+{{- $m = include "uzi.decMul1024" $m -}}
+{{- end -}}
 {{- if gt (add (len $m) $p) 19 -}}
 {{- fail $help -}}
 {{- end -}}
 {{- $ip := "" -}}
-{{- $rnz := false -}}
+{{- $rnz := $tail -}}
 {{- if ge $p 0 -}}
 {{- $ip = printf "%s%s" $m (repeat (int $p) "0") -}}
 {{- else if gt (len $m) (sub 0 $p) -}}
 {{- $cut := sub (len $m) (sub 0 $p) -}}
 {{- $ip = substr 0 (int $cut) $m -}}
-{{- $rnz = regexMatch "[1-9]" (substr (int $cut) (len $m) $m) -}}
+{{- $rnz = or $tail (regexMatch "[1-9]" (substr (int $cut) (len $m) $m)) -}}
 {{- else -}}
 {{- $rnz = true -}}
 {{- end -}}
