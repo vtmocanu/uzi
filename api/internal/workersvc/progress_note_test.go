@@ -308,6 +308,25 @@ func TestProgressNoteDropsEmptyUsageEntry(t *testing.T) {
 	}
 }
 
+// A zero-token entry for a KNOWN priced model with no worker costUSD is dropped too: the
+// server-resolved table price ($0) must not make it look like a cost claim, and it must not
+// consume a cap slot a real entry needs.
+func TestProgressNoteDropsZeroTokenKnownModelEntry(t *testing.T) {
+	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
+		`"claude-haiku-4-5-20251001":{"inputTokens":0},` +
+		`"m1":{"inputTokens":1},"m2":{"inputTokens":2},"m3":{"inputTokens":3},"m4":{"inputTokens":4}}}`)
+	var p progressNotePayload
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw, harnessClaude), &p); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.ModelUsage["claude-haiku-4-5-20251001"]; ok {
+		t.Fatalf("zero-token known-model entry kept: %+v", p.ModelUsage)
+	}
+	if len(p.ModelUsage) != 4 {
+		t.Fatalf("kept %d models, want the 4 real ones: %+v", len(p.ModelUsage), p.ModelUsage)
+	}
+}
+
 // Two raw keys that sanitise to the same name keep the first valid entry in sorted raw-key
 // order (" claude-haiku" sorts before "claude-haiku"), on every normalisation.
 func TestProgressNoteCollidingKeysAreDeterministic(t *testing.T) {
@@ -400,8 +419,10 @@ func TestProgressNoteCacheWriteSplitExactPrice(t *testing.T) {
 }
 
 // The stored note entry carries the server-resolved cost (costStatus always, costUSD only when
-// metered, never a zero on an unreported entry), and folding the STORED payload (what
-// RefoldRunUsage reads) gives the same run_usage row as folding the raw one.
+// metered, never a zero on an unreported entry), and re-feeding the stored payload through
+// AppendMessages (normalise again, then fold) gives the same run_usage row as the raw one:
+// fold(normalize(stored)) == fold(raw). The RefoldRunUsage read path itself is covered by the
+// LiveDB TestProgressNoteRefoldEquivalenceLiveDB.
 func TestProgressNoteStoredEntryCarriesResolvedCost(t *testing.T) {
 	cases := []struct {
 		name       string

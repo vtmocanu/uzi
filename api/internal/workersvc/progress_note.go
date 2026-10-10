@@ -177,6 +177,9 @@ func normalizeProgressNoteModelUsage(raw json.RawMessage, harness, model string)
 	mu.ServiceTier = tolerantMarker(f["service_tier"])
 	mu.Speed = tolerantMarker(f["speed"])
 	mu.InferenceGeo = tolerantMarker(f["inference_geo"])
+	// Judge emptiness on the worker-supplied (validated) costUSD, before the resolved cost
+	// below overwrites it: a table-priced $0 on a zero-token known model is not a cost claim.
+	workerCost := len(mu.CostUSD) > 0
 	// Replace the worker's cost claim with the server-resolved one.
 	status, usd := resolveProgressNoteCost(harness, model, mu)
 	mu.CostStatus, _ = json.Marshal(status)
@@ -186,7 +189,7 @@ func normalizeProgressNoteModelUsage(raw json.RawMessage, harness, model string)
 	}
 	// An entry with nothing to fold would only add a zero-token row.
 	if mu.InputTokens == 0 && mu.OutputTokens == 0 && mu.CacheReadInputTokens == 0 &&
-		mu.CacheCreationInputTokens == 0 && len(mu.CostUSD) == 0 {
+		mu.CacheCreationInputTokens == 0 && !workerCost {
 		return progressNoteModelUsage{}, false
 	}
 	return mu, true
