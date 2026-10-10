@@ -1445,6 +1445,7 @@ for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
     // recovery operation after the lifecycle stop is skipped.
     assert.equal(discoveries, 1, "no second discovery");
     assert.equal(discoveries, snapshot.discoveries);
+    assert.equal(snapshot.operations, 1, "the first recovery operation was entered");
     assert.equal(operations, snapshot.operations, "no second recovery operation was entered");
     assert.equal(models, 0);
     if (outcome === "owner cancel") {
