@@ -5050,7 +5050,9 @@ export class GitCache {
           catch (err) {
             if ((err as NodeJS.ErrnoException).code === "ENOENT" &&
                 !ownRetainedPaths.has(clone) && !this.reportProofs.getStore()) continue;
-            cause = "git_or_filesystem_error"; throw err;
+            cause = (err as NodeJS.ErrnoException).code === "ENOENT" && ownRetainedPaths.has(clone)
+              ? "clone_path_invalid" : "git_or_filesystem_error";
+            throw err;
           }
           if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
           const head = await atFailure("clone_head_unreadable", async () => {

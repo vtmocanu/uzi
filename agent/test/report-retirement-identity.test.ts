@@ -48,6 +48,46 @@ for (const kind of ['terminal', 'finalize'] as const) {
     await assert.rejects(fs.access(file), { code: 'ENOENT' });
   });
 }
+for (const replacement of [false, true]) {
+  it(`terminal: blocked rewrite preserves only its own winner identity (replacement=${replacement})`, async t => {
+    const scratch = path.resolve('../.uzi/scratch');
+    await fs.mkdir(scratch, { recursive: true });
+    const root = await fs.mkdtemp(path.join(scratch, 'report-metadata-'));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1024 * 1024,
+      maxBytes: 16 * 1024 * 1024, retentionMs: 86400000 });
+    await outbox.init();
+    const run = '00000000-0000-4000-8000-000000002652';
+    await outbox.journalTerminal(run, 2, 'running', 0, { status: 'failed' });
+    const first = (await outbox.readTerminalJournalForRetirement(run, 2))!;
+    const file = path.join(root, run, 'terminal-2.json');
+    if (replacement) {
+      const rename = fs.rename.bind(fs);
+      t.mock.method(fs, 'rename', async (...args: Parameters<typeof rename>) => {
+        await rename(...args);
+        if (String(args[1]) === file) {
+          await fs.writeFile(file + '.replacement', await fs.readFile(file));
+          await rename(file + '.replacement', file);
+        }
+      });
+    }
+    await outbox.markTerminalBlocked(run, 2, 'gap_unrecoverable');
+    const updated = (await outbox.readTerminalJournalForRetirement(run, 2))!;
+    if (replacement) assert.notEqual(updated.context.expectedIdentity, first.context.expectedIdentity);
+    else {
+      assert.equal(updated.context.expectedIdentity, first.context.expectedIdentity);
+      await outbox.journalTerminal(run, 2, 'running', 0, { status: 'completed' });
+      await outbox.markTerminalBlocked(run, 2, 'gap_unrecoverable');
+      assert.equal((await outbox.readTerminalJournalForRetirement(run, 2))!.context.expectedIdentity,
+        first.context.expectedIdentity, 'repeated metadata updates and adoption keep the winner');
+    }
+    assert.equal(updated.journal.blocked, true);
+    assert.equal(await outbox.retireTerminalIfEligible(run, 2, first.context), false);
+    assert.equal(await outbox.retireTerminalIfEligible(run, 2, updated.context), false);
+    await fs.access(file);
+  });
+}
+
 for (const fault of ['cancellation', 'deadline'] as const) {
 it(`terminal reauthentication stops issuing reads after ${fault}`, async t => {
   const scratch = path.resolve('../.uzi/scratch');

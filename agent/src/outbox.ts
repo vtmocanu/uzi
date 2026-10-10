@@ -1590,7 +1590,12 @@ export class Outbox {
         // Historical journals may have consumed the new writer\'s blocked-state reserve.
         // Keep their readable outcome intact and mark memory only rather than destroy replay.
         if (Buffer.byteLength(serialized) <= this.terminalReadMaxBytes) {
-          await this.withReserveOnEnospc(() => this.writeFileAtomic(dst, serialized, "terminal"));
+          const binding = this.terminalRetirementIdentities.get(meta);
+          const lifetime = await this.withReserveOnEnospc(() => this.writeFileAtomic(dst, serialized, "terminal"));
+          // markTerminalBlocked updates the same winner. Only the descriptor of our
+          // own rewrite may carry its identity across the atomic rename.
+          if (binding && lifetime && binding.lifetime === this.authenticatedLifetimes.get(parsed) &&
+              binding.payload === terminalRetirementPayload(parsed)) binding.lifetime = lifetime;
         }
       } else {
         this.log.warn("outbox: terminal journal unreadable while marking blocked; updating in-memory only", {
@@ -2677,9 +2682,10 @@ export class Outbox {
     dstPath: string,
     data: string,
     kind: RecordFileKind | "manifest" | "terminal",
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const dir = path.dirname(dstPath);
     const tmp = `${dstPath}.${randomUUID()}.tmp`;
+    let lifetime: string | undefined;
     const doWrite = async () => {
       const fh = await fs.open(
         tmp,
@@ -2689,6 +2695,7 @@ export class Outbox {
       try {
         await fh.writeFile(data, "utf8");
         await fh.sync();
+        if (kind === "terminal") lifetime = fileLifetime(await fh.stat({ bigint: true }));
       } finally {
         await fh.close();
       }
@@ -2701,6 +2708,7 @@ export class Outbox {
     }
     await fs.rename(tmp, dstPath);
     await this.fsyncDir(dir);
+    return lifetime;
   }
 
   private async fsyncDir(dir: string, strict = false): Promise<void> {
