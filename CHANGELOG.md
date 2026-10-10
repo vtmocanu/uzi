@@ -34,6 +34,8 @@ through `[0.52.0]`.)
   Changelog coverage and release promotion now share the worker autobump runtime paths, including templates and Codex assets, while excluding tests.
 - **Recovery release acknowledgments are bounded ([#2402](https://github.com/vtmocanu/uzi/issues/2402)).**
   The worker rejects release ACKs exceeding 16 KiB and retains local recovery evidence when the server response overflows.
+- **Neutralized Markdown links no longer look clickable ([#1968](https://github.com/vtmocanu/uzi/issues/1968)).**
+  A Markdown link whose URL is empty or uses a dangerous scheme (`javascript:`, `data:`, `file:`) now renders as plain text rather than an href-less anchor that was still styled as a link, so a report author cannot present a fake call to action.
 
 ## [0.86.0] - 2026-10-06
 

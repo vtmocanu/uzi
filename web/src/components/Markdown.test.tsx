@@ -80,9 +80,16 @@ describe("Markdown decoded entity policy", () => {
     const { container } = render(
       <Markdown content={'[bad](java&#x202e;script:alert(1))\n\n![bad](java&lrm;script:alert(1))\n\n<script>alert(1)</script>'} />,
     );
-    expect(container.querySelector("a")?.getAttribute("href")).toBeNull();
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toContain("bad");
     expect(container.querySelector("img, script")).toBeNull();
     expect(container.textContent).toContain("<script>alert(1)</script>");
+  });
+
+  it("renders a plain javascript: link as text with no anchor", () => {
+    const { container } = render(<Markdown content="[x](javascript:alert(1))" />);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toContain("x");
   });
 });
 
