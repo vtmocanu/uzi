@@ -305,6 +305,9 @@ export class ClaudeCrossCheck {
     let usageInit = false;
     let resultPosted = false;
     let failed = true;
+    let completedText: string | undefined;
+    let failure: { error: unknown } | undefined;
+    let nativeClean = false;
     try {
       const options = buildClaudeCrossCheckOptions({
         cwd: checkout, homeDir: home, oauthToken: token, log: this.log, secretPaths: this.opts.secretPaths, gate,
@@ -369,10 +372,9 @@ export class ClaudeCrossCheck {
       if (code) validateCodeFindings(text);
       else validateVerdict(text);
       failed = false;
-      return text;
+      completedText = text;
     } catch (err) {
-      budget?.assertWithinBudget();
-      throw err;
+      failure = { error: err };
     } finally {
       signal.removeEventListener("abort", onCancel);
       abort.abort();
@@ -405,26 +407,37 @@ export class ClaudeCrossCheck {
           } catch { clean = false; }
         }
       } else for (const pid of pids) this.kill(pid);
+      nativeClean = clean;
       try {
         if (usageInit && !resultPosted) {
           await postUsage({ event: "result", subtype: "cross_check", is_error: failed || signal.aborted, modelUsage: {} });
         }
+      } catch (error) {
+        failure ??= { error };
       } finally {
         this.log.removeSecret(token);
       }
-      if ((code || confirmNativeCleanup) && !clean) throw new Error("cross-check confinement refused: cleanup unconfirmed");
-      if (clean) confirmNativeCleanup?.();
     }
+    if ((code || confirmNativeCleanup) && !nativeClean) throw new Error("cross-check confinement refused: cleanup unconfirmed");
+    if (nativeClean) confirmNativeCleanup?.();
+    budget?.assertWithinBudget();
+    if (failure) throw failure.error;
+    if (completedText === undefined) throw new Error("cross-check ended without a result");
+    return completedText;
   }
 }
 
 /** The UZI_EXECUTOR=stub checker model call: no network, one init frame matching the checker
- *  surface, then a canned APPROVE (mirrors stubJudgeQueryFn for the other lanes). */
-export const stubClaudeCrossCheckQueryFn: SdkQueryFn = (async function* () {
+ *  surface, then canned stage-specific output (mirrors stubJudgeQueryFn for the other lanes).
+ *  Only the worker's trusted system brief selects the stage; prompt DATA has no authority. */
+export const stubClaudeCrossCheckQueryFn: SdkQueryFn = (async function* ({ options }: Parameters<SdkQueryFn>[0]) {
+  const systemPrompt = options.systemPrompt;
+  const code = typeof systemPrompt === "object" && !Array.isArray(systemPrompt) &&
+    systemPrompt.type === "preset" && systemPrompt.append === codeCrossCheckBrief("Read, Grep and Glob");
   const init = { type: "system", subtype: "init", model: "stub", session_id: "stub", tools: [...CHECKER_SURFACE.tools],
     mcp_servers: [], plugins: [], agents: [], skills: [] };
   if (checkIsolatedInit(init, CHECKER_SURFACE) !== undefined) throw new Error("stub init frame drifted from the checker surface");
   yield init;
   yield { type: "result", subtype: "success", is_error: false, num_turns: 1,
-    result: JSON.stringify({ verdict: "approve", summary: "[stub cross-check] no model call in e2e", items: [] }) };
+    result: code ? '{"findings":[]}' : JSON.stringify({ verdict: "approve", summary: "[stub cross-check] no model call in e2e", items: [] }) };
 } as unknown as SdkQueryFn);
