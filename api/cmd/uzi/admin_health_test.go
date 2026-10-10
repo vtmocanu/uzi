@@ -338,6 +338,29 @@ func codexPricingWarnCheck() apitypes.HealthCheckDTO {
 	}
 }
 
+func TestAdminHealthRecoveryStorageEvidence(t *testing.T) {
+	check := apitypes.HealthCheckDTO{ID: "recovery.storage", Scope: "owner", Group: "housekeeping", Title: "Recovery storage", Severity: "warn",
+		Summary:  "1 captures currently marked quota-refused.",
+		Evidence: []apitypes.HealthEvidenceDTO{{Label: "Shared stored-files limit", Value: "disabled"}, {Label: "Omitted owner examples", Value: "2"}}}
+	for _, strict := range []bool{false, true} {
+		args := []string{"admin", "health", "--no-color"}
+		want := uzicli.ExitOK
+		if strict {
+			args = append(args, "--strict")
+			want = 8
+		}
+		out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), args...)
+		if code != want {
+			t.Errorf("exit=%d want %d", code, want)
+		}
+		for _, s := range []string{"recovery.storage", "quota-refused", "Shared stored-files limit: disabled", "Omitted owner examples: 2", "blocking: false"} {
+			if !strings.Contains(out, s) {
+				t.Errorf("missing %q: %s", s, out)
+			}
+		}
+	}
+}
+
 func TestAdminHealthCodexEvidence(t *testing.T) {
 	check := codexPricingWarnCheck()
 	for _, flags := range [][]string{nil, {"--no-color"}, {"--all"}, {"--no-color", "--all"}} {

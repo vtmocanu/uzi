@@ -28,6 +28,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
   { id: "board.drift", scope: "owner", group: "housekeeping", title: "Board drift", doc: null },
   { id: "custody.holds", scope: "owner", group: "housekeeping", title: "Recovery custody holds", doc: null },
+  { id: "recovery.storage", scope: "owner", group: "housekeeping", title: "Recovery storage", doc: null },
   { id: "release.check", scope: "owner", group: "housekeeping", title: "Upstream release", doc: null },
   { id: "pricing.codex", scope: "instance", group: "housekeeping", title: "Codex price coverage", doc: "admin-health" },
 ];
@@ -50,6 +51,7 @@ const OK_SUMMARY: Record<string, string> = {
   "schedules.paused": "No user has paused schedules while owning enabled ones.",
   "board.drift": "No column move has been given up in the last 24 hours.",
   "custody.holds": "No owner is at the custody-hold admission limit.",
+  "recovery.storage": "0 captures currently marked quota-refused.",
   "release.check": "This instance is on a recent release.",
   "pricing.codex": "no recent Codex usage on unpriced models",
 };
