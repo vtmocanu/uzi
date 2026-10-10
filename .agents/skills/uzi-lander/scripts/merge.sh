@@ -8,10 +8,13 @@
 #                   so a push that landed after your last look is never merged unseen. The
 #                   merge itself passes --match-head-commit, so a push in the window between
 #                   the preflight and the merge is refused by GitHub as well.
-#   --expect-closes the issues this merge may close (`none` for a Refs-only PR). GitHub's
-#                   closingIssuesReferences, which also counts negated prose such as "does
-#                   not close #N", must equal it exactly, or the merge refuses (exit 11);
-#                   unreadable refuses (exit 2). Without the flag, CLOSES= is printed only.
+#   --expect-closes the issues this merge may close (`none` for a Refs-only PR). The union
+#                   of GitHub's closingIssuesReferences (the PR body) and the closing
+#                   keywords in the PR's commit messages (they reach main in the squash
+#                   commit and close issues there) must equal it exactly, or the merge
+#                   refuses (exit 11). Negated prose ("does not close" + an issue ref)
+#                   counts in both. Unreadable refuses (exit 2). Without the flag, CLOSES=
+#                   is printed only.
 #   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
 #   --confirm-only  do NOT merge: the PR was already merged OUT OF BAND (e.g. the harness
 #                   classifier refused the in-script `gh pr merge --admin` and the user ran it
@@ -144,8 +147,16 @@ if [ -n "$EXPECT_CLOSES" ] && [ "$EXPECT_CLOSES" != none ]; then
     END { if (bad) exit 1 }' | sort -n | paste -sd, -) \
     || { echo "bad --expect-closes '$EXPECT_CLOSES' (issue numbers, comma-separated, or none)" >&2; exit 2; }
 fi
-if closes=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences 2>/dev/null \
-     | jq -er 'if has("closingIssuesReferences") then [.closingIssuesReferences[].number]|sort|map(tostring)|join(",") else error("missing") end' 2>/dev/null); then
+# GitHub's keyword grammar: close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved,
+# case-insensitive, optional colon, then #N or OWNER/REPO#N.
+if closes=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences,commits 2>/dev/null \
+     | jq -er 'if has("closingIssuesReferences") and has("commits") then
+         ([.closingIssuesReferences[].number]
+          + [.commits[] | ((.messageHeadline // "") + "\n" + (.messageBody // ""))
+             | scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s*:?\\s*(?:[\\w.-]+/[\\w.-]+)?#([0-9]+)")[0]
+             | tonumber])
+         | unique | map(tostring) | join(",")
+       else error("missing") end' 2>/dev/null); then
   echo "CLOSES=${closes:-none}"
   if [ -n "$EXPECT_CLOSES" ] && [ "$closes" != "$want_closes" ]; then
     echo "CLOSING REFERENCES MISMATCH: merging would close [${closes:-none}], expected [${want_closes:-none}]; fix the PR body (a negated \"does not close #N\" still closes) and re-run"; exit 11

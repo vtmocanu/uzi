@@ -66,7 +66,7 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
   case "\$*" in
     *closingIssuesReferences*)
       [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
-      printf '{"closingIssuesReferences":%s}\n' "\${CLOSES_JSON:-[]}"; exit 0 ;;
+      printf '{"closingIssuesReferences":%s,"commits":%s}\n' "\${CLOSES_JSON:-[]}" "\${COMMITS_JSON:-[]}"; exit 0 ;;
   esac
   case "\$*" in
     *'-q .state'*) printf '%s\n' "\$st" ;;
@@ -489,7 +489,24 @@ MERGE_ARGS=()
 merge_run closes_noflag
 grep -q 'CLOSES=unknown' "$WORK/m.closes_noflag" || fail "no-flag run did not report unknown closing references: $(cat "$WORK/m.closes_noflag")"
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "without --expect-closes an unreadable lookup must stay informational: $(cat "$WORK/m.closes_noflag")"
-unset CLOSES_FAIL CLOSES_JSON; MERGE_ARGS=()
+unset CLOSES_FAIL
+# Commit messages reach main in the squash commit and close issues there, outside
+# closingIssuesReferences (PR #2651's squash commit 4d64d9a4 quoted the negated phrase).
+export CLOSES_JSON='[]'
+export COMMITS_JSON='[{"messageHeadline":"skills(x): y","messageBody":"GitHub parses \"this PR does not close #1912\" as a keyword."}]'
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_commit
+[ "$rc" -eq 11 ] || fail "a closing keyword in a commit message did not refuse, rc=$rc: $(cat "$WORK/m.closes_commit")"
+grep -q 'merging would close \[1912\]' "$WORK/m.closes_commit" || fail "commit-message closing ref not named: $(cat "$WORK/m.closes_commit")"
+[ ! -e "$WORK/merge.log" ] || fail "merged although a commit message would close #1912"
+export COMMITS_JSON='[{"messageHeadline":"Fixes: owner/repo#7","messageBody":"RESOLVED #12\nRefs #99, prefix#5 not a ref"}]'
+MERGE_ARGS=(--expect-closes '7,12')
+merge_run closes_grammar
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "keyword grammar (colon, owner/repo#, case) not parsed as 7,12: $(cat "$WORK/m.closes_grammar")"
+export CLOSES_JSON='[{"number":12}]'
+merge_run closes_union
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "body and commit references were not unioned: $(cat "$WORK/m.closes_union")"
+unset CLOSES_JSON COMMITS_JSON; MERGE_ARGS=()
 # --confirm-only never reads the run list.
 MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
 seed_state
