@@ -94,6 +94,9 @@ through `[0.52.0]`.)
 - **The owner and admin run lists are gzip-compressed ([#2660](https://github.com/vtmocanu/uzi/issues/2660)).**
   When the client sends Accept-Encoding: gzip, GET /api/runs and GET /api/admin/runs are gzip-compressed; the CLI, TUI and web decode it transparently, and there is no API shape change.
 
+- **Web assets are served compressed and cacheable, and API responses are never compressed by nginx ([#2662](https://github.com/vtmocanu/uzi/issues/2662)).**
+  Files under `/assets/` are now gzip-compressed with a one-year immutable `Cache-Control`, and a missing asset returns 404 instead of the SPA index; the index, SPA routes and unhashed root files such as `/theme-preinit.js` are `no-cache`. Every `/api/` location sets `gzip off`, so nginx never adds compression to API responses. The security headers and CSP are repeated in each static location and stay identical to the server-level ones. This applies to the compose web image, the Helm chart's web ConfigMap and the mock build.
+
 - **The lead defers a costly full gate after review invalidates a candidate ([#2593](https://github.com/vtmocanu/uzi/issues/2593)).**
   The lead still overlaps the integration gate with the read-only review wave by default (refining #215), but once review invalidates a candidate whose full gate is costly it completes the repair reviews and focused checks before repeating the full gate, and it triages a failed gate (narrowest reproducer on candidate and base) before rerunning it. This is prompt-level guidance, not enforcement; it ships in the worker image (agent prompt) and in the app release (builtin lead body).
 
