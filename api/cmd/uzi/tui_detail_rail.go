@@ -98,8 +98,10 @@ func (m tuiModel) railWorkerLine() string {
 	return m.pal.faint.Render("worker "+m.renderer.Plain(text.runWorkerName, 19)) + "\n"
 }
 
-// railWaitingMaxRows bounds the waiting explanation's height on the rail.
-const railWaitingMaxRows = 3
+// railWaitingMaxRows bounds the waiting explanation's height on the rail. Five rows keep the
+// stale-requeue pin reason's deadline AND the previous worker's name visible at laneRailWidth
+// (issue #2705: the name is often shown nowhere else once the run is queued).
+const railWaitingMaxRows = 5
 
 // railWaitingLabel leads the waiting explanation and stays faint; the reason follows it.
 const railWaitingLabel = "queued ▸ "
@@ -123,8 +125,11 @@ func (m tuiModel) railWaitingLine() string {
 	var sb strings.Builder
 	for i, row := range rows {
 		if i == 0 {
-			if rest, ok := strings.CutPrefix(row, railWaitingLabel); ok {
-				row = m.pal.faint.Render(railWaitingLabel) + rest
+			// TrimSpace: wrapWords drops the label's trailing space when the reason's first word
+			// does not fit beside it, and the label must stay faint either way.
+			label := strings.TrimSpace(railWaitingLabel)
+			if rest, ok := strings.CutPrefix(row, label); ok {
+				row = m.pal.faint.Render(label) + rest
 			}
 		}
 		sb.WriteString(row + "\n")

@@ -12,7 +12,7 @@ import (
 // Issue #2705: the crew rail explains a queued run held for its returning worker, with the
 // deadline, under the worker line.
 
-const pinReasonFixture = "waiting until 2026-07-12T12:19:00Z for its previous worker w1 to return; another worker may take it after that"
+const pinReasonFixture = "waiting until 2026-07-12T12:19:00Z for its previous worker uzi-hw-7f3c9a2e to return; another worker may take it after that"
 
 // waitingRailModel is a queued, waiting_worker run with the pin reason on the crew rail.
 func waitingRailModel(t *testing.T, mutate func(m *tuiModel)) tuiModel {
@@ -36,7 +36,9 @@ func TestRailWaitingLineShowsDeadlineForPinnedQueuedRun(t *testing.T) {
 	// Wrapped to at most railWaitingMaxRows rows within laneRailWidth, directly under the title
 	// row, the deadline kept whole and the tail ellipsized.
 	lines := strings.Split(rail, "\n")
-	want := []string{"queued ▸ waiting until", "2026-07-12T12:19:00Z for", "its previous worker w1 to…"}
+	// The previous worker's full name must survive the clamp (tui-ux review: at three rows every
+	// realistic name was cut to "uzi-h…").
+	want := []string{"queued ▸ waiting until", "2026-07-12T12:19:00Z for", "its previous worker", "uzi-hw-7f3c9a2e to return;", "another worker may take i…"}
 	if len(want) != railWaitingMaxRows {
 		t.Fatalf("fixture rows %d != railWaitingMaxRows %d", len(want), railWaitingMaxRows)
 	}
@@ -99,5 +101,17 @@ func TestRailWaitingLineChargedToFoldBudget(t *testing.T) {
 	}
 	if !decided {
 		t.Fatal("the waiting rows never decided the auto-fold")
+	}
+}
+
+// The label stays faint even when the reason's first word cannot share its row, where wrapWords
+// drops the label's trailing space (tui-ux review nit).
+func TestRailWaitingLabelFaintWhenFirstWordWraps(t *testing.T) {
+	m := waitingRailModel(t, func(m *tuiModel) {
+		m.detail.run.HealthReason = sp(strings.Repeat("x", 40))
+	})
+	line := m.railWaitingLine()
+	if !strings.HasPrefix(line, m.pal.faint.Render(strings.TrimSpace(railWaitingLabel))) {
+		t.Fatalf("label not drawn faint when the first word wraps: %q", line)
 	}
 }
