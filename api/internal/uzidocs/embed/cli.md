@@ -2423,6 +2423,13 @@ display as `pin` or `worker default`; missing or unfamiliar values show
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
 for resolution, validation and capability requirements.
 
+The human output ends with a `Now summary: on (default)`, `on` or `off` line:
+your own switch for the model-written [Now summary](./run-activity.md#now-summary)
+(`on (default)` means unset, which inherits on; the admin
+[kill switch](./admin-settings.md#run-summaries) can still turn it off for the
+instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
+**Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
@@ -2501,7 +2508,11 @@ mislead: `stalled · since HH:MM` (UTC), `waits on you · plan gate|question|fol
 on a question can add ` · may be blocked by <id>` when the open question
 mentions an issue another live run of the same owner and repo is working (a
 hint, not a recorded dependency; see
-[May be blocked by](./run-activity.md#may-be-blocked-by)). The row is
+[May be blocked by](./run-activity.md#may-be-blocked-by)). While the model-written
+[Now summary](./run-activity.md#now-summary) is on and a note exists for the active
+milestone, a percent row appends ` · now: <text> (model summary, 2m ago)`; the text is
+untrusted model output printed as plain text, and `--json` carries it as
+`progress.now_note` (`text`, `at`), present only on this single-run read. The row is
 omitted when the run has no estimate and once the run is terminal. `--json` carries `progress` as an object (`null` for a terminal
 run), so `--field progress` is a usage error (exit 2) while the run is live
 and prints an empty line once it is terminal, as for `milestones`.

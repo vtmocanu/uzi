@@ -451,6 +451,11 @@ runs per model, not usage rows. Priced models are excluded before the
 evidence limit. Evidence lists at most ten models, ordered by run count
 descending then model ID, with an **and more** row when further models exist.
 
+Usage from the [Now summary](run-activity.md#now-summary) is stored under a
+`progress_note:<model>` key; this check strips that prefix, so a summary-only
+model is named and counted under its real ID together with the run's own usage
+of it.
+
 Any finding is `warn`; this check has no `danger` band. With no findings it
 is `ok`, with the summary **"no recent Codex usage on unpriced models"**.
 A failed query, including its five-second deadline, reads `unknown`.

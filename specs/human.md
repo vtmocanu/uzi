@@ -1230,6 +1230,14 @@ PRD at `prds/done/2602-run-progress.md`.
 - Every non-terminal issue run with a frozen milestone list shows an approximate server-derived percent (11% for planning plus 89% of completed/total milestones, held below 100% until the run ends) on the web board and run page, the TUI board and detail, and `uzi run get`; a run that is waiting, parked, queued, stalled/looping or planning shows that flag instead of a number, and no surface shows a time remaining. (AI-synced 2026-10-09, #2602)
 - Run detail (web, TUI, CLI) shows "may be blocked by <run>" while a run waits on an unanswered question that mentions `#N` and another live run of the same owner on the same repo is working issue N; it is a hint, never another user's or repo's run, never the run itself. (AI-synced 2026-10-09, #2602)
 
+## Feature #2603 — Model-written "Now" summary
+
+PRD at `prds/done/2603-run-now-summary.md`.
+
+- A running issue run shows one plain sentence (at most 120 characters), written by a small model on the run's own credential, of what it is doing now, on the run page progress card, the TUI detail and `uzi run get`; it is marked as a model summary with its age. (AI-synced 2026-10-10, #2603)
+- It is on by default, each user can turn it off for their own runs, and an admin kill switch turns it off for the whole instance; turning it off reaches runs already executing. [user 2026-10-09] (AI-synced 2026-10-10, #2603)
+- The summary calls' spend counts toward the run's usage and shows as its own row, never as `$0` when a price is unknown. (AI-synced 2026-10-10, #2603)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is
