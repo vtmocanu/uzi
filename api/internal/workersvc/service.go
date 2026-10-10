@@ -4004,6 +4004,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
 	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
 	// own counted park transaction; disk_park_preventive is valid only alongside it.
+	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable &&
+		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexAccountParkV1) {
+		return store.Run{}, false, fmt.Errorf("%w: codex account park capability required", ErrInvalidState)
+	}
+	// The account park requires a generation regardless of credential-switch capability.
+	// Validate before the generic generation fence so this malformed request stays a 400.
+	if req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		*req.RecoveryCause == recoveryCauseCodexAccountUnavailable && req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: account park requires claim_generation", ErrInvalidState)
+	}
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}
@@ -4704,7 +4714,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go. Issue
 		// #1766 M2: a vault_locked report parks here too and is the one cause this park stores;
 		// the timer promoter re-queues it and Claim holds it idle while the vault stays locked.
-		rows, err = s.setRecoveryWait(ctx, owned, wkr, req, sessionID)
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable {
+			var crun store.Run
+			crun, rows, err = s.parkRunningCodexAccountUnavailable(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return crun, false, err
+			}
+			break
+		}
+		rows, err = s.setRecoveryWait(ctx, s.q, recoveryCauseStored(req.RecoveryCause), owned, wkr, req, sessionID)
 	case "paused":
 		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard
 		// ack contract as limit_wait — the worker keys off the RETURNED status being literally

@@ -1,13 +1,13 @@
 # PRD #1595: Park a running Codex run whose boundary reconcile meets an unusable subscription account
 
-**Status**: Draft rev 2 (architect, 2026-10-10). Revised after the review of rev 1; the review's decisions on the four open questions are recorded in the Decision Log (rows 10 to 13). Not dispatch-ready until the revision is re-reviewed.
+**Status**: Implementation complete / hosted acceptance pending (2026-10-10). Approved rev 2 decisions D1-D7 and Decision Log rows 10-15 are implemented. M1/M2 are committed and reviewed at `1dd58b22`; M3 documentation and focused checks are complete. M4 remains unchecked and maintainer-owned. This PRD stays at its existing path until hosted acceptance.
 **Issue**: [#1595](https://github.com/vtmocanu/uzi/issues/1595)
 **Priority**: High
 **Related**: [PRD #1590](1590-codex-quarantine-claim-hold.md) and [ADR-1590](../adr/1590-codex-binding-same-identity-readmission.md) (the `codex_account_unavailable` cause, the hold classifier, the account-driven promoter and re-admission this PRD reuses unchanged); [ADR-1766](../adr/1766-codex-vault-lock-park.md) (the typed-409 reason plus credential-free park this PRD extends with a third reason); #1594 (why a refresh is rejected; the `ErrCodexRefreshRejected` quarantine); [PRD #1810](1810-retain-failed-run-checkpoint-ref.md) and [PRD #1867](1867-failed-run-salvage-ref.md) (what still preserves source when a run fails for a reason this PRD does not park).
 
-Use current `main` and a short-lived worktree. This PRD changes no file under `.github/workflows/`, in either its implementation or its validation. It needs **no database migration**: the cause already exists in `runs_recovery_wait_cause_check` (PRD #1590).
+Implementation proceeded serially on `agent/issue-1595`; M3 documentation uses the same worktree at `1dd58b22`. This PRD changes no file under `.github/workflows/`, in either its implementation or its validation. It needs **no database migration**: the cause already exists in `runs_recovery_wait_cause_check` (PRD #1590).
 
-## Problem
+## Problem (before this implementation)
 
 A Codex subscription run that is already **running** reconciles its credential before every durability boundary (milestone checkpoint, done checkpoint, finalize, park). When that reconcile is refused because the subscription account is quarantined or a re-login is in flight, the run **fails** (`fail_origin=agent_failure`, `codex boundary failed at reconcile`). Its unpublished commits stay only on the worker, and someone has to recover them by hand.
 
@@ -91,12 +91,12 @@ No step from 4 onward makes a credential call.
 
 **Capture-failure behaviour** (inherited, and must be pinned):
 
-- An unsettled executor or an unverified capture **never parks**. The run stays `running` on this worker, heartbeating, and retries with backoff capped at 16 × `recoveryRetryMs`. It keeps the clone, session and custody hold, and posts deduplicated feed lines.
+- An unsettled executor or an unverified capture does not send this credential-deferral park report. The run stays `running` on this worker, heartbeating, and retries with backoff capped at 16 × `recoveryRetryMs`. It keeps the clone, session and custody hold, and posts deduplicated feed lines.
 - The wall clock bounds the loop. A server wall park answers `wall_parked`, and the worker retains everything.
 - A residue-quarantine latch fails the run `worker_residue_blocked` with `keepCustody: true`.
 - Shutdown retains everything and reports nothing.
 
-Source is therefore preserved **before** the park, never released, and nothing fails the run for account state.
+Verified source capture therefore precedes this account park, and the path does not settle custody. Account state in the eligible hold class does not itself fail the run; lifecycle and residue outcomes above retain their precedence. After the park ACK, the tracking ref and session remain recovery sources; the live clone may retire under independent quiescence checks. Best-effort publication does not promise an available server archive.
 
 **Mid-turn refreshes are out of scope** (Decision Log row 10). The app-server refresh bridge, `buildAppServerRefreshBridge` (`agent/src/codex/codex-executor.ts`), keeps its exact current behaviour. It latches only on `codexDeferralReason(err) === "vault_locked"` (#1789) and rethrows every other failure unchanged. An upgraded worker does receive the typed `codex_account_unavailable` 409 on a mid-turn refresh too: D1 applies to every refresh call from a capable worker. The bridge rethrows that 409 unchanged, like any other refusal, because widening `codexDeferralReason`'s return type does not change the bridge's `=== "vault_locked"` comparison. W10 pins this. The residual: a quarantine first met by a mid-turn refresh during a long turn is decided by the turn's failure path, not by this park (see Risks).
 
@@ -114,7 +114,7 @@ Source is therefore preserved **before** the park, never released, and nothing f
 6. Lock the alias state row, then the account row, both `FOR SHARE NOWAIT`, in the `classifyLockedCodexClaim` order. That function already takes a `claimFinishQueries` surface, which `*store.Queries` bound to `tx` satisfies, so it is called with `qtx`, unchanged. It re-reads `GetRunCodexAuthContext` and evaluates `classifyCodexClaimAuthority`. Add `runClaimOpenedCustody(run, true)`.
 7. **Hold** → the new `qtx.ParkRunningCodexAccountUnavailable :execrows` statement (D3a). A 0-row result rolls back with nothing written and is returned as a no-op. Commit.
 8. **Not hold** (the account recovered, the binding turned terminal, or the kind is ineligible) → the **existing untyped park**, written in the **same transaction** as `qtx.SetRunRecoveryWait` with `RecoveryCause` set explicitly to SQL NULL (`pgtype.Text{}`). The other parameters are computed exactly as `setRecoveryWait` (`api/internal/workersvc/recoverywait.go`) computes them: `RetryNotBefore` = now + `recoveryParkFallbackFor(run.RecoveryWaitCount)` + `recoveryParkJitter()`, `SessionID`, `WorkerID`, `ClaimGeneration`. To keep one copy of that computation, refactor `setRecoveryWait` to take an explicit cause plus a narrow writer interface, `interface{ SetRunRecoveryWait(context.Context, store.SetRunRecoveryWaitParams) (int64, error) }`. Both the service's store interface (which declares `SetRunRecoveryWait`, `api/internal/workersvc/service.go`) and `*store.Queries` satisfy it; the existing caller passes `s.q` and `recoveryCauseStored(req.RecoveryCause)`, and this caller passes `qtx` and NULL. The store package has no generated `Querier` interface to reuse. Calling today's `setRecoveryWait` here would issue the update on `s.q`, outside the transaction, and block on this transaction's own run lock until the context deadline. **Never fail** on this path. The worker already holds a verified capture. A binding that turned terminal fails at the next claim through PRD #1590's classification, which keeps custody. A recovered account resumes on the recovery timer.
-9. **`55P03`** on either `NOWAIT` lock → roll back, then retry the whole transaction (steps 2 to 7) up to `finishRunClaimAttempts` times, sleeping `finishRunClaimRetryDelay` between attempts. When the budget is spent, open a **fresh** transaction that repeats steps 2 to 5 under a new run lock and takes no alias or account lock, then writes step 8's untyped park through that transaction's `qtx` and commits. The whole report therefore finishes within about `finishRunClaimAttempts × finishRunClaimRetryDelay` plus statement time, never waiting on a lock. The cost is one timer hop before PRD #1590's gate re-parks the run typed.
+9. **`55P03`** on either `NOWAIT` lock → roll back, then retry the whole transaction (steps 2 to 7) up to `finishRunClaimAttempts` times, sleeping `finishRunClaimRetryDelay` between attempts. When the budget is spent, open a **fresh** transaction that repeats steps 2 to 5 under a new run lock and takes no alias or account lock, then writes step 8's untyped park through that transaction's `qtx` and commits. The NOWAIT retry budget is bounded by `finishRunClaimAttempts × finishRunClaimRetryDelay` plus statement time; the run-row lock still obeys the request context. The cost is one timer hop before PRD #1590's gate re-parks the run typed.
 
 #### D3a: the park statement's field set
 
@@ -225,7 +225,7 @@ Both fields are secret-free by construction: no error text, no identifiers. With
 
 ## Regression matrix
 
-Every row is a test that **fails on `main` at the PRD base and passes with the change**, observed in both directions (the mutation-testing discipline in `.claude/rules/go.md`). The rows marked *(pin)* are characterization tests of inherited behaviour. They must pass on both trees, and they need a recorded mutation that reddens them, which the "red on main" column names.
+This matrix records the approved regression requirements and expected pre-change failure mechanisms. Completion evidence below records actual observations: compiled isolated mechanism-removal regressions, not a replay of old-base behaviour and not exhaustive mutation coverage. The rows marked *(pin)* characterize inherited behaviour; their named mutations test sensitivity to the enforcing mechanism. The "red on main" column describes the design expectation, not an independently observed base replay.
 
 ### API (Go)
 
@@ -273,10 +273,10 @@ Every row is a test that **fails on `main` at the PRD base and passes with the c
 
 The gates for each milestone are `task gate:api` (M1) or `task gate:agent` (M2), plus `task gate:repo` for both. The LiveDB tests run via `./e2e/run-store-it.sh`, because `gate:api` skips them without `UZI_TEST_DATABASE_URL`. No milestone touches `.github/workflows/**`.
 
-- [ ] **M1: the api classifies, answers the typed reason and server-decides the park.** Expand phase: it ships first and changes nothing for released workers.
+- [x] **M1: the api classifies, answers the typed reason and server-decides the park.** Expand phase: it ships first and changes nothing for released workers.
   - **Deliverables:** D1, D3, D3a, D4, D5 (both tokens), D7.
   - **Files:**
-    - `api/internal/workersvc/codexauthz.go`: the behaviour-preserving prelude extraction from `authorizeCodexCredentialOp`, and `codexAccountHoldHint`;
+    - `api/internal/workersvc/codexauthz.go`: the behaviour-preserving prelude extraction from `authorizeCodexCredentialOp`; `api/internal/workersvc/codex_account_hint.go`: `codexAccountHoldHint`;
     - `api/internal/workersvc/codexrefresh.go`: the verdict on the error tail and `ErrCodexAccountUnavailable`;
     - `api/internal/workersvc/recoverywait.go`: `setRecoveryWait` takes the writer and an explicit cause (D3 step 8);
     - `api/internal/handler/worker_codex.go`: the mapping and the log fields;
@@ -287,7 +287,7 @@ The gates for each milestone are `task gate:api` (M1) or `task gate:agent` (M2),
     - `api/internal/capability/capability.go`;
     - `api/internal/handler/worker_protocol.go`.
   - **Acceptance:** A1 to A13 (including A1b, A1c, A6a and A6b) green, each red-direction observation recorded in the PR. The no-capability golden body (A3) is byte-identical.
-- [ ] **M2: the worker parks on the reason.** Depends on M1. Same MR is fine; the worker must not ship ahead of a released api in production (Order B is safe, merely inert).
+- [x] **M2: the worker parks on the reason.** Depends on M1. Same MR is fine; the worker must not ship ahead of a released api in production (Order B is safe, merely inert).
   - **Deliverables:** D2, D5 (worker side). The mid-turn bridge is **not** changed (Decision Log row 10).
   - **Files:**
     - `agent/src/client.ts`;
@@ -298,8 +298,8 @@ The gates for each milestone are `task gate:api` (M1) or `task gate:agent` (M2),
     - `agent/src/protocol.ts`: the `recovery_cause` doc comment;
     - `agent/src/worker.ts`.
   - **Acceptance:** W1 to W10 and E1 green, with red directions recorded. W9 pins the existing park-report retry on an api 400 (see Rollout); W10 pins the unchanged mid-turn bridge.
-- [ ] **M3: docs, specs and decision record.** Depends on M1 and M2.
-  - `docs/run-recovery-wait.md`, "Codex account unavailable": say that a running run can now land here at a checkpoint with its work captured first, and that this kind of hold resumes on the worker that holds its source (it currently says the preference applies "when the hold began at claim time"). Then `task docs:sync`.
+- [x] **M3: docs, specs and decision record.** Documentation and focused checks complete. Depends on M1 and M2.
+  - `docs/run-recovery-wait.md`, "Codex account unavailable": say that a running run can now land here at a checkpoint with its work captured first, and that this kind of hold resumes on the worker that holds its source (the pre-change wording limited the preference to "when the hold began at claim time"). Then `task docs:sync`.
   - `specs/human.md`, in the #1590 block: one `(AI-synced YYYY-MM-DD)` line saying an in-flight Codex run whose account is quarantined or mid-re-login parks with its work captured instead of failing, and that other boundary failures are unchanged.
   - An amendment section in `adr/1766-codex-vault-lock-park.md` (the mechanism owner), with a one-line pointer from `adr/1590-codex-binding-same-identity-readmission.md`, recording D1, D3's capability gate, D4 and Invariant 1. No new ADR (Decision Log row 12).
   - The PRD's link from `ARCHITECTURE.md`, next to wherever PRD #1590 is linked; add one if none exists.
@@ -314,6 +314,51 @@ The gates for each milestone are `task gate:api` (M1) or `task gate:agent` (M2),
      The api log shows `error_class=material_revision_stale account_hold=true`.
   2. **Provider-rejected login** (the #1594 shape). After pasting a login, spend its refresh token outside uzi with the same login, so uzi's next refresh is rejected. The run must park with `relogin_required`, resume after a same-identity re-login, and complete. The api log shows `error_class=refresh_rejected account_hold=true`.
   3. **Negative check.** Re-read the `error_class` of any Codex boundary failure in the acceptance window. A non-hold class must still show today's failure, so the scope did not widen.
+
+## Completion evidence (2026-10-10)
+
+M1 completed at `bc189ecc`: lead API and repository gates passed, and the real-PostgreSQL
+LiveDB run passed 2,499 cases with zero skips. The current tests include
+`TestCodexAccountHintRealStaleMaterialLiveDB` and the seven
+`TestRunningCodexAccountPark*` parents (observed hold, NULL fallback, claim fences,
+NOWAIT contention, re-login overlap, same-identity sweep and excluded kinds).
+They check server classification, capability revocation and retained custody.
+M1 implementation and repair reviews were clean.
+
+M2 completed at `1dd58b22`: final lead agent, API and repository gates passed;
+implementation and repair reviewer/tester/auditor rounds were clean.
+`agent/test/runner-codex-account-park.test.ts` pins verified capture before reporting,
+source/session/custody retention, lifecycle precedence and feature fallback.
+Its W9 case inspects real persisted session bytes after seven rejected 400 reports
+and after the park ACK. The bridge characterization keeps its vault-only latch.
+Recorded red proofs for M1/M2 used compiled isolated mechanism removals; they do not
+establish old-base behavioural replay or exhaustive mutation coverage.
+
+The full `task test:codex-refresh-lostreply-e2e` passed under existing deadlines:
+seven Go packages reported plain `ok`; verbose LiveDB totals were 6,146 RUN /
+6,146 PASS (including nested subtests), zero SKIP and zero FAIL.
+`TestCodexRefreshLostReplyE2E` and its four variants (`drop-first`, `drop-both`,
+`pending-retention`, `account-unavailable`) all ran and passed without skips.
+Real HTTP, PostgreSQL and `RunRunner` checked the typed 409, open custody hold,
+revoked capability and owned verified WIP source before re-login, then same-identity
+re-admission, same-worker exact G+1 resume, recovered file contents/ancestry and MR.
+This proves the owned tracking source, not a guaranteed available server archive.
+
+Measured full target elapsed time was 1,261 s; workersvc was 504.639 s, E1 parent
+38.42 s and the account-unavailable variant 8.41 s. A prior full-target attempt
+hit the existing ten-minute workersvc package timeout; the original base
+`92ce399d` reproduced that timeout at 600.767 s. The final retry passed without
+timer, Taskfile or workflow changes; the inherited aggregate-runtime finding was
+recorded separately. CI before/after timing and critical-path impact are unmeasured.
+Runtime: Node 24.20.0, API Go 1.27.2 and PostgreSQL 17.11; provisioned agent/web
+dependencies were used without reinstalling.
+
+M3 updates the recovery guide and embedded mirror, the scoped specification, ADR-1766's
+mechanism amendment, ADR-1590's pointer, the architecture links and the changelog.
+`task docs:sync`, `task check-docs:web` and `TestEmbeddedDocsMatchSource` passed;
+the docs checker reported body-line budget warnings. M4 hosted acceptance, deployment and real
+account manipulation have not been performed. The original unconfirmed boundary
+symptom is not guaranteed to have been saved by this implementation.
 
 ## Risks
 

@@ -910,7 +910,16 @@ chain in the diagram above, with no intervening `running`.
   Codex uses accepted structured per-turn account-window evidence, with the latest
   selected reset or bounded fallback, not provider prose, account reads or polling.
   If that account is unavailable after promotion, Claim refuses it and Sweep holds
-  it at `recovery_wait` / `codex_account_unavailable`. Recovered approved work
+  it at `recovery_wait` / `codex_account_unavailable`. The account hold and
+  same-identity re-admission are defined by [PRD #1590](prds/1590-codex-quarantine-claim-hold.md)
+  and [ADR-1590](adr/1590-codex-binding-same-identity-readmission.md).
+  [PRD #1595](prds/1595-codex-boundary-account-park.md) extends this hold to eligible
+  running subscription boundary reconciles: a negotiated worker captures source
+  credential-free before requesting a park; the API re-classifies under claim fences
+  and run → alias → account locks, revokes the capability, and retains custody and
+  source-worker affinity. The mechanism is owned by
+  [ADR-1766's amendment](adr/1766-codex-vault-lock-park.md#account-unavailable-boundary-amendment-issue-1595-2026-10-10);
+  maintainer-hosted acceptance is pending. Recovered approved work
   resumes without another plan gate. Two independent guards keep the on-disk
   state alive (the runner's teardown carve-out and `home-reclaim`'s
   terminal-status check); losing either loses the transcript. See

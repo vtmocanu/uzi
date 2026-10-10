@@ -103,10 +103,14 @@ func recoveryParkJitter() time.Duration {
 // The StateRequest parameter carries the reported claim_generation (threaded to the per-query
 // fence, PRD #1247 M5a-1 rework) and the already-validated recovery_cause, of which only
 // 'vault_locked' is persisted (recoveryCauseStored, issue #1766 M2).
-func (s *Service) setRecoveryWait(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
+type recoveryWaitWriter interface {
+	SetRunRecoveryWait(context.Context, store.SetRunRecoveryWaitParams) (int64, error)
+}
+
+func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
-	return s.q.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
-		RecoveryCause:  recoveryCauseStored(req.RecoveryCause),
+	return writer.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
+		RecoveryCause:  cause,
 		RetryNotBefore: pgconv.Time(retryNotBefore),
 		SessionID:      sessionID,
 		ID:             run.ID,

@@ -409,6 +409,7 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
 		{"recovery_cause_vault_locked"},
+		{"recovery_cause_codex_account_unavailable"},
 		// PRD #1795 M1: this api accepts presentation_id / adopt_gate_revision on the
 		// awaiting_approval report and answers the allocated gate_revision on its ACK. A worker
 		// sends the new fields ONLY when it sees this token, because an older api's strict
