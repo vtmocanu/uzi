@@ -245,7 +245,8 @@ func renderRecentFires(p *uzicli.Printer, fires []apitypes.LastFire) {
 			renderStartedScheduleRun(p, "    ", st)
 		}
 		for _, sk := range f.Skips {
-			p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), sk.Title)
+			// CellText folds newlines in the untrusted forge title so it cannot forge a line.
+			p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), uzicli.CellText(sk.Title))
 		}
 	}
 }

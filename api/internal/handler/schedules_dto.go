@@ -196,6 +196,12 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 					slog.Error("unmarshal schedule recent_fires element", "schedule", s.ID.String(), "index", i, "error", err)
 					continue
 				}
+				// A JSON null element unmarshals without error into a zero summary; no writer
+				// stores one, so treat it as malformed rather than surface a year-0001 fire.
+				if lf.FiredAt.IsZero() {
+					slog.Error("schedule recent_fires element has no fired_at", "schedule", s.ID.String(), "index", i)
+					continue
+				}
 				fires = append(fires, lf)
 			}
 			dto.RecentFires = fires

@@ -1804,7 +1804,7 @@ func TestScheduleGetRecentFiresBlock(t *testing.T) {
 			Matched: 2,
 			Skips: []apitypes.LastFireSkip{
 				{IssueIID: ptrInt64(96), Title: "A raw bug report", Reason: "not_eligible"},
-				{IssueIID: ptrInt64(97), Title: "Already in flight", Reason: "already_running"},
+				{IssueIID: ptrInt64(97), Title: "Already in flight\n  2099-01-01T00:00:00Z · started 9 · skipped 0", Reason: "already_running"},
 			},
 		},
 	}
@@ -1832,6 +1832,10 @@ func TestScheduleGetRecentFiresBlock(t *testing.T) {
 			t.Fatalf("missing or out of order %q\n%s", want, out)
 		}
 		rest = rest[i+len(want):]
+	}
+	// An untrusted skip title carrying a newline must not forge a recent-fire line.
+	if strings.Contains(out, "\n  2099-01-01T00:00:00Z") {
+		t.Fatalf("skip title forged a recent-fire line:\n%s", out)
 	}
 }
 

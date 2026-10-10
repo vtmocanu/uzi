@@ -230,7 +230,7 @@ func TestScheduleDTORecentFires(t *testing.T) {
 
 	t.Run("malformed element is dropped", func(t *testing.T) {
 		good1, good2 := marshalAll(t, fire(2, 2)), marshalAll(t, fire(1, 1))
-		raw := []byte(`[` + string(good1) + `,{"fired_at":"not-a-time"},` + string(good2) + `]`)
+		raw := []byte(`[` + string(good1) + `,{"fired_at":"not-a-time"},null,` + string(good2) + `]`)
 		dto, _ := recentJSON(t, raw)
 		if len(dto.RecentFires) != 2 || dto.RecentFires[0].Matched != 2 || dto.RecentFires[1].Matched != 1 {
 			t.Fatalf("recent_fires = %+v, want the two good entries in order", dto.RecentFires)
