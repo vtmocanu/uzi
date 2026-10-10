@@ -526,15 +526,16 @@ A few worth knowing:
   reached nobody, a hint that newer eligible issues weren't reached because the candidates
   ahead of them were skipped (it no longer suggests raising `--max-issues`:
   the fix is to clear those skips, and a higher cap also raises how many runs
-  one fire can start). After it, a **Recent fires** block lists the schedule's
+  one fire can start). A label sweep also prints how many open issues
+  match its selector but aren't eligible (`ineligible_matched`), when known.
+  After it, a **Recent fires** block lists the schedule's
   last 10 scheduled fires that started or skipped something, newest first
   (nothing is printed when there are none): each entry is a summary line
   (`<RFC 3339 UTC stamp> · started N · skipped M`), then one line per started
   issue (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
   schedule), then one line per skipped issue with its human reason label and
-  title. A label sweep also prints how many open issues
-  match its selector but aren't eligible (`ineligible_matched`), when known;
-  a never-fired schedule reads `Last fire: never fired`, and `--json` carries
+  title.
+  A never-fired schedule reads `Last fire: never fired`, and `--json` carries
   the same detail under `.last_fire` and the list under `.recent_fires` (including `.last_fire.ineligible_matched`
   when present — absent means unknown, not zero). `run-now` prints the
   matching per-candidate breakdown inline — a `Started N run(s)` header with

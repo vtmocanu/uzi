@@ -278,7 +278,10 @@ Web-only; no API/schema/agent changes. [user 2026-08-14]
 - Past runs reveal progressively ("show next 50"), like the board.
 - Admin Factory status shows only other users' runs — the admin's own runs are not repeated there.
 - Alongside (same batch): the Schedules "Last fire" caret must render correctly.
-- Schedules keep, alongside `last_fire`, the last 10 scheduled fires that started or skipped something (`recent_fires`, newest first); web and `uzi schedule get` list them. (AI-synced 2026-10-10)
+
+## Feature #2519 — Schedules keep recent fires
+
+- Schedules keep, alongside `last_fire`, the last 10 scheduled fires that started or skipped something (`recent_fires`, newest first); web and `uzi schedule get` list them. (AI-synced 2026-10-10, #2519)
 
 ## Feature #24 — MR closed without merging → card back to In Progress
 

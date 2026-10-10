@@ -526,8 +526,9 @@ reaches lands in exactly one bucket, so the tally never silently drops one.
 
 The outcome surfaces everywhere a schedule's status does: the
 Schedules page's `Last run` cell (an outcome badge — started work vs.
-started nothing) with an expandable **Recent fires** panel giving the
-per-issue breakdown (see [Recent fires](#recent-fires)); `uzi schedule
+started nothing) with an expandable panel giving the per-issue breakdown
+(labelled **Recent fires** once the schedule has recent fires, **Last fire**
+otherwise; see [Recent fires](#recent-fires)); `uzi schedule
 get`'s **Last fire** and **Recent fires** blocks (and their `--json`
 `.last_fire` and `.recent_fires`); and `uzi schedule run-now`'s
 per-candidate summary. In the web per-issue breakdown, each row's `#<iid>` links to
@@ -552,8 +553,11 @@ that started nothing (or fewer than expected) is being starved by
 [backfill](#sweep-cap) to walk past each one individually. It's shown in
 the Schedules list's **Last run** badge when the fire started nothing
 ("0 started · N not eligible", with the skip count between them when the
-fire also skipped candidates), the Schedules page's **Recent fires** panel (**Last fire** on a schedule with no
-recent fires yet), `uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s
+fire also skipped candidates), and the Schedules page's panel, but only
+while the schedule has no recent fires or when an entry in `recent_fires`
+itself carries the count: the web shows `recent_fires[0]` whenever the list
+is non-empty, and a fire whose selector matched only ineligible issues has
+`matched` 0, so it is never added to that list. It is also in `uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s
 summary, and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
 `ineligible_matched`). It's **absent, not zero, on a fire from before this
 count existed and on an assigned-selector sweep** (an assigned candidate is
@@ -578,12 +582,14 @@ reads `last_fire: null`.
 Alongside `last_fire`, a schedule keeps `recent_fires`: the last 10
 scheduled fires that **did something**, newest first, each in the same
 shape as `last_fire`. "Did something" means `matched > 0`, so the fire
-started a run or skipped an issue. It is never appended for a
+started a run or recorded a skip. It is never appended for a
 capacity-blocked tick (the "waiting for room" tick, matched 0), a tick
 that examined 0 candidates, or a fire whose summary failed to serialize.
 `last_fire` is unchanged: it is still the latest persisted tick, so it can
 differ from `recent_fires[0]` (for example, when the latest tick was
-blocked on capacity). The parked and transient paths write nothing to
+blocked on capacity, or matched 0 because nothing was eligible). The web
+shows only a blocked latest tick (the "Waiting for room at" line and a
+panel note), not an examined-0 one. The parked and transient paths write nothing to
 either field, and `run-now` records nothing in either. A one-time schedule
 held on a disabled credential appends its hold once, not once per tick,
 because the hold only writes when the stored summary differs.
@@ -598,7 +604,7 @@ current `last_fire` when it matched > 0.
 (`[]` when none); an older server lacks the field. On the Schedules page,
 a non-empty `recent_fires` makes the **Last run** cell show the newest
 recent fire's outcome badge and stamp instead of `last_fire`'s, and, when
-the latest tick was capacity-blocked, a muted
+the latest tick was capacity-blocked, a warning-coloured
 "Waiting for room at `<stamp>`" line. The **Recent fires** panel lists entries newest
 first: the newest is expanded with the per-issue breakdown, older ones are
 collapsed headers (stamp, outcome badge, examined/started/skipped counts)
