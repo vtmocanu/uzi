@@ -36,6 +36,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A judge run killed by a usage limit now fails with the limit facts instead of posting the fallback review ([#1970](https://github.com/vtmocanu/uzi/issues/1970)).**
+  The Claude judge lane reports the run failed with its rate-limit window and reset time (or a usage-limit reason when the model reported none), posts no review and does not report the run completed. Other model errors still post the deterministic fallback; the Codex judge lane is unchanged.
+
 - **Recovery quota refusals retain a retry diagnostic and appear in Admin Health ([#2544](https://github.com/vtmocanu/uzi/issues/2544)).**
   Workers preserve typed recovery API quota as transient `storage_quota_exceeded` while retaining source, bundle bytes and capture identity for retry; untyped 507 remains generic. The owner-scoped `recovery.storage` health check warns on current persisted `needs_action` captures with the exact server reason `storage quota exceeded`, with logical byte accounting, effective limits and bounded owner examples; read failures are unknown. An admitted retry clears that capture’s quota marker before upload succeeds, and reserve refusals without a capture row are absent. The [operator diagnosis](docs/recovery-storage-diagnosis.md) separates byte/count/custody limits and read-only reclaim simulation; no quota, expiry, custody, bundle or capacity-warning policy changes are included.
 

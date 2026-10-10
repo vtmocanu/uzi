@@ -6,7 +6,8 @@
 // run a command on the worker), so the single turn runs with a deny-all tool hook and
 // `settingSources: []`. If the model call fails, it posts the deterministic
 // command-not-found fallback the API pre-scanned into the claim (Decision 4), so a
-// finding still lands.
+// finding still lands — except on a usage-limit death, which fails the judge run with
+// the structured limit facts instead (PRD #35 Decision 14, issue #1970).
 
 import os from "node:os";
 
@@ -214,6 +215,8 @@ export class JudgeRunner {
     // Build the review. Any failure BEFORE the post still lands the deterministic
     // command-not-found findings the claim carries (Decision 4): a trace-fetch throw
     // must not lose them, so it falls back rather than failing the run with no review.
+    // The one exception is a usage-limit death (LimitReachedError), which fails the run
+    // with its structured limit facts (PRD #35 Decision 14, issue #1970).
     let review: ReviewRequest;
     // The terminal result frame's usage, mapped to a run message the API's foldRunUsage
     // writes into a run_usage row (PRD #69 M6). Set ONLY on a successful model call —
@@ -270,6 +273,31 @@ export class JudgeRunner {
         }
       }
     } catch (err) {
+      if (err instanceof LimitReachedError) {
+        // Issue #1970: a judge never parks, it dies better — failed with the limit facts,
+        // no review, no `completed`. A limit with neither a window nor a reset (a bare
+        // terminal_reason) carries no facts for the server to compose a reason from, so
+        // it fails with the error text as failure_reason instead of an empty one.
+        this.log.warn("judge model call hit a usage limit; failing the judge run", {
+          run_id: judgeRunId,
+          error: errMessage(err),
+        });
+        const hasFacts = err.rateLimitType !== undefined || err.resetsAtMs !== undefined;
+        await safeReportFailed(
+          this.client,
+          this.log,
+          "judge",
+          judgeRunId,
+          errMessage(err),
+          hasFacts ? err : undefined,
+          claim.claim_generation,
+          this.terminalDeps,
+        );
+        // The finally that removes it belongs to the post/complete try below, which this
+        // return skips.
+        this.activeRuns?.remove(judgeRunId);
+        return;
+      }
       this.log.warn("judge trace/prep failed; posting deterministic fallback", {
         run_id: judgeRunId,
         error: errMessage(err),
@@ -379,8 +407,9 @@ export class JudgeRunner {
     return { target: last.target, inputs: last.inputs, messages };
   }
 
-  /** The model call: one structured turn, no tools, JSON out. Throws on any failure
-   *  so execute() falls back to the deterministic review. */
+  /** The model call: one structured turn, no tools, JSON out. Falls back to the
+   *  deterministic review on any failure except a usage-limit death, which it rethrows
+   *  so execute() fails the run with the structured limit facts (issue #1970). */
   private async judge(
     claim: ClaimResponse,
     trace: JudgeTraceResponse,
@@ -399,6 +428,7 @@ export class JudgeRunner {
       const { text, result } = await this.runModel(token, model, prompt, claim.config?.default_effort);
       return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage: result };
     } catch (err) {
+      if (err instanceof LimitReachedError) throw err;
       this.log.warn("judge model call failed; using deterministic fallback", {
         run_id: claim.run_id,
         error: errMessage(err),
