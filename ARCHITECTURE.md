@@ -1129,7 +1129,7 @@ chain in the diagram above, with no intervening `running`.
   and two read-only surfaces reuse it: `RepoDTO.DockerAllowlisted`/`DockerBlocked`
   (`apitypes.RepoDTO`) are computed caller-scoped booleans feeding the Repos page's
   Setup chip, and the PRD #47 `queuedReason` resolver (`workersvc/health.go`) adds
-  `reasonRepoNotDockerAllowed` onto the `waiting_worker` health enum when every
+  `reasonRepoNotDockerAllowedAdmin`/`reasonRepoNotDockerAllowedMember` onto the `waiting_worker` health enum when every
   online worker is Docker-capable and none is eligible for the run's repo.
 - **Capability-aware eligibility, claim through plan gate (PRD #84).** A worker
   advertises a capability set (`workers.capabilities`, from the closed `{docker,

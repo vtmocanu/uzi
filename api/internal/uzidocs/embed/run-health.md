@@ -20,7 +20,7 @@ left to the deadline (e.g. `1h 5m left`).
 | ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled) — or one tool call has been running far longer than a normal build or test suite would (see [Long tool calls](#long-tool-calls)). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
 | ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will park and wait for you at the timeout, not fail — see [Running out of time](#running-out-of-time). | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
-| ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
+| ⚠ waiting for worker | Queued longer than expected with no worker claiming it — or, for a repo the Docker worker allowlist blocks, as soon as the next health sweep detects it (see below). | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
 When suitable persistent workers are finishing runs before an upgrade, the reason is
@@ -31,12 +31,30 @@ run vetoes it, because that worker can resume its own work. Incompatible own wor
 not veto it. Account, vault, custody and isolated-profile guards keep precedence.
 
 One **waiting for worker** reason worth calling out is the Docker-worker
-allowlist. When every online worker is a Docker worker and the run's repo
-isn't on the Docker-worker allowlist, no worker is eligible to claim it, so
-the run stays `queued` and the owner's reason names it specifically — _"this
-repo isn't on the Docker worker allowlist, so no Docker worker can run it"_ —
-distinct from "no worker online" or "all workers busy". The fix is to add the
-repo to the allowlist, not to start another worker.
+repo allowlist. When the owner has workers online but every one of them is a
+Docker worker and the run's repo isn't on the Docker worker repo allowlist,
+no worker is eligible to claim it, so the run stays `queued` and the reason
+names it specifically, distinct from "no worker online" or "all workers busy".
+Unlike the other waiting reasons, it is flagged as soon as the next health
+sweep detects the block, without waiting for **Stuck queued after**
+(`health_queued_seconds`); a higher-precedence block (locked vault, custody
+limit, and so on) still hides it, and setting `health_queued_seconds` to `0`
+still turns it off with every other queued flag. The wording depends on
+whether the run's owner is an admin, because only an admin can change the
+allowlist (**Admin → Instance → Docker worker repo allowlist**, at
+`/admin/settings`). An admin viewing someone else's run sees the owner's
+variant.
+
+- Owner is an admin: _"this repo isn't on the Docker worker repo allowlist, so
+  your Docker workers can't run it; add it under Admin → Instance → Docker
+  worker repo allowlist"_
+- Owner is not an admin: _"this repo isn't on the Docker worker repo
+  allowlist, so your Docker workers can't run it; ask an admin to add it under
+  Admin → Instance → Docker worker repo allowlist"_
+
+The fix is to add the repo to the allowlist, not to start another worker. The
+owner's Slack nudge for this flag arrives sooner too, still subject to the
+[Slack nudge cooldown](./admin-settings.md).
 
 One **stalled** reason worth calling out is an undelivered outcome. When a
 worker has a running or awaiting-approval run's outcome journaled but not yet
