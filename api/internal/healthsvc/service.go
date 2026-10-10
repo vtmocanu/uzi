@@ -276,7 +276,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,
-		s.checkDB(ctx),
+		s.checkDB(ctx, now),
 		s.checkLoops(now),
 		s.checkForgeCIWatch(ctx, now),
 		s.checkForgeSync(ctx, now),

@@ -503,7 +503,7 @@ func TestDB(t *testing.T) {
 				st := *tc.probe
 				svc.probeDB = func(context.Context) dbStat { return st }
 			}
-			c := svc.checkDB(context.Background())
+			c := svc.checkDB(context.Background(), svc.now())
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
 			}
@@ -528,7 +528,7 @@ func TestDBDiskFull(t *testing.T) {
 			clock = fixedNow
 			svc, sig := mk()
 			sig.Observe(err)
-			c := svc.checkDB(context.Background())
+			c := svc.checkDB(context.Background(), svc.now())
 			if c.Severity != sevDanger || c.Summary != "Database writes are failing: disk full (53100)." {
 				t.Fatalf("got %q / %q", c.Severity, c.Summary)
 			}
@@ -536,9 +536,23 @@ func TestDBDiskFull(t *testing.T) {
 				t.Fatalf("evidence = %+v", c.Evidence)
 			}
 			clock = fixedNow.Add(dbdiskfull.Window + time.Second)
-			if c := svc.checkDB(context.Background()); c.Severity != sevOK {
+			if c := svc.checkDB(context.Background(), svc.now()); c.Severity != sevOK {
 				t.Fatalf("after window: %q / %q", c.Severity, c.Summary)
 			}
+		}
+	})
+	t.Run("since is the incident start, evidence is the last sighting", func(t *testing.T) {
+		clock = fixedNow
+		svc, sig := mk()
+		sig.Observe(pg("53100"))
+		clock = fixedNow.Add(time.Minute)
+		sig.Observe(pg("53100"))
+		c := svc.checkDB(context.Background(), svc.now())
+		if c.Since == nil || *c.Since != fixedNow.UTC().Format(time.RFC3339) {
+			t.Fatalf("Since = %v, want %v", c.Since, fixedNow.UTC().Format(time.RFC3339))
+		}
+		if c.Evidence[0].Value != fixedNow.Add(time.Minute).UTC().Format(time.RFC3339) {
+			t.Fatalf("evidence = %+v", c.Evidence)
 		}
 	})
 	t.Run("nil probe does not hide it", func(t *testing.T) {
@@ -546,7 +560,7 @@ func TestDBDiskFull(t *testing.T) {
 		svc, sig := mk()
 		svc.probeDB = nil
 		sig.Observe(pg("53100"))
-		if c := svc.checkDB(context.Background()); c.Severity != sevDanger {
+		if c := svc.checkDB(context.Background(), svc.now()); c.Severity != sevDanger {
 			t.Fatalf("got %q", c.Severity)
 		}
 	})
@@ -555,7 +569,7 @@ func TestDBDiskFull(t *testing.T) {
 			clock = fixedNow
 			svc, sig := mk()
 			sig.Observe(err)
-			if c := svc.checkDB(context.Background()); c.Severity != sevOK {
+			if c := svc.checkDB(context.Background(), svc.now()); c.Severity != sevOK {
 				t.Fatalf("%v: got %q / %q", err, c.Severity, c.Summary)
 			}
 		}

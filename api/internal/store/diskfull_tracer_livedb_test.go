@@ -19,7 +19,7 @@ func diskFullPool(t *testing.T) (context.Context, *pgxpool.Pool, *dbdiskfull.Sig
 	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
 	}
 	ctx := context.Background()
 	sig := dbdiskfull.New(nil)
@@ -67,7 +67,7 @@ func TestDiskFullTracerCommitPathLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p2.Close()
+	t.Cleanup(p2.Close)
 
 	tx, err := p2.Begin(ctx)
 	if err != nil {

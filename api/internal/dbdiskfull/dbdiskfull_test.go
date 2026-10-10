@@ -118,3 +118,32 @@ func TestTracerActivates(t *testing.T) {
 		t.Fatal("wrapped 53100 must activate")
 	}
 }
+
+func TestIncidentStartHoldsWithinWindowAndResetsAfterGap(t *testing.T) {
+	c := newClock()
+	s := New(c.now)
+	if _, ok := s.IncidentStart(); ok {
+		t.Fatal("no incident start before any sighting")
+	}
+	first := c.t
+	s.Observe(pgErr(CodeDiskFull))
+	c.t = c.t.Add(Window - time.Second)
+	s.Observe(pgErr(CodeDiskFull))
+	if st, ok := s.IncidentStart(); !ok || !st.Equal(first) {
+		t.Fatalf("IncidentStart = %v, %v; want %v", st, ok, first)
+	}
+	if last, _ := s.LastSeen(); !last.Equal(c.t) {
+		t.Fatalf("LastSeen = %v, want %v", last, c.t)
+	}
+	if s.Generation() != 1 {
+		t.Fatalf("gen = %d, want 1", s.Generation())
+	}
+	c.t = c.t.Add(Window + time.Second)
+	s.Observe(pgErr(CodeDiskFull))
+	if st, _ := s.IncidentStart(); !st.Equal(c.t) {
+		t.Fatalf("IncidentStart = %v, want reset to %v", st, c.t)
+	}
+	if s.Generation() != 2 {
+		t.Fatalf("gen = %d, want 2", s.Generation())
+	}
+}

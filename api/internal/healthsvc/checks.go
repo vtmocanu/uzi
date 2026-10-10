@@ -617,17 +617,20 @@ func (s *Service) checkQueueUndispatched(ctx context.Context, now time.Time) api
 // checkDB warns on a slow ping or a saturated pool and is danger on a failed ping or a
 // migration-version mismatch. It reads the injected probe (the live pool in production, a
 // fake in unit tests). A nil probe (no pool wired) is `unknown`.
-func (s *Service) checkDB(ctx context.Context) apitypes.HealthCheckDTO {
+func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("db")
 	// Evaluated before the nil-probe return so a recorded 53100 is never hidden behind
 	// "probe not configured". It is a fixed server-authored string; no DB error text.
-	// The clock is read only when a signal is wired: tests count clock calls per Evaluate.
-	if s.cfg.DiskFull != nil && s.cfg.DiskFull.Active(s.now()) {
+	if s.cfg.DiskFull != nil && s.cfg.DiskFull.Active(now) {
 		last, _ := s.cfg.DiskFull.LastSeen()
 		c.Severity = sevDanger
 		c.Summary = "Database writes are failing: disk full (53100)."
 		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Last seen", Value: last.UTC().Format(time.RFC3339)}}
-		c.Since = sincePtr(last)
+		start, ok := s.cfg.DiskFull.IncidentStart()
+		if !ok {
+			start = last
+		}
+		c.Since = sincePtr(start)
 		c.Action = strPtr("The database volume is full. Free space or grow the volume; see the admin health docs for the recommended infrastructure free-space alert.")
 		return c
 	}

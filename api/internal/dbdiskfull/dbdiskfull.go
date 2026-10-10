@@ -33,6 +33,7 @@ func Is(err error) bool {
 type Signal struct {
 	now      func() time.Time
 	lastSeen atomic.Int64 // unix nanoseconds; 0 means never seen
+	start    atomic.Int64 // unix nanoseconds of the current incident's first sighting
 	gen      atomic.Uint64
 }
 
@@ -54,6 +55,7 @@ func (s *Signal) Observe(err error) bool {
 	t := s.now().UnixNano()
 	prev := s.lastSeen.Swap(t)
 	if prev == 0 || t-prev > int64(Window) {
+		s.start.Store(t)
 		s.gen.Add(1)
 	}
 	return true
@@ -83,6 +85,19 @@ func (s *Signal) LastSeen() (time.Time, bool) {
 	return time.Unix(0, last), true
 }
 
+// IncidentStart returns the first sighting of the current incident, if any. It resets
+// when a sighting follows a quiet gap longer than Window.
+func (s *Signal) IncidentStart() (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	t := s.start.Load()
+	if t == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, t), true
+}
+
 // Generation counts distinct incidents observed so far.
 func (s *Signal) Generation() uint64 {
 	if s == nil {
@@ -94,6 +109,9 @@ func (s *Signal) Generation() uint64 {
 // Tracer is a pgx.QueryTracer that feeds query errors to Signal. pgx v5 traces Exec,
 // Query and QueryRow (at rows close), and transaction Commit (which runs Exec("commit")),
 // so a 53100 raised at commit time is seen too.
+//
+// SendBatch, CopyFrom and Prepare use separate pgx tracer interfaces and are not traced
+// (the api uses none of them today).
 //
 // Not covered: the goose migration connection (a separate database/sql connection opened
 // in the store package's migrate.go), connect-time errors, and pool.Ping.
