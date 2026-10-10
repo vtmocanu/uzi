@@ -16,11 +16,15 @@ import type { LastFire, Schedule } from "../lib/api";
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ uziLabel: "uzi" }) }));
 afterEach(cleanup);
 
-function row(s: Schedule) {
-  return render(<MemoryRouter><table><tbody><ScheduleListRow s={s} name="Sweep"
+function rowElement(s: Schedule) {
+  return <MemoryRouter><table><tbody><ScheduleListRow s={s} name="Sweep"
     busy={false} addBusy={false} pauseNote={null} repos={[]} onToggle={vi.fn()}
     onRunNow={vi.fn()} onEdit={vi.fn()} onReset={vi.fn()} onClone={vi.fn()}
-    onRemove={vi.fn()} onAddRepo={vi.fn()} /></tbody></table></MemoryRouter>);
+    onRemove={vi.fn()} onAddRepo={vi.fn()} /></tbody></table></MemoryRouter>;
+}
+
+function row(s: Schedule) {
+  return render(rowElement(s));
 }
 
 const BLOCKED_AT = "2026-10-10T12:04:00Z";
@@ -127,6 +131,61 @@ describe("schedule row with recent fires (issue #2519)", () => {
     // A second click collapses it again.
     fireEvent.click(headers[0]);
     expect(within(panel).queryByText("Middle skipped issue")).toBeNull();
+
+    // The second older header expands to its own detail too.
+    fireEvent.click(headers[1]);
+    expect(headers[1].getAttribute("aria-expanded")).toBe("true");
+    const oldestDetail = document.getElementById(headers[1].getAttribute("aria-controls")!)!;
+    expect(within(oldestDetail).getByText("Earlier fire")).toBeTruthy();
+    expect(within(oldestDetail).getByText("Oldest started issue")).toBeTruthy();
+    expect(headers[0].getAttribute("aria-expanded")).toBe("false");
+    expect(within(panel).queryByText("Middle skipped issue")).toBeNull();
+  });
+
+  it("keeps an open earlier fire open when a refetch prepends a new fire", async () => {
+    const s = await sweep({ last_fire: newest });
+    const { rerender } = row(s);
+    fireEvent.click(disclosure("Recent fires"));
+    const panel = () => document.getElementById(`last-fire-${s.id}`)!;
+    const headers = () => within(within(panel()).getByRole("list", { name: "Earlier fires" })).getAllByRole("button");
+    fireEvent.click(headers()[0]);
+    expect(within(panel()).getByText("Middle skipped issue")).toBeTruthy();
+    const openId = headers()[0].getAttribute("aria-controls");
+
+    // Run now lands a new fire; the refetched list shifts every older entry down one slot.
+    const fresh: LastFire = { fired_at: "2026-10-10T12:30:00Z", matched: 1, capped: false, skips: [],
+      started: [{ issue_iid: 1012, run_id: "run-fresh", title: "Fresh started issue" }] };
+    rerender(rowElement({ ...s, last_fire: fresh, recent_fires: [fresh, newest, middle, oldest] }));
+
+    const after = headers();
+    expect(after).toHaveLength(3);
+    // The former newest is now an earlier fire, and it stays collapsed.
+    expect(after[0].textContent).toContain(formatStamp(newest.fired_at));
+    expect(after[0].getAttribute("aria-expanded")).toBe("false");
+    // The fire that was open is still open, under the same id.
+    expect(after[1].textContent).toContain(formatStamp(middle.fired_at));
+    expect(after[1].getAttribute("aria-expanded")).toBe("true");
+    expect(after[1].getAttribute("aria-controls")).toBe(openId);
+    const detail = document.getElementById(openId!)!;
+    expect(within(detail).getByText("Middle skipped issue")).toBeTruthy();
+    expect(after[2].getAttribute("aria-expanded")).toBe("false");
+    expect(within(panel()).queryByText("Newest started issue")).toBeNull();
+  });
+
+  it("gives earlier fires that share a fired_at distinct, valid ids", async () => {
+    const twin: LastFire = { ...oldest, started: [{ issue_iid: 1004, run_id: "run-twin", title: "Twin started issue" }] };
+    const s = await sweep({ recent_fires: [newest, oldest, twin] });
+    row(s);
+    fireEvent.click(disclosure("Recent fires"));
+    const panel = document.getElementById(`last-fire-${s.id}`)!;
+    const headers = within(within(panel).getByRole("list", { name: "Earlier fires" })).getAllByRole("button");
+    fireEvent.click(headers[0]);
+    fireEvent.click(headers[1]);
+    const ids = headers.map((h) => h.getAttribute("aria-controls")!);
+    expect(new Set(ids).size).toBe(2);
+    for (const id of ids) expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(within(document.getElementById(ids[0])!).getByText("Oldest started issue")).toBeTruthy();
+    expect(within(document.getElementById(ids[1])!).getByText("Twin started issue")).toBeTruthy();
   });
 
   it("omits the blocked note when last_fire was not blocked", async () => {

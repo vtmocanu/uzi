@@ -345,14 +345,23 @@ export function LastFireDetail({ s, fire, heading = "Last fire" }: { s: Schedule
 // capacity, a note naming that tick and its numbers leads the panel, since the list itself
 // only holds fires that examined something. Callers render it only for a non-empty list.
 export function RecentFiresPanel({ s, fires, panelId }: { s: Schedule; fires: LastFire[]; panelId: string }) {
-  const [open, setOpen] = useState<ReadonlySet<number>>(() => new Set());
+  // Open state, React keys and DOM ids follow each fire's identity (fired_at), not its
+  // position: a refetch after Run now prepends a fire, and a positional key would move the
+  // open slot onto a different fire. A repeated fired_at gets an occurrence suffix.
+  const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
   const blocked = s.last_fire?.capacity?.blocked ? s.last_fire : null;
   const [newest, ...older] = fires;
-  const toggle = (i: number) =>
+  const seen = new Map<string, number>();
+  const keys = older.map((f) => {
+    const n = (seen.get(f.fired_at) ?? 0) + 1;
+    seen.set(f.fired_at, n);
+    return n === 1 ? f.fired_at : `${f.fired_at}#${n}`;
+  });
+  const toggle = (key: string) =>
     setOpen((cur) => {
       const next = new Set(cur);
-      if (next.has(i)) next.delete(i);
-      else next.add(i);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   return (
@@ -370,13 +379,15 @@ export function RecentFiresPanel({ s, fires, panelId }: { s: Schedule; fires: La
       {older.length > 0 && (
         <ul aria-label="Earlier fires" className="flex flex-col gap-2">
           {older.map((f, i) => {
-            const isOpen = open.has(i);
-            const id = `${panelId}-earlier-${i}`;
+            const key = keys[i];
+            const isOpen = open.has(key);
+            // fired_at slugged to id-safe characters; the occurrence suffix keeps it unique.
+            const id = `${panelId}-earlier-${key.replace(/[^A-Za-z0-9_-]/g, "-")}`;
             return (
-              <li key={`${f.fired_at}-${i}`} className="flex flex-col gap-2">
+              <li key={key} className="flex flex-col gap-2">
                 <button
                   type="button"
-                  onClick={() => toggle(i)}
+                  onClick={() => toggle(key)}
                   aria-expanded={isOpen}
                   // Only while the detail is mounted, as LastRunOutcome's disclosure does.
                   aria-controls={isOpen ? id : undefined}
