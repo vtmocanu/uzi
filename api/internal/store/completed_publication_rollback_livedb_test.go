@@ -110,20 +110,20 @@ func TestCompletedPublicationRollbackRoundTripLiveDB(t *testing.T) {
 		}
 		expected[name] = snapshot
 	}
-	for _, version := range []int64{317, 316, 315, 312} {
+	for _, version := range []int64{319, 318, 317, 312} {
 		if err := store.MigrateDownTo(ctx, dsn, version); err != nil {
 			t.Fatalf("Down to %d: %v", version, err)
 		}
-		if version == 316 {
+		if version == 318 {
 			for _, function := range []string{"completed_publication_stamp", "recovery_inventory_hold_guard"} {
 				var body string
 				if err := pool.QueryRow(ctx, `SELECT prosrc FROM pg_proc WHERE oid=$1::regproc`,
 					function).Scan(&body); err != nil || strings.Contains(body, "self_improve") {
-					t.Fatalf("Down317 %s still supports self_improve: %v", function, err)
+					t.Fatalf("Down319 %s still supports self_improve: %v", function, err)
 				}
 			}
 		}
-		if version > 315 {
+		if version > 317 {
 			continue
 		}
 		var columns, objects int

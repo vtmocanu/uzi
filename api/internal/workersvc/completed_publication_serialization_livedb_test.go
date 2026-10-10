@@ -244,7 +244,7 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 	})
 	config.Path = "/" + name
 	isolated := config.String()
-	if err = store.MigrateTo(ctx, isolated, 317); err != nil {
+	if err = store.MigrateTo(ctx, isolated, 319); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, isolated)
@@ -277,9 +277,9 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		return identity, receipt
 	}
 	identity, receipt := read()
-	for step, version := range []int64{317, 318, 317, 318} {
+	for step, version := range []int64{319, 320, 319, 320} {
 		if step > 0 {
-			if version == 317 {
+			if version == 319 {
 				err = store.MigrateDownTo(ctx, dsn, version)
 			} else {
 				err = store.MigrateTo(ctx, dsn, version)
@@ -290,7 +290,7 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		}
 		t.Run(fmt.Sprintf("step_%d_version_%d", step, version), func(t *testing.T) {
 			assertPublicationDowngrade(t, e, false, true)
-			assertPublicationDowngrade(t, e, true, version == 318)
+			assertPublicationDowngrade(t, e, true, version == 320)
 			afterIdentity, afterReceipt := read()
 			if !bytes.Equal(identity, afterIdentity) || !bytes.Equal(receipt, afterReceipt) {
 				t.Fatal("migration altered existing identity or receipt")
