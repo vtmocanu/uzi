@@ -1146,6 +1146,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
+      - ./.agents/skills/uzi-lander/scripts/takeover-repo-fallback.test.sh
       - ./.agents/skills/uzi-lander/scripts/orphans.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-run-ci.test.sh
       - ./.agents/skills/uzi-lander/scripts/test-linux.test.sh
