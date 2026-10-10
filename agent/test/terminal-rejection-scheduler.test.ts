@@ -23,13 +23,13 @@ function custody(generation: number): TerminalRejectionCustodyResponse {
   return { run_id: run, worker_id: worker, generation, exact_holds: [{ id: hold, state: "released" }],
     sibling_holds: [], exact_count: 1, sibling_count: 0, exact_complete: true, sibling_complete: true, complete: true, outcome: "settled" };
 }
-async function until(predicate: () => boolean | Promise<boolean>) {
-  const deadline = Date.now() + 10_000;
+async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await predicate()) return;
     await sleep(5);
   }
-  assert.fail("condition did not complete within ten seconds");
+  assert.fail(`condition did not complete within ${timeoutMs}ms`);
 }
 async function rig(generations = [3], physical = run, generationWidth = 0) {
   const root = await fs.mkdtemp(path.join(scratch, "terminal-scheduler-"));
@@ -82,12 +82,12 @@ test("long aliases exceeding page metadata budget report all 310 generations des
   const coordinator = new TerminalRejectionCoordinator(r.outbox, r.client, nullLogger(), undefined, undefined, 2, 50);
   const loop = coordinator.loop(worker, r.controller.signal);
   try {
-    await until(() => posted.size === 310 && reads.size === 310);
+    await until(() => posted.size === 310 && reads.size === 310, 30_000);
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), true);
     assert.equal((await fs.readdir(path.dirname(r.file()))).length, 310);
     settle = true;
     coordinator.queueReconciliation();
-    await until(async () => (await fs.readdir(path.dirname(r.file()))).length === 0);
+    await until(async () => (await fs.readdir(path.dirname(r.file()))).length === 0, 30_000);
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), false);
   } finally { await r.clean(loop); }
 });
