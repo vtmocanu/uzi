@@ -7,7 +7,7 @@
 //
 // Admins get the HealthOverviewCard instead — the card and this line are mutually exclusive.
 
-import type { RunListItem, Worker } from "../lib/api";
+import type { RunSummaryItem, Worker } from "../lib/api";
 import { likelyCause } from "./WorkerUpgradeBadge";
 
 // The line is a fixed frame + reassurance tail (server-authored, PRD #1484), with the CAUSE
@@ -28,7 +28,7 @@ const GENERIC_CAUSE = "The worker image cannot start.";
 // The three conditions, all read from the viewer's own runs and workers: NOT admin, at least
 // one queued run, at least one hosted worker they own, and EVERY hosted worker they own reads
 // upgrade_failed. Any one failing hides the line.
-function platformLineVisible(isAdmin: boolean, runs: RunListItem[], workers: Worker[]): boolean {
+function platformLineVisible(isAdmin: boolean, runs: RunSummaryItem[], workers: Worker[]): boolean {
   if (isAdmin) return false;
   const hasQueuedRun = runs.some((r) => r.status === "queued");
   const hosted = workers.filter((w) => w.kind === "hosted");
@@ -53,7 +53,7 @@ export function HealthPlatformLine({
   workers,
 }: {
   isAdmin: boolean;
-  runs: RunListItem[];
+  runs: RunSummaryItem[];
   workers: Worker[];
 }) {
   if (!platformLineVisible(isAdmin, runs, workers)) return null;

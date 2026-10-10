@@ -3575,14 +3575,13 @@ export interface UsageTail {
 // RunListItem is a run row for the index + admin overview: the run plus display
 // context. owner_email is present only on the admin (all-users) list.
 // RunListItem is the LIST row — GET /api/runs. It extends Run, and that inheritance is a
-// trap worth naming: on the Go side RunDTO and RunListItemDTO are SEPARATE structs, so a
-// field added to one is simply absent from the other. Here, a field added to `Run` is
-// silently inherited by RunListItem, so putting a list-only field at the wrong level
-// compiles fine and quietly claims that GET /runs/{id} returns something the API never
-// sends. Nothing fails at runtime until a caller reads the missing field.
-//
-// So: a field the API puts on RunListItemDTO belongs HERE, not on Run. (PRD #98 M4's judge
-// badge fields were caught doing exactly this, by tsc via the run-view fixtures.)
+// trap worth naming: here, a field added to `Run` is silently inherited by RunListItem,
+// so putting a list-only field at the wrong level compiles fine and quietly claims that
+// GET /runs/{id} returns something the API never sends. On the Go side RunListItemDTO
+// EMBEDS RunDTO, so the list row carries every detail field; the rule that still holds is
+// that a field the API puts on RunListItemDTO alone belongs HERE, not on Run. (PRD #98
+// M4's judge badge fields were caught doing exactly this, by tsc via the run-view
+// fixtures.) The compact projection of this row is RunSummaryItem (?view=summary).
 export interface RunListItem extends Run {
   /** Judge badge (PRD #98 M4). judge_verdict is the run's review verdict, null when
    *  the run was never judged — rendered as NO badge, never a neutral one, since
@@ -3607,6 +3606,15 @@ export interface RunListItem extends Run {
   worker_name: string | null;
   owner_email?: string;
 }
+
+/** The compact run-list row served by GET /api/runs?view=summary and
+ *  GET /api/admin/runs?view=summary (Go RunSummaryItemDTO): exactly RunListItem minus the
+ *  four heavy, detail-only text fields. Every list surface that renders badges, durations
+ *  or ordering reads only these keys; the run detail page fetches the full Run. */
+export type RunSummaryItem = Omit<
+  RunListItem,
+  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+>;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before

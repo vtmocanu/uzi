@@ -935,3 +935,21 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     expect(health.parentElement?.className).toBe("contents sm:hidden");
   });
 });
+
+// Issue #2661: the dashboard polls the compact summary projection; tiles and the recent
+// list still render from rows that lack the four heavy detail keys.
+describe("Dashboard — summary run projection (#2661)", () => {
+  it("requests view=summary and renders a row without the heavy keys", async () => {
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRun({
+      issue_title: "Summary row title",
+      status: "running",
+    });
+    mockApi.listRuns.mockResolvedValue({ runs: [summary as never] });
+    renderDashboard();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
+    expect(screen.getByText("Summary row title")).toBeTruthy();
+  });
+});

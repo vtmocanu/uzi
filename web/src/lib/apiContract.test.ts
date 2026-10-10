@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import type {
   Run,
   RunListItem,
+  RunSummaryItem,
   RunJob,
   Repo,
   AdminDockerAllowlistRepo,
@@ -83,6 +84,8 @@ import runZero from "../../../fixtures/api-contract/run.zero.json";
 import runFull from "../../../fixtures/api-contract/run.full.json";
 import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.json";
 import runListItemFull from "../../../fixtures/api-contract/run_list_item.full.json";
+import runSummaryItemZero from "../../../fixtures/api-contract/run_summary_item.zero.json";
+import runSummaryItemFull from "../../../fixtures/api-contract/run_summary_item.full.json";
 import repoZero from "../../../fixtures/api-contract/repo.zero.json";
 import repoFull from "../../../fixtures/api-contract/repo.full.json";
 import dockerAllowlistRepoZero from "../../../fixtures/api-contract/admin_docker_allowlist_repo.zero.json";
@@ -367,6 +370,32 @@ void _releaseCheckStatusFull;
   void _runListItemExtra;
   void _runListItemZero;
   void _runListItemFull;
+}
+
+// ── RunSummaryItem ──────────────────────────────────────────────────────────
+// RunSummaryItem is RunListItem minus plan_md, repo_agents, issue_description and
+// preserved_patch (GET /api/runs?view=summary, Go RunSummaryItemDTO). The ZeroOf
+// exemptions are the same as RunListItem's.
+{
+  const _runSummaryItemMissing: never = null as unknown as Exclude<keyof RunSummaryItem, keyof typeof runSummaryItemFull>;
+  const _runSummaryItemExtra: never = null as unknown as Exclude<keyof typeof runSummaryItemFull, keyof RunSummaryItem>;
+  const _runSummaryItemZero: ZeroOf<
+    RunSummaryItem,
+    | "plan_changed_files"
+    | "required_capabilities"
+    | "required_tools"
+    | "completion_unmet"
+    | "completion_deferred"
+    | "completion_accepted"
+    | "credential_epochs"
+    // nonNilStrings in runs_dto.go normalizes the recorded nil slice to [].
+    | "auto_approve_blocked_reasons"
+  > = runSummaryItemZero;
+  const _runSummaryItemFull: Widen<RunSummaryItem> = runSummaryItemFull;
+  void _runSummaryItemMissing;
+  void _runSummaryItemExtra;
+  void _runSummaryItemZero;
+  void _runSummaryItemFull;
 }
 
 // ── Repo (M2) ───────────────────────────────────────────────────────────────
@@ -1447,6 +1476,7 @@ function hasNull(v: unknown): boolean {
 const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "run", nullable: true },
   { stem: "run_list_item", nullable: true },
+  { stem: "run_summary_item", nullable: true },
   // PRD #1908 D-D: inputs (nil slice), origin members and result are null in zero.json.
   { stem: "run_job", nullable: true },
   { stem: "repo", nullable: true },

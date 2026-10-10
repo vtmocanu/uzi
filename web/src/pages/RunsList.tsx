@@ -18,7 +18,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
+import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunSummaryItem, type RunUsage } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
 import { ActivityIcon } from "../components/icons";
@@ -74,7 +74,7 @@ const SEARCH_INPUT_ID = "runs-search";
 // When a past run HAPPENED, for both sorting and date grouping: finished_at is the
 // honest anchor, updated_at the pre-feature fallback — one function so the sort and
 // the group headers can never disagree about where a run belongs.
-function pastAnchor(r: RunListItem): string {
+function pastAnchor(r: RunSummaryItem): string {
   return r.finished_at ?? r.updated_at;
 }
 
@@ -82,12 +82,12 @@ function pastAnchor(r: RunListItem): string {
 // compare: Go trims trailing zeros from the fractional seconds, so same-second stamps
 // of differing precision ("…:00Z" vs "…:00.5Z") order correctly as instants and
 // INCORRECTLY as strings (see lib/boardOrder.ts's timeKey).
-function pastInstant(r: RunListItem): number {
+function pastInstant(r: RunSummaryItem): number {
   const t = Date.parse(pastAnchor(r));
   return Number.isNaN(t) ? -Infinity : t;
 }
 
-export function sortPast(a: RunListItem, b: RunListItem): number {
+export function sortPast(a: RunSummaryItem, b: RunSummaryItem): number {
   const t = pastInstant(b) - pastInstant(a);
   if (t !== 0) return t;
   return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
@@ -121,7 +121,7 @@ function runUsageTotalTokens(u: RunUsage): number {
 // exposed: when each tab page fetched for itself, every switch remounted the
 // page, refetched, and blanked the counted tab label until the load returned.
 interface RunsData {
-  runs: RunListItem[];
+  runs: RunSummaryItem[];
   loading: boolean;
   error: string;
   credentialCounts: { claude: number; codex: number };
@@ -144,7 +144,7 @@ function useRunsData(): RunsData {
 // shows the bare label rather than a flashing 0 (past-count null); after that the
 // count exists for the layout's whole life.
 export function RunsLayout() {
-  const [runs, setRuns] = useState<RunListItem[]>([]);
+  const [runs, setRuns] = useState<RunSummaryItem[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   // PRD #295 / #1730: per-harness credential counts for the personal badge gate,
@@ -159,7 +159,7 @@ export function RunsLayout() {
   const load = useCallback(async (isAlive: () => boolean = () => true) => {
     try {
       const [{ runs }, { secrets }] = await Promise.all([
-        api.listRuns(),
+        api.listRuns({ view: "summary" }),
         // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
         // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint
         // failure must not blank the whole Runs area. Fall back to no badge.
@@ -190,10 +190,10 @@ export function RunsLayout() {
   // the last-good rows: unlike the first load, this swallows its error and never
   // routes through setError/setLoading, so a blip cannot re-flash the skeleton or
   // pop an error banner. The credential-badge secrets/credentialCounts stay mount-only
-  // (they change rarely), so the poll re-fetches api.listRuns() alone.
+  // (they change rarely), so the poll re-fetches api.listRuns({ view: "summary" }) alone.
   const poll = useCallback(async () => {
     try {
-      const { runs } = await api.listRuns();
+      const { runs } = await api.listRuns({ view: "summary" });
       setRuns(runs);
     } catch {
       // keep the last-good list
@@ -244,7 +244,7 @@ export function RunRow({
   owned = false,
   onExpedited,
 }: {
-  run: RunListItem;
+  run: RunSummaryItem;
   // now (issue #256 M3): a Date.now()-style clock, ticked by useNow in the parent, so
   // the live duration token re-derives without a per-row timer.
   now: number;
@@ -261,7 +261,7 @@ export function RunRow({
   // so there is no linkable flag to thread through.
   showCredential?: boolean;
   // owned (PRD #320 M6): the viewer owns this run, so the Expedite/undo action may show.
-  // RunListItem carries no per-row is_mine, so ownership is threaded from the caller: the
+  // RunSummaryItem carries no per-row is_mine, so ownership is threaded from the caller: the
   // personal Active list is all the viewer's own runs (owned), the admin factory list is
   // OTHER users' runs (not owned). The queued gate + the server's owner-scoped 404 are
   // the backstop, but this keeps a non-owner from ever seeing a control that 404s.
@@ -557,7 +557,7 @@ export function RunsList() {
   const now = useNow(1000);
 
   const { runs, loading, error, credentialCounts, reload } = useRunsData();
-  const [adminRuns, setAdminRuns] = useState<RunListItem[]>([]);
+  const [adminRuns, setAdminRuns] = useState<RunSummaryItem[]>([]);
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
   const [adminError, setAdminError] = useState("");
   const [adminLoading, setAdminLoading] = useState(true);
@@ -565,7 +565,7 @@ export function RunsList() {
   useEffect(() => {
     if (!isAdmin) return;
     let alive = true;
-    Promise.all([api.adminListRuns(), api.adminListWorkers()])
+    Promise.all([api.adminListRuns({ view: "summary" }), api.adminListWorkers()])
       .then(([r, w]) => {
         if (!alive) return;
         setAdminRuns(r.runs);
@@ -594,7 +594,7 @@ export function RunsList() {
   const pollAdmin = useCallback(async () => {
     if (!isAdmin) return;
     try {
-      const [r, w] = await Promise.all([api.adminListRuns(), api.adminListWorkers()]);
+      const [r, w] = await Promise.all([api.adminListRuns({ view: "summary" }), api.adminListWorkers()]);
       setAdminRuns(r.runs);
       setAdminWorkers(w.workers);
     } catch {
@@ -607,7 +607,7 @@ export function RunsList() {
   const past = runs.filter((r) => isTerminalRun(r.status));
   // The factory card shows OTHER users' runs only (amendment 2026-08-14 (2)): the
   // admin's own runs already appear in Active above. owner_email is the admin-list
-  // discriminator (RunListItem carries no is_mine); a row without one stays visible.
+  // discriminator (RunSummaryItem carries no is_mine); a row without one stays visible.
   const factoryRuns = adminRuns.filter((r) => r.owner_email !== user?.email);
 
   return (
@@ -773,7 +773,7 @@ export function RunsList() {
 // isGenuineFailure (PRD #1650 D7): the Failed filter's membership. A failed run that a
 // human deliberately stopped (plan rejected) is not a failure, and a cancelled run never
 // is; isStoppedRun owns that line, so the filter and the row's pill agree.
-function isGenuineFailure(r: RunListItem): boolean {
+function isGenuineFailure(r: RunSummaryItem): boolean {
   return r.status === "failed" && !isStoppedRun(r.status, r.stop_kind);
 }
 
