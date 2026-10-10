@@ -307,3 +307,94 @@ func TestProgressNoteDropsEmptyUsageEntry(t *testing.T) {
 		t.Fatalf("model_usage = %+v, want only c", p.ModelUsage)
 	}
 }
+
+// Two raw keys that sanitise to the same name keep the first valid entry in sorted raw-key
+// order (" claude-haiku" sorts before "claude-haiku"), on every normalisation.
+func TestProgressNoteCollidingKeysAreDeterministic(t *testing.T) {
+	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
+		`"claude-haiku":{"inputTokens":2}," claude-haiku":{"inputTokens":1},"  claude-haiku":{"inputTokens":0}}}`)
+	first := string(normalizeProgressNotePayload(raw))
+	for i := 0; i < 200; i++ {
+		if got := string(normalizeProgressNotePayload(raw)); got != first {
+			t.Fatalf("normalisation differs between runs:\n%s\n%s", first, got)
+		}
+	}
+	var p progressNotePayload
+	if err := json.Unmarshal([]byte(first), &p); err != nil {
+		t.Fatal(err)
+	}
+	// "  claude-haiku" sorts first but is invalid (all zero), so " claude-haiku" is the first valid.
+	if len(p.ModelUsage) != 1 || p.ModelUsage["claude-haiku"].InputTokens != 1 {
+		t.Fatalf("model_usage = %+v, want one claude-haiku with inputTokens 1", p.ModelUsage)
+	}
+}
+
+// An invalid entry that sorts first does not consume a cap slot.
+func TestProgressNoteInvalidEntryDoesNotConsumeCapSlot(t *testing.T) {
+	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
+		`"a0":{"inputTokens":0},"m1":{"inputTokens":1},"m2":{"inputTokens":2},"m3":{"inputTokens":3},"m4":{"inputTokens":4},"m5":{"inputTokens":5}}}`)
+	var p progressNotePayload
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw), &p); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.ModelUsage) != 4 {
+		t.Fatalf("kept %d models, want 4: %+v", len(p.ModelUsage), p.ModelUsage)
+	}
+	for _, m := range []string{"m1", "m2", "m3", "m4"} {
+		if _, ok := p.ModelUsage[m]; !ok {
+			t.Fatalf("model %s missing from %+v", m, p.ModelUsage)
+		}
+	}
+}
+
+// A zero-token entry that carries a provider cost is kept.
+func TestProgressNoteKeepsZeroTokenEntryWithCost(t *testing.T) {
+	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{"m":{"costUSD":0.01}}}`)
+	var p progressNotePayload
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw), &p); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.ModelUsage["m"]; !ok || len(p.ModelUsage) != 1 {
+		t.Fatalf("model_usage = %+v, want the costed zero-token entry kept", p.ModelUsage)
+	}
+}
+
+// Exact cache-write split prices for claude-haiku-4-5-20251001 (USD/MTok: in 1, out 5, 5m write
+// 1.25, 1h write 2), in micro-dollars. Swapping the 5m and 1h fields changes the price.
+func TestProgressNoteCacheWriteSplitExactPrice(t *testing.T) {
+	cases := []struct {
+		name       string
+		entry      string
+		wantStatus string
+		wantMicros int64
+	}{
+		// 400*1 + 40*5 + 30*1.25 + 20*2 = 677.5, rounded to 678.
+		{"both halves", `{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":50,"cacheCreation5mInputTokens":30,"cacheCreation1hInputTokens":20}`, "metered", 678},
+		// 400 + 200 + 40*1.25 = 650.
+		{"lone 5m covering the total", `{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":40,"cacheCreation5mInputTokens":40}`, "metered", 650},
+		// 400 + 200 + 40*2 = 680.
+		{"lone 1h covering the total", `{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":40,"cacheCreation1hInputTokens":40}`, "metered", 680},
+		// A lone half that does not account for the whole cache-write total cannot be priced.
+		{"lone 5m short of the total", `{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":50,"cacheCreation5mInputTokens":30}`, "unreported", 0},
+		{"lone 1h short of the total", `{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":50,"cacheCreation1hInputTokens":30}`, "unreported", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := worker()
+			fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID)}}
+			svc := New(fs, newBox(t), testParams())
+			payload := `{"text":"x","milestone_id":"m1","model_usage":{"claude-haiku-4-5-20251001":` + c.entry + `}}`
+			if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID,
+				[]IncomingMessage{{Seq: 4, Kind: "progress_note", Agent: "worker", Payload: json.RawMessage(payload)}}); err != nil {
+				t.Fatal(err)
+			}
+			if len(fs.upsertedUsage) != 1 {
+				t.Fatalf("upserts = %d, want 1", len(fs.upsertedUsage))
+			}
+			u := fs.upsertedUsage[0]
+			if u.CostStatus != c.wantStatus || u.CostUsd.Int.Int64() != c.wantMicros {
+				t.Fatalf("status=%s micros=%d, want %s/%d", u.CostStatus, u.CostUsd.Int.Int64(), c.wantStatus, c.wantMicros)
+			}
+		})
+	}
+}

@@ -43,7 +43,7 @@ const (
 	MaxProgressNoteTextRunes = 120
 	// maxProgressNoteModels bounds model_usage entries kept per note: one summary call names
 	// one model, so a handful is generous and a hostile object cannot fan out run_usage rows. Past the cap the
-	// first models in sorted-name order are kept, so the kept set is deterministic per payload.
+	// first valid models in sorted raw-key order are kept, so the kept set is deterministic per payload.
 	maxProgressNoteModels = 4
 	// maxProgressNoteMarkerRunes caps the service_tier / speed / inference_geo strings.
 	maxProgressNoteMarkerRunes = 32
@@ -97,24 +97,27 @@ func normalizeProgressNotePayload(raw json.RawMessage) json.RawMessage {
 	}
 	var usage map[string]json.RawMessage
 	if json.Unmarshal(in["model_usage"], &usage) == nil {
-		// Sanitise every key first, then keep the first maxProgressNoteModels in sorted order, so
-		// the kept subset is a pure function of the payload (map iteration order is random and a
-		// re-delivered batch must normalise to the same rows).
-		entries := make(map[string]json.RawMessage, len(usage))
-		for model, entry := range usage {
-			model = truncateRunes(strings.TrimSpace(runactivity.Sanitize(model)), maxUsageModelRunes-len(progressNoteModelPrefix))
-			if model != "" {
-				entries[model] = entry
-			}
+		// Walk the RAW keys in sorted order (map iteration order is random and a re-delivered
+		// batch must normalise to the same rows). Two raw keys can sanitise to the same name
+		// (" m" and "m"): the first valid entry in raw-key order wins, a later duplicate is
+		// ignored. The cap then keeps the first maxProgressNoteModels valid names in that walk;
+		// an invalid entry never consumes a slot. Raw-key order and sanitised-name order can
+		// differ (leading whitespace sorts first), so the kept set is "first valid by raw key".
+		rawKeys := make([]string, 0, len(usage))
+		for k := range usage {
+			rawKeys = append(rawKeys, k)
 		}
-		models := make([]string, 0, len(entries))
-		for model := range entries {
-			models = append(models, model)
-		}
-		sort.Strings(models)
+		sort.Strings(rawKeys)
 		dropped := 0
-		for _, model := range models {
-			mu, ok := normalizeProgressNoteModelUsage(entries[model])
+		for _, rawKey := range rawKeys {
+			model := truncateRunes(strings.TrimSpace(runactivity.Sanitize(rawKey)), maxUsageModelRunes-len(progressNoteModelPrefix))
+			if model == "" {
+				continue
+			}
+			if _, dup := out.ModelUsage[model]; dup {
+				continue
+			}
+			mu, ok := normalizeProgressNoteModelUsage(usage[rawKey])
 			if !ok {
 				continue
 			}
