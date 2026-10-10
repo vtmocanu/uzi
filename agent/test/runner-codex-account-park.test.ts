@@ -250,12 +250,16 @@ describe("M2 account park W3-W6/W9", () => {
     fs.mkdirSync(path.join(epoch, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(epoch, "sessions", rollout), contents);
     const run = w.exec.run.bind(w.exec);
+    // The fd-anchored session store needs Linux /proc/self/fd. Elsewhere the retry, rollback,
+    // custody and feed assertions still run; only the physical-session checks are Linux-only.
+    const physicalSession = process.platform === "linux";
     w.exec.run = async (ctx) => {
       ctx.onSessionId?.(session);
-      await CodexSessionStore.persist(epoch, store);
+      if (physicalSession) await CodexSessionStore.persist(epoch, store);
       return run(ctx);
     };
     const assertSession = async (): Promise<void> => {
+      if (!physicalSession) return;
       assert.equal(await CodexSessionStore.inspectSession(store, session), "present");
       const generation = fs.readFileSync(path.join(store, "current"), "utf8").trim();
       assert.equal(fs.readFileSync(path.join(store, "generations", generation, "sessions", rollout), "utf8"), contents);
