@@ -12,7 +12,7 @@ run message (`payload.model_usage`) and is folded into `run_usage` under a key n
 frame can produce:
 
 ```
-model         = "progress_note:<model>"     // e.g. progress_note:haiku, progress_note:gpt-6-luna
+model         = "progress_note:<model>"     // the provider-reported model id, e.g. progress_note:claude-haiku-4-5-20251001, progress_note:gpt-6-luna
 lineage_epoch = the note's own seq
 usage_basis   = per_leg, lineage_index 0
 ```
@@ -33,10 +33,11 @@ before it sums (see [ADR-195](0195-run-usage-per-model-fold.md) and
 what makes a re-delivered or re-folded result frame a no-op. They are also why a summary
 call cannot be folded under the bare model:
 
-- The lead often runs on `haiku`, the same model the Claude summary uses. Under the bare
-  `haiku` key the note's tokens are compared with the lead's cumulative leg figure by
-  `GREATEST`/`MAX`, so a small note is absorbed by the larger value and its spend
-  disappears from the total, or a larger one replaces the lead's figure and the lead's
+- A run's own result frames often carry the same model the Claude summary uses
+  (`claude-haiku-4-5-20251001`, from a role pinned to haiku or from the SDK's own internal
+  calls, ADR-0195). Under that bare key the note's tokens are compared with the run's
+  cumulative leg figure by `GREATEST`/`MAX`, so a small note is absorbed by the larger value and its spend
+  disappears from the total, or a larger one replaces the run's figure and the run's
   spend disappears. Either way the run total is wrong.
 - Two notes in one leg would collapse into each other for the same reason, since each is a
   separate small call and not a cumulative reading of one session.

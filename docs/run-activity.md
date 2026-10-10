@@ -551,7 +551,8 @@ ingests it, and it is capped at 120 characters.
 **When it shows.** Only on the single-run read (the run page, `uzi run get`,
 the TUI detail), never on the dashboard, runs list or TUI board. It needs the
 progress state to be a percent (an executing, healthy issue run with a frozen
-milestone list), an active milestone, and the setting on for the run's owner.
+milestone list), an active milestone, and the Now summary enabled both by the admin switch and
+in the run owner's settings.
 It shows the newest note written for the *current* milestone, so a note from
 an earlier milestone never lingers. A waiting, parked, queued or stalled run
 shows no note, even one written for its still-active milestone. The note
@@ -564,8 +565,8 @@ is stalled or hides its stall.
 milestone changes, when the active role changes, or when 10 minutes have
 passed since the last call and at least one new tool call has appeared. It
 makes at most one call per 5 minutes (triggers inside that window coalesce
-into one call at its end), and a failed or skipped call counts against the
-window. Each call times out after 30 seconds. It makes no call while the run
+into one call at its end), and a call that fails or whose result is discarded
+still counts against the window. Each call times out after 30 seconds. It makes no call while the run
 is held (a plan gate, a question, a pause or park, a credential switch), when
 the setting is off, or when no milestone is active; after a credential-switch
 attempt gives up, summaries resume at the next trigger. A result that arrives
@@ -579,7 +580,7 @@ claim secrets redacted.
 | Harness | Model | Limits |
 |---|---|---|
 | Claude | `haiku`, extended thinking off | 256 output tokens |
-| Codex | `gpt-6-luna` at reasoning effort `low` | The Codex advice path cannot enforce an output-token cap, so the 30-second timeout is the only bound. `low` is the lowest effort the pinned Codex runtime accepts |
+| Codex | `gpt-6-luna` at reasoning effort `low` | The Codex advice path cannot enforce an output-token cap, so the 30-second timeout is the only bound. `low` is the lowest effort uzi's Codex contract allows |
 
 There is no fallback to a more expensive model: if the account refuses the
 model, or the call fails or times out, that summary is skipped and the run is

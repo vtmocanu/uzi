@@ -58,8 +58,8 @@ type RawCredentialOverride struct {
 // 0.156.1 pin, whose catalog requires client >= 0.155.0): the product-owned picker is EXACTLY these
 // ids and catalog discovery never adds more. It mirrors the agent's
 // agent/src/codex/render.ts CONTRACT_MODELS and codex-pricing.ts price table, except
-// gpt-6-luna: the agent carries it only for the Now summary advice call (PRD #2603), and it is
-// deliberately not a picker entry here.
+// gpt-6-luna: the agent's set carries it (the Now summary model, PRD #2603, and so also honoured
+// as a template role pin), while this picker and frozen-run vocabulary deliberately leave it out.
 var codexModels = map[string]bool{
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true,
