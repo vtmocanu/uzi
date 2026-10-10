@@ -363,6 +363,7 @@ tasks:
       # Hermetic regressions for the landing scripts: no network, forge or live PR.
       # They pin review routing, fail-closed quota timing and stale-base push behavior.
       - task: test:uzi-lander
+      - task: test:ci-safe-paths
       # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
       # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
       - task: test:fmt-check-toolchain
@@ -884,6 +885,11 @@ tasks:
       # directory (so a stray file up the tree could govern the gate), and `-c` on a
       # missing file exits 1 -- indistinguishable from "there are findings".
       - ./scripts/lint-yaml.sh .yamllint
+
+  test:ci-safe-paths:
+    desc: workflow safe-path skips, fallback conditions, cancellation and agent result gates
+    cmds:
+      - ruby scripts/ci-safe-paths.test.rb
 
   lint:actions:
     desc: actionlint + zizmor over .github/workflows (embedded shell + Actions hazards)
