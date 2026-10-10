@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/packbudget"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -329,8 +333,9 @@ func TestWorkerRunPublishSkipMappings(t *testing.T) {
 		skipped string
 	}{
 		{"not_descendant", pushbroker.ErrNotDescendant, "not_descendant"},
-		{"unsupported", pushbroker.ErrTipMissing, "unsupported"},
-		{"too_large", pushbroker.ErrPackTooLarge, "unsupported"},
+		{"tip_missing", pushbroker.ErrTipMissing, "tip_missing"},
+		{"too_large", pushbroker.ErrPackTooLarge, "pack_too_large"},
+		{"pack_invalid", pushbroker.ErrPackInvalid, "pack_invalid"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -351,6 +356,53 @@ func TestWorkerRunPublishSkipMappings(t *testing.T) {
 				t.Fatalf("body = %q, want published=false skipped=%s", rec.Body.String(), tc.skipped)
 			}
 		})
+	}
+}
+
+// TestWorkerRunPublishRefusalLogsDetail pins that a broker refusal is logged at WARN with the
+// run id, the mapped reason and the content-free detail, while the response body never carries
+// the detail.
+func TestWorkerRunPublishRefusalLogsDetail(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	box := newBox(t)
+	sealed, _ := box.Seal([]byte("pat"))
+	st := &publishStore{ownedRun: issueRun(42), claim: issueClaimRow(sealed)}
+	publish := func(context.Context, pushbroker.Options) (pushbroker.Result, error) {
+		return pushbroker.Result{}, fmt.Errorf("%w: %w", pushbroker.ErrPackTooLarge,
+			&packbudget.BudgetError{Bound: packbudget.BoundTotalBytes, Limit: 123})
+	}
+	h := newPublishHandler(t, st, box, func(string) bool { return true }, publish)
+	rec := httptest.NewRecorder()
+	runID := uuid.New()
+	h.WorkerRunPublish(rec, publishReq(runID, validTip, strings.NewReader("pack")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "detail") {
+		t.Fatalf("response body leaks detail: %q", rec.Body.String())
+	}
+	var found int
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["msg"] != "worker run publish refused" {
+			continue
+		}
+		found++
+		detail, _ := rec["detail"].(string)
+		if rec["level"] != "WARN" || rec["run_id"] != runID.String() || rec["reason"] != "pack_too_large" ||
+			!strings.Contains(detail, "total reconstructed size") || !strings.Contains(detail, "123") {
+			t.Fatalf("log record = %v, want WARN with run_id, reason=pack_too_large and the bound in detail", rec)
+		}
+	}
+	if found != 1 {
+		t.Fatalf("found %d refusal records in %q, want 1", found, logs.String())
 	}
 }
 
