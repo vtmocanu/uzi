@@ -46,7 +46,7 @@ describe("HealthOverviewCard", () => {
       { label: "gpt-5.6-sol", value: "2 runs, promotional price expired" },
     ];
     doc.status = "warn";
-    doc.counts = { ok: 17, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ok: 18, warn: 1, danger: 0, unknown: 0, na: 0 };
     mockApi.getAdminHealth.mockResolvedValue(doc);
     renderCard();
     const card = await screen.findByRole("status", { name: "System health" });
