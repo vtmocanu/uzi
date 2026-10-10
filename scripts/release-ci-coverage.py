@@ -153,7 +153,14 @@ def state(run):
     if run is None:
         return 'absent'
     if run.get('status') == 'completed':
-        return 'success' if run.get('conclusion') == 'success' else 'failed'
+        conclusion = run.get('conclusion')
+        if conclusion == 'success':
+            return 'success'
+        if conclusion in ('cancelled', 'skipped'):
+            return 'absent'
+        if conclusion in ('failure', 'timed_out', 'action_required', 'startup_failure', 'neutral', 'stale'):
+            return 'failed'
+        raise Refusal(f'unrecognized completed workflow conclusion: {conclusion}')
     if run.get('status') in ('queued', 'in_progress', 'waiting', 'pending', 'requested'):
         return 'pending'
     raise Refusal('unrecognized workflow status')
@@ -230,8 +237,8 @@ def smoke(api, sha, tag, wait, interval):
     deadline = time.monotonic() + wait
     while True:
         run = api.run('kind-smoke.yml', sha, tag)
-        if state(run) == 'failed':
-            raise Refusal(f'tag smoke run {run["id"]} failed')
+        if run and run.get('status') == 'completed' and state(run) != 'success':
+            raise Refusal(f'tag smoke run {run["id"]} concluded {run.get("conclusion")}')
         if run:
             job = api.smoke_job(run)
             if job and job.get('status') == 'completed':

@@ -354,6 +354,42 @@ class Decision(unittest.TestCase):
         with self.assertRaises(policy.Refusal):
             policy.coverage(self.api, 'head', 'parent', True, 0, 1)
 
+    def test_cancelled_head_inherits(self):
+        self.api.run.side_effect = lambda w, sha, b: run(w, sha, conclusion='cancelled') if sha == 'head' else run(w, sha)
+        policy.coverage(self.api, 'head', 'parent', True, 0, 1)
+        self.assertIn('coverage SHA parent', self.output.getvalue())
+
+    def test_skipped_head_inherits(self):
+        self.api.run.side_effect = lambda w, sha, b: run(w, sha, conclusion='skipped') if sha == 'head' else run(w, sha)
+        policy.coverage(self.api, 'head', 'parent', True, 0, 1)
+        self.assertIn('coverage SHA parent', self.output.getvalue())
+
+    def test_cancelled_parent_pending_head_deadline(self):
+        self.api.run.side_effect = lambda w, sha, b: run(w, sha, conclusion='cancelled') if sha == 'parent' else run(w, sha, status='in_progress', conclusion=None)
+        with self.assertRaisesRegex(policy.Refusal, 'no green main-push coverage'):
+            policy.coverage(self.api, 'head', 'parent', True, 0, 1)
+
+    def test_cancelled_parent_waits_for_head(self):
+        self.api.run.side_effect = [run(status='queued', conclusion=None), run('kind-smoke.yml', status='queued', conclusion=None),
+                                   run(conclusion='cancelled'), run('kind-smoke.yml', conclusion='cancelled'),
+                                   run(), run('kind-smoke.yml'), run(conclusion='cancelled'), run('kind-smoke.yml', conclusion='cancelled')]
+        with patch.object(policy.time, 'sleep') as sleep:
+            policy.coverage(self.api, 'head', 'parent', True, 10, 1)
+            sleep.assert_called_once()
+        self.assertIn('coverage SHA head', self.output.getvalue())
+
+    def test_real_failure_conclusions_veto(self):
+        for conclusion in ('failure', 'timed_out', 'action_required', 'startup_failure', 'neutral', 'stale'):
+            with self.subTest(conclusion=conclusion):
+                self.api.run.side_effect = lambda w, sha, b: run(w, sha, conclusion=conclusion) if sha == 'head' else run(w, sha)
+                with self.assertRaisesRegex(policy.Refusal, 'failed CI'):
+                    policy.coverage(self.api, 'head', 'parent', True, 0, 1)
+
+    def test_unknown_conclusion_refuses(self):
+        self.api.run.return_value = run(conclusion='unknown-future-conclusion')
+        with self.assertRaisesRegex(policy.Refusal, 'unrecognized completed workflow conclusion'):
+            policy.coverage(self.api, 'head', 'parent', True, 0, 1)
+
     def test_parent_failure(self):
         self.api.run.side_effect = lambda w, sha, b: None if sha == 'head' else run(w, sha, conclusion='failure')
         with self.assertRaises(policy.Refusal):
@@ -407,6 +443,18 @@ class Decision(unittest.TestCase):
         policy.smoke(self.api, 'head', 'v0.2.0', 0, 1)
         self.api.run.assert_called_with('kind-smoke.yml', 'head', 'v0.2.0')
         self.assertIn('job 8', self.output.getvalue())
+
+    def test_cancelled_tag_smoke_refuses(self):
+        self.api.run.return_value = run('kind-smoke.yml', conclusion='cancelled')
+        with self.assertRaisesRegex(policy.Refusal, 'concluded cancelled'):
+            policy.smoke(self.api, 'head', 'v0.2.0', 0, 1)
+        self.api.smoke_job.assert_not_called()
+
+    def test_skipped_tag_smoke_refuses(self):
+        self.api.run.return_value = run('kind-smoke.yml', conclusion='skipped')
+        with self.assertRaisesRegex(policy.Refusal, 'concluded skipped'):
+            policy.smoke(self.api, 'head', 'v0.2.0', 0, 1)
+        self.api.smoke_job.assert_not_called()
 
     def test_skipped_smoke(self):
         self.api.run.return_value = run('kind-smoke.yml')

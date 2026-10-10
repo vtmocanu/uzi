@@ -26,6 +26,9 @@
 # keys on the JOB'S ROLE, not on an exit code or a step name, so it survives the
 # cosign-installer hardening tracked in #945 (which changes the flake's signature
 # but not which jobs are gates).
+# A KinD flake causing assert-tag-smoke failure needs the failed tag kind-smoke run
+# rerun first (gh run rerun <kind-run> --failed); once green, rerun release.yml
+# failed jobs. Re-running this gate before its underlying smoke cannot recover it.
 #
 # Exit codes:
 #   0  every watched workflow all-green (after any auto-reruns): release.yml + brew.yml
