@@ -379,6 +379,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
         const tip = command("rev-parse", "refs/remotes/origin/main");
         command("update-ref", `refs/uzi-recovery-episode/${owner}/${tip}`, tip);
         fs.renameSync(journaledPath, journaledPath + ".saved");
+        if (journaledPath === canonical) readOnly.push(path.join(journaledPath + ".saved", "agent"));
         const savedHash = treeHash(journaledPath + ".saved");
         const snapshot = () => [
           command("config", "--get-regexp", "^uzi-"),
