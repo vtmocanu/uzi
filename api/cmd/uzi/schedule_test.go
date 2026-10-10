@@ -1789,6 +1789,84 @@ func TestScheduleGetLastFireBlock(t *testing.T) {
 	}
 }
 
+// TestScheduleGetRecentFiresBlock (issue #2519): recent fires render after the Last fire
+// block, newest first, each with its started runs and skips.
+func TestScheduleGetRecentFiresBlock(t *testing.T) {
+	lf := &apitypes.LastFire{FiredAt: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC), Matched: 0}
+	recent := []apitypes.LastFire{
+		{
+			FiredAt: time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC),
+			Matched: 1,
+			Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
+		},
+		{
+			FiredAt: time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC),
+			Matched: 2,
+			Skips: []apitypes.LastFireSkip{
+				{IssueIID: ptrInt64(96), Title: "A raw bug report", Reason: "not_eligible"},
+				{IssueIID: ptrInt64(97), Title: "Already in flight", Reason: "already_running"},
+			},
+		},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_rf": {ID: "sch_rf", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf, RecentFires: recent},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_rf")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	t.Logf("output:\n%s", out)
+	wantInOrder := []string{
+		"Last fire:",
+		"Recent fires:",
+		"  2026-08-12T09:00:00Z · started 1 · skipped 0",
+		"#158 → run run_c81a  Fix the thing",
+		"  2026-08-11T09:00:00Z · started 0 · skipped 2",
+		"#96  not eligible  A raw bug report",
+		"#97  already running  Already in flight",
+	}
+	rest := out
+	for _, want := range wantInOrder {
+		i := strings.Index(rest, want)
+		if i < 0 {
+			t.Fatalf("missing or out of order %q\n%s", want, out)
+		}
+		rest = rest[i+len(want):]
+	}
+}
+
+// TestScheduleGetRecentFiresAbsent: empty or absent recent_fires (older server JSON)
+// prints no "Recent fires" text.
+func TestScheduleGetRecentFiresAbsent(t *testing.T) {
+	for name, rf := range map[string][]apitypes.LastFire{"nil": nil, "empty": {}} {
+		fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+			"sch_rf": {ID: "sch_rf", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, RecentFires: rf},
+		}}
+		out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_rf")
+		if code != uzicli.ExitOK {
+			t.Fatalf("%s: exit = %d, want 0", name, code)
+		}
+		if strings.Contains(out, "Recent fires") {
+			t.Errorf("%s: unexpected Recent fires text\n%s", name, out)
+		}
+	}
+}
+
+// TestScheduleGetRecentFiresJSON: --json carries recent_fires.
+func TestScheduleGetRecentFiresJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_rf": {ID: "sch_rf", Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true,
+			RecentFires: []apitypes.LastFire{{FiredAt: time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC), Matched: 1}}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_rf", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"recent_fires"`) || !strings.Contains(out, "2026-08-12T09:00:00Z") {
+		t.Errorf("--json missing recent_fires\n%s", out)
+	}
+}
+
 // TestScheduleGetLastFireCappedHint: a capped fire that started nothing and skipped every
 // examined candidate shows the generic not-reached hint.
 func TestScheduleGetLastFireCappedHint(t *testing.T) {
