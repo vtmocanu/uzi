@@ -200,11 +200,12 @@ operation metadata or raw response errors reach the feed. The typed vault park's
 `recovery_cause_vault_locked` feature check is separate from the first-response compatibility flag
 described below.
 
-The blocked-proof retention exception is limited to `vault_locked` and `refresh_unknown`.
+The blocked-proof retention exception covers `vault_locked`, `refresh_unknown` and
+`account_unavailable` (the #1595 amendment above).
 Settlement must still be observed empty; quiescence, WIP commit, fetch-back, tracking-ref
 verification, canonical and foreign-residue checks, and completion proofs remain required.
 A blocked proof retains the clone, session and custody with capped waits and no terminal
-blocked-capture cap for these two deferrals; it does not permit a park or completion without the
+blocked-capture cap for these three deferrals; it does not permit a park or completion without the
 proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Cancellation,
 shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
 semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`).

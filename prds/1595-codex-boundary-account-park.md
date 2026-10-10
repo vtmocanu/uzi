@@ -1,6 +1,6 @@
 # PRD #1595: Park a running Codex run whose boundary reconcile meets an unusable subscription account
 
-**Status**: Implementation complete / hosted acceptance pending (2026-10-10). Approved rev 2 decisions D1-D7 and Decision Log rows 10-15 are implemented; M1/M2 are committed and reviewed at `1dd58b22`. M3 wording is complete pending lead gates and one clean review round; its focused documentation checks are recorded below. M4 remains unchecked and maintainer-owned. This PRD stays at its existing path until hosted acceptance and the lead's final completion update.
+**Status**: Implementation complete / hosted acceptance pending (2026-10-10). Approved rev 2 decisions D1-D7 and Decision Log rows 10-15 are implemented. M1/M2 are committed and reviewed at `1dd58b22`; M3 documentation and focused checks are complete. M4 remains unchecked and maintainer-owned. This PRD stays at its existing path until hosted acceptance.
 **Issue**: [#1595](https://github.com/vtmocanu/uzi/issues/1595)
 **Priority**: High
 **Related**: [PRD #1590](1590-codex-quarantine-claim-hold.md) and [ADR-1590](../adr/1590-codex-binding-same-identity-readmission.md) (the `codex_account_unavailable` cause, the hold classifier, the account-driven promoter and re-admission this PRD reuses unchanged); [ADR-1766](../adr/1766-codex-vault-lock-park.md) (the typed-409 reason plus credential-free park this PRD extends with a third reason); #1594 (why a refresh is rejected; the `ErrCodexRefreshRejected` quarantine); [PRD #1810](1810-retain-failed-run-checkpoint-ref.md) and [PRD #1867](1867-failed-run-salvage-ref.md) (what still preserves source when a run fails for a reason this PRD does not park).
@@ -298,7 +298,7 @@ The gates for each milestone are `task gate:api` (M1) or `task gate:agent` (M2),
     - `agent/src/protocol.ts`: the `recovery_cause` doc comment;
     - `agent/src/worker.ts`.
   - **Acceptance:** W1 to W10 and E1 green, with red directions recorded. W9 pins the existing park-report retry on an api 400 (see Rollout); W10 pins the unchanged mid-turn bridge.
-- [ ] **M3: docs, specs and decision record.** Wording done; pending lead gates and one clean review round. Depends on M1 and M2.
+- [x] **M3: docs, specs and decision record.** Documentation and focused checks complete. Depends on M1 and M2.
   - `docs/run-recovery-wait.md`, "Codex account unavailable": say that a running run can now land here at a checkpoint with its work captured first, and that this kind of hold resumes on the worker that holds its source (the pre-change wording limited the preference to "when the hold began at claim time"). Then `task docs:sync`.
   - `specs/human.md`, in the #1590 block: one `(AI-synced YYYY-MM-DD)` line saying an in-flight Codex run whose account is quarantined or mid-re-login parks with its work captured instead of failing, and that other boundary failures are unchanged.
   - An amendment section in `adr/1766-codex-vault-lock-park.md` (the mechanism owner), with a one-line pointer from `adr/1590-codex-binding-same-identity-readmission.md`, recording D1, D3's capability gate, D4 and Invariant 1. No new ADR (Decision Log row 12).
@@ -353,10 +353,10 @@ recorded separately. CI before/after timing and critical-path impact are unmeasu
 Runtime: Node 24.20.0, API Go 1.27.2 and PostgreSQL 17.11; provisioned agent/web
 dependencies were used without reinstalling.
 
-M3 wording is complete. `task docs:sync` and `task check-docs:web` passed (exit 0)
-in this documentation pass; the docs checker reported body-line budget warnings.
-Lead gates and one clean M3 review round remain pending;
-the lead owns the final milestone update. M4 hosted acceptance, deployment and real
+M3 updates the recovery guide and embedded mirror, the scoped specification, ADR-1766's
+mechanism amendment, ADR-1590's pointer, the architecture links and the changelog.
+`task docs:sync`, `task check-docs:web` and `TestEmbeddedDocsMatchSource` passed;
+the docs checker reported body-line budget warnings. M4 hosted acceptance, deployment and real
 account manipulation have not been performed. The original unconfirmed boundary
 symptom is not guaranteed to have been saved by this implementation.
 
