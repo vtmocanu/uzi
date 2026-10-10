@@ -5867,14 +5867,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
-// "superseded"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
 	Skipped   string
+	// Detail is a bounded, content-free reason behind Skipped (the broker's error text with
+	// secrets scrubbed), for the operator log only. It is never serialized to the worker.
+	Detail string
 }
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
@@ -5885,7 +5888,7 @@ type PublishResult struct {
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker
-// treats as "origin moved, nothing to do" — a diverged tip or an unsupported pack —
+// treats as "origin moved, nothing to do" — a diverged tip or an unusable pack —
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
@@ -6166,13 +6169,17 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
-	case errors.Is(err, pushbroker.ErrTipMissing),
-		errors.Is(err, pushbroker.ErrPackTooLarge),
-		errors.Is(err, pushbroker.ErrPackInvalid):
-		// A tip the pack never delivered, a pack over the reconstruction budget, or a
-		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
-		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
+	case errors.Is(err, pushbroker.ErrTipMissing):
+		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
+		// broker's content-free reason for the operator log (never serialized to the worker).
+		return PublishResult{Published: false, Ref: ref, Skipped: "tip_missing", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackTooLarge):
+		// A pack over the reconstruction budget: a best-effort skip. A worker pack may not
+		// OOM or 5xx-storm the shared api.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_too_large", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackInvalid):
+		// A malformed (or empty) pack: a best-effort skip, never a 5xx.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_invalid", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT

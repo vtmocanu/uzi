@@ -607,9 +607,20 @@ function isCodexBoundaryTimeout(err: unknown): boolean {
 
 /** issue #1597 M1: the closed set of server best-effort skip labels a checkpoint publish can
  *  carry onto the run feed — the `Skipped:` values api/internal/workersvc/service.go returns
- *  (PublishCheckpoint). Anything else the body carries is untrusted free text and is folded to
- *  `other`, so no server-/forge-shaped string reaches the feed verbatim. */
-const PUBLISH_SKIP_LABELS = ["unsupported", "no_ref", "not_descendant", "workflow_scope"] as const;
+ *  (`Publish` / `publishOutcome`): `unsupported` (run kind), `superseded`, and the broker refusals
+ *  `tip_missing` / `pack_too_large` / `pack_invalid`, besides the ref/scope skips. Anything
+ *  else the body carries is untrusted free text and is folded to `other`, so no server-/forge-
+ *  shaped string reaches the feed verbatim. */
+const PUBLISH_SKIP_LABELS = [
+  "unsupported",
+  "no_ref",
+  "not_descendant",
+  "workflow_scope",
+  "superseded",
+  "tip_missing",
+  "pack_too_large",
+  "pack_invalid",
+] as const;
 type PublishSkipLabel = (typeof PUBLISH_SKIP_LABELS)[number] | "other";
 
 function publishSkipLabel(raw: unknown): PublishSkipLabel {

@@ -198,8 +198,8 @@ func TestWorkerClaimRunLaneAcceptsSnapshotBody(t *testing.T) {
 
 func TestWorkerClaimDisabledApiRejectsSnapshotBody(t *testing.T) {
 	// PRD #1390 D7: an api started with UZI_ACTIVE_SNAPSHOT_DISABLED 400s a claim that still carries
-	// the field (the generic 400 that triggers the worker's strip-and-retry) — but an OLD bodyless
-	// claim on the same api still succeeds (never a lost claim).
+	// the field (a generic 400; the worker's claim call does not strip-and-retry, it claims again on
+	// its next poll) — but an OLD bodyless claim on the same api still succeeds (never a lost claim).
 	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
 	h.cfg = config.Config{ActiveSnapshotDisabled: true}
 

@@ -966,6 +966,39 @@ describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue
     );
   });
 
+  for (const label of ["tip_missing", "pack_too_large", "pack_invalid", "superseded", "unsupported"] as const) {
+    it(`a 2xx {published:false, skipped:${label}} surfaces the label on the feed, not "other"`, async () => {
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(92);
+      const { restore } = spyPublishResult({
+        ok: true,
+        body: { published: false, ref: "", skipped: label },
+      });
+      const exec: Executor = {
+        run: async (ctx) => {
+          commitInClone(ctx.worktreePath, "NEW.txt");
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+          return { branch: ctx.branch };
+        },
+        killAgentTree: () => {},
+      };
+      try {
+        await runner(exec, gitlab).execute(claim);
+      } finally {
+        restore();
+      }
+      const texts = statusTexts(claim.run_id);
+      assert.ok(
+        texts.some((t) => t.includes(`checkpoint publish skipped: ${label}`)),
+        `expected skip label ${label}, got ${JSON.stringify(texts)}`,
+      );
+      assert.ok(
+        !texts.some((t) => t.includes("checkpoint publish skipped: other")),
+        `label must not fold to other, got ${JSON.stringify(texts)}`,
+      );
+    });
+  }
+
   it("a non-2xx (HTTP 500) does not advance the tip and emits ONE deduped feed line naming the status", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(91);
