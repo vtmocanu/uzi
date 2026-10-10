@@ -671,3 +671,163 @@ true
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{- /*
+  uzi.decMul1024: multiply a non-negative decimal digit string (no leading zeros) by
+  1024 and return the digit string. Schoolbook, right to left. The carry stays below
+  1024: digit <= 9, so digit*1024 + carry <= 9216 + 1023 = 10239, and 10239/10 = 1023.
+  Every intermediate is therefore a few thousand at most; nothing approaches int64.
+  A nonzero input yields an output with no leading zero, because the top digit gives
+  t >= 1024 and a nonzero carry is always prepended.
+*/ -}}
+{{- define "uzi.decMul1024" -}}
+{{- $s := . -}}
+{{- $n := len $s -}}
+{{- $carry := 0 -}}
+{{- $out := "" -}}
+{{- range $i := until $n -}}
+{{- $d := atoi (substr (int (sub (sub $n 1) $i)) (int (sub $n $i)) $s) -}}
+{{- $t := add (mul $d 1024) $carry -}}
+{{- $out = printf "%d%s" (mod $t 10) $out -}}
+{{- $carry = div $t 10 -}}
+{{- end -}}
+{{- if $carry -}}
+{{- $out = printf "%d%s" $carry $out -}}
+{{- end -}}
+{{- $out -}}
+{{- end -}}
+
+{{- /*
+  uzi.quantityToBytes: a Kubernetes resource.Quantity -> bytes, as a base-10 integer
+  string, rounded UP exactly like resource.Quantity.Value(). Argument: a dict with
+  "path" (the values path, for error messages) and "value" (a string, an int64 from
+  --set, or a float64 from a YAML number; a float64 is formatted with %v, which prints
+  large integers as e.g. 1.073741824e+10, itself a valid exponent quantity).
+
+  Grammar (Kubernetes): optional sign; mantissa digits | digits. | digits.digits |
+  .digits; optional suffix Ki Mi Gi Ti Pi Ei (binary), n u m "" k M G T P E (decimal),
+  or an exponent [eE][+-]?digits.
+
+  Method: value = D x 10^p x 2^k, D a digit string with no leading or trailing zeros
+  (the fraction digit count, the SI exponent and any explicit exponent fold into the
+  one power of ten p). Exact; no precision limit on the mantissa.
+    1. k > 0 (binary suffix): D is multiplied by 1024^(k/10) as a digit string
+       (uzi.decMul1024); this is the only multiplication, so nothing can overflow.
+    2. If len(D) + p > 19 the value is >= 10^19 > 2^60: rejected before any zero
+       padding is built, so an absurd exponent never allocates.
+    3. p >= 0: the integer part is D followed by p zeros. p < 0: it is the leading
+       len(D)+p digits of D (empty = 0) and the rest is the discarded fraction; the
+       result is rounded up when any discarded digit is nonzero.
+    4. The integer part has at most 19 digits and is compared with 2^60 as a string
+       (same length) before atoi, so atoi only ever sees a value <= 2^60 < 2^63.
+  Rejected (render fails, naming the path): not a valid quantity; zero or negative; above
+  1 EiB = 2^60 = 1152921504606846976 bytes. The ceiling matches the range the api
+  accepts for DB_STORAGE_CAPACITY_BYTES and keeps all arithmetic far from int64 wrap;
+  no real PVC approaches it. Nothing is rejected for digit count or precision.
+*/ -}}
+{{- define "uzi.quantityToBytes" -}}
+{{- $path := .path -}}
+{{- $raw := printf "%v" .value -}}
+{{- $help := printf "%s must be a positive Kubernetes quantity (e.g. 8Gi, 500M, 1.5Gi, 8e9, 10737418240) of at most 1Ei (1152921504606846976 bytes), got %q" $path $raw -}}
+{{- $bound := "1152921504606846976" -}}
+{{- if not (regexMatch "^[+-]?[0-9]*[.]?[0-9]*(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E|[eE][+-]?[0-9]+)?$" $raw) -}}
+{{- fail $help -}}
+{{- end -}}
+{{- $neg := hasPrefix "-" $raw -}}
+{{- $body := regexReplaceAll "^[+-]" $raw "" -}}
+{{- $mant := regexFind "^[0-9]*[.]?[0-9]*" $body -}}
+{{- $suffix := trimPrefix $mant $body -}}
+{{- if not (regexMatch "[0-9]" $mant) -}}
+{{- fail $help -}}
+{{- end -}}
+{{- $parts := splitList "." $mant -}}
+{{- $ipart := index $parts 0 -}}
+{{- $fpart := "" -}}
+{{- if gt (len $parts) 1 -}}
+{{- $fpart = index $parts 1 -}}
+{{- end -}}
+{{- $m := regexReplaceAll "^0+" (printf "%s%s" $ipart $fpart) "" -}}
+{{- if or $neg (eq $m "") -}}
+{{- fail $help -}}
+{{- end -}}
+{{- $tz := len (regexFind "0*$" $m) -}}
+{{- $m = substr 0 (int (sub (len $m) $tz)) $m -}}
+{{- $p := sub $tz (len $fpart) -}}
+{{- $bin := dict "Ki" 1 "Mi" 2 "Gi" 3 "Ti" 4 "Pi" 5 "Ei" 6 -}}
+{{- $si := dict "n" -9 "u" -6 "m" -3 "" 0 "k" 3 "M" 6 "G" 9 "T" 12 "P" 15 "E" 18 -}}
+{{- if hasKey $bin $suffix -}}
+{{- range $i := until (int (get $bin $suffix)) -}}
+{{- $m = include "uzi.decMul1024" $m -}}
+{{- end -}}
+{{- else if hasKey $si $suffix -}}
+{{- $p = add $p (get $si $suffix) -}}
+{{- else -}}
+{{- /* explicit exponent; magnitudes past 6 digits clamp to 999999, which already decides the outcome */ -}}
+{{- $es := regexFind "[0-9]+$" $suffix -}}
+{{- $es = regexReplaceAll "^0+" $es "" -}}
+{{- if gt (len $es) 6 -}}
+{{- $es = "999999" -}}
+{{- end -}}
+{{- $ev := int (atoi (default "0" $es)) -}}
+{{- if hasPrefix "-" (substr 1 (len $suffix) $suffix) -}}
+{{- $ev = sub 0 $ev -}}
+{{- end -}}
+{{- $p = add $p $ev -}}
+{{- end -}}
+{{- if gt (add (len $m) $p) 19 -}}
+{{- fail $help -}}
+{{- end -}}
+{{- $ip := "" -}}
+{{- $rnz := false -}}
+{{- if ge $p 0 -}}
+{{- $ip = printf "%s%s" $m (repeat (int $p) "0") -}}
+{{- else if gt (len $m) (sub 0 $p) -}}
+{{- $cut := sub (len $m) (sub 0 $p) -}}
+{{- $ip = substr 0 (int $cut) $m -}}
+{{- $rnz = regexMatch "[1-9]" (substr (int $cut) (len $m) $m) -}}
+{{- else -}}
+{{- $rnz = true -}}
+{{- end -}}
+{{- if gt (len $ip) 19 -}}
+{{- fail $help -}}
+{{- end -}}
+{{- if eq (len $ip) 19 -}}
+{{- if or (gt $ip $bound) (and $rnz (eq $ip $bound)) -}}
+{{- fail $help -}}
+{{- end -}}
+{{- end -}}
+{{- $base := 0 -}}
+{{- if $ip -}}
+{{- $base = atoi $ip -}}
+{{- end -}}
+{{- if $rnz -}}
+{{- $base = add $base 1 -}}
+{{- end -}}
+{{- $base -}}
+{{- end -}}
+
+{{- /*
+  uzi.dbStorageCapacityBytes: the managed database's storage size in bytes, which the
+  api reads as DB_STORAGE_CAPACITY_BYTES (the admin-health db.size budget). simple reads
+  database.simple.storage.size, cnpg reads postgres.cluster.storage.size, external
+  renders "" (the chart does not know the size; set api.config.DB_STORAGE_CAPACITY_BYTES).
+*/ -}}
+{{- define "uzi.dbStorageCapacityBytes" -}}
+{{- if eq .Values.database.mode "simple" -}}
+{{- include "uzi.quantityToBytes" (dict "path" "database.simple.storage.size" "value" .Values.database.simple.storage.size) -}}
+{{- else if eq .Values.database.mode "cnpg" -}}
+{{- include "uzi.quantityToBytes" (dict "path" "postgres.cluster.storage.size" "value" .Values.postgres.cluster.storage.size) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.apiConfigMapEnabled: whether the api ConfigMap is rendered, and so whether the api
+  Deployment must envFrom it. ONE condition for both templates (api-configmap.yaml and
+  api-deployment.yaml), so a key the ConfigMap carries always reaches the pod. Non-empty
+  = true.
+*/ -}}
+{{- define "uzi.apiConfigMapEnabled" -}}
+{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
+true
+{{- end -}}
+{{- end -}}
