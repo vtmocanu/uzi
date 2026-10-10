@@ -937,11 +937,15 @@ jobs:
   # The three web nginx configs (compose, mock, and the chart's rendered web-configmap)
   # gzip and cache static assets and keep every security header (#2662, #2663). Real
   # nginx in Docker beside a stub api, so it stays out of gate:repo, which needs neither
-  # Docker nor Helm. Path-filtered on PRs; skipped (not pending) otherwise.
+  # Docker nor Helm. Path-filtered on PRs (skipped, not pending, otherwise); runs on every
+  # push to main. `changes` runs only on PRs, and a skipped `needs` skips this job unless
+  # the condition overrides it with a status function, hence `!cancelled()`.
   test-web-nginx:
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.web_nginx == 'true'
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.web_nginx == 'true')
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
