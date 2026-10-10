@@ -197,6 +197,55 @@ for (const control of ["moved", "unknown-settlement", "cleanup-failed", "confine
   });
 }
 
+for (const extraByte of [0, 1] as const) {
+  it(`code snapshot streamed UTF-8 diff: 1 MiB${extraByte ? " plus one byte" : " exactly"}`, async () => {
+    const f = await fixture();
+    try {
+      const maxBytes = 1024 * 1024;
+      const file = path.join(f.fx.originPath, "boundary.txt");
+      fs.writeFileSync(file, "é\n");
+      runGit(f.fx.originPath, "add", "boundary.txt");
+      runGit(f.fx.originPath, "-c", "user.name=test", "-c", "user.email=test@example.test", "commit", "-qm", "boundary");
+      const diffArgs = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", `${f.base}...HEAD`];
+      // Measure Git's actual patch framing, then grow the committed UTF-8 blob to the boundary.
+      const seed = execFileSync("git", ["-C", f.fx.originPath, ...diffArgs]);
+      const paddingBytes = maxBytes + extraByte - seed.length;
+      fs.writeFileSync(file, "é" + "é".repeat(Math.floor(paddingBytes / 2)) + "x".repeat(paddingBytes % 2) + "\n");
+      runGit(f.fx.originPath, "add", "boundary.txt");
+      runGit(f.fx.originPath, "-c", "user.name=test", "-c", "user.email=test@example.test", "commit", "--amend", "--no-edit", "-q");
+      const actualDiff = execFileSync("git", ["-C", f.fx.originPath, ...diffArgs], { maxBuffer: 2 * maxBytes });
+      assert.equal(actualDiff.length, maxBytes + extraByte, "actual Git output, including patch framing");
+      assert.ok(actualDiff.toString("utf8").length < actualDiff.length, "fixture counts UTF-8 bytes, not characters");
+      runGit(f.bare, "-c", "protocol.file.allow=always", "fetch", f.fx.originPath, "main");
+      f.head = runGit(f.fx.originPath, "rev-parse", "HEAD");
+      await f.git.pinCodeSnapshot(f.bare, "boundary-lead", f.head, f.base);
+      assert.equal(f.claim.cross_check?.stage, "code");
+      if (f.claim.cross_check?.stage !== "code") assert.fail("code claim required");
+      f.claim.cross_check.head_commit = f.head;
+      f.claim.cross_check.lead_run_id = "boundary-lead";
+      const streamed = await f.git.readBare(f.bare, [...diffArgs.slice(0, -1), `${f.base}...${f.head}`], { maxBytes });
+      assert.equal(streamed.truncated, extraByte === 1);
+      assert.equal(Buffer.byteLength(streamed.text), maxBytes);
+      assert.equal(streamed.text.includes("�"), false);
+      let observedStage: string | undefined;
+      let observedDiff: string | undefined;
+      await new CrossCheckRunner(f.client, f.git, nullLogger(), {
+        homeRoot: f.fx.dataDir, pollMs: 1, model: { run: async (claim, _checkout, _home, _signal, _usage, cleanupConfirmed) => {
+          observedStage = claim.cross_check?.stage;
+          observedDiff = claim.cross_check?.stage === "code" ? claim.cross_check.code_diff : undefined;
+          cleanupConfirmed?.();
+          return '{"findings":[]}';
+        } },
+      }).execute(f.claim);
+      assert.equal(observedStage, "code");
+      assert.equal(observedDiff, extraByte === 1
+        ? "Diff exceeds 1 MiB; inspect committed files through Read and Search."
+        : actualDiff.toString("utf8"));
+      assert.deepEqual(f.verdicts, [{ outcome: "completed", findings: [] }]);
+    } finally { f.fx.cleanup(); }
+  });
+}
+
 it("proof-free delete refuses a moved snapshot ref and pin refuses to replace it", async () => {
   const f = await fixture();
   try {
