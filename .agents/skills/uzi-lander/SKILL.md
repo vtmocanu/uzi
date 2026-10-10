@@ -337,10 +337,10 @@ changes it); trust it over a handover's claim.
    A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows
    onto an older base, which can make CI call a Task target the branch lacks. On such a
    finding, check the target on current `main`; when `main` defines it, rebase onto `main`,
-   rerun CI, then assess whatever finding remains. A bot finding or PR-description claim about
-   `.github/workflows` on a uzi branch whose two-dot workflow diff vs `main` is empty is the same
-   commit's artifact: rebase with `land-prep.sh` (it drops the commit), resolve the thread as
-   inherited, and correct the description (step *Always yours*).
+   rerun CI, then assess whatever finding remains. When the two-dot workflow diff vs `main` is
+   empty, verify a workflow finding against current `main` and the align commit: drop a redundant
+   align commit with `land-prep.sh`, correct inaccurate PR-description claims, resolve as
+   inherited only after verifying attribution, and track a real defect on `main` separately.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
