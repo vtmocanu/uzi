@@ -434,5 +434,6 @@ server's normalisation of the input (claude harness) or any other frame differs.
 |---|---|---|
 | Go unit | `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageSummaryFoldMatchesAuthoredRollup`) | `rows` and `totals` through `AppendMessages` over `result-frames-summary.json` |
 | Go unit | `run_usage_contract_test.go` (`TestRunUsageStoredSummaryFixtureMatchesNormalization`) | `stored-frames-summary.json` = normalised input |
+| vitest | `web/src/lib/runUsageContract.test.ts` ("deriveRunUsage matches the server's fold of summary_usage") | `totals` and the summary total via `deriveRunUsage` over `stored-frames-summary.json`; the web reader reads the stored file because the client has no price table |
 
 The Go half needs `-count=1` (this directory is outside the `api` module).

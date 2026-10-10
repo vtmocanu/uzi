@@ -7,9 +7,10 @@ package workersvc
 //
 //  1. INGEST (normalizeProgressNotePayload): the stored payload is rebuilt from scratch with
 //     only {text, milestone_id, model_usage}, each usage entry carrying the server-resolved
-//     costStatus (and costUSD when metered). Any other key is dropped, in particular `event`
-//     (a payload that says event:"result" would be read by the usage tail and the web fold as
-//     the end of a leg) and `usage` (the web fold would count it a second time).
+//     costStatus (and costUSD when metered). Any other key is dropped, in particular `usage`
+//     (the web fold's per-agent branch reads it without checking the kind, so it would be
+//     counted a second time) and `event` (defense in depth: every leg-end reader gates on kind
+//     status/error first, so it is harmless today).
 //  2. USAGE FOLD (foldProgressNoteUsage): the note's model_usage is folded into run_usage under
 //     its OWN key so it can neither collapse into, nor be collapsed by, the run's own result
 //     frames. adr/2603-progress-note-usage-key.md records why the key is

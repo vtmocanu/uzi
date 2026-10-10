@@ -604,6 +604,12 @@ recorded once; spend is unavailable only when no usage arrived before the
 abort. If the worker loses its claim, usage frames from the stale claim are
 rejected as for every result frame, so that call's spend can be missing.
 With one call per 5 minutes at most, a run makes at most 12 calls per hour.
+
+The intent, plan and PR-description summary passes are counted too. They are
+paid on the same credential, are stored under their own
+`summary_pass:<model>` key (one row per pass, so they add up and never merge
+into the run's own rows), and show in the usage panel as an **Intent, plan &
+PR summaries** row that adds up to the **Run total**.
 The [Codex price coverage](admin-health.md#codex-price-coverage) health check
 counts summary usage under the plain model name.
 

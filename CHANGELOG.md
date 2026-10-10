@@ -36,6 +36,8 @@ through `[0.52.0]`.)
   The worker rejects release ACKs exceeding 16 KiB and retains local recovery evidence when the server response overflows.
 - **Neutralized Markdown links no longer look clickable ([#1968](https://github.com/vtmocanu/uzi/issues/1968)).**
   A Markdown link whose URL is empty or uses a dangerous scheme (`javascript:`, `data:`, `file:`) now renders as plain text rather than an href-less anchor that was still styled as a link, so a report author cannot present a fake call to action.
+- **The usage panel now counts the spend of the intent, plan and PR-description summaries ([#2686](https://github.com/vtmocanu/uzi/issues/2686)).**
+  These summary passes ran on the run's own credential on both Claude and Codex, but their tokens and cost never reached the run's usage. The worker now sends one `summary_usage` message per pass that reported usage, and the api stores it under a separate `summary_pass:<model>` key so it cannot collapse into the run's own figure; the run page shows it as an **Intent, plan & PR summaries** row that adds up to the **Run total**. The messages are hidden from the transcript, activity feed, `uzi run logs`, the TUI and the run judge's input (`--json` still carries them). A credential switch also waits up to 3 seconds for an in-flight intent summary to finish before cancelling it. A run whose claim was fenced reports no summary usage. Roll the api before the workers: a worker sending `summary_usage` to an api that predates this change loses that usage (the chart ships both together).
 
 ## [0.86.0] - 2026-10-06
 
