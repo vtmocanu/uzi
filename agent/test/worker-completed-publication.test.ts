@@ -25,6 +25,7 @@ const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
 const feature = "recovery_completed_publication_v1";
 
 async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "reserve" = "journal", guarded = true) {
+  await fs.mkdir(scratch, { recursive: true });
   const root = await fs.mkdtemp(path.join(scratch, "completion-test-"));
   const events: string[] = [];
   const sent: StateRequest[] = [];

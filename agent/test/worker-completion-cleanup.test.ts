@@ -25,6 +25,7 @@ const literal: CompletedPublicationReceipt = wire.ack.completed_publication_rece
 
 // All Git children are local, bounded to 10 seconds, and use no forge credentials.
 async function fixture(shared = false, attempted = false, receipted = true, foreignSibling = false) {
+  await fs.mkdir(scratch, { recursive: true });
   const root = await fs.mkdtemp(path.join(scratch, "receipt-cleanup-"));
   const cmd = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
