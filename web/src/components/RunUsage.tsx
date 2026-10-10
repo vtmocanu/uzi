@@ -264,7 +264,7 @@ export function RunUsagePanel({
                   <Td>{formatTokens(noteTotal.fresh)}</Td>
                   <Td>{formatTokens(noteTotal.cached)}</Td>
                   <Td>{formatTokens(noteTotal.out)}</Td>
-                  <Td>{costCellText(costDisplay(costStatus, noteTotal.costUsd))}</Td>
+                  <Td>{costCellText(costDisplay(noteTotal.costStatus, noteTotal.costUsd))}</Td>
                 </tr>
               )}
               <tr>

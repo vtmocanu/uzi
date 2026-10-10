@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -690,7 +691,7 @@ func TestRunUsageFixtureDiscriminates(t *testing.T) {
 func foldRecordedNotesFrames(t *testing.T, frames []recordedFrame) map[legKey]store.UpsertRunUsageParams {
 	t.Helper()
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), SessionID: pgconv.TextOrNull("sess-notes")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Harness: harnessClaude, SessionID: pgconv.TextOrNull("sess-notes")}}
 	svc := New(fs, newBox(t), testParams())
 	msgs := make([]IncomingMessage, 0, len(frames))
 	for _, f := range frames {
@@ -784,5 +785,43 @@ func TestRunUsageNotesFixtureDiscriminates(t *testing.T) {
 	if sumIn == rollup.Totals.InputTokens || sumOut == rollup.Totals.OutputTokens {
 		t.Fatalf("fixture broken: the collapsed (prefix-less, init-epoch) reading in=%d out=%d equals the true totals in=%d out=%d",
 			sumIn, sumOut, rollup.Totals.InputTokens, rollup.Totals.OutputTokens)
+	}
+}
+
+// TestRunUsageStoredNotesFixtureMatchesNormalization: stored-frames-notes.json is
+// result-frames-notes.json with each progress_note payload as the server stores it (the claude
+// normalisation, carrying the resolved cost), and every other frame unchanged. The web contract
+// test reads the stored file, so this keeps the two fixtures from drifting apart.
+func TestRunUsageStoredNotesFixtureMatchesNormalization(t *testing.T) {
+	var in, stored recordedFrames
+	readFixture(t, "result-frames-notes.json", &in)
+	readFixture(t, "stored-frames-notes.json", &stored)
+	if len(in.Frames) != len(stored.Frames) {
+		t.Fatalf("frame counts differ: %d input, %d stored", len(in.Frames), len(stored.Frames))
+	}
+	notes := 0
+	for i, f := range in.Frames {
+		s := stored.Frames[i]
+		if f.Seq != s.Seq || f.Kind != s.Kind {
+			t.Fatalf("frame %d: seq/kind %d/%s vs stored %d/%s", i, f.Seq, f.Kind, s.Seq, s.Kind)
+		}
+		want := f.Payload
+		if f.Kind == KindProgressNote {
+			notes++
+			want = normalizeProgressNotePayload(f.Payload, harnessClaude)
+		}
+		var a, b any
+		if err := json.Unmarshal(want, &a); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(s.Payload, &b); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(a, b) {
+			t.Errorf("frame seq %d: stored fixture payload drifted from the server's normalisation\n got %s\nwant %s", f.Seq, s.Payload, want)
+		}
+	}
+	if notes == 0 {
+		t.Fatal("fixture broken: no progress_note frames")
 	}
 }

@@ -276,9 +276,9 @@ func TestProgressNoteClaudeCacheWriteSplitPricing(t *testing.T) {
 func TestProgressNoteModelCapIsDeterministic(t *testing.T) {
 	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
 		`"m6":{"inputTokens":6},"m3":{"inputTokens":3},"m1":{"inputTokens":1},"m5":{"inputTokens":5},"m2":{"inputTokens":2},"m4":{"inputTokens":4}}}`)
-	first := string(normalizeProgressNotePayload(raw))
+	first := string(normalizeProgressNotePayload(raw, harnessClaude))
 	for i := 0; i < 50; i++ {
-		if got := string(normalizeProgressNotePayload(raw)); got != first {
+		if got := string(normalizeProgressNotePayload(raw, harnessClaude)); got != first {
 			t.Fatalf("normalisation differs between runs:\n%s\n%s", first, got)
 		}
 	}
@@ -300,7 +300,7 @@ func TestProgressNoteModelCapIsDeterministic(t *testing.T) {
 func TestProgressNoteDropsEmptyUsageEntry(t *testing.T) {
 	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{"a":{"inputTokens":0},"b":{"inputTokens":"lots","outputTokens":-3},"c":{"outputTokens":5}}}`)
 	var p progressNotePayload
-	if err := json.Unmarshal(normalizeProgressNotePayload(raw), &p); err != nil {
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw, harnessClaude), &p); err != nil {
 		t.Fatal(err)
 	}
 	if len(p.ModelUsage) != 1 || p.ModelUsage["c"].OutputTokens != 5 {
@@ -313,9 +313,9 @@ func TestProgressNoteDropsEmptyUsageEntry(t *testing.T) {
 func TestProgressNoteCollidingKeysAreDeterministic(t *testing.T) {
 	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
 		`"claude-haiku":{"inputTokens":2}," claude-haiku":{"inputTokens":1},"  claude-haiku":{"inputTokens":0}}}`)
-	first := string(normalizeProgressNotePayload(raw))
+	first := string(normalizeProgressNotePayload(raw, harnessClaude))
 	for i := 0; i < 200; i++ {
-		if got := string(normalizeProgressNotePayload(raw)); got != first {
+		if got := string(normalizeProgressNotePayload(raw, harnessClaude)); got != first {
 			t.Fatalf("normalisation differs between runs:\n%s\n%s", first, got)
 		}
 	}
@@ -334,7 +334,7 @@ func TestProgressNoteInvalidEntryDoesNotConsumeCapSlot(t *testing.T) {
 	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
 		`"a0":{"inputTokens":0},"m1":{"inputTokens":1},"m2":{"inputTokens":2},"m3":{"inputTokens":3},"m4":{"inputTokens":4},"m5":{"inputTokens":5}}}`)
 	var p progressNotePayload
-	if err := json.Unmarshal(normalizeProgressNotePayload(raw), &p); err != nil {
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw, harnessClaude), &p); err != nil {
 		t.Fatal(err)
 	}
 	if len(p.ModelUsage) != 4 {
@@ -351,7 +351,7 @@ func TestProgressNoteInvalidEntryDoesNotConsumeCapSlot(t *testing.T) {
 func TestProgressNoteKeepsZeroTokenEntryWithCost(t *testing.T) {
 	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{"m":{"costUSD":0.01}}}`)
 	var p progressNotePayload
-	if err := json.Unmarshal(normalizeProgressNotePayload(raw), &p); err != nil {
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw, harnessClaude), &p); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := p.ModelUsage["m"]; !ok || len(p.ModelUsage) != 1 {
@@ -394,6 +394,83 @@ func TestProgressNoteCacheWriteSplitExactPrice(t *testing.T) {
 			u := fs.upsertedUsage[0]
 			if u.CostStatus != c.wantStatus || u.CostUsd.Int.Int64() != c.wantMicros {
 				t.Fatalf("status=%s micros=%d, want %s/%d", u.CostStatus, u.CostUsd.Int.Int64(), c.wantStatus, c.wantMicros)
+			}
+		})
+	}
+}
+
+// The stored note entry carries the server-resolved cost (costStatus always, costUSD only when
+// metered, never a zero on an unreported entry), and folding the STORED payload (what
+// RefoldRunUsage reads) gives the same run_usage row as folding the raw one.
+func TestProgressNoteStoredEntryCarriesResolvedCost(t *testing.T) {
+	cases := []struct {
+		name       string
+		harness    string
+		model      string
+		entry      string
+		wantStatus string
+		wantUSD    any // nil: costUSD must be absent
+	}{
+		{"claude priced from the table", "claude", "claude-haiku-4-5-20251001",
+			`{"inputTokens":400,"outputTokens":40}`, "metered", 0.0006},
+		{"claude provider cost wins", "claude", "claude-haiku-4-5-20251001",
+			`{"inputTokens":400,"outputTokens":40,"costUSD":0.01}`, "metered", 0.01},
+		{"claude unpriced model", "claude", "claude-unknown-9",
+			`{"inputTokens":400,"outputTokens":40}`, "unreported", nil},
+		{"codex metered with cost", "codex", "gpt-6-luna",
+			`{"inputTokens":100,"outputTokens":10,"costUSD":0.002,"costStatus":"metered"}`, "metered", 0.002},
+		{"codex subscription", "codex", "gpt-6-luna",
+			`{"inputTokens":100,"outputTokens":10,"costUSD":0.002,"costStatus":"subscription"}`, "subscription", nil},
+		{"codex unreported", "codex", "gpt-6-luna",
+			`{"inputTokens":100,"outputTokens":10}`, "unreported", nil},
+	}
+	appendNote := func(t *testing.T, harness, payload string) (json.RawMessage, store.UpsertRunUsageParams) {
+		t.Helper()
+		w := worker()
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID), Harness: harness}}
+		svc := New(fs, newBox(t), testParams())
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID,
+			[]IncomingMessage{{Seq: 4, Kind: "progress_note", Agent: "worker", Payload: json.RawMessage(payload)}}); err != nil {
+			t.Fatal(err)
+		}
+		if len(fs.insertedMessages) != 1 || len(fs.upsertedUsage) != 1 {
+			t.Fatalf("inserted %d messages, %d upserts; want 1 and 1", len(fs.insertedMessages), len(fs.upsertedUsage))
+		}
+		return fs.insertedMessages[0].Payload, fs.upsertedUsage[0]
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw := `{"text":"x","milestone_id":"m1","model_usage":{"` + c.model + `":` + c.entry + `}}`
+			stored, row := appendNote(t, c.harness, raw)
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(stored, &top); err != nil {
+				t.Fatal(err)
+			}
+			var mu map[string]map[string]any
+			if err := json.Unmarshal(top["model_usage"], &mu); err != nil {
+				t.Fatal(err)
+			}
+			e := mu[c.model]
+			if e["costStatus"] != c.wantStatus {
+				t.Fatalf("stored costStatus = %v, want %s (payload %s)", e["costStatus"], c.wantStatus, stored)
+			}
+			// An absent costUSD is stored as JSON null (resultModelUsage.CostUSD has no omitempty).
+			got := e["costUSD"]
+			if c.wantUSD == nil && got != nil {
+				t.Fatalf("stored costUSD = %v on a %s entry, want none", got, c.wantStatus)
+			}
+			if c.wantUSD != nil && got != c.wantUSD {
+				t.Fatalf("stored costUSD = %v, want %v", got, c.wantUSD)
+			}
+			_, refolded := appendNote(t, c.harness, string(stored))
+			if refolded.CostStatus != row.CostStatus || refolded.CostUsd.Int.Cmp(row.CostUsd.Int) != 0 ||
+				refolded.InputTokens != row.InputTokens || refolded.OutputTokens != row.OutputTokens {
+				t.Fatalf("fold(stored) = %s/%v/%d/%d, fold(raw) = %s/%v/%d/%d",
+					refolded.CostStatus, refolded.CostUsd.Int, refolded.InputTokens, refolded.OutputTokens,
+					row.CostStatus, row.CostUsd.Int, row.InputTokens, row.OutputTokens)
+			}
+			if row.CostStatus != c.wantStatus {
+				t.Fatalf("row cost_status = %s, want %s", row.CostStatus, c.wantStatus)
 			}
 		})
 	}

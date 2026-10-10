@@ -383,9 +383,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// PRD #2603: a progress_note payload is rebuilt from only its allowed keys (text stripped
 		// of control and format runes and capped, milestone_id, model_usage) AFTER the byte
 		// sanitation above and on the final stripped kind, so the stored row, the WS frame and
-		// the usage fold all see the same normalised note.
+		// the usage fold all see the same normalised note, whose usage entries carry the cost
+		// resolved for this run's harness.
 		if m.Kind == KindProgressNote {
-			m.Payload = normalizeProgressNotePayload(m.Payload)
+			m.Payload = normalizeProgressNotePayload(m.Payload, run.Harness)
 		}
 		if c.any() {
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",

@@ -6,7 +6,8 @@ package workersvc
 // Two api-side rules live here:
 //
 //  1. INGEST (normalizeProgressNotePayload): the stored payload is rebuilt from scratch with
-//     only {text, milestone_id, model_usage}. Any other key is dropped, in particular `event`
+//     only {text, milestone_id, model_usage}, each usage entry carrying the server-resolved
+//     costStatus (and costUSD when metered). Any other key is dropped, in particular `event`
 //     (a payload that says event:"result" would be read by the usage tail and the web fold as
 //     the end of a leg) and `usage` (the web fold would count it a second time).
 //  2. USAGE FOLD (foldProgressNoteUsage): the note's model_usage is folded into run_usage under
@@ -82,7 +83,16 @@ type progressNotePayload struct {
 // keys. It never fails: a payload that is not an object, or whose fields are the wrong
 // type, yields an empty note (empty text), which every reader ignores. It runs AFTER
 // sanitizePayloadJSON, so the input is valid JSON free of NUL and unpaired surrogates.
-func normalizeProgressNotePayload(raw json.RawMessage) json.RawMessage {
+//
+// Each stored model_usage entry carries the SERVER-RESOLVED cost (resolveProgressNoteCost,
+// for the run's harness): costStatus is always one of metered|subscription|unreported, and
+// costUSD is written only for metered, quantized exactly as numericUSD stores it. That lets
+// the web reader show the same dollars as run_usage without a client price table. costUSD is
+// never written for a non-metered entry: for Claude a present costUSD refolds as metered, so a
+// stored 0 on an unreported entry would turn it into a metered $0. An unreported Claude entry
+// is therefore re-priced on every refold, so it is not strictly idempotent if a later price
+// table learns the model.
+func normalizeProgressNotePayload(raw json.RawMessage, harness string) json.RawMessage {
 	var in map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &in); err != nil {
 		in = nil
@@ -117,7 +127,7 @@ func normalizeProgressNotePayload(raw json.RawMessage) json.RawMessage {
 			if _, dup := out.ModelUsage[model]; dup {
 				continue
 			}
-			mu, ok := normalizeProgressNoteModelUsage(usage[rawKey])
+			mu, ok := normalizeProgressNoteModelUsage(usage[rawKey], harness, model)
 			if !ok {
 				continue
 			}
@@ -144,8 +154,9 @@ func normalizeProgressNotePayload(raw json.RawMessage) json.RawMessage {
 }
 
 // normalizeProgressNoteModelUsage keeps the known fields of one model_usage entry, each
-// decoded tolerantly so one malformed field never discards its siblings.
-func normalizeProgressNoteModelUsage(raw json.RawMessage) (progressNoteModelUsage, bool) {
+// decoded tolerantly so one malformed field never discards its siblings. The returned
+// entry's costStatus/costUSD are the resolved ones (see normalizeProgressNotePayload).
+func normalizeProgressNoteModelUsage(raw json.RawMessage, harness, model string) (progressNoteModelUsage, bool) {
 	var f map[string]json.RawMessage
 	if json.Unmarshal(raw, &f) != nil {
 		return progressNoteModelUsage{}, false
@@ -166,12 +177,33 @@ func normalizeProgressNoteModelUsage(raw json.RawMessage) (progressNoteModelUsag
 	mu.ServiceTier = tolerantMarker(f["service_tier"])
 	mu.Speed = tolerantMarker(f["speed"])
 	mu.InferenceGeo = tolerantMarker(f["inference_geo"])
+	// Replace the worker's cost claim with the server-resolved one.
+	status, usd := resolveProgressNoteCost(harness, model, mu)
+	mu.CostStatus, _ = json.Marshal(status)
+	mu.CostUSD = nil
+	if status == costStatusMetered {
+		mu.CostUSD, _ = json.Marshal(numericToFloat64(usd))
+	}
 	// An entry with nothing to fold would only add a zero-token row.
 	if mu.InputTokens == 0 && mu.OutputTokens == 0 && mu.CacheReadInputTokens == 0 &&
 		mu.CacheCreationInputTokens == 0 && len(mu.CostUSD) == 0 {
 		return progressNoteModelUsage{}, false
 	}
 	return mu, true
+}
+
+// resolveProgressNoteCost resolves one note entry's (cost_status, cost_usd) for the run's
+// harness: deriveUsageCost as for a result frame, except a non-Codex entry with no provider
+// costUSD is priced from the standard table (priceProgressNoteEntry). Both the fold and the
+// ingest normalisation use it, so the stored entry and the run_usage row agree.
+func resolveProgressNoteCost(harness, model string, mu progressNoteModelUsage) (string, pgtype.Numeric) {
+	marker := resolveCostStatusMarker(mu.CostStatus)
+	emitted, present := resolveCostUSD(mu.CostUSD)
+	costStatus, costUSD := deriveUsageCost(harness, marker, emitted, present)
+	if harness != harnessCodex && !present {
+		costStatus, costUSD = priceProgressNoteEntry(model, mu)
+	}
+	return costStatus, costUSD
 }
 
 // tolerantOptionalTokens is tolerantTokens for a field whose absence matters: nil when the
@@ -219,9 +251,11 @@ func tolerantMarker(raw json.RawMessage) string {
 // function of the frame, so a re-delivered batch and RefoldRunUsage land on the same row, and
 // GREATEST in UpsertRunUsage makes the repeat a no-op.
 //
-// Cost: deriveUsageCost as for a result frame, except a CLAUDE entry with no provider costUSD
-// is priced from the standard table; an entry the table cannot price stores cost_status
-// 'unreported' with cost 0 and keeps its tokens. A missing cost is never a metered $0.
+// Cost: resolveProgressNoteCost (deriveUsageCost as for a result frame, except a CLAUDE entry
+// with no provider costUSD is priced from the standard table); an entry the table cannot price
+// stores cost_status 'unreported' with cost 0 and keeps its tokens. A missing cost is never a
+// metered $0. The stored entries already carry the resolved cost (see
+// normalizeProgressNotePayload), so folding them resolves to the same row.
 func foldProgressNoteUsage(ctx context.Context, q usageFoldQuerier, run store.Run, sessionID string, m IncomingMessage) error {
 	var p progressNotePayload
 	if err := json.Unmarshal(m.Payload, &p); err != nil || len(p.ModelUsage) == 0 {
@@ -231,12 +265,7 @@ func foldProgressNoteUsage(ctx context.Context, q usageFoldQuerier, run store.Ru
 		if model == "" {
 			continue
 		}
-		marker := resolveCostStatusMarker(mu.CostStatus)
-		emitted, present := resolveCostUSD(mu.CostUSD)
-		costStatus, costUSD := deriveUsageCost(run.Harness, marker, emitted, present)
-		if run.Harness != harnessCodex && !present {
-			costStatus, costUSD = priceProgressNoteEntry(model, mu)
-		}
+		costStatus, costUSD := resolveProgressNoteCost(run.Harness, model, mu)
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 			RunID:               run.ID,
 			SessionID:           sessionID,

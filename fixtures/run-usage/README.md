@@ -20,6 +20,9 @@ fixtures/run-usage/result-frames-84b6a933.json   both real result frames of one 
 fixtures/run-usage/run-usage-84b6a933.json       the run_usage rows the server folded from them
 fixtures/run-usage/result-frames-02854d5e.json   four init + four result frames of one run (PRD #1079)
 fixtures/run-usage/run-usage-02854d5e.json       the per-leg rows an independent jq reduction folds from them
+fixtures/run-usage/result-frames-notes.json      authored worker input for the Now-summary notes (PRD #2603)
+fixtures/run-usage/stored-frames-notes.json      the same frames with the notes as the server stores them
+fixtures/run-usage/run-usage-notes.json          the authored rollup for the notes pair
 fixtures/run-usage/README.md                     this file
 ```
 
@@ -369,16 +372,26 @@ frames (seq 6 and 9) in the same leg. The fold rule:
   `run_usage_totals` MAX-per-group sums them all: input 2600, output 2400, cache_read 50000,
   cache_creation 3000, cost 1.5024;
 - the notes carry no `costUSD`, so the server prices them from the standard Anthropic table
-  (haiku: $1 per million input, $5 per million output) rather than storing a metered $0;
+  (haiku: $1 per million input, $5 per million output) rather than storing a metered $0, and
+  writes that resolved cost back into the stored note entry (`costStatus`, plus `costUSD` only
+  when metered; never a `costUSD` on an unreported or subscription entry);
 - a note payload has no `event` and no `usage` key, so no result-frame reader counts it.
 
 The discriminator: dropping the prefix (or keying by the init count) collapses all three haiku
 rows into one group and under-counts haiku input by 900 and output by 100. The Go reader asserts
 the rows and totals and that collapsed reading differs.
 
+`stored-frames-notes.json` is the same frames with the `progress_note` payloads as the server
+STORES them (haiku 400 in / 40 out = 0.0006 metered, 500 / 60 = 0.0008 metered). The client has
+no price table, so the web reader reads the stored file and its cost equals `totals.cost_usd`
+exactly. `result-frames-notes.json` stays the worker INPUT. Do not hand-edit the stored file:
+`TestRunUsageStoredNotesFixtureMatchesNormalization` fails if its note payloads differ from the
+server's normalisation of the input (claude harness) or any other frame differs.
+
 | | reads | asserts |
 |---|---|---|
-| Go unit | `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageNotesFoldMatchesAuthoredRollup`) | `rows` and `totals` through `AppendMessages` |
-| vitest | `web/src/lib/runUsageContract.test.ts` (added by the web unit) | `totals` via `deriveRunUsage` |
+| Go unit | `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageNotesFoldMatchesAuthoredRollup`) | `rows` and `totals` through `AppendMessages` over `result-frames-notes.json` |
+| Go unit | `run_usage_contract_test.go` (`TestRunUsageStoredNotesFixtureMatchesNormalization`) | `stored-frames-notes.json` = normalised input |
+| vitest | `web/src/lib/runUsageContract.test.ts` | `totals` (cost included) and `noteTotal` via `deriveRunUsage` over `stored-frames-notes.json` |
 
 The Go half needs `-count=1` (this directory is outside the `api` module).
