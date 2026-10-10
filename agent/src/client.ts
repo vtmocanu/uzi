@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
@@ -1011,7 +1012,8 @@ export class WorkerClient {
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
   private completionInventoryUnreadable = false;
-  private unknownClaimsRequireEligible = false;
+  // Monotonic negative evidence: collisions conservatively refuse only new identities.
+  private readonly ineligibleCompletionClaims = new Uint8Array(64 * 1024);
   private completionIncarnation = 0;
   // Live and temporarily retired identities each reserve both provenance slots.
   private readonly completionReservations = new Map<string, CompletionReservation>();
@@ -1214,7 +1216,7 @@ export class WorkerClient {
         this.completionClaims.clear();
         this.completionHolds.clear();
         this.completionInventoryUnreadable = false;
-        this.unknownClaimsRequireEligible = false;
+        this.ineligibleCompletionClaims.fill(0);
         this.completionReservations.clear();
         this.completionTickets.clear();
         this.completionIncarnation++;
@@ -1453,8 +1455,12 @@ export class WorkerClient {
         if (ticket.exclusions.has(key)) {
           // This request preceded retirement of this exact identity.
         } else if (!eligible) {
-          if (this.completionClaims.has(key)) this.completionClaims.set(key, null);
-          else this.unknownClaimsRequireEligible = true;
+          if (this.completionReservations.has(key)) this.completionClaims.set(key, null);
+          else {
+            for (const bit of this.ineligibleCompletionClaimBits(key)) {
+              this.ineligibleCompletionClaims[bit >>> 3] |= 1 << (bit & 7);
+            }
+          }
         } else if (this.allowCompletionBinding(key)) {
           const next = {
             repoId: repoId as string | undefined, forgeType: forgeType as string, branch: branch as string | undefined,
@@ -1702,8 +1708,7 @@ export class WorkerClient {
     const key = `${runId}:${body.claim_generation}`;
     const claim = this.completionClaims.get(key);
     const hold = this.completionHolds.get(key);
-    if ((this.unknownClaimsRequireEligible && claim === undefined) ||
-        claim === null || (claim && (!claim.eligible || !claim.guarded ||
+    if (claim === null || (claim && (!claim.eligible || !claim.guarded ||
           (claim.repoId !== undefined && claim.repoId !== value.repo_id) ||
           (claim.forgeType !== undefined && claim.forgeType !== value.forge_type) ||
           (claim.branch !== undefined && claim.branch !== value.branch))) ||
@@ -2017,7 +2022,6 @@ export class WorkerClient {
     const claim = this.completionClaims.get(key);
     const hold = this.completionHolds.get(key);
     if (this.completionInventoryUnreadable ||
-        (this.unknownClaimsRequireEligible && claim === undefined) ||
         claim === null || (claim && (!claim.eligible || !claim.guarded)) || hold === null) return false;
     // Reserve both provenance slots synchronously, before the runner can await journal installation.
     return this.allowCompletionBinding(key);
@@ -2048,9 +2052,17 @@ export class WorkerClient {
     if (reservation.tickets.size === 0) this.completionReservations.delete(key);
   }
 
+  private ineligibleCompletionClaimBits(key: string): number[] {
+    const digest = createHash("sha256").update(key).digest();
+    const bitCount = this.ineligibleCompletionClaims.length * 8;
+    return [0, 4, 8].map(offset => digest.readUInt32BE(offset) % bitCount);
+  }
+
   private allowCompletionBinding(key: string): boolean {
     const prior = this.completionReservations.get(key);
     if (prior) { prior.live = true; return true; }
+    if (this.ineligibleCompletionClaimBits(key).every(bit =>
+      (this.ineligibleCompletionClaims[bit >>> 3] & (1 << (bit & 7))) !== 0)) return false;
     if (this.completionReservations.size * 2 >= COMPLETION_BINDINGS_MAX) return false;
     this.completionReservations.set(key, { live: true, tickets: new Set() });
     return true;

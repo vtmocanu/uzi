@@ -43,7 +43,9 @@ beforeEach(() => {
     sent.push(JSON.parse(String(init?.body)));
     return Response.json(response);
   });
-  client = new WorkerClient("http://publication.test", "test-worker-token", "test", nullLogger());
+  client = new WorkerClient("http://publication.test", "test-worker-token", "test", nullLogger(), {
+    sleep: async () => {}, terminalRetrySchedule: [0, 0],
+  });
 });
 afterEach(() => mock.restoreAll());
 async function report(body: StateRequest = fixture.request) {
@@ -60,6 +62,121 @@ it("accepts the literal shared ancestor receipt without inventing archive author
   assert.notEqual(ack.completedPublicationReceipt?.observed_branch_head, fixture.request.completion_final_head);
   assert.equal("coverage_digest" in ack.completedPublicationReceipt!, false);
   assert.deepEqual(sent[0], fixture.request);
+});
+
+for (const lostACK of [false, true]) {
+  it(`hold-only original replay survives unrelated ineligible claim: ${lostACK ? "lost ACK" : "accepted ACK"}`, async t => {
+    const original = Object.freeze(structuredClone(fixture.request)) as StateRequest;
+    const snapshot = structuredClone(original);
+    await client.register("worker");
+    await client.listRecoveryHolds(RUN);
+    let losing = lostACK;
+    let storedACK: Record<string, unknown> | undefined;
+    const originalFetch = globalThis.fetch;
+    t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const res = await originalFetch(input, init);
+      if (!new URL(String(input)).pathname.endsWith("/state")) return res;
+      // The server persists the original receipt before every initial transport attempt fails.
+      storedACK ??= await res.json() as Record<string, unknown>;
+      if (losing) throw new Error("stored completion ACK lost");
+      return Response.json(storedACK);
+    });
+    if (lostACK) await assert.rejects(client.reportState(RUN, original), /stored completion ACK lost/);
+    else assert.deepEqual((await client.reportState(RUN, original)).completedPublicationReceipt, receipt);
+    assert.deepEqual(storedACK, fixture.ack);
+    const initialAttempts = sent.length;
+    assert.equal(initialAttempts, lostACK ? 3 : 1, "lost ACK exhausts the immediate retry schedule");
+    losing = false;
+    claim = { ...claim, run_id: receipt.owner_id, claim_generation: 2, kind: "chat" };
+    await client.claimRun();
+    assert.deepEqual((await client.reportState(RUN, original)).completedPublicationReceipt, receipt);
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+    await client.register("same-worker");
+    assert.deepEqual((await client.reportState(RUN, original)).completedPublicationReceipt, receipt);
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+    assert.deepEqual(sent, Array(initialAttempts + 2).fill(snapshot), "every attempt sends the immutable original");
+    assert.deepEqual(original, snapshot);
+    assert.equal(fetchedPaths.filter(path => path.endsWith("/claim")).length, 1, "only unrelated B is claimed");
+    assert.equal(claim.run_id, receipt.owner_id, "A was never claimed");
+    assert.equal(fetchedPaths.filter(path => path.endsWith("/recovery-holds")).length, 1, "A hold is never refetched");
+  });
+}
+
+it("exact ineligible B refuses hold, eligible retry, admission and receipt until changed-worker registration", async () => {
+  const runB = receipt.owner_id;
+  const bodyB = { ...fixture.request, claim_generation: 2 };
+  await client.register("worker");
+  claim = { ...claim, run_id: runB, claim_generation: 2, kind: "chat" };
+  await client.claimRun();
+  holdsResponse = () => Response.json({ run_id: runB, holds: [{ ...holds[0], generation: 2 }] });
+  const refuseB = async () => {
+    await client.listRecoveryHolds(runB);
+    claim = { ...claim, kind: "issue" };
+    await client.claimRun();
+    assert.equal(client.canStartPublicationCompletion(runB, 2), false);
+    response = { ...fixture.ack, run: { ...fixture.ack.run, id: runB, worker_id: workerId },
+      completed_publication_receipt: { ...receipt, run_id: runB, generation: 2, worker_id: workerId } };
+    assert.equal((await client.reportState(runB, bodyB)).completedPublicationReceipt, undefined);
+    assert.deepEqual(sent.at(-1), bodyB);
+  };
+  await client.register("same-worker");
+  await refuseB();
+  registrationFails = true;
+  await assert.rejects(client.register("failed-worker"));
+  await refuseB();
+  registrationFails = false;
+  await client.register("same-worker-again");
+  await refuseB();
+  workerId = receipt.connection_id;
+  registrationFails = true;
+  await assert.rejects(client.register("failed-different-worker"));
+  assert.equal(client.canStartPublicationCompletion(runB, 2), false);
+  registrationFails = false;
+  await client.register("different-worker");
+  await client.listRecoveryHolds(runB);
+  await client.claimRun();
+  assert.equal(client.canStartPublicationCompletion(runB, 2), true);
+  response = { ...fixture.ack, run: { ...fixture.ack.run, id: runB, worker_id: workerId },
+    completed_publication_receipt: { ...receipt, run_id: runB, generation: 2, worker_id: workerId } };
+  assert.deepEqual((await client.reportState(runB, bodyB)).completedPublicationReceipt, response.completed_publication_receipt);
+});
+
+for (const provenance of ["hold-only", "receipt-only"] as const) {
+  it(`ineligible A poisons its exact ${provenance} reservation`, async () => {
+    await client.register("worker");
+    if (provenance === "hold-only") await client.listRecoveryHolds(RUN);
+    else assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
+    claim = { ...claim, kind: "chat" };
+    await client.claimRun();
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), false);
+    assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+    await client.register("same-worker");
+    claim = { ...claim, kind: "issue" };
+    await client.claimRun();
+    assert.equal(client.canStartPublicationCompletion(RUN, 1), false);
+    assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+    assert.equal(client.canStartPublicationCompletion(RUN, 2), true, "contradiction is generation-exact");
+  });
+}
+
+it("saturated ineligible filter preserves reserved original and refuses new identities and known hold conflicts", async () => {
+  await client.register("worker");
+  await client.listRecoveryHolds(RUN);
+  const filter = Reflect.get(client, "ineligibleCompletionClaims") as Uint8Array;
+  assert.equal(filter.byteLength, 64 * 1024);
+  filter.fill(255);
+  await client.register("same-worker");
+  assert.ok(filter.every(byte => byte === 255), "same-worker registration preserves the monotonic filter");
+  assert.equal(client.canStartPublicationCompletion(RUN, 1), true);
+  assert.deepEqual((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, receipt);
+  assert.equal(client.canStartPublicationCompletion(RUN, 2), false);
+  response.completed_publication_receipt = { ...receipt, generation: 2 };
+  assert.equal((await client.reportState(RUN, { ...fixture.request, claim_generation: 2 })).completedPublicationReceipt, undefined);
+  holds = [{ ...holds[0], hold_id: receipt.owner_id }];
+  await client.listRecoveryHolds(RUN);
+  response = structuredClone(fixture.ack);
+  assert.equal(client.canStartPublicationCompletion(RUN, 1), false);
+  assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
 });
 
 it("accepts exact stored terminal replay after fresh registration without claim or hold fetches", async () => {
