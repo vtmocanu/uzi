@@ -970,20 +970,33 @@ WITH claimant AS MATERIALIZED (
                WHERE ow.id = r.worker_id
                  AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
-                          AND ow.last_heartbeat_at >= $6)))
+                          AND ow.last_heartbeat_at >= $6)
+                      -- #2705 pin P: a run the stale sweeper requeued (stale_requeue_generation
+                      -- = claim_generation, set only by RequeueRunsOfStaleWorkers, cleared by
+                      -- every fresh claim) stays pinned to its stale owner for
+                      -- WORKER_STALE_REQUEUE_GRACE from status_since, so a returning worker
+                      -- (a roll, a network blip) resumes it. NULL cutoff (grace 0) never pins.
+                      -- Per-episode only: PromoteCodexAccountWaitRun resets status_since AND
+                      -- updated_at, so Codex account park/promote cycles renew both this grace
+                      -- and the ceiling below; there is NO global bound across cycles.
+                      -- stale_requeue_generation is deliberately kept through the park for
+                      -- #1390 readoption/refund provenance.
+                      OR (r.kind <> 'cross_check'
+                          AND r.stale_requeue_generation = r.claim_generation
+                          AND COALESCE(r.status_since > $7::timestamptz, false))))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
            -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
-           OR r.updated_at < $7)
+           OR r.updated_at < $8)
       -- PRD #1030 M2 / PRD #422 Decision 7: a DRAINING claimant claims NOTHING NEW. It
       -- reaches ClaimRun now (the workersvc early return that made it claim nothing was
       -- removed so it can re-claim its OWN promoted run through a roll), but it must be
       -- scoped to runs it already owns — never a new/unclaimed/fallen-open run. When the
       -- claimant is not draining this is a no-op; when it is, only its own runs qualify.
-      AND (NOT $8::boolean OR r.worker_id = $2)
+      AND (NOT $9::boolean OR r.worker_id = $2)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
-      AND fn_worker_can_claim($9::boolean, $10::uuid[], r.repo_id, r.kind, $11::text[], r.required_capabilities, $12::boolean)
+      AND fn_worker_can_claim($10::boolean, $11::uuid[], r.repo_id, r.kind, $12::text[], r.required_capabilities, $13::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
       -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
@@ -1013,13 +1026,13 @@ WITH claimant AS MATERIALIZED (
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
-      AND ($13::int <= 0
+      AND ($14::int <= 0
            OR (r.claim_generation >= 1
                AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
                              WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
                AND (SELECT count(*) FROM recovery_custody_holds oh2
-                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $13::int)
-           OR (SELECT fn_custody_admission_count($3::uuid, $6::timestamptz)) < $13::int)
+                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $14::int)
+           OR (SELECT fn_custody_admission_count($3::uuid, $6::timestamptz)) < $14::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -1031,7 +1044,7 @@ WITH claimant AS MATERIALIZED (
       -- not implement the completion protocol. @worker_protocol_caps is the claiming worker's
       -- stored workers.protocol_capabilities column, passed by the Go caller.
       AND (r.completion_contract_version IS NULL
-           OR 'completion_interlock_v1' = ANY($14::text[]))
+           OR 'completion_interlock_v1' = ANY($15::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
@@ -1048,15 +1061,15 @@ WITH claimant AS MATERIALIZED (
       -- @worker_protocol_caps param the completion clause reads (the claimant's stored
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-           OR ('codex_harness_v1' = ANY($14::text[]) AND 'codex_runtime_v2' = ANY($14::text[])))
+           OR ('codex_harness_v1' = ANY($15::text[]) AND 'codex_runtime_v2' = ANY($15::text[])))
       -- Interlocked Codex turns require the newer completion loop, independently of overrides.
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-           OR 'codex_completion_interlock_v1' = ANY($14::text[]))
+           OR 'codex_completion_interlock_v1' = ANY($15::text[]))
       AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
-           OR 'cross_check_v1' = ANY($14::text[]))
+           OR 'cross_check_v1' = ANY($15::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
-           OR 'cross_check_codex_lead_v1' = ANY($14::text[]))
+           OR 'cross_check_codex_lead_v1' = ANY($15::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1068,9 +1081,9 @@ WITH claimant AS MATERIALIZED (
             AND protocol_lead.claim_generation = protocol_check.lead_claim_generation
             AND (protocol_check.round = 1 OR (protocol_check.automatic_rounds_enabled
                 AND protocol_check.round <= protocol_check.automatic_revision_limit + 1
-                AND 'cross_check_rounds_v1' = ANY($14::text[])))
+                AND 'cross_check_rounds_v1' = ANY($15::text[])))
       ))
-      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY($14::text[]))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY($15::text[]))
       -- PRD #1551 M4 (D6): the NON-BYPASSABLE custom-Codex-model claim clause, a SIBLING of the
       -- codex-harness clause directly above. A Codex run whose EFFECTIVE worker-root model is a
       -- CUSTOM (non-curated) id may be claimed ONLY by a worker whose protocol_capabilities contain
@@ -1090,12 +1103,12 @@ WITH claimant AS MATERIALIZED (
               AND r.kind NOT IN ('judge', 'chat')
               AND r.review_target_run_id IS NULL
               AND COALESCE(
-                  NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($15::text[]) THEN r.model
+                  NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($16::text[]) THEN r.model
                              ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
-                       = ANY($15::text[])),
+                       = ANY($16::text[])),
                   false)
           )
-          OR 'codex_custom_model_v1' = ANY($14::text[])
+          OR 'codex_custom_model_v1' = ANY($15::text[])
       )
       -- PRD #1908 (D-A): the NON-BYPASSABLE job-runner claim clause, a standalone sibling of the
       -- Codex clauses above. A repo-less 'job' run may be claimed ONLY by a NON-docker worker whose
@@ -1108,13 +1121,13 @@ WITH claimant AS MATERIALIZED (
       -- created since the file protocol landed) additionally needs 'job_files_v1'; a pre-change job
       -- (job_protocol NULL) stays claimable by any job_runner_v1 worker. Same OUTSIDE-the-bypasses rule.
       AND (r.kind <> 'job'
-           OR (NOT $9::boolean AND 'job_runner_v1' = ANY($14::text[])
-               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($14::text[]))
+           OR (NOT $10::boolean AND 'job_runner_v1' = ANY($15::text[])
+               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($15::text[]))
                -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
                -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
                -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
                -- the lane clause below (isolated_lane + isolated_fetch_v1) is unchanged.
-               AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY($14::text[]))))
+               AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY($15::text[]))))
       -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
       -- its SAME alias's account authority is on hold (D1's hold class):
       --   (1) quarantine: the linked account is quarantined and is still the run's
@@ -1183,8 +1196,8 @@ WITH claimant AS MATERIALIZED (
       -- the lane. The same three lines are mirrored for the spread peer below, in
       -- CountOnlineWorkersClaimableForRun and (as the lane half) in the CountOnlineWorkersSatisfying*
       -- rungs.
-      AND ((r.egress_profile_id IS NOT NULL) = $16::boolean)
-      AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY($14::text[]))
+      AND ((r.egress_profile_id IS NOT NULL) = $17::boolean)
+      AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY($15::text[]))
       AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
@@ -1204,18 +1217,18 @@ WITH claimant AS MATERIALIZED (
       -- or when the claimant still holds an open custody hold. A NULL @ephemeral_lease or an
       -- absent lease admits nothing, so lease 0 / a non-leased worker is exactly the bound-run-only
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
-      AND (NOT $17::boolean
-           OR (r.kind = 'cross_check' AND r.target_run_id = $18::uuid)
-           OR r.id = $18::uuid
+      AND (NOT $18::boolean
+           OR (r.kind = 'cross_check' AND r.target_run_id = $19::uuid)
+           OR r.id = $19::uuid
            OR ((fn_ephemeral_lease_admits(
-                   $19::timestamptz,
-                   $20::uuid,
-                   $21::text,
-                   $8::boolean,
-                   $22::interval,
-                   $23::timestamptz,
+                   $20::timestamptz,
+                   $21::uuid,
+                   $22::text,
+                   $9::boolean,
+                   $23::interval,
+                   $24::timestamptz,
                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $24::boolean, r.repo_id, r.kind, r.egress_profile_id, $10::uuid[]) OR COALESCE($9::boolean, false)))
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $25::boolean, r.repo_id, r.kind, r.egress_profile_id, $11::uuid[]) OR COALESCE($10::boolean, false)))
                AND NOT EXISTS (
                    SELECT 1 FROM workers bw
                    WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
@@ -1242,7 +1255,7 @@ WITH claimant AS MATERIALIZED (
       AND (
           (r.kind = 'cross_check' AND COALESCE($1::text, 'run') = 'cross_check')
           OR r.worker_id = $2
-          OR r.updated_at < $25
+          OR r.updated_at < $26
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -1272,16 +1285,16 @@ WITH claimant AS MATERIALIZED (
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
                      OR (fn_ephemeral_lease_admits(
                             p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
-                            $22::interval, now(),
+                            $23::interval, now(),
                             r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $24::boolean, r.repo_id, r.kind, r.egress_profile_id, $10::uuid[]) OR COALESCE(p.docker_enabled, false))))
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $25::boolean, r.repo_id, r.kind, r.egress_profile_id, $11::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
                 -- A legacy child can defer only to a peer eligible on the run lane;
                 -- explicit zero or dedicated cross-check capacity cannot use fallback.
                 -- Keep the protocol, pins and custom-model mirrors below as well.
                 AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(p, r, true,
                      'run', 'plan', $4::timestamptz, $5::timestamptz))
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $10::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $12::boolean)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $11::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $13::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
                 -- the peer, or fleet-spread could DEFER an interlocked run to an INCAPABLE peer
                 -- that would never be able to claim it — making the run unclaimable. Reads the
@@ -1329,9 +1342,9 @@ WITH claimant AS MATERIALIZED (
                         AND r.kind NOT IN ('judge', 'chat')
                         AND r.review_target_run_id IS NULL
                         AND COALESCE(
-                            NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($15::text[]) THEN r.model
+                            NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($16::text[]) THEN r.model
                                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
-                                 = ANY($15::text[])),
+                                 = ANY($16::text[])),
                             false)
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
@@ -1410,7 +1423,7 @@ WITH claimant AS MATERIALIZED (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $26
+            AND (a.reported_at >= $27
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -1420,8 +1433,8 @@ WITH claimant AS MATERIALIZED (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($27::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($28::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($28::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($29::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -1452,7 +1465,7 @@ WITH claimant AS MATERIALIZED (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $2, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $29) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $30) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1472,10 +1485,10 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at, inventory_guarded)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $2, $30::text, $2, t.id, now(), now(),
-           ('recovery_inventory_v1' = ANY($14::text[]))
+           $2, $31::text, $2, t.id, now(), now(),
+           ('recovery_inventory_v1' = ANY($15::text[]))
     FROM target t
-    WHERE $31::boolean
+    WHERE $32::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
@@ -1534,6 +1547,7 @@ type ClaimRunParams struct {
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
 	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	ClaimantDraining         bool               `json:"claimant_draining"`
 	IsDockerWorker           bool               `json:"is_docker_worker"`
@@ -1564,8 +1578,11 @@ type ClaimRunParams struct {
 // The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
 // for the worker's user, EXCLUDING chat runs (which the chat lane claims via
 // ClaimChatRun). A re-queued run prefers its prior worker (own runs sort first, and
-// are the only claimant until the affinity grace lapses — @affinity_cutoff is now
-// minus WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
+// are the only claimant while the owner row exists and can still resume the run: it is
+// draining/fenced, heartbeat-fresh, or (a stale requeue, #2705) inside
+// WORKER_STALE_REQUEUE_GRACE via @stale_requeue_cutoff; the @affinity_cutoff ceiling
+// (now minus WORKER_AFFINITY_CEILING) bounds it; once the owner row is gone or the pin
+// lapses any of the user's workers may claim it.
 // FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 // blocking. The kind<>'chat' predicate is what keeps
 // the run lane and the concurrent chat lane from stealing each other's work.
@@ -1604,6 +1621,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
 		arg.HeartbeatCutoff,
+		arg.StaleRequeueCutoff,
 		arg.AffinityCutoff,
 		arg.ClaimantDraining,
 		arg.IsDockerWorker,
@@ -2230,8 +2248,12 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6)))
-        OR run.updated_at < $7) AS affinity
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6)
+                            -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
+                            OR (run.kind <> 'cross_check'
+                                AND run.stale_requeue_generation = run.claim_generation
+                                AND COALESCE(run.status_since > $7::timestamptz, false))))
+        OR run.updated_at < $8) AS affinity
 FROM runs run
 JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
@@ -2241,7 +2263,7 @@ CROSS JOIN LATERAL (
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
-WHERE run.id = $8
+WHERE run.id = $9
   AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', $1::timestamptz, $2::timestamptz))
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= $6
@@ -2252,7 +2274,7 @@ WHERE run.id = $8
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
         run.required_capabilities,
-        $9::boolean)
+        $10::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -2288,9 +2310,9 @@ WHERE run.id = $8
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
           AND COALESCE(
-              NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id)) WHEN run.model = ANY($10::text[]) THEN run.model
+              NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id)) WHEN run.model = ANY($11::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
-                   = ANY($10::text[])),
+                   = ANY($11::text[])),
               false)
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -2327,6 +2349,7 @@ type CountOnlineWorkersClaimableForRunParams struct {
 	WorkerDockerEnabled      bool               `json:"worker_docker_enabled"`
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
 	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	RunID                    uuid.UUID          `json:"run_id"`
 	CapabilityAware          bool               `json:"capability_aware"`
@@ -2373,6 +2396,7 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		arg.WorkerDockerEnabled,
 		arg.DockerRepoAllowlist,
 		arg.HeartbeatCutoff,
+		arg.StaleRequeueCutoff,
 		arg.AffinityCutoff,
 		arg.RunID,
 		arg.CapabilityAware,
@@ -15918,6 +15942,9 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     -- heartbeat re-adoption can refund the requeue only when the same generation is restored
     -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
     stale_requeue_generation = runs.claim_generation,
+    -- #2705 invariant: this column plus a fresh status_since (set above) is what pins the run
+    -- to its stale owner in ClaimRun for WORKER_STALE_REQUEUE_GRACE. Every fresh claim clears
+    -- it; park/promote paths keep it (per-episode pin, see ClaimRun's comment).
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from

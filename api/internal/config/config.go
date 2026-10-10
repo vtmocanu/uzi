@@ -466,9 +466,12 @@ type Config struct {
 	ActiveSnapshotDisabled bool
 	WorkerPollInterval     time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace    time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling  time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace      time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace  time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	// WorkerStaleRequeueGrace (#2705): how long a run the stale-worker sweeper requeued stays
+	// pinned to its (heartbeat-stale) previous worker so a returning worker can resume it. 0 disables.
+	WorkerStaleRequeueGrace time.Duration
+	WorkerAffinityCeiling   time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace   time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -1171,6 +1174,10 @@ func Load() (Config, error) {
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+	// #2705: a stale-requeued run stays pinned to its previous worker this long (from the
+	// requeue) while that worker's row exists; 0 disables the pin. The 2h WorkerAffinityCeiling
+	// still bounds it.
+	cfg.WorkerStaleRequeueGrace = parseNonNegDuration("WORKER_STALE_REQUEUE_GRACE", 10*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
 	// to its prior worker while its row exists and it is heartbeating or draining
 	// (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment

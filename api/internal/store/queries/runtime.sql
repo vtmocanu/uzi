@@ -861,8 +861,11 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
 -- for the worker's user, EXCLUDING chat runs (which the chat lane claims via
 -- ClaimChatRun). A re-queued run prefers its prior worker (own runs sort first, and
--- are the only claimant until the affinity grace lapses — @affinity_cutoff is now
--- minus WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
+-- are the only claimant while the owner row exists and can still resume the run: it is
+-- draining/fenced, heartbeat-fresh, or (a stale requeue, #2705) inside
+-- WORKER_STALE_REQUEUE_GRACE via @stale_requeue_cutoff; the @affinity_cutoff ceiling
+-- (now minus WORKER_AFFINITY_CEILING) bounds it; once the owner row is gone or the pin
+-- lapses any of the user's workers may claim it.
 -- FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 -- blocking. The kind<>'chat' predicate is what keeps
 -- the run lane and the concurrent chat lane from stealing each other's work.
@@ -957,7 +960,20 @@ WITH claimant AS MATERIALIZED (
                WHERE ow.id = r.worker_id
                  AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
-                          AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
+                          AND ow.last_heartbeat_at >= @heartbeat_cutoff)
+                      -- #2705 pin P: a run the stale sweeper requeued (stale_requeue_generation
+                      -- = claim_generation, set only by RequeueRunsOfStaleWorkers, cleared by
+                      -- every fresh claim) stays pinned to its stale owner for
+                      -- WORKER_STALE_REQUEUE_GRACE from status_since, so a returning worker
+                      -- (a roll, a network blip) resumes it. NULL cutoff (grace 0) never pins.
+                      -- Per-episode only: PromoteCodexAccountWaitRun resets status_since AND
+                      -- updated_at, so Codex account park/promote cycles renew both this grace
+                      -- and the ceiling below; there is NO global bound across cycles.
+                      -- stale_requeue_generation is deliberately kept through the park for
+                      -- #1390 readoption/refund provenance.
+                      OR (r.kind <> 'cross_check'
+                          AND r.stale_requeue_generation = r.claim_generation
+                          AND COALESCE(r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
            -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
            OR r.updated_at < @affinity_cutoff)
@@ -6019,6 +6035,9 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     -- heartbeat re-adoption can refund the requeue only when the same generation is restored
     -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
     stale_requeue_generation = runs.claim_generation,
+    -- #2705 invariant: this column plus a fresh status_since (set above) is what pins the run
+    -- to its stale owner in ClaimRun for WORKER_STALE_REQUEUE_GRACE. Every fresh claim clears
+    -- it; park/promote paths keep it (per-episode pin, see ClaimRun's comment).
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
@@ -9390,7 +9409,11 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)
+                            -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
+                            OR (run.kind <> 'cross_check'
+                                AND run.stale_requeue_generation = run.claim_generation
+                                AND COALESCE(run.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))))
         OR run.updated_at < @affinity_cutoff) AS affinity
 FROM runs run
 JOIN users owner ON owner.id = run.user_id

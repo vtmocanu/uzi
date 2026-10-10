@@ -337,6 +337,7 @@ func run() error {
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
+		WorkerStaleRequeueGrace:     cfg.WorkerStaleRequeueGrace,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
 		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
