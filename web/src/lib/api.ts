@@ -458,7 +458,7 @@ function listRuns(params?: {
 
 // GET /api/admin/runs, with the same opt-in summary projection as listRuns.
 function adminListRuns(params: { view: "summary" }): Promise<{ runs: RunSummaryItem[] }>;
-function adminListRuns(params?: object): Promise<{ runs: RunListItem[] }>;
+function adminListRuns(): Promise<{ runs: RunListItem[] }>;
 function adminListRuns(params?: {
   view?: "summary";
 }): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {

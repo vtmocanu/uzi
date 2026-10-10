@@ -106,7 +106,7 @@ func TestRunListJSONAndAdminRunsSendNoView(t *testing.T) {
 	if out != want.String() {
 		t.Errorf("run list --json drifted from the legacy encoding:\n got: %s\nwant: %s", out, want.String())
 	}
-	for _, key := range []string{`"plan_md": "# the plan`, `"preserved_patch"`, `"issue_description": "long issue body"`, `"repo_agents"`} {
+	for _, key := range []string{`"plan_md": "# the plan`, `"preserved_patch": "diff --git a/x b/x"`, `"issue_description": "long issue body"`, `"name": "coder"`} {
 		if !bytes.Contains([]byte(out), []byte(key)) {
 			t.Errorf("run list --json lost heavy field %s", key)
 		}

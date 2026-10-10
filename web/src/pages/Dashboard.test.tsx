@@ -952,4 +952,17 @@ describe("Dashboard — summary run projection (#2661)", () => {
     expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(screen.getByText("Summary row title")).toBeTruthy();
   });
+
+  it("every listRuns call, including the poll tick, requests view=summary", async () => {
+    vi.useFakeTimers();
+    renderDashboard();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
+  });
 });

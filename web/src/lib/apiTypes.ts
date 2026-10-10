@@ -3578,7 +3578,7 @@ export interface UsageTail {
 // trap worth naming: here, a field added to `Run` is silently inherited by RunListItem,
 // so putting a list-only field at the wrong level compiles fine and quietly claims that
 // GET /runs/{id} returns something the API never sends. On the Go side RunListItemDTO
-// EMBEDS RunDTO, so the list row carries every detail field; the rule that still holds is
+// EMBEDS RunDTO, so the list row carries every RunDTO key; the rule that still holds is
 // that a field the API puts on RunListItemDTO alone belongs HERE, not on Run. (PRD #98
 // M4's judge badge fields were caught doing exactly this, by tsc via the run-view
 // fixtures.) The compact projection of this row is RunSummaryItem (?view=summary).

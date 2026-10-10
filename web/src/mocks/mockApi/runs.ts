@@ -288,7 +288,7 @@ function mockListRuns(params?: {
 }
 
 function mockAdminListRuns(params: { view: "summary" }): Promise<{ runs: RunSummaryItem[] }>;
-function mockAdminListRuns(params?: object): Promise<{ runs: RunListItem[] }>;
+function mockAdminListRuns(): Promise<{ runs: RunListItem[] }>;
 function mockAdminListRuns(params?: {
   view?: "summary";
 }): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {

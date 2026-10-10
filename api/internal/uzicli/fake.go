@@ -91,11 +91,11 @@ type FakeClient struct {
 	EgressProfiles        []apitypes.EgressProfileDTO
 	LastEgressProfileName string
 
-	// ListRunsCalls / AdminListRunsCalls count real ListRuns / AdminListRuns
-	// invocations (PRD #1130 M1). Purely additive, no mutex like the rest of this
-	// fake — every consumer is a single-goroutine command test — so the board-poll
-	// in-flight guard can be asserted with a positive count (exactly one fetch across
-	// two back-to-back periodic ticks) rather than a vacuous "not two".
+	// ListRunsCalls / AdminListRunsCalls count the legacy full-list calls (uzi run
+	// list, uzi admin runs); the TUI board polls the compact summary view and is
+	// counted by ListRunSummariesCalls below (PRD #1130 M1). Purely additive, no
+	// mutex like the rest of this fake: every consumer is a single-goroutine command
+	// test, so a poll in-flight guard can be asserted with a positive count.
 	ListRunsCalls      int
 	AdminListRunsCalls int
 
