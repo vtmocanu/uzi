@@ -356,3 +356,30 @@ Focused median leaf time at default CPU, unprobed (b) to barrier (c):
 - owner: 667ms to 963ms
 - symlink: 619ms to 987ms
 - single-uid: 670ms to 1029ms
+
+## Readiness barrier fix: real-lane GREEN (2026-10-10, plan v3 M2)
+
+Fixed commit: `1f64ebe3`. Base leaves for the RED: `0e356b9f` (batch (b) above). The fixed
+leaves ran on the same image and focused projection as the RED batches, with the same scratch
+diagnostic emission patch and no barrier patch: the barrier is now in the tracked leaves.
+
+| Batch | Iterations with any failing leaf | Wall total / mean |
+| --- | --- | --- |
+| fixed leaves, default CPU | 0 / 20 | 167.5s / 8.4s |
+| fixed leaves, `--cpus 0.25` | 0 / 20 | 675.7s / 33.8s |
+
+- All 160 leaf records passed, including the genuine-unclean control.
+- Every record for the three fixed leaves read `started > provider_ready > mutation_start >
+  mutation_end > dispose_start > dispose > exit_zero > dispose_end`.
+- The probe-safety observations were unchanged: owner `["keep"]` = `"keep"`, symlink victim
+  `["keep"]` = `"outside"`.
+
+Median leaf time at default CPU, base (b) to fixed:
+- owner: 667ms to 929ms
+- symlink: 619ms to 924ms
+- single-uid: 670ms to 1000ms
+
+Median leaf time at `--cpus 0.25`, base (b) to fixed:
+- owner: 2660ms to 3049ms
+- symlink: 2485ms to 3006ms
+- single-uid: 2815ms to 3302ms
