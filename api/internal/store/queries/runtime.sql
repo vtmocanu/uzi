@@ -9336,10 +9336,10 @@ WHERE id = @id AND status = @status;
 
 -- name: CountOnlineWorkersForUser :one
 -- How many of a user's workers are online — the queued-run reason resolver uses it
--- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
--- for a queued run already past its threshold, so it is off the hot path. The early
--- docker-allowlist probe also calls it for every repo-bearing queued run still under the
--- threshold (one cheap count per such run per tick; it gates the costlier reads).
+-- to say "no worker is online" vs "waiting for a worker" (Decision 8), for a queued run
+-- past its threshold. Under the threshold the early docker-allowlist probe calls it once
+-- per tick for each queued run that has a repo, no egress profile and a configured
+-- allowlist reader (one cheap count; it gates the costlier reads).
 -- draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): a draining
 -- worker keeps status='online' and still counts as an online worker for "no worker is
 -- online" purposes — do not add a draining predicate.
@@ -9352,7 +9352,8 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 -- with capability_aware mirroring the claim path's flag so this count and the claim gate can
 -- never disagree on ELIGIBILITY. It is deliberately an ELIGIBILITY count, NOT an
 -- availability one: it does NOT exclude draining workers (nor busy ones). That is on
--- purpose — its sole consumer is PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowedAdmin/Member),
+-- purpose — it serves only PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowedAdmin/Member)
+-- and the early probe that surfaces that rung under the queued threshold,
 -- whose job is to isolate the docker-allowlist fence as the blocker. Excluding draining here
 -- would MISATTRIBUTE a transient all-draining fleet (during a worker roll — CountOnlineWorkersForUser
 -- keeps draining workers online, so the run still reaches that rung) to the allowlist, printing
@@ -9364,9 +9365,9 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 -- Params cast EXACTLY as ClaimRun passes them so a green sqlc generate is not mistaken for a
 -- query Postgres will accept. The fence-BLIND capability-gap discriminator ("does the fleet
 -- HAVE these caps at all") is a separate concern handled upstream by
--- CountOnlineWorkersSatisfyingCaps. Its callers are the queued-reason resolver, only for a
--- run already past its health threshold, and the early docker-allowlist probe for a
--- repo-bearing queued run under it, after CountOnlineWorkersForUser found an online worker.
+-- CountOnlineWorkersSatisfyingCaps. Its callers are the queued-reason resolver (past the
+-- health threshold, or under it once the early probe has fired) and the early
+-- docker-allowlist probe itself, after CountOnlineWorkersForUser found an online worker.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
