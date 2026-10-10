@@ -185,7 +185,8 @@ changes it); trust it over a handover's claim.
    trace tail); do not assume dead or lost, change nothing until you know, then launch its
    `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
-   surface it, answer with `uzi run answer` if you can (a completion question about a milestone
+   surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
+   *Watching*; a completion question about a milestone
    the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
    a plain answer cannot exempt it, then open the PR); `awaiting_approval` → the plan gate
    is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
@@ -336,7 +337,10 @@ changes it); trust it over a handover's claim.
    A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows
    onto an older base, which can make CI call a Task target the branch lacks. On such a
    finding, check the target on current `main`; when `main` defines it, rebase onto `main`,
-   rerun CI, then assess whatever finding remains.
+   rerun CI, then assess whatever finding remains. When the two-dot workflow diff vs `main` is
+   empty, verify a workflow finding against current `main` and the align commit: drop a redundant
+   align commit with `land-prep.sh`, correct inaccurate PR-description claims, resolve as
+   inherited only after verifying attribution, and track a real defect on `main` separately.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
@@ -551,6 +555,7 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   `list` shows it, and B's lander waits on A's owner (trail `waiting #A`).
 - **Unclaimed run PRs.** `S/orphans.sh` lists them; the dispatching session lands its own
   run (`run-<RUN_ID>` claim), an orphan goes to whoever asks first: references/orphans.md.
+  Look a run up by its PR number too: takeover converts `run-<RUN_ID>` into the `#PR` claim.
 - **Contested PR.** Never `--force` a live session's claim; message the owner. A dead or
   stale owner (registry says gone, or no heartbeat for 6 h) is taken over silently.
 - **Cleanup spans the post-merge watch.** `merge.sh` releases the live claim on `MERGED`
@@ -596,6 +601,7 @@ wrapper always completes with 0.
   `scripts/lib/state.sh` the shared state dir/session identity; `scripts/lib/review-threads.sh`
   the fail-closed GitHub thread-resolution reader; `scripts/lib/pr-comments.sh` the
   every-author blockers; `scripts/lib/sanitize.sh` the UNTRUSTED-text renderer;
+  `scripts/lib/net-retry.sh` read-only `gh`/`uzi` transport retry (takeover, land-prep, watch-pr);
   `scripts/ack-comments.sh` acknowledges read comments.
 - `scripts/watch-pr.sh` readiness (CI + CR/Greptile on head + rework + rate-limit/skip exits);
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +

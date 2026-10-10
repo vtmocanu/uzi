@@ -66,6 +66,9 @@ through `[0.52.0]`.)
 - **Completed publication serializes safely with worker updates.**
   Persistent workers complete under the same worker-before-run lock order as claims and registration, even with leasing disabled. A worker capability downgrade still completes and consumes its matching permit without stamping a publication head or custody identity. Completion migrations also support schema rollback and reapplication while keeping released custody released.
 
+- **A judge run killed by a usage limit now fails with the limit facts instead of posting the fallback review ([#1970](https://github.com/vtmocanu/uzi/issues/1970)).**
+  The Claude judge lane reports the run failed with its rate-limit window and reset time (or a usage-limit reason when the model reported none), posts no review and does not report the run completed. Other model errors still post the deterministic fallback; the Codex judge lane is unchanged.
+
 - **TUI run detail fits narrow terminals ([#2591](https://github.com/vtmocanu/uzi/issues/2591)).**
   The run detail and answer views' crew and transcript rows are now clipped to the terminal width instead of overflowing it; the crew rail keeps its width and the transcript column is what is cut.
 
@@ -92,6 +95,9 @@ through `[0.52.0]`.)
 
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
+
+- **`uzi job create --prompt-file` and `--input` keep the failure reason visible for long paths ([#2608](https://github.com/vtmocanu/uzi/issues/2608)).**
+  A missing, unreadable or non-regular prompt or input file now reports the reason before the path, so the CLI’s bounded error line preserves it for deeply nested files.
 
 - **Label sweep help includes bot-assignment eligibility.**
   The schedule modal clarifies that selector candidates can fire with the configured eligibility label or assignment to the uzi bot.

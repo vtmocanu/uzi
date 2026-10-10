@@ -63,12 +63,14 @@ func wrapWords(text string, width, maxRows int) []string {
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
 // no-milestone run (renderMilestones returns "" for an empty frozen list). The rail is
-// laneRailWidth (26) columns, so the mock's one-line block wraps to one fact per row.
+// laneRailWidth columns: the block is a top line (the percent or a state flag, with the
+// milestone done/total counts when available in the percent state) followed by optional
+// phase, Now-note, since, planning and may-be-blocked-by lines.
 //
 // Every state has a text form, so the colorprofile Ascii/NoTTY downgrade loses only colour.
-// ActiveMilestoneID, Phase and MaybeBlockedByRunID are server strings derived from untrusted
-// repo/agent/question text, so each is drawn only through m.renderer.Plain (D7). The block is
-// "" for a nil, none or unknown state with no blocked-by hint.
+// Phase and MaybeBlockedByRunID are server strings derived from untrusted repo/agent/question
+// text, so each is drawn only through m.renderer.Plain (D7); the Now note takes the same path
+// in nowNoteLines. The block is "" for a nil, none or unknown state with no blocked-by hint.
 func (m tuiModel) renderProgress() string {
 	run := m.detail.run
 	p := run.Progress
