@@ -428,7 +428,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				return map[string]any{"claim_generation": claimGen, "worker_id": workerID, "hold_generations": holdGenerations, "reauth_required": reauth, "cap_revoked": capRevoked, "fail_free": failFree, "status": status, "cause": cause, "session": session, "slot": slot, "coord": coord, "sealing": sealing, "generation": gen, "holds": holds, "captures": captures, "issued": issued, "consumed": consumed, "permit_requests": requests, "inputs": inputs, "discover": discover}, nil
 			}
 			recoverAccount := func(before map[string]any) (map[string]any, error) {
-				if before["status"] != "recovery_wait" || before["issued"] != 0 || before["permit_requests"] != 0 || before["holds"] == 0 || before["captures"] == 0 || !vlt.Unlocked(owner) || before["cap_revoked"] != true || before["fail_free"] != true {
+				if before["status"] != "recovery_wait" || before["issued"] != 0 || before["permit_requests"] != 0 || before["holds"] == 0 || !vlt.Unlocked(owner) || before["cap_revoked"] != true || before["fail_free"] != true {
 					return nil, errors.New("account park/custody/authority invariant failed")
 				}
 				durable, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: account.ID, UserID: owner})

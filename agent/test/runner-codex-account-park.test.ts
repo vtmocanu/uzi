@@ -2,13 +2,15 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { CodexSessionStore } from "../src/codex/session-state.js";
 import { RequestError } from "../src/client.js";
 import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import type { CredentialFreeSettleOutcome } from "../src/executor.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import {
-  api, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith, worktreeDirFor,
+  api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor,
 } from "./runner-harness.js";
 import {
   commitInTree, codexRig, FakeCodexExecutor, statuses, feedTexts, parkReports,
@@ -240,8 +242,26 @@ describe("M2 account park W3-W6/W9", () => {
     const rig = codexRig({ accountUnavailable: () => true });
     const w = workThenDefer(rig);
     const claim = gitlabClaim(159511, { claim_generation: 3 });
-    const { logger, lines } = recordingLogger();
-    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
+    const session = randomUUID();
+    const epoch = path.join(homeDir, "model-session");
+    const store = path.join(homeDir, "codex-session-store");
+    const rollout = "rollout-" + session + ".jsonl";
+    const contents = JSON.stringify({ type: "session_meta", payload: { id: session } }) + "\n";
+    fs.mkdirSync(path.join(epoch, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(epoch, "sessions", rollout), contents);
+    const run = w.exec.run.bind(w.exec);
+    w.exec.run = async (ctx) => {
+      ctx.onSessionId?.(session);
+      await CodexSessionStore.persist(epoch, store);
+      return run(ctx);
+    };
+    const assertSession = async (): Promise<void> => {
+      assert.equal(await CodexSessionStore.inspectSession(store, session), "present");
+      const generation = fs.readFileSync(path.join(store, "current"), "utf8").trim();
+      assert.equal(fs.readFileSync(path.join(store, "generations", generation, "sessions", rollout), "utf8"), contents);
+    };
+    const { logger } = recordingLogger();
+    const runner = runnerWith(() => ({ executor: w.exec, homeDir }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
     const custody = spyCustodySettle(runner);
     const waits = observeWaits(runner);
     let reports = 0;
@@ -251,16 +271,28 @@ describe("M2 account park W3-W6/W9", () => {
         assert.equal(body.recovery_cause, "codex_account_unavailable");
         assertCaptured(159511);
         assert.ok(fs.existsSync(worktreeDirFor(159511)));
-        assert.equal(sessionKept(lines), false, "active session retained");
+        await assertSession();
+        assert.equal(body.session_id, session);
         assert.equal(custody(), 0);
         assert.ok(!statuses(claim.run_id).some((s) => s === "failed" || s === "completed"));
-        if (++reports <= 7) throw new RequestError("POST", "/state", 400, "unknown cause");
+        if (++reports <= 7) {
+          try {
+            throw new RequestError("POST", "/state", 400, "unknown cause");
+          } catch (error) {
+            await assertSession(); // Inspect after this rejected report, before the next retry.
+            throw error;
+          }
+        }
+        const ack = await report(id, body, signal);
+        await assertSession();
+        return ack;
       }
       return report(id, body, signal);
     };
     const restore = spyPublishLands();
     try {
       await runner.execute(claim);
+      await assertSession();
       assert.equal(reports, 8);
       assert.deepEqual(waits, [1, 2, 4, 8, 16, 16, 16]);
       assert.equal(feedTexts(claim.run_id).filter((s) => s === REPORT_FAILED).length, 1);
