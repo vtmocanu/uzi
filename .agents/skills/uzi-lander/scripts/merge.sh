@@ -3,11 +3,15 @@
 # admin-merge past the ruleset, then CONFIRM it merged and print the merge SHA for the
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
-# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
+# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--expect-closes N[,N...]|none] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
 #   --expect-head   the head you reviewed/watched; a different current head refuses (exit 8)
 #                   so a push that landed after your last look is never merged unseen. The
 #                   merge itself passes --match-head-commit, so a push in the window between
 #                   the preflight and the merge is refused by GitHub as well.
+#   --expect-closes the issues this merge may close (`none` for a Refs-only PR). GitHub's
+#                   closingIssuesReferences, which also counts negated prose such as "does
+#                   not close #N", must equal it exactly, or the merge refuses (exit 11);
+#                   unreadable refuses (exit 2). Without the flag, CLOSES= is printed only.
 #   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
 #   --confirm-only  do NOT merge: the PR was already merged OUT OF BAND (e.g. the harness
 #                   classifier refused the in-script `gh pr merge --admin` and the user ran it
@@ -49,6 +53,8 @@
 #      mergeability lag) — poll `gh pr view --json state` yourself before the CI watch
 #  10  a `chore(release):` commit's CI is still running on main: merging now would supersede
 #      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run
+#  11  closing references differ from --expect-closes: fix the PR body (drop the closing
+#      keyword, e.g. reword "does not close #N" to "Refs #N"), then re-run
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,16 +67,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
 
-REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
+REPO=""; PR=""; EXPECT=""; EXPECT_CLOSES=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-head) EXPECT="${2:?}"; shift 2;;
+    --expect-closes) [ $# -ge 2 ] && [ -n "$2" ] || { echo "--expect-closes needs issue numbers or none" >&2; exit 2; }
+      EXPECT_CLOSES="$2"; shift 2;;
     --method) METHOD="${2:?}"; shift 2;;
     --no-admin) ADMIN=0; shift;;
     --no-delete-branch) DELETE=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
     --confirm-only) CONFIRM_ONLY=1; shift;;
-    -h|--help) sed -n '2,25p' "$0"; exit 2;;
+    -h|--help) sed -n '2,29p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -124,6 +132,28 @@ if [ -n "$EXPECT" ] && ! printf '%s' "$head" | grep -q "^$EXPECT"; then
   echo "HEAD MISMATCH: current ${head:0:8}, expected ${EXPECT:0:8} — a push landed after your last look; re-review"; exit 8
 fi
 echo "head=${head:0:8} mergeable=$mg mergeStateStatus=$ms"
+
+# Closing references, as GitHub will apply them on merge (negated prose counts too).
+want_closes=""
+if [ -n "$EXPECT_CLOSES" ] && [ "$EXPECT_CLOSES" != none ]; then
+  # Each comma-separated token: optional surrounding blanks, one optional leading '#', digits.
+  want_closes=$(printf '%s\n' "$EXPECT_CLOSES" | awk -F, '{
+      for (i = 1; i <= NF; i++) { t = $i; gsub(/^[ \t]+|[ \t]+$/, "", t)
+        if (t !~ /^#?[0-9]+$/) { bad = 1; exit }
+        sub(/^#/, "", t); print t + 0 } }
+    END { if (bad) exit 1 }' | sort -n | paste -sd, -) \
+    || { echo "bad --expect-closes '$EXPECT_CLOSES' (issue numbers, comma-separated, or none)" >&2; exit 2; }
+fi
+if closes=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences 2>/dev/null \
+     | jq -er 'if has("closingIssuesReferences") then [.closingIssuesReferences[].number]|sort|map(tostring)|join(",") else error("missing") end' 2>/dev/null); then
+  echo "CLOSES=${closes:-none}"
+  if [ -n "$EXPECT_CLOSES" ] && [ "$closes" != "$want_closes" ]; then
+    echo "CLOSING REFERENCES MISMATCH: merging would close [${closes:-none}], expected [${want_closes:-none}]; fix the PR body (a negated \"does not close #N\" still closes) and re-run"; exit 11
+  fi
+else
+  echo "CLOSES=unknown"
+  [ -z "$EXPECT_CLOSES" ] || { echo "closing references unreadable; not merging"; exit 2; }
+fi
 
 # mr_rework guard, last moment — FAIL CLOSED: an absent uzi, a failed listing or unreadable
 # JSON cannot rule out an active rework (exit 4). Only a successful listing that shows the

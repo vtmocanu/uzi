@@ -64,6 +64,11 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
       [ "\$c" -ge 2 ] || oid= ;;
   esac
   case "\$*" in
+    *closingIssuesReferences*)
+      [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
+      printf '{"closingIssuesReferences":%s}\n' "\${CLOSES_JSON:-[]}"; exit 0 ;;
+  esac
+  case "\$*" in
     *'-q .state'*) printf '%s\n' "\$st" ;;
     *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
     *)     if [ -n "\$oid" ]; then
@@ -245,7 +250,7 @@ MERGE_STATE=OPEN; export MERGE_STATE
 merge_run() { # label -> rc, output in $WORK/m.<label>
   rm -f "$WORK/merge.log"
   set +e
-  bash "$SCRIPT" test/repo 42 --no-rework-check > "$WORK/m.$1" 2>&1
+  bash "$SCRIPT" test/repo 42 --no-rework-check ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} > "$WORK/m.$1" 2>&1
   rc=$?
   set -e
 }
@@ -447,6 +452,44 @@ merge_run capped
 [ "$rc" -eq 2 ] || fail "1,000 of total_count 1001 did not refuse, rc=$rc: $(cat "$WORK/m.capped")"
 [ ! -e "$WORK/merge.log" ] || fail "merged on a capped run listing"
 unset MAIN_RUNS_PAGE_FILE
+# --expect-closes: GitHub's closingIssuesReferences counts negated prose too (PR #2629's
+# "this PR does not close #1912" closed #1912 on merge). A mismatch refuses before the merge.
+export CLOSES_JSON='[{"number":1912}]'
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_negated
+[ "$rc" -eq 11 ] || fail "a Refs-only PR that GitHub would close #1912 with did not refuse, rc=$rc: $(cat "$WORK/m.closes_negated")"
+grep -q 'merging would close \[1912\], expected \[none\]' "$WORK/m.closes_negated" || fail "closing mismatch not named: $(cat "$WORK/m.closes_negated")"
+[ ! -e "$WORK/merge.log" ] || fail "merged although it would close an issue meant to stay open"
+MERGE_ARGS=(--expect-closes '#1912')
+merge_run closes_match
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "matching closing references blocked the merge: $(cat "$WORK/m.closes_match")"
+export CLOSES_JSON='[{"number":7},{"number":12}]'
+MERGE_ARGS=(--expect-closes '12,7')
+merge_run closes_set
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "an equal set in another order blocked the merge: $(cat "$WORK/m.closes_set")"
+MERGE_ARGS=(--expect-closes 7)
+merge_run closes_extra
+[ "$rc" -eq 11 ] || fail "an extra closing reference did not refuse, rc=$rc: $(cat "$WORK/m.closes_extra")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with an unexpected closing reference"
+for bad in 'seven' '1#2' '7,' ',7' '7,,12' '##7' '7 12' ''; do
+  MERGE_ARGS=(--expect-closes "$bad")
+  merge_run closes_bad
+  [ "$rc" -eq 2 ] || fail "malformed --expect-closes '$bad' did not refuse, rc=$rc: $(cat "$WORK/m.closes_bad")"
+  [ ! -e "$WORK/merge.log" ] || fail "merged on malformed --expect-closes '$bad'"
+done
+MERGE_ARGS=(--expect-closes ' #12 , 7 ')
+merge_run closes_blanks
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "surrounding blanks and a leading # blocked a matching set: $(cat "$WORK/m.closes_blanks")"
+export CLOSES_FAIL=1
+MERGE_ARGS=(--expect-closes none)
+merge_run closes_unreadable
+[ "$rc" -eq 2 ] || fail "unreadable closing references did not refuse, rc=$rc: $(cat "$WORK/m.closes_unreadable")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with unreadable closing references"
+MERGE_ARGS=()
+merge_run closes_noflag
+grep -q 'CLOSES=unknown' "$WORK/m.closes_noflag" || fail "no-flag run did not report unknown closing references: $(cat "$WORK/m.closes_noflag")"
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "without --expect-closes an unreadable lookup must stay informational: $(cat "$WORK/m.closes_noflag")"
+unset CLOSES_FAIL CLOSES_JSON; MERGE_ARGS=()
 # --confirm-only never reads the run list.
 MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
 seed_state
@@ -456,4 +499,4 @@ bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 MERGE_STATE=OPEN; export MERGE_STATE
 unset RUNS_FAIL CHECKS_JSON CHECKS_RC
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses; --expect-closes refuses a closing-reference mismatch"
