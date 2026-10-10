@@ -1,16 +1,15 @@
 # uzi release: build + push the images and the Helm chart to GHCR on a `v*` tag
 # (ported from the retired GitLab `publish:*` jobs, PRD #58 / #113 / #175 / #230).
 #
-# TRIGGER: `v*` tags only. A release is cut by tagging a commit already on main (which
-# ci.yml gated). release.yml re-runs the two RELEASE-SPECIFIC gates -- assert-version
-# and assert-changelog -- before any push; a mismatch there blocks every publish.
-#
-#   ATOMICITY NOTE (differs from GitLab). The GitLab pipeline ran the full lint/test
-#   gate set IN THE SAME tag pipeline, so a failing test blocked the push. GitHub does
-#   not run ci.yml on tags and cannot `needs:` another workflow's jobs, so the heavy
-#   gates are NOT re-run here -- they are assumed green on the main commit being
-#   tagged. If we ever want true single-pipeline atomicity, make ci.yml
-#   `workflow_call`-able and add it as a `needs:` job below.
+# TRIGGER: v* tags only. assert-ci-coverage requires successful main-push CI
+# and smoke on the tagged SHA or across at most two strict metadata hops.
+# assert-release-metadata checks the changed chart and bundled changelog on the tag.
+# An explicit annotated stable-patch hotfix may report UNVERIFIED, preserving
+# the documented off-main path. Tagged metadata and real smoke still gate it.
+# Full main CI still runs on release commits; publication can inherit its parent's
+# coverage immediately instead of waiting for those heavy jobs a second time.
+# Chart publication also requires the tagged tree's actual KinD smoke job.
+# Never use a skip-ci marker on a release commit: it suppresses tag workflows too.
 #
 # TRUST BOUNDARY: read-only default token. Writes are per-job and of two kinds:
 # `packages: write` (GHCR, via the built-in GITHUB_TOKEN) on every image + chart job,
@@ -75,8 +74,74 @@ jobs:
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
-  # Reject a tag that is not clean SemVer, and require Chart.yaml version/appVersion to
-  # equal it (Model B). Every publish job `needs` this, so a bad tag blocks all pushes.
+  # Coverage is inherited only across at most two strictly classified metadata commits.
+  assert-ci-coverage:
+    outputs:
+      hotfix_unverified: ${{ steps.coverage.outputs.hotfix_unverified }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove green CI coverage or record the explicit hotfix exception
+        id: coverage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 -I scripts/release-ci-coverage.py coverage "$RELEASE_SHA" --tag "$RELEASE_TAG"
+
+  # web embeds CHANGELOG.md; agents COPY the whole repository. API/controller
+  # use component-local contexts and need coverage without this metadata gate.
+  assert-release-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version-file: api/go.mod
+          cache: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+        with:
+          version: v4.3.0
+      - uses: ./.github/actions/setup-task
+      - name: Install the locked web test dependencies
+        working-directory: web
+        run: npm ci
+      - name: Validate release metadata on the tagged tree
+        run: task check:release-metadata
+
+  # Smoke of the tagged chart gates chart publication; image builds run alongside it.
+  assert-tag-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - name: Require the real tagged KinD smoke job
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 -I scripts/release-ci-coverage.py smoke "$RELEASE_SHA" "$RELEASE_TAG"
+
+  # Require a valid tag equal to both chart version fields before publishing.
   assert-version:
     runs-on: ubuntu-latest
     steps:
@@ -175,7 +240,7 @@ jobs:
 
   publish-api:
     runs-on: ubuntu-latest
-    needs: [prep, assert-version, assert-changelog]
+    needs: [prep, assert-version, assert-changelog, assert-ci-coverage]
     environment: release
     permissions:
       contents: read
@@ -238,7 +303,7 @@ jobs:
 
   publish-web:
     runs-on: ubuntu-latest
-    needs: [prep, assert-version, assert-changelog]
+    needs: [prep, assert-version, assert-changelog, assert-ci-coverage, assert-release-metadata]
     environment: release
     permissions:
       contents: read
@@ -291,7 +356,7 @@ jobs:
 
   publish-controller:
     runs-on: ubuntu-latest
-    needs: [prep, assert-version, assert-changelog]
+    needs: [prep, assert-version, assert-changelog, assert-ci-coverage]
     environment: release
     permissions:
       contents: read
@@ -369,7 +434,7 @@ jobs:
   # anyway, that is acceptable by design: each release consumes the digest it verified.
   publish-agent:
     runs-on: ubuntu-latest
-    needs: [prep, assert-version, assert-changelog]
+    needs: [prep, assert-version, assert-changelog, assert-ci-coverage, assert-release-metadata]
     environment: release
     permissions:
       contents: read
@@ -665,7 +730,7 @@ jobs:
   # oci://ghcr.io/vtmocanu/uzi/uzi:<Chart.version>.
   publish-chart:
     runs-on: ubuntu-latest
-    needs: [assert-version, assert-changelog, publish-api, publish-web, publish-controller, publish-agent, assert-worker-pin, assert-agent-version]
+    needs: [assert-version, assert-changelog, assert-ci-coverage, assert-release-metadata, assert-tag-smoke, publish-api, publish-web, publish-controller, publish-agent, assert-worker-pin, assert-agent-version]
     environment: release
     permissions:
       contents: read
@@ -742,17 +807,22 @@ jobs:
   # in-run approval. See the TRUST BOUNDARY note at the top.)
   publish-release:
     runs-on: ubuntu-latest
-    needs: [publish-api, publish-web, publish-controller, publish-agent, publish-chart]
+    needs: [assert-ci-coverage, assert-release-metadata, publish-api, publish-web, publish-controller, publish-agent, publish-chart]
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Build release notes from the CHANGELOG section
         id: notes
+        env:
+          HOTFIX_UNVERIFIED: ${{ needs.assert-ci-coverage.outputs.hotfix_unverified }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           bash scripts/changelog-section.sh body "$VERSION" > release-notes.md
+          if [ "$HOTFIX_UNVERIFIED" = true ]; then
+            printf '\n**UNVERIFIED hotfix: this off-main release has no full CI evidence. Tagged metadata, worker-image checks and real KinD smoke passed.**\n' >> release-notes.md
+          fi
           {
             echo "title=$(bash scripts/changelog-section.sh title "$VERSION")"
           } >> "$GITHUB_OUTPUT"

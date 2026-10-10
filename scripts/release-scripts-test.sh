@@ -470,7 +470,7 @@ put_changelog() { # put_changelog <dir> ; stdin -> CHANGELOG.md, committed
 }
 run_rc() { # run_rc <dir> <args...>  -> sets RC_RC / RC_OUT
   local d="$1"; shift
-  RC_OUT="$( cd "$d" && UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
+  RC_OUT="$( cd "$d" && UZI_RELEASE_OFFLINE_FIXTURE=1 UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
 }
 chart_ver()   { awk '/^version:/{print $2; exit}' "$1/deploy/chart/Chart.yaml"; }
 pin_tag()     { awk '/^workers:/{w=1} w&&/^    tag:/{gsub(/"/,"",$2);print $2;exit}' "$1/deploy/chart/values.yaml"; }

@@ -202,6 +202,22 @@ else
   done
 fi
 
+# Publish-time coverage is the release proof; the tagged SHA may inherit main CI.
+for gate in assert-ci-coverage assert-release-metadata assert-tag-smoke; do
+  result="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}/jobs?per_page=100" \
+    --jq ".jobs[] | select(.name == \"${gate}\") | .conclusion" 2>/dev/null)"
+  if [ "$result" = success ]; then
+    if [ "$gate" = assert-ci-coverage ] &&
+       python3 -I "$ROOT/scripts/release-ci-coverage.py" annotation "$TAG" --tag "$TAG" >/dev/null 2>&1; then
+      pass "assert-ci-coverage accepted UNVERIFIED hotfix: no full CI evidence (run $RELRUN)"
+    else
+      pass "$gate green (run $RELRUN)"
+    fi
+  else
+    fail "$gate not proven successful (run $RELRUN, result '$result')"
+  fi
+done
+
 # --- 6. agent image identity gate ran green (#1720) ----------------------------
 if [ -z "${RELRUN:-}" ]; then
   fail "no release.yml run found for $TAG (cannot prove the agent identity check ran)"
