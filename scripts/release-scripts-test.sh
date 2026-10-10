@@ -32,6 +32,9 @@
 set -uo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
+mkdir -p "$TMPDIR"
+export TMPDIR
 ORACLE="$SCRIPTS_DIR/assert-changelog-covers-release.sh"
 SECTION="$SCRIPTS_DIR/changelog-section.sh"
 
@@ -817,7 +820,7 @@ if has_heading "$S8P" 0.3.0; then fail "promote-only opens NO [0.3.0] section"; 
 echo "=== M2b: --promote-only (stable from the RC commit, NO next candidate, main untouched) ==="
 # The 0.83.1 case: SHIPPING work landed on main after the RC, it must not ride into the
 # stable, and no next candidate is wanted yet. --promote would cut v0.3.0-rc.1 in lockstep
-# (and, with an empty [Unreleased], fail and roll the stable back); --promote-only tags
+# (and, with empty [Unreleased] and no draft, refuse before tagging); --promote-only tags
 # v0.2.0 from the RC commit and stops, whatever main carries. Same setup as S8.
 S8O="$(mktemp -d)"; seed_repo "$S8O"; add_origin "$S8O"; add_feature "$S8O" 201
 put_changelog "$S8O" <<'MD'
@@ -1126,27 +1129,6 @@ assert_contains "abort names the non-allowlisted file" "non-allowlisted file:" "
 if git -C "$S9" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "aborted promote leaves NO v0.2.0 tag"; else pass "aborted promote leaves NO v0.2.0 tag"; fi
 if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "aborted promote leaves NO release/0.2.0 branch"; else pass "aborted promote leaves NO release/0.2.0 branch"; fi
 
-echo "=== M2b: --promote rolls back the local stable tag when the main half fails ==="
-S10="$(mktemp -d)"; seed_repo "$S10"; add_origin "$S10"; add_feature "$S10" 201
-put_changelog "$S10" <<'MD'
-# Changelog
-
-## [Unreleased]
-### Added
-- **Feature 201** (#201)
-
-## [0.1.0] - 2026-09-01
-### Added
-- **Initial** (#100)
-MD
-run_rc "$S10" 0.2.0; git -C "$S10" tag v0.2.0-rc.1; push_tag_to_origin "$S10" v0.2.0-rc.1
-add_feature "$S10" 301               # merges since the RC, so NOT the promote-only path
-# but leave [Unreleased] EMPTY and pass no --changelog-file, so the main-half fold fails
-# AFTER promote_inflight has already tagged v0.2.0. The trap must roll that tag back.
-run_rc "$S10" 0.3.0 --promote
-if [ "$RC_RC" -ne 0 ]; then pass "promote main-half failure exits nonzero"; else fail "promote main-half failure exits nonzero"; fi
-if git -C "$S10" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "failed promote leaves NO local v0.2.0 tag (rolled back)"; else pass "failed promote leaves NO local v0.2.0 tag (rolled back)"; fi
-
 echo "=== M2c: worker-tag-autobump — a pin naming a MISSING tag is repinned, never failed open ==="
 # The 0.83.0-rc.7 forward trap: after the local-only rc.7 tag was deleted, the pin named a
 # tag that no longer existed and the old autobump FAILED OPEN (left the dead pin, shipped
@@ -1324,9 +1306,282 @@ run_rc "$SDH" 0.2.0
 assert_eq "a dependency merge that also changes source is not auto-cited (cut fails)" "1" "$RC_RC"
 rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI"
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
-       "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$SA" "$SB" "$SC" "$SD" "$SE" \
+       "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$SD.origin.git" "$SE.origin.git" \
        "$S8R.draft.md" "$SBH" "$SBH.origin.git"
+
+echo "=== #1468 M1: NUL paths and checked listing producers ==="
+LIST_SHIM="$(mktemp -d)"
+export LIST_REAL_GIT
+LIST_REAL_GIT="$(command -v git)"
+cat > "$LIST_SHIM/git" <<'STUB'
+#!/usr/bin/env bash
+# Record stable-tag creation attempts; delegate all non-listing operations unchanged.
+if [ "${1:-}" = tag ] && [ "${2:-}" = -a ] && [ "${3:-}" = v0.2.0 ] && [ -n "${PROMOTE_ATTEMPT_LOG:-}" ]; then
+  printf 'v0.2.0\n' >> "$PROMOTE_ATTEMPT_LOG"
+fi
+# Intercept only path listings for this fixture's selected commit.
+listing=0
+case "${1:-}" in
+  diff|show)
+    for arg in "$@"; do
+      [ "$arg" != --name-only ] || listing=1
+    done
+    ;;
+esac
+if [ "$listing" = 1 ] && [ "${!#}" = "${LIST_SHA:-}" ]; then
+  case "${LIST_MODE:-}" in
+    fallback) [ "$1" != diff ] || exit 71 ;;
+    fallback_prefix)
+      if [ "$1" = diff ]; then printf 'prds/'; exit 71; fi
+      ;;
+    fallback_changelog)
+      if [ "$1" = diff ]; then printf 'CHANGELOG.md\0'; exit 71; fi
+      ;;
+    fail) exit 72 ;;
+    partial)
+      printf 'api/go.mod\0api/é.go\0'
+      exit 73
+      ;;
+    large)
+      # 20,000 records exceed pipe capacity; success requires draining all of them.
+      printf 'api/é.go\0'
+      for ((i=0; i<20000; i++)); do
+        printf 'prds/nonshipping-record-%08d-padding-padding-padding.md\0' "$i" || exit 74
+      done
+      printf 'drained\n' >> "$LIST_LOG"
+      exit 0
+      ;;
+  esac
+fi
+exec "$LIST_REAL_GIT" "$@"
+STUB
+chmod +x "$LIST_SHIM/git"
+export PATH="$LIST_SHIM:$PATH"
+export LIST_SHA LIST_MODE LIST_LOG
+listing_failure() {
+  if [ "$2" -ne 0 ]; then pass "$1 refuses"; else fail "$1 refuses"; fi
+  assert_contains "$1 names SHA" "$LIST_SHA" "$3"
+  assert_contains "$1 explains listing failure" "list" "$3"
+}
+unusual_feature() {
+  local d="$1" path="$2"
+  printf 'package main\n' > "$d/$path"
+  git -C "$d" add -- "$path"
+  gcommit "$d" 'feat: unusual path (#1468)'
+}
+published_rc() {
+  seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
+  feature_201_changelog "$1"
+  run_rc "$1" 0.2.0
+  assert_eq "listing fixture initial RC succeeds" 0 "$RC_RC"
+  git -C "$1" tag v0.2.0-rc.1
+  push_tag_to_origin "$1" v0.2.0-rc.1
+}
+# Snapshot every tracked file, plus index/worktree status, to prove refusal is inert.
+promote_snapshot() {
+  ( cd "$1" && git ls-files -z | xargs -0 cksum && git status --porcelain )
+}
+no_promote_attempt() {
+  assert_eq "$1 never attempts a stable tag" "" "$(cat "$PROMOTE_ATTEMPT_LOG")"
+  if git -C "$2" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "$1 leaves stable tag absent"
+  else
+    pass "$1 leaves stable tag absent"
+  fi
+}
+assert_absent() {
+  case "$3" in
+    *"$2"*) fail "$1 (unexpected '$2')" ;;
+    *) pass "$1" ;;
+  esac
+}
+echo "=== #1468 M2: empty-body promotion preflight ==="
+export PROMOTE_ATTEMPT_LOG
+for history in feature docs dependency; do
+  S10="$(mktemp -d)"; published_rc "$S10"
+  case "$history" in
+    feature) add_feature "$S10" 301 ;;
+    docs)
+      mkdir -p "$S10/docs"
+      printf 'CLI shipping documentation\n' > "$S10/docs/cli.md"
+      git -C "$S10" add -- docs/cli.md
+      gcommit "$S10" 'docs(cli): clarify usage (#1468)'
+      ;;
+    dependency) add_dep "$S10" api/go.mod 'fix(deps): bump x (#1468)' ;;
+  esac
+  shipping_sha="$(git -C "$S10" rev-parse HEAD)"
+  before="$(promote_snapshot "$S10")"
+  PROMOTE_ATTEMPT_LOG="$S10.attempt.log"; : > "$PROMOTE_ATTEMPT_LOG"
+  run_rc "$S10" 0.3.0 --promote
+  assert_eq "$history empty-body promote exits 3" 3 "$RC_RC"
+  assert_contains "$history refusal names shipping SHA" "$shipping_sha" "$RC_OUT"
+  assert_contains "$history refusal offers next candidate entries" 'next candidate' "$RC_OUT"
+  assert_contains "$history refusal offers writing entries" 'write' "$RC_OUT"
+  assert_contains "$history refusal offers draft" '--changelog-file' "$RC_OUT"
+  assert_absent "$history refusal emits no promotion" 'promoted:' "$RC_OUT"
+  assert_absent "$history refusal emits no rollback" 'rolled back' "$RC_OUT"
+  assert_eq "$history refusal keeps HEAD" "$shipping_sha" "$(git -C "$S10" rev-parse HEAD)"
+  assert_eq "$history refusal keeps files and index" "$before" "$(promote_snapshot "$S10")"
+  no_promote_attempt "$history refusal" "$S10"
+  case "$history" in
+    feature)
+      # Supplying a draft bypasses preflight, but later validation must still roll back.
+      printf '## [0.4.0]\n### Added\n- Wrong base (#301)\n' > "$S10.draft.md"
+      : > "$PROMOTE_ATTEMPT_LOG"
+      run_rc "$S10" 0.3.0 --promote --changelog-file "$S10.draft.md"
+      assert_eq "bad supplied draft fails later" 3 "$RC_RC"
+      assert_eq "bad draft attempted stable tag" v0.2.0 "$(cat "$PROMOTE_ATTEMPT_LOG")"
+      assert_contains "bad draft rolls back stable tag" 'rolled back the local promote tag v0.2.0' "$RC_OUT"
+      if git -C "$S10" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+        fail "bad draft leaves stable tag absent"
+      else
+        pass "bad draft leaves stable tag absent"
+      fi
+      ;;
+    docs)
+      : > "$PROMOTE_ATTEMPT_LOG"
+      run_rc "$S10" 0.2.0 --promote-only
+      assert_eq "docs history explicit promote-only succeeds" 0 "$RC_RC"
+      assert_eq "explicit promote-only keeps HEAD" "$shipping_sha" "$(git -C "$S10" rev-parse HEAD)"
+      assert_eq "explicit promote-only keeps files and index" "$before" "$(promote_snapshot "$S10")"
+      assert_eq "explicit promote-only attempts stable tag once" v0.2.0 "$(cat "$PROMOTE_ATTEMPT_LOG")"
+      ;;
+    dependency)
+      # Use the same post-RC dependency history in an independent plain-cut fixture.
+      SDP="$(mktemp -d)"; published_rc "$SDP"
+      add_dep "$SDP" api/go.mod 'fix(deps): bump x (#1468)'
+      PROMOTE_ATTEMPT_LOG="$SDP.attempt.log"; : > "$PROMOTE_ATTEMPT_LOG"
+      run_rc "$SDP" 0.2.0
+      assert_eq "paired plain dependency-only cut succeeds" 0 "$RC_RC"
+      assert_contains "paired plain cut autocites dependency" '#1468' "$(dep_bullet "$SDP")"
+      no_promote_attempt "paired plain cut" "$SDP"
+      rm -rf "$SDP" "$SDP.origin.git" "$SDP.attempt.log"
+      ;;
+  esac
+  rm -rf "$S10" "$S10.origin.git" "$S10.attempt.log" "$S10.draft.md"
+done
+# Empty Unreleased plus a correctly based draft may promote and cut the next candidate.
+S10="$(mktemp -d)"; published_rc "$S10"
+mkdir -p "$S10/docs"
+printf 'CLI shipping documentation\n' > "$S10/docs/cli.md"
+git -C "$S10" add -- docs/cli.md
+gcommit "$S10" 'docs(cli): clarify usage (#1468)'
+printf '## [0.3.0]\n### Changed\n- CLI usage (#1468)\n' > "$S10.draft.md"
+PROMOTE_ATTEMPT_LOG="$S10.attempt.log"; : > "$PROMOTE_ATTEMPT_LOG"
+run_rc "$S10" 0.3.0 --promote --changelog-file "$S10.draft.md"
+assert_eq "empty-body promote with valid draft succeeds" 0 "$RC_RC"
+assert_eq "valid draft advances main chart" 0.3.0-rc.1 "$(chart_ver "$S10")"
+assert_eq "valid draft attempts stable tag once" v0.2.0 "$(cat "$PROMOTE_ATTEMPT_LOG")"
+assert_contains "valid draft preserves citation" 'CLI usage ([#1468](https://github.com/vtmocanu/uzi/pull/1468))' "$(cat "$S10/CHANGELOG.md")"
+rm -rf "$S10" "$S10.origin.git" "$S10.attempt.log" "$S10.draft.md"
+unset PROMOTE_ATTEMPT_LOG
+
+# Each oracle path is the ONLY shipping path on its commit.
+for unusual in 'api/é.go' $'api/new\n"quote.go'; do
+  LN="$(mktemp -d)"; seed_repo "$LN"
+  unusual_feature "$LN" "$unusual"
+  printf '# Changelog\n\n## [0.2.0]\n### Added\n- Other (#201)\n' | put_changelog "$LN"
+  out="$(cd "$LN" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; status=$?
+  assert_eq "oracle flags uncited unusual path $unusual" 1 "$status"
+  assert_contains "oracle reports unusual commit" 'feat: unusual path (#1468)' "$out"
+  rm -rf "$LN"
+done
+for consumer in oracle shipping dependency; do
+  for mode in fallback fallback_prefix fallback_changelog fail partial large; do
+    # Large output is a shipping-drain probe, not another failure mode.
+    [ "$mode" != large ] || [ "$consumer" = shipping ] || continue
+    LN="$(mktemp -d)"
+    LIST_SHA=""; LIST_MODE=""
+    if [ "$consumer" = shipping ]; then
+      published_rc "$LN"
+      unusual_feature "$LN" 'api/é.go'
+      LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
+      # Empty Unreleased exposes a mistaken promote-only classification.
+    else
+      seed_repo "$LN"
+      if [ "$consumer" = dependency ]; then
+        add_dep "$LN" api/go.mod 'fix(deps): bump x (#1468)'
+      else
+        unusual_feature "$LN" 'api/é.go'
+      fi
+      LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
+      if [ "$consumer" = dependency ]; then
+        feature_201_changelog "$LN"
+      elif [ "$mode" = fallback_prefix ] || [ "$mode" = fallback_changelog ]; then
+        # Successful show lists an uncited shipping path; failed diff cannot exempt it.
+        printf '# Changelog\n\n## [0.2.0]\n### Added\n- Other (#201)\n' | put_changelog "$LN"
+      else
+        printf '# Changelog\n\n## [Unreleased]\n### Added\n- Other (#201)\n\n## [0.2.0]\n### Added\n- Cited (#1468)\n' | put_changelog "$LN"
+      fi
+    fi
+    before="$(git -C "$LN" rev-parse HEAD)"
+    before_reflog="$(git -C "$LN" reflog --format=%H HEAD)"
+    LIST_MODE="$mode"; LIST_LOG="$LN.producer.log"
+    if [ "$consumer" = oracle ]; then
+      out="$(cd "$LN" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; status=$?
+    else
+      if [ "$consumer" = shipping ]; then
+        run_rc "$LN" 0.2.0 --promote-only
+      else
+        run_rc "$LN" 0.2.0
+      fi
+      out="$RC_OUT"; status="$RC_RC"
+    fi
+    case "$consumer:$mode" in
+      oracle:fallback_prefix|oracle:fallback_changelog)
+        assert_eq "oracle $mode refuses uncited shipping path" 1 "$status"
+        assert_contains "oracle $mode reports the real shipping commit" 'feat: unusual path (#1468)' "$out"
+        ;;
+      *:fallback|*:fallback_prefix|*:fallback_changelog|*:large)
+        assert_eq "$consumer $mode succeeds" 0 "$status"
+        if [ "$consumer" = shipping ]; then
+          assert_contains "shipping $mode counts the unusual commit once" '1 shipping commit(s)' "$out"
+        fi
+        if [ "$consumer" = dependency ]; then
+          assert_contains "dependency $mode retains manifest autocitation" '#1468' "$(dep_bullet "$LN")"
+        fi
+        if [ "$mode" = large ]; then
+          assert_eq "large producer completed without SIGPIPE" drained "$(cat "$LIST_LOG")"
+        fi
+        ;;
+      *)
+        listing_failure "$consumer $mode" "$status" "$out"
+        assert_eq "$consumer $mode creates no release commit" "$before" "$(git -C "$LN" rev-parse HEAD)"
+        if [ "$consumer" = dependency ]; then
+          assert_eq "dependency $mode does not create then roll back a release commit" "$before_reflog" "$(git -C "$LN" reflog --format=%H HEAD)"
+        fi
+        if git -C "$LN" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+          fail "$consumer $mode creates no stable tag"
+        else
+          pass "$consumer $mode creates no stable tag"
+        fi
+        ;;
+    esac
+    LIST_SHA=""; LIST_MODE=""
+    rm -rf "$LN" "$LN.origin.git" "$LN.producer.log"
+  done
+done
+# Source + manifest in ONE dependency-typed commit must never gain an autocitation.
+LN="$(mktemp -d)"; seed_repo "$LN"; add_feature "$LN" 201
+printf '// bump\n' > "$LN/api/go.mod"
+printf 'package main\n' > "$LN/api/é.go"
+git -C "$LN" add -- api/go.mod api/é.go
+gcommit "$LN" 'fix(deps): bump and adapt (#1468)'
+feature_201_changelog "$LN"
+run_rc "$LN" 0.2.0
+assert_eq "Unicode source plus manifest is not autocited" 1 "$RC_RC"
+assert_eq "Unicode source plus manifest has no Routine bullet" 0 "$(dep_bullets "$LN")"
+rm -rf "$LN"
+# With entries, Unicode work after a published RC reaches the next main-half cut.
+LN="$(mktemp -d)"; published_rc "$LN"
+unusual_feature "$LN" 'api/é.go'
+printf '# Changelog\n\n## [Unreleased]\n### Added\n- Unicode (#1468)\n\n## [0.2.0]\n### Added\n- Feature (#201)\n\n## [0.1.0]\n- Initial (#100)\n' | put_changelog "$LN"
+run_rc "$LN" 0.3.0 --promote
+assert_eq "Unicode work with entries promotes and cuts main" 0 "$RC_RC"
+assert_eq "Unicode work advances main chart" 0.3.0-rc.1 "$(chart_ver "$LN")"
+rm -rf "$LN" "$LN.origin.git" "$LIST_SHIM"
+unset LIST_SHA LIST_MODE LIST_LOG LIST_REAL_GIT
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

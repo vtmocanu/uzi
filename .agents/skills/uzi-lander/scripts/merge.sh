@@ -8,10 +8,14 @@
 #                   so a push that landed after your last look is never merged unseen. The
 #                   merge itself passes --match-head-commit, so a push in the window between
 #                   the preflight and the merge is refused by GitHub as well.
-#   --expect-closes the issues this merge may close (`none` for a Refs-only PR). GitHub's
-#                   closingIssuesReferences, which also counts negated prose such as "does
-#                   not close #N", must equal it exactly, or the merge refuses (exit 11);
-#                   unreadable refuses (exit 2). Without the flag, CLOSES= is printed only.
+#   --expect-closes the issues this merge may close (`none` for a Refs-only PR). The union
+#                   of GitHub's closingIssuesReferences (the PR body) and the closing
+#                   keywords in the PR title and commit messages (they reach main in the
+#                   squash commit and close issues there) must equal it exactly, or the
+#                   merge refuses (exit 11); another repo's reference stays OWNER/REPO#N.
+#                   Negated prose ("does not close" + an issue ref) counts everywhere.
+#                   Unreadable or an incomplete commit list refuses (exit 2). Without the
+#                   flag, CLOSES= is printed only.
 #   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
 #   --confirm-only  do NOT merge: the PR was already merged OUT OF BAND (e.g. the harness
 #                   classifier refused the in-script `gh pr merge --admin` and the user ran it
@@ -144,10 +148,32 @@ if [ -n "$EXPECT_CLOSES" ] && [ "$EXPECT_CLOSES" != none ]; then
     END { if (bad) exit 1 }' | sort -n | paste -sd, -) \
     || { echo "bad --expect-closes '$EXPECT_CLOSES' (issue numbers, comma-separated, or none)" >&2; exit 2; }
 fi
-if closes=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences 2>/dev/null \
-     | jq -er 'if has("closingIssuesReferences") then [.closingIssuesReferences[].number]|sort|map(tostring)|join(",") else error("missing") end' 2>/dev/null); then
+# What the merge can close: the PR body's closingIssuesReferences, plus closing keywords in
+# the PR title and every commit message (both can reach main in the squash commit message).
+# GitHub's grammar: close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved,
+# case-insensitive, optional colon, then #N or OWNER/REPO#N. A same-repo reference prints as
+# N; another repo's keeps its OWNER/REPO#N identity. Commits come from the paginated REST list
+# and must number exactly the PR's commit count (REST lists at most 250), or the read fails.
+closes_read() {
+  local meta n pages
+  meta=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences,title 2>/dev/null) || return 1
+  n=$(gh api "repos/$REPO/pulls/$PR" --jq .commits 2>/dev/null) || return 1
+  pages=$(gh api "repos/$REPO/pulls/$PR/commits?per_page=100" --paginate --slurp 2>/dev/null) || return 1
+  { printf '%s\n' "$meta"; printf '%s\n' "$n"; printf '%s\n' "$pages"; } | jq -ser --arg repo "$REPO" '
+    def norm($o; $num): if ($o // "") == "" or (($o|ascii_downcase) == ($repo|ascii_downcase))
+      then ($num|tonumber|tostring) else "\($o)#\($num|tonumber)" end;
+    def kw: [scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b(?:\\s*:\\s*|\\s+|(?=#))([\\w.-]+/[\\w.-]+)?#([0-9]+)") | norm(.[0]; .[1])];
+    .[0] as $meta | .[1] as $n | ((.[2] // []) | add // []) as $cs
+    | if (($meta|type) != "object") or ($meta|has("closingIssuesReferences")|not) or ($meta|has("title")|not)
+         or (($n|type) != "number") or (($cs|length) != $n) then error("incomplete") else . end
+    | ([$meta.closingIssuesReferences[]
+         | norm(if .repository then "\(.repository.owner.login)/\(.repository.name)" else null end; (.number|tostring))]
+       + ([$meta.title // "", ($cs[] | .commit.message // "")] | map(kw) | add))
+    | unique | sort_by([test("/"), (if test("/") then . else tonumber end)]) | join(",")'
+}
+if closes=$(closes_read); then
   echo "CLOSES=${closes:-none}"
-  if [ -n "$EXPECT_CLOSES" ] && [ "$closes" != "$want_closes" ]; then
+if [ -n "$EXPECT_CLOSES" ] && [ "$closes" != "$want_closes" ]; then
     echo "CLOSING REFERENCES MISMATCH: merging would close [${closes:-none}], expected [${want_closes:-none}]; fix the PR body (a negated \"does not close #N\" still closes) and re-run"; exit 11
   fi
 else

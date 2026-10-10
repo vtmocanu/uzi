@@ -396,6 +396,7 @@ tasks:
       # Sub-second, offline, index-only -- runs before `scan:secrets` too. A tree fact,
       # so it belongs in gate:repo.
       - task: check:mktemp-portability
+      - task: check:postgres-pin-parity
       # Over-cap SKILL.md guard: a repo skill whose SKILL.md exceeds the 65536-byte
       # runtime cap is dropped silently at run time (agent/src/repo-skills.ts:151), so it
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
@@ -1274,6 +1275,13 @@ tasks:
       # (instrument broken). The explicit canary arg makes this echo show what is scanned.
       # See the script header.
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
+
+  check:postgres-pin-parity:
+    desc: docker-compose.yml and ci.yml's mirrored postgres service pin the same tag and digest, with hermetic 0/1/2 fixtures
+    cmds:
+      # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
+      # renovate.json groups them (#2622) and this fails the gate if they still drift.
+      - ./scripts/check-postgres-pin-parity.test.sh
 
   check:mktemp-portability:
     desc: no tracked *.sh carries a `mktemp -t <name>` template with too few X's (dies on GNU coreutils), with a canary proving the detector fired

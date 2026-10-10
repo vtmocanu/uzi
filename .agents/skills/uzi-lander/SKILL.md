@@ -509,8 +509,10 @@ and they precede every merge (step 6):
 - **The closing references match the outcome.** uzi does not honor prose-only non-closing
   intent (#2172), and GitHub parses negated prose ("does not close #N") as a closing
   keyword. If the approved scope and verified outcome require an issue to stay open, remove
-  every closing directive for it from the PR body (use `Refs #N`) and pass the expected set
-  to `merge.sh --expect-closes` (`none` for a Refs-only PR), which refuses a mismatch.
+  every closing directive for it from the PR body, title and commit messages (use `Refs #N`;
+  title and commit messages reach `main` in the squash commit and close issues there) and
+  pass the expected set to `merge.sh --expect-closes` (`none` for a Refs-only PR), which
+  checks all three and refuses a mismatch.
 - **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
   lines near a known alert, compare rule and path with `main`'s alerts
   (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the
