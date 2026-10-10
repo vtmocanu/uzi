@@ -2281,7 +2281,15 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
 export interface PublishResponse {
   published: boolean;
   ref: string;
-  skipped?: "no_ref" | "not_descendant" | "unsupported" | "workflow_scope";
+  skipped?:
+    | "no_ref"
+    | "not_descendant"
+    | "unsupported"
+    | "workflow_scope"
+    | "superseded"
+    | "tip_missing"
+    | "pack_too_large"
+    | "pack_invalid";
 }
 
 /**
