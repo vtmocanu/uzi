@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -65,6 +65,52 @@ function clientFor(url: string): WorkerClient {
   return new WorkerClient(url, TOKEN, "0.1.0-test", nullLogger(), {
     sleep: async () => {},
     terminalRetrySchedule: [1, 1, 1],
+  });
+}
+
+for (const scenario of [
+  { name: "decode400->decode400 proven", replies: ["decode", "decode"], proven: true },
+  { name: "decode400->lostACK ambiguous", replies: ["decode", "lost", "lost", "lost", "lost"], proven: false },
+  { name: "lostACKretry->decode400->decode400 ambiguous", replies: ["lost", "decode", "decode"], proven: false },
+  { name: "generic400 ambiguous", replies: ["generic"], proven: false },
+  { name: "malformed400 ambiguous", replies: ["malformed", "malformed"], proven: false },
+  { name: "extra field400 ambiguous", replies: ["extra", "extra"], proven: false },
+  { name: "malformed400->decode400 ambiguous", replies: ["malformed", "decode"], proven: false },
+  { name: "overflow400 ambiguous", replies: ["overflow"], proven: false },
+  { name: "truncated400 ambiguous", replies: ["truncated"], proven: false },
+]) {
+  it("Unit 2: client " + scenario.name, async () => {
+    let attempts = 0;
+    const mocked = mock.method(globalThis, "fetch", async (input: unknown, init?: RequestInit) => {
+      if (String(input).endsWith("/register")) return Response.json({ worker_id: "worker-1", protocol_features: ["claim_generation_fence"] });
+      assert.ok(new Headers(init?.headers).get("Authorization"));
+      const reply = scenario.replies[attempts++];
+      if (reply === "lost") throw new Error("lost ACK");
+      if (reply === "truncated") return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"error":"invalid request body"}'));
+        },
+        pull(controller) { controller.error(new Error("body disconnected")); },
+      }), { status: 400 });
+      const raw = reply === "overflow" ? '{"error":"invalid request body"}' + " ".repeat(4096)
+        : reply === "decode" ? '{"error":"invalid request body"}\n'
+        : reply === "generic" ? '{"error":"arbitrary refusal"}'
+        : reply === "extra" ? '{"error":"invalid request body","reason":"unknown"}'
+        : '{"error":"invalid request body"';
+      return new Response(raw, { status: 400 });
+    });
+    try {
+      const client = clientFor("http://unit2.test");
+      await client.register("unit2");
+      await assert.rejects(client.reportState("run-1", { status: "completed", claim_generation: 1 }),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          if (scenario.proven) assert.ok(err instanceof RequestError);
+          assert.equal(err.name === "StateReportUnappliedError", scenario.proven);
+          return true;
+        });
+      assert.equal(attempts, scenario.replies.length);
+    } finally { mocked.mock.restore(); }
   });
 }
 

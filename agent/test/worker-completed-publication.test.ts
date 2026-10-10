@@ -29,6 +29,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   const events: string[] = [];
   const sent: StateRequest[] = [];
   let loseResponse = false, refuse = false, enabled = true, released = false;
+  let stateReplies: Array<"decode" | "lost" | "stale"> = [];
   let workerId = literal.worker_id;
   let retirement: { ownership: unknown; custody: unknown } | undefined;
   const branch = kind === "self_improve" ? "uzi/self-improve/" + literal.run_id : literal.branch;
@@ -52,6 +53,10 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
         const body = JSON.parse(String(init?.body)) as StateRequest;
         events.push("state:" + body.status);
         sent.push(body);
+        const reply = stateReplies.shift();
+        if (reply === "decode") return Response.json({ error: "invalid request body" }, { status: 400 });
+        if (reply === "lost") throw new Error("lost ACK");
+        if (reply === "stale") return Response.json({ disposition: "stale_claim" }, { status: 409 });
         if (body.status === "completed" && !refuse) released = true;
         if (loseResponse) throw new Error("response lost after API release");
         return Response.json({ run: { ...wire.ack.run, id: receipt.run_id, worker_id: workerId },
@@ -90,6 +95,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     terminalResolved: false, completionSendAttempted: false, successfulPushedSha: literal.final_head,
     batcher: { currentSeq: () => 7, close: async () => {}, awaitPermanentFailureSettled: async () => {}, emit: () => events.push("failed-feed") },
     runLog: nullLogger(), redactText: (text: string) => text, executor: {}, cancel: new AbortController(),
+    reportState: async (b: StateRequest) => send(b),
     prepareTerminalInventory: async () => {
       events.push("prepare");
       flight.successfulPushedSha = "c".repeat(40);
@@ -111,6 +117,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     outbox: outbox!, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger(),
   }), { runId: receipt.run_id, claimGeneration: receipt.generation, send });
   return { root, events, sent, receipt, recovery, record, run, flight, body, terminal, replay, outbox, client,
+    replies: (...values: typeof stateReplies) => { stateReplies = values; },
     retirement: (ownership: unknown, custody: unknown) => { retirement = { ownership, custody }; },
     freshClient: async () => {
       const fresh = new WorkerClient("http://completion.test", "completion-worker-fixture", "test", nullLogger(),
@@ -138,6 +145,131 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
 }
 
 type CompletionFixture = Awaited<ReturnType<typeof fixture>>;
+
+async function unit2Failure(f: CompletionFixture) {
+  await (f.run as unknown as { reportGenericFailure(c: unknown, f: unknown, e: unknown, o: unknown): Promise<void> })
+    .reportGenericFailure(makeClaim(), f.flight, new Error("completion refused"), { keepCustody: true });
+}
+
+for (const mode of ["none", "reserve"] as const) {
+  it("Unit 2: " + mode + " fresh decode refusal permits ordinary failed", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      f.replies("decode", "decode");
+      await assert.rejects(f.terminal());
+      assert.equal(f.flight.completionSendAttempted, false);
+      assert.equal((Reflect.get(f.run, "attemptedPublicationTerminals") as Set<string>).size, 0);
+      await unit2Failure(f);
+      assert.equal(f.sent.at(-1)?.status, "failed");
+      assert.equal(f.sent.at(-1)?.completion_final_head, undefined);
+      assert.equal(await f.recovery.hasPersistedCompletionReceipt(f.receipt.run_id, 1), false);
+    } finally { await f.close(); }
+  });
+
+  for (const replies of [["decode", "lost", "lost"], ["lost", "decode", "decode"]] as const) {
+    it("Unit 2: " + mode + " " + replies.join("->") + " suppresses competing failed", async () => {
+      const f = await fixture("issue", mode);
+      try {
+        f.replies(...replies);
+        await assert.rejects(f.terminal());
+        assert.equal(f.flight.completionSendAttempted, true);
+        await unit2Failure(f);
+        assert.equal(f.sent.every(b => b.status === "completed"), true);
+      } finally { await f.close(); }
+    });
+  }
+
+  it("Unit 2: " + mode + " prior ambiguous attempt survives later decode refusal", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      f.replies("lost", "lost");
+      await assert.rejects(f.terminal());
+      f.replies("decode", "decode");
+      await assert.rejects(f.terminal());
+      assert.equal(f.flight.completionSendAttempted, true);
+      await unit2Failure(f);
+      assert.equal(f.sent.every(b => b.status === "completed"), true);
+    } finally { await f.close(); }
+  });
+
+  it("Unit 2: " + mode + " fallback exception cannot conceal definitive nonapplication", async t => {
+    const f = await fixture("issue", mode);
+    try {
+      const fallback = t.mock.method(f.flight, "prepareTerminalInventory", async () => { throw new Error("fallback failed"); });
+      f.replies("decode", "decode");
+      await assert.rejects(f.terminal(), { name: "StateReportUnappliedError" });
+      assert.equal(f.flight.completionSendAttempted, false);
+      assert.equal((Reflect.get(f.run, "attemptedPublicationTerminals") as Set<string>).size, 0);
+      fallback.mock.restore();
+      await unit2Failure(f);
+      assert.equal(f.sent.at(-1)?.status, "failed");
+    } finally { await f.close(); }
+  });
+
+  it("Unit 2: " + mode + " retained runner marker prevents a fresh flight clearing prior ambiguity", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      f.replies("lost", "lost");
+      await assert.rejects(f.terminal());
+      f.flight.completionSendAttempted = false;
+      f.replies("decode", "decode");
+      await assert.rejects(f.terminal());
+      assert.equal(f.flight.completionSendAttempted, true);
+      assertAttempted(f.run, f);
+      await unit2Failure(f);
+      assert.equal(f.sent.every(b => b.status === "completed"), true);
+    } finally { await f.close(); }
+  });
+
+  it("Unit 2: " + mode + " stale fence takes precedence before publication", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      Reflect.set(f.flight, "steering", { claimFence: () => "released" });
+      f.replies("decode", "decode");
+      await assert.rejects(f.terminal(), { name: "StaleClaimError" });
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.flight.completionSendAttempted, false);
+    } finally { await f.close(); }
+  });
+
+  it("Unit 2: " + mode + " stale claim never sends competing failed", async () => {
+    const f = await fixture("issue", mode);
+    try {
+      f.replies("stale");
+      await f.terminal();
+      await unit2Failure(f);
+      assert.equal(f.sent.length, 1);
+      assert.equal(f.sent[0]?.status, "completed");
+    } finally { await f.close(); }
+  });
+}
+
+it("Unit 2: reserve unavailable absence proof retains original attempt", async t => {
+  const f = await fixture("issue", "reserve");
+  try {
+    t.mock.method(f.outbox!, "confirmTerminalAbsent", async () => false);
+    f.replies("decode", "decode");
+    await assert.rejects(f.terminal());
+    assert.equal(f.flight.completionSendAttempted, true);
+    await unit2Failure(f);
+    assert.equal(f.sent.every(b => b.status === "completed"), true);
+  } finally { await f.close(); }
+});
+
+it("Unit 2: journaled decode refusal preserves exact original for replay", async () => {
+  const f = await fixture();
+  try {
+    f.replies("decode", "decode");
+    await f.terminal();
+    const original = await f.outbox!.readTerminalJournal(f.receipt.run_id, 1);
+    assert.deepEqual(original?.body, f.body);
+    await unit2Failure(f);
+    assert.equal(f.sent.every(b => b.status === "completed"), true);
+    f.replies("decode", "decode");
+    await f.replay();
+    assert.equal(canonicalJson(await f.outbox!.readTerminalJournal(f.receipt.run_id, 1)), canonicalJson(original));
+  } finally { await f.close(); }
+});
 
 function discardAuthority(f: CompletionFixture, state = "discarded") {
   return {

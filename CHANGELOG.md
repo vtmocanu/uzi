@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Workers report terminal failure after a proven unapplied completion refusal.**
+  An unjournaled completion rejected before mutation can follow the ordinary failure path; lost acknowledgements and journaled originals still preserve the selected completion for replay.
+
 - **Persistent workers keep publication capacity after non-receipt reports retire.**
   Failed, cancelled and archive-fallback generations release completion bookkeeping only after proven report retirement, preserving unresolved completion replay and custody safeguards.
 

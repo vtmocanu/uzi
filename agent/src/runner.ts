@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
-import { RequestError, isRunOwnershipLost } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -4188,12 +4188,21 @@ export class RunRunner {
       delete ordinary.completion_final_head;
       body = ordinary;
     }
+    // A fresh send may release only its attempt markers, never custody or receipt provenance.
+    // A prior attempt or any unavailable/pending journal keeps the original outcome selected.
+    const clearFreshUnappliedAttempt = async (err: unknown, publicationSend: boolean): Promise<void> => {
+      if (!(err instanceof StateReportUnappliedError) || err.runId !== flight.runId ||
+          previouslyAttempted || preexistingPending || !publicationSend ||
+          flight.steering?.claimFence() !== undefined) return;
+      if (this.outbox && !await this.outbox.confirmTerminalAbsent(flight.runId, flight.claimGeneration)) return;
+      flight.completionSendAttempted = false;
+      this.attemptedPublicationTerminals.delete(this.completionKey(flight.runId, flight.claimGeneration));
+    };
     if (!deps) {
       const incarnation = this.client.capturePublicationCompletionRetirement?.();
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
       // stale ack still THROWS StaleClaimError out of `send` and propagates to executeClaim's catch
-      // (there is no journal to stale-retire on this degradation path), so this branch is otherwise
-      // byte-for-byte unchanged.
+      // (there is no journal to stale-retire on this degradation path).
       await beforeResolve?.();
       const deferred = admitted;
       if (deferred) await this.bindCompletionSource(flight);
@@ -4207,6 +4216,9 @@ export class RunRunner {
         if (ack.applied && ack.status === body.status &&
             (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, body, incarnation);
+      } catch (err) {
+        await clearFreshUnappliedAttempt(err, deferred);
+        throw err;
       } finally {
         if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
       }
@@ -4227,8 +4239,9 @@ export class RunRunner {
     // unjournaled send and the journaled resolve), the same as journalAndResolveTerminal does today.
     const wrappedSend: SendTerminalState = async (b, sig) => {
       const incarnation = this.client.capturePublicationCompletionRetirement?.();
+      const publicationSend = this.eligiblePublicationCompletion(flight, b);
       try {
-        if (this.eligiblePublicationCompletion(flight, b)) {
+        if (publicationSend) {
           flight.completionSendAttempted = true;
           this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
         }
@@ -4239,6 +4252,7 @@ export class RunRunner {
         return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+        if (!installed.journaled && !("deferred" in installed)) await clearFreshUnappliedAttempt(err, publicationSend);
         throw err;
       }
     };
@@ -4268,8 +4282,8 @@ export class RunRunner {
     if (!installed.journaled && "deferred" in installed) {
       // Preserve finalize and the selected winner; reach the latch before the hook releases its hold.
     } else if (!installed.journaled) {
-      // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
-      // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
+      // reserve_exhausted: a throw skips terminalResolved. A fresh, proven-unapplied completion
+      // clears its attempt markers; an ambiguous or previously attempted completion still suppresses failed.
       try {
         await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
       } finally {
@@ -4291,8 +4305,8 @@ export class RunRunner {
     }
     // PRD #1391 Run B M3 (N2/D5): latch terminal resolution or selected-winner deferral, so
     // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
-    // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
-    // un-journaled send that failed), so that fallback still reports failed as today.
+    // journal (hasPendingTerminal then reads false). An unjournaled throw skips this latch;
+    // completionSendAttempted still suppresses failed unless the fresh send was proven unapplied.
     flight.terminalResolved = true;
   }
 

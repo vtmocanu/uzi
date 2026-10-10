@@ -312,6 +312,18 @@ export class RequestError extends Error {
   }
 }
 
+/** All attempts of this state report received the complete pre-mutation decode refusal. */
+export class StateReportUnappliedError extends RequestError {
+  constructor(readonly runId: string, refusal: RequestError) {
+    super(refusal.method, refusal.path, refusal.status, refusal.body, refusal.retryAfterHeaderMs);
+    this.name = "StateReportUnappliedError";
+  }
+}
+
+// Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
+class StateDecodeRefusalError extends RequestError {}
+interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
+
 /** Exact current-worker ownership loss; generic route/auth/transport failures are unknown. */
 export function isRunOwnershipLost(err: unknown, runId: string): boolean {
   if (!(err instanceof RequestError) || err.method !== "GET" || err.status !== 404 ||
@@ -1671,14 +1683,24 @@ export class WorkerClient {
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
     // gate presentation fields are not either: the report degrades to an id-less one, which an
     // allocating api still answers with its revision and an older api accepts unchanged.
-    const ack = await this.withGenerationFallback(included, (includeField) =>
-      this.reportStateOnce(
-        runId,
-        path,
-        includeField ? outbound : { ...outbound, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
-        signal,
-      ),
-    );
+    const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+    let ack: StateAck;
+    try {
+      ack = await this.withGenerationFallback(included, (includeField) =>
+        this.reportStateOnce(
+          runId,
+          path,
+          includeField ? outbound : { ...outbound, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
+          signal,
+          undefined,
+          evidence,
+        ),
+      );
+    } catch (err) {
+      if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
+        throw new StateReportUnappliedError(runId, err);
+      throw err;
+    }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
     return ack;
   }
@@ -1734,7 +1756,7 @@ export class WorkerClient {
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
     const incarnation = this.completionIncarnation;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
@@ -1827,11 +1849,28 @@ export class WorkerClient {
           }
           return ack;
         }
+        if (res.status === 400 && evidence) {
+          let text = "";
+          let exact = false;
+          try {
+            // Reject overflow and incomplete reads; a truncated diagnostic is never evidence.
+            text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, true);
+            const decoded: unknown = JSON.parse(text);
+            exact = isRecord(decoded) && Object.keys(decoded).length === 1 &&
+              decoded.error === "invalid request body";
+          } catch { /* unknown or incomplete response */ }
+          const ErrorType = exact ? StateDecodeRefusalError : RequestError;
+          throw new ErrorType("POST", path, res.status, text.slice(0, 4096).trim());
+        }
         if (res.status >= 400) throw await this.toError("POST", path, res);
         // A 2xx we do not model (e.g. 204 from an older server): the report landed,
         // but no status came back. Undefined reads as "not parked", which is safe.
         return { applied: true, status: undefined };
       } catch (err) {
+        if (evidence) {
+          if (err instanceof StateDecodeRefusalError) evidence.refusals++;
+          else evidence.ambiguous = true;
+        }
         if (signal?.aborted) throw err;
         if (this.isAlreadyTerminal(err)) {
           // A 4xx whose TEXT says terminal. The status is not recoverable here, and
