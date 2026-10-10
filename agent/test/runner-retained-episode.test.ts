@@ -6,7 +6,7 @@ import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, createHmac } from "node:crypto";
 import { PendingRecoveryCaptureError } from "../src/git.js";
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
 import { deflateSync } from "node:zlib";
@@ -896,6 +896,133 @@ for (const disposition of ["stale_claim", "released"]) {
     assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
     assert.equal(readJournal(bare, clone.branch).recovery.blocker, "source_missing");
     assert.equal(fs.readFileSync(path.join(clone.path + ".saved", "retained.txt"), "utf8"), "only local dirty work\n");
+  });
+}
+
+for (const scenario of ["refused now", "refused wall", "owner cancel", "shutdown", "fence",
+  "switch", "unrearmed pause", "fresh pause", "disk before rearm", "disk after rearm",
+  "generic pre-aborted", "generic later abort"] as const) {
+  it(`retained liveness: ${scenario}`, async () => {
+    const { claim, bare, clone, key } = await seed();
+    client.protocolFeatures = ["claim_generation_fence"];
+    client.publishCheckpoint = async () => { throw new Error("publication unknown"); };
+    const retainedHome = path.join(homeDir, claim.run_id);
+    fs.mkdirSync(retainedHome, { recursive: true });
+    fs.writeFileSync(path.join(retainedHome, "session"), "predecessor session");
+    const observations: {
+      models: number; parks: number; spent?: boolean; live?: boolean; parked?: unknown;
+      before?: any; after?: any; settled?: boolean; error?: unknown;
+      signalBefore?: boolean; signalAfter?: boolean; signalReason?: unknown; pending?: boolean;
+      episodeCustody?: boolean;
+    } = { models: 0, parks: 0 };
+    const generic = scenario.startsWith("generic");
+    const reason = new Error("generic cancel-only interruption");
+    let flight: any;
+    const r = runnerWith(factory(async ctx => {
+      observations.models++;
+      const steering = flight.steering;
+      const route = (kind: string, body?: string) => steering.route(kind, body, 1, false, undefined);
+      observations.before = readJournal(bare, clone.branch);
+      if (generic) {
+        if (scenario === "generic pre-aborted") flight.cancel.abort(reason);
+      } else {
+        route("pause", scenario === "refused wall" ? "wall" : "now");
+        observations.spent = flight.cancel.signal.aborted && flight.cancel.signal.reason instanceof PauseNowSignal;
+        if (scenario === "disk before rearm") steering.requestDiskStop();
+        if (scenario !== "unrearmed pause") {
+          observations.parked = scenario === "refused wall"
+            ? await ctx.parkForWall!() : await ctx.parkForPause!({ completedCount: 0 });
+          if (scenario === "refused wall") ctx.clearWallMode!();
+        }
+        observations.live = !steering.lifecycleSignal().aborted;
+        if (scenario === "owner cancel") route("cancel");
+        if (scenario === "shutdown") (r as any).shuttingDownGlobal = true;
+        if (scenario === "fence") steering.claimFence = () => ({ kind: "superseded" });
+        if (scenario === "switch") steering.tripCredentialSwitch(2);
+        if (scenario === "fresh pause") route("pause", "now");
+        if (scenario === "disk after rearm") steering.requestDiskStop();
+      }
+      // Observe the actual operation composition before and after a cancel-only abort.
+      const signal = (r as any).retainedLifecycleSignal(flight) as AbortSignal;
+      observations.signalBefore = signal.aborted;
+      if (scenario === "generic later abort") flight.cancel.abort(reason);
+      observations.signalAfter = signal.aborted;
+      observations.signalReason = signal.reason;
+      try {
+        await ctx.onModelTurnSettled!(1);
+        observations.settled = true;
+      } catch (error) {
+        observations.error = error;
+      }
+      observations.after = readJournal(bare, clone.branch);
+      observations.pending = await r.recoveryInventoryPending(claim.run_id, 2);
+      observations.episodeCustody = flight.retainedEpisodeCustody;
+      // Route a typed switch through the runner's real outer handler.
+      if (scenario === "switch") throw observations.error;
+      throw new Error("fixture ends retained liveness scenario");
+    }), fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 });
+    const phaseClone = (r as any).phaseClone.bind(r);
+    (r as any).phaseClone = async (...args: any[]) => {
+      flight = args[1];
+      return phaseClone(...args);
+    };
+    (r as any).handlePausePark = async () => { observations.parks++; return false; };
+    (r as any).enterWallPark = async () => { observations.parks++; return "refused"; };
+    let releases = 0, settlements = 0;
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("custody must remain"); };
+    (r as any).settleRecoveryGeneration = async () => { settlements++; };
+    await r.execute(claim);
+    assert.equal(observations.models, 1, "actual retained successor reaches model");
+    assert.equal(observations.before.recovery.attempts, 1);
+    assert.equal(observations.before.recovery.stage, "ready-for-model");
+    if (!generic) {
+      assert.equal(observations.spent, true, "shared cancel retains its first PauseNowSignal");
+      assert.equal(observations.live, !["unrearmed pause", "disk before rearm"].includes(scenario),
+        "refusal replaces only a nonterminal current lifecycle");
+      assert.equal(flight.cancel.signal.reason instanceof PauseNowSignal, true);
+      assert.equal(observations.parks, scenario === "unrearmed pause" ? 0 : 1);
+      if (scenario !== "unrearmed pause")
+        assert.equal(observations.parked, scenario === "refused wall" ? "refused" : false);
+    }
+    if (scenario === "refused now" || scenario === "refused wall") {
+      assert.equal(observations.error, undefined);
+      assert.equal(observations.settled, true);
+      assert.equal(observations.signalBefore, false, "spent pause cannot poison composed operations");
+      assert.equal(observations.after.recovery, undefined, "trusted settlement clears persisted budget");
+      assert.equal(observations.episodeCustody, false, "trusted settlement clears episode custody suppression");
+      assert.equal(observations.pending, true, "settlement grants no independent inventory retirement authority");
+    } else {
+      assert.equal(observations.settled, undefined);
+      if (scenario === "switch") assert.ok(observations.error instanceof CredentialSwitchSignal);
+      else assert.match(String(observations.error), /retained recovery stopped/);
+      assert.deepEqual(observations.after.recovery, observations.before.recovery);
+      assert.equal(observations.pending, true);
+      assert.equal(observations.episodeCustody, true);
+    }
+    if (["unrearmed pause", "fresh pause", "disk before rearm", "disk after rearm"].includes(scenario))
+      assert.equal(observations.signalAfter, true, "current lifecycle interruption aborts retained operations");
+    if (generic) {
+      assert.equal(flight.steering.lifecycleSignal().aborted, false);
+      assert.equal(observations.signalBefore, scenario === "generic pre-aborted");
+      assert.equal(observations.signalAfter, true);
+      assert.equal(observations.signalReason, reason);
+    }
+    const switches = api.states.filter(s => s.body.status === "credential_switch" || s.body.status === "credential_switch_failed");
+    if (scenario === "switch") {
+      assert.equal(switches.length, 1, "switch after refusal reaches retained exact-generation handler");
+      assert.equal(switches[0]!.body.claim_generation, 2);
+      assert.equal(flight.steering.pendingCredentialSwitch(), 2);
+    } else assert.deepEqual(switches, []);
+    assert.equal(releases, 0);
+    assert.equal(settlements, 0);
+    const journal = readJournal(bare, clone.branch);
+    assert.notEqual(journal.clonePath, clone.path);
+    assert.ok(journal.retainedSources.some((source: any) => source.clonePath === clone.path));
+    for (const clonePath of [clone.path, journal.clonePath])
+      assert.equal(fs.readFileSync(path.join(clonePath, "retained.txt"), "utf8"), "only local dirty work\n");
+    assert.equal(fs.readFileSync(path.join(retainedHome, "session"), "utf8"), "predecessor session");
+    assert.equal(await git.recoveryAttemptMode(fx.originPath, key), true);
+    assert.ok(command(bare, "for-each-ref", "--format=%(refname)", "refs/uzi-recovery-episode/" + claim.run_id));
   });
 }
 

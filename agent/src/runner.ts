@@ -15205,12 +15205,21 @@ export class RunRunner {
     if (flight.steering.terminalLifecycleSignal().aborted) throw new RetainedRecoveryStop();
   }
 
+  private retainedLifecycleSignals(flight: RunFlight): AbortSignal[] {
+    const lifecycle = flight.steering.lifecycleSignal();
+    const cancel = flight.cancel.signal;
+    // parkForPause/parkForWall rearm the current lifecycle after refusal; the shared
+    // cancel controller retains its first PauseNowSignal for the rest of this flight.
+    return cancel.aborted && cancel.reason instanceof PauseNowSignal ? [lifecycle] : [cancel, lifecycle];
+  }
+
   private retainedLifecycleGuard(flight: RunFlight): void {
     this.retainedTerminalGuard(flight);
-    for (const signal of [flight.cancel.signal, flight.steering.lifecycleSignal()]) {
+    const signals = this.retainedLifecycleSignals(flight);
+    for (const signal of signals) {
       if (signal.aborted && signal.reason instanceof CredentialSwitchSignal) throw signal.reason;
     }
-    if (flight.cancel.signal.aborted || flight.steering.lifecycleSignal().aborted) throw new RetainedRecoveryStop();
+    if (signals.some(signal => signal.aborted)) throw new RetainedRecoveryStop();
   }
 
   /** One bounded, credential-free verification pass over EXISTING evidence. Every outcome
@@ -15226,7 +15235,7 @@ export class RunRunner {
     const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
     const identity = () => {
       this.retainedTerminalGuard(flight);
-      for (const signal of [flight.cancel.signal, flight.steering.lifecycleSignal()]) {
+      for (const signal of this.retainedLifecycleSignals(flight)) {
         if (signal.aborted && !(signal.reason instanceof CredentialSwitchSignal)) throw new RetainedRecoveryStop();
       }
       if (generation === undefined || generation !== flight.claimGeneration ||
@@ -15347,7 +15356,7 @@ export class RunRunner {
   }
 
   private retainedLifecycleSignal(flight: RunFlight): AbortSignal {
-    return AbortSignal.any([flight.cancel.signal, flight.steering.lifecycleSignal(), this.shutdownSignal.signal]);
+    return AbortSignal.any([...this.retainedLifecycleSignals(flight), this.shutdownSignal.signal]);
   }
 
   private async requireRetainedOwnership(flight: RunFlight, deadline = Date.now() + this.codexBoundaryDeadlineMs, signal = this.retainedLifecycleSignal(flight)): Promise<void> {

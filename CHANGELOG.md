@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Retained recovery continues after a refused immediate or wall pause.**
+  Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
+
 - **Full-screen TUI footers keep help and quit keys visible ([#2194](https://github.com/vtmocanu/uzi/issues/2194)).**
   At 80 columns and wider, the board, CI and pulls footers shed lower-priority hints before help and quit; the board retains its partial-cost cue and client-only version fallback.
 
