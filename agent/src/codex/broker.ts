@@ -38,6 +38,7 @@
 // second copy of the clamping logic.
 
 import path from "node:path";
+import { CODE_DISPOSITIONS_TOOL, authorizeCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { createHash } from "node:crypto";
 import {
   validatePolicyRefusal,
@@ -93,6 +94,7 @@ const CODEX_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([
  * rule. Advertise collision-free fixed wire aliases and map them back to canonical
  * worker authority before any decision. */
 const CODEX_DYNAMIC_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
+  [CODE_DISPOSITIONS_TOOL, "report_cross_check_dispositions"],
   ["Bash", "uzi_bash"],
   ["apply_patch", "uzi_apply_patch"],
   ["Read", "uzi_read"],
@@ -365,6 +367,7 @@ export interface RunGrants {
 /** Everything the broker is constructed with: the registry, the injected seams, the
  *  immutable grants, and optional routing/screening config. */
 export interface CodexCallbackBrokerOptions {
+  readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly scrubPolicyRole?: (role: string) => string;
   readonly registry: ExecutionRegistry;
   readonly spawnCommand: SpawnCommandSeam;
@@ -569,6 +572,16 @@ export class CodexCallbackBroker {
     if (bounds) return bounds;
     const toolName = name as string; // narrowed by checkIngestion
     const org: CallbackOrigin = origin === "root" || origin === "child" ? origin : "unknown";
+
+    // Codex retains this registration on resume. Live authority also gates cached replies.
+    if (canonicalizeCodexToolName(toolName) === CODE_DISPOSITIONS_TOOL) {
+      if (org !== "root" || !this.grants.isRoot || !this.grants.allowedTools.has(CODE_DISPOSITIONS_TOOL) || this.signal?.aborted)
+        return deny("denied_tool", "code repair is not active");
+      try {
+        await authorizeCodeDispositions(this.opts.codeCrossCheck, args);
+        if (this.signal?.aborted || !this.opts.codeCrossCheck?.codeCrossCheckRepairActive()) return deny("denied_tool", "code repair is not active");
+      } catch { return deny("denied_tool", "code repair is not active or dispositions are invalid"); }
+    }
 
     // 2. Admission. The fingerprint binds (name + canonical args + origin); the same
     // tuple with a DIFFERENT fingerprint is a replay/forgery the registry poisons on.

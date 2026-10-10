@@ -11,6 +11,7 @@
 // zero-unused-export gate stays green).
 
 import type { Readable, Writable } from "node:stream";
+import type { CodeCrossCheckToolAccess } from "./code-cross-check-tools.js";
 import type { EmittedMessage } from "./executor.js";
 import type { PrSummaryClaim } from "./signals.js";
 import type { PluginLoadError } from "./plugin-errors.js";
@@ -308,6 +309,8 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  /** Opted-in root registration persists; the broker checks live repair authority per call. */
+  codeCrossCheck?: CodeCrossCheckToolAccess;
   prompt: string;
   systemPrompt: string;
   resumeSessionId?: string;

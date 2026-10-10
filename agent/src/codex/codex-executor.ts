@@ -149,6 +149,7 @@ import {
   type ChildThreadController,
   type StartChildTurnSpec,
 } from "./delegation.js";
+import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
@@ -1250,7 +1251,14 @@ export class FailClosedExecutor implements Executor {
 }
 
 // ─── the production MCP/forge/memory/findings/skill tool-handler map ────────────
+function codeCrossCheckAccess(ctx: RunContext): CodeCrossCheckToolAccess | undefined {
+  if (!ctx.codeCrossCheckGate || !ctx.codeCrossCheckRepairActive || !ctx.codeCrossCheckRepair || !ctx.reportCrossCheckDispositions || !ctx.claimGeneration) return undefined;
+  return { generation: ctx.claimGeneration, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive, codeCrossCheckRepair: ctx.codeCrossCheckRepair,
+    reportCrossCheckDispositions: ctx.reportCrossCheckDispositions };
+}
+
 export interface CodexToolHandlerDeps {
+  readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly client: WorkerClient;
   readonly runId: string;
   readonly log: Logger;
@@ -1285,6 +1293,10 @@ export interface CodexToolHandlerDeps {
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
   const { client, runId, log, emit, skills } = deps;
   const map = new Map<string, ToolHandler>();
+  if (deps.codeCrossCheck) map.set(CODE_DISPOSITIONS_TOOL, async args => {
+    await reportCodeDispositions(deps.codeCrossCheck!, args);
+    return { content: [{ type: "text", text: "Code cross-check dispositions recorded." }] };
+  });
 
   // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
   // allowedTools gate stops a subagent reaching this handler regardless).
@@ -2360,6 +2372,7 @@ export class CodexExecutor implements Executor {
         log: this.log,
         emit: (msg) => ctx.emit(msg),
         skills: ctx.skills ?? [],
+        codeCrossCheck: codeCrossCheckAccess(ctx),
       });
 
       // The low-level effect launcher, boundary seams and per-sink reconcile/eviction closures —
@@ -3050,7 +3063,17 @@ export class CodexExecutor implements Executor {
             if (secretDecision?.action === "fail") break;
           }
           if (!interlockedIssue) {
-            await ctx.codeCrossCheckGate?.({ interlocked: false, reportOnly: declaredReportOnly });
+            if (ctx.codeCrossCheckGate) {
+              await epoch.persistSession();
+              reapedSinceLastPersist = true;
+              epochNeedsRecreate = true;
+              const codeDecision = await ctx.codeCrossCheckGate({ interlocked: false, reportOnly: declaredReportOnly });
+              if (codeDecision.action === "repair") {
+                epochNeedsRecreate = true;
+                completionFollowUp = codeDecision.followUp;
+                continue;
+              }
+            }
             // Issue #1514: same done-exit scope cap as sdk-executor's legacy done exit.
             if (isIssueRun) {
               const cap = scopeCapAtDone({
@@ -3082,7 +3105,12 @@ export class CodexExecutor implements Executor {
           });
           completionAttempted = true;
           if (unmet.length === 0) {
-            await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly });
+            const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly });
+            if (codeDecision?.action === "repair") {
+              epochNeedsRecreate = true;
+              completionFollowUp = codeDecision.followUp;
+              continue;
+            }
             break;
           }
           const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
@@ -3141,7 +3169,10 @@ export class CodexExecutor implements Executor {
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
       }
 
-      return loopResult();
+      const completed = loopResult();
+      const codeSummary = await ctx.codeCrossCheckSummary?.();
+      if (codeSummary) completed.codeCrossCheckSummary = codeSummary;
+      return completed;
     } finally {
       await settleInstall();
       ctx.signal?.removeEventListener("abort", forwardInstallAbort);
@@ -3377,6 +3408,7 @@ export class CodexExecutor implements Executor {
           fileop,
           worktreePath,
           grants: runPlan.lead.grants,
+          codeCrossCheck: codeCrossCheckAccess(ctx),
           delegate: delegationRunner.toDelegateSeam(),
           toolHandlers,
           allowedRoles: runPlan.allowedRoles,
@@ -4289,10 +4321,13 @@ export class CodexExecutor implements Executor {
     const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
+    // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
+    // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
     const request: RunTurnRequest = {
       prompt,
       systemPrompt,
       phase,
+      ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,
       leadSkills,
       signal,

@@ -1183,6 +1183,7 @@ const BRIDGE_SENTENCE =
  */
 export type KindSectionLine =
   | { fixed: string }
+  | { codeCrossCheck: import("./code-cross-check-gate.js").CodeCrossCheckSummary }
   | { path: string }
   | { check: { name: string; status: CheckStatus; detail: string } };
 
@@ -1207,6 +1208,7 @@ function renderFixedLine(s: string): string {
 }
 
 function renderKindSectionLine(line: KindSectionLine): string {
+  if ("codeCrossCheck" in line) return renderCodeCrossCheck(line.codeCrossCheck);
   if ("path" in line) return `> - ${codeSpan(line.path)}`;
   if ("check" in line) {
     const c = line.check;
@@ -1214,6 +1216,41 @@ function renderKindSectionLine(line: KindSectionLine): string {
     return `- ${checkEmoji(status)} ${escapeInline(c.name)} — ${status} (${escapeInline(c.detail)})`;
   }
   return renderFixedLine(line.fixed);
+}
+
+/** Code data occupies escaped value slots only; the 4 KiB budget drops finding lines first. */
+function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").CodeCrossCheckSummary): string {
+  const value = (s: string | null | undefined, cap = 256): string => {
+    // Strip complete ANSI sequences before dropping the remaining invisible controls.
+    // eslint-disable-next-line no-control-regex -- Literal ESC/BEL matching removes hostile ANSI sequences.
+    const clean = (s ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, "");
+    let bounded = "";
+    for (const rune of clean) {
+      if (Buffer.byteLength(bounded + rune) > cap) break;
+      bounded += rune;
+    }
+    return escapeInline(bounded);
+  };
+  if ("incomplete" in summary) return `Code cross-check incomplete: ${value(summary.incomplete)}`;
+  if (summary.interrupted_at !== null || summary.reason_class === "interrupted") return "Code cross-check incomplete: interrupted";
+  if (summary.outcome !== "completed") return `Code cross-check incomplete: ${value(summary.reason_class ?? "not finished")}`;
+  if (!summary.head_commit || !summary.base_commit) return "Code cross-check incomplete: snapshot failed";
+  const dispositions = new Map((summary.dispositions ?? []).map(d => [d.finding_id, d]));
+  let addressed = 0, declined = 0, missing = 0;
+  const findings = summary.findings.map(f => {
+    const d = dispositions.get(f.id);
+    const disposition = d?.disposition ?? "not_reported";
+    if (disposition === "addressed") addressed++;
+    else if (disposition === "declined") declined++;
+    else missing++;
+    return `- ${codeSpan(f.id)} · ${value(f.severity)} · ${value(f.path)}:${f.line} · ${value(f.title)} — ${disposition === "not_reported" ? "not reported" : value(disposition)}${d?.reason ? `: ${value(d.reason, 1024)}` : ""}`;
+  });
+  const identity = `Code cross-check (checked ${value(summary.head_commit.slice(0, 12))}, ${value(summary.checker_harness)} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
+  const counts = `${summary.findings.length} findings: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+  const footer = "**Changes after the check were not cross-checked.**";
+  const render = () => [identity, counts, ...findings, footer].join("\n");
+  while (findings.length && Buffer.byteLength(render()) > 4096) findings.pop();
+  return render();
 }
 
 /** A kind section as markdown, leading and trailing blank lines dropped; "" when it has no text. */
@@ -1357,9 +1394,10 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
     paras.push(issueArm(input).join("\n"));
   }
   if (input.repoAgents) paras.push(REPO_AGENTS_LINE);
-  if (input.kindLine !== undefined) {
+  {
     for (const section of input.kindSections ?? []) {
-      const t = section ? renderKindSection(section) : "";
+      const visible = input.kindLine === undefined ? section?.filter(line => "codeCrossCheck" in line) : section;
+      const t = visible ? renderKindSection(visible) : "";
       if (t) paras.push(t);
     }
   }

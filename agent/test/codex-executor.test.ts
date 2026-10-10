@@ -13106,6 +13106,83 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
   });
 });
 
+
+for (const mode of ["off", "repair", "stale"] as const) {
+  const optedIn = mode !== "off";
+  it(`U3 D9 CodexExecutor first planning root consent=${optedIn} and resumed repair authority: ${mode}`, async () => {
+    const row: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
+  "stage": "code",
+  "round": 1,
+  "candidate_generation": 7,
+  "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "candidate_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "checker_run_id": "child",
+  "checker_harness": "codex",
+  "checker_model": "m",
+  "checker_effort": "high",
+  "outcome": "completed",
+  "reason_class": null,
+  "findings": [
+    {
+      "id": "F_1",
+      "severity": "major",
+      "path": "a.ts",
+      "line": 2,
+      "title": "Verify guard",
+      "detail": "untrusted advice"
+    }
+  ],
+  "dispositions": null,
+  "finalized_at": null,
+  "interrupted_at": null,
+  "deadline_at": "2030-01-01T00:00:00Z"
+};
+    const args = { dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] };
+    let active = false, checks = 0, posts = 0;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(10, "report_cross_check_dispositions", args, th, tn, "before"));
+        t.push(toolCall(11, "submit_plan", { plan_md: "the plan" }, th, tn, "plan"));
+        t.push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(20, "signal_done", {}, th, tn, "done"));
+        t.push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-3", (t, th, tn) => {
+        t.push(toolCall(30, "report_cross_check_dispositions", args, th, tn, "repair"));
+        t.push(toolCall(31, "signal_done", {}, th, tn, "done"));
+        t.push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
+      ...(optedIn ? {
+        claimGeneration: 7,
+        codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => active ? { ...row, candidate_generation: mode === "stale" ? 6 : 7 } : undefined,
+        reportCrossCheckDispositions: async () => { posts++; return row; },
+        codeCrossCheckGate: async () => {
+          active = ++checks === 1;
+          return active ? { action: "repair" as const, followUp: "D9-REPAIR" } : { action: "proceed" as const };
+        },
+      } : {}),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "D9 planning/repair");
+    const start = rig.epochs[0]!.transport.requests.find(r => r.method === "thread/start")!;
+    assert.equal((rec(start.params).dynamicTools as Array<{ name: string }>).some(t => t.name === "report_cross_check_dispositions"), optedIn);
+    assert.equal(posts, mode === "repair" ? 1 : 0, "stale resumed generation never posts through the runner hook");
+    for (const epoch of rig.epochs.slice(1, optedIn ? 3 : 2)) {
+      assert.ok(epoch.transport.requests.some(r => r.method === "thread/resume"));
+      for (const request of epoch.transport.requests) {
+        assert.equal(rec(request.params).dynamicTools, undefined, request.method);
+        assert.equal(rec(request.params).dynamic_tools, undefined, request.method);
+      }
+    }
+  });
+}
+
 // Issue #1932 m3: the Codex executor consults ctx.secretRemediationGate at the done point, BEFORE
 // the persist / done checkpoint. `remediate` re-prompts the SAME live epoch; `fail` stops.
 describe("CodexExecutor secret remediation gate (issue #1932)", () => {
@@ -13128,6 +13205,36 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       .filter((r) => r.method === "turn/start")
       .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
+
+  for (const interlocked of [false, true]) {
+    it(`code repair recreates epoch with persisted session before both done paths: ${interlocked}`, async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(11, th, tn)]]),
+        script("th-1", [(th, tn) => [done(21, th, tn)]]),
+      ]);
+      let checks = 0;
+      const events: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: interlocked,
+        secretRemediationGate: async () => { events.push("secret"); return { action: "proceed" }; },
+        checkpoint: async () => { events.push("checkpoint"); },
+        recordCompletionAttempt: async () => { events.push("attempt"); return { unmet: [], attemptCount: 1 }; },
+        codeCrossCheckGate: async () => {
+          assert.ok(rig.sessionOps.persist > 0, "session persisted before gate reaps");
+          events.push("code");
+          return ++checks === 1 ? { action: "repair", followUp: "ONE-CODE-REPAIR-MARKER" } : { action: "proceed" };
+        },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "code repair epochs");
+      assert.equal(checks, 2);
+      assert.equal(rig.providerLaunches(), 2);
+      assert.ok(turnTexts(rig.epochs[1]!.transport)[0]?.includes("ONE-CODE-REPAIR-MARKER"));
+      assert.ok(rig.epochs[1]!.transport.requests.some(r => r.method === "thread/resume"), "same session resumed");
+      assert.deepEqual(events, interlocked
+        ? ["secret", "checkpoint", "attempt", "code", "secret", "checkpoint", "attempt", "code"]
+        : ["secret", "code", "secret", "code"]);
+    });
+  }
 
   it("unmet completion attempts do not call code until the successful done exit", async () => {
     const rig = makeMultiEpochRig([
@@ -13172,7 +13279,8 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       assert.equal(checks, 1);
       assert.equal(result.walled, undefined);
       assert.equal(rig.providerLaunches(), 1);
-      assert.equal(rig.sessionOps.persist, persistsBefore + (interlocked ? 0 : 1));
+      assert.ok(persistsBefore > 0, "both paths persist before the gate can reap");
+      assert.equal(rig.sessionOps.persist, persistsBefore, "never persist a potentially reaped home after code gate");
     });
   }
 

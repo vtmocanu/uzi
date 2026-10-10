@@ -765,3 +765,18 @@ describe("renderCodexRun — diagnostic name sanitization", () => {
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "r", "Frobnicate-XYZ"), true);
   });
 });
+
+it("U3 D9 root registration is opt-in in every phase and forbidden to explicitly granted children", () => {
+  const name = "mcp__uzi__report_cross_check_dispositions";
+  for (const phase of ["plan", "implement"] as const) {
+    const off = renderCodexRun(runRequest({ phase }));
+    assert.equal(off.leadGrants.allowedTools.has(name), false);
+    const on = renderCodexRun(runRequest({ phase, codeCrossCheck: {
+      generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
+      reportCrossCheckDispositions: async () => ({ stage: "code", result: "no_row" }),
+    }, agents: { inherited: agent(), explicit: agent({ tools: allow([name, "report_cross_check_dispositions"]) }) } }));
+    assert.equal(on.leadGrants.allowedTools.has(name), true);
+    assert.equal(toolsOf(on, "inherited").has(name), false);
+    assert.equal(toolsOf(on, "explicit").has(name), false);
+  }
+});

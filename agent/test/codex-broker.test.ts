@@ -107,6 +107,7 @@ function makeBroker(opts: Partial<CodexCallbackBrokerOptions> = {}): Harness {
     toolHandlers: opts.toolHandlers,
     allowedRoles: opts.allowedRoles ?? new Set(["coder", "reviewer"]),
     screenPolicy: opts.screenPolicy,
+    codeCrossCheck: opts.codeCrossCheck,
   });
   return { broker, registry, spawn, fileop, delegate };
 }
@@ -1170,5 +1171,111 @@ describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandle
     const r = await h.broker.handleToolCall(rt(), "Skill", { skill: "prd-lifecycle" }, "root");
     assert.equal(r.ok, true, "a granted-but-bodyless skill is an ok ack, not a deny");
     if (r.ok) assert.ok(JSON.stringify(r.output).includes("prd-lifecycle"), "the ack names the skill");
+  });
+});
+
+
+it("U3 D9 production handler map is opt-in and revalidates before reporting", async () => {
+  const row: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
+  "stage": "code",
+  "round": 1,
+  "candidate_generation": 7,
+  "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "candidate_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "checker_run_id": "child",
+  "checker_harness": "codex",
+  "checker_model": "m",
+  "checker_effort": "high",
+  "outcome": "completed",
+  "reason_class": null,
+  "findings": [
+    {
+      "id": "F_1",
+      "severity": "major",
+      "path": "a.ts",
+      "line": 2,
+      "title": "Verify guard",
+      "detail": "untrusted advice"
+    }
+  ],
+  "dispositions": null,
+  "finalized_at": null,
+  "interrupted_at": null,
+  "deadline_at": "2030-01-01T00:00:00Z"
+};
+  let active = true, posts = 0;
+  const log: Logger = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return log; } };
+  const deps = { client: {} as WorkerClient, runId: "lead", log, emit: () => {}, skills: [] };
+  const name = "mcp__uzi__report_cross_check_dispositions";
+  assert.equal(buildCodexToolHandlers(deps).has(name), false);
+  const map = buildCodexToolHandlers({ ...deps, codeCrossCheck: {
+    generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => active ? row : undefined,
+    reportCrossCheckDispositions: async () => { posts++; return row; },
+  } });
+  const handler = map.get(name)!;
+  const args = { dispositions: [{ finding_id: "F_1", disposition: "declined", reason: "verified existing guard" }] };
+  await handler(args);
+  active = false;
+  await assert.rejects(handler(args), /not active/);
+  assert.equal(posts, 1);
+});
+
+describe("U3 D9 live code repair broker", () => {
+  it("U3 D9 broker refuses a pass closing between asynchronous validation and cached replay", async () => {
+    let active = true, closeOnRead = false, effects = 0;
+    const row = { stage: "code", round: 1, candidate_generation: 7,
+      head_commit: "b".repeat(40), base_commit: "a".repeat(40), interrupted_at: null, outcome: "completed",
+      findings: [{ id: "F_1", severity: "major", path: "a.ts", line: 1, title: "t", detail: "d" }] } as import("../src/code-cross-check-contract.js").CodeCrossCheckRecord;
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["mcp__uzi__report_cross_check_dispositions"]) }),
+      codeCrossCheck: { generation: 7, codeCrossCheckRepairActive: () => active,
+        codeCrossCheckRepair: async () => {
+          if (closeOnRead) queueMicrotask(() => queueMicrotask(() => { active = false; }));
+          return row;
+        }, reportCrossCheckDispositions: async () => row },
+      toolHandlers: new Map([["mcp__uzi__report_cross_check_dispositions", async () => { effects++; return {}; }]]),
+    });
+    const id = rt(), args = { dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] };
+    assert.equal((await h.broker.handleToolCall(id, "report_cross_check_dispositions", args, "root")).ok, true);
+    closeOnRead = true;
+    assertDenied(await h.broker.handleToolCall(id, "report_cross_check_dispositions", args, "root"), "denied_tool");
+    assert.equal(effects, 1);
+  });
+  const row = {"stage":"code","round":1,"candidate_generation":7,"base_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","candidate_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","checker_run_id":"child","checker_harness":"codex","checker_model":"m","checker_effort":"high","outcome":"completed","reason_class":null,"findings":[{"id":"F_1","severity":"major","path":"a.ts","line":2,"title":"Verify guard","detail":"untrusted advice"}],"dispositions":null,"finalized_at":null,"interrupted_at":null,"deadline_at":"2030-01-01T00:00:00Z"};
+  const args = { dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] };
+  it("refuses before and after repair including cached successful same-runtime callbacks", async () => {
+    let current: typeof row | undefined;
+    let effects = 0;
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["mcp__uzi__report_cross_check_dispositions"]) }),
+      codeCrossCheck: { generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => current as import("../src/code-cross-check-contract.js").CodeCrossCheckRecord | undefined,
+        reportCrossCheckDispositions: async () => { throw new Error("unused"); } },
+      toolHandlers: new Map([["mcp__uzi__report_cross_check_dispositions", async () => { effects++; return {}; }]]),
+    });
+    assertDenied(await h.broker.handleToolCall(rt(), "report_cross_check_dispositions", args, "root"), "denied_tool");
+    current = row;
+    const same = rt();
+    assert.equal((await h.broker.handleToolCall(same, "report_cross_check_dispositions", args, "root")).ok, true);
+    assert.equal((await h.broker.handleToolCall(same, "report_cross_check_dispositions", args, "root")).ok, true);
+    assert.equal(effects, 1);
+    current = undefined;
+    assertDenied(await h.broker.handleToolCall(same, "report_cross_check_dispositions", args, "root"), "denied_tool");
+    assertDenied(await h.broker.handleToolCall(rt(), "report_cross_check_dispositions", args, "root"), "denied_tool");
+    assert.equal(effects, 1);
+  });
+  it("refuses stale resumed generation, child origin, nonroot explicit grant and consent-off explicit grant", async () => {
+    let effects = 0;
+    for (const mode of ["stale", "child", "nonroot", "off"] as const) {
+      const h = makeBroker({
+        grants: grants({ isRoot: mode !== "nonroot", allowedTools: new Set(["mcp__uzi__report_cross_check_dispositions"]) }),
+        codeCrossCheck: mode === "off" ? undefined : { generation: mode === "stale" ? 8 : 7,
+          codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => row as import("../src/code-cross-check-contract.js").CodeCrossCheckRecord,
+          reportCrossCheckDispositions: async () => { throw new Error("unused"); } },
+        toolHandlers: new Map([["mcp__uzi__report_cross_check_dispositions", async () => { effects++; return {}; }]]),
+      });
+      assertDenied(await h.broker.handleToolCall(rt(), "report_cross_check_dispositions", args, mode === "child" ? "child" : "root"), "denied_tool");
+    }
+    assert.equal(effects, 0);
   });
 });

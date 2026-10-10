@@ -1,4 +1,4 @@
-import { checkCode } from "./code-cross-check-gate.js";
+import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
@@ -7113,6 +7113,18 @@ export class RunRunner {
     // The completion block this run writes, with or without `Closes #N` and the unverified banner.
     // mrCompletionBlock's wording; the publisher and the reconcile compose the region and the
     // preserved text around it.
+    // Rebuild persisted evidence at publication as well as session completion: a superseded
+    // completed row must not carry the earlier attempt's counts into a reconciled MR.
+    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary) {
+      try {
+        result.codeCrossCheckSummary = persistedCodeCrossCheckSummary(
+          await this.client.codeCrossCheckStatus(claim.run_id, flight.claimGeneration,
+            AbortSignal.any([boundarySignal ?? new AbortController().signal, AbortSignal.timeout(3000)])),
+          flight.claimGeneration);
+      } catch {
+        result.codeCrossCheckSummary = { incomplete: "status unavailable" };
+      }
+    }
     const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
       mrCompletionBlock(
         claim,
@@ -7127,6 +7139,7 @@ export class RunRunner {
         claim.config?.completion_scope,
         bridged,
         opts,
+        result.codeCrossCheckSummary,
       );
     const runKind = resolveRunKind(claim.kind);
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
@@ -8947,7 +8960,7 @@ export class RunRunner {
     // See the ctx.checkpoint comment for the reap-before-git and best-effort invariants.
     let codeSnapshot: { head_commit: string; base_commit: string } | undefined;
     let codeFreshReceipt: CodeSnapshotFreshReceipt | undefined;
-    let codeCheckCalled = false;
+    let codeGate: CodeCrossCheckGate | undefined;
     let codeDefaultCommit: string | undefined;
     let codeEmptyPrompt = false;
     const captureImportedCodeHead = async (head: string | null): Promise<void> => {
@@ -9035,7 +9048,7 @@ export class RunRunner {
         // iteration can become publish-eligible on a later tip-unmoved iteration).
         // PRD #1809 D8: whether the tracking ref (what the publish packs) holds cloneTip: the tip was
         // unmoved since the last fetch-back, or this fetch-back landed.
-        const codeDoneSnapshot = claim.code_cross_check_required === true && !codexBound
+        const codeDoneSnapshot = claim.code_cross_check_required === true && codeGate === undefined
           && opts.reap && opts.sink === "done_checkpoint";
         // This read is inside the checkpoint's quiescent boundary, before import and bridging.
         const originalCodeHead = codeDoneSnapshot ? await this.git.branchTip(runnerClone.path, runnerClone.branch) : null;
@@ -10151,7 +10164,7 @@ export class RunRunner {
       checkpoint: (opts) =>
         // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
         this.runGatedSink(flight, async () => {
-          if (opts.reap && opts.sink === "done_checkpoint") { codeSnapshot = undefined; codeEmptyPrompt = false; }
+          if (opts.reap && opts.sink === "done_checkpoint" && !codeGate) { codeSnapshot = undefined; codeEmptyPrompt = false; }
           await checkpointBody({ reap: opts.reap, progress: opts.progress, sink: opts.sink });
         }),
       // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
@@ -10160,12 +10173,11 @@ export class RunRunner {
       ...(claim.code_cross_check_required === true
         && isCodePublishingKind(claim.kind ?? "issue") ? {
         codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
-          if (codeCheckCalled || completion.reportOnly || completion.notCode || completion.confirmedEmptyPrompt) return { action: "proceed" as const };
-          codeCheckCalled = true;
-          const record = await this.runGatedSink(flight, () => checkCode({
+          if (completion.reportOnly || completion.notCode || completion.confirmedEmptyPrompt) return { action: "proceed" as const };
+          const decision = await this.runGatedSink(flight, async () => {
+            codeGate ??= new CodeCrossCheckGate({
             client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
             snapshot: async () => {
-              if (codexBound) return { reason_class: "worker_unsupported" as const };
               if (!barePath) return { reason_class: "snapshot_failed" as const };
               if (!completion.interlocked) {
                 codeSnapshot = undefined;
@@ -10190,7 +10202,11 @@ export class RunRunner {
               }
               return { reason_class: "snapshot_failed" as const };
             },
-          }));
+            });
+            return codeGate.done();
+          });
+          const summary = codeGate?.observed();
+          const record = summary && !("incomplete" in summary) ? summary : undefined;
           if (codeEmptyPrompt) return { action: "proceed" as const };
           if (barePath && codeSnapshot && codeFreshReceipt && record && !("result" in record)
             && record.candidate_generation === flight.claimGeneration
@@ -10204,12 +10220,20 @@ export class RunRunner {
             })
               .catch((err) => runLog.warn("code snapshot retained after cleanup error", { error: errMessage(err) }));
           }
-          // Persisted trace only in U2; no repair prompt, dispositions or MR rendering.
+          // The completion section uses the server row, retaining the original checked identity.
           batcher.emit({ kind: "status", agent: "worker", payload: {
             text: record && !("result" in record) ? "Code cross-check advisory result" : "Code cross-check incomplete",
           } });
-          return { action: "proceed" as const };
+          return decision;
         },
+        codeCrossCheckRepairActive: () => codeGate?.repairActive() === true,
+        codeCrossCheckRepair: () => this.runGatedSink(flight, async () => codeGate?.repair()),
+        reportCrossCheckDispositions: (batch: import("./code-cross-check-contract.js").CodeCrossCheckDispositionBatch) =>
+          this.runGatedSink(flight, async () => {
+            if (!codeGate) throw new Error("code cross-check repair is not active");
+            return codeGate.report(batch);
+          }),
+        codeCrossCheckSummary: () => this.runGatedSink(flight, async () => codeGate?.persistedSummary()),
       } : {}),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
@@ -10359,6 +10383,8 @@ export class RunRunner {
       this.diskGovernor?.enterRun(flight.runId);
       try {
         result = await executor.run(ctx);
+        const codeSummary = await ctx.codeCrossCheckSummary?.();
+        if (codeSummary) result.codeCrossCheckSummary = codeSummary;
       } catch (value) {
         executionRejection.rejected = true;
         executionRejection.value = value;
@@ -16119,6 +16145,7 @@ export function mrCompletionBlock(
   // `git merge -s ours <P>` bridge is equally possible.
   bridged = false,
   opts?: MrDescriptionOptions,
+  codeCrossCheckSummary?: import("./code-cross-check-gate.js").CodeCrossCheckSummary,
 ): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
@@ -16132,7 +16159,7 @@ export function mrCompletionBlock(
     issueIid: claim.issue_iid,
     branch,
     kindLine,
-    kindSections: [selfImproveSection, promptGuardSection],
+    kindSections: [selfImproveSection, promptGuardSection, codeCrossCheckSummary ? [{ codeCrossCheck: codeCrossCheckSummary }] : undefined],
     closes: renderCloses,
     completionScope,
     scopeCapped,

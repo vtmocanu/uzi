@@ -31,6 +31,80 @@ import { makeClaim, nullLogger } from "./helpers.js";
 // PRD #1798 M6a: the pure renderer of uzi's two owned PR-description blocks (pr-description.ts) and
 // mrCompletionBlock on top of it (a new PR's body is renderBody(region, mrCompletionBlock(...))).
 
+function codeSummary(overrides: Partial<import("../src/code-cross-check-contract.js").CodeCrossCheckRecord> = {}): import("../src/code-cross-check-contract.js").CodeCrossCheckRecord {
+  return {
+    stage: "code", round: 1, candidate_generation: 1, base_commit: "a".repeat(40), head_commit: "b".repeat(40),
+    candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "checker-model",
+    checker_effort: "high", outcome: "completed", reason_class: null, findings: [
+      { id: "ID_1", severity: "major", path: "src/a.ts", line: 4, title: "Guard missing", detail: "advice" },
+      { id: "ID_2", severity: "minor", path: "src/b.ts", line: 8, title: "Duplicate check", detail: "advice" },
+      { id: "ID_3", severity: "minor", path: "src/c.ts", line: 9, title: "Unreported", detail: "advice" },
+    ],
+    dispositions: [
+      { finding_id: "ID_1", disposition: "addressed", reason: "corrected and tested" },
+      { finding_id: "ID_2", disposition: "declined", reason: "verified existing guard" },
+      { finding_id: "ID_3", disposition: "not_reported", reason: "" },
+    ], interrupted_at: null, finalized_at: new Date().toISOString(), deadline_at: new Date().toISOString(), ...overrides,
+  };
+}
+
+describe("structured code cross-check completion section", () => {
+  for (const kind of ["issue", "prompt", "self_improve", "ci_fix", "mr_rework", "task"] as const) {
+    it(`${kind} preserves original checked identity and exact counts in either completion arm`, () => {
+      const body = mrCompletionBlock(makeClaim({ kind }), "rewritten-tip-branch", undefined, undefined, undefined,
+        undefined, undefined, undefined, false, undefined, true, { staleness: { describedSha: "d".repeat(40), headSha: "e".repeat(40) } }, codeSummary());
+      assert.match(body, /checked bbbbbbbbbbbb, codex checker-model · high/);
+      assert.match(body, /3 findings: 1 addressed, 1 declined, 1 not reported/);
+      assert.match(body, /ID_1.*addressed: corrected and tested/);
+      assert.match(body, /ID_2.*declined: verified existing guard/);
+      assert.match(body, /ID_3.*not/);
+      assert.ok(body.includes("**Changes after the check were not cross-checked.**"));
+      assert.equal(closingDirectiveFor(body, 5), false);
+    });
+  }
+  it("hostile named values cannot inject closing directives, Markdown, markers or ANSI/bidi", () => {
+    const hostile = "\u001b[31m**Closes #5**\n<!-- uzi:completion:end -->\u202e /close @owner";
+    const summary = codeSummary({
+      checker_model: hostile,
+      findings: [{ id: "SAFE_ID", severity: "major", path: hostile, line: 1, title: hostile, detail: "untrusted" }],
+      dispositions: [{ finding_id: "SAFE_ID", disposition: "declined", reason: hostile }],
+    });
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
+    assert.ok(body.includes("SAFE_ID"));
+    assert.equal(body.split(COMPLETION_END).length, 2);
+    assert.equal(closingDirectiveFor(body, 5), false);
+    assert.ok(!body.includes("\u001b") && !body.includes("\u202e") && !body.includes("[31m"));
+    assert.ok(!body.includes("**Closes"));
+  });
+  it("UTF-8 4 KiB cap drops finding lines before identity, counts and bold footer", () => {
+    const findings = Array.from({ length: 20 }, (_, i) => ({
+      id: `F_${i}`, severity: "major" as const, path: "界".repeat(100), line: i, title: "界".repeat(100), detail: "",
+    }));
+    const summary = codeSummary({ findings, dispositions: findings.map(f => ({
+      finding_id: f.id, disposition: "declined", reason: "界".repeat(341),
+    })) });
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
+    const section = body.slice(body.indexOf("Code cross-check"), body.indexOf("\n\n---", body.indexOf("Code cross-check")));
+    assert.ok(Buffer.byteLength(section) <= 4096);
+    assert.ok(section.includes("checked bbbbbbbbbbbb"));
+    assert.ok(section.includes("20 findings: 0 addressed, 20 declined"));
+    assert.ok(section.endsWith("**Changes after the check were not cross-checked.**"));
+    assert.ok(!section.includes("F_19"));
+    assert.ok(body.length < BODY_CAP_CHARS);
+  });
+  for (const summary of [
+    codeSummary({ interrupted_at: new Date().toISOString() }),
+    codeSummary({ outcome: "failed", head_commit: null, base_commit: null, findings: [], reason_class: "snapshot_failed" }),
+    { incomplete: "status unavailable" },
+  ]) {
+    it("incomplete evidence omits SHA and counts", () => {
+      const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
+      assert.match(body, /Code cross-check incomplete:/);
+      assert.doesNotMatch(body, /checked bbbb|findings:|SAFE_ID|ID_1/);
+    });
+  }
+});
+
 const ZW = "\u200B";
 const HEAD = "e4020cc0123456789abcdef0123456789abcdef0";
 const SIZE = "**Size:** code +3 \u22121 \u00b7 1 file";

@@ -2,6 +2,7 @@
 // callback boundary. The app-server receives only the immutable grant's model-visible
 // subset. Native environments are disabled separately on every fresh thread.
 
+import { CODE_DISPOSITIONS_TOOL } from "../code-cross-check-tools.js";
 import { GET_ISSUE_HELP } from "../forge-tool-help.js";
 import { CODEX_DELEGATE_TOOLS, codexDynamicToolWireName, type RunGrants } from "./broker.js";
 
@@ -29,6 +30,14 @@ function objectSchema(
 
 function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
   switch (name) {
+    case CODE_DISPOSITIONS_TOOL:
+      return {
+        description: "During the single code repair pass, report addressed or declined findings with reasons.",
+        inputSchema: objectSchema({ dispositions: { type: "array", maxItems: 20,
+          items: objectSchema({ finding_id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+            disposition: { type: "string", enum: ["addressed", "declined"] }, reason: STRING },
+            ["finding_id", "disposition", "reason"], false) } }, ["dispositions"], false),
+      };
     case "Bash":
       return {
         description: "Run one worker-screened shell command inside the current worktree.",

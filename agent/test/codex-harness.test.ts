@@ -4493,3 +4493,28 @@ describe("CodexHarness: process-safety delegation + session inspection", () => {
     assert.equal(await harness.inspectSession("xyz"), "absent");
   });
 });
+
+for (const optedIn of [false, true]) {
+  it(`U3 D9 actual first planning thread consent=${optedIn} retains registration on resume without new params`, async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).end();
+    const access = { generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
+      reportCrossCheckDispositions: async () => ({ stage: "code" as const, result: "no_row" as const }) };
+    await harness.startTurn(makeRequest({ phase: "plan", ...(optedIn ? { codeCrossCheck: access } : {}) })).events[Symbol.asyncIterator]().next();
+    const params = rec(transport.requests.find(r => r.method === "thread/start")!.params);
+    assert.equal((params.dynamicTools as Array<{ name: string }>).some(t => t.name === "report_cross_check_dispositions"), optedIn);
+    const resumed = makeHarness();
+    resumed.transport.push(threadStarted("th-1")).end();
+    await resumed.harness.startTurn(makeRequest({ phase: "implement", resumeSessionId: "th-1",
+      ...(optedIn ? { codeCrossCheck: access } : {}) })).events[Symbol.asyncIterator]().next();
+    assert.ok(resumed.transport.requests.some(r => r.method === "thread/resume"));
+    for (const request of [...transport.requests, ...resumed.transport.requests]) {
+      if (request.method !== "thread/start") {
+        assert.equal(rec(request.params).dynamicTools, undefined, request.method);
+        assert.equal(rec(request.params).dynamic_tools, undefined, request.method);
+      }
+    }
+    await harness.close();
+    await resumed.harness.close();
+  });
+}

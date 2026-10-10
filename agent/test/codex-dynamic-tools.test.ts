@@ -87,3 +87,16 @@ describe("buildCodexDynamicTools: report_progress milestone attribution (issue #
     assert.equal(spec?.inputSchema.additionalProperties, false, "the top-level schema stays closed");
   });
 });
+
+it("U3 D9 disposition wire tool has a closed authority-neutral schema", () => {
+  assert.equal(buildCodexDynamicTools(grants([])).some(t => t.name === "report_cross_check_dispositions"), false);
+  const spec = buildCodexDynamicTools(grants(["mcp__uzi__report_cross_check_dispositions"])).find(t => t.name === "report_cross_check_dispositions")!;
+  assert.ok(spec);
+  assert.equal(spec.inputSchema.additionalProperties, false);
+  assert.deepEqual(spec.inputSchema.required, ["dispositions"]);
+  assert.deepEqual(Object.keys(spec.inputSchema.properties as object), ["dispositions"]);
+  const batch = (spec.inputSchema.properties as Record<string, { items: Record<string, unknown> }>).dispositions!;
+  assert.equal(batch.items.additionalProperties, false);
+  assert.deepEqual(Object.keys(batch.items.properties as object).sort(), ["disposition", "finding_id", "reason"]);
+  assert.deepEqual(batch.items.required, ["finding_id", "disposition", "reason"]);
+});

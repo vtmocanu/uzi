@@ -16,7 +16,7 @@ import {
 } from "../src/pr-description.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
-import { api, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, type FakeForgeOpts } from "./runner-harness.js";
+import { api, client, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, type FakeForgeOpts } from "./runner-harness.js";
 
 installHarness();
 
@@ -28,6 +28,44 @@ function fakeGitlab(opts: Parameters<typeof rawFakeGitlab>[0] = {}) {
   const forge = rawFakeGitlab(opts);
   followSuccessfulPush(git, forge.pr, opts.head === undefined || opts.head === H);
   return forge;
+}
+
+for (const interrupted of [false, true]) {
+  it(`code summary survives verified completion reconciliation; interrupted=${interrupted}`, async t => {
+    const summary: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
+      stage: "code", round: 1, candidate_generation: 1, head_commit: "b".repeat(40), base_commit: "a".repeat(40),
+      candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "test-checker",
+      checker_effort: "high", outcome: "completed", reason_class: null,
+      findings: [{ id: "F1", severity: "major", path: "a.ts", line: 1, title: "Check guard", detail: "advice" }],
+      dispositions: [{ finding_id: "F1", disposition: "declined", reason: "verified existing guard" }],
+      finalized_at: new Date().toISOString(), interrupted_at: null, deadline_at: new Date().toISOString(),
+    };
+    t.mock.method(client, "codeCrossCheckStatus", async () => interrupted
+      ? { ...summary, interrupted_at: new Date().toISOString(), candidate_generation: 2, findings: [], dispositions: null } : summary);
+    class SummaryExecutor extends StubExecutor {
+      override async run(ctx: RunContext): Promise<ExecutorResult> {
+        const result = await super.run(ctx);
+        return { ...result, codeCrossCheckSummary: summary };
+      }
+    }
+    const iid = 2190;
+    const { gitlab, pr } = fakeGitlab({ head: H, existing: adoptedBody(iid, "Maintainer notes.") });
+    const claim = { ...interlockedClaim(iid), code_cross_check_required: true, claim_generation: 1 };
+    api.setCompletionPermitResponse(true);
+    await runner(new SummaryExecutor(nullLogger()), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(pr.description.startsWith("Maintainer notes."));
+    assert.match(pr.description, /Closes #2190/);
+    assert.ok(parseOwnedBlocks(pr.description).kind === "ok");
+    if (interrupted) {
+      assert.match(pr.description, /Code cross-check incomplete: interrupted/);
+      assert.doesNotMatch(pr.description, /checked bbbb|findings:|F1/);
+    } else {
+      assert.match(pr.description, /checked bbbbbbbbbbbb, codex test-checker · high/);
+      assert.match(pr.description, /1 findings: 0 addressed, 1 declined/);
+      assert.ok(pr.description.includes("**Changes after the check were not cross-checked.**"));
+    }
+  });
 }
 
 const H = "1111111111111111111111111111111111111111";

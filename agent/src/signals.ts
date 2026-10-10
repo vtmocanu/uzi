@@ -15,6 +15,7 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { reportCodeDispositions, type CodeCrossCheckToolAccess } from "./code-cross-check-tools.js";
 
 import type {
   AskUserQuestion,
@@ -183,6 +184,8 @@ const PR_SUMMARY_MAX_LIST_ENTRIES = 50;
 
 /** Options for the signal server's tool schemas. */
 export interface SignalServerOptions {
+  /** SDK only: supplied during the current repair; the handler revalidates every call. */
+  codeCrossCheck?: CodeCrossCheckToolAccess;
   /** PRD #72 M4: expose `prd_done_path` on signal_done. Issue runs only — a
    *  `ci_fix` run has no issue and a `self_improve` run's issue is a reused
    *  backlog container whose description must never be rewritten (Decision 13).
@@ -462,6 +465,18 @@ export function buildSignalMcpServer(
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
     tools: [
+      ...(opts.codeCrossCheck ? [tool("report_cross_check_dispositions",
+        "During the single code repair pass, report addressed or declined findings with reasons.",
+        { dispositions: z.array(z.object({ finding_id: z.string(), disposition: z.enum(["addressed", "declined"]),
+          reason: z.string() }).strict()).max(20) },
+        async (args) => {
+          try {
+            await reportCodeDispositions(opts.codeCrossCheck!, args);
+            return { content: [{ type: "text" as const, text: "Code cross-check dispositions recorded." }] };
+          } catch {
+            return { isError: true, content: [{ type: "text" as const, text: "Code repair is not active or dispositions are invalid." }] };
+          }
+        })] : []),
       tool(
         SAVE_DRAFT_PLAN_TOOL,
         "Lead only: request capture of a draft Markdown plan and keep working. This is not submission or approval.",

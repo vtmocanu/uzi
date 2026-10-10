@@ -1048,6 +1048,24 @@ describe("isSignalToolName", () => {
   });
 });
 
+
+it("U3 D9 SDK signal registration is conditional and live guard returns a fixed error", async () => {
+  type Registered = { handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ isError?: boolean; content: unknown }> };
+  const tools = (server: unknown) => (server as { instance: { _registeredTools: Record<string, Registered> } }).instance._registeredTools;
+  assert.equal(tools(buildSignalMcpServer()).report_cross_check_dispositions, undefined);
+  let posts = 0;
+  const server = buildSignalMcpServer({ codeCrossCheck: {
+    generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
+    reportCrossCheckDispositions: async () => { posts++; throw new Error("PRIVATE"); },
+  } });
+  const handler = tools(server).report_cross_check_dispositions;
+  assert.ok(handler);
+  const response = await handler.handler({ dispositions: [] }, {});
+  assert.equal(response.isError, true);
+  assert.deepEqual(response.content, [{ type: "text", text: "Code repair is not active or dispositions are invalid." }]);
+  assert.equal(posts, 0);
+});
+
 describe("buildSignalMcpServer", () => {
   it("builds an in-process (sdk) MCP server named uzi", () => {
     const s = buildSignalMcpServer() as unknown as { type: string; name: string };
