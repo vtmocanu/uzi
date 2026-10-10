@@ -450,6 +450,92 @@ function assertSafeEvents(events: Record<string, unknown>[], forbidden: string[]
   }
 }
 
+describe("missing-source canonical runner ordering", () => {
+  for (const crossKind of [false, true]) {
+    it(`missing-source canonical ${crossKind ? "cross-kind Case A" : "matching Case B"} reclaim`, async () => {
+      const iid = 1451;
+      const owner = randomUUID(), claimant = randomUUID();
+      const { bare, branch, clonePath } = await seedResidue(iid, owner, "FOREIGN.txt");
+      fs.rmSync(clonePath, { recursive: true });
+      api.setOrphanClassification(owner, {
+        status: "completed", repo_id: "r1", kind: "issue", issue_iid: iid,
+        branch: null, pipeline_ref: null, pipeline_id: null,
+      });
+      const freshPath = git.runnerClonePath(bare, crossKind ? `agent-issue-${iid}` : `issue-${iid}`);
+      let entered = false;
+      const factory: ExecutorFactory = () => ({
+        homeDir: path.join(homeDir, claimant),
+        executor: { run: async ctx => {
+          assert.equal(ctx.worktreePath, freshPath);
+          assert.equal(fs.readFileSync(path.join(freshPath, "README.md"), "utf8"), "# fixture\n");
+          assert.equal(fs.existsSync(path.join(freshPath, "FOREIGN.txt")), false);
+          assert.deepEqual(readJournal(bare, branch), { runId: claimant, clonePath: freshPath });
+          entered = true;
+          throw new Error("stop after fresh seed");
+        } },
+      });
+      const logs = diagnosticLogger();
+      await runnerWith(factory, fakeGitlab().gitlab, undefined, logs.logger, { recoveryRetryMs: 5 })
+        .execute(gitlabClaim(iid, { run_id: claimant, ...(crossKind ? { kind: "mr_rework", branch } : {}) }));
+      assert.equal(entered, true, "fresh claimant executor reached");
+      assertSafeEvents(logs.events);
+      assert.ok(logs.events.some(e => e.event === "orphan_reclaim_succeeded" && e.owner_id === owner && e.claimant_id === claimant),
+        "authoritative owner validation and disposition succeeded");
+    });
+    for (const status of ["nonterminal", "404", "503"] as const) {
+      it(`missing-source canonical ${crossKind ? "cross-kind" : "matching"} ${status} refusal`, async t => {
+        const iid = 1452;
+        const owner = randomUUID(), claimant = randomUUID();
+        const { bare, branch, clonePath } = await seedResidue(iid, owner, "FOREIGN.txt");
+        // Plant a surviving same-branch retained source with supported coordinates.
+        const siblingId = formatAttemptId(new Date(), 1, "0123456789abcdef");
+        const sibling = `${clonePath}.attempt-${siblingId}`;
+        fs.cpSync(clonePath, sibling, { recursive: true });
+        const original = { runId: owner, clonePath, retainedSources: [{ runId: owner, clonePath: sibling, attemptId: siblingId }] };
+        const command = (...args: string[]) => execFileSync("git", ["-C", bare, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+        command("config", `uzi-recovery.${branch}.clone`, JSON.stringify(original));
+        command("config", `uzi-retained.${owner}.journal`, JSON.stringify({ version: 1, branch, key: `issue-${iid}`, journal: original }));
+        const tip = command("rev-parse", "refs/remotes/origin/main");
+        for (const family of ["uzi-recovery-episode", "uzi-owed"]) command("update-ref", `refs/${family}/${owner}/${tip}`, tip);
+        fs.rmSync(clonePath, { recursive: true });
+        if (status === "404") api.setOrphanNotFound(owner);
+        else if (status === "503") api.failOrphanClassification(owner, 503);
+        else api.setOrphanClassification(owner, {
+          status: "running", repo_id: "r1", kind: "issue", issue_iid: iid,
+          branch: null, pipeline_ref: null, pipeline_id: null,
+        });
+        const snapshot = () => [command("config", "--get-regexp", "^uzi-"),
+          command("for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi")];
+        const before = snapshot();
+        let seeds = 0, entered = false, releases = 0;
+        const seed = git.runnerCloneForBranch.bind(git);
+        t.mock.method(git, "runnerCloneForBranch", async (...args: Parameters<typeof seed>) => {
+          const result = await seed(...args);
+          seeds++;
+          return result;
+        });
+        for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+          t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+        }
+        const factory: ExecutorFactory = () => ({
+          homeDir: path.join(homeDir, claimant),
+          executor: { run: async () => { entered = true; throw new Error("unexpected executor"); } },
+        });
+        await runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 })
+          .execute(gitlabClaim(iid, { run_id: claimant, ...(crossKind ? { kind: "mr_rework", branch } : {}) }));
+        assert.equal(entered, false);
+        assert.equal(seeds, 0);
+        assert.equal(releases, 0);
+        assert.deepEqual(snapshot(), before, "journal, descriptors and pins remain unchanged");
+        assert.equal(fs.readFileSync(path.join(sibling, "FOREIGN.txt"), "utf8"), "owner-only bytes\n");
+        assert.equal(fs.existsSync(clonePath), false);
+        assert.equal(fs.existsSync(holdingRoot()), false);
+        if (crossKind) assert.equal(fs.existsSync(git.runnerClonePath(bare, `agent-issue-${iid}`)), false);
+      });
+    }
+  }
+});
+
 describe("1848 M1: moved terminal mr_rework custody", () => {
   const branch = "agent/issue-1810";
   const slug = "agent-issue-1810";

@@ -1421,6 +1421,174 @@ describe("issue #1783 M2 review: checkpoint adoption on a wired resume that seed
 });
 
 
+describe("missing-source restarted worker ordering", () => {
+  const command = (...args: string[]) => execFileSync("git", ["-C", bare(), ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+  const pins = () => command("for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi");
+
+  async function missingPrimary(iid: number, owner: string, attempt: boolean, episode: boolean) {
+    const pred = await seedPredecessor(iid, owner, { attempt });
+    if (episode) await git.reserveRecoveryIteration(bare(), `agent/issue-${iid}`, `issue-${iid}`, { runId: owner, ...pred }, 5);
+    const siblingId = mintAttemptId(2);
+    const sibling = `${canonicalFor(iid)}.attempt-${siblingId}`;
+    fs.cpSync(pred.clonePath, sibling, { recursive: true });
+    command("config", "--add", `uzi-attempts.agent/issue-${iid}.entry`,
+      JSON.stringify({ attemptId: siblingId, runId: owner, clonePath: sibling, state: "live" }));
+    const journal = { ...readJournal(iid)!, retainedSources: [{ runId: owner, clonePath: sibling, attemptId: siblingId }] };
+    command("config", `uzi-recovery.agent/issue-${iid}.clone`, JSON.stringify(journal));
+    const tip = command("rev-parse", "refs/remotes/origin/main");
+    for (const family of ["uzi-recovery-episode", "uzi-owed"]) command("update-ref", `refs/${family}/${owner}/${tip}`, tip);
+    fs.rmSync(pred.clonePath, { recursive: true });
+    return { pred, sibling, journal, hash: treeHash(sibling), pinSnapshot: pins() };
+  }
+
+  it("missing-source ledger-recorded foreign attempt after restart reclaim", async t => {
+    const iid = 25130, owner = randomUUID(), claimant = randomUUID();
+    const pred = await seedPredecessor(iid, owner, { attempt: true });
+    fs.rmSync(pred.clonePath, { recursive: true });
+    terminalOwner(owner, iid);
+    const { logger, lines } = recordingLogger();
+    let entryChecked = false;
+    const { factory, started } = transientFactory(ctx => {
+      assert.notEqual(ctx.worktreePath, pred.clonePath);
+      assert.ok(parseAttemptPath(ctx.worktreePath, path.join(fx.dataDir, "runner")));
+      assert.equal(fs.existsSync(path.join(ctx.worktreePath, "ONLY_COPY.txt")), false);
+      assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "README.md"), "utf8"), "# fixture\n");
+      assert.equal(readJournal(iid)?.runId, claimant);
+      assert.equal(readJournal(iid)?.clonePath, ctx.worktreePath);
+      entryChecked = true;
+    });
+    const worker = restartedWorker(factory, {}, logger);
+    const release = worker.git.releaseAttemptInPlace.bind(worker.git);
+    let reclaimed = false;
+    t.mock.method(worker.git, "releaseAttemptInPlace", async (...args: Parameters<typeof release>) => {
+      const result = await release(...args);
+      if (args[1] === pred.clonePath && args[3] === owner && args[4] === "reclaimed") {
+        assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed");
+        reclaimed = true;
+      }
+      return result;
+    });
+    await worker.runner.execute(gitlabClaim(iid, { run_id: claimant }));
+    assert.equal(started(), 1);
+    assert.equal(entryChecked, true, "all fresh claimant entry assertions ran");
+    assert.equal(reclaimed, true, "observe release before seed compacts missing ledger entries");
+    assert.ok(lines.some(l => (l as { msg?: string; owner_id?: string }).msg === "orphan_reclaim_succeeded"
+      && (l as { owner_id?: string }).owner_id === owner));
+  });
+
+  for (const attempt of [false, true]) {
+    for (const episode of [false, true]) {
+      it(`missing-source terminal ${attempt ? "attempt" : "canonical"} primary with surviving sibling ${episode ? "episode" : "legacy"} reclaim`, async t => {
+        const iid = 25131, owner = randomUUID(), claimant = randomUUID();
+        const s = await missingPrimary(iid, owner, attempt, episode);
+        terminalOwner(owner, iid);
+        const { logger, lines } = recordingLogger();
+        let releases = 0;
+        for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+          t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+        }
+        let entryChecked = false;
+        const { factory, started } = transientFactory(ctx => {
+          assert.notEqual(ctx.worktreePath, s.pred.clonePath);
+          assert.notEqual(ctx.worktreePath, s.sibling);
+          assert.ok(parseAttemptPath(ctx.worktreePath, path.join(fx.dataDir, "runner")));
+          assert.equal(fs.existsSync(path.join(ctx.worktreePath, "ONLY_COPY.txt")), false);
+          assert.equal(readJournal(iid)?.runId, claimant);
+          assert.equal(readJournal(iid)?.clonePath, ctx.worktreePath);
+          assert.deepEqual(JSON.parse(configGetAll(`uzi-retained.${owner}.journal`)[0]!), {
+            version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal: s.journal,
+          });
+          entryChecked = true;
+        });
+        const worker = restartedWorker(factory, { dockerHost: undefined }, logger);
+        assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { run_id: claimant })), false);
+        assert.equal(started(), 1);
+        assert.equal(entryChecked, true, "all fresh claimant entry assertions ran");
+        assert.equal(releases, 0);
+        assert.deepEqual(JSON.parse(configGetAll(`uzi-retained.${owner}.journal`)[0]!).journal, s.journal);
+        assert.equal(fs.existsSync(s.pred.clonePath), false, "missing owner source is never reconstructed");
+        assert.equal(treeHash(s.sibling), s.hash);
+        assert.equal(pins(), s.pinSnapshot);
+        assert.ok(lines.some(l => (l as { msg?: string }).msg === "orphan_reclaim_succeeded"));
+      });
+    }
+
+    for (const refusal of ["nonterminal", "404", "503", "quiescence"] as const) {
+      it(`missing-source retained ${attempt ? "attempt" : "canonical"} ${refusal} refusal`, async t => {
+        const iid = 25133, owner = randomUUID(), claimant = randomUUID();
+        const s = await missingPrimary(iid, owner, attempt, true);
+        const envelope = JSON.stringify({ version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal: s.journal });
+        command("config", `uzi-retained.${owner}.journal`, envelope);
+        if (refusal === "404") api.setOrphanNotFound(owner);
+        else if (refusal === "503") api.failOrphanClassification(owner, 503);
+        else if (refusal === "quiescence") terminalOwner(owner, iid);
+        else api.setOrphanClassification(owner, {
+          status: "running", repo_id: "r1", kind: "issue", issue_iid: iid,
+          branch: null, pipeline_ref: null, pipeline_id: null,
+        });
+        let releases = 0, seeded = 0;
+        for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+          t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+        }
+        const { factory, started } = transientFactory();
+        const worker = restartedWorker(factory, {
+          dockerHost: undefined,
+          quiesceRun: async req => req.site === "orphan_reclaim" && refusal === "quiescence" ? {
+            process: { state: "survivors", processes: [], killed: [], detail: "retained sibling writer" },
+            docker: { state: "not_wired", removed: [], detail: "" },
+          } : fastQuiesce(req),
+        });
+        const seed = worker.git.runnerCloneForBranch.bind(worker.git);
+        t.mock.method(worker.git, "runnerCloneForBranch", async (...args: Parameters<typeof seed>) => {
+          const clone = await seed(...args);
+          seeded++;
+          return clone;
+        });
+        const paths = fs.readdirSync(runnerRepoDir()).sort();
+        const ledger = configGetAll(`uzi-attempts.agent/issue-${iid}.entry`);
+        assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { run_id: claimant })), false);
+        assert.equal(started(), 0);
+        assert.equal(seeded, 0);
+        assert.equal(releases, 0);
+        assert.deepEqual(readJournal(iid), s.journal);
+        assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), [envelope]);
+        assert.deepEqual(configGetAll(`uzi-attempts.agent/issue-${iid}.entry`), ledger);
+        assert.equal(pins(), s.pinSnapshot);
+        assert.equal(treeHash(s.sibling), s.hash);
+        assert.deepEqual(fs.readdirSync(runnerRepoDir()).sort(), paths);
+      });
+    }
+
+    it(`missing-source own ${attempt ? "attempt" : "canonical"} runner refusal`, async t => {
+      const iid = 25132, owner = randomUUID();
+      const s = await missingPrimary(iid, owner, attempt, false);
+      const envelope = JSON.stringify({ version: 1, branch: `agent/issue-${iid}`, key: `issue-${iid}`, journal: s.journal });
+      command("config", `uzi-retained.${owner}.journal`, envelope);
+      let releases = 0;
+      for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+        t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+      }
+      const { factory, started } = transientFactory();
+      const worker = restartedWorker(factory, attempt ? {} : { dockerHost: undefined });
+      const paths = fs.readdirSync(runnerRepoDir()).sort();
+      assert.equal(await boundedExecute(worker.runner, gitlabClaim(iid, { run_id: owner, claim_generation: 2 })), false);
+      assert.equal(started(), 0);
+      assert.equal(releases, 0);
+      const after = readJournal(iid)!;
+      assert.equal(after.runId, owner);
+      assert.equal(after.clonePath, s.pred.clonePath);
+      assert.equal(after.attemptId, s.pred.attemptId);
+      assert.deepEqual(after.retainedSources, s.journal.retainedSources);
+      assert.deepEqual(after.recovery?.source, { runId: owner, clonePath: s.pred.clonePath, ...(s.pred.attemptId ? { attemptId: s.pred.attemptId } : {}) });
+      assert.equal(after.recovery?.blocker, "source_missing");
+      assert.deepEqual(configGetAll(`uzi-retained.${owner}.journal`), [envelope]);
+      assert.equal(pins(), s.pinSnapshot);
+      assert.equal(treeHash(s.sibling), s.hash);
+      assert.deepEqual(fs.readdirSync(runnerRepoDir()).sort(), paths);
+    });
+  }
+});
+
 describe("Unit 2 terminal retained descriptors", { skip: !HAS_PROCFS }, () => {
   async function retained(iid: number, attempt: boolean) {
     const owner = randomUUID();

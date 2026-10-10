@@ -549,17 +549,53 @@ test("legacy discovery is credential-free and precharged attempts survive worker
   await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source), /blocked/);
 });
 
-test("identity mismatches and missing known source never overwrite attribution or seed", async () => {
+test("missing-source identity mismatches and missing known own source never overwrite attribution or seed refusal", async () => {
   const before = git(bare, ["config", `uzi-recovery.${branch}.clone`]);
   await assert.rejects(cache.markRecoveryCapture(bare, source.clonePath, branch, "foreign"), /overwritten/);
   await assert.rejects(cache.discoverRetainedRecovery(fx.originPath, branch, key, "foreign"), /foreign/);
   await assert.rejects(cache.reserveRecoveryIteration(bare, branch, "other-key", source), /key/);
-  fs.renameSync(source.clonePath, source.clonePath + ".saved");
-  await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId), /missing/);
-  await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId, true, undefined, {
-    attemptId: aid(2), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true,
-  }), /missing/);
   assert.equal(git(bare, ["config", `uzi-recovery.${branch}.clone`]), before);
+  const { tip } = await ready();
+  const value = journal();
+  git(bare, ["config", `uzi-retained.${runId}.journal`, protectedValue(value)]);
+  git(bare, ["update-ref", `refs/uzi-owed/${runId}/${tip}`, tip]);
+  // Keep the real successor sibling and pins while removing the canonical source.
+  const active = value.clonePath;
+  const siblingHead = fs.readFileSync(path.join(active, ".git", "HEAD"));
+  const siblingWork = fs.readFileSync(path.join(active, "work.txt"));
+  const sourceHead = fs.readFileSync(path.join(source.clonePath, ".git", "HEAD"));
+  const siblingBytes = fs.readFileSync(path.join(source.clonePath, "work.txt"));
+  const snapshot = () => [
+    git(bare, ["config", "--get-regexp", "^uzi-"]),
+    git(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi"]),
+  ];
+  const calls: string[] = [];
+  // The canonical caller computes a different path for this successor. Use the own
+  // canonical source coordinates for the seed refusal in both modes.
+  writeJournal({ ...source, retainedSources: [{ runId, clonePath: active, attemptId: aid(2) }] });
+  fs.renameSync(source.clonePath, source.clonePath + ".saved");
+  const ownBefore = git(bare, ["config", `uzi-recovery.${branch}.clone`]);
+  const ownEvidence = snapshot();
+  const ownPaths = fs.readdirSync(path.dirname(active)).sort();
+  for (const attempt of [false, true]) {
+    await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, {
+      beforeFree: async () => { calls.push("free"); },
+    }, runId, false, undefined, attempt ? {
+      attemptId: aid(3), isLive: () => { calls.push("live"); return false; },
+      beforeSeed: async () => { calls.push("seed"); },
+      quiescent: async () => { calls.push("sweep"); return true; },
+    } : undefined), { message: "known recovery source is missing; nothing seeded" });
+    assert.deepEqual(calls, []);
+    assert.deepEqual(snapshot(), ownEvidence);
+    assert.deepEqual(fs.readdirSync(path.dirname(active)).sort(), ownPaths);
+    assert.equal(fs.existsSync(source.clonePath), false);
+    assert.equal(fs.existsSync(source.clonePath + ".attempt-" + aid(3)), false);
+    assert.deepEqual(fs.readFileSync(path.join(source.clonePath + ".saved", "work.txt")), siblingBytes);
+    assert.deepEqual(fs.readFileSync(path.join(active, ".git", "HEAD")), siblingHead);
+    assert.deepEqual(fs.readFileSync(path.join(active, "work.txt")), siblingWork);
+    assert.deepEqual(fs.readFileSync(path.join(source.clonePath + ".saved", ".git", "HEAD")), sourceHead);
+    assert.equal(git(bare, ["config", `uzi-recovery.${branch}.clone`]), ownBefore);
+  }
 });
 
 test("invalid progress, unknown versions, attribution and unsafe paths fail closed", async () => {
