@@ -4205,7 +4205,7 @@ export class RunRunner {
         }
         const ack = await send(body);
         if (ack.applied && ack.status === body.status &&
-            (ack.status === "completed" || ack.status === "failed" || ack.status === "cancelled"))
+            (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, body, incarnation);
       } finally {
         if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
@@ -4234,7 +4234,7 @@ export class RunRunner {
         }
         const ack = await send(b, sig);
         if (ack.applied && ack.status === b.status &&
-            (ack.status === "completed" || ack.status === "failed" || ack.status === "cancelled"))
+            (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, b, incarnation);
         return ack;
       } catch (err) {

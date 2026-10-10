@@ -519,8 +519,9 @@ describe("Unit 1: proven nonreceipt history preserves completion admission", () 
       await f.client.claimRun();
       await f.client.listRecoveryHolds(literal.run_id);
       const status = (["failed", "cancelled", "completed"] as const)[n % 3]!;
-      await terminal.journalAndSendTerminal(f.flight, "running", { status, claim_generation: n },
-        async () => ({ applied: true, status }));
+      await terminal.journalAndSendTerminal(f.flight, "running", {
+        status: status === "cancelled" ? "failed" : status, claim_generation: n,
+      }, async () => ({ applied: status !== "cancelled", status }));
       assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, n), false, "real nonreceipt deletion");
       assert.equal(f.client.canStartPublicationCompletion(literal.run_id, n + 1), true,
         "Unit 1: retired history must free admission");
