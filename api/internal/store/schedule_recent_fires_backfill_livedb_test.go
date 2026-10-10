@@ -1,4 +1,4 @@
-package store_test
+package store
 
 import (
 	"context"
@@ -12,16 +12,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/vtmocanu/uzi/api/internal/store"
-)
-
-// These versions pin 00318_schedule_recent_fires.sql and its predecessor. `task
-// migration:renumber` does NOT rewrite them: when this migration is renumbered on landing,
-// update both constants by hand.
-const (
-	preRecentFiresVersion = 317
-	recentFiresVersion    = 318
 )
 
 // TestScheduleRecentFiresBackfillLiveDB (issue #2519) is the regression gate for the data
@@ -37,9 +27,12 @@ func TestScheduleRecentFiresBackfillLiveDB(t *testing.T) {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store-IT runner for live-DB coverage")
 	}
 	ctx := context.Background()
+	// Derive the versions from the embedded migration name so a renumber on landing needs no edit here.
+	recentFiresVersion := migrationVersionByName(t, "schedule_recent_fires")
+	preRecentFiresVersion := recentFiresVersion - 1
 
 	name := "recent_fires_bf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	adminPool, err := store.OpenPool(ctx, dsn)
+	adminPool, err := OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatalf("open admin pool: %v", err)
 	}
@@ -54,7 +47,7 @@ func TestScheduleRecentFiresBackfillLiveDB(t *testing.T) {
 		if pool != nil {
 			pool.Close()
 		}
-		cleanupAdmin, err := store.OpenPool(ctx, dsn)
+		cleanupAdmin, err := OpenPool(ctx, dsn)
 		if err != nil {
 			t.Logf("cleanup: open admin pool to drop %s: %v", name, err)
 			return
@@ -73,10 +66,10 @@ func TestScheduleRecentFiresBackfillLiveDB(t *testing.T) {
 	u.Path = "/" + name
 	newDSN := u.String()
 
-	if err := store.MigrateTo(ctx, newDSN, preRecentFiresVersion); err != nil {
+	if err := MigrateTo(ctx, newDSN, preRecentFiresVersion); err != nil {
 		t.Fatalf("MigrateTo(%d): %v", preRecentFiresVersion, err)
 	}
-	pool, err = store.OpenPool(ctx, newDSN)
+	pool, err = OpenPool(ctx, newDSN)
 	if err != nil {
 		t.Fatalf("open work pool: %v", err)
 	}
@@ -91,13 +84,19 @@ func TestScheduleRecentFiresBackfillLiveDB(t *testing.T) {
 		t.Fatalf("recent_fires already exists at v%d; the seam over-migrated and the test would be vacuous", preRecentFiresVersion)
 	}
 
+	bfExec := func(ctx context.Context, t *testing.T, p *pgxpool.Pool, sql string, args ...any) {
+		t.Helper()
+		if _, err := p.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
 	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
-	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	bfExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		userID, "recent-fires-"+userID.String()+"@e2e")
-	mustExec(ctx, t, pool,
+	bfExec(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot-rf', 7102, $3)`, connID, userID, []byte{0x1})
-	mustExec(ctx, t, pool,
+	bfExec(ctx, t, pool,
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, enabled)
 		 VALUES ($1, $2, 7102, 'g/rf', 'https://forge.e2e/g/rf', true)`, repoID, connID)
 
@@ -106,7 +105,7 @@ func TestScheduleRecentFiresBackfillLiveDB(t *testing.T) {
 	examined0 := `{"fired_at":"2026-08-12T11:00:00Z","matched":0,"started":[],"skips":[]}`
 	seed := func(lastFire any) uuid.UUID {
 		id := uuid.New()
-		mustExec(ctx, t, pool,
+		bfExec(ctx, t, pool,
 			`INSERT INTO run_schedules (id, user_id, repo_id, target, timing, cron_expr, timezone, next_fire_at, auto_approve, enabled, last_fire)
 			 VALUES ($1, $2, $3, 'sweep', 'recurring', '*/5 * * * *', 'UTC', now(), true, true, $4::jsonb)`,
 			id, userID, repoID, lastFire)
@@ -117,7 +116,7 @@ func TestScheduleRecentFiresBackfillLiveDB(t *testing.T) {
 	examinedID := seed(examined0)
 	nullID := seed(nil)
 
-	if err := store.MigrateTo(ctx, newDSN, recentFiresVersion); err != nil {
+	if err := MigrateTo(ctx, newDSN, recentFiresVersion); err != nil {
 		t.Fatalf("MigrateTo(%d): %v", recentFiresVersion, err)
 	}
 

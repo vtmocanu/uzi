@@ -134,9 +134,11 @@ func TestScheduleFireOnceCredentialDisabledHoldsLiveDB(t *testing.T) {
 		t.Fatalf("recent_fires after first held tick = %+v, want exactly the credential_disabled hold", got)
 	}
 	sched.Boot(ctx)
-	if again := assertOnceHeldLiveDB(ctx, t, q, scID, due); !again.UpdatedAt.Time.Equal(held.UpdatedAt.Time) {
+	again := assertOnceHeldLiveDB(ctx, t, q, scID, due)
+	if !again.UpdatedAt.Time.Equal(held.UpdatedAt.Time) {
 		t.Fatalf("a second held tick rewrote the row: updated_at %v -> %v, want unchanged", held.UpdatedAt.Time, again.UpdatedAt.Time)
-	} else if got := scheduleRecentFires(t, again); len(got) != 1 {
+	}
+	if got := scheduleRecentFires(t, again); len(got) != 1 {
 		t.Fatalf("recent_fires after second held tick has %d entries, want 1 (no churn)", len(got))
 	}
 

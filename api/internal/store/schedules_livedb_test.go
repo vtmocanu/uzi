@@ -1090,12 +1090,13 @@ func TestScheduleRecentFiresNullSummaryLiveDB(t *testing.T) {
 // both survive, because the prepend is read-modify-write inside a single UPDATE and the row
 // lock serializes the writers. A transaction holds the row lock (SELECT ... FOR UPDATE); the
 // first write runs inside it, the second write is started in a goroutine and observed
-// blocked on the lock (pg_stat_activity wait_event_type = 'Lock') before the transaction
+// blocked on the lock (a backend whose pg_blocking_pids include the locker's pid) before the transaction
 // commits. The committed-first entry must then sit behind the entry that waited.
 func TestScheduleRecentFiresConcurrentAppendsLiveDB(t *testing.T) {
 	for _, w := range recentFireWriters() {
 		t.Run(w.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 			q, userID, repoID := schedFixture(ctx, t)
 			id := w.create(ctx, t, q, userID, repoID)
 
@@ -1110,6 +1111,10 @@ func TestScheduleRecentFiresConcurrentAppendsLiveDB(t *testing.T) {
 				t.Fatalf("begin: %v", err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
+			var lockerPID int
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&lockerPID); err != nil {
+				t.Fatalf("locker pid: %v", err)
+			}
 			if _, err := tx.Exec(ctx, `SELECT 1 FROM run_schedules WHERE id = $1 FOR UPDATE`, id); err != nil {
 				t.Fatalf("lock row: %v", err)
 			}
@@ -1119,14 +1124,12 @@ func TestScheduleRecentFiresConcurrentAppendsLiveDB(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- w.write(ctx, q, id, second) }()
 
-			// Wait (bounded) until a backend is blocked on a lock running the recent_fires UPDATE.
+			// Wait (bounded) until some backend is blocked by the locking transaction's pid.
 			deadline := time.Now().Add(10 * time.Second)
 			for {
 				var n int
 				if err := pool.QueryRow(ctx,
-					`SELECT count(*) FROM pg_stat_activity
-					  WHERE datname = current_database() AND wait_event_type = 'Lock'
-					    AND query LIKE '%recent_fires%' AND query LIKE '%UPDATE run_schedules%'`).Scan(&n); err != nil {
+					`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, lockerPID).Scan(&n); err != nil {
 					t.Fatalf("poll pg_stat_activity: %v", err)
 				}
 				if n > 0 {
