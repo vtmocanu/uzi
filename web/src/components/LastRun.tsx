@@ -4,8 +4,10 @@
 // (Schedules.tsx imports ScheduleListRow, which renders these, so re-exporting the "last run"
 // pieces from Schedules.tsx would cycle). The public surface is LastRunOutcome (the list
 // cell), LastFireDetail (the expandable panel), and formatStamp (the single source of
-// truth for the schedules' timestamp formatting).
+// truth for the schedules' timestamp formatting). Issue #2519 adds RecentFiresPanel, the
+// expanded "Recent fires" list.
 
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Badge, type BadgeTone, cx } from "./ui";
 import { ChevronDownIcon } from "./icons";
@@ -60,17 +62,28 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a
 // persisted fire (PRD #308 M4, mock §1): an outcome badge, a muted "{stamp} ·
 // examined N" line, and a disclosure that toggles the "Last fire" detail row.
+//
+// Issue #2519: the caller passes the fire to SHOW (recent_fires[0] when the schedule has
+// recent fires, else last_fire), the disclosure's label ("Recent fires" then), and, when
+// the latest tick was capacity-blocked behind those recent fires, its time as
+// waitingSince for one extra warning line.
 export function LastRunOutcome({
   fire,
   expanded,
   onToggle,
   panelId,
+  label = "Last fire",
+  waitingSince,
 }: {
   fire: LastFire;
   expanded: boolean;
   onToggle: () => void;
   // The detail row's element id, for the disclosure's aria-controls.
   panelId: string;
+  // The disclosure's text.
+  label?: string;
+  // The fired_at of a newer, capacity-blocked tick than `fire`; absent when there is none.
+  waitingSince?: string;
 }) {
   return (
     <div className="flex flex-col gap-1">
@@ -82,6 +95,9 @@ export function LastRunOutcome({
           ? `space for ${fire.capacity.room} more run${fire.capacity.room === 1 ? "" : "s"}; needs ${fire.capacity.room_needed}`
           : `examined ${fire.matched}`}
       </span>
+      {waitingSince && (
+        <span className="text-[11px] text-warn tabular-nums">Waiting for room at {formatStamp(waitingSince)}</span>
+      )}
       {fire.started.map((run) => labelRemovalOutcome(run) && (
         <span key={run.run_id} className={cx("text-[11px]", run.label_remove_failed ? "text-warn" : "text-muted")}>{labelRemovalOutcome(run)}</span>
       ))}
@@ -102,7 +118,7 @@ export function LastRunOutcome({
         aria-controls={expanded ? panelId : undefined}
         className="inline-flex w-fit items-center gap-1 rounded text-[11px] font-medium text-muted transition-colors hover:text-fg"
       >
-        Last fire
+        {label}
         <ChevronDownIcon className={cx("h-3 w-3 transition-transform", expanded && "rotate-180")} />
       </button>
     </div>
@@ -176,7 +192,10 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
 // the bot) BEFORE its scan window, so selector-only issues are no longer per-candidate
 // `not_eligible` skips: they surface only as the aggregate `ineligible_matched`, and
 // `capped` means more ELIGIBLE issues sit beyond the window.
-export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
+//
+// `heading` titles the panel; inside the "Recent fires" list (issue #2519) the entries are
+// titled "Latest fire" / "Earlier fire" rather than each reading "Last fire".
+export function LastFireDetail({ s, fire, heading = "Last fire" }: { s: Schedule; fire: LastFire; heading?: string }) {
   const { uziLabel } = useAuth();
   const good = fire.started.length > 0;
   // A pause-all fire (PRD #1093): the owner's user-level switch was on when this fire came
@@ -208,7 +227,7 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   if (fire.capacity?.blocked) {
     return <div className="rounded-lg border border-edge border-l-2 border-l-warn/60 bg-surface p-4">
       <div className="flex flex-wrap items-center gap-2.5">
-        <span className="text-[13px] font-semibold">Last fire</span>
+        <span className="text-[13px] font-semibold">{heading}</span>
         <span className="font-mono text-[12px] text-faint">{formatStamp(fire.fired_at)} · {s.timezone}</span>
         <OutcomeBadge fire={fire} />
       </div>
@@ -223,7 +242,7 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
       )}
     >
       <div className="mb-3 flex flex-wrap items-baseline gap-2.5">
-        <span className="text-[13px] font-semibold text-fg">Last fire</span>
+        <span className="text-[13px] font-semibold text-fg">{heading}</span>
         <span className="font-mono text-[12px] text-faint">
           {formatStamp(fire.fired_at)} · {s.timezone}
         </span>
@@ -314,6 +333,71 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
             {ineligible === 1 ? "it" : "them"} to uzi to make {ineligible === 1 ? "it" : "them"} runnable.
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+// RecentFiresPanel is the expanded "Recent fires" detail (issue #2519): the schedule's
+// recent fires that did something, newest first. The newest renders open through
+// LastFireDetail; each older one is a one-line header (stamp, outcome badge, counts) that
+// expands to the same detail. When the latest persisted tick (last_fire) was blocked on
+// capacity, a note naming that tick and its numbers leads the panel, since the list itself
+// only holds fires that examined something. Callers render it only for a non-empty list.
+export function RecentFiresPanel({ s, fires, panelId }: { s: Schedule; fires: LastFire[]; panelId: string }) {
+  const [open, setOpen] = useState<ReadonlySet<number>>(() => new Set());
+  const blocked = s.last_fire?.capacity?.blocked ? s.last_fire : null;
+  const [newest, ...older] = fires;
+  const toggle = (i: number) =>
+    setOpen((cur) => {
+      const next = new Set(cur);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  return (
+    <div className="flex flex-col gap-3">
+      {blocked?.capacity && (
+        <div role="note" className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2.5 text-[12.5px] text-muted">
+          <span className="font-semibold text-fg">Waiting for room</span> since the fire at{" "}
+          <span className="tabular-nums">{formatStamp(blocked.fired_at)} · {s.timezone}</span>:{" "}
+          {blocked.capacity.in_flight} unfinished runs, limit {blocked.capacity.limit} · space for{" "}
+          {blocked.capacity.room} more run{blocked.capacity.room === 1 ? "" : "s"}; needs {blocked.capacity.room_needed}.
+          Nothing was examined.
+        </div>
+      )}
+      {newest && <LastFireDetail s={s} fire={newest} heading="Latest fire" />}
+      {older.length > 0 && (
+        <ul aria-label="Earlier fires" className="flex flex-col gap-2">
+          {older.map((f, i) => {
+            const isOpen = open.has(i);
+            const id = `${panelId}-earlier-${i}`;
+            return (
+              <li key={`${f.fired_at}-${i}`} className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => toggle(i)}
+                  aria-expanded={isOpen}
+                  // Only while the detail is mounted, as LastRunOutcome's disclosure does.
+                  aria-controls={isOpen ? id : undefined}
+                  className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-edge bg-surface px-3 py-2 text-left transition-colors hover:bg-raised/60"
+                >
+                  <span className="font-mono text-[12px] text-faint">{formatStamp(f.fired_at)}</span>
+                  <OutcomeBadge fire={f} />
+                  <span className="text-[11.5px] text-muted tabular-nums">
+                    examined {f.matched} · started {f.started.length} · skipped {f.skips.length}
+                  </span>
+                  <ChevronDownIcon className={cx("ml-auto h-3 w-3 text-muted transition-transform", isOpen && "rotate-180")} />
+                </button>
+                {isOpen && (
+                  <div id={id} className="md:ml-4">
+                    <LastFireDetail s={s} fire={f} heading="Earlier fire" />
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
       )}
     </div>
   );
