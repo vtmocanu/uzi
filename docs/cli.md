@@ -900,7 +900,7 @@ A few worth knowing:
   bot's numeric forge user id) whose MR review comments the
   [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may ingest although
   they are not repo collaborators. It is **read-only by design**: edit the list
-  from Admin Settings in the web UI or through the cookie-only
+  from **Admin → Instance → Trusted review bots** in the web UI or through the cookie-only
   `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
   `STATUS` (`ok`, or `malformed` when the entry is not parseable as
   `<url>#<id>`; the CLI is lenient, so an entry the server skips can still show

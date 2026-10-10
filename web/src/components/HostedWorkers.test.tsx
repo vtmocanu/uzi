@@ -470,7 +470,7 @@ describe("HostedWorkers ephemeral Docker preference", () => {
     expect(screen.getByText("Persistent worker")).toBeTruthy();
     expect(screen.getByText("Ephemeral workers")).toBeTruthy();
     expect(screen.getByText(/Runs in the cluster/).textContent).toBe(
-      "Runs in the cluster, not on your machine: no join token, no container to start. It shows up under Your workers and you delete it there. Docker-capable gives it a Docker daemon for container builds and tests, at extra CPU and storage.",
+      "Runs in the cluster, not on your machine: no join token, no container to start. It shows up under Your workers and you delete it there. Docker-capable gives it a Docker daemon for container builds and tests, at extra CPU and storage. A Docker-capable worker can pick up repo runs only when an admin has added the repo to the Docker worker repo allowlist under Admin → Instance. Runs on other repos need another eligible worker.",
     );
     expect(checkbox.parentElement?.parentElement).toBe(autoSwitch().parentElement?.parentElement);
     expect(checkbox.getAttribute("aria-describedby")).toBe(autoSwitch().getAttribute("aria-describedby"));
