@@ -118,6 +118,9 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Issue #2686: true once this run's claim is fenced (lost), so accounting-only side messages
+   *  (summary_usage) are suppressed. Absent = never fenced (stub/test executors). */
+  claimFenced?(): boolean;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;
