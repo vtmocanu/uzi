@@ -4289,8 +4289,9 @@ export class GitCache {
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
               path.dirname(path.dirname(clone)) !== root) refuse("clone_path_invalid", "unsafe clone path");
-          // After attribution validation, probe outer-to-inner: ENOENT skips this clone
-          // without reading descendants; every existing ancestor must be a non-symlink directory.
+          // After attribution validation, probe outer-to-inner: ordinary inventory skips
+          // an absent clone without reading descendants; report proofs refuse absence.
+          // Every existing ancestor must be a non-symlink directory.
           for (const dir of [root, path.dirname(clone)]) {
             let st: Stats;
             try { st = await fs.lstat(dir); }
