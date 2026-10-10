@@ -272,8 +272,9 @@ func (h *Handler) writeCodexError(w http.ResponseWriter, op string, err error) {
 // errors and the wrapped provider-exchange error) falls to the generic 500 bucket, whose
 // fixed body carries no detail. The authorization/ownership cases collapse to one 404 so
 // the mapping cannot be used as an oracle to tell "not owned" from "not bound" from "does
-// not exist". reason is a fixed machine-readable code, "" for every case but the locked
-// vault (issue #1766), whose body is then {"error", "reason"}.
+// not exist". reason is a fixed machine-readable code for a locked vault (issue #1766)
+// or an unavailable Codex account (PRD #1595), whose body is then {"error", "reason"}.
+// Every other case returns an empty reason.
 func codexHTTPError(err error) (int, string, string) {
 	switch {
 	// Ownership / binding / existence → one indistinguishable 404 (non-oracular).

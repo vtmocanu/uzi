@@ -4008,6 +4008,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexAccountParkV1) {
 		return store.Run{}, false, fmt.Errorf("%w: codex account park capability required", ErrInvalidState)
 	}
+	// The account park requires a generation regardless of credential-switch capability.
+	// Validate before the generic generation fence so this malformed request stays a 400.
+	if req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		*req.RecoveryCause == recoveryCauseCodexAccountUnavailable && req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: account park requires claim_generation", ErrInvalidState)
+	}
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}

@@ -172,6 +172,7 @@ func TestRunningCodexAccountParkFencesLiveDB(t *testing.T) {
 		t.Run(fence, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
 			fx, w, _ := runningAccountParkFixture(t, env)
+			w.ProtocolCapabilities = append(w.ProtocolCapabilities, capability.CredentialSwitchV1)
 			setCoordState(t, env, fx.accountID, "quarantined")
 			req := StateRequest{State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseCodexAccountUnavailable), ClaimGeneration: i64Ptr(1)}
 			switch fence {
