@@ -410,3 +410,50 @@ Median leaf time at `--cpus 0.25`, base (b) to fixed:
 - owner: 2660ms to 3049ms
 - symlink: 2485ms to 3006ms
 - single-uid: 2815ms to 3302ms
+
+## Final verification and disposition (2026-10-10, plan v3 M3)
+
+Code under test: `1f64ebe3`. The later commits change only this file.
+
+Ran on this worker, each to a scratch log with its exit status recorded:
+
+| Command | Result |
+| --- | --- |
+| `task test:worker-uid-harness` (`check_test.py`, `run_test.py`, `gate_test.py`) | EXIT=0 |
+| `WORKER_UID_SKIP_BUILD=1 task test:agent:worker-uid` | EXIT=0, 34s wall; the unmodified wrapper, full inventory and checker report "29 required leaves passed" |
+| `task gate:agent` (umask 027) | EXIT=201 after 1917s. Passed: deps-check, lint, typecheck, deadcode. Unit stage: 11430 pass, 2 fail, 0 cancelled, 3 skipped. M4 was not reached |
+| `task test:codex-m4`, run separately because of that stop | EXIT=0, run-completeness OK |
+
+- **Prebuilt image:** `WORKER_UID_SKIP_BUILD` is `run.sh`'s existing knob. It reused the
+  `--network host` build described above, because a default build cannot reach the network on
+  this worker. `run.sh` mounts the commit's `agent/src`, `agent/test` and `agent/templates`
+  over the image, and no non-test file changed after the image's source commit.
+- **The two unit failures** are `codex-launcher.test.ts` "M1 controlled advice disposal ordering
+  probe": `exit_first` and `evidence_first through actual executor owner_refusal`, each failing
+  with `ENOENT` reading `.../codex-advice-data/<uuid>/keep`. This branch does not change that
+  file. The same focused test run on a `git archive` export of base `40caea1d` failed the same
+  two leaves (4 pass, 2 fail), so the failures pre-exist on this host. They match the hosted-worker
+  case recorded in the #2397 thread and are not addressed here.
+- **CI:** the PR's ordinary CI (`test-agent-worker-uid` and the agent shards) is observed by the
+  maintainer. This worker did not run or edit any workflow.
+
+**Status of each #2397 case:**
+- **Symlink refusal (the run 38001555502 leaf), owner refusal and single-uid
+  `assertGone`/`Missing expected rejection` in these advice leaves:** controlled RED and GREEN on
+  this worker's real lane, as above.
+  - **Caveat:** older single-uid and owner-refusal CI failures carried no ordering record. That
+    they share this cause is likely but unproven.
+- **"real worker-UID initialization" `assertGone` failures** (a different test): unproven, and
+  not addressed.
+- **Hosted-worker `codex-launcher.test.ts` probe `ENOENT`:** reproduced on this host at base and
+  head. Separate from this fix, and unresolved.
+- **#2532 runtime-upgrade `EACCES` / `child launch failed`:** out of scope.
+
+**Known limits:**
+- A provider that stays alive but never answers `initialize` would hang until the 120s test
+  timeout without a named message. No new timer was added.
+- `providerChildExitObserved()` reports what the bounded diagnostic observed. If that observer
+  were blind (truncated or no supervisor observed), the original assertions still catch an
+  unclean disposal.
+
+Because the cases above remain open, #2397 stays open and the PR uses `Refs #2397`.
