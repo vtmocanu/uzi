@@ -257,7 +257,7 @@ export function RunUsagePanel({
                   <Td>{costCellText(costDisplay(costStatus, p.costUsd))}</Td>
                 </tr>
               ))}
-              {noteTotal.fresh + noteTotal.cached + noteTotal.out > 0 && (
+              {(noteTotal.fresh + noteTotal.cached + noteTotal.out > 0 || noteTotal.costUsd > 0) && (
                 <tr>
                   <Td left>Now summaries</Td>
                   <Td>—</Td>

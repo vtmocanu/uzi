@@ -104,6 +104,23 @@ describe("RunUsagePanel", () => {
     expect(total?.slice(2, 5)).toEqual(["1.4k", "2.1k", "350"]);
   });
 
+  it("shows the Now summaries row for a cost-only note so Run total's cost adds up", () => {
+    seq = 0;
+    const msgs: RunMessage[] = [
+      m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+      result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+      m("progress_note", "lead", {
+        text: "Writing tests",
+        model_usage: { "claude-haiku-4-5": { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.02 } },
+      }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+    );
+    expect(rows.find((r) => r[0] === "Now summaries")).toEqual(["Now summaries", "—", "0", "0", "0", "$0.02"]);
+  });
+
   it("omits the Now summaries row when no note carried usage", () => {
     const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
     expect(queryByText("Now summaries")).toBeNull();

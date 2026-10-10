@@ -699,6 +699,25 @@ describe("NowSummaryController: review-rework behaviours", () => {
     assert.ok(!prompt.includes("OLD_MILESTONE_FILE"), "the previous milestone's frames are gone");
   });
 
+  it("a milestone change discards the unsent frame count: no call until a frame of the new milestone", async () => {
+    const h = harness();
+    await running(h);
+    h.calls[0]!.resolve("one");
+    await settle();
+    // More m1 frames arrive after the call, inside the window, then m2 becomes active.
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "OLD_M1_FRAME" }));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "OLD_M1_FRAME_2" }));
+    h.c.observeProgress(progress(["m2"], ["m1"]));
+    await h.clock.advance(NOW_MIN_INTERVAL_MS + MIN);
+    assert.equal(h.calls.length, 1, "the window elapsed but no m2 frame has arrived: no call");
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "M2_FRAME" }));
+    await h.clock.advance(0);
+    assert.equal(h.calls.length, 2);
+    const prompt = h.calls[1]!.opts.prompt;
+    assert.match(prompt, /M2_FRAME/);
+    assert.ok(!prompt.includes("OLD_M1_FRAME"), "only m2 frames");
+  });
+
   it("the 5 minute floor is literal: 5*60000-1 ms later still one call, one more ms makes two", async () => {
     const h = harness();
     await running(h);
@@ -773,6 +792,12 @@ describe("NowSummaryController: review-rework behaviours", () => {
       assert.ok(trimToolFrame({ kind: "tool_use", payload: { name: "Read", input: { file_path: pad + secret } } })!.detail.includes(fragment.slice(0, 6)), "without a redactor the cut leaves the prefix (the premise)");
     });
 
+    it("trimToolFrame redacts the tool field before the cap", () => {
+      const f = trimToolFrame({ kind: "tool_use", payload: { name: "x".repeat(192) + secret, input: {} } }, redact)!;
+      assert.ok(!f.tool.includes(fragment.slice(0, 6)), "no prefix of the secret survives the cut");
+      assert.ok(trimToolFrame({ kind: "tool_use", payload: { name: "x".repeat(192) + secret, input: {} } })!.tool.includes(fragment.slice(0, 6)), "without a redactor the prefix survives (the premise)");
+    });
+
     it("sanitizeNowText redacts before the 120 rune cap", () => {
       const out = sanitizeNowText("y".repeat(112) + secret, redact);
       assert.ok(!out.includes(fragment.slice(0, 6)));
@@ -781,7 +806,7 @@ describe("NowSummaryController: review-rework behaviours", () => {
     it("the controller redacts the title, the frames and the posted text", async () => {
       const h = harness({ redact });
       h.c.start();
-      h.c.observeProgress(progress(["m1"]), [{ id: "m1", title: "t".repeat(195) + secret }] as Milestone[]);
+      h.c.observeProgress(progress(["m1"]), [{ id: "m1", title: "t".repeat(192) + secret }] as Milestone[]);
       h.c.observeFrame(toolUse("lead", "Read", { file_path: "z".repeat(192) + secret }));
       await h.clock.advance(0);
       assert.ok(!h.calls[0]!.opts.prompt.includes(fragment.slice(0, 6)));

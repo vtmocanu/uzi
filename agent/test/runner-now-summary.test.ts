@@ -63,6 +63,20 @@ function summaryQuery(calls: { options: unknown; prompt: unknown }[]): SdkQueryF
   }) as unknown as SdkQueryFn;
 }
 
+/** summaryQuery that also drains the streamed prompt into `texts` (the model pass sends an async iterable). */
+function promptCapturingQuery(texts: string[]): SdkQueryFn {
+  const inner = summaryQuery([]);
+  return ((params: { options: unknown; prompt: unknown }) => {
+    return (async function* () {
+      let text = "";
+      if (typeof params.prompt === "string") text = params.prompt;
+      else for await (const m of params.prompt as AsyncIterable<unknown>) text += JSON.stringify(m);
+      texts.push(text);
+      yield* (inner as unknown as (p: unknown) => AsyncIterable<unknown>)(params);
+    })();
+  }) as unknown as SdkQueryFn;
+}
+
 function runnerFor(executor: Executor, nowSummary?: { homeRoot: string; queryFn: SdkQueryFn }): RunRunner {
   return new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, {
     pollMs: 5,
@@ -219,5 +233,64 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     assert.ok(heldFrames > 3, "frames arrived during the hold");
     assert.equal(callsDuringHold, 0, "no model call while the run is parked on askUser");
     assert.ok(calls.length >= 1, "the call is made once the hold ends (positive control)");
+  });
+
+  it("redacts the run's claim secrets in the model prompt: a secret straddling the 200 rune cut leaves no prefix", async () => {
+    const texts: string[] = [];
+    // Assembled at runtime so no secret-shaped literal sits in source.
+    const secret = ["fixture", "forge", "pat", "Zq9Xw8Vu7Ts6"].join("-");
+    const claim = claimFor(2608, { secrets: { forge_pat: secret, anthropic_oauth_token: "oauth-fixture-token" } });
+    api.nowSummary.set(claim.run_id, true);
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        await ctx.reportProgress!({ completed: [], in_progress: ["m1"] }, [{ id: "m1", title: "Write the docs" }] as never);
+        const until = Date.now() + 4000;
+        while (notesOf(claim.run_id).length === 0 && Date.now() < until) {
+          ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "x", description: "y".repeat(192) + secret } } });
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        commitMarker(ctx.worktreePath);
+        return { branch: ctx.branch };
+      },
+    };
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(executor, { homeRoot, queryFn: promptCapturingQuery(texts) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    assert.ok(texts.length >= 1, "a call was made");
+    const prompt = texts[0]!;
+    assert.ok(prompt.includes("yyyyyyyy"), "the frame reached the prompt (positive control)");
+    assert.ok(!prompt.includes(secret.slice(0, 6)), "no prefix of the claim secret reaches the model");
+  });
+
+  it("the turn-boundary claim milestone list is only a fallback: it never replaces the list reportProgress gave", async () => {
+    const texts: string[] = [];
+    const claim = claimFor(2609, { milestones: [{ id: "m1", title: "CLAIM_LIST_TITLE" }] });
+    api.nowSummary.set(claim.run_id, true);
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        await ctx.reportProgress!({ completed: [], in_progress: ["m1"] }, [{ id: "m1", title: "LIVE_LIST_TITLE" }] as never);
+        await ctx.reportIteration!(1, { completed: [], in_progress: ["m1"] });
+        const until = Date.now() + 4000;
+        while (notesOf(claim.run_id).length === 0 && Date.now() < until) {
+          ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "x", description: "Run the api gate" } } });
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        commitMarker(ctx.worktreePath);
+        return { branch: ctx.branch };
+      },
+    };
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(executor, { homeRoot, queryFn: promptCapturingQuery(texts) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    assert.ok(texts.length >= 1);
+    const prompt = texts[0]!;
+    assert.ok(prompt.includes("LIVE_LIST_TITLE"));
+    assert.ok(!prompt.includes("CLAIM_LIST_TITLE"));
   });
 });
