@@ -344,6 +344,9 @@ rc=0; PATH="$WORK/nouzi" bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/
 has nouzi 'NEXT='
 hasnt nouzi 'MR_REWORK=repo-not-on-uzi'
 has nouzi 'MR_REWORK_ACTIVE=0'
+# A stand-in uzi() would make the CLI look present but unreadable.
+hasnt nouzi 'UZI_REPO_LIST=unreadable'
+hasnt nouzi 'NEXT=unknown'
 snap head_clean with-uzi
 has with-uzi 'MR_REWORK=repo-not-on-uzi'
 

@@ -32,10 +32,15 @@ case "$FAKE_MODE" in
   malformed) printf '{not json'; exit 0 ;;
   ok) printf 'no-newline'; exit 0 ;;
   okwarn) printf 'body\n'; echo "warning: version skew" >&2; exit 0 ;;
+  # once: the first call fails with $FAKE_ERR on stderr, the second succeeds.
+  once) if [ "$n" -le 1 ]; then echo "$FAKE_ERR" >&2; exit 1; fi
+        printf 'ok-out'; exit 0 ;;
 esac
 STUB
 chmod +x "$WORK/bin/sleep" "$WORK/bin/fakecmd"
-export PATH="$WORK/bin:$PATH" NET_RETRY_BASE_SLEEP=0 FAKE_COUNT="$WORK/count"
+mkdir -p "$WORK/tmp"
+# A private TMPDIR keeps the leak check exact: another process's net-retry files are not ours.
+export PATH="$WORK/bin:$PATH" NET_RETRY_BASE_SLEEP=0 FAKE_COUNT="$WORK/count" TMPDIR="$WORK/tmp"
 # shellcheck source=net-retry.sh
 . "$HERE/net-retry.sh"
 
@@ -85,6 +90,16 @@ cmp_str "$WORK/out" 'body
 ' okwarn-out
 cmp_str "$WORK/err" 'warning: version skew
 ' okwarn-err
+
+# Each transport class retries, matched case-insensitively.
+for e in 'HTTP 502: Bad Gateway' 'gh: HTTP 504' 'dial tcp: Connection Refused' \
+  'Could Not Resolve Host: api.github.com' 'lookup api.github.com: no such host' \
+  'request Timed Out' 'net/http: TLS handshake timeout' 'context deadline exceeded'; do
+  FAKE_ERR="$e" run once; expect 0 "once($e)" 2
+done
+# A 5xx outside 500-504 and a lowercase 4xx are not transport errors.
+FAKE_ERR='HTTP 505: Version Not Supported' run once; expect 1 http505 1
+FAKE_ERR='http 404 (connection refused)' run once; expect 1 lc404 1
 
 # Leading `command` word is skipped in the log name.
 FAKE_MODE=blip2; echo 0 > "$FAKE_COUNT"
