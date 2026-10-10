@@ -114,6 +114,27 @@ func TestComputeUnmetCriteria(t *testing.T) {
 		}
 	})
 
+	// A criterion for a milestone outside the frozen list still counts until completed: the
+	// frozen-coverage check (issue #2259) only requires frozen milestones to be covered, it
+	// never drops extras (issue #2681).
+	t.Run("criterion outside the frozen list still counts", func(t *testing.T) {
+		run := store.Run{
+			CompletionContractVersion: rev,
+			CompletionContract:        contractJSON(t, "m1", "m2", "x9"),
+			MilestonesFrozen:          frozenJSON(t, "m1", "m2"),
+			MilestonesCompleted:       idsJSON(t, "m1", "m2"),
+		}
+		unmet, verifiable := computeUnmetCriteria(run)
+		if !verifiable || len(unmet) != 1 || unmet[0] != "x9" {
+			t.Fatalf("unmet = %v verifiable = %v, want [x9] true", unmet, verifiable)
+		}
+		run.MilestonesCompleted = idsJSON(t, "m1", "m2", "x9")
+		unmet, verifiable = computeUnmetCriteria(run)
+		if !verifiable || len(unmet) != 0 {
+			t.Fatalf("all completed: unmet = %v verifiable = %v, want [] true", unmet, verifiable)
+		}
+	})
+
 	t.Run("vacuously complete (empty criteria)", func(t *testing.T) {
 		run := store.Run{
 			CompletionContractVersion: rev,
