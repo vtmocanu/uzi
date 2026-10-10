@@ -823,4 +823,26 @@ for status in failed completed cancelled; do
   done
 done
 
+# Episode-free completed singleton: the primary is also its retained source.
+reset_layout
+rid="completed-protected-singleton"
+predecessor="$RB/issue-4242"
+make_clone "$predecessor" agent/issue-4242 singleton-old-dirty
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 singleton-new-active
+ledger "$A3" newer-run "$RB/issue-4242.attempt-$A3" live
+envelope="$(jq -cn --arg rid "$rid" --arg pred "$predecessor" '
+  {runId:$rid,clonePath:$pred} as $source
+  | {version:1,branch:"agent/issue-4242",key:"issue-4242",
+     journal:($source + {retainedSources:[$source]})}')"
+git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$envelope"
+journal newer-run "$RB/issue-4242.attempt-$A3" "$A3"
+dest="$WORK/out.protected-singleton"
+rc="$(backup_rc "$dest" "$rid")"
+[ "$rc" -eq 0 ] || fail "protected singleton: backup exit $rc"
+tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+singleton-old-dirty' \
+  || fail "protected singleton: newer active run hid old dirty bytes"
+tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.meta.txt | grep -qF "clone=$predecessor" \
+  || fail "protected singleton: original path missing"
+echo "PASS protected completed singleton: episode-free old dirty bytes survive newer active run"
+
 echo "ALL PASS"

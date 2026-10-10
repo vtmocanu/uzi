@@ -44,7 +44,7 @@ describe("verified successor retirement", () => {
     return execFileSync("git", ["-C", repo, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
   }
 
-  async function seedCompleted() {
+  async function seedCompleted(predecessorCount = 2) {
     const owner = randomUUID(), key = "issue-2512", branch = "agent/issue-2512";
     const bare = await git.ensureClone(fx.originPath);
     fs.chmodSync(path.dirname(bare), 0o700);
@@ -54,8 +54,9 @@ describe("verified successor retirement", () => {
     fs.writeFileSync(path.join(initial.path, "predecessor.txt"), "original dirty bytes\n");
     const tip = command(initial.path, "rev-parse", "HEAD");
     let source: import("../src/recovery-progress.js").RecoverySource = { runId: owner, clonePath: initial.path };
-    // Two real completed adoptions exercise retention of the entire predecessor set.
-    for (const n of [1, 2]) {
+    const bytes = new Map([[initial.path, "original dirty bytes\n"]]);
+    // Real completed adoptions exercise retention of the entire predecessor set.
+    for (let n = 1; n <= predecessorCount; n++) {
       const reservation = await git.reserveRecoveryIteration(bare, branch, key, source, 1);
       await git.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, tip);
       const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, n.toString(16).padStart(16, "0"));
@@ -63,15 +64,21 @@ describe("verified successor retirement", () => {
       source = await git.completeRecoveryEpisode(bare, branch, key,
         { runId: owner, clonePath: successor.path, attemptId },
         { settled: true, processedEvents: 1, attemptId });
-      fs.writeFileSync(path.join(successor.path, "predecessor.txt"), n === 1 ? "intermediate dirty bytes\n" : "successor bytes\n");
+      const dirty = n === predecessorCount ? "successor bytes\n" : `intermediate ${n} dirty bytes\n`;
+      bytes.set(successor.path, dirty);
+      fs.writeFileSync(path.join(successor.path, "predecessor.txt"), dirty);
     }
     const expected = JSON.parse(command(bare, "config", "--get", `uzi-recovery.${branch}.clone`)) as import("../src/git.js").RecoveryJournalEntry;
-    assert.equal(expected.retainedSources!.length, 2);
+    assert.equal(expected.retainedSources!.length, predecessorCount);
+    const ownership = new Map(expected.retainedSources!.map(src => {
+      const st = fs.statSync(src.clonePath);
+      return [src.clonePath, { uid: st.uid, gid: st.gid }];
+    }));
     const opts = { discard: true, attemptId: expected.attemptId!,
       verifiedSuccessor: { key, generation: 2, expected, acknowledged: async () => true } };
     const ledger = () => command(bare, "config", "--get-all", `uzi-attempts.${branch}.entry`).split("\n")
       .map(raw => JSON.parse(raw) as { attemptId: string; state: string; clonePath: string });
-    return { bare, branch, key, owner, expected, opts, ledger, tip,
+    return { bare, branch, key, owner, expected, opts, ledger, tip, bytes, ownership,
       pin: `refs/uzi-recovery-episode/${owner}/${tip}`,
       retire: () => git.retireRunnerClone(bare, expected.clonePath, branch, owner, opts) };
   }
@@ -81,14 +88,26 @@ describe("verified successor retirement", () => {
     const fresh = new GitCache(fx.dataDir, nullLogger());
     const discovery = await fresh.discoverRetainedRecovery(fx.originPath, s.branch, s.key, s.owner);
     assert.ok(discovery, "fresh cache discovers retained custody");
-    const sources = [discovery.journal, ...(discovery.journal.retainedSources ?? [])];
+    const identity = ({ runId, clonePath, attemptId, restoreTip }: import("../src/recovery-progress.js").RecoverySource) =>
+      ({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }), ...(restoreTip === undefined ? {} : { restoreTip }) });
+    const sources = [discovery.journal, ...(discovery.journal.retainedSources ?? [])]
+      .map(identity).filter((src, i, all) => all.findIndex(other => JSON.stringify(other) === JSON.stringify(src)) === i);
     if (anchored) {
       assert.equal(discovery.journal.clonePath, s.expected.retainedSources![0]!.clonePath);
-      assert.deepEqual(sources.map(src => src.clonePath), s.expected.retainedSources!.map(src => src.clonePath));
+      assert.deepEqual(sources, s.expected.retainedSources!.map(identity));
+      const [first, second, third] = s.expected.retainedSources!;
+      const persistedRetained = new Map([[1, [first!]], [2, [second!]], [3, [second!, third!]]])
+        .get(s.expected.retainedSources!.length);
+      assert.deepEqual(JSON.parse(command(s.bare, "config", "--get", `uzi-recovery.${s.branch}.clone`)),
+        { ...first!, retainedSources: persistedRetained });
+      assert.equal(Object.hasOwn(discovery.journal, "recovery"), false);
     } else assert.deepEqual(discovery.journal, s.expected);
     for (const predecessor of s.expected.retainedSources!) {
       assert.equal(fs.readFileSync(path.join(predecessor.clonePath, "predecessor.txt"), "utf8"),
-        predecessor.attemptId ? "intermediate dirty bytes\n" : "original dirty bytes\n");
+        s.bytes.get(predecessor.clonePath));
+      const st = fs.statSync(predecessor.clonePath);
+      assert.deepEqual({ uid: st.uid, gid: st.gid }, s.ownership.get(predecessor.clonePath));
+      if (predecessor.restoreTip) assert.equal(predecessor.restoreTip, s.tip);
       assert.equal(command(predecessor.clonePath, "rev-parse", "HEAD"), s.tip);
       assert.equal(await fresh.classifyOwnerClonePath(s.bare, s.branch, s.key, s.owner, predecessor.clonePath),
         predecessor.attemptId ? "attempt" : "canonical");
@@ -96,9 +115,9 @@ describe("verified successor retirement", () => {
     assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
   }
 
-  for (const exdev of [false, true]) {
-    it(`covering FINAL retires successor and ledger, preserving predecessors and pins (EXDEV=${exdev})`, async (t) => {
-      const s = await seedCompleted();
+  for (const predecessorCount of [1, 2, 3]) for (const exdev of [false, true]) {
+    it(`covering FINAL retires successor and ledger, preserving predecessors and pins (predecessors=${predecessorCount}, EXDEV=${exdev})`, async (t) => {
+      const s = await seedCompleted(predecessorCount);
       const rename = fsp.rename.bind(fsp);
       let moves = 0;
       t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
@@ -114,7 +133,76 @@ describe("verified successor retirement", () => {
       assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "retired");
       assert.equal(fs.readdirSync(holdingRoot()).length, 0);
       assert.equal(fs.readdirSync(runnerRoot()).filter(name => name.startsWith(".retire-")).length, 0);
+      const primary = s.expected.retainedSources![0]!;
+      const snapshot = await git.terminalRetainedSnapshot(s.bare, s.branch, s.key, primary);
+      assert.ok(snapshot, "terminalRetainedSnapshot preserves completed predecessor custody");
+      assert.deepEqual(snapshot.paths, s.expected.retainedSources!.map(src => src.clonePath));
       await assertPredecessors(s, true);
+
+      api.setOwnershipNotOwned(s.owner);
+      api.setOrphanClassification(s.owner, {
+        status: "completed", repo_id: "r1", kind: "issue", issue_iid: 2512,
+        branch: null, pipeline_ref: null, pipeline_id: null,
+      });
+      const claimant = randomUUID();
+      const proofs: QuiesceRunRequest[] = [];
+      let entered = false;
+      let entryError: unknown;
+      const factory: ExecutorFactory = () => ({
+        homeDir: path.join(homeDir, claimant),
+        executor: { run: async () => {
+          entered = true;
+          try {
+            assert.equal(readJournal(s.bare, s.branch)?.runId, claimant);
+            const protectedRecord = JSON.parse(command(s.bare, "config", "--get", `uzi-retained.${s.owner}.journal`));
+            assert.deepEqual(protectedRecord, { version: 1, branch: s.branch, key: s.key, journal: JSON.parse(JSON.stringify(snapshot.journal)) });
+            const activeInventory = await new GitCache(fx.dataDir, nullLogger()).readInventoryCloneHeads(s.bare, s.owner);
+            assert.equal(activeInventory.kind, "verified");
+            if (activeInventory.kind === "verified") {
+              assert.deepEqual(activeInventory.heads, [s.tip]);
+              assert.deepEqual(activeInventory.clones.map(src => src.clonePath), snapshot.paths);
+            }
+          } catch (error) {
+            entryError = error;
+            throw error;
+          }
+          throw new Error("stop at new model entry");
+        } },
+      });
+      const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), {
+        recoveryRetryMs: 5,
+        quiesceRun: async req => {
+          proofs.push(req);
+          if (req.site === "orphan_reclaim") {
+            assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "retired");
+          }
+          return { process: { state: "quiescent", processes: [], killed: [], detail: "fixture proof" },
+            docker: { state: "not_wired", removed: [], detail: "" } };
+        },
+      });
+      await runner.execute(gitlabClaim(2512, { run_id: claimant }));
+      assert.equal(entered, true, "new run enters after real runner canonical reclamation");
+      assert.equal(entryError, undefined, "protected descriptor and fresh inventory survive newer active run");
+      const reclaim = proofs.filter(req => req.site === "orphan_reclaim");
+      assert.equal(reclaim.length, 1);
+      assert.equal(reclaim[0]!.mode, "capture");
+      assert.deepEqual(reclaim[0]!.targetPaths, snapshot.paths);
+      const protectedRecord = JSON.parse(command(s.bare, "config", "--get", `uzi-retained.${s.owner}.journal`));
+      assert.deepEqual(protectedRecord.journal, JSON.parse(JSON.stringify(snapshot.journal)));
+      // A newer active owner cannot hide the old detached sources from a fresh inventory.
+      const inventory = await new GitCache(fx.dataDir, nullLogger()).readInventoryCloneHeads(s.bare, s.owner);
+      assert.equal(inventory.kind, "verified");
+      if (inventory.kind === "verified") {
+        assert.deepEqual(inventory.heads, [s.tip]);
+        assert.deepEqual(inventory.clones.map(src => src.clonePath), snapshot.paths);
+      }
+      for (const predecessor of s.expected.retainedSources!) {
+        assert.equal(fs.readFileSync(path.join(predecessor.clonePath, "predecessor.txt"), "utf8"), s.bytes.get(predecessor.clonePath));
+        const st = fs.statSync(predecessor.clonePath);
+        assert.deepEqual({ uid: st.uid, gid: st.gid }, s.ownership.get(predecessor.clonePath));
+        assert.equal(command(predecessor.clonePath, "rev-parse", "HEAD"), s.tip);
+      }
+      assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
     });
   }
 

@@ -6135,7 +6135,7 @@ export class GitCache {
         if (!predecessors.length || predecessors.length !== pending.retainedSources.length) {
           throw new Error("invalid successor predecessor set");
         }
-        anchored = { ...predecessors[0]!, retainedSources: predecessors.slice(1) };
+        anchored = { ...predecessors[0]!, retainedSources: predecessors.length === 1 ? predecessors : predecessors.slice(1) };
       } else if (pending.recovery || pending.retainedSources?.length) {
         throw new Error("recovery sources require explicit verified disposition before retirement");
       }
