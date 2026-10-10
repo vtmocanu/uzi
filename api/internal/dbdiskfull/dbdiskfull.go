@@ -70,20 +70,6 @@ func (s *Signal) Observe(err error) bool {
 	return true
 }
 
-// Active reports whether a sighting happened within Window before now.
-func (s *Signal) Active(now time.Time) bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	last := s.lastSeen
-	s.mu.Unlock()
-	if last == 0 {
-		return false
-	}
-	return now.UnixNano()-last <= int64(Window)
-}
-
 // Snapshot returns the active state, the newest sighting and the current incident's start
 // read under one lock, so start <= last whenever active. last and start are zero when
 // nothing was ever seen.
@@ -101,35 +87,6 @@ func (s *Signal) Snapshot(now time.Time) (active bool, last, start time.Time) {
 		st = l
 	}
 	return now.UnixNano()-l <= int64(Window), time.Unix(0, l), time.Unix(0, st)
-}
-
-// LastSeen returns the most recent sighting time, if any.
-func (s *Signal) LastSeen() (time.Time, bool) {
-	if s == nil {
-		return time.Time{}, false
-	}
-	s.mu.Lock()
-	last := s.lastSeen
-	s.mu.Unlock()
-	if last == 0 {
-		return time.Time{}, false
-	}
-	return time.Unix(0, last), true
-}
-
-// IncidentStart returns the first sighting of the current incident, if any. It resets
-// when a sighting follows a quiet gap longer than Window.
-func (s *Signal) IncidentStart() (time.Time, bool) {
-	if s == nil {
-		return time.Time{}, false
-	}
-	s.mu.Lock()
-	t := s.start
-	s.mu.Unlock()
-	if t == 0 {
-		return time.Time{}, false
-	}
-	return time.Unix(0, t), true
 }
 
 // Generation counts distinct incidents observed so far.

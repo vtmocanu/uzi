@@ -3,6 +3,7 @@ package healthsvc
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"time"
 
@@ -90,6 +91,8 @@ func (s *Service) evalDBSize(ctx context.Context) apitypes.HealthCheckDTO {
 		apitypes.HealthEvidenceDTO{Label: "Used", Value: fmt.Sprintf("%d.%d%%", tenths/10, tenths%10)},
 	)
 	if size.RelationsUnavailable {
+		// The probe runs once per cache refresh (dbSizeCacheTTL), so this logs at most that often.
+		slog.Warn("healthsvc: db.size largest-relations query unavailable", "error", size.RelationsErr)
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Largest relations", Value: "Unavailable (the relation-size query gave up; the size above is still current)"})
 	}
 	for i, r := range size.Largest {

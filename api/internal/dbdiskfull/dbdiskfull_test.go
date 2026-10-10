@@ -44,8 +44,8 @@ func TestIsAndObserve(t *testing.T) {
 			if got := s.Observe(tc.err); got != tc.want {
 				t.Fatalf("Observe = %v, want %v", got, tc.want)
 			}
-			if got := s.Active(c.now()); got != tc.want {
-				t.Fatalf("Active = %v, want %v", got, tc.want)
+			if got, _, _ := s.Snapshot(c.now()); got != tc.want {
+				t.Fatalf("active = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -55,14 +55,15 @@ func TestActiveClearsAfterWindow(t *testing.T) {
 	c := newClock()
 	s := New(c.now)
 	s.Observe(pgErr(CodeDiskFull))
-	if !s.Active(c.t.Add(Window)) {
+	if active, _, _ := s.Snapshot(c.t.Add(Window)); !active {
 		t.Fatal("want active at the window edge")
 	}
-	if s.Active(c.t.Add(Window + time.Second)) {
+	active, last, _ := s.Snapshot(c.t.Add(Window + time.Second))
+	if active {
 		t.Fatal("want inactive after the window")
 	}
-	if last, ok := s.LastSeen(); !ok || !last.Equal(c.t) {
-		t.Fatalf("LastSeen = %v, %v", last, ok)
+	if !last.Equal(c.t) {
+		t.Fatalf("last = %v, want %v", last, c.t)
 	}
 }
 
@@ -92,14 +93,11 @@ func TestGenerationBumpsOnlyAfterQuietGap(t *testing.T) {
 
 func TestNilSignalIsSafe(t *testing.T) {
 	var s *Signal
-	if s.Observe(pgErr(CodeDiskFull)) || s.Active(time.Now()) || s.Generation() != 0 {
+	if s.Observe(pgErr(CodeDiskFull)) || s.Generation() != 0 {
 		t.Fatal("nil signal must be inert")
 	}
-	if _, ok := s.LastSeen(); ok {
-		t.Fatal("nil signal has no LastSeen")
-	}
-	if _, ok := s.IncidentStart(); ok {
-		t.Fatal("nil signal has no IncidentStart")
+	if active, last, start := s.Snapshot(time.Now()); active || !last.IsZero() || !start.IsZero() {
+		t.Fatalf("nil signal snapshot = %v %v %v", active, last, start)
 	}
 	(&Tracer{}).TraceQueryEnd(context.Background(), nil, pgx.TraceQueryEndData{Err: pgErr(CodeDiskFull)})
 }
@@ -113,11 +111,11 @@ func TestTracerActivates(t *testing.T) {
 		t.Fatal("TraceQueryStart must return ctx unchanged")
 	}
 	tr.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{Err: fmt.Errorf("w: %w", pgErr("53200"))})
-	if s.Active(c.now()) {
+	if active, _, _ := s.Snapshot(c.now()); active {
 		t.Fatal("53200 must not activate")
 	}
 	tr.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{Err: fmt.Errorf("w: %w", pgErr(CodeDiskFull))})
-	if !s.Active(c.now()) {
+	if active, _, _ := s.Snapshot(c.now()); !active {
 		t.Fatal("wrapped 53100 must activate")
 	}
 }
@@ -125,26 +123,23 @@ func TestTracerActivates(t *testing.T) {
 func TestIncidentStartHoldsWithinWindowAndResetsAfterGap(t *testing.T) {
 	c := newClock()
 	s := New(c.now)
-	if _, ok := s.IncidentStart(); ok {
+	if _, _, st := s.Snapshot(c.t); !st.IsZero() {
 		t.Fatal("no incident start before any sighting")
 	}
 	first := c.t
 	s.Observe(pgErr(CodeDiskFull))
 	c.t = c.t.Add(Window - time.Second)
 	s.Observe(pgErr(CodeDiskFull))
-	if st, ok := s.IncidentStart(); !ok || !st.Equal(first) {
-		t.Fatalf("IncidentStart = %v, %v; want %v", st, ok, first)
-	}
-	if last, _ := s.LastSeen(); !last.Equal(c.t) {
-		t.Fatalf("LastSeen = %v, want %v", last, c.t)
+	if _, last, st := s.Snapshot(c.t); !st.Equal(first) || !last.Equal(c.t) {
+		t.Fatalf("start = %v last = %v; want %v and %v", st, last, first, c.t)
 	}
 	if s.Generation() != 1 {
 		t.Fatalf("gen = %d, want 1", s.Generation())
 	}
 	c.t = c.t.Add(Window + time.Second)
 	s.Observe(pgErr(CodeDiskFull))
-	if st, _ := s.IncidentStart(); !st.Equal(c.t) {
-		t.Fatalf("IncidentStart = %v, want reset to %v", st, c.t)
+	if _, _, st := s.Snapshot(c.t); !st.Equal(c.t) {
+		t.Fatalf("start = %v, want reset to %v", st, c.t)
 	}
 	if s.Generation() != 2 {
 		t.Fatalf("gen = %d, want 2", s.Generation())

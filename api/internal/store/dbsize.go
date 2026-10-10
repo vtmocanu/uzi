@@ -22,6 +22,10 @@ type DatabaseSize struct {
 	// for any reason (a table lock past relationsLockTimeout, a statement timeout, relationsTimeout,
 	// the caller's deadline, a connection error). SizeBytes is still valid.
 	RelationsUnavailable bool
+	// RelationsErr is the error that made the relations unavailable, for the caller to log.
+	// It is nil whenever RelationsUnavailable is false. It is diagnostic only and may carry
+	// database error text, so it must not be interpolated into health text.
+	RelationsErr error
 }
 
 // RelationSize is one relation's name (schema-qualified when outside search_path) and total size.
@@ -55,8 +59,8 @@ func DatabaseSizeOnly(ctx context.Context, pool *pgxpool.Pool) (DatabaseSize, er
 // caller's pool, like SchemaVersionStatus. Only a failed size read is an error. The
 // relations are evidence only: once the size has been read, any failure of the relations
 // query (lock timeout, statement timeout, relationsTimeout, the caller's deadline, a
-// connection error) returns the size with Largest empty and RelationsUnavailable set, and
-// no error. A relation dropped between
+// connection error) returns the size with Largest empty, RelationsUnavailable set and the
+// cause in RelationsErr, and no error. A relation dropped between
 // the catalog scan and the size call yields a NULL size and is skipped.
 func DatabaseSizeStatus(ctx context.Context, pool *pgxpool.Pool) (DatabaseSize, error) {
 	out, err := DatabaseSizeOnly(ctx, pool)
@@ -68,6 +72,7 @@ func DatabaseSizeStatus(ctx context.Context, pool *pgxpool.Pool) (DatabaseSize, 
 	largest, err := largestRelations(rctx, pool)
 	if err != nil {
 		out.RelationsUnavailable = true
+		out.RelationsErr = err
 		return out, nil
 	}
 	out.Largest = largest

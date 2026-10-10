@@ -1,8 +1,11 @@
 package healthsvc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -242,5 +245,32 @@ func TestCheckDBSizeSkipsRelationsWhenNA(t *testing.T) {
 		if got == nil || *got != want {
 			t.Errorf("capacity %d: withRelations = %v, want %v", capacity, got, want)
 		}
+	}
+}
+
+// A failed largest-relations query is logged once per probe refresh with the error as a
+// field, and the error text never reaches the health text.
+func TestCheckDBSizeLogsRelationsErr(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	relErr := errors.New("lock timeout RELERR-MARKER")
+	s := dbSizeSvc(1000, func(context.Context, bool) (store.DatabaseSize, error) {
+		return store.DatabaseSize{SizeBytes: 500, RelationsUnavailable: true, RelationsErr: relErr}, nil
+	})
+	c := s.checkDBSize(context.Background(), fixedNow)
+	s.checkDBSize(context.Background(), fixedNow.Add(time.Second)) // cached: no second probe, no second log
+
+	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
+		t.Fatalf("warn lines = %d, want 1: %q", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "RELERR-MARKER") {
+		t.Errorf("log lacks the relations error: %q", buf.String())
+	}
+	raw, _ := json.Marshal(c)
+	if strings.Contains(string(raw), "RELERR-MARKER") {
+		t.Errorf("relations error leaked into the check: %s", raw)
 	}
 }

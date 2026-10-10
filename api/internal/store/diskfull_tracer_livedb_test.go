@@ -37,7 +37,7 @@ func TestDiskFullTracerStatementPathLiveDB(t *testing.T) {
 	if !dbdiskfull.Is(err) {
 		t.Fatalf("err = %v, want SQLSTATE 53100", err)
 	}
-	if !sig.Active(time.Now()) {
+	if !diskFullActive(sig) {
 		t.Fatal("signal not active after statement-path 53100")
 	}
 }
@@ -76,14 +76,14 @@ func TestDiskFullTracerCommitPathLiveDB(t *testing.T) {
 	if _, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (1)`, table)); err != nil {
 		t.Fatalf("insert must succeed before commit: %v", err)
 	}
-	if fresh.Active(time.Now()) {
+	if diskFullActive(fresh) {
 		t.Fatal("signal active before commit")
 	}
 	cerr := fmt.Errorf("commit: %w", tx.Commit(ctx))
 	if !dbdiskfull.Is(cerr) {
 		t.Fatalf("commit err = %v, want wrapped 53100", cerr)
 	}
-	if !fresh.Active(time.Now()) {
+	if !diskFullActive(fresh) {
 		t.Fatal("signal not active after commit-time 53100")
 	}
 }
@@ -95,7 +95,13 @@ func TestDiskFullTracerControlLiveDB(t *testing.T) {
 	if err == nil {
 		t.Fatal("want division-by-zero error")
 	}
-	if dbdiskfull.Is(err) || sig.Active(time.Now()) {
+	if dbdiskfull.Is(err) || diskFullActive(sig) {
 		t.Fatalf("22012 must not activate the signal (err %v)", err)
 	}
+}
+
+// diskFullActive reports whether sig currently sees a disk-full sighting.
+func diskFullActive(sig *dbdiskfull.Signal) bool {
+	active, _, _ := sig.Snapshot(time.Now())
+	return active
 }
