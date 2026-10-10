@@ -106,7 +106,7 @@ usage_basis   = per_leg
 ```
 
 The worker emits one `summary_usage` run message per pass that observed usage, with payload
-`{pass: intent|plan|pr_description, model_usage}`; a claim-fenced run emits none. The api
+`{pass: intent|plan|pr_description, model_usage}`; a pass that finishes after the claim is fenced emits none. The api
 rebuilds the payload at ingest (`api/internal/workersvc/summary_usage.go`) and folds it
 (`foldSummaryUsage`, called from `usage_fold.go`). Each pass is its own row, so the rows sum.
 
