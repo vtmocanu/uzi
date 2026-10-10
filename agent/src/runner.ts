@@ -9705,6 +9705,7 @@ export class RunRunner {
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
             },
             emit: (m) => batcher.emit(m),
+            redact: flight.redactText,
             runPass: runReadOnlyModelPass,
             pass: {
               token: claim.secrets.anthropic_oauth_token,
@@ -10276,8 +10277,8 @@ export class RunRunner {
       // failed report returns undefined ("no budget update") rather than failing the run.
       reportIteration: async (iteration, progress) => {
         // PRD #2603: the turn-boundary snapshot also feeds the Now summary (the claim's frozen list
-        // is the fallback when the controller has not seen one yet).
-        if (progress) nowSummary?.observeProgress(progress, claim.milestones ?? undefined);
+        // is only a fallback: it never replaces a list reportProgress already gave the controller).
+        if (progress) nowSummary?.observeProgress(progress, claim.milestones ?? undefined, true);
         try {
           // PRD #1064 M1: enqueue onto the per-run chain so any still-in-flight immediate
           // push (from the prior turn's scan loop) is sent BEFORE this turn-boundary report

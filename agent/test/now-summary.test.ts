@@ -97,7 +97,7 @@ function usage(input: number, output: number, extra: Partial<AdviceUsageSnapshot
   };
 }
 
-function harness(over: { claude?: boolean; issueRun?: boolean; enabled?: boolean; ignoreAbort?: boolean } = {}) {
+function harness(over: { claude?: boolean; issueRun?: boolean; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
   const clock = new FakeClock();
   const emitted: EmittedMessage[] = [];
   const calls: PassCall[] = [];
@@ -117,6 +117,7 @@ function harness(over: { claude?: boolean; issueRun?: boolean; enabled?: boolean
     steering,
     claim: { issueRun: over.issueRun ?? true, claude: over.claude ?? true },
     emit: (m) => void emitted.push(m),
+    ...(over.redact ? { redact: over.redact } : {}),
     runPass: (opts) =>
       new Promise<string>((resolve, reject) => {
         calls.push({ opts, resolve, reject });
@@ -140,6 +141,8 @@ function harness(over: { claude?: boolean; issueRun?: boolean; enabled?: boolean
 async function running(h: ReturnType<typeof harness>, ...ids: string[]): Promise<void> {
   h.c.start();
   h.c.observeProgress(progress([ids[0] ?? "m1"]), frozen(...(ids.length ? ids : ["m1", "m2"])));
+  // A call needs one tool frame of the new milestone (a fresh milestone clears the frame ring).
+  h.c.observeFrame(toolUse("lead", "Read", { file_path: "first.md" }));
   await h.clock.advance(0);
 }
 
@@ -209,6 +212,7 @@ describe("NowSummaryController: triggers and the rate window", () => {
     await settle();
     assert.deepEqual(h.notes(), []);
     h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(NOW_MIN_INTERVAL_MS - 1);
     assert.equal(h.calls.length, 1, "the failure still used the 5 minute window");
     await h.clock.advance(1);
@@ -223,6 +227,7 @@ describe("NowSummaryController: triggers and the rate window", () => {
     await settle();
     assert.deepEqual(h.notes(), []);
     h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(NOW_MIN_INTERVAL_MS - 1);
     assert.equal(h.calls.length, 1);
   });
@@ -254,8 +259,9 @@ describe("NowSummaryController: triggers and the rate window", () => {
   it("sends the active milestone title and only the newest 20 tool frames", async () => {
     const h = harness();
     h.c.start();
-    for (let i = 0; i < 30; i++) h.c.observeFrame(toolUse("lead", "Read", { file_path: `f${i}` }));
     h.c.observeProgress(progress(["m1"]), frozen("m1", "m2"));
+    for (let i = 0; i < 30; i++) h.c.observeFrame(toolUse("lead", "Read", { file_path: `f${i}` }));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(0);
     const prompt = h.calls[0]!.opts.prompt;
     assert.match(prompt, /Title of m1/);
@@ -294,9 +300,11 @@ describe("NowSummaryController: gate", () => {
     const h = harness();
     h.c.start();
     h.c.observeProgress(progress(["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(0);
     assert.equal(h.calls.length, 0, "no frozen list yet");
     h.c.observeProgress(progress([], ["m1"]), frozen("m1"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(0);
     assert.equal(h.calls.length, 0, "the only milestone is completed: no active one");
   });
@@ -305,6 +313,7 @@ describe("NowSummaryController: gate", () => {
     const h = harness();
     h.c.start();
     h.c.observeProgress(progress(["m3", "m2"], ["m2"]), frozen("m1", "m2", "m3"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(0);
     assert.match(h.calls[0]!.opts.prompt, /Title of m3/);
   });
@@ -315,6 +324,7 @@ describe("NowSummaryController: gate", () => {
     let release!: () => void;
     const held = h.c.hold(() => new Promise<void>((r) => (release = r)));
     h.c.observeProgress(progress(["m1"]), frozen("m1"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(MIN);
     assert.equal(h.calls.length, 0, "parked at a gate: no call");
     release();
@@ -331,6 +341,7 @@ describe("NowSummaryController: gate", () => {
     const a = h.c.hold(() => new Promise<void>((r) => (r1 = r)));
     const b = h.c.hold(() => new Promise<void>((r) => (r2 = r)));
     h.c.observeProgress(progress(["m1"]), frozen("m1"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     r1();
     await a;
     await h.clock.advance(MIN);
@@ -346,6 +357,7 @@ describe("NowSummaryController: gate", () => {
     h.c.start();
     await assert.rejects(h.c.hold(() => Promise.reject(new Error("x"))), /x/);
     h.c.observeProgress(progress(["m1"]), frozen("m1"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(0);
     assert.equal(h.calls.length, 1);
   });
@@ -409,6 +421,7 @@ describe("NowSummaryController: the posted note", () => {
     await settle();
     assert.equal(h.notes().length, 1);
     h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(NOW_MIN_INTERVAL_MS);
     assert.equal(h.calls.length, 2);
     h.st.enabled = false;
@@ -441,6 +454,7 @@ describe("NowSummaryController: the posted note", () => {
     await running(h);
     h.calls[0]!.opts.onUsage?.(usage(4, 2));
     h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     h.calls[0]!.resolve("about m1");
     await settle();
     assert.deepEqual(h.notes().map((n) => [n.text, n.milestone_id]), [["", "m1"]]);
@@ -480,6 +494,7 @@ describe("NowSummaryController: the posted note", () => {
     assert.equal(orig.life.signal.aborted, false);
     // The controller keeps working afterwards.
     h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
     await h.clock.advance(NOW_MIN_INTERVAL_MS);
     assert.equal(h.calls.length, 2);
   });
@@ -657,5 +672,123 @@ describe("holdContextCallbacks", () => {
       "parkForWall",
       "takeResumedGateEvent",
     ]);
+  });
+});
+
+describe("NowSummaryController: review-rework behaviours", () => {
+  it("a milestone change drops the previous milestone's frames and waits for a new tool frame", async () => {
+    const h = harness();
+    h.c.start();
+    h.c.observeProgress(progress(["m1"]), frozen("m1", "m2"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "OLD_MILESTONE_FILE" }));
+    await h.clock.advance(0);
+    assert.equal(h.calls.length, 1);
+    h.calls[0]!.resolve("one");
+    await settle();
+    await h.clock.advance(NOW_MIN_INTERVAL_MS);
+    // m2 becomes active and the window is long over, but no frame of m2 has arrived yet.
+    h.c.observeProgress(progress(["m2"], ["m1"]));
+    await h.clock.advance(MIN);
+    assert.equal(h.calls.length, 1, "no new tool frame since the change: no spend");
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "NEW_MILESTONE_FILE" }));
+    await h.clock.advance(0);
+    assert.equal(h.calls.length, 2);
+    const prompt = h.calls[1]!.opts.prompt;
+    assert.match(prompt, /Title of m2/);
+    assert.match(prompt, /NEW_MILESTONE_FILE/);
+    assert.ok(!prompt.includes("OLD_MILESTONE_FILE"), "the previous milestone's frames are gone");
+  });
+
+  it("the 5 minute floor is literal: 5*60000-1 ms later still one call, one more ms makes two", async () => {
+    const h = harness();
+    await running(h);
+    h.calls[0]!.resolve("one");
+    await settle();
+    h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
+    await h.clock.advance(5 * 60_000 - 1);
+    assert.equal(h.calls.length, 1);
+    await h.clock.advance(1);
+    assert.equal(h.calls.length, 2);
+  });
+
+  it("stop() after the bound posts the usage the abandoned call already delivered, unless the claim is fenced", async () => {
+    for (const fenced of [false, true]) {
+      const h = harness({ ignoreAbort: true });
+      await running(h);
+      h.calls[0]!.opts.onUsage?.(usage(40, 9));
+      if (fenced) h.st.fence = "fenced";
+      const p = h.c.stop();
+      await settle();
+      await h.clock.advance(NOW_STOP_BOUND_MS);
+      await p;
+      const notes = h.notes();
+      if (fenced) {
+        assert.deepEqual(notes, []);
+        continue;
+      }
+      assert.equal(notes.length, 1);
+      assert.equal(notes[0]!.text, "");
+      assert.equal(notes[0]!.milestone_id, "m1");
+      assert.equal(((notes[0]!.model_usage as AdviceUsageSnapshot)["claude-haiku-4-5-20251001"] as { inputTokens: number }).inputTokens, 40);
+      h.calls[0]!.opts.onUsage?.(usage(500, 500));
+      h.calls[0]!.resolve("late");
+      await settle();
+      assert.equal(h.notes().length, 1, "the late result adds nothing");
+    }
+  });
+
+  it("a fallback frozen list never replaces the list the controller already holds", async () => {
+    const h = harness();
+    h.c.start();
+    h.c.observeProgress(progress(["m1"]), frozen("m1", "m2"));
+    // The turn-boundary report carries the claim's (different) list as a fallback only.
+    h.c.observeProgress(progress(["m2"]), [{ id: "zz", title: "claim list" }] as Milestone[], true);
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "a" }));
+    await h.clock.advance(0);
+    assert.match(h.calls[0]!.opts.prompt, /Title of m2/, "m2 is still resolved against the held list");
+  });
+
+  it("a fallback list is used while the controller has none", async () => {
+    const h = harness();
+    h.c.start();
+    h.c.observeProgress(progress(["m1"]), frozen("m1"), true);
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "a" }));
+    await h.clock.advance(0);
+    assert.equal(h.calls.length, 1);
+  });
+
+  describe("redaction runs before the caps", () => {
+    const secret = ["fixture", "redact", "marker"].join("-");
+    const redact = (s: string): string => s.split(secret).join("[redacted]");
+    const fragment = secret.slice(0, 12);
+
+    it("trimToolFrame redacts a secret straddling the 200 rune cut in every field", () => {
+      const pad = "x".repeat(192);
+      const f = trimToolFrame(
+        { kind: "tool_use", agent: pad + secret, agentLabel: pad + secret, payload: { name: "Read", input: { file_path: pad + secret } } },
+        redact,
+      )!;
+      for (const v of [f.role, f.label, f.detail]) assert.ok(!v.includes(fragment.slice(0, 6)), "no prefix of the secret survives the cut");
+      assert.ok(trimToolFrame({ kind: "tool_use", payload: { name: "Read", input: { file_path: pad + secret } } })!.detail.includes(fragment.slice(0, 6)), "without a redactor the cut leaves the prefix (the premise)");
+    });
+
+    it("sanitizeNowText redacts before the 120 rune cap", () => {
+      const out = sanitizeNowText("y".repeat(112) + secret, redact);
+      assert.ok(!out.includes(fragment.slice(0, 6)));
+    });
+
+    it("the controller redacts the title, the frames and the posted text", async () => {
+      const h = harness({ redact });
+      h.c.start();
+      h.c.observeProgress(progress(["m1"]), [{ id: "m1", title: "t".repeat(195) + secret }] as Milestone[]);
+      h.c.observeFrame(toolUse("lead", "Read", { file_path: "z".repeat(192) + secret }));
+      await h.clock.advance(0);
+      assert.ok(!h.calls[0]!.opts.prompt.includes(fragment.slice(0, 6)));
+      h.calls[0]!.resolve("w".repeat(110) + secret);
+      await settle();
+      const text = String(h.notes()[0]!.text);
+      assert.ok(text !== "" && !text.includes(fragment.slice(0, 6)));
+    });
   });
 });

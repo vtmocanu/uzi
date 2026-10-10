@@ -160,7 +160,8 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
   it("makes no call for a Codex-harness claim (M1 is Claude only)", async () => {
     const calls: { options: unknown; prompt: unknown }[] = [];
     const claim = claimFor(2606, {
-      secrets: { forge_pat: "fixture-forge-pat-000000", codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null } },
+      // Carries an Anthropic token too, so ONLY the Codex term of the claim gate keeps the call out.
+      secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "oauth-fixture-token", codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null } },
     });
     api.nowSummary.set(claim.run_id, true);
     let frames = 0;
@@ -171,5 +172,52 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
     assert.equal(calls.length, 0);
+  });
+
+  it("makes no call while the executor is parked on askUser, and calls once the answer ends the hold", async () => {
+    const calls: { options: unknown; prompt: unknown }[] = [];
+    const claim = claimFor(2607);
+    api.nowSummary.set(claim.run_id, true);
+    let questionId = "";
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) questionId = body.open_question_id;
+    });
+    let callsDuringHold = -1;
+    let heldFrames = 0;
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        await ctx.reportProgress!({ completed: [], in_progress: ["m1"] }, [{ id: "m1", title: "Write the docs" }] as never);
+        const asked = ctx.askUser!([{ question: "which docs?", header: "Docs" }]);
+        const parkBy = Date.now() + 3000;
+        while (questionId === "" && Date.now() < parkBy) await new Promise((r) => setTimeout(r, 10));
+        // Frames arrive while the run is parked; a controller that is not held would call at once.
+        const holdUntil = Date.now() + 300;
+        while (Date.now() < holdUntil) {
+          ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "x", description: "Run the api gate" } } });
+          heldFrames++;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        callsDuringHold = calls.length;
+        api.setInputs(claim.run_id, [{ id: 1, kind: "answer", body: JSON.stringify({ question_id: questionId, answers: ["the api docs"] }) }]);
+        await asked;
+        const until = Date.now() + 4000;
+        while (notesOf(claim.run_id).length === 0 && Date.now() < until) {
+          ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "x", description: "Run the api gate" } } });
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        commitMarker(ctx.worktreePath);
+        return { branch: ctx.branch };
+      },
+    };
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(executor, { homeRoot, queryFn: summaryQuery(calls) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    assert.ok(questionId !== "", "the run really parked on the question");
+    assert.ok(heldFrames > 3, "frames arrived during the hold");
+    assert.equal(callsDuringHold, 0, "no model call while the run is parked on askUser");
+    assert.ok(calls.length >= 1, "the call is made once the hold ends (positive control)");
   });
 });

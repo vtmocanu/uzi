@@ -22,7 +22,15 @@
 // list names an active milestone. A result that completes after the gate closed is DISCARDED, but
 // its usage is still posted as an empty-text note (spend counts, specs/human.md "Failed and
 // cancelled runs still count their spend") unless the claim was lost (the api refuses a fenced
-// delivery anyway).
+// delivery anyway). stop() applies the same rule to a call it abandons after the stop bound: the
+// usage the pass already delivered is posted as an empty-text note when the claim is not fenced.
+// When the setting turns off after a note was shown, one empty "clear" note (no usage) is emitted
+// so open pages refresh and the line disappears.
+//
+// A milestone change clears the frame ring and the first call for the new milestone waits for at
+// least one new tool frame, so a call never describes the previous milestone's work. Every
+// claim-secret-shaped string is redacted (deps.redact, the run's ctx.redactText) BEFORE the field
+// and text caps cut it (issue #1583), in the frames, the milestone title and the model's answer.
 
 import type { EmittedMessage, RunContext } from "./executor.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
@@ -92,7 +100,10 @@ function cleanRunes(s: string, max: number): string {
  *   200 runes. Returns undefined for anything but a tool_use frame.
  * The trim is pinned against the shared fixtures/run-activity/cases.json in the test suite.
  */
-export function trimToolFrame(m: Pick<EmittedMessage, "kind" | "agent" | "agentLabel" | "payload">): NowFrame | undefined {
+export function trimToolFrame(
+  m: Pick<EmittedMessage, "kind" | "agent" | "agentLabel" | "payload">,
+  redact: (s: string) => string = (s) => s,
+): NowFrame | undefined {
   if (m.kind !== "tool_use") return undefined;
   const tool = str(m.payload["name"]);
   const input = rec(m.payload["input"]);
@@ -120,17 +131,17 @@ export function trimToolFrame(m: Pick<EmittedMessage, "kind" | "agent" | "agentL
       detail = "";
   }
   return {
-    role: cleanRunes(role, FIELD_CAP_RUNES),
-    label: cleanRunes(label, FIELD_CAP_RUNES),
-    tool: cleanRunes(tool, FIELD_CAP_RUNES),
-    detail: cleanRunes(detail, FIELD_CAP_RUNES),
+    role: cleanRunes(redact(role), FIELD_CAP_RUNES),
+    label: cleanRunes(redact(label), FIELD_CAP_RUNES),
+    tool: cleanRunes(redact(tool), FIELD_CAP_RUNES),
+    detail: cleanRunes(redact(detail), FIELD_CAP_RUNES),
   };
 }
 
 /** The note text: whitespace folded to single spaces, then control and format runes stripped,
  *  trimmed and capped at 120 code points. */
-export function sanitizeNowText(s: string): string {
-  return cleanRunes(s.replace(/\s+/g, " "), NOW_MAX_TEXT_RUNES).trim();
+export function sanitizeNowText(s: string, redact: (s: string) => string = (x) => x): string {
+  return cleanRunes(redact(s).replace(/\s+/g, " "), NOW_MAX_TEXT_RUNES).trim();
 }
 
 /** The active milestone: the first FROZEN id that is in progress and not completed. This mirrors
@@ -159,6 +170,8 @@ export interface NowSummaryDeps {
   runPass(opts: ReadOnlyModelPassOpts): Promise<string>;
   /** The pass options the controller does not own: token, homeRoot, queryFn, log. */
   pass: Pick<ReadOnlyModelPassOpts, "token" | "homeRoot" | "queryFn">;
+  /** The run's claim-secret redactor (RunContext.redactText), applied before any cap. Absent ⇒ identity. */
+  redact?: (s: string) => string;
   now(): number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
@@ -171,6 +184,9 @@ interface InFlight {
   done: Promise<void>;
   /** stop() gave up waiting: the late result is dropped. */
   abandoned: boolean;
+  milestoneId: string;
+  /** The newest usage the pass delivered, for stop()'s abandon branch. */
+  usage: AdviceUsageSnapshot | undefined;
 }
 
 export class NowSummaryController {
@@ -194,7 +210,11 @@ export class NowSummaryController {
   /** The milestone of the last note with text posted, until a clear note is emitted for it. */
   private postedMilestone: string | undefined;
 
-  constructor(private readonly deps: NowSummaryDeps) {}
+  private readonly redact: (s: string) => string;
+
+  constructor(private readonly deps: NowSummaryDeps) {
+    this.redact = deps.redact ?? ((s) => s);
+  }
 
   /** Begin scheduling. Idempotent. The first call still needs an active milestone. */
   start(): void {
@@ -208,7 +228,7 @@ export class NowSummaryController {
   observeFrame(m: EmittedMessage): void {
     this.guard(() => {
       if (this.stopped || m.kind !== "tool_use") return;
-      const f = trimToolFrame(m);
+      const f = trimToolFrame(m, this.redact);
       if (f === undefined) return;
       this.frames.push(f);
       if (this.frames.length > NOW_MAX_FRAMES) this.frames.splice(0, this.frames.length - NOW_MAX_FRAMES);
@@ -224,14 +244,19 @@ export class NowSummaryController {
 
   /** Feed the milestone progress (the lead's report_progress and the turn-boundary report).
    *  `frozen` is the frozen list it is over when the caller has one; the last non-empty list is
-   *  kept. Never throws. */
-  observeProgress(progress: MilestoneProgress, frozen?: readonly Pick<Milestone, "id" | "title">[]): void {
+   *  kept. With `fallback` the list is only a default: it is used while the controller has none
+   *  and never replaces one it already holds. A change of the active milestone drops the frames
+   *  gathered for the previous one. Never throws. */
+  observeProgress(progress: MilestoneProgress, frozen?: readonly Pick<Milestone, "id" | "title">[], fallback = false): void {
     this.guard(() => {
       if (this.stopped) return;
-      if (frozen && frozen.length > 0) this.frozen = frozen.map((m) => ({ id: m.id, title: m.title }));
+      if (frozen && frozen.length > 0 && !(fallback && this.frozen.length > 0)) this.frozen = frozen.map((m) => ({ id: m.id, title: m.title }));
       const id = activeMilestone(this.frozen, progress);
       if (id !== this.activeId) {
         this.activeId = id;
+        this.frames = [];
+        this.role = undefined;
+        this.toolSinceCall = 0;
         if (id !== undefined) this.request();
       }
       this.syncEnabled();
@@ -276,6 +301,8 @@ export class NowSummaryController {
     this.deps.clearTimer(bound);
     if (!finished) {
       call.abandoned = true;
+      // Spend counts: the usage the pass delivered before it hung is posted unless the claim is lost.
+      if (call.usage && this.deps.steering.claimFence() === undefined) this.emitUsageOnly(call.milestoneId, call.usage);
       this.deps.log.warn("now summary: the aborted call did not settle within the stop bound; its late result is dropped");
     }
   }
@@ -312,7 +339,7 @@ export class NowSummaryController {
   /** Arm the timer for a pending trigger, at the window's end. A closed gate arms nothing: the
    *  pending trigger waits for the next observation after the gate reopens. */
   private schedule(): void {
-    if (!this.pending || this.timer !== undefined || this.inflight !== undefined || this.stopped || !this.started) return;
+    if (!this.pending || this.toolSinceCall === 0 || this.timer !== undefined || this.inflight !== undefined || this.stopped || !this.started) return;
     if (!this.gate()) return;
     const last = this.lastCallAt;
     const delay = last === undefined ? 0 : Math.max(0, last + NOW_MIN_INTERVAL_MS - this.deps.now());
@@ -327,6 +354,8 @@ export class NowSummaryController {
       if (this.stopped || this.inflight !== undefined || !this.pending) return;
       this.syncEnabled();
       if (!this.gate()) return;
+      // A trigger without a tool frame since it (a fresh milestone) waits: observeFrame re-arms.
+      if (this.toolSinceCall === 0) return;
       const now = this.deps.now();
       if (this.lastCallAt !== undefined && now < this.lastCallAt + NOW_MIN_INTERVAL_MS) {
         this.schedule();
@@ -354,7 +383,7 @@ export class NowSummaryController {
 
     let usage: AdviceUsageSnapshot | undefined;
     let text = "";
-    const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve() };
+    const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve(), milestoneId, usage: undefined };
     // Registered BEFORE the async body runs: a pass that throws synchronously settles inside the
     // first synchronous stretch of the body, and settle() must find the registration to clear.
     this.inflight = call;
@@ -364,7 +393,7 @@ export class NowSummaryController {
           ...this.deps.pass,
           model: NOW_MODEL,
           systemPrompt: SYSTEM_PROMPT,
-          prompt: buildPrompt(title, frames),
+          prompt: buildPrompt(this.redact(title), frames),
           homePrefix: "uzi-now-",
           label: "now",
           timeoutMs: NOW_TIMEOUT_MS,
@@ -375,6 +404,7 @@ export class NowSummaryController {
           log: this.deps.log,
           onUsage: (u) => {
             usage = u;
+            call.usage = u;
           },
         });
       } catch (e) {
@@ -396,7 +426,7 @@ export class NowSummaryController {
   /** The call ended: post the text if the gate still holds, else only its usage. */
   private settle(call: InFlight, milestoneId: string, rawText: string, usage: AdviceUsageSnapshot | undefined): void {
     if (this.inflight === call) this.inflight = undefined;
-    const text = sanitizeNowText(rawText);
+    const text = sanitizeNowText(rawText, this.redact);
     // The same gate, evaluated now and synchronously with the emit below, plus: still the same
     // milestone, and this call was not aborted.
     const keep = text !== "" && !call.ctrl.signal.aborted && this.gate() && this.activeId === milestoneId;
@@ -408,14 +438,14 @@ export class NowSummaryController {
       });
       this.postedMilestone = milestoneId;
     } else if (usage && this.deps.steering.claimFence() === undefined) {
-      this.deps.emit({
-        kind: "progress_note",
-        agent: "worker",
-        payload: { text: "", milestone_id: milestoneId, model_usage: usage },
-      });
+      this.emitUsageOnly(milestoneId, usage);
     }
     this.syncEnabled();
     this.schedule();
+  }
+
+  private emitUsageOnly(milestoneId: string, usage: AdviceUsageSnapshot): void {
+    this.deps.emit({ kind: "progress_note", agent: "worker", payload: { text: "", milestone_id: milestoneId, model_usage: usage } });
   }
 
   /** Track the setting; on on-to-off after a note was posted, emit one empty "clear" note so open
