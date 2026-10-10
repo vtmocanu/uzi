@@ -47,7 +47,8 @@ const (
 	// frozen contract_revision (a #1227 revision bump raced the request, or the worker is stale).
 	CompletionDenyRevisionDrift = "revision_drift"
 	// CompletionDenyContractNotFrozen: the run is interlocked but its completion_contract is NULL
-	// — the split-state hazard (revision could be 1 with contract NULL if the Go builder errored).
+	// — the split-state hazard (revision could be 1 with contract NULL if the Go builder errored) —
+	// or unverifiable (corrupt, null criteria, or a frozen milestone with no criterion; #2259).
 	// FAIL-CLOSED: the permit is DENIED so a corrupt/unfrozen run holds rather than completing.
 	CompletionDenyContractNotFrozen = "contract_not_frozen"
 	// CompletionDenyMissingMilestones: one or more in-scope structural criteria are not declared
@@ -393,7 +394,8 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		unmet, verifiable = nil, true
 	}
 	if !verifiable {
-		// Split-state (contract NULL / corrupt while frozen): fail closed, hold, do not complete.
+		// Split-state or unverifiable contract (NULL, corrupt, null criteria, or a frozen milestone
+		// without a criterion): fail closed, hold, do not complete.
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyContractNotFrozen}, nil
 	}
 	if len(unmet) > 0 {

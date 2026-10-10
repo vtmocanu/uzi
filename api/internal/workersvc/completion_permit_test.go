@@ -85,7 +85,7 @@ func frozenJSON(t *testing.T, ids ...string) []byte {
 // split-state hazard.
 func TestComputeUnmetCriteria(t *testing.T) {
 	rev := pgtype.Int4{Int32: 1, Valid: true}
-	frozen := frozenJSON(t, "m1", "m2", "m3") // used only for the fail-closed frozen-id fallback
+	frozen := frozenJSON(t, "m1", "m2", "m3") // drives the fail-closed frozen-id fallback and the coverage check
 
 	t.Run("some unmet", func(t *testing.T) {
 		run := store.Run{
@@ -179,6 +179,27 @@ func TestComputeUnmetCriteria(t *testing.T) {
 				t.Fatalf("unmet = %v, want [m1 m2 m3]", unmet)
 			}
 		})
+	}
+
+	// Null criteria fail closed even with no frozen milestones (the coverage check is skipped
+	// there): only an explicit criteria:[] is the milestone-less vacuous shape (issue #2259).
+	for _, contract := range []string{`null`, `{}`, `{"profile":"structural","revision":1,"criteria":null}`} {
+		for _, fz := range []struct {
+			name string
+			raw  []byte
+		}{{"nil", nil}, {"empty", []byte("[]")}} {
+			t.Run("fail-closed: "+contract+" with frozen "+fz.name, func(t *testing.T) {
+				run := store.Run{
+					CompletionContractVersion: rev,
+					CompletionContract:        []byte(contract),
+					MilestonesFrozen:          fz.raw,
+				}
+				unmet, verifiable := computeUnmetCriteria(run)
+				if verifiable || len(unmet) != 0 {
+					t.Fatalf("got unmet=%v verifiable=%v, want [] false", unmet, verifiable)
+				}
+			})
+		}
 	}
 }
 
