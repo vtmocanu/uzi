@@ -87,10 +87,12 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 			t.Fatalf("CancelRunServerSide(%s) = %d, %v; want 1 row", id, n, err)
 		}
 	}
+	// Order matters: both card-less writes sit between the two positive controls, so a
+	// regressed stamp on either would fall inside the give-up window bounded below.
 	complete(issueDone)
 	complete(judgeRun)
-	cancel(issueCancelled)
 	cancel(promptRun)
+	cancel(issueCancelled)
 
 	// The marker itself, read straight off the rows.
 	for _, tc := range []struct {
@@ -114,7 +116,7 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 
 	// Crowding (issue #1966): ListGaveUpColumnMoves is ORDER BY move_pending_since LIMIT 100
 	// with no user or repo scope, and the serial live-DB suite leaves other tests' stamped rows
-	// behind. 100 card-bearing filler runs stamped before the fixtures reproduce that, so a
+	// behind. 100 card-bearing filler runs stamped earlier than the fixtures reproduce that, so a
 	// window not bounded by the fixtures' own stamps loses the positive control past the LIMIT.
 	fillerUser, fillerConn, fillerRepo := uuid.New(), uuid.New(), uuid.New()
 	t.Cleanup(func() {
@@ -147,8 +149,8 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 	// The query keeps only the oldest 100 rows in the window, unscoped, so bound the window
 	// by the positive controls' own stamps (> prior, <= giveup). The serial suite stamped
 	// every leftover row before these fixtures, so they fall outside it, and the positive
-	// control proves the window still returns rows, keeping the card-less absence checks
-	// meaningful.
+	// control proves the window still returns rows, and both card-less writes were stamped
+	// between the controls, keeping their absence checks meaningful.
 	var stamps []time.Time
 	for _, id := range []uuid.UUID{issueDone, issueCancelled} {
 		var ts time.Time
