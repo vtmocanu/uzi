@@ -19,18 +19,28 @@ const settings: UserSettings = {
   ],
 };
 
-it.each([390, 1100])("keeps one accessible Plan row in aligned checker columns at %ipx", async width => {
+it.each([390, 1100])("keeps accessible Plan and Code rows in aligned checker columns at %ipx", async width => {
   await page.viewport(width, 900);
   render(<div className="p-4"><CrossCheckDefaults settings={settings} onSaved={() => {}} /></div>);
   const table = screen.getByRole("table", { name: "Cross-check defaults" });
-  expect(within(table).getAllByRole("row")).toHaveLength(2);
-  const claude = screen.getByLabelText("Claude checker model");
-  const codex = screen.getByLabelText("Codex checker model");
+  expect(within(table).getAllByRole("row")).toHaveLength(3);
+  const claude = within(screen.getByRole("row", { name: /Plan cross-check/ })).getByLabelText("Claude checker model");
+  const codex = within(screen.getByRole("row", { name: /Plan cross-check/ })).getByLabelText("Codex checker model");
   expect(Math.abs(claude.getBoundingClientRect().top - codex.getBoundingClientRect().top)).toBeLessThan(1);
   expect(claude.getBoundingClientRect().right).toBeLessThanOrEqual(codex.getBoundingClientRect().left);
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
   expect(getComputedStyle(table.parentElement!).overflowX).toBe("auto");
-  const custom = screen.getByLabelText("Custom claude checker model ID") as HTMLInputElement;
+  const code = within(screen.getByRole("row", { name: /Code cross-check/ }));
+  const codeClaude = code.getByLabelText("Claude checker model");
+  const codeCodex = code.getByLabelText("Codex checker model");
+  expect(Math.abs(codeClaude.getBoundingClientRect().top - codeCodex.getBoundingClientRect().top)).toBeLessThan(1);
+  expect(Math.abs(codeClaude.getBoundingClientRect().left - claude.getBoundingClientRect().left)).toBeLessThan(1);
+  expect(Math.abs(codeCodex.getBoundingClientRect().left - codex.getBoundingClientRect().left)).toBeLessThan(1);
+  expect(codeClaude.getBoundingClientRect().top).toBeGreaterThan(claude.getBoundingClientRect().bottom);
+  codeCodex.focus();
+  expect(document.activeElement).toBe(codeCodex);
+  expect((codeCodex as HTMLSelectElement).disabled).toBe(false);
+  const custom = screen.getByLabelText("Custom plan claude checker model ID") as HTMLInputElement;
   expect(custom.disabled).toBe(false);
   custom.focus();
   expect(document.activeElement).toBe(custom);

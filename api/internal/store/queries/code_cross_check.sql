@@ -154,6 +154,17 @@ WHERE lead.id = cc.lead_run_id AND child.id = cc.checker_run_id
  AND child.status IN ('completed','failed','cancelled')
 RETURNING cc.*;
 
+-- name: FinalizeCodeCrossCheckDispositions :one
+UPDATE cross_checks cc SET dispositions = @dispositions::jsonb, finalized_at = now()
+FROM runs lead
+WHERE lead.id = cc.lead_run_id AND lead.id = @lead_run_id
+ AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
+ AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND cc.lead_claim_generation = lead.claim_generation
+ AND cc.stage = 'code' AND cc.outcome = 'completed' AND cc.decided_at IS NOT NULL
+ AND cc.interrupted_at IS NULL AND cc.finalized_at IS NULL AND cc.dispositions IS NULL
+RETURNING cc.*;
+
 -- name: ListCodeCrossChecksToSettle :many
 SELECT lead.id, lead.worker_id, lead.claim_generation FROM runs lead
 JOIN cross_checks cc ON cc.lead_run_id = lead.id

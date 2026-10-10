@@ -8,11 +8,14 @@ import { ModelSelect } from "./ModelSelect";
 import { EffortSelect } from "./EffortSelect";
 
 const families = ["claude", "codex"] as const;
-type Draft = Record<Harness, { model: string; effort: string }>;
+const stages = ["plan", "code"] as const;
+type Stage = typeof stages[number];
+type Draft = Record<`${Stage}/${Harness}`, { model: string; effort: string }>;
+const cells = stages.flatMap(stage => families.map(harness => ({ stage, harness, key: `${stage}/${harness}` as const })));
 function stored(settings: UserSettings): Draft {
-  return Object.fromEntries(families.map(harness => {
-    const pin = settings.cross_check_pins?.find(p => p.stage === "plan" && p.harness === harness);
-    return [harness, { model: pin?.model ?? "", effort: pin?.effort ?? "" }];
+  return Object.fromEntries(cells.map(({ stage, harness, key }) => {
+    const pin = settings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness);
+    return [key, { model: pin?.model ?? "", effort: pin?.effort ?? "" }];
   })) as Draft;
 }
 
@@ -23,15 +26,15 @@ export function CrossCheckDefaults({ settings, onSaved }: {
   const [saved, setSaved] = useState(() => stored(settings));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const warnings = families.map(h => checkerModelWarning(draft[h].model, h)).filter(Boolean);
-  const dirty = families.some(h => normalizeCheckerValue(draft[h].model) !== saved[h].model || draft[h].effort !== saved[h].effort);
+  const warnings = cells.map(({ harness, key }) => checkerModelWarning(draft[key].model, harness)).filter(Boolean);
+  const dirty = cells.some(({ key }) => normalizeCheckerValue(draft[key].model) !== saved[key].model || draft[key].effort !== saved[key].effort);
   const save = async () => {
     setError("");
     setBusy(true);
     const cross_check_pins: NonNullable<UserSettingsPatch["cross_check_pins"]> = [];
-    for (const harness of families) {
-      const cell = draft[harness], previous = saved[harness];
-      const patch: NonNullable<UserSettingsPatch["cross_check_pins"]>[number] = { stage: "plan", harness };
+    for (const { stage, harness, key } of cells) {
+      const cell = draft[key], previous = saved[key];
+      const patch: NonNullable<UserSettingsPatch["cross_check_pins"]>[number] = { stage, harness };
       if (normalizeCheckerValue(cell.model) !== previous.model) patch.model = normalizeCheckerValue(cell.model) || null;
       if (cell.effort !== previous.effort) patch.effort = cell.effort || null;
       if ("model" in patch || "effort" in patch) cross_check_pins.push(patch);
@@ -51,20 +54,21 @@ export function CrossCheckDefaults({ settings, onSaved }: {
     <fieldset disabled={busy} className="min-w-0 overflow-x-auto">
       <table aria-label="Cross-check defaults" aria-describedby="checker-default-help" className="w-full text-sm">
         <thead><tr><th scope="col">Cross-check</th><th scope="col">Claude cross-checker</th><th scope="col">Codex cross-checker</th></tr></thead>
-        <tbody><tr><th scope="row">Plan cross-check</th>{families.map(harness => {
-          const workerModel = settings.cross_check_pins?.find(p => p.stage === "plan" && p.harness === harness)?.worker_default_model;
+        <tbody>{stages.map(stage => <tr key={stage}><th scope="row">{stage === "plan" ? "Plan" : "Code"} cross-check</th>{families.map(harness => {
+          const key = `${stage}/${harness}` as const;
+          const workerModel = settings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness)?.worker_default_model;
           const workerEffort = (harness === "claude" ? settings.default_effort : settings.default_codex_effort) || "medium";
-          const change = (field: "model" | "effort", value: string) => setDraft(d => ({ ...d, [harness]: { ...d[harness], [field]: value } }));
+          const change = (field: "model" | "effort", value: string) => setDraft(d => ({ ...d, [key]: { ...d[key], [field]: value } }));
           return <td key={harness} className="min-w-56 align-top p-2">
-            <label htmlFor={`checker-${harness}-model`}>{harness === "claude" ? "Claude" : "Codex"} checker model</label>
-            <ModelSelect id={`checker-${harness}-model`} harness={harness} allowCustom value={draft[harness].model}
-              customAriaLabel={`Custom ${harness} checker model ID`} onChange={v => change("model", v)}
+            <label htmlFor={`checker-${stage}-${harness}-model`}>{harness === "claude" ? "Claude" : "Codex"} checker model</label>
+            <ModelSelect id={`checker-${stage}-${harness}-model`} harness={harness} allowCustom value={draft[key].model}
+              customAriaLabel={`Custom ${stage} ${harness} checker model ID`} onChange={v => change("model", v)}
               defaultLabel={`Default · ${workerModel === undefined || (workerModel === null && harness === "codex") ? "Unavailable" : workerModel ?? "SDK/account default"} (worker default)`} />
-            <label htmlFor={`checker-${harness}-effort`}>{harness === "claude" ? "Claude" : "Codex"} checker effort</label>
-            <EffortSelect id={`checker-${harness}-effort`} value={draft[harness].effort} onChange={v => change("effort", v)}
+            <label htmlFor={`checker-${stage}-${harness}-effort`}>{harness === "claude" ? "Claude" : "Codex"} checker effort</label>
+            <EffortSelect id={`checker-${stage}-${harness}-effort`} value={draft[key].effort} onChange={v => change("effort", v)}
               defaultLabel={`Default · ${workerEffort} (worker default)`} />
           </td>;
-        })}</tr></tbody>
+        })}</tr>)}</tbody>
       </table>
     </fieldset>
     {error && <Alert message={error} />}

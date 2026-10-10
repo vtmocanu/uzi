@@ -1,9 +1,9 @@
 -- name: ListUserCrossCheckPins :many
--- Read both cells, pins and worker defaults in one statement snapshot.
+-- Read all four stage-local cells, pins and worker defaults in one statement snapshot.
 SELECT cells.stage, cells.harness, p.model, p.effort,
     u.default_claude_model, u.default_codex_model, u.default_effort, u.default_codex_effort,
     template.model AS template_model
-FROM users u CROSS JOIN (SELECT 'plan'::text AS stage, 'claude'::text AS harness UNION ALL SELECT 'plan', 'codex') cells
+FROM users u CROSS JOIN (SELECT 'plan'::text AS stage, 'claude'::text AS harness UNION ALL SELECT 'plan', 'codex' UNION ALL SELECT 'code', 'claude' UNION ALL SELECT 'code', 'codex') cells
 LEFT JOIN user_cross_check_pins p ON p.user_id = u.id AND p.stage = cells.stage AND p.harness = cells.harness
 LEFT JOIN LATERAL (
     SELECT t.model FROM agent_templates t
@@ -17,7 +17,7 @@ LEFT JOIN LATERAL (
     ORDER BY t.name LIMIT 1
 ) template ON true
 WHERE u.id = @user_id
-ORDER BY 1, 2;
+ORDER BY CASE cells.stage WHEN 'plan' THEN 0 ELSE 1 END, cells.harness;
 
 -- name: PatchUserCrossCheckPin :exec
 INSERT INTO user_cross_check_pins (user_id, stage, harness, model, effort)

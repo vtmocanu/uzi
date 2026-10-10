@@ -130,7 +130,7 @@ func TestCrossCheckPinOppositeOrderSavesLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(pins) != 2 || pins[0].Model.String != "haiku" || !pins[0].Model.Valid ||
+			if len(pins) != 4 || pins[0].Model.String != "haiku" || !pins[0].Model.Valid ||
 				pins[0].Effort.String != "high" || !pins[0].Effort.Valid ||
 				pins[1].Model.Valid || pins[1].Effort.String != "xhigh" || !pins[1].Effort.Valid {
 				t.Fatalf("concurrent saves lost omitted fields or explicit null: %+v", pins)
@@ -183,7 +183,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		metadataCells(t, rec)
-		if len(response.Settings.Pins) != 2 {
+		if len(response.Settings.Pins) != 4 {
 			t.Fatalf("cells: %+v", response)
 		}
 		return response.Settings.Pins
@@ -223,7 +223,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	for _, body := range []string{
 		`{"cross_check_pins":[{"stage":"plan","harness":"claude","worker_default_model":null}]}`,
 		`{"cross_check_pins":null}`, `{"cross_check_pins":{}}`,
-		`{"cross_check_pins":[{"stage":"code","harness":"codex"}]}`,
+		`{"cross_check_pins":[{"stage":"unknown","harness":"codex"}]}`,
 		`{"cross_check_pins":[{"stage":"plan","harness":"other"}]}`,
 		`{"cross_check_pins":[{"stage":"plan","harness":"codex"},{"stage":"plan","harness":"codex"}]}`,
 		`{"default_effort":"low","cross_check_pins":[{"stage":"plan","harness":"claude","model":"haiku"},{"stage":"plan","harness":"codex","model":"sonnet"}]}`,

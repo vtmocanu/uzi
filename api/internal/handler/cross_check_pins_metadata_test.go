@@ -31,10 +31,17 @@ func metadataCells(t *testing.T, rec *httptest.ResponseRecorder) []crossCheckPin
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw.Settings.Pins) != 2 {
-		t.Fatalf("expected both cells: %s", rec.Body.String())
+	if len(raw.Settings.Pins) != 4 {
+		t.Fatalf("expected four cells: %s", rec.Body.String())
 	}
-	for i, harness := range []string{"claude", "codex"} {
+	for i, harness := range []string{"claude", "codex", "claude", "codex"} {
+		stage := "plan"
+		if i >= 2 {
+			stage = "code"
+		}
+		if string(raw.Settings.Pins[i]["stage"]) != "\""+stage+"\"" {
+			t.Fatalf("cell %d stage: %v", i, raw.Settings.Pins[i])
+		}
 		if string(raw.Settings.Pins[i]["harness"]) != "\""+harness+"\"" {
 			t.Fatalf("cell %d: %v", i, raw.Settings.Pins[i])
 		}
@@ -87,6 +94,8 @@ func TestCrossCheckMetadataSettings(t *testing.T) {
 			}
 			assertMetadataModel(t, cells[0].WorkerDefaultModel, claude)
 			assertMetadataModel(t, cells[1].WorkerDefaultModel, codex)
+			assertMetadataModel(t, cells[2].WorkerDefaultModel, claude)
+			assertMetadataModel(t, cells[3].WorkerDefaultModel, codex)
 		}
 	}
 }
@@ -282,7 +291,7 @@ func TestCrossCheckMetadataNativeLocaleDiscriminatorLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(rows) != 2 || rows[0].TemplateModel != first.Model {
+			if len(rows) != 4 || rows[0].TemplateModel != first.Model || rows[2].TemplateModel != first.Model {
 				t.Fatalf("settings SQL disagrees with claim delivery: %+v vs %+v", rows, first)
 			}
 			rec := httptest.NewRecorder()

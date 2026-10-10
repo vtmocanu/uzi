@@ -65,9 +65,9 @@ func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTa
 func (f *fakeSettingsDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 	if strings.Contains(sql, "-- name: ListUserCrossCheckPins") {
 		rows := &fakeNotifRows{}
-		for _, harness := range []string{"claude", "codex"} {
+		for _, cell := range []struct{ stage, harness string }{{"plan", "claude"}, {"plan", "codex"}, {"code", "claude"}, {"code", "codex"}} {
 			rows.scans = append(rows.scans, func(dest ...any) error {
-				*dest[0].(*string), *dest[1].(*string) = "plan", harness
+				*dest[0].(*string), *dest[1].(*string) = cell.stage, cell.harness
 				values := []pgtype.Text{{}, {}, f.claudeModel, f.codexModel, f.effort, f.codexEffort, {}}
 				for i, v := range values {
 					*dest[i+2].(*pgtype.Text) = v

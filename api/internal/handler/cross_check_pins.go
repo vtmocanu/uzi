@@ -29,8 +29,8 @@ func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchU
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
-	if err := d.Decode(&cells); err != nil || cells == nil || len(cells) > 2 {
-		return nil, fmt.Errorf("cross_check_pins: expected at most two keyed cells")
+	if err := d.Decode(&cells); err != nil || cells == nil || len(cells) > 4 {
+		return nil, fmt.Errorf("cross_check_pins: expected at most four keyed cells")
 	}
 	if err := d.Decode(new(any)); err != io.EOF {
 		return nil, fmt.Errorf("cross_check_pins: invalid list")
@@ -39,7 +39,7 @@ func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchU
 	patches := make([]store.PatchUserCrossCheckPinParams, 0, len(cells))
 	for _, c := range cells {
 		key := c.Stage + "/" + c.Harness
-		if c.Stage != "plan" {
+		if c.Stage != "plan" && c.Stage != "code" {
 			return nil, fmt.Errorf("cross_check_pins %s stage: unknown stage", key)
 		}
 		if c.Harness != "claude" && c.Harness != "codex" {

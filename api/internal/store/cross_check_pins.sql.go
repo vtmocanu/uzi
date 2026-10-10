@@ -87,7 +87,7 @@ const listUserCrossCheckPins = `-- name: ListUserCrossCheckPins :many
 SELECT cells.stage, cells.harness, p.model, p.effort,
     u.default_claude_model, u.default_codex_model, u.default_effort, u.default_codex_effort,
     template.model AS template_model
-FROM users u CROSS JOIN (SELECT 'plan'::text AS stage, 'claude'::text AS harness UNION ALL SELECT 'plan', 'codex') cells
+FROM users u CROSS JOIN (SELECT 'plan'::text AS stage, 'claude'::text AS harness UNION ALL SELECT 'plan', 'codex' UNION ALL SELECT 'code', 'claude' UNION ALL SELECT 'code', 'codex') cells
 LEFT JOIN user_cross_check_pins p ON p.user_id = u.id AND p.stage = cells.stage AND p.harness = cells.harness
 LEFT JOIN LATERAL (
     SELECT t.model FROM agent_templates t
@@ -101,7 +101,7 @@ LEFT JOIN LATERAL (
     ORDER BY t.name LIMIT 1
 ) template ON true
 WHERE u.id = $1
-ORDER BY 1, 2
+ORDER BY CASE cells.stage WHEN 'plan' THEN 0 ELSE 1 END, cells.harness
 `
 
 type ListUserCrossCheckPinsRow struct {
@@ -116,7 +116,7 @@ type ListUserCrossCheckPinsRow struct {
 	TemplateModel      pgtype.Text `json:"template_model"`
 }
 
-// Read both cells, pins and worker defaults in one statement snapshot.
+// Read all four stage-local cells, pins and worker defaults in one statement snapshot.
 func (q *Queries) ListUserCrossCheckPins(ctx context.Context, userID uuid.UUID) ([]ListUserCrossCheckPinsRow, error) {
 	rows, err := q.db.Query(ctx, listUserCrossCheckPins, userID)
 	if err != nil {

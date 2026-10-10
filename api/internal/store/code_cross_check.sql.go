@@ -507,6 +507,78 @@ func (q *Queries) FailDeadCodeCrossCheckChild(ctx context.Context, arg FailDeadC
 	return i, err
 }
 
+const finalizeCodeCrossCheckDispositions = `-- name: FinalizeCodeCrossCheckDispositions :one
+UPDATE cross_checks cc SET dispositions = $1::jsonb, finalized_at = now()
+FROM runs lead
+WHERE lead.id = cc.lead_run_id AND lead.id = $2
+ AND lead.worker_id = $3 AND lead.claim_generation = $4
+ AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND cc.lead_claim_generation = lead.claim_generation
+ AND cc.stage = 'code' AND cc.outcome = 'completed' AND cc.decided_at IS NOT NULL
+ AND cc.interrupted_at IS NULL AND cc.finalized_at IS NULL AND cc.dispositions IS NULL
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+`
+
+type FinalizeCodeCrossCheckDispositionsParams struct {
+	Dispositions    []byte      `json:"dispositions"`
+	LeadRunID       uuid.UUID   `json:"lead_run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+func (q *Queries) FinalizeCodeCrossCheckDispositions(ctx context.Context, arg FinalizeCodeCrossCheckDispositionsParams) (CrossCheck, error) {
+	row := q.db.QueryRow(ctx, finalizeCodeCrossCheckDispositions,
+		arg.Dispositions,
+		arg.LeadRunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	var i CrossCheck
+	err := row.Scan(
+		&i.ID,
+		&i.LeadRunID,
+		&i.Stage,
+		&i.Round,
+		&i.LeadClaimGeneration,
+		&i.PlanMd,
+		&i.Milestones,
+		&i.RequiredCapabilities,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.BaseCommit,
+		&i.PlanningDiff,
+		&i.CandidateDigest,
+		&i.CheckerRunID,
+		&i.CheckerHarness,
+		&i.CheckerModel,
+		&i.CheckerEffort,
+		&i.Verdict,
+		&i.ReasonClass,
+		&i.Findings,
+		&i.DecidedAt,
+		&i.DeadlineAt,
+		&i.CreatedAt,
+		&i.CheckerModelSource,
+		&i.CheckerEffortSource,
+		&i.AutomaticRevisionLimit,
+		&i.AutomaticRoundsEnabled,
+		&i.InterruptedAt,
+		&i.WaitCredited,
+		&i.HeadCommit,
+		&i.Outcome,
+		&i.CodeContext,
+		&i.GuidanceSnapshot,
+		&i.GuidanceText,
+		&i.GuidanceDigest,
+		&i.RepoInstructionsEnabled,
+		&i.RepoInstructionsText,
+		&i.RepoInstructionsDigest,
+		&i.Dispositions,
+		&i.FinalizedAt,
+	)
+	return i, err
+}
+
 const getCodeCrossCheck = `-- name: GetCodeCrossCheck :one
 SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at FROM cross_checks WHERE lead_run_id = $1 AND stage = 'code' FOR UPDATE
 `

@@ -20,6 +20,7 @@ type CodeCrossCheck struct {
 	Outcome             string          `json:"outcome"`
 	ReasonClass         *string         `json:"reason_class"`
 	Findings            json.RawMessage `json:"findings"`
+	Dispositions        json.RawMessage `json:"dispositions"`
 	InterruptedAt       *time.Time      `json:"interrupted_at"`
 	FinalizedAt         *time.Time      `json:"finalized_at"`
 	DeadlineAt          time.Time       `json:"deadline_at"`

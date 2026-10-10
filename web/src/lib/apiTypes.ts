@@ -133,7 +133,7 @@ export interface SecretMeta {
 // the per-user UI theme override; null means "use the instance default" (PRD
 // #21).
 export interface CrossCheckPinDTO {
-  stage: "plan";
+  stage: "plan" | "code";
   harness: Harness;
   model: string | null;
   effort: string | null;
@@ -210,7 +210,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
-  cross_check_pins?: { stage: "plan"; harness: Harness; model?: string | null; effort?: string | null }[];
+  cross_check_pins?: { stage: "plan" | "code"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
    *  send this. Kept only for the bounded stale-client bridge, where the server routes it
