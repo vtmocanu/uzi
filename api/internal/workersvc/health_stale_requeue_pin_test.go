@@ -148,9 +148,11 @@ func TestHealthStaleRequeuePinExpiryStartsNewEpisode(t *testing.T) {
 	}
 }
 
-// A locked vault is more fundamental than the pin: the run cannot start whoever returns.
+// A locked vault is more fundamental than the pin: the run cannot start whoever returns. Past the
+// queued threshold (10m) the vault reason wins over the pin reason.
 func TestHealthStaleRequeuePinVaultLockedWins(t *testing.T) {
 	r := pinnedRun()
+	r.StatusSince = ago(15 * time.Minute) // past the 10m threshold, inside the 20m grace
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc, _ := pinSvc(fs, defaultHealthSettings())
 	svc.SetVault(vault.New(newBox(t), newMemVaultStore())) // r.UserID never unlocked
@@ -158,6 +160,51 @@ func TestHealthStaleRequeuePinVaultLockedWins(t *testing.T) {
 	svc.detectRunHealth(context.Background(), t0)
 	if got := lastWrite(t, fs, r.ID).HealthReason.String; got != reasonVaultLocked {
 		t.Fatalf("reason = %q, want %q", got, reasonVaultLocked)
+	}
+}
+
+// Below the queued threshold only the pin reason bypasses the age gate: a pinned run with a
+// locked vault stays ok, exactly like an unpinned one, so no vault flag or nudge fires on tick 1.
+func TestHealthStaleRequeuePinYoungRunWithLockedVaultStaysOK(t *testing.T) {
+	r := pinnedRun() // 1m old
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc, b := pinSvc(fs, defaultHealthSettings())
+	svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+
+	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
+		t.Fatalf("changed = %d, want 0; writes=%v", n, fs.writes)
+	}
+	if len(b.healthNudges) != 0 {
+		t.Fatalf("nudged a young pinned run with a locked vault: %v", b.healthNudges)
+	}
+}
+
+// The grace bound is exclusive and the ceiling bound inclusive (the SQL comparisons
+// status_since > cutoff, updated_at >= affinity cutoff), at the exact instants.
+func TestStaleRequeuePinBoundaryInstants(t *testing.T) {
+	svc, _ := pinSvc(&healthFakeStore{}, defaultHealthSettings())
+
+	r := pinnedRun()
+	r.StatusSince = ago(0)
+	graceEnd := t0.Add(pinTestGrace)
+	if _, pinned := svc.staleRequeuePin(graceEnd, r); pinned {
+		t.Fatal("pinned at exactly graceEnd, want released (grace bound exclusive)")
+	}
+	if _, pinned := svc.staleRequeuePin(graceEnd.Add(-time.Nanosecond), r); !pinned {
+		t.Fatal("not pinned just before graceEnd")
+	}
+
+	// Ceiling shorter than the grace: the hold ends at updated_at + ceiling, inclusive.
+	svc.p.WorkerAffinityCeiling = 5 * time.Minute
+	r2 := pinnedRun()
+	r2.StatusSince = ago(0)
+	r2.UpdatedAt = ago(0)
+	ceilingEnd := t0.Add(5 * time.Minute)
+	if until, pinned := svc.staleRequeuePin(ceilingEnd, r2); !pinned || !until.Equal(ceilingEnd) {
+		t.Fatalf("at exactly ceilingEnd: pinned=%v until=%v, want pinned until %v (ceiling inclusive)", pinned, until, ceilingEnd)
+	}
+	if _, pinned := svc.staleRequeuePin(ceilingEnd.Add(time.Nanosecond), r2); pinned {
+		t.Fatal("pinned after ceilingEnd")
 	}
 }
 

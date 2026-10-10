@@ -127,7 +127,8 @@ const (
 	// sweeper requeued and ClaimRun is still holding for its returning worker. Unlike its fixed
 	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
 	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns carries the same literal in SQL
-	// (pinned in sync by a store test). No other reason starts with it.
+	// (pinned in sync by a workersvc test,
+	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). No other reason starts with it.
 	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
@@ -517,13 +518,21 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		if th.queued == 0 {
 			return healthOK, ""
 		}
-		// Issue #2705: a run held for its returning worker is explained from the first tick of
-		// the hold, not after the queued threshold: it bypasses the age gate and queuedReason
-		// resolves it (th.queued == 0 above still switches every queued flag off).
-		if _, pinned := s.staleRequeuePin(now, r); !pinned && !olderThan(now, r.StatusSince, th.queued) {
+		// Issue #2705: a run held for its returning worker is explained from the first tick of the
+		// hold, not after the queued threshold. Below the threshold ONLY the pin reason bypasses
+		// the age gate: any other reason queuedReason resolves (vault, custody, codex, egress)
+		// stays quiet until th.queued, exactly as for an unpinned run. th.queued == 0 above still
+		// switches every queued flag off.
+		if !olderThan(now, r.StatusSince, th.queued) {
+			if _, pinned := s.staleRequeuePin(now, r); !pinned {
+				return healthOK, ""
+			}
+			if reason := s.queuedReason(ctx, now, r); isStaleRequeuePinReason(reason) {
+				return healthWaitingWorker, reason
+			}
 			return healthOK, ""
 		}
-		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
+		// Every reason is resolved in queuedReason, most-fundamental
 		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
 		// re-label, then the fleet reasons). The flag is always healthWaitingWorker; only the
 		// reason string differs, so healthSince's "stuck for Xm" preservation keeps working.
@@ -1007,7 +1016,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// admitted at/over the cap, so it never gets the custody reason; a run already holding
 	// custodyHoldLimit holds of its own is not exempt and gets it like new work. A non-positive limit DISABLES the gate on the claim
 	// side too, so this rung stays silent then. The per-run read sits behind the
-	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read error
+	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick except for a run held by
+	// the stale-requeue pin below that threshold (healthTargetFor computes queuedReason for it, once per
+	// tick until its grace ends); a read error
 	// falls through to the generic reasons below rather than inventing a reason on a failed
 	// lookup (the conservative degrade the sibling per-run lookups use).
 	if custodyHoldLimit > 0 {

@@ -9215,7 +9215,7 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- whose stale_requeue_generation equals claim_generation); the time half (status_since + the
 -- grace, capped by updated_at + the affinity ceiling) is computed in Go (staleRequeuePin)
 -- from the status_since and updated_at already projected here. COALESCE keeps a NULL
--- stale_requeue_generation false rather than NULL. The name is the owner worker's, '' when the
+-- stale_requeue_generation false rather than NULL. The name is the owner worker's, an empty string when the
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
@@ -10680,6 +10680,12 @@ FROM runs r
 WHERE r.health = 'waiting_worker'
   AND r.kind <> 'cross_check'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+  -- Issue #2705: during the stale-requeue grace a run is explicitly held for its returning owner
+  -- (workersvc reasonStaleRequeuePinPrefix, 'waiting until ...'), so it is not a capacity failure
+  -- yet. health_since is stamped at the requeue, so without this the 5m danger threshold would fire
+  -- inside the grace, clear at the pin exit and fire again. Excluding the pin row makes the age run
+  -- from the pin-exit restamp. A NULL health_reason must stay included, hence the COALESCE.
+  AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -10699,7 +10705,8 @@ WHERE health = 'waiting_worker'
   -- Issue #2705 M3: a run held for its returning worker (workersvc reasonStaleRequeuePinPrefix,
   -- 'waiting until ...') is expected waiting, not a queue.waiting age signal. Only a positively
   -- identified pin row is excluded; waiting_worker rows with a NULL health_reason must stay
-  -- included, which is why this is NOT COALESCE(LIKE, false) and not a bare NOT LIKE (NULL).
+  -- included: the LIKE is wrapped in COALESCE(..., false) under the NOT rather than written as a
+  -- bare NOT LIKE (which is NULL for a NULL reason).
   AND NOT COALESCE(health_reason LIKE 'waiting until %', false)
 ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id;
 
