@@ -91,6 +91,10 @@ jobs:
       # explicit for the docker-container builder (current Compose also exports them
       # locally). No login and no registry write: the cache refs are public and
       # nothing is pushed.
+      # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
+      # back to Docker Hub on a mirror miss, and buildx uses the local copy if its own pull fails.
+      - name: Pre-pull the BuildKit image (mirror first, Docker Hub fallback)
+        run: ./scripts/docker-pull-fallback.sh moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           buildkitd-config-inline: |
