@@ -2821,8 +2821,8 @@ tasks:
     # web/nginx.mock.conf and the chart's rendered web-configmap.yaml) beside a stub api, and
     # checks gzip, Cache-Control and security headers on real responses. Requires a working
     # docker daemon plus helm, yq and curl. NOT wired into gate, gate:repo or gate:web
-    # (gate:repo does not require Docker or Helm); CI wiring is the maintainer-local
-    # follow-up #2663. Exit 2 means the instrument is broken, 1 means a property failed, and
+    # (gate:repo does not require Docker or Helm); CI runs it in the path-filtered
+    # test-web-nginx job (#2663). Exit 2 means the instrument is broken, 1 means a property failed, and
     # task reports either failure as 201.
     cmds:
       - ./scripts/assert-web-nginx.sh
