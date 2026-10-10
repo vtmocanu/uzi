@@ -594,11 +594,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes, validate-agent]
-    # TEMP #2637 validation push A (old condition); removed before merge.
+    # TEMP #2637 validation push B (fix); removed by push C, the final head.
     # changes deliberately skips on main pushes. Override dependency skip propagation,
     # but never run after failed validation or a failed PR path-filter job.
+    # !cancelled(), not always(): an always() job ignores cancel-in-progress, so a
+    # superseded run kept it going ~8 min and held the next run in the group (#2637).
     if: >-
-      always() && needs.validate-agent.result == 'success' &&
+      !cancelled() && needs.validate-agent.result == 'success' &&
       (github.event_name == 'push' ||
       (github.event_name == 'pull_request' && needs.changes.result == 'success' &&
       needs.changes.outputs.worker_uid == 'true'))
