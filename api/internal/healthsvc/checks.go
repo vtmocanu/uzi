@@ -47,6 +47,7 @@ var checkMeta = map[string]struct {
 	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
 	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
 	"db":                 {"instance", groupControl, "Database", ""},
+	"db.size":            {"instance", groupControl, "Database size", "admin-health"},
 	"loops":              {"instance", groupControl, "Background loops", ""},
 	"forge.sync":         {"owner", groupIntegrations, "Forge issue sync", ""},
 	"forge.ciwatch":      {"owner", groupIntegrations, "CI watch capacity", ""},

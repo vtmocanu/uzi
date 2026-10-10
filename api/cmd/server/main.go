@@ -1101,6 +1101,7 @@ func run() error {
 		Store:                      q,
 		Pool:                       pool,
 		DiskFull:                   diskFull,
+		DBStorageCapacityBytes:     cfg.DBStorageCapacityBytes,
 		Settings:                   settingsCache,
 		SlackState:                 slackManager.State,
 		Now:                        time.Now,
