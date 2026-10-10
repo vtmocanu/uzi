@@ -24,7 +24,7 @@ const literal = wire.ack.completed_publication_receipt;
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
 const feature = "recovery_completed_publication_v1";
 
-async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "reserve" = "journal") {
+async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "reserve" = "journal", guarded = true) {
   const root = await fs.mkdtemp(path.join(scratch, "completion-test-"));
   const events: string[] = [];
   const sent: StateRequest[] = [];
@@ -33,7 +33,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   let retirement: { ownership: unknown; custody: unknown } | undefined;
   const branch = kind === "self_improve" ? "uzi/self-improve/" + literal.run_id : literal.branch;
   const receipt = { ...literal, branch };
-  const claim = makeClaim({ run_id: receipt.run_id, claim_generation: 1, inventory_guarded: true,
+  const claim = makeClaim({ run_id: receipt.run_id, claim_generation: 1, inventory_guarded: guarded,
     kind, issue_iid: 7, branch,
     repo: { ...makeClaim().repo, id: literal.repo_id, forge_type: "gitlab" } });
   mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
@@ -47,7 +47,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
         return Response.json(retirement?.custody ?? {});
       }
       if (url.pathname.endsWith("/recovery-holds")) return Response.json({ run_id: receipt.run_id,
-        holds: released ? [] : [{ hold_id: receipt.hold_id, generation: receipt.generation, inventory_guarded: true, has_available_capture: false }] });
+        holds: released || !guarded ? [] : [{ hold_id: receipt.hold_id, generation: receipt.generation, inventory_guarded: true, has_available_capture: false }] });
       if (url.pathname.endsWith("/state")) {
         const body = JSON.parse(String(init?.body)) as StateRequest;
         events.push("state:" + body.status);
@@ -73,7 +73,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   const recovery = new RecoveryCoordinator({ recoveryRoot: git.recoveryRoot, git, client,
     workerToken: "completion-worker-fixture", log: nullLogger() });
   const record = await recovery.pin({ runId: receipt.run_id, generation: 1, sourceSha: "b".repeat(40),
-    inventoryGuarded: true, branch, kind });
+    inventoryGuarded: guarded, branch, kind });
   assert.ok(record);
   const rawWrite: RawWriteSeam | undefined = mode === "reserve" ? async (write, ctx) => {
     if (ctx.kind === "terminal") throw Object.assign(new Error("full"), { code: "ENOSPC" });
@@ -86,7 +86,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     "completion-worker-fixture", { recovery, outbox });
   const body: StateRequest = { ...wire.request, branch };
   const flight = {
-    runId: receipt.run_id, claimGeneration: 1, inventoryGuarded: true, runKind: kind,
+    runId: receipt.run_id, claimGeneration: 1, inventoryGuarded: guarded, runKind: kind,
     terminalResolved: false, completionSendAttempted: false, successfulPushedSha: literal.final_head,
     batcher: { currentSeq: () => 7, close: async () => {}, awaitPermanentFailureSettled: async () => {}, emit: () => events.push("failed-feed") },
     runLog: nullLogger(), redactText: (text: string) => text, executor: {}, cancel: new AbortController(),
@@ -207,6 +207,8 @@ for (const inventory of ["pending", "absent"] as const) {
         assert.equal(await f.outbox!.readTerminalJournal(f.receipt.run_id, 1), undefined);
         assert.equal(f.outbox!.listPendingFinalizeGenerations(true).length, 0);
         assert.equal(await f.recovery.hasPersistedCompletionReceipt(f.receipt.run_id, 1), false);
+        assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(f.receipt.run_id + ":1"), false,
+          "Unit 1: actual discard retirement detaches nonreceipt provenance");
       } finally { await f.close(); }
     });
   }
@@ -414,7 +416,7 @@ it("persistence failure blocks finalize retirement as well as terminal retiremen
   try {
     t.mock.method(f.recovery, "persistCompletionReceipt", async () => false);
     let retired = false;
-    t.mock.method(f.outbox!, "retireFinalize", async () => { retired = true; });
+    t.mock.method(f.outbox!, "retireFinalize", async () => { retired = true; return true; });
     await f.terminal();
     await (f.run as unknown as { retireFinalizeRecord(f: unknown, site: string): Promise<void> })
       .retireFinalizeRecord(f.flight, "test");
@@ -459,6 +461,219 @@ describe("P1-a/c: 4097 authenticated completing generations reclaim bindings thr
     assert.equal(f.sent.some(body => body.status === "failed"), false);
   });
 });
+
+it("Unit 1: eligible unguarded failed generation detaches only after runner retirement", async () => {
+  const f = await fixture("issue", "journal", false);
+  try {
+    await discardInventory(f, "absent");
+    f.retirement({ ...terminalOwnership(false), status: "failed" }, discardAuthority(f));
+    assert.equal((await f.client.reportState(literal.run_id, f.body)).completedPublicationReceipt, undefined,
+      "unguarded provenance still refuses a completion receipt");
+    await f.outbox!.journalTerminal(literal.run_id, 1, "running", 7, { status: "failed" });
+    const claims = Reflect.get(f.client, "completionClaims") as Map<string, unknown>;
+    assert.equal(claims.has(literal.run_id + ":1"), true);
+    const reports = f.run.protectRecoveryTerminalDeps({ outbox: f.outbox!, client: f.client,
+      gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }).outbox;
+    assert.equal(await reports.retireTerminal(literal.run_id, 1), true);
+    assert.equal(await f.outbox!.confirmReportsAbsent(literal.run_id, 1), true);
+    assert.equal(claims.has(literal.run_id + ":1"), false);
+    assert.equal((Reflect.get(f.client, "completionHolds") as Map<string, unknown>).has(literal.run_id + ":1"), false);
+  } finally { await f.close(); }
+});
+
+it("Unit 1: publication refusal reclaims only after acknowledged archive fallback retires the original", async t => {
+  const f = await fixture();
+  let archived = false;
+  try {
+    f.refuse();
+    t.mock.method(f.recovery, "inventoryCleanupState", async () => archived ? "acknowledged" as const : "pending" as const);
+    // Model the existing authenticated archive FINAL ACK; completion is sent first.
+    t.mock.method(f.flight, "prepareTerminalInventory", async () => { archived = true; });
+    await f.terminal();
+    const original = await f.outbox!.readTerminalJournal(literal.run_id, 1);
+    assert.ok(original, "refused publication keeps its original until archive coverage is acknowledged");
+    assert.equal(original.body.completion_final_head, literal.final_head);
+    assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), true);
+    assert.equal(archived, true);
+    await f.replay();
+    assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, 1), false);
+    assert.deepEqual(f.sent.at(-1), { ...original.body, claim_generation: 1 });
+    assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), false);
+    assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 1), false);
+  } finally { await f.close(); }
+});
+
+describe("Unit 1: proven nonreceipt history preserves completion admission", () => {
+  let f: CompletionFixture;
+  before(async () => { f = await fixture(); });
+  after(async () => { await f.close(); });
+  for (let chunk = 0; chunk < 3; chunk++) it("nonreceipt history chunk " + chunk, async t => {
+    // Model the existing acknowledged FINAL coverage seam; real reports, deletion and client admission.
+    t.mock.method(f.recovery, "inventoryCleanupState", async () => "acknowledged" as const);
+    const terminal = f.run as unknown as {
+      journalAndSendTerminal(flight: unknown, phase: string, body: StateRequest,
+        send: (body: StateRequest) => Promise<StateAck>): Promise<void>;
+    };
+    for (let n = chunk * 1024 + 1; n <= Math.min((chunk + 1) * 1024, 2050); n++) {
+      f.select(literal.run_id, n);
+      await f.client.claimRun();
+      await f.client.listRecoveryHolds(literal.run_id);
+      const status = (["failed", "cancelled", "completed"] as const)[n % 3]!;
+      await terminal.journalAndSendTerminal(f.flight, "running", { status, claim_generation: n },
+        async () => ({ applied: true, status }));
+      assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, n), false, "real nonreceipt deletion");
+      assert.equal(f.client.canStartPublicationCompletion(literal.run_id, n + 1), true,
+        "Unit 1: retired history must free admission");
+    }
+    if (chunk === 2) {
+      f.select(literal.run_id, 2051);
+      // The prior ordinary terminals prepared inventory and changed the pushed SHA.
+      // Model a fresh publication flight with its actual successful push and unsent terminal.
+      f.flight.successfulPushedSha = literal.final_head;
+      f.flight.terminalResolved = false;
+      f.flight.completionSendAttempted = false;
+      await f.client.claimRun();
+      await f.client.listRecoveryHolds(literal.run_id);
+      assert.ok(await f.recovery.pin({ runId: literal.run_id, generation: 2051, sourceSha: "b".repeat(40),
+        inventoryGuarded: true, branch: literal.branch, kind: "issue" }));
+      await f.terminal();
+      assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 2051), true,
+        "fresh admitted completion still validates and persists its receipt");
+    }
+  });
+});
+
+for (const actor of ["terminal", "runner finalize", "worker finalize"] as const) {
+  for (const registration of ["same", "changed", "A-B-A"] as const) {
+    it("Unit 1: " + actor + " retirement fences " + registration + " registration", async t => {
+      const f = await fixture();
+      let finish!: () => void;
+      try {
+        let entered!: () => void;
+        const started = new Promise<void>(resolve => { entered = resolve; });
+        const pending = new Promise<void>(resolve => { finish = resolve; });
+        t.mock.method(f.run, "recoveryInventoryPending", async () => { entered(); await pending; return false; });
+        f.retirement(terminalOwnership(), discardAuthority(f));
+        const deps = f.run.protectRecoveryTerminalDeps({
+          outbox: f.outbox!, client: f.client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger(),
+        });
+        if (actor === "terminal") await f.outbox!.journalTerminal(literal.run_id, 1, "running", 7, { status: "failed" });
+        else await f.outbox!.journalFinalize(literal.run_id, 1);
+        const operation = actor === "terminal" ? deps.outbox.retireTerminal(literal.run_id, 1) :
+          actor === "runner finalize" ? (f.run as unknown as {
+            retireFinalizeRecord(flight: unknown, site: string): Promise<void>;
+          }).retireFinalizeRecord(f.flight, "Unit 1") :
+          discardWorker(f, f.run).sweepPendingFinalizes(new AbortController().signal);
+        await started;
+        await f.registerAs(registration === "same" ? literal.worker_id : literal.owner_id);
+        if (registration === "A-B-A") await f.registerAs(literal.worker_id);
+        await f.client.claimRun();
+        await f.client.listRecoveryHolds(literal.run_id);
+        finish();
+        await operation;
+        assert.equal(f.outbox!.hasPendingTerminal(literal.run_id, 1), false);
+        assert.equal(f.outbox!.listPendingFinalizeGenerations(true).length, 0);
+        assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"),
+          registration !== "same", "only unchanged incarnation can detach");
+      } finally { finish?.(); await f.close(); }
+    });
+  }
+}
+
+it("Unit 1: receipt persistence failure during report absence retains provenance", async t => {
+  const f = await fixture();
+  try {
+    f.retirement(terminalOwnership(), discardAuthority(f));
+    await discardInventory(f, "absent");
+    await f.outbox!.journalTerminal(literal.run_id, 1, "running", 7, { status: "failed" });
+    t.mock.method(f.recovery, "persistCompletionReceipt", async () => false);
+    const confirm = f.outbox!.confirmReportsAbsent.bind(f.outbox!);
+    t.mock.method(f.outbox!, "confirmReportsAbsent", async (runId: string, generation: number) => {
+      const absent = await confirm(runId, generation);
+      assert.equal(absent, true);
+      const ack = await f.client.reportState(runId, f.body);
+      assert.ok(ack.completedPublicationReceipt, "real receipt admission during the absence check");
+      await f.run.observeSettlementTerminalAck(runId, generation, f.body, ack);
+      return absent;
+    });
+    assert.equal(await f.run.protectRecoveryTerminalDeps({ outbox: f.outbox!, client: f.client,
+      gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }).outbox.retireTerminal(literal.run_id, 1), true);
+    assert.equal(await f.recovery.hasPersistedCompletionReceipt(literal.run_id, 1), false);
+    assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), true);
+    assert.equal(await f.run.recoveryInventoryPending(literal.run_id, 1), true);
+  } finally { await f.close(); }
+});
+
+for (const protection of ["finalize", "unlink", "unknown", "void finalize", "absent finalize"] as const) {
+  it("Unit 1: report notification retains provenance after " + protection, async t => {
+    const f = await fixture();
+    try {
+      t.mock.method(f.run, "recoveryInventoryPending", async () => false);
+      const provider = f.run as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> };
+      if (protection === "void finalize" || protection === "absent finalize") {
+        if (protection === "void finalize") {
+          await f.outbox!.journalFinalize(literal.run_id, 1);
+          t.mock.method(f.outbox!, "retireFinalize", async () => undefined as never);
+        }
+        await provider.retireFinalizeRecord(f.flight, "Unit 1");
+      } else {
+        await f.outbox!.journalTerminal(literal.run_id, 1, "running", 7, { status: "failed" });
+        if (protection === "finalize") await f.outbox!.journalFinalize(literal.run_id, 1);
+        if (protection === "unknown") t.mock.method(f.outbox!, "confirmReportsAbsent", async () => false);
+        if (protection === "unlink") t.mock.method(f.outbox!, "retireTerminal", async () => false);
+        await f.run.protectRecoveryTerminalDeps({ outbox: f.outbox!, client: f.client,
+          gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }).outbox.retireTerminal(literal.run_id, 1);
+        if (protection === "finalize") {
+          assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), true);
+          await provider.retireFinalizeRecord(f.flight, "Unit 1");
+          assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), false);
+          return;
+        }
+      }
+      assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), true);
+    } finally { await f.close(); }
+  });
+}
+
+it("Unit 1: lost ACK original remains selected until actual proven discard retirement", async () => {
+  const f = await fixture();
+  try {
+    f.refuse();
+    f.lose(true);
+    await f.outbox!.journalFinalize(literal.run_id, 1);
+    await f.terminal();
+    const original = await f.outbox!.readTerminalJournal(literal.run_id, 1);
+    assert.ok(original);
+    f.retirement(terminalOwnership(), discardAuthority(f, "released"));
+    await f.replay();
+    assert.deepEqual((await f.outbox!.readTerminalJournal(literal.run_id, 1))?.body, original.body);
+    assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), true);
+    f.retirement(terminalOwnership(), discardAuthority(f));
+    f.lose(false);
+    await f.replay();
+    await (f.run as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
+      .retireFinalizeRecord(f.flight, "Unit 1");
+    assert.deepEqual(f.sent.at(-1), { ...original.body, claim_generation: 1 });
+    assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), false);
+  } finally { await f.close(); }
+});
+
+for (const mode of ["none", "reserve"] as const) {
+  for (const applied of [true, false]) {
+    it("Unit 1: " + mode + " nonreceipt terminal requires applied ACK: " + applied, async t => {
+      const f = await fixture("issue", mode);
+      try {
+        t.mock.method(f.run, "recoveryInventoryPending", async () => false);
+        await (f.run as unknown as {
+          journalAndSendTerminal(flight: unknown, phase: string, body: StateRequest,
+            send: () => Promise<StateAck>): Promise<void>;
+        }).journalAndSendTerminal(f.flight, "running", { status: "failed" },
+          async () => ({ applied, status: "failed" }));
+        assert.equal((Reflect.get(f.client, "completionClaims") as Map<string, unknown>).has(literal.run_id + ":1"), !applied);
+      } finally { await f.close(); }
+    });
+  }
+}
 
 async function pressure(f: Awaited<ReturnType<typeof fixture>>) {
   // Claim-only observations reserve the missing hold slot. The final unseen attempt taints.

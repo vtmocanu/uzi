@@ -275,6 +275,7 @@ export class Worker {
     outbox: Outbox, entry: PendingFinalize, key: string, identity: Readonly<object>, signal: AbortSignal, deadline: number,
     registrationLower = false,
   ): Promise<void> {
+    const incarnation = this.client.capturePublicationCompletionRetirement?.();
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
@@ -292,8 +293,11 @@ export class Worker {
       const eligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
         !this.isFinalizeRunLive(entry.run_id);
       if (!eligible()) return;
-      await waitForFinalize(outbox.retireFinalizeIfEligible(
+      const retired = await waitForFinalize(outbox.retireFinalizeIfEligible(
         entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity), authorityWait.signal);
+      if (retired === true && incarnation && eligible())
+        await waitForFinalize(this.runner.notifyPublicationCompletionRetired(
+          entry.run_id, entry.claim_generation, incarnation), authorityWait.signal);
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),

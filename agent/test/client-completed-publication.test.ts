@@ -48,6 +48,39 @@ beforeEach(() => {
   });
 });
 afterEach(() => mock.restoreAll());
+for (const lane of ["claim", "holds"] as const) {
+  it("Unit 1: nonreceipt retirement excludes delayed " + lane + " observations", async () => {
+    await client.register("worker");
+    await client.claimRun();
+    await client.listRecoveryHolds(RUN);
+    const delayed = await delayedObservation(lane);
+    client.releaseRetiredPublicationCompletion(RUN, 1, client.capturePublicationCompletionRetirement());
+    delayed.finish(Response.json(lane === "claim" ? claim : { run_id: RUN,
+      holds: [{ ...holds[0], hold_id: receipt.owner_id }] }));
+    await delayed.settled;
+    assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt?.hold_id, receipt.hold_id);
+    assert.equal((Reflect.get(client, "completionClaims") as Map<string, unknown>).has(RUN + ":1"), false);
+    assert.equal((Reflect.get(client, "completionHolds") as Map<string, unknown>).has(RUN + ":1"), false);
+  });
+}
+
+for (const conflict of ["claim", "hold"] as const) {
+  it("Unit 1: nonreceipt notification retains " + conflict + " conflict", async () => {
+    await client.register("worker");
+    await client.claimRun();
+    await client.listRecoveryHolds(RUN);
+    if (conflict === "claim") {
+      claim = { ...claim, repo: { ...(claim.repo as object), id: receipt.owner_id } };
+      await client.claimRun();
+    } else {
+      holds = [{ ...holds[0], hold_id: receipt.owner_id }];
+      await client.listRecoveryHolds(RUN);
+    }
+    client.releaseRetiredPublicationCompletion(RUN, 1, client.capturePublicationCompletionRetirement());
+    assert.equal((await client.reportState(RUN, fixture.request)).completedPublicationReceipt, undefined);
+  });
+}
+
 async function report(body: StateRequest = fixture.request) {
   await client.register("worker");
   return client.reportState(RUN, body);

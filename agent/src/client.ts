@@ -1015,6 +1015,7 @@ export class WorkerClient {
   // Monotonic negative evidence: collisions conservatively refuse only new identities.
   private readonly ineligibleCompletionClaims = new Uint8Array(64 * 1024);
   private completionIncarnation = 0;
+  private completionRetirementIncarnation: Readonly<object> = {};
   // Live and temporarily retired identities each reserve both provenance slots.
   private readonly completionReservations = new Map<string, CompletionReservation>();
   private readonly completionTickets = new Set<CompletionTicket>();
@@ -1220,6 +1221,7 @@ export class WorkerClient {
         this.completionReservations.clear();
         this.completionTickets.clear();
         this.completionIncarnation++;
+        this.completionRetirementIncarnation = {};
       }
       this.completionWorkerId = this.registeredWorkerId;
     }
@@ -2028,7 +2030,8 @@ export class WorkerClient {
   }
 
   /** Called only with persisted receipt proof after actual terminal resolution/removal. */
-  releasePublicationCompletion(receipt: CompletedPublicationReceipt): void {
+  releasePublicationCompletion(receipt: CompletedPublicationReceipt, incarnation?: Readonly<object>): void {
+    if (incarnation !== undefined && incarnation !== this.completionRetirementIncarnation) return;
     if (this.completionInventoryUnreadable || this.receiptIncarnations.get(receipt) !== this.completionIncarnation) return;
     const key = `${receipt.run_id}:${receipt.generation}`;
     const claim = this.completionClaims.get(key);
@@ -2038,6 +2041,25 @@ export class WorkerClient {
           (claim.repoId !== undefined && claim.repoId !== receipt.repo_id) ||
           (claim.forgeType !== undefined && claim.forgeType !== receipt.forge_type) ||
           (claim.branch !== undefined && claim.branch !== receipt.branch)))) return;
+    this.detachPublicationCompletion(receipt.run_id, key);
+  }
+
+  /** Capture before asynchronous retirement authority checks; same-worker refresh preserves it. */
+  capturePublicationCompletionRetirement(): Readonly<object> {
+    return this.completionRetirementIncarnation;
+  }
+
+  /** Runner notification after authorized deletion and positive absence of both original reports. */
+  releaseRetiredPublicationCompletion(runId: string, generation: number, incarnation: Readonly<object>): void {
+    if (incarnation !== this.completionRetirementIncarnation || this.completionInventoryUnreadable) return;
+    const key = `${runId}:${generation}`;
+    const claim = this.completionClaims.get(key);
+    if (claim === null || this.completionHolds.get(key) === null ||
+        (claim && !claim.eligible)) return;
+    this.detachPublicationCompletion(runId, key);
+  }
+
+  private detachPublicationCompletion(runId: string, key: string): void {
     this.completionClaims.delete(key);
     this.completionHolds.delete(key);
     const reservation = this.completionReservations.get(key);
@@ -2045,7 +2067,7 @@ export class WorkerClient {
     reservation.live = false;
     // At most 2048 tickets per 2048 identities. A sibling failure never blocks detach.
     for (const ticket of this.completionTickets) {
-      if (ticket.runId !== undefined && ticket.runId !== receipt.run_id) continue;
+      if (ticket.runId !== undefined && ticket.runId !== runId) continue;
       ticket.exclusions.add(key);
       reservation.tickets.add(ticket);
     }

@@ -4043,9 +4043,12 @@ export class RunRunner {
    */
   private async retireFinalizeRecord(flight: RunFlight, site: string): Promise<void> {
     if (!this.outbox) return;
+    const incarnation = this.client.capturePublicationCompletionRetirement?.();
     if (await this.recoveryInventoryPending(flight.runId, flight.claimGeneration)) return;
     try {
-      await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
+      const retired = await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
+      if (retired === true && incarnation)
+        await this.notifyPublicationCompletionRetired(flight.runId, flight.claimGeneration, incarnation);
     } catch (err) {
       this.log.warn("finalize record retire failed", {
         run_id: flight.runId,
@@ -4093,14 +4096,16 @@ export class RunRunner {
     const outbox = new Proxy(deps.outbox, {
       get: (target, property) => {
         if (property === "retireTerminal") return async (runId: string, generation: number) => {
+          const incarnation = this.client.capturePublicationCompletionRetirement?.();
           const receipt = this.completionReceipts.get(this.completionKey(runId, generation));
           const original = receipt && this.persistedReceiptProofs.has(receipt)
             ? await target.readTerminalJournal(runId, generation) : undefined;
           if (await this.recoveryInventoryPending(runId, generation)) return false;
           const retired = await target.retireTerminal(runId, generation);
-          if (retired === true && receipt && this.persistedReceiptProofs.has(receipt) &&
-              original?.body.status === "completed" && original.body.completion_final_head === receipt.final_head)
-            this.client.releasePublicationCompletion?.(receipt);
+          if (retired === true && incarnation && (!receipt ||
+              (this.persistedReceiptProofs.has(receipt) && original?.body.status === "completed" &&
+                original.body.completion_final_head === receipt.final_head)))
+            await this.notifyPublicationCompletionRetired(runId, generation, incarnation, target);
           return retired;
         };
         const value = Reflect.get(target, property);
@@ -4111,13 +4116,31 @@ export class RunRunner {
     return { ...deps, outbox };
   }
 
-  private async releaseUnjournaledCompletion(flight: RunFlight, body: StateRequest): Promise<void> {
+  /** Only callers observing an actual authorized retirement may notify. Absence alone is no event. */
+  async notifyPublicationCompletionRetired(runId: string, generation: number, incarnation: Readonly<object>,
+    reports: Pick<Outbox, "confirmReportsAbsent"> = this.outbox!,
+  ): Promise<void> {
+    const key = this.completionKey(runId, generation);
+    if (this.unpersistedCompletionReceipts.has(key) ||
+        typeof reports?.confirmReportsAbsent !== "function" ||
+        !(await reports.confirmReportsAbsent(runId, generation)) ||
+        this.unpersistedCompletionReceipts.has(key)) return;
+    const receipt = this.completionReceipts.get(key);
+    if (receipt) {
+      if (this.persistedReceiptProofs.has(receipt)) this.client.releasePublicationCompletion?.(receipt, incarnation);
+    } else this.client.releaseRetiredPublicationCompletion?.(runId, generation, incarnation);
+  }
+
+  private async releaseUnjournaledCompletion(flight: RunFlight, body: StateRequest, incarnation?: Readonly<object>): Promise<void> {
+    if (!incarnation || await this.recoveryInventoryPending(flight.runId, flight.claimGeneration)) return;
     const receipt = this.completionReceipts.get(this.completionKey(flight.runId, flight.claimGeneration));
-    if (!receipt || !this.persistedReceiptProofs.has(receipt) ||
-        body.status !== "completed" || body.completion_final_head !== receipt.final_head) return;
-    // A disabled store cannot prove absence; a pending/unreadable original stays retained.
-    if (this.outbox && !(await this.outbox.confirmTerminalAbsent(flight.runId, flight.claimGeneration))) return;
-    this.client.releasePublicationCompletion?.(receipt);
+    if (receipt && (!this.persistedReceiptProofs.has(receipt) ||
+        body.status !== "completed" || body.completion_final_head !== receipt.final_head)) return;
+    // A disabled store cannot prove absence; either original report stays retained.
+    if (this.outbox) {
+      await this.notifyPublicationCompletionRetired(flight.runId, flight.claimGeneration, incarnation);
+    } else if (receipt) this.client.releasePublicationCompletion?.(receipt, incarnation);
+    else this.client.releaseRetiredPublicationCompletion?.(flight.runId, flight.claimGeneration, incarnation);
   }
 
   private terminalDeps(): TerminalOutboxDeps | undefined {
@@ -4166,6 +4189,7 @@ export class RunRunner {
       body = ordinary;
     }
     if (!deps) {
+      const incarnation = this.client.capturePublicationCompletionRetirement?.();
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
       // stale ack still THROWS StaleClaimError out of `send` and propagates to executeClaim's catch
       // (there is no journal to stale-retire on this degradation path), so this branch is otherwise
@@ -4180,7 +4204,9 @@ export class RunRunner {
           this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
         }
         const ack = await send(body);
-        if (ack.applied && ack.status === "completed") await this.releaseUnjournaledCompletion(flight, body);
+        if (ack.applied && ack.status === body.status &&
+            (ack.status === "completed" || ack.status === "failed" || ack.status === "cancelled"))
+          await this.releaseUnjournaledCompletion(flight, body, incarnation);
       } finally {
         if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
       }
@@ -4200,13 +4226,16 @@ export class RunRunner {
     // designed. #1539: this wrapper wraps the send passed to BOTH branches (the reserve-exhausted
     // unjournaled send and the journaled resolve), the same as journalAndResolveTerminal does today.
     const wrappedSend: SendTerminalState = async (b, sig) => {
+      const incarnation = this.client.capturePublicationCompletionRetirement?.();
       try {
         if (this.eligiblePublicationCompletion(flight, b)) {
           flight.completionSendAttempted = true;
           this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
         }
         const ack = await send(b, sig);
-        if (ack.applied && ack.status === "completed") await this.releaseUnjournaledCompletion(flight, b);
+        if (ack.applied && ack.status === b.status &&
+            (ack.status === "completed" || ack.status === "failed" || ack.status === "cancelled"))
+          await this.releaseUnjournaledCompletion(flight, b, incarnation);
         return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };

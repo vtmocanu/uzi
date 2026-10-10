@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Persistent workers keep publication capacity after non-receipt reports retire.**
+  Failed, cancelled and archive-fallback generations release completion bookkeeping only after proven report retirement, preserving unresolved completion replay and custody safeguards.
+
 - **Completed publication serializes safely with worker updates.**
   Persistent workers complete under the same worker-before-run lock order as claims and registration, even with leasing disabled. A worker capability downgrade still completes and consumes its matching permit without stamping a publication head or custody identity. Completion migrations also support schema rollback and reapplication while keeping released custody released.
 
