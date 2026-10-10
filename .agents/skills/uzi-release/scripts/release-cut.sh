@@ -174,7 +174,18 @@ shipping_commits_since() {
     [ -n "$sha" ] || continue
     shipping=0
     # Two attempts at most; drain the whole producer before trusting its status.
-    exec {files_fd}< <(git diff --name-only -z "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= -z "$sha")
+    exec {files_fd}< <(
+      listing_tmp="$(mktemp)" || exit 1
+      listing_rc=0
+      if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+         git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+        cat "$listing_tmp" || listing_rc=$?
+      else
+        listing_rc=$?
+      fi
+      rm -f "$listing_tmp"
+      exit "$listing_rc"
+    )
     files_pid=$!
     while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
@@ -514,7 +525,18 @@ dependency_merge_refs() {
     is_dependency_subject "$subject" || continue
     if git log -1 --format=%B "$sha" | grep -iE '^Changelog:[[:space:]]*none' >/dev/null; then continue; fi
     # A failed listing aborts this scan before any dependency citations are used.
-    exec {files_fd}< <(git diff --name-only -z "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= -z "$sha")
+    exec {files_fd}< <(
+      listing_tmp="$(mktemp)" || exit 1
+      listing_rc=0
+      if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+         git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+        cat "$listing_tmp" || listing_rc=$?
+      else
+        listing_rc=$?
+      fi
+      rm -f "$listing_tmp"
+      exit "$listing_rc"
+    )
     files_pid=$!
     shipping=0; manifest_only=1; touched_cl=0
     while IFS= read -r -d '' f; do

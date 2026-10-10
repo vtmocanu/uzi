@@ -1349,6 +1349,12 @@ esac
 if [ "$listing" = 1 ] && [ "${!#}" = "${LIST_SHA:-}" ]; then
   case "${LIST_MODE:-}" in
     fallback) [ "$1" != diff ] || exit 71 ;;
+    fallback_prefix)
+      if [ "$1" = diff ]; then printf 'prds/'; exit 71; fi
+      ;;
+    fallback_changelog)
+      if [ "$1" = diff ]; then printf 'CHANGELOG.md\0'; exit 71; fi
+      ;;
     fail) exit 72 ;;
     partial)
       printf 'api/go.mod\0api/é.go\0'
@@ -1400,7 +1406,7 @@ for unusual in 'api/é.go' $'api/new\n"quote.go'; do
   rm -rf "$LN"
 done
 for consumer in oracle shipping dependency; do
-  for mode in fallback fail partial large; do
+  for mode in fallback fallback_prefix fallback_changelog fail partial large; do
     # Large output is a shipping-drain probe, not another failure mode.
     [ "$mode" != large ] || [ "$consumer" = shipping ] || continue
     LN="$(mktemp -d)"
@@ -1420,6 +1426,9 @@ for consumer in oracle shipping dependency; do
       LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
       if [ "$consumer" = dependency ]; then
         feature_201_changelog "$LN"
+      elif [ "$mode" = fallback_prefix ] || [ "$mode" = fallback_changelog ]; then
+        # Successful show lists an uncited shipping path; failed diff cannot exempt it.
+        printf '# Changelog\n\n## [0.2.0]\n### Added\n- Other (#201)\n' | put_changelog "$LN"
       else
         printf '# Changelog\n\n## [Unreleased]\n### Added\n- Other (#201)\n\n## [0.2.0]\n### Added\n- Cited (#1468)\n' | put_changelog "$LN"
       fi
@@ -1437,14 +1446,18 @@ for consumer in oracle shipping dependency; do
       fi
       out="$RC_OUT"; status="$RC_RC"
     fi
-    case "$mode" in
-      fallback|large)
+    case "$consumer:$mode" in
+      oracle:fallback_prefix|oracle:fallback_changelog)
+        assert_eq "oracle $mode refuses uncited shipping path" 1 "$status"
+        assert_contains "oracle $mode reports the real shipping commit" 'feat: unusual path (#1468)' "$out"
+        ;;
+      *:fallback|*:fallback_prefix|*:fallback_changelog|*:large)
         assert_eq "$consumer $mode succeeds" 0 "$status"
         if [ "$consumer" = shipping ]; then
           assert_contains "shipping $mode counts the unusual commit once" '1 shipping commit(s)' "$out"
         fi
         if [ "$consumer" = dependency ]; then
-          assert_contains "dependency fallback retains autocitation" '#1468' "$(dep_bullet "$LN")"
+          assert_contains "dependency $mode retains manifest autocitation" '#1468' "$(dep_bullet "$LN")"
         fi
         if [ "$mode" = large ]; then
           assert_eq "large producer completed without SIGPIPE" drained "$(cat "$LIST_LOG")"

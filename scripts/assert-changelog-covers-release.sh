@@ -206,7 +206,18 @@ while read -r sha; do
 
   # At most two listing attempts per SHA; drain even after classification, then
   # require producer success before applying exemptions or checking citations.
-  exec {files_fd}< <(git diff --name-only -z "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= -z "$sha")
+  exec {files_fd}< <(
+    listing_tmp="$(mktemp)" || exit 1
+    listing_rc=0
+    if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+       git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+      cat "$listing_tmp" || listing_rc=$?
+    else
+      listing_rc=$?
+    fi
+    rm -f "$listing_tmp"
+    exit "$listing_rc"
+  )
   files_pid=$!
 
   touched_changelog=0
