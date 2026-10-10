@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -15,7 +15,7 @@ for (const injection of ["verdict", "state", "both"]) {
   // Start an independent runner, rather than inheriting the parent worker context.
   delete env.NODE_TEST_CONTEXT;
   const { error, stdout, stderr } = await new Promise<{
-   error: (Error & { code?: string | number; killed?: boolean; signal?: string | null }) | null;
+   error: ExecFileException | null;
    stdout: string; stderr: string;
   }>((resolve) => {
    execFile(process.execPath, [
