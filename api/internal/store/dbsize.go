@@ -3,12 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,9 +18,9 @@ type DatabaseSize struct {
 	// Largest holds at most three tables or materialized views, biggest first, sized with
 	// pg_total_relation_size (heap, indexes and TOAST). Empty when RelationsUnavailable.
 	Largest []RelationSize
-	// RelationsUnavailable is true when the largest-relations query was attempted but gave
-	// up (a table lock held it past relationsLockTimeout, or it exceeded relationsTimeout).
-	// SizeBytes is still valid.
+	// RelationsUnavailable is true when the largest-relations query was attempted but failed
+	// for any reason (a table lock past relationsLockTimeout, a statement timeout, relationsTimeout,
+	// the caller's deadline, a connection error). SizeBytes is still valid.
 	RelationsUnavailable bool
 }
 
@@ -39,8 +37,8 @@ const (
 	relationsLockTimeout = "500ms"
 	// relationsTimeout bounds the whole relations query, independent of the caller's deadline.
 	relationsTimeout = 2 * time.Second
-	// lockNotAvailable is SQLSTATE 55P03, raised when lock_timeout expires.
-	lockNotAvailable = "55P03"
+	// relationsRollbackTimeout bounds the deferred rollback, which runs detached from ctx.
+	relationsRollbackTimeout = time.Second
 )
 
 // DatabaseSizeOnly reads only pg_database_size, which takes no relation locks. Use it
@@ -54,10 +52,11 @@ func DatabaseSizeOnly(ctx context.Context, pool *pgxpool.Pool) (DatabaseSize, er
 }
 
 // DatabaseSizeStatus reads the database size and its three largest relations through the
-// caller's pool, like SchemaVersionStatus. The size read failing is an error. The
-// relations are evidence only: when their query cannot get its locks within
-// relationsLockTimeout, or runs past relationsTimeout, the size is returned with
-// Largest empty and RelationsUnavailable set, and no error. A relation dropped between
+// caller's pool, like SchemaVersionStatus. Only a failed size read is an error. The
+// relations are evidence only: once the size has been read, any failure of the relations
+// query (lock timeout, statement timeout, relationsTimeout, the caller's deadline, a
+// connection error) returns the size with Largest empty and RelationsUnavailable set, and
+// no error. A relation dropped between
 // the catalog scan and the size call yields a NULL size and is skipped.
 func DatabaseSizeStatus(ctx context.Context, pool *pgxpool.Pool) (DatabaseSize, error) {
 	out, err := DatabaseSizeOnly(ctx, pool)
@@ -67,20 +66,12 @@ func DatabaseSizeStatus(ctx context.Context, pool *pgxpool.Pool) (DatabaseSize, 
 	rctx, cancel := context.WithTimeout(ctx, relationsTimeout)
 	defer cancel()
 	largest, err := largestRelations(rctx, pool)
-	switch {
-	case err == nil:
-		out.Largest = largest
-	case isRelationsGiveUp(err) || (rctx.Err() != nil && ctx.Err() == nil):
+	if err != nil {
 		out.RelationsUnavailable = true
-	default:
-		return DatabaseSize{}, err
+		return out, nil
 	}
+	out.Largest = largest
 	return out, nil
-}
-
-func isRelationsGiveUp(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == lockNotAvailable
 }
 
 func largestRelations(ctx context.Context, pool *pgxpool.Pool) ([]RelationSize, error) {
@@ -88,7 +79,11 @@ func largestRelations(ctx context.Context, pool *pgxpool.Pool) ([]RelationSize, 
 	if err != nil {
 		return nil, fmt.Errorf("begin largest relations: %w", err)
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	defer func() {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), relationsRollbackTimeout)
+		defer cancel()
+		_ = tx.Rollback(rctx)
+	}()
 	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+relationsLockTimeout+`'`); err != nil {
 		return nil, fmt.Errorf("set lock_timeout: %w", err)
 	}

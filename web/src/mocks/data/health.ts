@@ -270,7 +270,7 @@ export function noHostedWorkersDoc(): HealthDoc {
         severity: "na",
         summary: "No hosted workers are configured, so the controller does not report.",
       },
-      "db.size": { severity: "na", summary: "No database storage capacity is configured (DB_STORAGE_CAPACITY_BYTES)." },
+      "db.size": { severity: "na", summary: "No valid database storage capacity is configured (DB_STORAGE_CAPACITY_BYTES)." },
       "slack.socket": { severity: "na", summary: "Slack is not configured." },
     }),
   );

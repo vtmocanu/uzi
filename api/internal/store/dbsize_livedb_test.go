@@ -91,7 +91,7 @@ func TestDatabaseSizeStatusSurvivesAccessExclusiveLockLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect holder: %v", err)
 	}
-	defer holder.Close(context.Background())
+	t.Cleanup(func() { _ = holder.Close(context.Background()) })
 	tx, err := holder.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -124,6 +124,50 @@ func TestDatabaseSizeStatusSurvivesAccessExclusiveLockLiveDB(t *testing.T) {
 	got, err = store.DatabaseSizeStatus(ctx, pool)
 	if err != nil || got.RelationsUnavailable || len(got.Largest) == 0 {
 		t.Errorf("after release: %+v, %v", got, err)
+	}
+}
+
+// TestDatabaseSizeStatusDegradesOnStatementTimeoutLiveDB proves a relations failure other
+// than a lock timeout (SQLSTATE 57014) still returns the size with relations unavailable.
+// The pool's session statement_timeout (300ms) fires before the 500ms lock_timeout while a
+// second connection holds ACCESS EXCLUSIVE; the size read takes no relation locks.
+func TestDatabaseSizeStatusDegradesOnStatementTimeoutLiveDB(t *testing.T) {
+	ctx, dsn, pool := dbSizeTestPool(t)
+	dbSizeTestSchema(ctx, t, pool, "dbsize_it_stmt")
+	if _, err := pool.Exec(ctx, `CREATE TABLE dbsize_it_stmt.locked AS SELECT g FROM generate_series(1,10) g`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "300"
+	stmtPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open statement-timeout pool: %v", err)
+	}
+	t.Cleanup(stmtPool.Close)
+
+	holder, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect holder: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Close(context.Background()) })
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE dbsize_it_stmt.locked IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+
+	got, err := store.DatabaseSizeStatus(ctx, stmtPool)
+	if err != nil {
+		t.Fatalf("DatabaseSizeStatus with statement timeout: %v", err)
+	}
+	if got.SizeBytes <= 0 || !got.RelationsUnavailable || len(got.Largest) != 0 {
+		t.Errorf("want size with relations unavailable, got %+v", got)
 	}
 }
 

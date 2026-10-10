@@ -90,7 +90,7 @@ func (s *Service) evalDBSize(ctx context.Context) apitypes.HealthCheckDTO {
 		apitypes.HealthEvidenceDTO{Label: "Used", Value: fmt.Sprintf("%d.%d%%", tenths/10, tenths%10)},
 	)
 	if size.RelationsUnavailable {
-		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Largest relations", Value: "Unavailable (the query timed out waiting for a table lock)"})
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Largest relations", Value: "Unavailable (the relation-size query gave up; the size above is still current)"})
 	}
 	for i, r := range size.Largest {
 		if i == maxLargestRelations {

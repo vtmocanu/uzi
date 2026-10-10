@@ -201,7 +201,7 @@ func TestCheckDBSizeRelationsUnavailableEvidence(t *testing.T) {
 	if c.Severity != sevOK {
 		t.Fatalf("severity = %q, want ok", c.Severity)
 	}
-	if v, ok := evidenceValue(c, "Largest relations"); !ok || !strings.Contains(v, "Unavailable") {
+	if v, ok := evidenceValue(c, "Largest relations"); !ok || v != "Unavailable (the relation-size query gave up; the size above is still current)" {
 		t.Errorf("missing unavailable-relations evidence: %+v", c.Evidence)
 	}
 }
