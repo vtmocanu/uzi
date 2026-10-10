@@ -889,8 +889,10 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
-	// Worker-authenticated, generation-fenced plan cross-check protocol.
+	// Worker-authenticated, generation-fenced, stage-dispatched cross-check protocol.
 	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
+	// Owned-worker dispositions are bounded and write-once, like the verdict callback.
+	{"POST", "/api/worker/runs/{id}/cross-checks/code/dispositions", noLimiter},
 	// Owned-worker status polling spends no provider or forge quota, like plan status.
 	{"GET", "/api/worker/runs/{id}/cross-checks/code/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/latest", noLimiter},
