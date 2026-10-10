@@ -10,7 +10,7 @@ import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
-import { SummaryRunner, type IntentSummaryInput } from "../src/summary-runner.js";
+import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import type { WorkerClient } from "../src/client.js";
 import type { IterationBudget, Milestone } from "../src/protocol.js";
 import { CredentialSwitchSignal, PauseNowSignal, type PauseMode, type PlanVerdict } from "../src/steering.js";
@@ -354,5 +354,83 @@ describe("the intent settlement edge cases", () => {
     const probe = makeCtx();
     await newExec(spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]), runner, 50).run(probe.ctx);
     assert.equal(probe.usage().length, 0);
+  });
+});
+
+const USAGE = { [HAIKU]: { inputTokens: 7, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+describe("a credential-switch give-up keeps the intent summary", () => {
+  it("lets the pass finish naturally, posts its summary and emits its usage once", async () => {
+    const posted: string[] = [];
+    const postingClient = { postIntentSummary: async (_run: string, s: string) => void posted.push(s), postPlanSummary: async () => {} } as unknown as WorkerClient;
+    // The intent pass finishes after 300ms with usage, or resolves null when aborted.
+    const runner = {
+      generateIntentSummary: (input: IntentSummaryInput) =>
+        new Promise<string | null>((resolve) => {
+          const timer = setTimeout(() => {
+            input.onUsage!(USAGE);
+            resolve("INTENT");
+          }, 300);
+          input.signal!.addEventListener("abort", () => (clearTimeout(timer), resolve(null)), { once: true });
+        }),
+      generatePlanSummary: async () => null,
+    } as unknown as SummaryRunner;
+    let gates = 0;
+    const probe = makeCtx({
+      gatePlan: async () => {
+        gates++;
+        if (gates === 1) throw new CredentialSwitchSignal();
+        await sleep(600);
+        return approve;
+      },
+    });
+    probe.ctx.attemptCredentialSwitch = async () => "gave_up";
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      client: postingClient,
+      summaryRunner: runner,
+      intentSettleBoundMs: SETTLE_BOUND_MS,
+      spawn: () => ({ pid: 7800 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+    });
+    await exec.run(probe.ctx);
+    assert.equal(gates, 2, "the gate was re-presented after the give-up");
+    assert.deepEqual(posted, ["INTENT"]);
+    const usage = probe.usage();
+    assert.equal(usage.length, 1, "exactly one summary_usage");
+    assert.equal(usage[0]!.payload["pass"], "intent");
+  });
+});
+
+describe("the plan pass's summary_usage", () => {
+  function planRunner() {
+    return {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (input: PlanSummaryInput) => {
+        input.onUsage!(USAGE);
+        return null;
+      },
+    } as unknown as SummaryRunner;
+  }
+  // The real gate invokes the plan-summary generator it is handed; this one does the same.
+  const callingPlanSummary: RunContext["gatePlan"] = async (plan, _milestones, generate) => (await generate?.(plan), approve);
+  const planUsage = (probe: Probe) => probe.usage().filter((m) => m.payload["pass"] === "plan");
+
+  it("an approved plan emits exactly one summary_usage with the reported model_usage", async () => {
+    const probe = makeCtx({ gatePlan: callingPlanSummary });
+    await newExec(spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]), planRunner()).run(probe.ctx);
+    const usage = planUsage(probe);
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0]!.agent, "worker");
+    assert.deepEqual(usage[0]!.payload["model_usage"], USAGE);
+    assert.deepEqual(Object.keys(usage[0]!.payload).sort(), ["model_usage", "pass"]);
+  });
+
+  it("a fenced claim emits none", async () => {
+    const probe = makeCtx({ gatePlan: callingPlanSummary, claimFenced: () => true });
+    await newExec(spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]), planRunner()).run(probe.ctx);
+    assert.equal(planUsage(probe).length, 0);
   });
 });

@@ -3674,6 +3674,55 @@ export class SdkExecutor implements Executor {
     return reportDepsInstall(ctx, this.log, result);
   }
 
+  /**
+   * Issue #2686: wait up to `intentSettleBoundMs` for the intent pass to finish on its own,
+   * WITHOUT aborting it. Resolves true when it settled (or none exists), false at the bound.
+   */
+  private async waitIntentSummary(): Promise<boolean> {
+    const flight = this.intentFlight;
+    if (flight === undefined) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), this.intentSettleBoundMs);
+    });
+    try {
+      return await Promise.race([flight.done.then(() => true as const, () => true as const), timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Issue #2686: abort the unawaited intent-summary pass and wait, bounded, for it to deliver
+   * its already-observed usage. Idempotent; never throws; never waits for the generation
+   * timeout. A pass still running at the bound is abandoned (its late usage is dropped).
+   */
+  private async settleIntentSummary(): Promise<void> {
+    const flight = this.intentFlight;
+    if (flight === undefined) return;
+    flight.ctrl.abort();
+    if (flight.abandoned) return;
+    if (!(await this.waitIntentSummary())) {
+      flight.abandoned = true;
+      this.log.warn("intent summary: the aborted pass did not settle within the bound; its late usage is dropped");
+    }
+  }
+
+  /**
+   * Issue #2686: a credential-switch attempt on a verified release closes the runner's batcher
+   * before the executor returns, so the intent pass must have reported its usage first. Wait for
+   * it to finish naturally (bounded) so a "gave_up" run, which continues in place on the old
+   * token, still posts its intent summary; only a pass still running at the bound is aborted and
+   * settled. Residual: such a pass is cancelled, so its summary is not posted on a later give-up
+   * (its usage is still reported).
+   */
+  private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
+    if (!ctx.attemptCredentialSwitch) return undefined;
+    await this.waitIntentSummary();
+    await this.settleIntentSummary();
+    return ctx.attemptCredentialSwitch();
+  }
+
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
   /**
    * PRD #1247 M5b (data-integrity fix): run an idle held-state WAIT (the plan gate, an ask_user
@@ -3693,39 +3742,6 @@ export class SdkExecutor implements Executor {
    * With no attemptCredentialSwitch hook wired (stub/test executor) it re-throws the signal, so it
    * reaches the runner's outer catch byte-identically to the pre-fix behaviour.
    */
-  /**
-   * Issue #2686: abort the unawaited intent-summary pass and wait, bounded, for it to deliver
-   * its already-observed usage. Idempotent; never throws; never waits for the generation
-   * timeout. A pass still running at the bound is abandoned (its late usage is dropped).
-   */
-  private async settleIntentSummary(): Promise<void> {
-    const flight = this.intentFlight;
-    if (flight === undefined) return;
-    flight.ctrl.abort();
-    if (flight.abandoned) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<false>((resolve) => {
-      timer = setTimeout(() => resolve(false), this.intentSettleBoundMs);
-    });
-    try {
-      const finished = await Promise.race([flight.done.then(() => true as const, () => true as const), timedOut]);
-      if (!finished) {
-        flight.abandoned = true;
-        this.log.warn("intent summary: the aborted pass did not settle within the bound; its late usage is dropped");
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  /** Issue #2686: a credential-switch attempt on a verified release closes the runner's batcher
-   *  before the executor returns, so settle the intent pass (emitting its usage) first. */
-  private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
-    if (!ctx.attemptCredentialSwitch) return undefined;
-    await this.settleIntentSummary();
-    return ctx.attemptCredentialSwitch();
-  }
-
   private async runThroughSwitch<T>(
     ctx: RunContext,
     state: RunDrive,
