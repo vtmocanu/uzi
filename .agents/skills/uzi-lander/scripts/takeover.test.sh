@@ -14,7 +14,8 @@ mkdir -p "$WORK/bin"
 cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 # Not connected to uzi: the run/rework lookups are skipped, which is not under test here.
-if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo '[]'; exit 0; fi
+if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo '[]'; exit 0; fi
 echo "unexpected uzi call: $*" >&2; exit 1
 STUB
 cat > "$WORK/bin/gh" <<'STUB'
@@ -102,8 +103,10 @@ case "$*" in
       prior_pending|prior_pending_resolved) greptile in_progress null '' ;;
       *) none ;;
     esac ;;
-  *'/pulls/42/files'*) echo '[]' ;;
-  *'/contents/'*) echo '[]' ;;
+  *'/pulls/42/files'*)
+    if [ "${PR_FILES_FAIL:-}" = 1 ]; then echo "HTTP 404: Not Found" >&2; exit 1; fi
+    echo "${PR_FILES_JSON:-[]}" ;;
+  *'/contents/'*) echo "${BASE_MIG_JSON:-[]}" ;;
   *) echo "unexpected gh api: $*" >&2; exit 1 ;;
 esac
 STUB
@@ -125,6 +128,7 @@ snap() {
   bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/$out.out" 2>&1 || fail "$out: takeover.sh exited $?: $(cat "$WORK/$out.out")"
 }
 has() { grep -qF -- "$2" "$WORK/$1.out" || fail "$1: missing '$2': $(cat "$WORK/$1.out")"; }
+has_line() { grep -qxF -- "$2" "$WORK/$1.out" || fail "$1: missing line '$2': $(cat "$WORK/$1.out")"; }
 hasnt() { if grep -qF -- "$2" "$WORK/$1.out"; then fail "$1: unexpected '$2': $(cat "$WORK/$1.out")"; fi; }
 
 # An explicit clean pass on THIS head clears the older anchored comment...
@@ -180,7 +184,7 @@ has head_review_object 'LIVE_FINDINGS=1 (cr=0 gr=1 '
 # A review still running on a newer commit than the last verdict: unknown, never ready.
 snap prior_pending
 has prior_pending 'GREPTILE_PRIOR_VERDICT=pending'
-has prior_pending 'UNKNOWN=1'
+has_line prior_pending 'UNKNOWN=1'
 has prior_pending 'NEXT=unknown'
 
 # ...and so is a review REQUESTED after the last verdict whose check-run has not appeared yet.
@@ -277,14 +281,14 @@ hasnt head_clean_ea_alert 'NEXT=ready'
 # Unreadable code scanning (5xx) is unknown, never ready.
 export CS_MODE=broken
 snap head_clean head_clean_ea_broken
-has head_clean_ea_broken 'UNKNOWN=1'
+has_line head_clean_ea_broken 'UNKNOWN=1'
 has head_clean_ea_broken 'code_scanning=unknown'
 has head_clean_ea_broken 'NEXT=unknown'
 # Code scanning not enabled counts as none.
 export CS_MODE=unavailable
 snap head_clean head_clean_ea_unavail
 has head_clean_ea_unavail 'EVERY_AUTHOR=threads=0 code_scanning=unavailable unacked=0'
-has head_clean_ea_unavail 'UNKNOWN=0'
+has_line head_clean_ea_unavail 'UNKNOWN=0'
 has head_clean_ea_unavail 'NEXT=ready'
 unset CS_MODE
 
@@ -296,10 +300,28 @@ CHECKS_JSON='[{"name":"ci","bucket":"pending"}]'; snap head_clean noreq-pending;
 CHECKS_JSON='[{"name":"ci","bucket":"fail"}]'; snap head_clean noreq-fail; has noreq-fail 'NEXT=ci_red'
 CHECKS_JSON='[{"name":"ci","bucket":"cancel"}]'; snap head_clean noreq-cancel; has noreq-cancel 'NEXT=ci_pending'
 CHECKS_JSON='[]'; snap head_clean noreq-empty; has noreq-empty 'NEXT=unknown'
+has_line noreq-empty 'CI_UNKNOWN=1'; hasnt noreq-empty 'NEXT=ready'
 CHECKS_JSON='[{"name":"ci","bucket":"mystery"}]'; snap head_clean noreq-malformed; has noreq-malformed 'NEXT=unknown'
 CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; export RULES_FAIL=1
 snap head_clean noreq-unreadable; has noreq-unreadable 'NEXT=unknown'
 unset CHECKS_REQUIRED_EMPTY CHECKS_JSON RULES_FAIL
+
+# A CI-only unknown (empty checks) must not mask a DIRTY route or a known migration collision;
+# an unknown from another lookup still wins over both.
+export CHECKS_JSON='[]'
+MERGE_STATE=DIRTY; export MERGE_STATE
+snap head_clean noreq-dirty
+has noreq-dirty 'NEXT=conflict'; has_line noreq-dirty 'CI_UNKNOWN=1'; has_line noreq-dirty 'UNKNOWN=1'; hasnt noreq-dirty 'NEXT=unknown'
+export PR_FILES_FAIL=1
+snap head_clean noreq-dirty-files; has noreq-dirty-files 'PR_FILES=unreadable'; has noreq-dirty-files 'NEXT=unknown'
+unset PR_FILES_FAIL
+export UZI_REPO_JSON='[{"id":"r1","path_with_namespace":"test/repo"}]' UZI_RUN_LIST_FAIL=1
+snap head_clean noreq-dirty-runs; has noreq-dirty-runs 'MR_REWORK=unreadable'; has noreq-dirty-runs 'NEXT=unknown'
+unset UZI_REPO_JSON UZI_RUN_LIST_FAIL MERGE_STATE
+export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00099_new.sql","status":"added"}]' BASE_MIG_JSON='[{"name":"00099_old.sql"}]'
+snap head_clean noreq-collision
+has noreq-collision 'MIGRATION_COLLISION='; has noreq-collision 'NEXT=migration_collision'; has_line noreq-collision 'CI_UNKNOWN=1'
+unset PR_FILES_JSON BASE_MIG_JSON CHECKS_JSON
 
 export CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'
 export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'

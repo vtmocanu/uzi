@@ -20,15 +20,18 @@
 #   run_failed:<origin>   run failed/cancelled and no PR — hand to uzi-watcher recovery
 #   claimed_by_other      another live session is landing this PR (CLAIM_HELD_BY printed)
 #   merged | closed       nothing to land
-#   conflict              mergeable CONFLICTING (wins over unknown: GitHub runs no CI on a
-#                         conflicting PR, so empty checks are expected) or mergeStateStatus
-#                         DIRTY — rebase with land-prep.sh
+#   conflict              mergeable CONFLICTING (wins over any unknown) or mergeStateStatus
+#                         DIRTY (wins over a CI-only unknown) — rebase with land-prep.sh.
+#                         GitHub may never run pull_request CI on a DIRTY PR, so empty checks
+#                         are expected there
 #   migration_collision   PR adds a migration whose number already exists on main — rebase + renumber
+#                         (wins over a CI-only unknown)
 #   ci_red | ci_pending   required checks
 #   mr_rework_active      defer to uzi's rework
 #   cr_rate_limited       CR refused this head; CR_RESET_MIN set when known
 #   review_pending        a bot is reviewing this head now
-#   unknown               a lookup failed or returned an unreadable payload; never act on it
+#   unknown               a lookup failed or returned an unreadable payload; never act on it.
+#                         UNKNOWN= is the union; CI_UNKNOWN= names the CI-checks part
 #   no_review             nothing reviewed this head and nothing is coming — trigger or fall back
 #   findings              live inline findings on the head (LIVE_FINDINGS=n) or any every-author
 #                         blocker (EVERY_AUTHOR=: unresolved threads from any author, open
@@ -81,6 +84,9 @@ have_uzi=0; command -v uzi >/dev/null 2>&1 && have_uzi=1
 # UNKNOWN is set by any lookup that fails or returns an unreadable payload; a snapshot with
 # UNKNOWN=1 never reaches NEXT=ready. Declared here because the first such lookup is next.
 UNKNOWN=0
+# CI_UNKNOWN is the required-checks part only: it routes after migration_collision and DIRTY,
+# so a CI-only unknown cannot mask a known collision or a conflict.
+CI_UNKNOWN=0
 repo_id=""; repo_listed=0
 if [ "$have_uzi" -eq 1 ]; then
   rl=$(uzi repo list --json 2>/dev/null || echo 'x')
@@ -169,25 +175,26 @@ mergeable=$(printf '%s' "$pj" | jq -r '.mergeable // empty')
 case "$state" in MERGED) echo "NEXT=merged"; exit 0;; CLOSED) echo "NEXT=closed"; exit 0;; esac
 
 # Every lookup below that fails or returns an unparseable payload sets UNKNOWN=1 (declared
-# at the top), and an unknown snapshot never reaches NEXT=ready: a masked failure would
-# otherwise read as "zero pending, zero findings".
+# at the top; the required-checks block sets CI_UNKNOWN=1 instead), and an unknown
+# snapshot never reaches NEXT=ready: a masked failure would otherwise read as "zero
+# pending, zero findings".
 arr_or_unknown() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1 || UNKNOWN=1; }
 
-# Required checks by bucket (must be a non-empty array; `{}`/`[]` are unknown).
+# Required checks by bucket (must be a non-empty array; `{}`/`[]` are CI_UNKNOWN).
 ci_fail=0; ci_pend=0; ci_cancel=0
 req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
 cj=""; cj_rc=0
 if [ -n "$req" ]; then cj=$(pr_ci_checks "$REPO" "$PR" "$req" "$head" "$base" 2>/dev/null) || cj_rc=$?
-else UNKNOWN=1; echo "CI_REQUIRED_RULES=unreadable"; fi
+else CI_UNKNOWN=1; echo "CI_REQUIRED_RULES=unreadable"; fi
 if ci_checks_valid "$cj" && [ "$(printf '%s' "$cj" | jq length)" -gt 0 ]; then
   ci_fail=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
   ci_pend=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
   ci_cancel=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
-  missing=$(missing_required "$req" "$cj") || { UNKNOWN=1; missing=0; }
+  missing=$(missing_required "$req" "$cj") || { CI_UNKNOWN=1; missing=0; }
   ci_pend=$((ci_pend + missing))
-  if [ "$cj_rc" -ne 0 ] && [ "$ci_fail" -eq 0 ] && [ "$ci_pend" -eq 0 ] && [ "$ci_cancel" -eq 0 ]; then UNKNOWN=1; fi
+  if [ "$cj_rc" -ne 0 ] && [ "$ci_fail" -eq 0 ] && [ "$ci_pend" -eq 0 ] && [ "$ci_cancel" -eq 0 ]; then CI_UNKNOWN=1; fi
 else
-  UNKNOWN=1
+  CI_UNKNOWN=1
   if [ "$mergeable" = "CONFLICTING" ]; then echo "CI_CHECKS=none (conflicting PR: GitHub runs no pull_request CI)"
   else echo "CI_CHECKS=unreadable-or-empty"; fi
 fi
@@ -428,11 +435,12 @@ fi
 # ---- NEXT -------------------------------------------------------------------------------
 reviewed=$cr_reviewed
 [ "$gr_reviewed" -eq 1 ] && reviewed=1
-echo "UNKNOWN=$UNKNOWN"
+echo "UNKNOWN=$(( UNKNOWN | CI_UNKNOWN ))"; echo "CI_UNKNOWN=$CI_UNKNOWN"
 if   [ "$mergeable" = "CONFLICTING" ]; then echo "NEXT=conflict"
 elif [ "$UNKNOWN" -eq 1 ]; then echo "NEXT=unknown (a lookup failed or returned an unreadable payload; re-run before acting)"
 elif [ -n "$collision" ]; then echo "NEXT=migration_collision"
 elif [ "$merge_state" = "DIRTY" ]; then echo "NEXT=conflict"
+elif [ "$CI_UNKNOWN" -eq 1 ]; then echo "NEXT=unknown (a lookup failed or returned an unreadable payload; re-run before acting)"
 elif [ "$ci_fail" -gt 0 ]; then echo "NEXT=ci_red"
 elif [ "$mrw" -gt 0 ]; then echo "NEXT=mr_rework_active"
 elif [ "$ci_pend" -gt 0 ] || [ "$ci_cancel" -gt 0 ]; then echo "NEXT=ci_pending"
