@@ -43,5 +43,14 @@ export function deriveMockProgress(run: Run): RunProgress | null {
   if (run.health === "stalled" || run.health === "looping") return { ...base, state: "stalled" };
   if (run.is_planning === true) return { ...base, state: "planning" };
   if (run.kind !== "issue" || total === 0) return { ...base, state: "none" };
-  return { ...base, state: "percent", pct: Math.min(99, Math.floor(11 + (89 * done) / total)) };
+  const percent: RunProgress = { ...base, state: "percent", pct: Math.min(99, Math.floor(11 + (89 * done) / total)) };
+  // PRD #2603: only the run-live demo carries a model-written Now line, so the parity
+  // fixtures (which never use that id) still compare equal.
+  if (run.id === "run-live") {
+    percent.now_note = {
+      text: "Running the heartbeat tests for the active milestone",
+      at: new Date(Date.now() - 2 * 60_000).toISOString(),
+    };
+  }
+  return percent;
 }

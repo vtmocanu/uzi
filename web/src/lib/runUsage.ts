@@ -342,6 +342,9 @@ interface ModelFigures {
   costUsd: number; // costUSD, quantized to microdollars (see quantizeCost)
 }
 
+/** `maxProgressNoteModels` (progress_note.go): model_usage entries kept per note. */
+const MAX_NOTE_MODELS = 4;
+
 const ZERO_MODEL: ModelFigures = { input: 0, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 };
 
 /** One model's run-total, per column — the client's copy of a `run_usage` row. */
@@ -615,6 +618,11 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
   // derived from this map.
   const modelSums = new Map<string, ModelFigures>();
   let implIteration = 0;
+  // PRD #2603: the Now-summary notes' usage. It joins the model sums and the billed total
+  // below but never a phase row or a per-agent row. `seenNoteSeqs` makes a replayed note
+  // (ws -> REST overlap) count once, as the server's per-seq row does.
+  const noteTotal = { fresh: 0, cached: 0, out: 0, costUsd: 0 };
+  const seenNoteSeqs = new Set<number>();
   // Whether ANY init frame has been seen yet: the run's FIRST init never opens a new
   // lineage (lineage 0 is the initial session whether or not its first init is flagged).
   let sawInit = false;
@@ -638,6 +646,46 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       prevByModel.clear();
       if (payload["fresh_session"] === true && sawInit) lineageR.clear();
       sawInit = true;
+    }
+
+    // PRD #2603: a progress_note's model_usage folds under `progress_note:<model>`, one
+    // row per note (the server's lineage_epoch is the note's own seq), so it is summed,
+    // never max-merged with the run's own frame of the same model. It never reaches the
+    // per-agent branch below.
+    if (m.kind === "progress_note") {
+      if (seenNoteSeqs.has(m.seq)) continue;
+      seenNoteSeqs.add(m.seq);
+      const nu = rec(payload?.["model_usage"]);
+      if (!nu) continue;
+      // Mirror normalizeProgressNotePayload: first MAX_NOTE_MODELS in sorted name order.
+      const names = Object.keys(nu).filter((k) => k !== "").sort().slice(0, MAX_NOTE_MODELS);
+      for (const raw of names) {
+        const e = rec(nu[raw]);
+        if (!e) continue;
+        const cur: ModelFigures = {
+          input: tokens(e["inputTokens"]),
+          cacheCreation: tokens(e["cacheCreationInputTokens"]),
+          cached: tokens(e["cacheReadInputTokens"]),
+          out: tokens(e["outputTokens"]),
+          // The server prices a note with no costUSD from its standard table; the client
+          // carries no price table, so an unpriced note adds tokens and $0 here.
+          costUsd: quantizeCost(e["costUSD"]),
+        };
+        const key = capModelID(`progress_note:${raw}`);
+        const sum = modelSums.get(key) ?? ZERO_MODEL;
+        modelSums.set(key, {
+          input: sum.input + cur.input,
+          cacheCreation: sum.cacheCreation + cur.cacheCreation,
+          cached: sum.cached + cur.cached,
+          out: sum.out + cur.out,
+          costUsd: sum.costUsd + cur.costUsd,
+        });
+        noteTotal.fresh += cur.input + cur.cacheCreation;
+        noteTotal.cached += cur.cached;
+        noteTotal.out += cur.out;
+        noteTotal.costUsd += cur.costUsd;
+      }
+      continue;
     }
 
     if (isResultFrame(m)) {
@@ -812,6 +860,11 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     }),
     { fresh: 0, cached: 0, out: 0, costUsd: 0, turns: 0, durationMs: 0, phaseCount: 0 },
   );
+
+  total.fresh += noteTotal.fresh;
+  total.cached += noteTotal.cached;
+  total.out += noteTotal.out;
+  total.costUsd += noteTotal.costUsd;
 
   const inTotal = total.fresh + total.cached;
   const agents: AgentUsage[] = [...agentMap.values()].map((a) => ({ ...a, ...primaryModel(a.modelCounts) }));
