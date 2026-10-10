@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Mock Docker allowlist saves match the server UUID parser.**
+  Saves accept compact UUIDs, URN prefixes, ASCII wrappers and Go whitespace while preserving the raw input; invalid tokens, including BOM padding, leave the saved allowlist unchanged.
+
 - **Checkpoint publication tolerates extra flush packets after a plain receive-pack report ([#2703](https://github.com/vtmocanu/uzi/issues/2703)).**
   A plain (non-sideband) receive-pack report followed by one or more bare flush packets is still read as the complete report, so publication no longer fails with "missing or incomplete receive-pack acknowledgement"; data or contradictory packets after the report are still not treated as an acknowledgement.
 - **A transient storage or deadline error during pre-clone retained-recovery discovery no longer fails the claim ([#2613](https://github.com/vtmocanu/uzi/issues/2613)).**
