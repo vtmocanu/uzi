@@ -31,6 +31,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Worker images exclude run-local artifacts from their baked source ([#2523](https://github.com/vtmocanu/uzi/issues/2523)).**
+  Both worker templates exclude `.uzi/`, keeping scratch and recovery artifacts out of `/opt/uzi-src` and preventing scratch updates from invalidating the source-copy cache.
+
 - **Mock Docker allowlist saves match the server UUID parser.**
   Saves accept compact UUIDs, URN prefixes, ASCII wrappers and Go whitespace while preserving the raw input; invalid tokens, including BOM padding, leave the saved allowlist unchanged.
 
