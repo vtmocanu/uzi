@@ -286,6 +286,8 @@ type fakeRedundancyQ struct {
 	view    store.GetArchiveRedundancyViewRow
 	binding store.GetCompletedPublicationBindingRow
 	memos   []string
+	// bindingErr fails GetCompletedPublicationBinding when set.
+	bindingErr error
 }
 
 func (q *fakeRedundancyQ) GetArchiveRedundancyView(context.Context, store.GetArchiveRedundancyViewParams) (store.GetArchiveRedundancyViewRow, error) {
@@ -293,6 +295,9 @@ func (q *fakeRedundancyQ) GetArchiveRedundancyView(context.Context, store.GetArc
 }
 
 func (q *fakeRedundancyQ) GetCompletedPublicationBinding(context.Context, store.GetCompletedPublicationBindingParams) (store.GetCompletedPublicationBindingRow, error) {
+	if q.bindingErr != nil {
+		return store.GetCompletedPublicationBindingRow{}, q.bindingErr
+	}
 	return q.binding, nil
 }
 
@@ -306,10 +311,12 @@ type fakeRedundancyTxQ struct {
 	expire  func() []uuid.UUID
 	expires int
 	proof   []byte
+	// workerErr fails the first locked read (GetWorkerForUpdate) when set.
+	workerErr error
 }
 
 func (t *fakeRedundancyTxQ) GetWorkerForUpdate(context.Context, uuid.UUID) (store.Worker, error) {
-	return store.Worker{}, nil
+	return store.Worker{}, t.workerErr
 }
 
 func (t *fakeRedundancyTxQ) GetRunOwnedByWorkerForUpdate(context.Context, store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error) {
@@ -692,4 +699,147 @@ func TestArchiveRedundancyReplayReturnsExpired(t *testing.T) {
 	// A TTL expiry (no recorded proof) or another digest is not a replay.
 	u.q.view.RedundancyProof = nil
 	u.wantRetained(t, apitypes.RecoveryRedundancyNotAvailable)
+}
+
+// Only refusals derived from forge evidence are remembered: a database error, a binding mismatch,
+// a missing forge or a client that went away says nothing about the forge.
+func TestArchiveRedundancyOnlyForgeEvidenceIsMemoized(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		edit   func(*redundancyUnit)
+		ctx    func() (context.Context, context.CancelFunc)
+		reason string
+	}{
+		{"binding_db_error", func(u *redundancyUnit) { u.q.bindingErr = errors.New("db down") }, nil, apitypes.RecoveryRedundancyAncestryUnknown},
+		{"binding_mismatch", func(u *redundancyUnit) { u.q.binding.ProjectID = 12 }, nil, apitypes.RecoveryRedundancyIdentityChanged},
+		{"nil_forges", func(u *redundancyUnit) { u.p.forges = nil }, nil, apitypes.RecoveryRedundancyAncestryUnknown},
+		{"cancelled_request", func(u *redundancyUnit) { u.forge.compareErr = context.Canceled }, func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}, apitypes.RecoveryRedundancyAncestryUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := newRedundancyUnit(t, "small")
+			tc.edit(u)
+			ctx := context.Background()
+			if tc.ctx != nil {
+				var cancel context.CancelFunc
+				ctx, cancel = tc.ctx()
+				defer cancel()
+			}
+			res, err := u.p.prove(ctx, u.w, u.run, u.capID, u.req)
+			if err != nil || res.Outcome != apitypes.RecoveryRedundancyRetained || res.Reason != tc.reason {
+				t.Fatalf("%+v %v want retained/%s", res, err, tc.reason)
+			}
+			if len(u.q.memos) != 0 || u.txq.expires != 0 {
+				t.Fatalf("a refusal not derived from forge evidence was memoized: %v", u.q.memos)
+			}
+		})
+	}
+}
+
+// A store error on the locked reads is an infrastructure failure, not an identity change.
+func TestArchiveRedundancyExpireStoreErrorIsAnError(t *testing.T) {
+	u := newRedundancyUnit(t, "small")
+	u.txq.workerErr = errors.New("connection reset")
+	res, err := u.p.prove(context.Background(), u.w, u.run, u.capID, u.req)
+	if err == nil || res.Outcome != "" {
+		t.Fatalf("got %+v %v want an error", res, err)
+	}
+	if u.tx.commits != 0 || u.txq.expires != 0 {
+		t.Fatalf("commits=%d expires=%d", u.tx.commits, u.txq.expires)
+	}
+	// A missing row is still the bounded identity_changed reason.
+	u = newRedundancyUnit(t, "small")
+	u.txq.workerErr = pgx.ErrNoRows
+	u.wantRetained(t, apitypes.RecoveryRedundancyIdentityChanged)
+}
+
+// A forged current_object can list far more parents than a real commit; the proof must not turn
+// that into one forge call per parent.
+func TestArchiveRedundancyParentAndProvedCapsRefuseBeforeForge(t *testing.T) {
+	tree := strings.Repeat("7", 40)
+	shas := func(base, n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("%040x", base+i)
+		}
+		return out
+	}
+	build := func(nRoots, nParents int) (apitypes.RecoveryArchiveRedundancyRequest, string) {
+		roots := shas(0x1000, nRoots)
+		curBody, cur := synthCommit(tree, shas(0x9000, nParents), "current")
+		witBody, _ := synthCommit(tree, shas(0xa000, 1), "witness")
+		digest := redundancyDigest(roots, cur, tree)
+		heads := append(slices.Clone(roots), cur)
+		slices.Sort(heads)
+		aggBody, agg := synthCommit(tree, heads, "uzi recovery coverage "+digest+" round 0 batch 0")
+		return apitypes.RecoveryArchiveRedundancyRequest{
+			Generation: 3, CoverageDigest: digest, Roots: roots, CurrentSha: cur, Tree: tree,
+			AggregateObjects: []string{b64s(aggBody)}, CurrentObject: b64s(curBody),
+			WIP: &apitypes.RecoveryArchiveRedundancyWIP{WitnessObject: b64s(witBody)},
+		}, agg
+	}
+	for _, tc := range []struct {
+		name           string
+		roots, parents int
+		prerequisites  int
+		wantTooLarge   bool
+	}{
+		{"parents_at_cap", 2, redundancyMaxParents, 0, false},
+		{"parents_over_cap", 2, redundancyMaxParents + 1, 0, true},
+		// 31 roots + the head + 32 parents + 64 prerequisites + the witness is 129 distinct commits.
+		{"proved_over_cap", 31, redundancyMaxParents, redundancyMaxPrerequisite, true},
+		{"proved_at_cap", 30, redundancyMaxParents, redundancyMaxPrerequisite, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := newRedundancyUnit(t, "small")
+			req, source := build(tc.roots, tc.parents)
+			u.req = req
+			u.q.view.SourceSha = source
+			u.q.view.CoverageDigest = pgconv.Text(req.CoverageDigest)
+			u.q.view.PrerequisiteShas = shas(0x5000, tc.prerequisites)
+			res, err := u.p.prove(context.Background(), u.w, u.run, u.capID, u.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tooLarge := res.Outcome == apitypes.RecoveryRedundancyRetained && res.Reason == apitypes.RecoveryRedundancyInventoryTooLarge
+			if tooLarge != tc.wantTooLarge {
+				t.Fatalf("%+v wantTooLarge=%v", res, tc.wantTooLarge)
+			}
+			if tc.wantTooLarge && (u.forge.callCount() != 0 || len(u.q.memos) != 0 || u.txq.expires != 0) {
+				t.Fatalf("over-cap claim reached forge/store: calls=%d memos=%v", u.forge.callCount(), u.q.memos)
+			}
+		})
+	}
+}
+
+// The captured head's own parents are part of the WIP proof. In this vector the parent is not a
+// root, so the parent loop is the only thing that can notice it is unpublished.
+func TestArchiveRedundancyWIPParentMustBePublished(t *testing.T) {
+	setup := func(parentPublished bool) *redundancyUnit {
+		u := newRedundancyUnit(t, "wip_unrooted_parent")
+		u.forge.unknown = map[string]bool{}
+		parent := u.vec.CurrentObject.Parents[0]
+		if slices.Contains(u.vec.Roots, parent) {
+			t.Fatalf("vector parent %s must not be a root", parent)
+		}
+		u.forge.answers[u.vec.CurrentSha] = forge.AncestryNotAncestor
+		u.forge.answers[u.vec.WitnessObject.Sha] = forge.AncestryAncestor
+		if parentPublished {
+			u.forge.answers[parent] = forge.AncestryAncestor
+		} else {
+			u.forge.answers[parent] = forge.AncestryNotAncestor
+		}
+		return u
+	}
+	u := setup(false)
+	u.wantRetained(t, apitypes.RecoveryRedundancyUncoveredWIP)
+	if u.txq.expires != 0 || !slices.Equal(u.q.memos, []string{apitypes.RecoveryRedundancyUncoveredWIP}) {
+		t.Fatalf("expires=%d memos=%v", u.txq.expires, u.q.memos)
+	}
+	if res := setup(true).run1(t); res.Outcome != apitypes.RecoveryRedundancyExpired {
+		t.Fatalf("%+v", res)
+	}
 }

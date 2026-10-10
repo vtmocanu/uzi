@@ -249,6 +249,46 @@
         "bodyBase64": "dHJlZSA3MWE2NWEzMmEzOTEzOWRhNmNkNDc1ZjJmYjM5ODA0MWNlMDBiYzE1CnBhcmVudCBlY2JjZTNiODQyZmY3MGYwY2RhYWU1OTRlOTljNTYwYzk0OWRmNTNmCmF1dGhvciBGaXh0dXJlIEF1dGhvciA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+IDE1NzkzMDU2MDAgKzAwMDAKY29tbWl0dGVyIEZpeHR1cmUgQXV0aG9yIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4gMTU3OTMwNTYwMCArMDAwMAoKcHVibGlzaGVkIHJld3JpdGUgb2YgdGhlIHNhbWUgY29udGVudAo=",
         "tree": "71a65a32a39139da6cd475f2fb398041ce00bc15"
       }
+    },
+    {
+      "name": "wip_unrooted_parent",
+      "description": "parked WIP current head whose parent is not among the roots; the parent and a witness carrying the same tree must be published",
+      "roots": [
+        "38bb98cf89c78b14b13ba2cc2998cff10c2ef5c0"
+      ],
+      "currentSha": "015b377dfed54f4c8b36c922259234187c3cb3a5",
+      "tree": "7c4f8db0aa7de7099e1e142de6123f6576f9eb4b",
+      "digest": "8db62248efe7b6a1984ac0e4581d71462ec28e934dbfe29083c811c2f6116f8d",
+      "digestInput": "{\"roots\":[\"38bb98cf89c78b14b13ba2cc2998cff10c2ef5c0\"],\"currentSha\":\"015b377dfed54f4c8b36c922259234187c3cb3a5\",\"tree\":\"7c4f8db0aa7de7099e1e142de6123f6576f9eb4b\"}",
+      "sourceSha": "383944f1f727dddb26219ac35aa81d444af6b203",
+      "leafParents": [
+        "015b377dfed54f4c8b36c922259234187c3cb3a5",
+        "38bb98cf89c78b14b13ba2cc2998cff10c2ef5c0"
+      ],
+      "aggregateObjects": [
+        {
+          "sha": "383944f1f727dddb26219ac35aa81d444af6b203",
+          "round": 0,
+          "batch": 0,
+          "parents": [
+            "015b377dfed54f4c8b36c922259234187c3cb3a5",
+            "38bb98cf89c78b14b13ba2cc2998cff10c2ef5c0"
+          ],
+          "bodyBase64": "dHJlZSA3YzRmOGRiMGFhN2RlNzA5OWUxZTE0MmRlNjEyM2Y2NTc2ZjllYjRiCnBhcmVudCAwMTViMzc3ZGZlZDU0ZjRjOGIzNmM5MjIyNTkyMzQxODdjM2NiM2E1CnBhcmVudCAzOGJiOThjZjg5Yzc4YjE0YjEzYmEyY2MyOTk4Y2ZmMTBjMmVmNWMwCmF1dGhvciB1emktYWdlbnQgPHV6aS1hZ2VudEB1emkubG9jYWw+IDk0NjY4NDgwMCArMDAwMApjb21taXR0ZXIgdXppLWFnZW50IDx1emktYWdlbnRAdXppLmxvY2FsPiA5NDY2ODQ4MDAgKzAwMDAKCnV6aSByZWNvdmVyeSBjb3ZlcmFnZSA4ZGI2MjI0OGVmZTdiNmExOTg0YWMwZTQ1ODFkNzE0NjJlYzI4ZTkzNGRiZmUyOTA4M2M4MTFjMmY2MTE2ZjhkIHJvdW5kIDAgYmF0Y2ggMAo="
+        }
+      ],
+      "currentObject": {
+        "sha": "015b377dfed54f4c8b36c922259234187c3cb3a5",
+        "bodyBase64": "dHJlZSA3YzRmOGRiMGFhN2RlNzA5OWUxZTE0MmRlNjEyM2Y2NTc2ZjllYjRiCnBhcmVudCBlY2JjZTNiODQyZmY3MGYwY2RhYWU1OTRlOTljNTYwYzk0OWRmNTNmCmF1dGhvciBGaXh0dXJlIEF1dGhvciA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+IDE1NzkzOTIwMDAgKzAwMDAKY29tbWl0dGVyIEZpeHR1cmUgQXV0aG9yIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4gMTU3OTM5MjAwMCArMDAwMAoKd2lwKHBhcmspOiBzZWNvbmQgd29yayBpbiBwcm9ncmVzcwo=",
+        "parents": [
+          "ecbce3b842ff70f0cdaae594e99c560c949df53f"
+        ]
+      },
+      "witnessObject": {
+        "sha": "4f90e74c5531d3f644fadd90a65a8eac8f3b56a6",
+        "bodyBase64": "dHJlZSA3YzRmOGRiMGFhN2RlNzA5OWUxZTE0MmRlNjEyM2Y2NTc2ZjllYjRiCnBhcmVudCAzOGJiOThjZjg5Yzc4YjE0YjEzYmEyY2MyOTk4Y2ZmMTBjMmVmNWMwCmF1dGhvciBGaXh0dXJlIEF1dGhvciA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+IDE1Nzk0Nzg0MDAgKzAwMDAKY29tbWl0dGVyIEZpeHR1cmUgQXV0aG9yIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4gMTU3OTQ3ODQwMCArMDAwMAoKcHVibGlzaGVkIHJld3JpdGUgb2YgdGhlIHNlY29uZCBjb250ZW50Cg==",
+        "tree": "7c4f8db0aa7de7099e1e142de6123f6576f9eb4b"
+      }
     }
   ]
 }

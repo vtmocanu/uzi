@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Issue #2625: POST /api/worker/runs/{id}/archives/{captureID}/redundancy through the real router,
@@ -167,8 +168,22 @@ func TestRecoveryArchiveRedundancyRouteExpiresLiveDB(t *testing.T) {
 	if code, _ := r.claim(r.token, unsorted); code != http.StatusBadRequest {
 		t.Fatalf("unsorted roots must be a 400: %d", code)
 	}
-	if rec := r.do(path, r.token, `{"generation":1,"padding":"`+strings.Repeat("x", 3<<20)+`"}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("over the body cap: %d", rec.Code)
+	// Pad a known field, so the body cap is the only thing that can refuse the oversized body: the
+	// same claim below the cap decodes and is answered 200, one byte-for-byte over it is a 400.
+	padded := func(n int) map[string]any {
+		b := map[string]any{}
+		for k, v := range r.body {
+			b[k] = v
+		}
+		b["current_object"] = strings.Repeat("A", n)
+		return b
+	}
+	if code, res := r.claim(r.token, padded(workersvc.RedundancyRequestMaxBytes/2)); code != http.StatusOK ||
+		res.Outcome != apitypes.RecoveryRedundancyRetained || res.Reason != apitypes.RecoveryRedundancyInventoryTooLarge {
+		t.Fatalf("a large body under the cap must decode and be refused by the claim caps: %d %+v", code, res)
+	}
+	if code, _ := r.claim(r.token, padded(workersvc.RedundancyRequestMaxBytes+1)); code != http.StatusBadRequest {
+		t.Fatalf("over the body cap: %d", code)
 	}
 	if n := r.chunks(); n != 1 || r.forge.compareCalls != 1 {
 		t.Fatalf("malformed claims must change nothing: chunks=%d compare calls=%d", n, r.forge.compareCalls)

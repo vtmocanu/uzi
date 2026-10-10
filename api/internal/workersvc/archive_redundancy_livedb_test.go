@@ -459,6 +459,23 @@ func TestArchiveRedundancyProtectedFinalCaptureLiveDB(t *testing.T) {
 			})
 		}
 	})
+	// A valid proof recorded together with an identity-tuple change must raise: the guard's silent
+	// RETURN NULL is reserved for statements that carry no proof (see (3j)).
+	t.Run("valid_proof_with_identity_change_raises_and_keeps_bytes", func(t *testing.T) {
+		r := newRedundancyLive(t, redundancyLiveOpts{vec: "small", ack: true})
+		_, err := r.e.pool.Exec(r.e.ctx, flip(`state='expired', reason='published_redundant', local_replica_worker_id=NULL, expires_at=LEAST(expires_at, now()), source_sha=$3, redundancy_proof=$2::jsonb`),
+			r.capture, proofJSON(r, nil), strings.Repeat("7", 40))
+		isGuardRefusal(t, err)
+		if !strings.Contains(err.Error(), "cannot change the capture identity") {
+			t.Fatalf("refused for another reason: %v", err)
+		}
+		if c := r.row(t); c.State != "available" || len(c.Proof) != 0 || !c.LocalReplica.Valid {
+			t.Fatalf("row changed: %+v", c)
+		}
+		if n := r.chunks(t); n != 1 {
+			t.Fatalf("chunks %d", n)
+		}
+	})
 	t.Run("proof_on_another_transition_raises", func(t *testing.T) {
 		r := newRedundancyLive(t, redundancyLiveOpts{vec: "small", ack: true})
 		_, err := r.e.pool.Exec(r.e.ctx, "UPDATE recovery_captures SET state='discarded', reason='published_redundant', redundancy_proof=$2::jsonb WHERE id=$1", r.capture, proofJSON(r, nil))

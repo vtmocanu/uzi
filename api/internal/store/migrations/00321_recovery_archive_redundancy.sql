@@ -15,10 +15,11 @@ ALTER TABLE recovery_captures ADD CONSTRAINT recovery_captures_redundancy_refusa
 
 -- The ADR-2417 guard, extended. Without a proof every branch below is the original: a protected
 -- final capture cannot reach 'expired' before its window, a changed identity tuple is dropped.
--- With a proof the guard RAISEs on any violation (a silent RETURN NULL would let a CTE delete
--- chunks of a row it did not expire) and skips the protected-final raise only when the proof
--- matches the capture, its released hold and the completed run. The exemption is a COALESCE so
--- an unknown (NULL) predicate falls through to the original protection, never around it.
+-- While a proof is being recorded the guard RAISEs on any violation, including an identity-tuple
+-- change in the same UPDATE (a silent RETURN NULL would let a CTE delete chunks of a row it did
+-- not expire), and skips the protected-final raise only when the proof matches the capture, its
+-- released hold and the completed run. The exemption is a COALESCE so an unknown (NULL) predicate
+-- falls through to the original protection, never around it.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION recovery_inventory_capture_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
@@ -58,6 +59,10 @@ BEGIN
         IF NOT redundant THEN
             RAISE EXCEPTION 'recovery redundancy proof does not match its capture' USING ERRCODE = '55000';
         END IF;
+        IF (NEW.hold_id, NEW.run_id, NEW.user_id, NEW.original_worker_id, NEW.source_sha, NEW.coverage_digest)
+            IS DISTINCT FROM (OLD.hold_id, OLD.run_id, OLD.user_id, OLD.original_worker_id, OLD.source_sha, OLD.coverage_digest) THEN
+            RAISE EXCEPTION 'recovery redundancy proof cannot change the capture identity' USING ERRCODE = '55000';
+        END IF;
     END IF;
     -- Raise before any no-op guard: an old expiry CTE may already have deleted chunks.
     -- The exception rolls back that entire statement, including its chunk deletion.
@@ -76,6 +81,11 @@ $$;
 -- +goose StatementEnd
 
 -- +goose Down
+-- Rolling back loses data that cannot be rebuilt: every redundancy_proof (the evidence that an
+-- archive expired as published-redundant) and every refusal memo (redundancy_refused_at and
+-- redundancy_refusal, which only throttle repeat claims) go with their columns. A capture that
+-- expired as published_redundant keeps its state with the reason rewritten below, and its chunks
+-- were deleted at expiry, so those bytes are never recoverable by a rollback.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION recovery_inventory_capture_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

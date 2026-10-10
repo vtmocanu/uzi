@@ -50,6 +50,9 @@ const (
 	redundancyMaxObjectBytes  = 64 << 10
 	redundancyMaxParents      = 32
 	redundancyMaxPrerequisite = 64
+	// redundancyMaxProved bounds the distinct commits one claim may ask the forge about: the
+	// heads, the prerequisites, the captured head's parents and the witness.
+	redundancyMaxProved = 128
 )
 
 // ErrInvalidRedundancyRequest is a malformed redundancy claim: a field that is not a lowercase
@@ -163,6 +166,9 @@ func (p *archiveRedundancyProver) prove(ctx context.Context, w store.Worker, run
 	if reason != "" {
 		return retain(reason), nil
 	}
+	if redundancyProvedCount(in, view.PrerequisiteShas) > redundancyMaxProved {
+		return retain(apitypes.RecoveryRedundancyInventoryTooLarge), nil
+	}
 
 	// The memo is a database read, so it precedes the first forge call.
 	if view.RedundancyRefusedAt.Valid && view.RedundancyRefusal.Valid &&
@@ -170,8 +176,14 @@ func (p *archiveRedundancyProver) prove(ctx context.Context, w store.Worker, run
 		return retain(apitypes.RecoveryRedundancyCoolingDown), nil
 	}
 
-	// Past this point every refusal is forge evidence (or its absence) and is remembered.
+	// refuse remembers a refusal derived from forge evidence (or its absence). A database error, a
+	// binding mismatch, a missing forge and a cancelled request say nothing about the forge, so
+	// they use retain and are not memoized.
 	refuse := func(reason string) apitypes.RecoveryArchiveRedundancyResponse {
+		if ctx.Err() != nil {
+			// The client went away; whatever the forge calls returned is not evidence.
+			return retain(reason)
+		}
 		memoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), redundancyWriteDeadline)
 		defer cancel()
 		if _, err := p.q.RecordArchiveRedundancyRefusal(memoCtx, store.RecordArchiveRedundancyRefusalParams{
@@ -182,25 +194,25 @@ func (p *archiveRedundancyProver) prove(ctx context.Context, w store.Worker, run
 		return retain(reason)
 	}
 	if p.forges == nil {
-		return refuse(apitypes.RecoveryRedundancyAncestryUnknown), nil
+		return retain(apitypes.RecoveryRedundancyAncestryUnknown), nil
 	}
 	proofCtx, cancel := context.WithTimeout(ctx, redundancyProofDeadline)
 	defer cancel()
 	repoID, perr := uuid.Parse(id.RepoID)
 	if perr != nil {
-		return refuse(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
 	}
 	binding, err := p.q.GetCompletedPublicationBinding(proofCtx, store.GetCompletedPublicationBindingParams{RepoID: repoID, UserID: w.UserID})
 	if err != nil {
-		return refuse(completedPublicationError(proofCtx, err)), nil
+		return retain(completedPublicationError(proofCtx, err)), nil
 	}
 	if binding.ConnectionID.String() != id.ConnectionID || binding.ProjectID != id.ProjectID ||
 		binding.ForgeType != id.ForgeType || binding.BaseUrl != id.BaseURL {
-		return refuse(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
 	}
 	f, err := p.forges.ForgeForConnection(binding.ForgeType, binding.BaseUrl, binding.TokenCiphertext)
 	if err != nil {
-		return refuse(apitypes.RecoveryRedundancyAncestryUnknown), nil
+		return retain(apitypes.RecoveryRedundancyAncestryUnknown), nil
 	}
 	head, reason := proveCompletedPublication(proofCtx, f, id)
 	if reason != "" {
@@ -239,28 +251,36 @@ func (p *archiveRedundancyProver) expire(ctx context.Context, w store.Worker, ru
 	}
 	defer func() { _ = tx.Rollback(writeCtx) }()
 	qt := p.txq(tx)
+	// Only a missing row means the identity changed; any other store error is an infrastructure
+	// failure and surfaces as an error (the handler answers 500) rather than a bounded reason.
+	changed := func(err error) (apitypes.RecoveryArchiveRedundancyResponse, error) {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+		}
+		return apitypes.RecoveryArchiveRedundancyResponse{}, err
+	}
 	if _, err = qt.GetWorkerForUpdate(writeCtx, w.ID); err != nil {
-		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return changed(err)
 	}
 	if _, err = qt.GetRunOwnedByWorkerForUpdate(writeCtx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(w.ID)}); err != nil {
-		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return changed(err)
 	}
 	hold, err := qt.GetFinalInventoryHold(writeCtx, store.GetFinalInventoryHoldParams{
 		RunID: runID, UserID: w.UserID, WorkerID: w.ID, Generation: req.Generation,
 	})
 	if err != nil {
-		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return changed(err)
 	}
 	if _, err = qt.GetFinalInventoryCapture(writeCtx, store.GetFinalInventoryCaptureParams{
 		ID: captureID, HoldID: hold.ID, RunID: runID, UserID: w.UserID, WorkerID: w.ID,
 	}); err != nil {
-		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return changed(err)
 	}
 	locked, err := qt.GetArchiveRedundancyView(writeCtx, store.GetArchiveRedundancyViewParams{
 		CaptureID: captureID, RunID: runID, UserID: w.UserID, WorkerID: w.ID,
 	})
 	if err != nil {
-		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+		return changed(err)
 	}
 	_, replay, reason := redundancyBinding(locked, w, runID, req)
 	if replay {
@@ -280,6 +300,9 @@ func (p *archiveRedundancyProver) expire(ctx context.Context, w store.Worker, ru
 		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
 	}
 	current, err := qt.LockCompletedPublicationBinding(writeCtx, store.LockCompletedPublicationBindingParams{RepoID: repoID, UserID: w.UserID})
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return apitypes.RecoveryArchiveRedundancyResponse{}, err
+	}
 	if err != nil || current.ConnectionID.String() != id.ConnectionID || current.ProjectID != id.ProjectID ||
 		current.ForgeType != id.ForgeType || current.BaseUrl != id.BaseURL {
 		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
@@ -604,6 +627,9 @@ func verifyRedundancyInputs(req apitypes.RecoveryArchiveRedundancyRequest, sourc
 	if !ok || cur.sha != req.CurrentSha {
 		return in, apitypes.RecoveryRedundancyBadObject
 	}
+	if len(cur.parents) > redundancyMaxParents {
+		return in, apitypes.RecoveryRedundancyInventoryTooLarge
+	}
 	if cur.tree != req.Tree {
 		return in, apitypes.RecoveryRedundancyTreeMismatch
 	}
@@ -623,6 +649,26 @@ func verifyRedundancyInputs(req apitypes.RecoveryArchiveRedundancyRequest, sourc
 		in.witness = &wit
 	}
 	return in, ""
+}
+
+// redundancyProvedCount is the number of distinct commits the proof may ask the forge about. The
+// captured head's parents and the witness are only asked for parked work-in-progress, which is
+// the claim that carries a witness.
+func redundancyProvedCount(in redundancyInputs, prerequisites []string) int {
+	set := make(map[string]struct{}, len(in.heads)+len(prerequisites))
+	for _, sha := range in.heads {
+		set[sha] = struct{}{}
+	}
+	for _, sha := range prerequisites {
+		set[sha] = struct{}{}
+	}
+	if in.witness != nil {
+		set[in.witness.sha] = struct{}{}
+		for _, sha := range in.current.parents {
+			set[sha] = struct{}{}
+		}
+	}
+	return len(set)
 }
 
 // proveRedundantCoverage asks the forge, once per distinct commit, whether it is an ancestor of
