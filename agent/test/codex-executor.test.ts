@@ -2171,7 +2171,7 @@ describe("m1 credential-free owner cancel", () => {
             },
             cancel() { releaseCancelled = true; },
           }, { highWaterMark: 0 }), { headers: { "Content-Length": "1" } });
-          response.text = async () => { throw new Error("Response.text prohibited for release ACK"); };
+          t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
           return response;
         },
       });

@@ -171,7 +171,7 @@ describe("recovery archive client wire (PRD #1296 M3 ↔ M2 handler)", () => {
   }
 
   for (const contentLength of [undefined, "1"]) {
-    it(`release bounds streamed bytes with ${contentLength === undefined ? "absent" : "lying"} Content-Length`, async () => {
+    it(`release bounds streamed bytes with ${contentLength === undefined ? "absent" : "lying"} Content-Length`, async (t) => {
       const receipt = { run_id: RUN_ID, generation: 7, released: true, holds_released: 1, retained: false };
       const text = JSON.stringify({ ...receipt, reason: "界".repeat(10_000) });
       const bytes = Buffer.from(text);
@@ -195,7 +195,7 @@ describe("recovery archive client wire (PRD #1296 M3 ↔ M2 handler)", () => {
         cancel() { cancelled = true; },
       }, { highWaterMark: 0 }), { headers });
       // A bounded ACK must read the stream rather than materialize Response.text().
-      response.text = async () => { throw new Error("Response.text prohibited for release ACK"); };
+      t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
       const calls: Array<{ url: string; init?: RequestInit }> = [];
       const client = new WorkerClient(baseUrl, TOKEN, "test", nullLogger(), {
         fetch: async (input, init) => {
@@ -233,7 +233,7 @@ describe("recovery archive client wire (PRD #1296 M3 ↔ M2 handler)", () => {
             controller.enqueue(chunk);
           },
         }, { highWaterMark: 0 }), { headers });
-        response.text = async () => { throw new Error("Response.text prohibited for release ACK"); };
+        t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
         assert.deepEqual(await client.releaseRecoveryCustody(RUN_ID, 7), receipt);
         assert.equal(offset, healthy.length);
         assert.equal(healthyEnded, true);
