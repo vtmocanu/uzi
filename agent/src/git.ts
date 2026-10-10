@@ -2201,7 +2201,6 @@ export class GitCache {
       // in the runner-owned clone. An unreadable journal fails closed before rm.
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending) {
-        if (!await this.pathPresent(pending.clonePath)) throw new Error("known recovery source is missing; nothing seeded");
         // issue #1315 — three fail-closed cases. The git layer NEVER probes owner
         // status and NEVER disposes; it only classifies. Only Case B is reclaimable,
         // and only the runner reclaims, after an authoritative owner probe.
@@ -2219,6 +2218,7 @@ export class GitCache {
           throw new ForeignCaptureBlockedError(clonePath, branch, pending.runId);
         }
         // Case C: this run's own retained work — capture before reseeding.
+        if (!await this.pathPresent(pending.clonePath)) throw new Error("known recovery source is missing; nothing seeded");
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
       // issue #1783 M3: the journal cases above ran first and threw with the path untouched.
@@ -2401,7 +2401,8 @@ export class GitCache {
    *     PendingRecoveryCaptureError(journaledPath).
    *   - B′ the same key, another run → ForeignCaptureBlockedError(journaledPath).
    *   - A′ a different key, or a path that parses as neither → CapturePathMismatchError.
-   * A journal whose known source path is gone fails closed; it is never overwritten by a seed.
+   * Mismatch and foreign-owner classification precede the source-presence check. This run's own
+   * journal whose known source path is gone fails closed; it is never overwritten by a seed.
    */
   private async attemptCloneForBranch(
     barePath: string,
@@ -2424,7 +2425,6 @@ export class GitCache {
       const clonePath = attemptClonePath(canonical, attempt.attemptId);
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending) {
-        if (!await this.pathPresent(pending.clonePath)) throw new Error("known recovery source is missing; nothing seeded");
         const shape = this.clonePathShape(pending.clonePath, canonical);
         const idMismatch =
           pending.attemptId !== undefined && (shape?.attemptId ?? "") !== pending.attemptId;
@@ -2434,6 +2434,7 @@ export class GitCache {
         if (pending.runId !== runId) {
           throw new ForeignCaptureBlockedError(pending.clonePath, branch, pending.runId);
         }
+        if (!await this.pathPresent(pending.clonePath)) throw new Error("known recovery source is missing; nothing seeded");
         throw new PendingRecoveryCaptureError(pending.clonePath, branch);
       }
       // The attempt id carries 64 random bits: an existing path is not a collision to paper
