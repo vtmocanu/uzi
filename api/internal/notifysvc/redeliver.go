@@ -62,9 +62,13 @@ func NewRedeliverer(q RedeliveryStore, slack Slacker, logger *slog.Logger, opts 
 // Pass claims one batch of pending durable rows and re-enqueues each on the Slacker with
 // its row id as DeliveryID. It returns how many were handed to the Slacker: an enqueue
 // the notifier drops on a full queue still counts, and that row stays pending for a later
-// claim. A row whose stored render cannot be decoded is logged and skipped; it keeps being
-// claimed until it exhausts MaxSlackAttempts and then stops. With no Slacker it claims
-// nothing.
+// claim while below MaxSlackAttempts. A row whose stored render cannot be decoded is
+// logged and skipped; it keeps being claimed until it exhausts MaxSlackAttempts.
+// The final claim attempts best-effort per-user pruning before decoding or publishing,
+// including for a corrupt render (issue #2076). Successful pruning removes eligible
+// older rows without a later Notify; pending durable rows and timestamp ties remain.
+// A prune failure is logged without undoing exhaustion or blocking a valid final DM.
+// This pass does not sweep historical settled rows. With no Slacker it claims nothing.
 func (r *Redeliverer) Pass(ctx context.Context) (int64, error) {
 	if r.slack == nil {
 		return 0, nil

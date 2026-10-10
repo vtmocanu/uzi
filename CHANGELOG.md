@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Settled halt notifications can be pruned without a later notification ([#2076](https://github.com/vtmocanu/uzi/issues/2076)).**
+  Best-effort per-user pruning now follows a successful Slack delivery stamp (including terminal no-link outcomes) and the final retry claim, even for a corrupt stored render, so an idle user's log can converge toward the nominal 200-row retention target when pruning succeeds. Pending durable rows below the attempt cap stay exempt, timestamp ties may retain more than 200 rows, and logged prune failures do not undo delivery settlement or retry exhaustion. There is no historical settled-backlog sweep or unconditional cleanup guarantee.
+
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
 
