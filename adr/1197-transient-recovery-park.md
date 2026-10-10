@@ -222,8 +222,9 @@ confirmed operational errors: the operation deadline, identified by an elapsed
 absolute attempt deadline plus abort evidence (the lock-wait abort message or
 a "recovery deadline exhausted" error in the cause chain), and the resource
 errnos EAGAIN, EMFILE, ENFILE and ENOMEM. A bare abort without that evidence
-is terminal. Typed, corruption, unsafe-storage and invalid-episode errors are
-classified first and stay terminal, keeping custody. Git spawn exhaustion is
+is terminal. Typed errors and known corruption markers are rejected before
+any deadline-text match, and every other error is terminal unless positively
+identified as retryable; all of them keep custody. Git spawn exhaustion is
 wrapped without a code, so it stays terminal.
 
 The allowance is at most 2 retries per claim, shared across both discovery

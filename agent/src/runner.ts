@@ -1000,11 +1000,13 @@ function classifyRetainedDiscoveryError(error: unknown, deadlineElapsed: boolean
       error instanceof ForeignRetainedRecoveryError || error instanceof RetainedRecoveryStop ||
       error instanceof CredentialSwitchSignal || error instanceof SyntaxError) return "terminal";
   const message = error instanceof Error ? error.message : "";
-  if (RETAINED_CORRUPTION_MARKERS.some(marker => message.includes(marker))) return "terminal";
   const errno = error as { code?: unknown; syscall?: unknown } | null;
   if (error instanceof Error && typeof errno?.code === "string" && typeof errno.syscall === "string") {
+    // Node errno messages embed the failing path, so a marker such as "ledger" in a repo path
+    // must not reject them; the errno code alone decides.
     return RETAINED_RETRYABLE_ERRNO.has(errno.code) ? "retryable" : "terminal";
   }
+  if (RETAINED_CORRUPTION_MARKERS.some(marker => message.includes(marker))) return "terminal";
   if (!deadlineElapsed) return "terminal";
   if (error instanceof Error && error.name === "AbortError" && message === RETAINED_LOCK_WAIT_ABORT_MESSAGE) return "retryable";
   let current: unknown = error;
