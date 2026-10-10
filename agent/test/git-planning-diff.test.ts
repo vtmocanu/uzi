@@ -64,6 +64,14 @@ async function assertRefused(pending: Promise<unknown>, refusal: string, diagnos
   const got = await refusalOf(pending);
   assert.deepEqual({ refusal: got.refusal, diagnostic: got.diagnostic }, { refusal, diagnostic });
 }
+// TickSpawner enters cwd before runnerCommand switches identity. Launch from the
+// worker cwd, then enter the private clone inside the trusted Node capture helper.
+function captureSpawnRequest(request: BoundaryProcessRequest): BoundaryProcessRequest {
+  const argv = [...request.argv];
+  assert.equal(argv[1], "-e");
+  argv[2] = `process.chdir(${JSON.stringify(request.cwd)});\n` + argv[2];
+  return { ...request, cwd: process.cwd(), argv };
+}
 async function fixture(options: {
   seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean; sandbox?: boolean;
   limits?: { snapshotLimit: number; totalLimit: number };
@@ -141,13 +149,15 @@ for (const denied of ["/", ${JSON.stringify(path.join(data, "seed", "tracked"))}
 ` + argv[2];
               return owner.spawn({
                 ...request,
+                // The sandbox enters its explicit clone cwd after the identity switch.
+                cwd: process.cwd(),
                 argv: ["/usr/local/bin/uzi-codex-command-sandbox",
                   ...commandSandboxArgv(clone, clone, argv[0]!, argv.slice(1), privateTmp, "required")],
                 env: { ...request.env, HOME: privateTmp, TMPDIR: privateTmp },
               });
             }
             const spawnRequest = options.privateTmp ? { ...request, env: { ...request.env, TMPDIR: tmp } } : request;
-            if (!options.meter && !options.hook) return owner.spawn(spawnRequest);
+            if (!options.meter && !options.hook) return owner.spawn(captureSpawnRequest(spawnRequest));
             // Instrument only the trusted inline capture program, preserving its argv and body.
             const argv = [...spawnRequest.argv];
             assert.equal(argv[1], "-e");
@@ -188,7 +198,7 @@ meterCp.spawn = function(...args) {
 };
 process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JSON.stringify(readMetrics)));
 ` : "") + argv[2];
-            return owner.spawn({ ...spawnRequest, argv });
+            return owner.spawn(captureSpawnRequest({ ...spawnRequest, argv }));
           }, signal, () => cache.capturePlanningDiff(clone, base));
         } finally {
           await owner.settled();
@@ -226,7 +236,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
 
   it("owns fixture roots, private tmp, late state and capture hook outputs", async () => {
     const f = await fixture({ privateTmp: true, meter: true,
-      hook: 'require("node:fs").writeFileSync(__DATA__ + "/hook.json", "{}");' });
+      hook: 'require("node:fs").writeFileSync(__DATA__ + "/hook.json", JSON.stringify({ cwd: process.cwd(), uid: process.getuid() }));' });
     try {
       await assertOwned(f.data, 0o700);
       await assertOwned(f.tmp, 0o700);
@@ -234,6 +244,9 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       await fs.writeFile(path.join(f.clone, "tracked"), "owned change\\n");
       await f.git("add", "tracked");
       await f.capture();
+      assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.data, "hook.json"), "utf8")), {
+        cwd: f.clone, uid: uidSplitActive() ? RUNNER_UID : process.getuid!(),
+      });
       for (const file of [f.clone, path.join(f.clone, ".git/index"),
         path.join(f.data, "hook.json"), path.join(f.data, "read-metrics.json")]) await assertOwned(file);
       await assertOwned(path.join(f.data, "late-state"), 0o700);
@@ -645,7 +658,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       await fs.unlink(path.join(f.clone, ".gitignore"));
       await fs.writeFile(path.join(f.clone, ".gitignore"), "");
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal });
-      await assert.rejects(f.cache.withBoundaryProcessSpawner(owner.spawn, ac.signal,
+      await assert.rejects(f.cache.withBoundaryProcessSpawner(req => owner.spawn(captureSpawnRequest(req)), ac.signal,
         () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40))), /UZI-PLANNING-REFUSAL base_object_type_mismatch/);
       await owner.settled();
       assert.deepEqual(owner.survivors(), []);
@@ -1037,7 +1050,7 @@ snapFs.readSync = function(...args) {
       await assert.rejects(f.cache.capturePlanningDiff(f.clone, "HEAD"), /40-hex/);
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal, killGraceMs: 100 });
       const pending = f.cache.withBoundaryProcessSpawner(async req => {
-        const handle = await owner.spawn(req);
+        const handle = await owner.spawn(captureSpawnRequest(req));
         ac.abort();
         return handle;
       }, ac.signal, () => f.cache.capturePlanningDiff(f.clone, f.base));
