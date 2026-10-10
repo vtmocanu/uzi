@@ -357,3 +357,47 @@ describe("product site-list allowance URLs", () => {
     expect((init as RequestInit).method).toBe(method);
   });
 });
+
+// Issue #2661: ?view=summary is opt-in; the default calls must keep sending no view.
+describe("listRuns / adminListRuns summary view (#2661)", () => {
+  const emptyRuns = { runs: [] };
+  const stub = () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, emptyRuns),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("listRuns() sends no query string and no view by default", async () => {
+    const fetchMock = stub();
+    await api.listRuns();
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/runs$/);
+  });
+
+  it("view=summary composes with repo_id and issue_iid", async () => {
+    const fetchMock = stub();
+    await api.listRuns({ repoId: "r1", issueIid: 7, view: "summary" });
+    const url = new URL(String(fetchMock.mock.calls[0][0]), "http://x");
+    expect(url.pathname.endsWith("/runs")).toBe(true);
+    expect(url.searchParams.get("repo_id")).toBe("r1");
+    expect(url.searchParams.get("issue_iid")).toBe("7");
+    expect(url.searchParams.get("view")).toBe("summary");
+  });
+
+  it("view=summary keeps the passive header", async () => {
+    const fetchMock = stub();
+    await api.listRuns({ passive: true, view: "summary" });
+    expect(String(fetchMock.mock.calls[0][0])).toContain("view=summary");
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>)["X-Uzi-Passive"]).toBe("1");
+  });
+
+  it("adminListRuns() sends no query string; with view it hits /admin/runs?view=summary", async () => {
+    const fetchMock = stub();
+    await api.adminListRuns();
+    await api.adminListRuns({ view: "summary" });
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/admin\/runs$/);
+    expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/admin\/runs\?view=summary$/);
+  });
+});

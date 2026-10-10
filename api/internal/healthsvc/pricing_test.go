@@ -63,7 +63,7 @@ func TestPricingReasonsAndParameters(t *testing.T) {
 		if !p.Cutoff.Valid || !p.Cutoff.Time.Equal(time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)) {
 			t.Errorf("cutoff: %+v", p.Cutoff)
 		}
-		if !reflect.DeepEqual(p.Priced, []string{"gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"}) {
+		if !reflect.DeepEqual(p.Priced, []string{"gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}) {
 			t.Errorf("priced: %#v", p.Priced)
 		}
 		return []store.ListRecentUnpricedCodexModelsRow{{Model: "gpt-5.5", Runs: 3}, {Model: "gpt-5.6-sol", Runs: 2}}, nil
@@ -107,10 +107,10 @@ func TestPricingCacheLifecycle(t *testing.T) {
 	var queryErr error
 	var rows []store.ListRecentUnpricedCodexModelsRow
 	f.query = func(_ context.Context, p store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error) {
-		if f.calls.Load() == 1 && !reflect.DeepEqual(p.Priced, []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"}) {
+		if f.calls.Load() == 1 && !reflect.DeepEqual(p.Priced, []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}) {
 			t.Errorf("pre-expiry priced: %v", p.Priced)
 		}
-		if f.calls.Load() == 2 && (!p.Cutoff.Time.Equal(time.Date(2026, 11, 14, 0, 9, 0, 0, time.UTC)) || !reflect.DeepEqual(p.Priced, []string{"gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"})) {
+		if f.calls.Load() == 2 && (!p.Cutoff.Time.Equal(time.Date(2026, 11, 14, 0, 9, 0, 0, time.UTC)) || !reflect.DeepEqual(p.Priced, []string{"gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"})) {
 			t.Errorf("refresh parameters: %+v", p)
 		}
 		return rows, queryErr

@@ -47,7 +47,8 @@ const (
 	// frozen contract_revision (a #1227 revision bump raced the request, or the worker is stale).
 	CompletionDenyRevisionDrift = "revision_drift"
 	// CompletionDenyContractNotFrozen: the run is interlocked but its completion_contract is NULL
-	// — the split-state hazard (revision could be 1 with contract NULL if the Go builder errored).
+	// — the split-state hazard (revision could be 1 with contract NULL if the Go builder errored) —
+	// or unverifiable (corrupt, null criteria, or a frozen milestone with no criterion; #2259).
 	// FAIL-CLOSED: the permit is DENIED so a corrupt/unfrozen run holds rather than completing.
 	CompletionDenyContractNotFrozen = "contract_not_frozen"
 	// CompletionDenyMissingMilestones: one or more in-scope structural criteria are not declared
@@ -157,7 +158,10 @@ type CompletionAttemptResult struct {
 // when the interlocked run's completion_contract is NULL (or corrupt) while milestones were
 // frozen: the permit path must DENY (contract_not_frozen), and to keep the attempt path
 // fail-closed too the returned unmet is then the FULL frozen milestone id set (nothing reads as
-// done). A genuinely milestone-less run has a NON-NULL contract with criteria:[], so it returns
+// done). Two further parseable-but-damaged shapes fail closed the same way (issue #2259): a
+// contract whose criteria are absent or null (JSON null, {} or {"criteria":null}, as distinct
+// from an explicit criteria:[]), and one lacking a criterion for some frozen milestone. A
+// genuinely milestone-less run has a NON-NULL contract with criteria:[], so it returns
 // (empty, true) — vacuously complete. That contract exists only because the freeze sees a
 // non-NULL milestone source: the worker omits an empty milestone list, so the server reads an
 // interlocked run's milestone-less PLAN-BEARING report as the explicit `[]`
@@ -173,6 +177,25 @@ func computeUnmetCriteria(run store.Run) (unmet []string, verifiable bool) {
 	if err := json.Unmarshal(run.CompletionContract, &c); err != nil {
 		// A corrupt contract column is the same fail-closed hazard.
 		return frozenMilestoneIDs(run), false
+	}
+	if c.Criteria == nil {
+		// JSON null, {} and {"criteria":null} parse cleanly but state no criteria at all (an
+		// explicit criteria:[] is the only milestone-less shape). Reading that as vacuously
+		// complete would let a damaged contract pass the permit.
+		return frozenMilestoneIDs(run), false
+	}
+	if frozen, err := DecodeMilestones(run.MilestonesFrozen); err == nil && len(frozen) > 0 {
+		// Every frozen milestone must have a criterion; a contract that omits one cannot vouch
+		// for it. Extra criteria for non-frozen milestones are still counted below.
+		have := make(map[string]bool, len(c.Criteria))
+		for _, cr := range c.Criteria {
+			have[cr.MilestoneID] = true
+		}
+		for _, m := range frozen {
+			if !have[m.ID] {
+				return frozenMilestoneIDs(run), false
+			}
+		}
 	}
 	completed, _ := DecodeMilestoneIDs(run.MilestonesCompleted)
 	done := make(map[string]bool, len(completed))
@@ -371,7 +394,8 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		unmet, verifiable = nil, true
 	}
 	if !verifiable {
-		// Split-state (contract NULL / corrupt while frozen): fail closed, hold, do not complete.
+		// Split-state or unverifiable contract (NULL, corrupt, null criteria, or a frozen milestone
+		// without a criterion): fail closed, hold, do not complete.
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyContractNotFrozen}, nil
 	}
 	if len(unmet) > 0 {

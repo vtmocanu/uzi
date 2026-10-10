@@ -47,7 +47,9 @@ reaches a final status. Each retained capture is in one of these six states:
   downloadable yet.
 - **Available** — the original committed history is ready to download.
 - **Needs action** — the archive could not be completed (for example, a
-  storage limit was hit); the source is still retained and will be retried.
+  storage limit was hit); the source stays retained. Retries depend on the
+  recovery path's budget; terminal retained-source failure does not cycle
+  automatically or offer Resume.
 - **Expired** — the ready download window passed and the bytes were purged.
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
 
@@ -87,6 +89,57 @@ Every download surface warns that the original may contain secrets: review
 it before publishing anywhere, and if it exposed a real credential, revoke
 and rotate it and remove it from the affected history — deleting the
 archive alone does not undo that exposure.
+
+## Retained-source failure and local proof
+
+A claim discovers retained source before forge refresh or disk preflight
+and recovers it within that claim. Its source-bound durable budget reserves at most **3 total
+iterations**, blocked and nonblocked together, within **five minutes from
+the first reservation**, using the existing exponential retry cap of 16
+times the base delay. Crash, reclaim, capture, publication and successor
+handoff preserve that budget. Reset requires a trusted, successfully settled
+real model turn. Recovery adopts work on a fresh attempt path and model
+session even on an unwired worker; ordinary unwired keys that never entered
+retained recovery keep same-path continuity.
+
+Permanent blockers or exhaustion end the run **failed** with custody kept,
+without automatic reclaim or failed-run Resume. The reason names the
+blocker: missing source, invalid clock, preservation/adoption failure,
+missing or unverifiable needed prerequisites, or a fallback still oversized.
+`worker_residue_blocked` identifies an actual quiescence failure, not an
+archive or prerequisite failure. Transient capture, forge and disk failures
+spend the same reservation budget. These bounds are separate from healthy
+provider/empty-turn parks and the owner worker-recovery-exhaustion hold.
+
+A verified thin bundle within the cap, with its needed prerequisites locally
+available and verified, permits local adoption and model execution even
+when remote publication is unknown. Nonempty prerequisites alone do not
+block it. Local verification reads reachable history and checks object hashes.
+Decoded history above 1 GiB fails closed with work and custody retained, even
+when the thin archive is below 64 MiB. `uzi run recovery` and the worker log
+show the recorded blocker. Local proof does not establish independent recovery
+or remote durability and does not release custody: predecessor sources, pins, journals
+and descriptors remain until the existing verified final disposition or
+explicit discard. The guarded prerequisite-free archive/empty-inventory
+release conditions below remain unchanged.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).
+
+A healthy run with an unknown publish outcome continues in the same claim
+generation, retaining its tip, owed roots and publication time gate.
+Confirmed durability requires positive proof. External restarts require a
+genuinely fenced successor; loss of local storage can still lose work.
+
+For a failed source-only run, an operator must recover from retained worker
+storage. `uzi run export` still requires a manifest-bound available archive;
+there is no new source download API or failed-run Resume. Downgrade during
+pending recovery is unsupported because older workers may drop recovery
+fields. See [bounded retained-source recovery](./run-recovery-wait.md#bounded-retained-source-recovery).
 
 ## Downloading an archive
 

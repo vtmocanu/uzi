@@ -540,3 +540,51 @@ describe("deriveRunUsage matches the session-cumulative fold (issue #1562)", () 
     });
   }
 });
+
+// PRD #2603: the `notes` pair. progress_note frames fold under `progress_note:<model>`,
+// one row per note, into the model sums and the billed total, never a per-agent row.
+// The client has no price table: it reads the server-resolved costStatus + costUSD that the
+// server stores on each note entry (stored-frames-notes.json, the payloads as stored; the
+// raw worker input is result-frames-notes.json), so cost matches run_usage exactly.
+describe("deriveRunUsage matches the server's fold of progress_note usage", () => {
+  const notesFrames = (JSON.parse(read("stored-frames-notes.json")) as { frames: Frame[] }).frames;
+  const notes = JSON.parse(read("run-usage-notes.json")) as { rows: EpochRow[]; totals: Totals };
+  const msgs: RunMessage[] = notesFrames.map((f) => ({
+    seq: f.seq,
+    kind: f.kind,
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: f.payload,
+    created_at: "2026-10-09T00:00:00Z",
+  }));
+
+  it("sums the note rows into the totals, apart from the lead's same-model row", () => {
+    const d = deriveRunUsage(msgs);
+    expect(d.total.fresh).toBe(notes.totals.input_tokens + notes.totals.cache_creation_tokens);
+    expect(d.total.cached).toBe(notes.totals.cache_read_tokens);
+    expect(d.total.out).toBe(notes.totals.output_tokens);
+    // The notes' standard-table cost (0.0006 + 0.0008) is carried by the stored entries.
+    expect(d.total.costUsd).toBeCloseTo(notes.totals.cost_usd, 6);
+    const noteCost = notes.rows.filter((r) => r.model.startsWith("progress_note:")).reduce((n, r) => n + r.cost_usd, 0);
+    expect(d.noteTotal.costUsd).toBeCloseTo(noteCost, 6);
+    expect(d.noteTotal.costStatus).toBe("metered");
+  });
+
+  it("keys the notes under progress_note:<model> and never makes a phase or agent row", () => {
+    const d = deriveRunUsage(msgs);
+    const haiku = d.modelTotals.find((t) => t.model === "claude-haiku-4-5-20251001");
+    const note = d.modelTotals.find((t) => t.model === "progress_note:claude-haiku-4-5-20251001");
+    expect(haiku?.input).toBe(700);
+    // The two notes (400 + 500) sum; a prefix-less or max-merged reading would not.
+    expect(note?.input).toBe(900);
+    expect(note?.out).toBe(100);
+    expect(d.phases).toHaveLength(1);
+    expect(d.agents).toHaveLength(0);
+  });
+
+  it("counts a replayed note once", () => {
+    const again = deriveRunUsage([...msgs, ...msgs.filter((m) => m.kind === "progress_note")]);
+    expect(again.total.out).toBe(notes.totals.output_tokens);
+  });
+});

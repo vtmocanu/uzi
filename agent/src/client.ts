@@ -1939,13 +1939,14 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean }> {
+  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
     // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     // Issue #1673: `receipts` is the server's per-reply declaration of receipt mode.
-    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true };
+    // PRD #2603: `now_summary` is the run's effective Now-summary setting; absent ⇒ off.
+    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
   }
 
   async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
@@ -2025,9 +2026,9 @@ export class WorkerClient {
    *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
-  async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
+  async getRunOwnership(runId: string, signal?: AbortSignal): Promise<RunOwnershipResponse> {
     // Bound actual streamed bytes before ownership can authorize recovery retirement.
-    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024)) as RunOwnershipResponse;
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024, signal)) as RunOwnershipResponse;
   }
 
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`

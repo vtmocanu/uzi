@@ -1857,3 +1857,84 @@ describe("RunRow — Progress cell (PRD #2602)", () => {
     expect(container.querySelector("[data-run-progress]")).toBeNull();
   });
 });
+
+// Issue #2661: both the owner list and the admin fleet list read the compact summary
+// projection, and rows still render without the four heavy detail keys.
+describe("RunsList — summary run projection (#2661)", () => {
+  it("owner list requests view=summary and renders a summary row", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRun({
+      id: "r",
+      issue_title: "Summary row",
+      status: "running",
+    });
+    mockApi.listRuns.mockResolvedValue({ runs: [summary as never] });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Summary row")).toBeTruthy());
+    expect(screen.getByText("running")).toBeTruthy();
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
+  });
+
+  it("owner poll tick keeps requesting view=summary", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    vi.useFakeTimers();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    renderRuns();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
+  });
+
+  it("admin list requests view=summary on adminListRuns too", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    renderRuns();
+    await waitFor(() => expect(mockApi.adminListRuns).toHaveBeenCalled());
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
+    expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
+  });
+
+  it("admin fleet list renders a summary row and its poll tick keeps view=summary", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRun({
+      id: "theirs",
+      issue_title: "Their summary row",
+      status: "queued",
+      owner_email: "other@uzi.test",
+    });
+    vi.useFakeTimers();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [summary as never] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    renderRuns();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Their summary row")).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.adminListRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
+    for (const call of mockApi.adminListRuns.mock.calls) expect((call as unknown[])[0]).toEqual({ view: "summary" });
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
+  });
+});

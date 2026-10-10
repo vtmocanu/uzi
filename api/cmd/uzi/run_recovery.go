@@ -5,7 +5,8 @@ package main
 // custody holds (GET /api/recovery/holds) once. With a run id it narrows them to that run
 // client-side and renders each hold's exact id, generation, server-derived disposition
 // (attention) and latest capture state; with none it lists every open hold across runs (all
-// states under --json). `run discard` targets ONE exact hold
+// states under --json). It also reads each relevant run once via the existing GET run
+// route to show a failed run's failure_reason. `run discard` targets ONE exact hold
 // (DELETE .../recovery-holds/<hold>?confirm=discard, which the client always sends); it
 // requires an interactive confirmation when --yes is absent and HARD-REFUSES when --yes is
 // absent and stdin is not a TTY, so a possible only copy is never destroyed without a human
@@ -13,6 +14,8 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -48,6 +51,8 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"of a still-running run and needs nothing.\n\n" +
 			"A terminal_record_rejection of mac_failure is shown separately: " + terminalMACFailureCopy +
 			". JSON also includes this fixed diagnostic as terminal_rejection; disposition and archive availability remain independent.\n\n" +
+			"An additional read-only lookup of each held run shows its existing failure_reason when failed; " +
+			"an unavailable run lookup leaves custody unchanged and warns on stderr.\n\n" +
 			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
@@ -68,7 +73,11 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			if len(args) == 0 {
-				return renderOwnerRecovery(env, gf, holds)
+				reasons, err := recoveryFailureReasons(cmd.Context(), env, c, holds.Holds, true)
+				if err != nil {
+					return err
+				}
+				return renderOwnerRecovery(env, gf, holds, reasons)
 			}
 			runID := args[0]
 			// The endpoint is owner-wide; narrow to this run client-side.
@@ -78,8 +87,12 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 					forRun = append(forRun, h)
 				}
 			}
+			reasons, err := recoveryFailureReasons(cmd.Context(), env, c, forRun, false)
+			if err != nil {
+				return err
+			}
 			// --json joins each hold's captures (#1417) so an agent reads the capture ids as
-			// data. The human table is unchanged and makes no extra call; a run with no holds
+			// data. The human table needs no archives read; a run with no holds
 			// has nothing to join onto, so it skips the archives read too.
 			var archives []apitypes.RecoveryArchiveDTO
 			if gf.json && len(forRun) > 0 {
@@ -96,15 +109,65 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 					archives = summary.Archives
 				}
 			}
-			return renderRunRecovery(env, gf, runID, forRun, archives)
+			return renderRunRecovery(env, gf, runID, forRun, archives, reasons)
 		},
 	}
 	return recovery
 }
 
+// recoveryFailureReasons makes at most one read per distinct relevant run in the
+// already-fetched hold list, with no retries. Each read uses the command context;
+// one unavailable read does not block siblings or change custody. All unavailable
+// reads share one static warning, including 404s: absence is not verified clearance.
+func recoveryFailureReasons(ctx context.Context, env Env, c uzicli.Client,
+	holds []apitypes.RecoveryCustodyHoldDTO, openOnly bool) (map[string]string, error) {
+	reasons := make(map[string]string)
+	seen := make(map[string]bool)
+	unavailable := 0
+	for _, h := range holds {
+		if openOnly && h.State != "open" || seen[h.RunID] {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		seen[h.RunID] = true
+		run, err := c.GetRun(ctx, h.RunID)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		if err != nil {
+			unavailable++
+			continue
+		}
+		if run.Status == "failed" && run.FailureReason != nil && strings.TrimSpace(*run.FailureReason) != "" {
+			reasons[h.RunID] = *run.FailureReason
+		}
+	}
+	if unavailable > 0 {
+		_, _ = fmt.Fprintf(env.Stderr, "warning: failure reason unavailable for %d held run(s); custody remains as listed, failure status is unverified\n", unavailable)
+	}
+	return reasons, nil
+}
+
+// printRecoveryFailureReasons prints one diagnostic per run even when several holds
+// share it. Human output folds untrusted fields with cellText; JSON retains DTO values.
+func printRecoveryFailureReasons(p *uzicli.Printer, holds []apitypes.RecoveryCustodyHoldDTO, reasons map[string]string) {
+	seen := make(map[string]bool)
+	for _, h := range holds {
+		if reason := cellText(reasons[h.RunID]); reason != "" && !seen[h.RunID] {
+			p.Printf("run %s: %s\n", cellText(h.RunID), reason)
+			seen[h.RunID] = true
+		}
+	}
+}
+
 // renderOwnerRecovery shows only open holds in the human view. The JSON form preserves
 // the server's entire owner response, including settled holds and server order.
-func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyHoldsDTO) error {
+func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyHoldsDTO, reasons map[string]string) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		if dto.Holds == nil {
@@ -112,7 +175,7 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		}
 		rows := make([]recoveryOwnerHoldJSON, 0, len(dto.Holds))
 		for _, h := range dto.Holds {
-			rows = append(rows, recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h)})
+			rows = append(rows, recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h), FailureReason: reasons[h.RunID]})
 		}
 		return p.JSON(struct {
 			// Embed the response to preserve aggregate keys while enriching hold rows.
@@ -166,6 +229,7 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 			p.Printf("run %s hold %s gen %d: %s\n", cellText(h.RunID), cellText(h.ID), h.Generation, copy)
 		}
 	}
+	printRecoveryFailureReasons(p, open, reasons)
 	a := dto.Aggregate
 	p.Printf("open_holds: %d  admission_counted_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
 		a.OpenHolds, a.AdmissionCountedHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
@@ -197,6 +261,7 @@ func terminalRejectionCopy(h apitypes.RecoveryCustodyHoldDTO) string {
 type recoveryOwnerHoldJSON struct {
 	apitypes.RecoveryCustodyHoldDTO
 	TerminalRejection string `json:"terminal_rejection,omitempty"`
+	FailureReason     string `json:"failure_reason,omitempty"`
 }
 
 // sourceOnlyLine explains retained local inventory, including a guarded hold with a
@@ -268,7 +333,7 @@ type recoveryHoldJSON struct {
 // Every hold gets a non-nil captures slice, so the JSON is [] and never null. An archive
 // whose hold_id names no listed hold (including an empty hold_id from a server predating
 // the field) is attached nowhere.
-func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apitypes.RecoveryArchiveDTO) []recoveryHoldJSON {
+func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apitypes.RecoveryArchiveDTO, reasons map[string]string) []recoveryHoldJSON {
 	out := make([]recoveryHoldJSON, 0, len(holds))
 	for _, h := range holds {
 		caps := []recoveryHoldCapture{}
@@ -280,7 +345,7 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 				ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
 			})
 		}
-		out = append(out, recoveryHoldJSON{recoveryOwnerHoldJSON: recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h)}, Captures: caps})
+		out = append(out, recoveryHoldJSON{recoveryOwnerHoldJSON: recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h), FailureReason: reasons[h.RunID]}, Captures: caps})
 	}
 	return out
 }
@@ -302,7 +367,7 @@ func unattributedCaptures(archives []apitypes.RecoveryArchiveDTO) int {
 // its exact id, generation, disposition and capture state, plus a one-line hint when a hold
 // needs an owner decision.
 func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
-	archives []apitypes.RecoveryArchiveDTO) error {
+	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		// Never emit a null slice: an empty result is [] so a consuming agent iterates it
@@ -316,7 +381,7 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
 				n, sanitizeTTY(runID))
 		}
-		return p.JSON(holdsWithCaptures(holds, archives))
+		return p.JSON(holdsWithCaptures(holds, archives, reasons))
 	}
 	if len(holds) == 0 {
 		if !gf.quiet {
@@ -353,6 +418,7 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 			p.Printf("%s\n", line)
 		}
 	}
+	printRecoveryFailureReasons(p, holds, reasons)
 	if !gf.quiet {
 		for _, h := range holds {
 			if line := sourceOnlyLine(h); line != "" {

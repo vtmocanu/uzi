@@ -1,11 +1,13 @@
 import { describe, it } from "node:test";
+import { Outbox } from "../src/outbox.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import net from "node:net";
 import { execFileSync } from "node:child_process";
-import { ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
+import { GitCache, ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
+import { latchResidueQuarantine } from "../src/residue-quarantine.js";
 import type { Logger } from "../src/log.js";
 import { RequestError } from "../src/client.js";
 import { type ExecutorFactory } from "../src/runner.js";
@@ -37,6 +39,331 @@ import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 
 installHarness();
 
+describe("verified successor retirement", () => {
+  function command(repo: string, ...args: string[]): string {
+    return execFileSync("git", ["-C", repo, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+  }
+
+  async function seedCompleted(predecessorCount = 2) {
+    const owner = randomUUID(), key = "issue-2512", branch = "agent/issue-2512";
+    const bare = await git.ensureClone(fx.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700);
+    fs.chmodSync(bare, 0o700);
+    const initial = await git.createOrAttachRunnerClone(bare, 2512, noProofReseed, owner);
+    await git.markRecoveryCapture(bare, initial.path, branch, owner);
+    fs.writeFileSync(path.join(initial.path, "predecessor.txt"), "original dirty bytes\n");
+    const tip = command(initial.path, "rev-parse", "HEAD");
+    let source: import("../src/recovery-progress.js").RecoverySource = { runId: owner, clonePath: initial.path };
+    const bytes = new Map([[initial.path, "original dirty bytes\n"]]);
+    // Real completed adoptions exercise retention of the entire predecessor set.
+    for (let n = 1; n <= predecessorCount; n++) {
+      const reservation = await git.reserveRecoveryIteration(bare, branch, key, source, 1);
+      await git.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, tip);
+      const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, n.toString(16).padStart(16, "0"));
+      const successor = await git.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, attemptId);
+      source = await git.completeRecoveryEpisode(bare, branch, key,
+        { runId: owner, clonePath: successor.path, attemptId },
+        { settled: true, processedEvents: 1, attemptId });
+      const dirty = n === predecessorCount ? "successor bytes\n" : `intermediate ${n} dirty bytes\n`;
+      bytes.set(successor.path, dirty);
+      fs.writeFileSync(path.join(successor.path, "predecessor.txt"), dirty);
+    }
+    const expected = JSON.parse(command(bare, "config", "--get", `uzi-recovery.${branch}.clone`)) as import("../src/git.js").RecoveryJournalEntry;
+    assert.equal(expected.retainedSources!.length, predecessorCount);
+    const ownership = new Map(expected.retainedSources!.map(src => {
+      const st = fs.statSync(src.clonePath);
+      return [src.clonePath, { uid: st.uid, gid: st.gid }];
+    }));
+    const opts = { discard: true, attemptId: expected.attemptId!,
+      verifiedSuccessor: { key, generation: 2, expected, acknowledged: async () => true } };
+    const ledger = () => command(bare, "config", "--get-all", `uzi-attempts.${branch}.entry`).split("\n")
+      .map(raw => JSON.parse(raw) as { attemptId: string; state: string; clonePath: string });
+    return { bare, branch, key, owner, expected, opts, ledger, tip, bytes, ownership,
+      pin: `refs/uzi-recovery-episode/${owner}/${tip}`,
+      retire: () => git.retireRunnerClone(bare, expected.clonePath, branch, owner, opts) };
+  }
+
+  type Seed = Awaited<ReturnType<typeof seedCompleted>>;
+  async function assertPredecessors(s: Seed, anchored: boolean) {
+    const fresh = new GitCache(fx.dataDir, nullLogger());
+    const discovery = await fresh.discoverRetainedRecovery(fx.originPath, s.branch, s.key, s.owner);
+    assert.ok(discovery, "fresh cache discovers retained custody");
+    const identity = ({ runId, clonePath, attemptId, restoreTip }: import("../src/recovery-progress.js").RecoverySource) =>
+      ({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }), ...(restoreTip === undefined ? {} : { restoreTip }) });
+    const sources = [discovery.journal, ...(discovery.journal.retainedSources ?? [])]
+      .map(identity).filter((src, i, all) => all.findIndex(other => JSON.stringify(other) === JSON.stringify(src)) === i);
+    if (anchored) {
+      assert.equal(discovery.journal.clonePath, s.expected.retainedSources![0]!.clonePath);
+      assert.deepEqual(sources, s.expected.retainedSources!.map(identity));
+      const [first, second, third] = s.expected.retainedSources!;
+      const persistedRetained = new Map([[1, [first!]], [2, [second!]], [3, [second!, third!]]])
+        .get(s.expected.retainedSources!.length);
+      assert.deepEqual(JSON.parse(command(s.bare, "config", "--get", `uzi-recovery.${s.branch}.clone`)),
+        { ...first!, retainedSources: persistedRetained });
+      assert.equal(Object.hasOwn(discovery.journal, "recovery"), false);
+    } else assert.deepEqual(discovery.journal, s.expected);
+    for (const predecessor of s.expected.retainedSources!) {
+      assert.equal(fs.readFileSync(path.join(predecessor.clonePath, "predecessor.txt"), "utf8"),
+        s.bytes.get(predecessor.clonePath));
+      const st = fs.statSync(predecessor.clonePath);
+      assert.deepEqual({ uid: st.uid, gid: st.gid }, s.ownership.get(predecessor.clonePath));
+      if (predecessor.restoreTip) assert.equal(predecessor.restoreTip, s.tip);
+      assert.equal(command(predecessor.clonePath, "rev-parse", "HEAD"), s.tip);
+      assert.equal(await fresh.classifyOwnerClonePath(s.bare, s.branch, s.key, s.owner, predecessor.clonePath),
+        predecessor.attemptId ? "attempt" : "canonical");
+    }
+    assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
+  }
+
+  for (const predecessorCount of [1, 2, 3]) for (const exdev of [false, true]) {
+    it(`covering FINAL retires successor and ledger, preserving predecessors and pins (predecessors=${predecessorCount}, EXDEV=${exdev})`, async (t) => {
+      const s = await seedCompleted(predecessorCount);
+      const rename = fsp.rename.bind(fsp);
+      let moves = 0;
+      t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+        if (String(from) === s.expected.clonePath) {
+          moves++;
+          if (exdev && String(to).startsWith(holdingRoot())) throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        }
+        return rename(from, to);
+      });
+      await s.retire();
+      assert.equal(moves, exdev ? 2 : 1);
+      assert.equal(fs.existsSync(s.expected.clonePath), false);
+      assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "retired");
+      assert.equal(fs.readdirSync(holdingRoot()).length, 0);
+      assert.equal(fs.readdirSync(runnerRoot()).filter(name => name.startsWith(".retire-")).length, 0);
+      const primary = s.expected.retainedSources![0]!;
+      const snapshot = await git.terminalRetainedSnapshot(s.bare, s.branch, s.key, primary);
+      assert.ok(snapshot, "terminalRetainedSnapshot preserves completed predecessor custody");
+      assert.deepEqual(snapshot.paths, s.expected.retainedSources!.map(src => src.clonePath));
+      await assertPredecessors(s, true);
+
+      api.setOwnershipNotOwned(s.owner);
+      api.setOrphanClassification(s.owner, {
+        status: "completed", repo_id: "r1", kind: "issue", issue_iid: 2512,
+        branch: null, pipeline_ref: null, pipeline_id: null,
+      });
+      const claimant = randomUUID();
+      const proofs: QuiesceRunRequest[] = [];
+      let entered = false;
+      let entryError: unknown;
+      const factory: ExecutorFactory = () => ({
+        homeDir: path.join(homeDir, claimant),
+        executor: { run: async () => {
+          entered = true;
+          try {
+            assert.equal(readJournal(s.bare, s.branch)?.runId, claimant);
+            const protectedRecord = JSON.parse(command(s.bare, "config", "--get", `uzi-retained.${s.owner}.journal`));
+            assert.deepEqual(protectedRecord, { version: 1, branch: s.branch, key: s.key, journal: JSON.parse(JSON.stringify(snapshot.journal)) });
+            const activeInventory = await new GitCache(fx.dataDir, nullLogger()).readInventoryCloneHeads(s.bare, s.owner);
+            assert.equal(activeInventory.kind, "verified");
+            if (activeInventory.kind === "verified") {
+              assert.deepEqual(activeInventory.heads, [s.tip]);
+              assert.deepEqual(activeInventory.clones.map(src => src.clonePath), snapshot.paths);
+            }
+          } catch (error) {
+            entryError = error;
+            throw error;
+          }
+          throw new Error("stop at new model entry");
+        } },
+      });
+      const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), {
+        recoveryRetryMs: 5,
+        quiesceRun: async req => {
+          proofs.push(req);
+          if (req.site === "orphan_reclaim") {
+            assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "retired");
+          }
+          return { process: { state: "quiescent", processes: [], killed: [], detail: "fixture proof" },
+            docker: { state: "not_wired", removed: [], detail: "" } };
+        },
+      });
+      await runner.execute(gitlabClaim(2512, { run_id: claimant }));
+      assert.equal(entered, true, "new run enters after real runner canonical reclamation");
+      assert.equal(entryError, undefined, "protected descriptor and fresh inventory survive newer active run");
+      const reclaim = proofs.filter(req => req.site === "orphan_reclaim");
+      assert.equal(reclaim.length, 1);
+      assert.equal(reclaim[0]!.mode, "capture");
+      assert.deepEqual(reclaim[0]!.targetPaths, snapshot.paths);
+      const protectedRecord = JSON.parse(command(s.bare, "config", "--get", `uzi-retained.${s.owner}.journal`));
+      assert.deepEqual(protectedRecord.journal, JSON.parse(JSON.stringify(snapshot.journal)));
+      // A newer active owner cannot hide the old detached sources from a fresh inventory.
+      const inventory = await new GitCache(fx.dataDir, nullLogger()).readInventoryCloneHeads(s.bare, s.owner);
+      assert.equal(inventory.kind, "verified");
+      if (inventory.kind === "verified") {
+        assert.deepEqual(inventory.heads, [s.tip]);
+        assert.deepEqual(inventory.clones.map(src => src.clonePath), snapshot.paths);
+      }
+      for (const predecessor of s.expected.retainedSources!) {
+        assert.equal(fs.readFileSync(path.join(predecessor.clonePath, "predecessor.txt"), "utf8"), s.bytes.get(predecessor.clonePath));
+        const st = fs.statSync(predecessor.clonePath);
+        assert.deepEqual({ uid: st.uid, gid: st.gid }, s.ownership.get(predecessor.clonePath));
+        assert.equal(command(predecessor.clonePath, "rev-parse", "HEAD"), s.tip);
+      }
+      assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
+    });
+  }
+
+  for (const exdev of [false, true]) {
+    it(`physical terminal custody during FINAL read retains moved successor (EXDEV=${exdev})`, async (t) => {
+      const s = await seedCompleted();
+      const outboxRoot = path.join(fx.dataDir, "terminal-race-outbox");
+      const outbox = new Outbox({ root: outboxRoot, log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+      await outbox.init();
+      t.mock.method(git, "hasPhysicalTerminalProtection", (runId: string) => outbox.hasPhysicalTerminalProtection(runId));
+      const rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+        if (exdev && String(from) === s.expected.clonePath && String(to).startsWith(holdingRoot())) {
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        }
+        return rename(from, to);
+      });
+      let injected = false;
+      s.opts.verifiedSuccessor.acknowledged = async () => {
+        if (s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state === "retired") {
+          fs.mkdirSync(path.join(outboxRoot, s.owner), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(path.join(outboxRoot, s.owner, "terminal-2.json"), "{}");
+          injected = true;
+        }
+        return true;
+      };
+      await assert.rejects(s.retire(), /verified successor FINAL authority unavailable/);
+      assert.equal(injected, true);
+      assert.equal(await outbox.hasPhysicalTerminalProtection(s.owner), true);
+      assert.equal(fs.existsSync(s.expected.clonePath), false);
+      const held = fs.readdirSync(holdingRoot());
+      assert.equal(held.length, exdev ? 0 : 1);
+      if (!exdev) assert.equal(fs.readFileSync(path.join(holdingRoot(), held[0]!, "predecessor.txt"), "utf8"), "successor bytes\n");
+      const scratches = fs.readdirSync(runnerRoot()).filter(name => name.startsWith(".retire-"));
+      assert.equal(scratches.length, exdev ? 1 : 0);
+      if (exdev) assert.equal(fs.readFileSync(path.join(runnerRoot(), scratches[0]!, "clone", "predecessor.txt"), "utf8"), "successor bytes\n");
+      await assertPredecessors(s, true);
+    });
+  }
+
+  for (const refusal of ["ordinary caller", "missing callback", "missing proof", "wrong generation", "changed identity", "changed predecessor set", "unsafe predecessor", "wrong ledger"] as const) {
+    it(`${refusal} refuses successor retirement without a rename`, async (t) => {
+      const s = await seedCompleted();
+      let moves = 0;
+      const rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => { moves++; return rename(from, to); });
+      if (refusal === "missing proof") s.opts.verifiedSuccessor.acknowledged = async () => false;
+      if (refusal === "missing callback") Reflect.deleteProperty(s.opts.verifiedSuccessor, "acknowledged");
+      if (refusal === "wrong generation") s.opts.verifiedSuccessor.generation = 3;
+      if (refusal === "changed identity") s.opts.verifiedSuccessor.expected = { ...s.expected, attemptId: formatAttemptId(new Date(), 3, "1111111111111111") };
+      if (refusal === "changed predecessor set") s.opts.verifiedSuccessor.expected = { ...s.expected, retainedSources: s.expected.retainedSources!.slice(1) };
+      if (refusal === "unsafe predecessor") {
+        const predecessor = s.expected.retainedSources![0]!.clonePath;
+        fs.renameSync(predecessor, predecessor + ".saved");
+        fs.symlinkSync(predecessor + ".saved", predecessor);
+      }
+      if (refusal === "wrong ledger") command(s.bare, "config", "--add", `uzi-attempts.${s.branch}.entry`,
+        JSON.stringify({ attemptId: s.opts.attemptId, runId: s.owner, clonePath: s.expected.clonePath, state: "retired" }));
+      await assert.rejects(refusal === "ordinary caller"
+        ? git.retireRunnerClone(s.bare, s.expected.clonePath, s.branch, s.owner, { discard: true, attemptId: s.opts.attemptId })
+        : s.retire());
+      assert.equal(moves, 0);
+      assert.ok(fs.existsSync(s.expected.clonePath));
+      assert.deepEqual(JSON.parse(command(s.bare, "config", "--get", `uzi-recovery.${s.branch}.clone`)), s.expected);
+    });
+  }
+
+  for (const crash of ["failed journal write", "durable reanchor before rename", "immediately after rename"] as const) {
+    it(`${crash} leaves usable predecessors discoverable by a fresh GitCache`, async (t) => {
+      const s = await seedCompleted();
+      const fault = new Error(crash);
+      let injected = false, synced = 0;
+      if (crash === "failed journal write") {
+        const internal = git as unknown as { writeRecovery(...args: unknown[]): Promise<void> };
+        t.mock.method(internal, "writeRecovery", async () => { injected = true; throw fault; });
+      } else {
+        const open = fsp.open.bind(fsp);
+        t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+          const handle = await open(...args);
+          if ([s.bare, path.join(s.bare, "config")].includes(String(args[0]))) {
+            const sync = handle.sync.bind(handle);
+            t.mock.method(handle, "sync", async () => { await sync(); synced++; });
+          }
+          return handle;
+        });
+        const rename = fsp.rename.bind(fsp);
+        t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+          if (String(from) !== s.expected.clonePath) return rename(from, to);
+          assert.equal(synced, 2, "file and bare directory are synced before successor move");
+          injected = true;
+          if (crash === "immediately after rename") await rename(from, to);
+          throw fault;
+        });
+      }
+      await assert.rejects(s.retire(), error => error === fault);
+      assert.equal(injected, true);
+      assert.equal(fs.existsSync(s.expected.clonePath), crash !== "immediately after rename");
+      assert.equal(s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state, "live");
+      await assertPredecessors(s, crash !== "failed journal write");
+    });
+  }
+
+  for (const seam of ["journal write", "primary rename", "EXDEV scratch rename", "disposal"] as const) {
+    for (const denial of ["authority", "quarantine"] as const) {
+      it(`${denial} at ${seam} retains successor evidence`, async (t) => {
+        const s = await seedCompleted();
+        let allowed = true, injected = false, moves = 0;
+        const deny = () => {
+          injected = true;
+          if (denial === "authority") allowed = false;
+          else latchResidueQuarantine({ cause: "fixture", site: "terminal_retire", runId: s.owner }, nullLogger());
+        };
+        s.opts.verifiedSuccessor.acknowledged = async () => allowed;
+        if (seam === "journal write") {
+          const internal = git as unknown as { writeRecovery(...args: unknown[]): Promise<void> };
+          const write = internal.writeRecovery.bind(git);
+          t.mock.method(internal, "writeRecovery", async (...args: Parameters<typeof internal.writeRecovery>) => { deny(); return write(...args); });
+        }
+        if (seam === "primary rename") {
+          const open = fsp.open.bind(fsp);
+          t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+            const handle = await open(...args);
+            if (String(args[0]) === s.bare) {
+              const sync = handle.sync.bind(handle);
+              t.mock.method(handle, "sync", async () => { await sync(); deny(); });
+            }
+            return handle;
+          });
+        }
+        const rename = fsp.rename.bind(fsp);
+        t.mock.method(fsp, "rename", async (...[from, to]: Parameters<typeof fsp.rename>) => {
+          if (String(from) === s.expected.clonePath) {
+            if (seam === "EXDEV scratch rename" && String(to).startsWith(holdingRoot())) {
+              deny();
+              throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+            }
+            moves++;
+          }
+          return rename(from, to);
+        });
+        if (seam === "disposal") {
+          const protection = git.hasPhysicalTerminalProtection.bind(git);
+          t.mock.method(git, "hasPhysicalTerminalProtection", async (...args: Parameters<typeof git.hasPhysicalTerminalProtection>) => {
+            if (s.ledger().filter(e => e.attemptId === s.opts.attemptId).at(-1)!.state === "retired") deny();
+            return protection(...args);
+          });
+        }
+        if (seam === "disposal" && denial === "quarantine") await s.retire();
+        else await assert.rejects(s.retire());
+        assert.equal(injected, true);
+        assert.equal(moves, seam === "disposal" ? 1 : 0);
+        assert.equal(fs.existsSync(s.expected.clonePath), seam !== "disposal");
+        if (seam === "disposal") assert.equal(fs.readdirSync(holdingRoot()).length, 1);
+        await assertPredecessors(s, seam !== "journal write");
+      });
+    }
+  }
+});
+
+
 const GIT_ENV = {
   ...process.env,
   GIT_CONFIG_GLOBAL: "/dev/null",
@@ -59,6 +386,12 @@ function readJournal(bare: string, branch: string): { runId: string; clonePath: 
   }
   if (!raw) return undefined;
   return JSON.parse(raw) as { runId: string; clonePath: string };
+}
+
+/** Inject racing/corrupt metadata without bypassing the guarded production writer. */
+function writeFixtureJournal(bare: string, branch: string, runId: string, clonePath: string): void {
+  execFileSync("git", ["-C", bare, "config", "--local", `uzi-recovery.${branch}.clone`,
+    JSON.stringify({ runId, clonePath })], { env: GIT_ENV, stdio: "pipe" });
 }
 
 const holdingRoot = (): string => path.join(fx.dataDir, "runner-quarantine");
@@ -116,6 +449,92 @@ function assertSafeEvents(events: Record<string, unknown>[], forbidden: string[]
     for (const value of forbidden) assert.ok(!JSON.stringify(event).includes(value));
   }
 }
+
+describe("missing-source canonical runner ordering", () => {
+  for (const crossKind of [false, true]) {
+    it(`missing-source canonical ${crossKind ? "cross-kind Case A" : "matching Case B"} reclaim`, async () => {
+      const iid = 1451;
+      const owner = randomUUID(), claimant = randomUUID();
+      const { bare, branch, clonePath } = await seedResidue(iid, owner, "FOREIGN.txt");
+      fs.rmSync(clonePath, { recursive: true });
+      api.setOrphanClassification(owner, {
+        status: "completed", repo_id: "r1", kind: "issue", issue_iid: iid,
+        branch: null, pipeline_ref: null, pipeline_id: null,
+      });
+      const freshPath = git.runnerClonePath(bare, crossKind ? `agent-issue-${iid}` : `issue-${iid}`);
+      let entered = false;
+      const factory: ExecutorFactory = () => ({
+        homeDir: path.join(homeDir, claimant),
+        executor: { run: async ctx => {
+          assert.equal(ctx.worktreePath, freshPath);
+          assert.equal(fs.readFileSync(path.join(freshPath, "README.md"), "utf8"), "# fixture\n");
+          assert.equal(fs.existsSync(path.join(freshPath, "FOREIGN.txt")), false);
+          assert.deepEqual(readJournal(bare, branch), { runId: claimant, clonePath: freshPath });
+          entered = true;
+          throw new Error("stop after fresh seed");
+        } },
+      });
+      const logs = diagnosticLogger();
+      await runnerWith(factory, fakeGitlab().gitlab, undefined, logs.logger, { recoveryRetryMs: 5 })
+        .execute(gitlabClaim(iid, { run_id: claimant, ...(crossKind ? { kind: "mr_rework", branch } : {}) }));
+      assert.equal(entered, true, "fresh claimant executor reached");
+      assertSafeEvents(logs.events);
+      assert.ok(logs.events.some(e => e.event === "orphan_reclaim_succeeded" && e.owner_id === owner && e.claimant_id === claimant),
+        "authoritative owner validation and disposition succeeded");
+    });
+    for (const status of ["nonterminal", "404", "503"] as const) {
+      it(`missing-source canonical ${crossKind ? "cross-kind" : "matching"} ${status} refusal`, async t => {
+        const iid = 1452;
+        const owner = randomUUID(), claimant = randomUUID();
+        const { bare, branch, clonePath } = await seedResidue(iid, owner, "FOREIGN.txt");
+        // Plant a surviving same-branch retained source with supported coordinates.
+        const siblingId = formatAttemptId(new Date(), 1, "0123456789abcdef");
+        const sibling = `${clonePath}.attempt-${siblingId}`;
+        fs.cpSync(clonePath, sibling, { recursive: true });
+        const original = { runId: owner, clonePath, retainedSources: [{ runId: owner, clonePath: sibling, attemptId: siblingId }] };
+        const command = (...args: string[]) => execFileSync("git", ["-C", bare, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+        command("config", `uzi-recovery.${branch}.clone`, JSON.stringify(original));
+        command("config", `uzi-retained.${owner}.journal`, JSON.stringify({ version: 1, branch, key: `issue-${iid}`, journal: original }));
+        const tip = command("rev-parse", "refs/remotes/origin/main");
+        for (const family of ["uzi-recovery-episode", "uzi-owed"]) command("update-ref", `refs/${family}/${owner}/${tip}`, tip);
+        fs.rmSync(clonePath, { recursive: true });
+        if (status === "404") api.setOrphanNotFound(owner);
+        else if (status === "503") api.failOrphanClassification(owner, 503);
+        else api.setOrphanClassification(owner, {
+          status: "running", repo_id: "r1", kind: "issue", issue_iid: iid,
+          branch: null, pipeline_ref: null, pipeline_id: null,
+        });
+        const snapshot = () => [command("config", "--get-regexp", "^uzi-"),
+          command("for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi")];
+        const before = snapshot();
+        let seeds = 0, entered = false, releases = 0;
+        const seed = git.runnerCloneForBranch.bind(git);
+        t.mock.method(git, "runnerCloneForBranch", async (...args: Parameters<typeof seed>) => {
+          const result = await seed(...args);
+          seeds++;
+          return result;
+        });
+        for (const method of ["releaseRecoveryCustody", "settleRecoveryHold", "settleRecoveryHoldLive"] as const) {
+          t.mock.method(client, method, async () => { releases++; throw new Error("unexpected custody release"); });
+        }
+        const factory: ExecutorFactory = () => ({
+          homeDir: path.join(homeDir, claimant),
+          executor: { run: async () => { entered = true; throw new Error("unexpected executor"); } },
+        });
+        await runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 })
+          .execute(gitlabClaim(iid, { run_id: claimant, ...(crossKind ? { kind: "mr_rework", branch } : {}) }));
+        assert.equal(entered, false);
+        assert.equal(seeds, 0);
+        assert.equal(releases, 0);
+        assert.deepEqual(snapshot(), before, "journal, descriptors and pins remain unchanged");
+        assert.equal(fs.readFileSync(path.join(sibling, "FOREIGN.txt"), "utf8"), "owner-only bytes\n");
+        assert.equal(fs.existsSync(clonePath), false);
+        assert.equal(fs.existsSync(holdingRoot()), false);
+        if (crossKind) assert.equal(fs.existsSync(git.runnerClonePath(bare, `agent-issue-${iid}`)), false);
+      });
+    }
+  }
+});
 
 describe("1848 M1: moved terminal mr_rework custody", () => {
   const branch = "agent/issue-1810";
@@ -232,10 +651,11 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       entry: () => entry, entryError: () => entryError, calls, events: logs.events, runner };
   }
 
-  function assertEntry(s: Seed, e: ReturnType<typeof execution>, enabled: boolean, expectReclaimProof = true): void {
+  function assertEntry(s: Seed, e: ReturnType<typeof execution>, enabled: boolean, expectReclaimProof = true,
+    expectedReason = s.attemptId ? "retained-in-place" : "quarantined"): void {
     if (expectReclaimProof) assertSafeEvents(e.events, [s.clonePath]);
     if (expectReclaimProof) assert.equal(e.events.filter((event) => event.event === "orphan_reclaim_succeeded").at(-1)?.reason,
-      s.attemptId ? "retained-in-place" : "quarantined");
+      expectedReason);
     assert.equal(e.entryError(), undefined, "predecessor bytes survived through model entry");
     const entry = e.entry();
     assert.ok(entry, "successor model entered");
@@ -381,7 +801,12 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
       };
       try { await retry.run(); } finally { seam.runGit = real; }
       assert.ok(clearedDuringClone.every((capture) => capture?.runId !== s.claimant), "retry never clears successor custody during clone preparation");
-      assertEntry(s, retry, true, stage !== "canonical-journal");
+      if (stage === "canonical-journal") {
+        assertEntry(s, retry, true, true, "source-already-absent");
+        assert.equal(fs.existsSync(s.clonePath), false, "no canonical source overwrite");
+      } else {
+        assertEntry(s, retry, true, true);
+      }
       assertBytes(retained, s);
     });
   }
@@ -990,7 +1415,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
     const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "SUCCESSOR.txt");
     // The lock gap: after the guard threw ForeignCaptureBlockedError(ownerRunId), a
     // successor re-journals the SAME canonical path under a DIFFERENT runId.
-    await git.markRecoveryCapture(bare, clonePath, branch, successorRunId);
+    writeFixtureJournal(bare, branch, successorRunId, clonePath);
 
     await assert.rejects(
       git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: false }),
@@ -1420,7 +1845,7 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
   }
 
   for (const discard of [true, false]) {
-    it(`T1354-d (discard=${discard}): a journal-clear failure AFTER the rename leaves no capture-guard wedge`, async () => {
+    it(`T1354-d (discard=${discard}): a journal-clear failure AFTER the rename blocks reseeding with custody retained`, async () => {
       const iid = discard ? 1476 : 1477;
       const ownerRunId = `d1354d${discard ? "1" : "0"}0-0000-4000-8000-000000000006`;
       const { bare, branch, clonePath } = await seedResidue(iid, ownerRunId, "MARK.txt");
@@ -1458,11 +1883,15 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
         assert.equal(q.length, 1, "the already-complete PVC copy survives the clear failure (copied before the rename)");
         assert.equal(fs.readFileSync(path.join(holdingRoot(), q[0]!, "MARK.txt"), "utf8"), "owner-only bytes\n");
       }
-      // The stale journal does NOT wedge the next claim: the guard's lstat→ENOENT (canonical
-      // gone via the rename) lets it reseed despite the uncleared journal.
-      const reseeded = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId);
-      assert.equal(reseeded.path, clonePath);
-      assert.equal(fs.existsSync(clonePath), true);
+      const retainedJournal = readJournal(bare, branch);
+      const saved = [...scratchDirs().map(name => path.join(runnerRoot(), name, "clone")), ...(fs.existsSync(holdingRoot())
+        ? fs.readdirSync(holdingRoot()).map(name => path.join(holdingRoot(), name)) : [])]
+        .filter(dir => fs.existsSync(path.join(dir, "MARK.txt")));
+      assert.ok(saved.length > 0, "renamed source or holding copy retains the only bytes");
+      await assert.rejects(git.createOrAttachRunnerClone(bare, iid, noProofReseed, ownerRunId), /known recovery source is missing/);
+      assert.equal(fs.existsSync(clonePath), false, "no replacement clone can enter a model");
+      assert.deepEqual(readJournal(bare, branch), retainedJournal);
+      for (const dir of saved) assert.equal(fs.readFileSync(path.join(dir, "MARK.txt"), "utf8"), "owner-only bytes\n");
     });
   }
 
@@ -1569,7 +1998,7 @@ describe("1848 M2 local retirement disposition and stage diagnostics", () => {
         clonePath = path.join(fx.dataDir, "outside-runner");
         fs.mkdirSync(clonePath);
         fs.writeFileSync(path.join(clonePath, "M2.txt"), "owner-only bytes\n");
-        await git.markRecoveryCapture(seeded.bare, clonePath, seeded.branch, owner);
+        writeFixtureJournal(seeded.bare, seeded.branch, owner, clonePath);
       }
       const logs = diagnosticLogger();
       const fault = Object.assign(new Error("/private/path\n" + "glpat-" + "0123456789abcdefghij"), { code: stage === "rename" ? "ENOENT" : "EIO" });
@@ -1633,7 +2062,7 @@ describe("1848 M2 local retirement disposition and stage diagnostics", () => {
         // The refusal above left both fixtures untouched; restore canonical custody
         // before retrying a path that retirement is permitted to move.
         assert.equal(fs.readFileSync(path.join(seeded.clonePath, "M2.txt"), "utf8"), "owner-only bytes\n");
-        await git.markRecoveryCapture(seeded.bare, seeded.clonePath, seeded.branch, owner);
+        writeFixtureJournal(seeded.bare, seeded.branch, owner, seeded.clonePath);
         clonePath = seeded.clonePath;
       }
       assert.equal(await git.retireRunnerClone(seeded.bare, clonePath, seeded.branch, owner, {

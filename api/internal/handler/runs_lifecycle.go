@@ -479,6 +479,8 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.Progress.MaybeBlockedByRunID = &id
 		}
 	}
+	// PRD #2603: the model-written Now line, GetRun only (a list read never runs it). Best-effort.
+	h.overlayNowNote(r.Context(), run, &dto)
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)

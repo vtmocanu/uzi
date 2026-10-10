@@ -599,13 +599,42 @@ export interface RunTurnReducer {
   finish(end: TurnStreamEnd): ReducedTurnCompletion;
 }
 
+/** One model's usage as it goes on the wire in a progress_note payload's `model_usage`
+ *  (PRD #2603). The camelCase token keys are the result frame's own `modelUsage` spelling; the
+ *  5m/1h split and the tier/speed/geo markers are what lets the api price a snapshot that has
+ *  no provider costUSD. `costUSD` is set ONLY from a terminal provider report, never invented. */
+export interface AdviceModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheCreation5mInputTokens?: number;
+  cacheCreation1hInputTokens?: number;
+  costUSD?: number;
+  costStatus?: string;
+  service_tier?: string;
+  speed?: string;
+  inference_geo?: string;
+}
+
+/** The latest per-model usage evidence of one advice pass, keyed by the real model id. */
+export type AdviceUsageSnapshot = Readonly<Record<string, AdviceModelUsage>>;
+
 export interface AdviceRequest {
-  label: "judge" | "review" | "summary";
+  label: "judge" | "review" | "summary" | "now";
   systemPrompt: string;
   prompt: string;
   model?: string;
   /** Reasoning effort; applied to the SDK query only when set. */
   effort?: HarnessEffort;
+  /** Output-token cap; applied only when set (PRD #2603: the Now summary passes 256). */
+  maxOutputTokens?: number;
+  /** "disabled" turns extended thinking off; applied only when set. */
+  thinking?: "disabled";
+  /** Called with the latest non-empty usage snapshot every time provider usage arrives, so the
+   *  evidence survives an abort that never reaches a terminal frame. Optional; a harness that
+   *  cannot observe usage never calls it. */
+  usageObserver?(snapshot: AdviceUsageSnapshot): void;
   output: { kind: "text" } | { kind: "json"; schema: JsonObject };
   signal: AbortSignal;
   timeoutMs: number;

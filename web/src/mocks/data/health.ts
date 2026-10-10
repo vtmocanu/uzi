@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 19 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all 20 of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
@@ -21,6 +21,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "queue.undispatched", scope: "owner", group: "queue", title: "Undispatched task runs", doc: null },
   { id: "controller.report", scope: "instance", group: "control", title: "Controller reporting", doc: "hosted-workers" },
   { id: "db", scope: "instance", group: "control", title: "Database", doc: null },
+  { id: "db.size", scope: "instance", group: "control", title: "Database size", doc: "admin-health" },
   { id: "loops", scope: "instance", group: "control", title: "Background loops", doc: null },
   { id: "forge.ciwatch", scope: "owner", group: "integrations", title: "CI watch capacity", doc: null },
   { id: "forge.sync", scope: "owner", group: "integrations", title: "Forge issue sync", doc: null },
@@ -44,6 +45,7 @@ const OK_SUMMARY: Record<string, string> = {
   "queue.undispatched": "No task run is stuck undispatched.",
   "controller.report": "The controller is reporting.",
   db: "Database reachable (2ms); schema at head.",
+  "db.size": "Database is using 42% of its configured storage capacity.",
   loops: "All 4 background loops are ticking.",
   "forge.ciwatch": "Every repo's run branches fit within the CI watch cap.",
   "forge.sync": "0 of 3 failing; 0 pending.",
@@ -270,6 +272,7 @@ export function noHostedWorkersDoc(): HealthDoc {
         severity: "na",
         summary: "No hosted workers are configured, so the controller does not report.",
       },
+      "db.size": { severity: "na", summary: "No valid database storage capacity is configured (DB_STORAGE_CAPACITY_BYTES)." },
       "slack.socket": { severity: "na", summary: "Slack is not configured." },
     }),
   );

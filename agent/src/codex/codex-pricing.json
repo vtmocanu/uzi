@@ -1,5 +1,5 @@
 {
-  "version": "openai-standard-2026-10-01",
+  "version": "openai-standard-2026-10-09",
   "input_tier_threshold_tokens": 272000,
   "models": {
     "gpt-6-astra": {
@@ -77,6 +77,25 @@
         "cached_input": 0.2,
         "cache_write": 5,
         "output": 15
+      }
+    },
+    "gpt-6-luna": {
+      "verified_at": "2026-10-09",
+      "sources": [
+        "https://developers.openai.com/api/docs/pricing",
+        "https://developers.openai.com/api/docs/models/gpt-6-luna"
+      ],
+      "low": {
+        "uncached_input": 0.1,
+        "cached_input": 0.01,
+        "cache_write": 0.125,
+        "output": 0.5
+      },
+      "high": {
+        "uncached_input": 0.2,
+        "cached_input": 0.02,
+        "cache_write": 0.25,
+        "output": 0.75
       }
     }
   }

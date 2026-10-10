@@ -1019,6 +1019,7 @@ export async function makeCodexAdviceHarness(
   launchRoot: LaunchAdviceRootSeam,
   log: Logger,
   signal?: AbortSignal,
+  refresh?: "deny",
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1031,8 +1032,8 @@ export async function makeCodexAdviceHarness(
   // built). It seeds the app-server login credential; the token flows over the login RPC, never env.
   const initial = await bridge.release(signal);
   registerToken(initial);
-  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, log });
+  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1088,6 +1089,7 @@ function buildAdviceAuthConfig(
   bridge: CodexAdviceCredentialBridge,
   initial: string,
   registerToken: (token: string) => void,
+  denyRefresh = false,
 ): CodexAppServerAuthConfig {
   if (bridge.authMode !== "subscription") {
     return { mode: "api_key", apiKey: initial };
@@ -1100,7 +1102,11 @@ function buildAdviceAuthConfig(
   return {
     mode: "subscription",
     initial: { accessToken: initial, accountId },
-    bridge: bridge.buildSubscriptionRefreshBridge(registerToken),
+    // PRD #2603: the Now summary shares the RUN's credential, so its advice call must never
+    // advance the run's committed generation: a refresh request fails the (advisory) call instead.
+    bridge: denyRefresh
+      ? { refresh: () => Promise.reject(new Error("codex advice refresh is denied for this call")) }
+      : bridge.buildSubscriptionRefreshBridge(registerToken),
   };
 }
 
@@ -1243,6 +1249,9 @@ export interface CodexAdviceHarnessBuildParams {
   readonly runId: string;
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
+  /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
+   *  refreshCodex, for a caller that shares the run's credential (the Now summary). */
+  readonly refresh?: "deny";
 }
 
 /** The injected judge/review advice-harness seam (PRD #1429 M3): built ONLY here and in
@@ -1265,10 +1274,10 @@ export function makeProductionCodexAdviceHarnessFactory(
   log: Logger,
   homeRoot: string,
 ): CodexAdviceHarnessFactory {
-  return async ({ runId, binding, signal }: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
+  return async ({ runId, binding, signal, refresh }: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
     const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal);
+    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh);
   };
 }
 
@@ -3680,6 +3689,8 @@ export class CodexExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: import("../harness.js").HarnessTerminal | undefined;
+    let processedEvents = 0;
+    let result: ReducedTurnResult;
     // #1593: capture root-thread text by frame origin, independently of displayed
     // attribution. The planning loop uses this bounded, scrubbed tail as finalText
     // to distinguish a prose-only turn from an empty one.
@@ -3720,6 +3731,7 @@ export class CodexExecutor implements Executor {
       let sawModelEvidence = false;
       for (; !first.done; first = await events.next()) {
         const event = first.value;
+        if (evidencesModelProcessing(event)) processedEvents++;
         if (!sawModelEvidence && evidencesModelProcessing(event)) {
           sawModelEvidence = true;
           try {
@@ -3749,8 +3761,13 @@ export class CodexExecutor implements Executor {
           sawTerminal = true;
           terminal = event.terminal;
           if (terminal.policyRefusal) await ctx.emit({ kind: "status", agent: "worker", payload: { ...terminal.policyRefusal } });
-          turn.requestStop("terminal");
-          break;
+          if (terminal.outcome !== "success") {
+            turn.requestStop("terminal");
+            break;
+          }
+          // Resume this same iterator through the harness's pendingToolCalls settlement
+          // and final projection drain. Cancel delegations while trip handlers stay live.
+          effectsAbort.abort();
         }
       }
       if (terminal?.policyRefusal) {
@@ -3768,13 +3785,12 @@ export class CodexExecutor implements Executor {
       }
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
-      const result = reducer.finish(end).result;
+      result = reducer.finish(end).result;
       // The capture (not the emitted feed frames, which the batcher redacts) is scrubbed of the
       // claim secrets and the runtime-released Codex tokens before it leaves the turn. It wins
       // over any reducer-set finalText, so the only lead text a Codex turn returns is this
       // bounded, scrubbed tail.
       if (rootText) result.finalText = scrubLeadText(rootText);
-      return result;
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
       if (tripReason) throw this.tripError(tripReason, tripToken!);
@@ -3789,6 +3805,16 @@ export class CodexExecutor implements Executor {
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
       if (vaultLock.activeTurnTrip === trip) vaultLock.activeTurnTrip = undefined;
     }
+    // No await separates cleanup from this live-state check and notification entry.
+    // The async notification owner must recheck its ownership before journaling.
+    if (tripReason) throw this.tripError(tripReason, tripToken!);
+    if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
+        !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !vaultLock.latched &&
+        this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
+        registry.inFlightCallbackCountSince(callbackCursor) === 0) {
+      await ctx.onModelTurnSettled?.(processedEvents);
+    }
+    return result;
   }
 
   /**

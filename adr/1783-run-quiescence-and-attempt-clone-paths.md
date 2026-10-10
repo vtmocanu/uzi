@@ -141,9 +141,11 @@ removes the tree.
     from the new attempt path. Continuity of WORK, not of conversation, is what
     survives: the tracking ref, the recovery journal, and captured checkpoints
     carry the prior attempt's committed state forward; only the model's own
-    memory of the conversation is lost. Unwired workers (no Docker daemon
-    configured) keep full same-path resume and are unaffected. The reviewers
-    chose this trade-off under the user's delegation: it is a real, disclosed cost
+    memory of the conversation is lost. Ordinary unwired resumes (no Docker
+    daemon configured), for keys that never entered retained-source recovery,
+    keep same-path continuity. Retained-source recovery uses a fresh attempt
+    path and model session even on unwired workers (see the #2512 amendment).
+    The reviewers chose this trade-off under the user's delegation: it is a real, disclosed cost
     of the isolation guarantee, not an oversight.
 
 ### Option B — the deferred durable follow-up
@@ -664,3 +666,99 @@ sandbox does not grant the bare and git inside the sandbox cannot follow the
 alternate. This applies to both the canonical seed and, since the merge that
 reconciled #1783 with #1769, the per-attempt seed as well (see
 `runnerCloneForBranch`'s docstring in `agent/src/git.ts`).
+
+## Amendment 2026-10-08 — #2512: retained recovery on unwired workers
+
+The same-path exception in decision 15 applies to ordinary unwired keys
+that never entered retained-source recovery. A retained-source claim uses
+a fresh attempt path and model session regardless of Docker wiring.
+Recovery must not run a model in the predecessor while its source and
+evidence remain necessary for custody. This extends the fresh-path trade-off
+to retained recovery without changing ordinary unwired continuity.
+
+Discovery precedes forge refresh and disk preflight. Recovery reserves a
+durable source-bound budget of 3 total iterations (blocked and nonblocked
+together), with a five-minute deadline from the first reservation and the
+existing exponential retry cap of 16 times its base. Reservations survive
+crash, reclaim and successor handoff; reset requires a trusted, successfully
+settled real model turn. External restarts require a genuinely fenced
+successor, not reuse of a discovered ready successor as execution authority.
+
+A permanent blocker or exhaustion ends `failed` with `keepCustody`, no
+automatic reclaim and no failed-run Resume. In this retained-recovery path,
+`worker_residue_blocked` denotes actual quiescence failure; archive size,
+prerequisite, source, clock, preservation and adoption blockers have their
+own accurate reasons. Healthy provider/empty-turn parks and the owner
+worker-recovery-exhaustion hold keep their existing budgets.
+
+An actual verified thin bundle under the cap can support local adoption
+and model execution with locally available, verified prerequisites despite
+unknown remote publication. A nonempty prerequisite list is not itself a
+blocker; unavailable/unverifiable needed prerequisites or a still-oversized
+fallback are. This local proof grants neither independent recovery, remote
+durability nor custody release. Predecessor sources, pins, journals and
+descriptors remain until existing verified final disposition or explicit
+discard; guarded archive-release conditions are unchanged.
+
+Healthy unknown publication stays in the same generation with the tip,
+owed roots and publication time gate retained; confirmed durability requires
+positive proof. No API/schema, hold-rebinding, custody-cap or #2486 behavior
+change is included, and [ADR-1751](1751-continuation-custody-admission.md)'s
+soft cap is unchanged. Local storage loss remains a limit: a failed
+source-only run requires operator recovery from retained storage, and
+export still requires a manifest-bound available archive. There is no new
+download API or failed-run Resume. Downgrade during pending recovery is
+unsupported because older workers may drop its recovery fields.
+
+See the matching [ADR-1197 amendment](1197-transient-recovery-park.md#amendment-2026-10-08--2512-source-bound-retained-recovery)
+and [user recovery guide](../docs/run-recovery-wait.md#bounded-retained-source-recovery).
+
+## Amendment 2026-10-09 — #2512: terminal retained custody
+
+A terminal run's retained recovery journal must not monopolize a branch's active
+slot. After exact terminal ownership validation, the worker validates the full
+journal and every source identity, then proves capture-mode quiescence over the
+primary, retained predecessors, recovery source and recorded successor. This
+also applies to canonical sources on unwired workers.
+
+Detachment compares the full snapshot again after the proof, including recovery
+counters and siblings. Under the bare lock it persists and reads back a
+worker-owned config record, `uzi-retained.<runId>.journal`, containing
+`{version:1,branch,key,journal}`, with the complete original journal. It marks
+every attempt source reclaimed and clears only the matching active slot.
+Interruption at write, readback, ledger append or clear retains active evidence
+or both records for a bounded, idempotent retry. Malformed, duplicate,
+conflicting or unattributed evidence refuses detachment and inventory.
+
+Protected records preserve custody evidence, source paths and recovery pins;
+they grant no seed, discovery or executor authority. Inventory, retention sweep
+and ledger compaction include their sources. Backup validates the exact run's
+full protected descriptor and ledger identities before selecting its current
+clone or a retained predecessor, even after a newer run owns the active slot;
+completed and cancelled runs with protected sources remain eligible. Inconclusive
+evidence fails the backup cycle without replacing the previous latest backup.
+The backup remains a selected-source snapshot, not an atomic archive of all
+siblings, and detachment grants no remote durability or server custody release.
+
+The per-key attempt-mode marker is persisted before releasing the active slot.
+Later runs use fresh attempt paths and model sessions even without Docker;
+a canonical source needs no invented attempt id or on-disk marker. Explicit
+owner discard addresses the exact protected run, deletes only its validated
+pins and descriptor, leaves source bytes intact, and preserves any newer active
+journal and the persistent attempt-mode marker.
+
+## Amendment 2026-10-09 — #2512: verification resource limit
+
+Human review authorizes a 1 GiB delivered decoded-history limit for reachable
+object integrity verification, even for a thin archive below 64 MiB. The
+worker verifies hashes under the existing deadline, records a visible blocker
+in `uzi run recovery` and its log on overflow, and retains source and custody
+on overflow, timeout, corruption or interruption. This limit is separate from
+archive size and does not make a thin archive independently recoverable.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).

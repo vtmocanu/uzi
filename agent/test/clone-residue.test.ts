@@ -351,6 +351,74 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
     assert.deepEqual(residueNames(), [], "nothing was quarantined");
   }
 
+  for (const attemptMode of [false, true]) {
+    for (const shape of ["matching foreign", "path mismatch", "attempt-id mismatch"] as const) {
+      it(`missing-source ${attemptMode ? "attempt" : "canonical"} ${shape} classification`, async () => {
+        const iid = 3190;
+        const owner = randomUUID();
+        const claimant = randomUUID();
+        const { b, canonical } = await primedCanonical(iid);
+        const id = mintAttemptId(1);
+        const journaledPath = shape === "matching foreign" ? canonical
+          : shape === "path mismatch" ? path.join(runnerRepoDir(), `agent-issue-${iid}`)
+          : `${canonical}.attempt-${id}`;
+        if (journaledPath !== canonical) {
+          fs.mkdirSync(journaledPath);
+          fs.writeFileSync(path.join(journaledPath, "EVIDENCE.txt"), "retained owner bytes\n");
+        }
+        const journalId = shape === "attempt-id mismatch" ? mintAttemptId(2) : undefined;
+        const command = (...args: string[]) => execFileSync("git", ["-C", b, ...args], { encoding: "utf8" }).trim();
+        await git.markRecoveryCapture(b, journaledPath, branch(iid), owner, shape === "attempt-id mismatch" ? id : undefined);
+        if (journalId) {
+          // Legacy journals can carry inconsistent ids; the guarded writer rejects them.
+          command("config", `uzi-recovery.${branch(iid)}.clone`, JSON.stringify({ runId: owner, clonePath: journaledPath, attemptId: journalId }));
+        }
+        const pending = command("config", `uzi-recovery.${branch(iid)}.clone`);
+        command("config", `uzi-retained.${owner}.journal`,
+          JSON.stringify({ version: 1, branch: branch(iid), key: `issue-${iid}`, journal: { ...JSON.parse(pending), ...(journalId ? { attemptId: id } : {}) } }));
+        const tip = command("rev-parse", "refs/remotes/origin/main");
+        command("update-ref", `refs/uzi-recovery-episode/${owner}/${tip}`, tip);
+        fs.renameSync(journaledPath, journaledPath + ".saved");
+        if (journaledPath === canonical) readOnly.push(path.join(journaledPath + ".saved", "agent"));
+        const savedHash = treeHash(journaledPath + ".saved");
+        const snapshot = () => [
+          command("config", "--get-regexp", "^uzi-"),
+          command("for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi"),
+        ];
+        const before = snapshot();
+        const pathsBefore = fs.readdirSync(runnerRepoDir()).sort();
+        const { reseed, calls } = recordingReseed();
+        const seeds: string[][] = [];
+        const opts: AttemptSeedOptions = {
+          attemptId: mintAttemptId(3), isLive: () => false,
+          beforeSeed: async p => void seeds.push(p), quiescent: async () => { calls.push("sweep"); return true; },
+        };
+        await assert.rejects(
+          git.createOrAttachRunnerClone(b, iid, reseed, claimant, false, undefined, attemptMode ? opts : undefined),
+          (error: unknown) => {
+            if (shape === "matching foreign") {
+              assert.ok(error instanceof ForeignCaptureBlockedError);
+              assert.equal(error.clonePath, journaledPath);
+            } else {
+              assert.ok(error instanceof CapturePathMismatchError);
+              assert.equal(error.journaledPath, journaledPath);
+              assert.equal(error.computedPath, canonical);
+            }
+            assert.equal(error.branch, branch(iid));
+            assert.equal(error.ownerRunId, owner);
+            return true;
+          },
+        );
+        assert.deepEqual(calls, []);
+        assert.deepEqual(seeds, []);
+        assert.deepEqual(snapshot(), before, "journal, protected descriptor and pins unchanged");
+        assert.deepEqual(fs.readdirSync(runnerRepoDir()).sort(), pathsBefore, "no destination created");
+        assert.equal(treeHash(journaledPath + ".saved"), savedHash);
+        assert.equal(fs.existsSync(journaledPath), false);
+      });
+    }
+  }
+
   it("Case C (this run's own journal): PendingRecoveryCaptureError, nothing freed", async () => {
     const iid = 3101;
     const runId = randomUUID();

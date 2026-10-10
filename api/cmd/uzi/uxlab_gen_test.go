@@ -743,6 +743,20 @@ func withLiveStream(m tuiModel) tuiModel {
 }
 
 func detailRunning(dark bool, now time.Time) string {
+	return detailRunningSceneH(dark, now, nil, 0)
+}
+
+// detailRunningWithNoteH is detailRunning (light theme) with the PROGRESS block's Now note drawn, at a
+// chosen terminal height (width stays 100); an empty text draws no note.
+func detailRunningWithNoteH(now time.Time, text string, at time.Time, height int) string {
+	var note *apitypes.ProgressNote
+	if text != "" {
+		note = &apitypes.ProgressNote{Text: text, At: at}
+	}
+	return detailRunningSceneH(false, now, note, height)
+}
+
+func detailRunningSceneH(dark bool, now time.Time, note *apitypes.ProgressNote, height int) string {
 	// A milestone-structured run so the crew rail's milestone block renders (#379), coherent
 	// with the board's M2/4 for the same run id.
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
@@ -756,7 +770,7 @@ func detailRunning(dark bool, now time.Time) string {
 		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, // two in flight (#1176)
 		// PRD #2602: the crew rail's PROGRESS block (TUI mock 2).
 		Progress: &apitypes.RunProgress{State: "percent", Pct: ip32(70), MilestoneDone: 2, MilestoneTotal: 4,
-			ActiveMilestoneID: "m3", Phase: "implement"}}
+			ActiveMilestoneID: "m3", Phase: "implement", NowNote: note}}
 	// The credential label rides the right of the header's first line, before the transport tag
 	// (PRD #295), coherent with the board's meta label for this same run id.
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
@@ -764,6 +778,9 @@ func detailRunning(dark bool, now time.Time) string {
 	// the board's runs[0] for this same run id (identical cost value).
 	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
+	if height > 0 {
+		m.height = height
+	}
 	m = withLiveStream(m)
 	return m.View().Content
 }

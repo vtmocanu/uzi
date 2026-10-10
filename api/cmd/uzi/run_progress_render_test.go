@@ -93,3 +93,26 @@ func TestRunGetPrintsProgressRowAndFieldIsUsageErrorWhileLive(t *testing.T) {
 		t.Errorf("terminal run must not print PROGRESS:\n%s", out)
 	}
 }
+
+func TestProgressRowNowNote(t *testing.T) {
+	pct := 70
+	mk := func(n *apitypes.ProgressNote, state string) apitypes.RunDTO {
+		return apitypes.RunDTO{Progress: &apitypes.RunProgress{State: state, Pct: &pct, MilestoneDone: 2, MilestoneTotal: 3, NowNote: n}}
+	}
+	at := time.Now().Add(-2 * time.Minute)
+	row := progressRow(mk(&apitypes.ProgressNote{Text: "running the gate", At: at}, "percent"))
+	if len(row) != 2 || row[1] != "≈70% · 2 of 3 done · now: running the gate (model summary, 2m ago)" {
+		t.Errorf("got %v", row)
+	}
+	if row := progressRow(mk(&apitypes.ProgressNote{Text: "   ", At: at}, "percent")); row[1] != "≈70% · 2 of 3 done" {
+		t.Errorf("blank note drawn: %v", row)
+	}
+	if row := progressRow(mk(&apitypes.ProgressNote{Text: "x", At: at}, "stalled")); row[1] != "stalled" {
+		t.Errorf("note drawn for non-percent state: %v", row)
+	}
+	hostile := "\x1b[31m\x1b[2J\u202E\x07<b>evil</b>"
+	row = progressRow(mk(&apitypes.ProgressNote{Text: hostile, At: at}, "percent"))
+	if strings.ContainsAny(row[1], "\x1b\x07\u202e") || !strings.Contains(row[1], "evil") {
+		t.Errorf("hostile note not inert: %q", row[1])
+	}
+}

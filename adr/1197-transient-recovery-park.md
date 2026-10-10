@@ -112,12 +112,15 @@ cleanup serialization and message-cursor refresh.
 
 "Verified capture before a promotable park" above assumes a clone already
 exists to inspect, WIP-commit and fetch. That assumption does not hold for
-a transient forge failure (DNS, connect, or a 5xx) hit *while cloning* — a
-run resumed from any park re-clones on every resume, so the same exposure
-recurs on every such resume, not only on first dispatch.
+a transient forge failure (DNS, connect, or a 5xx) hit *while cloning* —
+a healthy resume with no retained source can need the same forge refresh,
+so this exposure is not limited to first dispatch. Retained-source discovery
+now precedes forge refresh and disk preflight; the #2512 amendment below
+covers claims that already have local source.
 
-When `ensureClone` exhausts its retry schedule with a transient verdict,
-there is no runner clone, no worktree, no branch and no recovery journal
+On the healthy path with no retained source discovered, when `ensureClone`
+exhausts its retry schedule with a transient verdict, there is no runner
+clone, no worktree, no branch and no recovery journal
 yet (`phaseClone` reports `running` and starts steering before any of those
 exist). There is therefore **nothing to capture, verify, or retain a source
 for**: the worker reports `recovery_wait` with cause `forge_unreachable`
@@ -140,3 +143,72 @@ a generation that never adopted a source releases its hold without the
 forge proof this ADR's sibling amendments otherwise require — and
 [adr/1392-forge-unreachable-preclone-park.md](1392-forge-unreachable-preclone-park.md)
 for the full decision record.
+
+## Amendment 2026-10-08 — #2512: source-bound retained recovery
+
+Retained-source discovery runs inside an acquired claim before forge refresh
+or disk preflight. The #1392 no-local-source forge park remains valid on the
+healthy path where discovery found no retained source. A retained source
+instead enters a durable episode bound to its identity, reserving work
+before capture: **3 total iterations**, blocked and nonblocked together,
+with a **five-minute deadline from the first reservation**. Retries use the
+existing exponential delay capped at 16 times the base. Crash, reclaim,
+capture, publication and successor handoff preserve the reservation and
+deadline. Reset requires a trusted, successfully settled real model turn.
+
+A permanent blocker or exhaustion reports terminal `failed` with
+`keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
+The reason distinguishes missing source, invalid clock, preservation or
+adoption failure, unavailable/unverifiable needed prerequisites, and a
+fallback still over the size cap. `worker_residue_blocked` is reserved here
+for actual quiescence failure. Transient capture, forge and disk failures
+spend the same episode budget. The healthy provider/empty-turn park budgets
+and owner worker-recovery-exhaustion hold are separate and unchanged.
+
+The guarded producer's actual verified thin bundle, under the cap and with
+needed prerequisites locally available and verified, permits local adoption
+and model execution despite unknown remote publication. Nonempty
+prerequisites alone are not a blocker. Content verification reads only the
+reachable object closure and verifies object hashes within the recovery
+deadline. A decoded history above 1 GiB fails closed with custody retained,
+even when its thin archive is below 64 MiB; the recorded reason is visible
+in `uzi run recovery` and the worker log. Local proof establishes neither
+independent recovery nor remote durability and grants no custody release. Predecessor
+sources, pins, journals and descriptors remain until the existing verified
+final disposition or explicit discard. Guarded prerequisite-free
+archive/verified-empty-inventory release conditions remain unchanged.
+
+Recovery seeds a fresh successor path and model session even on an unwired
+worker, avoiding execution in a predecessor while its recovery evidence
+must remain. Ordinary unwired keys that never entered retained recovery
+retain same-path continuity. External restarts require a genuinely fenced
+successor; local storage loss remains outside the protection. See the
+matching [ADR-1783 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-08--2512-retained-recovery-on-unwired-workers).
+
+Healthy unknown publication continues within the same generation, preserving
+the tip, owed roots and publication time gate; confirmed durability requires
+positive proof. No API/schema, hold-rebinding, custody-cap or #2486 behavior
+changes are included; [ADR-1751](1751-continuation-custody-admission.md)'s soft cap
+is unchanged.
+
+A failed source-only run needs operator recovery from retained storage.
+Export remains limited to a manifest-bound available archive, with no new
+download API or failed-run Resume. Downgrade during pending recovery is
+unsupported: older workers may drop the durable recovery fields.
+
+## Amendment 2026-10-09 — #2512: bounded reachable integrity verification
+
+The human review authorizes a 1 GiB delivered decoded-history limit for
+local recovery verification, separate from the 64 MiB encoded archive cap.
+Exceeding it fails closed and retains custody, with a visible recorded reason
+in `uzi run recovery` and the worker log. Verify reachable object contents
+and hashes under the existing deadline; unrelated cache objects do not
+participate in that proof. Overflow, timeout, corruption and interruption
+never authorize custody release or source cleanup.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).

@@ -11,7 +11,7 @@ The revised prompt asks for a compact diagram when the visible diff establishes 
 
 ## Prerequisites and invocation
 
-Use the repository's Node 24 runtime and installed agent dependencies, including the pinned Claude Agent SDK 0.3.287, Go compatible with the API module, and the production pinned Codex executable at /opt/uzi-codex/0.159.3/bin/codex. The Go command must have the API module dependencies available through its normal tool caches. Do not install a second dependency tree to run this evaluation.
+Use the repository's Node 24 runtime and installed agent dependencies, including the pinned Claude Agent SDK 0.3.287, Go compatible with the API module, and the production pinned Codex executable at /opt/uzi-codex/0.160.0/bin/codex. The Go command must have the API module dependencies available through its normal tool caches. Do not install a second dependency tree to run this evaluation.
 
 Claude reads only CLAUDE_CODE_OAUTH_TOKEN for provider authentication and uses the unchanged runReadOnlyModelPass, buildSdkEnv and ClaudeAdviceHarness SDK query. Codex reads only OPENAI_API_KEY and uses the sanctioned evaluator factory, actual CodexAdviceHarness and production api_key login RPC. Supply credentials through the process environment; never include them in arguments or result attachments. This does not change production model selection.
 

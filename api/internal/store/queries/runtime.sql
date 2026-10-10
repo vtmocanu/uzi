@@ -4745,7 +4745,13 @@ WHERE runs.id = @id AND runs.user_id = @user_id
 -- generation with an unreleased claim, so a released/reclaimed old flight cannot advance
 -- last_seq (which would strand the reclaiming flight's re-emitted seqs behind a stale mark). A
 -- legacy caller (NULL) advances unconditionally, byte-identical to before.
-UPDATE runs SET last_seq = GREATEST(last_seq, @seq), last_activity_at = now()
+--
+-- PRD #2603: @quiet_activity true advances the high-water mark but LEAVES last_activity_at
+-- untouched. appendMessages passes it for a batch made only of progress_note messages (the
+-- worker's Now summary), so a summary note neither revives a stalled run nor hides its stall.
+-- The zero value (false) is the historical behaviour, so every other caller is unchanged.
+UPDATE runs SET last_seq = GREATEST(last_seq, @seq),
+    last_activity_at = CASE WHEN @quiet_activity::boolean THEN last_activity_at ELSE now() END
 WHERE id = @id
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
@@ -8024,14 +8030,16 @@ ORDER BY u.id;
 -- makes it converge: a post-migration run is born refolded and never selected here.
 
 -- name: ListRunUsageFrames :many
--- A run's full status/error frame history in seq order — the exact frame shape
--- foldUsageFrames folds (never tool/text traffic). Column order matches
+-- A run's full status/error/progress_note frame history in seq order — the exact frame shape
+-- foldUsageFrames folds (never tool/text traffic). progress_note (PRD #2603) carries the usage of
+-- a Now-summary call, so the refold MUST read it or it would drop spend the incremental fold
+-- recorded. Column order matches
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
-WHERE run_id = @run_id AND kind IN ('status', 'error')
+WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note')
 ORDER BY seq ASC;
 
 -- name: ListRunsPendingUsageRefold :many
@@ -10884,3 +10892,20 @@ WHERE runs.id = @id AND runs.user_id = @user_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ))
 RETURNING runs.id, runs.user_id, runs.status;
+
+-- name: GetLatestProgressNote :one
+-- The newest model-written Now summary of a run for ONE milestone (PRD #2603): the newest
+-- kind='progress_note' row whose text is non-empty and whose milestone_id equals @milestone_id.
+-- An empty-text note (a usage-only note, or the clear note sent when the setting turns off) is
+-- skipped, so it never shadows an older real note for the milestone but also never surfaces
+-- itself. Served by idx_run_messages_progress_note_seq (run_id, seq) WHERE kind='progress_note'.
+-- GetRun only; a list read never runs it. The text was sanitised on ingest and is sanitised
+-- again by the caller.
+SELECT (payload->>'text')::text AS text, created_at
+FROM run_messages
+WHERE run_id = @run_id
+  AND kind = 'progress_note'
+  AND payload->>'milestone_id' = @milestone_id::text
+  AND COALESCE(payload->>'text', '') <> ''
+ORDER BY seq DESC
+LIMIT 1;

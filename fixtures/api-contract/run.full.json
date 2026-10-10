@@ -36,7 +36,11 @@
     "milestone_total": 1,
     "active_milestone_id": "x",
     "phase": "x",
-    "maybe_blocked_by_run_id": "x"
+    "maybe_blocked_by_run_id": "x",
+    "now_note": {
+      "text": "x",
+      "at": "2020-01-02T03:04:05Z"
+    }
   },
   "auto_approve": true,
   "auto_approve_blocked_reasons": [

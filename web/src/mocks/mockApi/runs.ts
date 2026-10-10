@@ -9,6 +9,8 @@ import {
   type Run,
   type RunPriority,
   type RunInputKind,
+  type RunListItem,
+  type RunSummaryItem,
   type SelfUsage,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
@@ -238,6 +240,69 @@ function overrideToRead(body: { mode: string; secret_id?: string }): CredentialO
   return { mode: body.mode, label: null };
 }
 
+// Mirrors the real client's summary projection (Go RunSummaryItemDTO): drops the four
+// detail-only keys at runtime so demo/test parity with ?view=summary holds.
+function toSummary(item: RunListItem): RunSummaryItem {
+  const {
+    plan_md: _planMd,
+    repo_agents: _repoAgents,
+    issue_description: _issueDescription,
+    preserved_patch: _preservedPatch,
+    ...summary
+  } = item;
+  return summary;
+}
+
+// Overload order mirrors realApi.listRuns: summary first, legacy LAST.
+function mockListRuns(params: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+  view: "summary";
+}): Promise<{ runs: RunSummaryItem[] }>;
+function mockListRuns(params?: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+}): Promise<{ runs: RunListItem[] }>;
+function mockListRuns(params?: {
+  repoId?: string;
+  issueIid?: number;
+  // Mirrors the real client's passive-poll flag (#331); the mock does no real
+  // fetch, so the marker has no effect here beyond keeping the types compatible.
+  passive?: boolean;
+  view?: "summary";
+}): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
+  const items = listRunsFor()
+    // Chat conversations ride runs but have their own page (PRD #39), and judge
+    // is a repo-less meta-run — both are excluded here exactly as the real
+    // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
+    .filter((r) => r.kind !== "chat" && r.kind !== "judge")
+    // Caller-scoped, like the real ListRunsForUser: other demo users' runs
+    // (mockOtherRunOwners) belong to the admin all-users list only.
+    .filter((r) => !(r.id in mockOtherRunOwners))
+    .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
+    .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
+    .map((r) => runListItem(harnessOverlay(r)));
+  return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
+}
+
+function mockAdminListRuns(params: { view: "summary" }): Promise<{ runs: RunSummaryItem[] }>;
+function mockAdminListRuns(): Promise<{ runs: RunListItem[] }>;
+function mockAdminListRuns(params?: {
+  view?: "summary";
+}): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
+  const items = listRunsFor()
+    .filter((r) => r.kind !== "chat")
+    .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
+    // Owner attribution: the mock's owner column is mockOtherRunOwners; every
+    // other run belongs to the session admin. Before this map existed, EVERY
+    // row here was stamped with the session email — the demo factory list was
+    // 100% "mine", the exact duplication amendment 2 removes.
+    .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email));
+  return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
+}
+
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
   // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
@@ -462,26 +527,7 @@ export const runsApi = {
     startNewRun(run.id);
     return delay({ run: { ...run } }, 350);
   },
-  listRuns: async (params?: {
-    repoId?: string;
-    issueIid?: number;
-    // Mirrors the real client's passive-poll flag (#331); the mock does no real
-    // fetch, so the marker has no effect here beyond keeping the types compatible.
-    passive?: boolean;
-  }) =>
-    delay({
-      runs: listRunsFor()
-        // Chat conversations ride runs but have their own page (PRD #39), and judge
-        // is a repo-less meta-run — both are excluded here exactly as the real
-        // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
-        .filter((r) => r.kind !== "chat" && r.kind !== "judge")
-        // Caller-scoped, like the real ListRunsForUser: other demo users' runs
-        // (mockOtherRunOwners) belong to the admin all-users list only.
-        .filter((r) => !(r.id in mockOtherRunOwners))
-        .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
-        .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-        .map((r) => runListItem(harnessOverlay(r))),
-    }),
+  listRuns: mockListRuns,
   // PRD #40: token/cost usage. Static demo figures — enough to populate the
   // dashboard's "Your usage" and (admin) factory cards + per-user table.
   getUsage: async () =>
@@ -1041,15 +1087,5 @@ export const runsApi = {
     return delay({ server_side: false }, 150);
   },
 
-  adminListRuns: async () =>
-    delay({
-      runs: listRunsFor()
-        .filter((r) => r.kind !== "chat")
-        .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
-        // Owner attribution: the mock's owner column is mockOtherRunOwners; every
-        // other run belongs to the session admin. Before this map existed, EVERY
-        // row here was stamped with the session email — the demo factory list was
-        // 100% "mine", the exact duplication amendment 2 removes.
-        .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email)),
-    }),
+  adminListRuns: mockAdminListRuns,
 };

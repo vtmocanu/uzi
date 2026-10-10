@@ -5142,6 +5142,41 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 	return forge_type, err
 }
 
+const getLatestProgressNote = `-- name: GetLatestProgressNote :one
+SELECT (payload->>'text')::text AS text, created_at
+FROM run_messages
+WHERE run_id = $1
+  AND kind = 'progress_note'
+  AND payload->>'milestone_id' = $2::text
+  AND COALESCE(payload->>'text', '') <> ''
+ORDER BY seq DESC
+LIMIT 1
+`
+
+type GetLatestProgressNoteParams struct {
+	RunID       uuid.UUID `json:"run_id"`
+	MilestoneID string    `json:"milestone_id"`
+}
+
+type GetLatestProgressNoteRow struct {
+	Text      string             `json:"text"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// The newest model-written Now summary of a run for ONE milestone (PRD #2603): the newest
+// kind='progress_note' row whose text is non-empty and whose milestone_id equals @milestone_id.
+// An empty-text note (a usage-only note, or the clear note sent when the setting turns off) is
+// skipped, so it never shadows an older real note for the milestone but also never surfaces
+// itself. Served by idx_run_messages_progress_note_seq (run_id, seq) WHERE kind='progress_note'.
+// GetRun only; a list read never runs it. The text was sanitised on ingest and is sanitised
+// again by the caller.
+func (q *Queries) GetLatestProgressNote(ctx context.Context, arg GetLatestProgressNoteParams) (GetLatestProgressNoteRow, error) {
+	row := q.db.QueryRow(ctx, getLatestProgressNote, arg.RunID, arg.MilestoneID)
+	var i GetLatestProgressNoteRow
+	err := row.Scan(&i.Text, &i.CreatedAt)
+	return i, err
+}
+
 const getOwnedPlanCrossCheck = `-- name: GetOwnedPlanCrossCheck :one
 SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
 WHERE lead.id = $1 AND lead.worker_id = $2
@@ -9492,7 +9527,7 @@ const listRunUsageFrames = `-- name: ListRunUsageFrames :many
 
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
-WHERE run_id = $1 AND kind IN ('status', 'error')
+WHERE run_id = $1 AND kind IN ('status', 'error', 'progress_note')
 ORDER BY seq ASC
 `
 
@@ -9503,8 +9538,10 @@ ORDER BY seq ASC
 // per-leg rows. 00188 added runs.usage_refolded (DEFAULT true, set false for every
 // non-chat row that existed at migration time), which scopes the job to history and
 // makes it converge: a post-migration run is born refolded and never selected here.
-// A run's full status/error frame history in seq order — the exact frame shape
-// foldUsageFrames folds (never tool/text traffic). Column order matches
+// A run's full status/error/progress_note frame history in seq order — the exact frame shape
+// foldUsageFrames folds (never tool/text traffic). progress_note (PRD #2603) carries the usage of
+// a Now-summary call, so the refold MUST read it or it would drop spend the incremental fold
+// recorded. Column order matches
 // ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 // the `init` markers CountRunInitFramesBefore counts and the success result frames;
 // error carries a failed turn's result frame. This is a few dozen rows per run.
@@ -20217,17 +20254,19 @@ func (q *Queries) SweepTaskNeverDispatched(ctx context.Context, arg SweepTaskNev
 }
 
 const updateRunLastSeq = `-- name: UpdateRunLastSeq :execrows
-UPDATE runs SET last_seq = GREATEST(last_seq, $1), last_activity_at = now()
-WHERE id = $2
+UPDATE runs SET last_seq = GREATEST(last_seq, $1),
+    last_activity_at = CASE WHEN $2::boolean THEN last_activity_at ELSE now() END
+WHERE id = $3
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
   AND claim_released_at IS NULL
-  AND ($3::bigint IS NULL
-       OR claim_generation = $3::bigint)
+  AND ($4::bigint IS NULL
+       OR claim_generation = $4::bigint)
 `
 
 type UpdateRunLastSeqParams struct {
 	Seq             int32       `json:"seq"`
+	QuietActivity   bool        `json:"quiet_activity"`
 	ID              uuid.UUID   `json:"id"`
 	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
 }
@@ -20245,8 +20284,18 @@ type UpdateRunLastSeqParams struct {
 // generation with an unreleased claim, so a released/reclaimed old flight cannot advance
 // last_seq (which would strand the reclaiming flight's re-emitted seqs behind a stale mark). A
 // legacy caller (NULL) advances unconditionally, byte-identical to before.
+//
+// PRD #2603: @quiet_activity true advances the high-water mark but LEAVES last_activity_at
+// untouched. appendMessages passes it for a batch made only of progress_note messages (the
+// worker's Now summary), so a summary note neither revives a stalled run nor hides its stall.
+// The zero value (false) is the historical behaviour, so every other caller is unchanged.
 func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateRunLastSeq, arg.Seq, arg.ID, arg.ClaimGeneration)
+	result, err := q.db.Exec(ctx, updateRunLastSeq,
+		arg.Seq,
+		arg.QuietActivity,
+		arg.ID,
+		arg.ClaimGeneration,
+	)
 	if err != nil {
 		return 0, err
 	}

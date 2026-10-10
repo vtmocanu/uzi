@@ -1572,6 +1572,17 @@ describe("m2 accounting presentation isolation", () => {
   });
 });
 
+describe("progress_note exclusion (PRD #2603)", () => {
+  it.each(["agent", "timeline"])("shows no row or count for a progress_note in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const messages = [m(1, "text", { text: "real one" }), m(2, "progress_note", { text: "ghost note", milestone_id: "m1" })];
+    const r = renderFeed(messages, { status: "completed" });
+    expect(r.getAllByText("real one").length).toBeGreaterThan(0);
+    expect(r.queryByText("ghost note")).toBeNull();
+    expect(r.queryByText(/unrenderable/i)).toBeNull();
+  });
+});
+
 describe("m2 cap accounting exclusion", () => {
   it.each(["agent", "timeline"])("computes the real cap and hidden count in %s without mutating replay source", (view) => {
     if (view === "timeline") selectTimelineView();

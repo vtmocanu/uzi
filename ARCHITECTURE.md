@@ -2213,7 +2213,7 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 rationale, and the deferred items (version skew, per-connection sync freshness).
 
 The health registry supplies each check's `scope` (#2293): `db`,
-`controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
+`db.size`, `controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
@@ -2223,6 +2223,22 @@ the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
 sends no admin DM and raises no banner; owner run-health routing is unchanged.
+
+Database storage has two signals, both from inside the api (no volume or
+Kubernetes access). A pgx query tracer on the pool
+(`api/internal/dbdiskfull`) remembers the last SQLSTATE `53100` the api saw, per
+replica and in memory, and the `db` check is danger for five minutes after it.
+`db.size` compares `pg_database_size` to the operator-declared
+`DB_STORAGE_CAPACITY_BYTES` (rendered by the chart from the database storage
+size), warning at 75% and danger at 85% (the episode opens on the first danger tick
+and the admin notice goes out on the next still-danger tick, the usual debounce),
+cached 60 seconds per replica; it is a database-size budget, not volume usage,
+and excludes WAL. When the episode open (on the second consecutive tick whose
+open fails), the notice claim or the notification insert itself fails with
+`53100`, the episode reconciler posts the admin Slack notice straight from memory
+(`api/internal/healthsvc/emergency.go`) with a per-replica 30-minute cooldown.
+See [Database storage signals](docs/admin-health.md#database-storage-signals)
+for the blind spots and limits.
 
 `pricing.codex` compares recent Codex usage folds against the API's embedded
 release price table. `codexprice.PricedModels` filters the usage query and
