@@ -203,32 +203,48 @@ def hotfix_exception(sha, tag):
     return f'UNVERIFIED hotfix: no CI evidence; same as pre-gate behaviour; tag {tag}, SHA {sha}, base {previous} ({base})'
 
 
-def coverage(api, sha, parent, inherit, wait, interval, tag=None):
+def metadata_chain(sha):
+    """At most two single-parent, strictly metadata edges, never an arbitrary walk."""
+    chain = [sha]
+    for _ in range(2):
+        parents = git('rev-list', '--parents', '-n', '1', chain[-1]).split()
+        if len(parents) != 2 or not metadata(parents[1], chain[-1]):
+            break
+        chain.append(parents[1])
+    return chain
+
+
+def coverage(api, sha, parent, inherit, wait, interval, tag=None, chain=None):
     deadline = time.monotonic() + wait
     workflows = ('ci.yml', 'kind-smoke.yml')
+    candidates = chain if chain is not None else ([sha, parent] if inherit else [sha])
     while True:
-        heads = {w: api.run(w, sha, 'main') for w in workflows}
-        if any(state(r) == 'failed' for r in heads.values()):
-            raise Refusal(f'tagged/main SHA {sha} has failed CI: {heads}')
-        exception = hotfix_exception(sha, tag) if tag else None
-        if exception:
-            print(exception, flush=True)
-            return True
         selected = {}
-        for workflow in workflows:
-            ancestor = api.run(workflow, parent, 'main') if inherit else None
-            if state(ancestor) == 'success':
-                selected[workflow] = (parent, ancestor)
-            elif state(heads[workflow]) == 'success':
-                selected[workflow] = (sha, heads[workflow])
-        if len(selected) == len(workflows):
-            for workflow, (covered, run) in selected.items():
-                print(f'PASS {workflow}: coverage SHA {covered}, run {run["id"]}, attempt {run["run_attempt"]}', flush=True)
-            return False
-        # A promotion commit off main has no prospective main runs to wait for.
+        visited = []
+        heads = {}
+        for candidate in candidates:
+            runs = {w: api.run(w, candidate, 'main') for w in workflows}
+            visited.append(candidate)
+            if candidate == sha:
+                heads = runs
+            if any(state(r) == 'failed' for r in runs.values()):
+                raise Refusal(f'coverage SHA {candidate} has failed CI: {runs}; chain={visited}')
+            if candidate == sha:
+                exception = hotfix_exception(sha, tag) if tag else None
+                if exception:
+                    print(exception, flush=True)
+                    return True
+            for workflow in workflows:
+                if workflow not in selected and state(runs[workflow]) == 'success':
+                    selected[workflow] = (candidate, runs[workflow])
+            if len(selected) == len(workflows):
+                for workflow, (covered, run) in selected.items():
+                    print(f'PASS {workflow}: coverage SHA {covered}, run {run["id"]}, attempt {run["run_attempt"]}; chain {" -> ".join(visited)}', flush=True)
+                return False
+        # Off-main promotion commits have no prospective main runs to wait for.
         on_main = subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'refs/remotes/origin/main'], check=False).returncode == 0
         if not on_main or time.monotonic() >= deadline:
-            raise Refusal(f'no green main-push coverage for {sha}; selected={list(selected)}; heads={heads}; off-main hotfixes require the documented annotated-tag exception')
+            raise Refusal(f'no green main-push coverage for {sha}; selected={list(selected)}; heads={heads}; chain={visited}; off-main hotfixes require the documented annotated-tag exception')
         print(f'Waiting for main-push coverage of {sha}', flush=True)
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
 
@@ -286,10 +302,8 @@ def main():
             raise Refusal('smoke needs a valid release tag')
         smoke(api, sha, args.other, args.wait, args.interval)
     else:
-        parents = git('rev-list', '--parents', '-n', '1', sha).split()
-        parent = parents[1] if len(parents) == 2 else None
-        inherit = args.mode == 'coverage' and parent is not None and metadata(parent, sha)
-        unverified = coverage(api, sha, parent, inherit, args.wait, args.interval, args.tag if args.mode == 'coverage' else None)
+        chain = metadata_chain(sha) if args.mode == 'coverage' else [sha]
+        unverified = coverage(api, sha, None, False, args.wait, args.interval, args.tag if args.mode == 'coverage' else None, chain=chain)
         if args.mode == 'coverage' and os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
                 output.write(f'hotfix_unverified={str(unverified).lower()}\n')

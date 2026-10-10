@@ -138,7 +138,7 @@ code every feature PR already gated.
 
 **Release publication proves CI coverage without repeating the full gate.**
 `assert-ci-coverage` requires successful main-push CI and smoke on the tagged SHA or its
-immediate parent across a strict metadata-only diff. It rejects known failures on the
+ancestors across at most two strict metadata-only hops. It rejects known failures on the
 tagged SHA. Tagged-tree metadata checks validate the chart and bundled changelog; the
 real tagged KinD smoke must succeed before chart publication. Agent runtime bases and
 registry layers are reused when their inputs match; release image identity checks still run.
@@ -232,8 +232,9 @@ git tag -a v0.85.3 -m "v0.85.3" -m "CI-Coverage: hotfix-uncovered" HEAD
 The gate reports **UNVERIFIED hotfix: no full CI evidence**. This preserves the existing
 hotfix path; it does not claim those local checks are CI proof. The tag must target an
 off-main descendant of the immediately previous stable patch on its first-parent chain.
-A lightweight tag or missing marker cannot use this exception. Known main CI failures
-still block it; tagged metadata, version/changelog, worker-image checks and real tagged
+A lightweight tag or missing marker cannot use this exception. In general, a failed
+main-push run on the tagged SHA or any visited coverage-chain commit vetoes publication;
+tagged metadata, version/changelog, worker-image checks and real tagged
 KinD smoke before chart publication remain required. Push under the usual tag authority.
 See [ADR-1265](../adr/1265-rc-release-train.md) (D4) for the separate coverage window.
 

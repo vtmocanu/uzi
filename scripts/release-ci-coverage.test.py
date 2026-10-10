@@ -107,6 +107,14 @@ class Metadata(RepoFixture, unittest.TestCase):
         Path(path).write_bytes(self.files[path].replace('0.1.0', '0.2.0').replace('\n', '\r\n').encode())
         self.assertFalse(policy.metadata(self.parent, self.commit()))
 
+    def test_quoted_chart_duplicate(self):
+        path = 'deploy/chart/Chart.yaml'
+        duplicate = '"version": x\n' + self.files[path]
+        self.write(path, duplicate)
+        self.parent = self.commit()
+        self.write(path, duplicate.replace('version: 0.1.0', 'version: 0.2.0'))
+        self.assertFalse(policy.metadata(self.parent, self.commit()))
+
     def test_chart_duplicate(self):
         self.assertFalse(self.changed('deploy/chart/Chart.yaml', 'apiVersion:', 'version: 0.2.0\napiVersion:'))
 
@@ -138,6 +146,89 @@ class Metadata(RepoFixture, unittest.TestCase):
 
     def test_root(self):
         self.assertFalse(policy.metadata(self.parent, self.parent))
+
+
+class Chain(RepoFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.anchor = self.parent
+        self.nodes = [self.anchor]
+        for n in range(1, 4):
+            self.write('deploy/chart/Chart.yaml', self.files['deploy/chart/Chart.yaml'].replace('0.1.0', f'0.1.{n}'))
+            self.nodes.append(self.commit())
+        self.api = unittest.mock.Mock()
+        self.api.run.side_effect = lambda w, sha, b: run(w, sha) if sha == self.anchor else run(w, sha, conclusion='cancelled')
+
+    def prove(self, target):
+        chain = policy.metadata_chain(target)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            policy.coverage(self.api, target, None, False, 0, 1, chain=chain)
+        return output.getvalue()
+
+    def test_two_hops(self):
+        output = self.prove(self.nodes[2])
+        self.assertIn(' -> '.join(reversed(self.nodes[:3])), output)
+        self.assertIn('coverage SHA ' + self.anchor, output)
+
+    def test_three_hops_refused(self):
+        with self.assertRaises(policy.Refusal):
+            self.prove(self.nodes[3])
+
+    def test_middle_non_metadata_refused(self):
+        self.git('checkout', '-q', self.anchor)
+        self.write('api/change.go', 'package main\n')
+        middle = self.commit()
+        self.write('deploy/chart/Chart.yaml', self.files['deploy/chart/Chart.yaml'].replace('0.1.0', '0.2.0'))
+        target = self.commit()
+        self.assertEqual(policy.metadata_chain(target), [target, middle])
+        with self.assertRaises(policy.Refusal):
+            self.prove(target)
+
+    def test_middle_failure_veto(self):
+        self.api.run.side_effect = lambda w, sha, b: run(w, sha, conclusion='failure') if sha == self.nodes[1] else (run(w, sha) if sha == self.anchor else None)
+        with self.assertRaisesRegex(policy.Refusal, 'failed CI'):
+            self.prove(self.nodes[2])
+
+    def test_stop_at_first_covered_commit(self):
+        self.api.run.side_effect = lambda w, sha, b: run(w, sha) if sha == self.nodes[2] else run(w, sha, conclusion='failure')
+        output = self.prove(self.nodes[2])
+        self.assertIn('chain ' + self.nodes[2], output)
+        self.assertNotIn(' -> ', output)
+        self.assertEqual(self.api.run.call_count, 2)
+
+
+class Cutter(RepoFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        root = Path(__file__).resolve().parent.parent
+        self.cutter = Path(os.environ.get('UZI_CUTTER_SCRIPT', root / '.agents/skills/uzi-release/scripts/release-cut.sh'))
+        for name in ('shipping-paths.sh', 'dependency-bump.sh'):
+            self.write('scripts/lib/' + name, (root / 'scripts/lib' / name).read_text())
+        self.write('scripts/release-ci-coverage.py', "import sys\nfrom pathlib import Path\nwith Path('coverage-calls').open('a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')\nraise SystemExit(1)\n")
+        self.commit()
+        self.git('tag', 'v0.1.0')
+        self.git('tag', 'v0.2.0-rc.1')
+        origin = tempfile.TemporaryDirectory()
+        self.addCleanup(origin.cleanup)
+        subprocess.check_call(['git', 'init', '-q', '--bare', origin.name])
+        self.git('remote', 'add', 'origin', origin.name)
+        self.git('push', '-q', 'origin', 'main', '--tags')
+
+    def cut(self, *args):
+        env = {**os.environ}
+        env.pop('UZI_RELEASE_OFFLINE_FIXTURE', None)
+        result = subprocess.run(['bash', str(self.cutter), *args], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 3, result.stderr + result.stdout)
+        return Path('coverage-calls').read_text()
+
+    def test_promote_only_checks_candidate_without_main(self):
+        calls = self.cut('0.2.0', '--promote-only')
+        self.assertEqual(calls, 'coverage v0.2.0-rc.1 --wait 0\n')
+
+    def test_cut_still_checks_exact_main(self):
+        calls = self.cut('0.2.0')
+        self.assertEqual(calls, 'tip HEAD --wait 0\n')
 
 
 class Hotfix(RepoFixture, unittest.TestCase):

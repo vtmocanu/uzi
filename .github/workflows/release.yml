@@ -2,7 +2,7 @@
 # (ported from the retired GitLab `publish:*` jobs, PRD #58 / #113 / #175 / #230).
 #
 # TRIGGER: v* tags only. assert-ci-coverage requires successful main-push CI
-# and smoke on the tagged SHA or its single parent across a strict metadata diff.
+# and smoke on the tagged SHA or across at most two strict metadata hops.
 # assert-release-metadata checks the changed chart and bundled changelog on the tag.
 # An explicit annotated stable-patch hotfix may report UNVERIFIED, preserving
 # the documented off-main path. Tagged metadata and real smoke still gate it.
@@ -74,7 +74,7 @@ jobs:
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
-  # Coverage is inherited only across one strictly classified metadata commit.
+  # Coverage is inherited only across at most two strictly classified metadata commits.
   assert-ci-coverage:
     outputs:
       hotfix_unverified: ${{ steps.coverage.outputs.hotfix_unverified }}

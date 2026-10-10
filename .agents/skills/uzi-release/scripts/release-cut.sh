@@ -256,7 +256,7 @@ if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" = "1" ]; then
      { [ -n "$fixture_origin" ] && [ "${fixture_origin#/}" = "$fixture_origin" ]; }; then
     echo "release-cut: offline exemption requires the local test fixture" >&2; exit 3
   fi
-else
+elif [ "$VERB" != "--promote-only" ]; then
   python3 -I "$ROOT/scripts/release-ci-coverage.py" tip HEAD --wait 0 || exit 3
 fi
 
@@ -630,7 +630,7 @@ EOF
 promote_inflight() {
   local relbranch="release/$IB" tagB="v$IB" wt
   if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" != "1" ]; then
-    python3 -I "$ROOT/scripts/release-ci-coverage.py" tip "$INFLIGHT" --wait 0 || exit 3
+    python3 -I "$ROOT/scripts/release-ci-coverage.py" coverage "$INFLIGHT" --wait 0 || exit 3
   fi
   if git rev-parse -q --verify "refs/heads/$relbranch" >/dev/null; then
     echo "release-cut: branch $relbranch already exists (aborted prior promotion?). Remove it deliberately and re-run." >&2; exit 3
