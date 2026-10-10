@@ -30,7 +30,7 @@ func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.
 	q := store.New(tx)
 	lead, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation ||
-		lead.ClaimReleasedAt.Valid || (lead.Status != "claimed" && lead.Status != "running") ||
+		lead.ClaimReleasedAt.Valid || !codeCrossCheckCustodyStatus(lead) ||
 		!lead.CodeCrossCheckRequired || !runkind.CodeCrossCheckable(lead.Kind) ||
 		lead.ReportOnly || lead.FixVerdict.String == "not_code" {
 		return result, ErrCrossCheckRefused

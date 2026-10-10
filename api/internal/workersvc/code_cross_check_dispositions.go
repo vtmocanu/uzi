@@ -47,7 +47,7 @@ func (s *Service) FinalizeCodeCrossCheckDispositions(ctx context.Context, worker
 	q := store.New(tx)
 	lead, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation ||
-		lead.ClaimReleasedAt.Valid || (lead.Status != "claimed" && lead.Status != "running") {
+		lead.ClaimReleasedAt.Valid || !codeCrossCheckCustodyStatus(lead) {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
 	cc, err := q.GetCodeCrossCheck(ctx, leadID)

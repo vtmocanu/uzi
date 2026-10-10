@@ -174,7 +174,7 @@ WITH candidates AS MATERIALIZED (
       AND cc.lead_run_id = ANY(locks.ids)
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
-      AND lead.status IN ('claimed', 'running')
+      AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
@@ -246,7 +246,7 @@ WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = fals
         AND lead.user_id = r.user_id
         AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
         AND cc.deadline_at > now()
-        AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+        AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
   ))
   AND EXISTS (
@@ -658,7 +658,7 @@ WITH candidates AS MATERIALIZED (
       AND cc.lead_run_id = ANY(locks.ids)
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
-      AND lead.status IN ('claimed', 'running')
+      AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
@@ -780,7 +780,7 @@ WHERE runs.worker_id = @worker_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
         AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
         AND cc.deadline_at > now()
-        AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+        AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
   ))
   AND EXISTS (
@@ -1128,7 +1128,7 @@ WITH candidates AS MATERIALIZED (
       AND cc.lead_run_id = ANY(locks.ids)
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
-      AND lead.status IN ('claimed', 'running')
+      AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
@@ -1227,7 +1227,7 @@ WHERE runs.id = candidate.run_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
         AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
         AND cc.deadline_at > now()
-        AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+        AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
   ))
   AND EXISTS (
@@ -1574,7 +1574,7 @@ WITH candidates AS MATERIALIZED (
       AND cc.lead_run_id = ANY(locks.ids)
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
-      AND lead.status IN ('claimed', 'running')
+      AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
@@ -1671,7 +1671,7 @@ WHERE runs.worker_id = @worker_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
         AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
         AND cc.deadline_at > now()
-        AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+        AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
         AND lead.claim_generation = cc.lead_claim_generation
   ))
   AND EXISTS (

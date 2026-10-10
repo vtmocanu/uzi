@@ -21,6 +21,13 @@ func validCodeSHA(value string) bool {
 	return len(value) == 40 && strings.Trim(value, "0123456789abcdef") == ""
 }
 
+// codeCrossCheckCustodyStatus admits finalization of an interactive task without
+// consuming an owner follow-up or changing its persisted waiting status.
+func codeCrossCheckCustodyStatus(lead store.Run) bool {
+	return lead.Status == "claimed" || lead.Status == "running" ||
+		(lead.Status == "awaiting_followup" && lead.Kind == runkind.Task && lead.Interactive)
+}
+
 // SubmitCodeCrossCheck atomically freezes one local snapshot and creates its child.
 // A lost ACK returns the exact attempt before resolving credentials again.
 func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, base, head string) (store.CrossCheck, error) {
@@ -57,7 +64,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 	retryQ := store.New(tx)
 	owned, e := retryQ.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 	if e != nil || owned.UserID != worker.UserID || owned.ClaimGeneration != generation || owned.ClaimReleasedAt.Valid ||
-		(owned.Status != "claimed" && owned.Status != "running") || !owned.CodeCrossCheckRequired {
+		!codeCrossCheckCustodyStatus(owned) || !owned.CodeCrossCheckRequired {
 		_ = tx.Rollback(ctx)
 		return result, ErrCrossCheckRefused
 	}
@@ -83,7 +90,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		locked, e := txq.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 		if e != nil || locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.ClaimReleasedAt.Valid ||
-			(locked.Status != "claimed" && locked.Status != "running") || !locked.CodeCrossCheckRequired || !runkind.CodeCrossCheckable(locked.Kind) ||
+			!codeCrossCheckCustodyStatus(locked) || !locked.CodeCrossCheckRequired || !runkind.CodeCrossCheckable(locked.Kind) ||
 			locked.Harness != lead.Harness || validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
@@ -149,7 +156,7 @@ func (s *Service) CodeCrossCheckStatus(ctx context.Context, worker store.Worker,
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
 	lead, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
-	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid || (lead.Status != "claimed" && lead.Status != "running") {
+	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid || !codeCrossCheckCustodyStatus(lead) {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
 	expired, err := q.ExpireCodeCrossCheck(ctx, store.ExpireCodeCrossCheckParams{LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation})

@@ -18,7 +18,7 @@ SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_har
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id JOIN workers w ON w.id = lead.worker_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id AND lead.worker_id = @worker_id
  AND lead.claim_generation = @claim_generation AND lead.claim_released_at IS NULL
- AND lead.status IN ('claimed','running') AND lead.code_cross_check_required
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.code_cross_check_required
  AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
  AND lead.harness IN ('claude','codex') AND lead.harness <> @child_harness::text
  AND 'cross_check_code_v1' = ANY(w.protocol_capabilities)
@@ -43,7 +43,7 @@ FROM runs lead JOIN runs child ON child.id = @checker_run_id
 WHERE lead.id = @lead_run_id AND child.target_run_id = lead.id AND child.kind = 'cross_check'
  AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
  AND child.harness <> lead.harness
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = lead.id AND cc.stage = 'code')
 RETURNING *;
 
@@ -55,7 +55,7 @@ WHERE child.id = @child_id AND child.worker_id = @worker_id
  AND child.kind = 'cross_check' AND child.status IN ('claimed','running')
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND now() < cc.deadline_at
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.worker_id = child.worker_id AND lead.claim_generation = cc.lead_claim_generation
 FOR UPDATE OF lead, cc;
 
@@ -67,7 +67,7 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
  AND child.id = @child_id AND child.worker_id = @worker_id
  AND child.claim_generation = @claim_generation AND child.claim_released_at IS NULL
  AND child.kind = 'cross_check' AND child.status IN ('claimed','running')
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.claim_generation = cc.lead_claim_generation AND lead.worker_id = child.worker_id
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND now() < cc.deadline_at
@@ -84,7 +84,7 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
  AND child.claim_generation = @claim_generation AND child.claim_released_at IS NULL
  AND child.kind = 'cross_check' AND child.harness = cc.checker_harness
  AND child.status IN ('claimed','running')
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.claim_generation = cc.lead_claim_generation AND lead.worker_id = child.worker_id
  AND lead.harness <> cc.checker_harness
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
@@ -97,7 +97,7 @@ WITH expired AS (
  decided_at = cc.deadline_at
  FROM runs lead WHERE lead.id = cc.lead_run_id AND lead.id = @lead_run_id
  AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND cc.lead_claim_generation = lead.claim_generation AND cc.stage = 'code'
  AND cc.outcome = 'pending' AND cc.deadline_at <= now()
  RETURNING cc.*
@@ -136,7 +136,7 @@ SELECT lead.id, 'code', 1, lead.claim_generation,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.size_class END
 FROM runs lead WHERE lead.id = @lead_run_id AND lead.worker_id = @worker_id
  AND lead.user_id = @user_id AND lead.claim_generation = @claim_generation
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.code_cross_check_required AND NOT lead.report_only
  AND lead.fix_verdict IS DISTINCT FROM 'not_code'
  AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
@@ -149,7 +149,7 @@ FROM runs lead, runs child
 WHERE lead.id = cc.lead_run_id AND child.id = cc.checker_run_id
  AND lead.id = @lead_run_id AND lead.worker_id = @worker_id
  AND lead.claim_generation = @claim_generation AND lead.claim_released_at IS NULL
- AND lead.status IN ('claimed','running') AND cc.lead_claim_generation = lead.claim_generation
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND cc.lead_claim_generation = lead.claim_generation
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND child.status IN ('completed','failed','cancelled')
 RETURNING cc.*;
@@ -159,7 +159,7 @@ UPDATE cross_checks cc SET dispositions = @dispositions::jsonb, finalized_at = n
 FROM runs lead
 WHERE lead.id = cc.lead_run_id AND lead.id = @lead_run_id
  AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND cc.lead_claim_generation = lead.claim_generation
  AND cc.stage = 'code' AND cc.outcome = 'completed' AND cc.decided_at IS NOT NULL
  AND cc.interrupted_at IS NULL AND cc.finalized_at IS NULL AND cc.dispositions IS NULL
@@ -170,7 +170,7 @@ SELECT lead.id, lead.worker_id, lead.claim_generation FROM runs lead
 JOIN cross_checks cc ON cc.lead_run_id = lead.id
 LEFT JOIN runs child ON child.id = cc.checker_run_id
 WHERE cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
- AND lead.status IN ('claimed','running') AND lead.claim_released_at IS NULL
+ AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.claim_generation = cc.lead_claim_generation
  AND (cc.deadline_at <= now() OR child.status IN ('completed','failed','cancelled'))
 ORDER BY cc.deadline_at LIMIT 100;
