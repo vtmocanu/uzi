@@ -78,10 +78,27 @@ func validateMrReworkCap(value string) error {
 }
 
 // NowSummaryEnabled reports the instance-wide kill-switch for the model-written "Now"
-// summary (PRD #2603). Same three-state, error-propagating read as MrReworkEnabled:
-// present-true / present-false / absent (the default ON) are values, a store read error
-// is returned to the caller, which owns the fail-closed mapping (a summary is a
-// nice-to-have, so the callers read an error as OFF).
+// summary (PRD #2603). Three-state like MrReworkEnabled: present-true / present-false /
+// absent (the default ON) are values. It is a STRICT read: a store error is returned,
+// including on a warm cache whose refresh failed (no stale-on-error), so an admin's
+// switch-off cannot be outlived by a failed refresh. The caller owns the fail-closed
+// mapping (a summary is a nice-to-have, so the callers read an error as OFF); the bool is
+// false alongside any error. An ENV override wins without touching the store.
 func (c *Cache) NowSummaryEnabled(ctx context.Context) (bool, error) {
-	return c.boolSetting(ctx, KeyNowSummaryEnabled)
+	v, ok := c.env[KeyNowSummaryEnabled]
+	if !ok || v == "" {
+		m, err := c.strictSnapshot(ctx)
+		if err != nil {
+			return false, err
+		}
+		v = c.effective(KeyNowSummaryEnabled, m)
+	}
+	switch v {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return Defaults[KeyNowSummaryEnabled] == "true", nil
+	}
 }
