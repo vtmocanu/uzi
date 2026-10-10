@@ -153,6 +153,33 @@ func TestComputeUnmetCriteria(t *testing.T) {
 			t.Fatal("a corrupt contract must be NOT verifiable (fail-closed)")
 		}
 	})
+
+	// A stored contract that parses but carries no usable criteria must not read as complete
+	// while milestones were frozen (issue #2259).
+	for _, tc := range []struct {
+		name     string
+		contract []byte
+	}{
+		{"JSON null", []byte("null")},
+		{"empty object", []byte("{}")},
+		{"criteria null", []byte(`{"profile":"structural","revision":1,"criteria":null}`)},
+		{"criterion missing for a frozen milestone", contractJSON(t, "m1", "m2")},
+	} {
+		t.Run("fail-closed: "+tc.name, func(t *testing.T) {
+			run := store.Run{
+				CompletionContractVersion: rev,
+				CompletionContract:        tc.contract,
+				MilestonesFrozen:          frozen,
+			}
+			unmet, verifiable := computeUnmetCriteria(run)
+			if verifiable {
+				t.Fatal("must be NOT verifiable (fail-closed)")
+			}
+			if len(unmet) != 3 || unmet[0] != "m1" || unmet[1] != "m2" || unmet[2] != "m3" {
+				t.Fatalf("unmet = %v, want [m1 m2 m3]", unmet)
+			}
+		})
+	}
 }
 
 // interlockedRun builds a running interlocked run owned by wkr with the given revision/contract.

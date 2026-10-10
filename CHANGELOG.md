@@ -54,6 +54,9 @@ through `[0.52.0]`.)
 - **Retained recovery continues after a refused immediate or wall pause.**
   Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
 
+- **Completion permit fails closed on a contract with null or missing criteria ([#2259](https://github.com/vtmocanu/uzi/issues/2259)).**
+  A stored completion contract of JSON null, `{}`, `criteria: null`, or one lacking a criterion for a frozen milestone now reads as unverifiable (all frozen milestones unmet, permit denied `contract_not_frozen`) instead of complete. An explicit `criteria: []` on a milestone-less run is still vacuously complete.
+
 - **Chart-rendered api settings now reach the pod when `api.config` is empty ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
   The api Deployment mounted its ConfigMap only when `api.config` or the hosted-workers flag was set, while the ConfigMap itself also rendered for the forge allowlist and release-check keys, so those keys were silently not loaded in that configuration. Both templates now share one condition, which also covers the new `DB_STORAGE_CAPACITY_BYTES`.
 
