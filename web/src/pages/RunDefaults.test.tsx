@@ -1005,7 +1005,9 @@ describe("Run defaults — Now line switch (PRD #2603)", () => {
     mockAuth({ ...baseUser });
     mockApi.getMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: null } });
     renderPage();
-    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalled());
+    // The checkbox is disabled until the settings have loaded, so waiting for it to enable
+    // proves the null reading is the loaded one, not the pre-load default.
+    await waitFor(() => expect(nowToggle().disabled).toBe(false));
     expect(nowToggle().checked).toBe(true);
     cleanup();
     mockApi.getMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: false } });
@@ -1018,7 +1020,7 @@ describe("Run defaults — Now line switch (PRD #2603)", () => {
     mockApi.getMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: null } });
     mockApi.putMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: false } });
     renderPage();
-    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalled());
+    await waitFor(() => expect(nowToggle().disabled).toBe(false));
     fireEvent.click(nowToggle());
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ now_summary_enabled: false }));
     await waitFor(() => expect(nowToggle().checked).toBe(false));

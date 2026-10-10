@@ -170,6 +170,10 @@ export interface RunUsage {
     durationMs: number | null;
     phaseCount: number;
   };
+  /** PRD #2603: the Now-summary notes' usage, ALREADY INCLUDED in `total` but absent from
+   *  every phase row; the panel renders it as its own row so Run total equals the sum of
+   *  the displayed rows. All zero when the run has no note usage. */
+  noteTotal: { fresh: number; cached: number; out: number; costUsd: number };
   /** cached / (fresh + cached) in [0,1] — the UNROUNDED truth.
    *
    *  NOT what the strip renders: `Math.round(this * 100)` reads "100% from cache" at
@@ -657,7 +661,8 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       seenNoteSeqs.add(m.seq);
       const nu = rec(payload?.["model_usage"]);
       if (!nu) continue;
-      // Mirror normalizeProgressNotePayload: first MAX_NOTE_MODELS in sorted name order.
+      // The stored payload is already normalised by the server (normalizeProgressNotePayload);
+      // this re-cap to the first MAX_NOTE_MODELS in sorted name order is only defensive.
       const names = Object.keys(nu).filter((k) => k !== "").sort().slice(0, MAX_NOTE_MODELS);
       for (const raw of names) {
         const e = rec(nu[raw]);
@@ -896,6 +901,7 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     hasConfirmed: phases.length > 0,
     phases,
     total,
+    noteTotal,
     modelTotals,
     cacheHitRatio: inTotal > 0 ? total.cached / inTotal : 0,
     model,

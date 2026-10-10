@@ -727,6 +727,12 @@ describe("AdminSettings — run summaries (PRD #362)", () => {
     expect((await screen.findByLabelText("Model-written Now line") as HTMLInputElement).checked).toBe(false);
   });
 
+  it("reads an absent Now-line kill switch (older server) as on", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: undefined }));
+    renderPage();
+    expect((await screen.findByLabelText("Model-written Now line") as HTMLInputElement).checked).toBe(true);
+  });
+
   it("saves only the Now-line kill switch when the model is unchanged (PRD #2603)", async () => {
     mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: "true" }));
     mockApi.updateSettings.mockResolvedValue(response({ now_summary_enabled: "false" }));

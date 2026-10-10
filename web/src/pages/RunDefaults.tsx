@@ -845,7 +845,7 @@ export function RunDefaults() {
               type="checkbox"
               className="h-4 w-4 accent-brand"
               checked={nowSummaryEnabled !== false}
-              disabled={nowSummaryBusy}
+              disabled={nowSummaryBusy || !committedSettings}
               aria-describedby="now-summary-help"
               onChange={(e) => toggleNowSummary(e.target.checked)}
             />

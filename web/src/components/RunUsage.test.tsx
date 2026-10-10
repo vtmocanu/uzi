@@ -83,6 +83,32 @@ describe("RunUsagePanel", () => {
     expect(getByText(/Estimated attribution from deduplicated assistant usage/)).toBeTruthy();
   });
 
+  it("shows Now summaries as its own row so Run total equals the sum of the rows", () => {
+    seq = 0;
+    const msgs: RunMessage[] = [
+      m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+      result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+      m("progress_note", "lead", {
+        text: "Writing tests",
+        model_usage: { "claude-haiku-4-5": { inputTokens: 400, outputTokens: 50, cacheReadInputTokens: 100, cacheCreationInputTokens: 0, costUSD: 0.01 } },
+      }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+    );
+    const total = rows.find((r) => r[0] === "Run total");
+    const notes = rows.find((r) => r[0] === "Now summaries");
+    expect(notes).toEqual(["Now summaries", "—", "400", "100", "50", "$0.01"]);
+    // Phase 1000/2000/300 plus the note row 400/100/50.
+    expect(total?.slice(2, 5)).toEqual(["1.4k", "2.1k", "350"]);
+  });
+
+  it("omits the Now summaries row when no note carried usage", () => {
+    const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
+    expect(queryByText("Now summaries")).toBeNull();
+  });
+
   it("renders nothing for a run with no usage (pre-feature)", () => {
     const { container } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage([m("text", "lead", { text: "hi" })])} />);
     expect(container.firstChild).toBeNull();
