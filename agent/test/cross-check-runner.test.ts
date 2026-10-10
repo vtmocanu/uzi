@@ -185,31 +185,57 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   if (mode !== "legacy-rejection") c.cross_check!.model_source = mode === "default-rejection" ? "worker default" : "pin";
   c.cross_check!.effort_source = "pin";
  }
+ // Only the selected child integration test accepts the regression injection.
+ const injection = mode === "approve" && round === 1 ? process.env.UZI_CROSS_CHECK_HANDLER_FAILURE : undefined;
+ const injected: string[] = [];
+ let hasHandlerError = false;
+ let handlerError: unknown;
+ const retainHandlerError = (error: unknown) => {
+  if (!hasHandlerError) { hasHandlerError = true; handlerError = error; }
+ };
  const server = http.createServer(async (req, res) => {
-  let raw = "";
-  for await (const chunk of req) raw += chunk;
-  const body = raw ? JSON.parse(raw) : {};
-  if (req.method === "POST") posts.push({ url: req.url!, body });
-  res.setHeader("Content-Type", "application/json");
-  if (req.url?.endsWith("/codex/release")) res.end(JSON.stringify({ auth_mode: "api_key", access_token: "released-token" }));
-  else if (req.url?.endsWith("/inputs")) res.end(JSON.stringify({ inputs: [] }));
-  else if (req.url?.endsWith("/cross-check-verdict")) {
-   assert.equal(req.url, "/api/worker/runs/check/cross-check-verdict");
-   assert.equal(body.claim_generation, 7);
-   assert.equal(body.verdict, expectedVerdict);
-   assert.equal(body.reason_class, expectedReason);
-   res.end("{}");
-  } else if (req.url?.endsWith("/state")) {
-   if (body.status === "completed" || body.status === "failed") {
-    assert.equal(body.status, expectedStatus);
-    assert.equal(outbox.hasPendingTerminal(c.run_id, 7), true);
-    const journal = await outbox.readTerminalJournal(c.run_id, 7);
-    assert.equal(journal?.body.status, expectedStatus);
-    assert.equal(journal?.body.claim_generation, 7);
-    assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 0 : 2);
+  let response = "{}";
+  try {
+   let raw = "";
+   for await (const chunk of req) raw += chunk;
+   const body = raw ? JSON.parse(raw) : {};
+   if (req.method === "POST") posts.push({ url: req.url!, body });
+   res.setHeader("Content-Type", "application/json");
+   if (req.url?.endsWith("/codex/release")) response = JSON.stringify({ auth_mode: "api_key", access_token: "released-token" });
+   else if (req.url?.endsWith("/inputs")) response = JSON.stringify({ inputs: [] });
+   else if (req.url?.endsWith("/cross-check-verdict")) {
+    if (injection === "verdict" || injection === "both") {
+     injected.push("verdict");
+     assert.fail("cross-check handler injected verdict assertion");
+    }
+    assert.equal(req.url, "/api/worker/runs/check/cross-check-verdict");
+    assert.equal(body.claim_generation, 7);
+    assert.equal(body.verdict, expectedVerdict);
+    assert.equal(body.reason_class, expectedReason);
+   } else if (req.url?.endsWith("/state")) {
+    response = JSON.stringify({ applied: true, status: body.status });
+    if (body.status === "completed" || body.status === "failed") {
+     if (injection === "state" || injection === "both") {
+      injected.push("state");
+      assert.fail("cross-check handler injected state assertion");
+     }
+     assert.equal(body.status, expectedStatus);
+     assert.equal(outbox.hasPendingTerminal(c.run_id, 7), true);
+     const journal = await outbox.readTerminalJournal(c.run_id, 7);
+     assert.equal(journal?.body.status, expectedStatus);
+     assert.equal(journal?.body.claim_generation, 7);
+     assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 0 : 2);
+    }
    }
-   res.end(JSON.stringify({ applied: true, status: body.status }));
-  } else res.end("{}");
+  } catch (error) {
+   retainHandlerError(error);
+  } finally {
+   try { res.end(response); } catch (error) {
+    retainHandlerError(error);
+    // An unusable response must not leave its socket waiting for a reply.
+    try { res.destroy(); } catch (destroyError) { retainHandlerError(destroyError); }
+   }
+  }
  });
  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
  const address = server.address() as { port: number };
@@ -224,9 +250,24 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   },
   removeRunnerClone: async (checkout: string) => { removed.push(checkout); },
  } as unknown as GitCache;
+ let hasTestError = false;
+ let testError: unknown;
  try {
-  await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1,
-   activeRuns: registry, outbox, model: new CodexCrossCheck(client, r.log, r.deps) }).execute(c);
+  let hasExecutionError = false;
+  let executionError: unknown;
+  try {
+   await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1,
+    activeRuns: registry, outbox, model: new CodexCrossCheck(client, r.log, r.deps) }).execute(c);
+  } catch (error) { hasExecutionError = true; executionError = error; }
+  if (injection) console.log("CROSS_CHECK_HANDLER_OBSERVATION " + JSON.stringify({
+   injected, executionSettled: true, executionFailed: hasExecutionError,
+   verdictPosts: posts.filter((p) => p.url.endsWith("/cross-check-verdict")).length,
+   terminalPosts: posts.filter((p) => p.url.endsWith("/state") && ["completed", "failed"].includes(p.body.status)).length,
+   journalCleared: !outbox.hasPendingTerminal(c.run_id, 7),
+   registryRemoved: registry.size === 0, checkoutRemoved: removed.length === 1 && removed[0] === "/checkout",
+  }));
+  if (hasHandlerError) throw handlerError;
+  if (hasExecutionError) throw executionError;
   assert.deepEqual(clones, [["/bare", c.cross_check!.base_commit, c.run_id]]);
   assert.deepEqual(r.ops, mode === "invalid-effort" ? [] : rejected ? ["stat"] : ["stat", "read"]);
   assert.deepEqual(r.disposed, mode === "invalid-effort" ? [] : ["provider", "fileop"]);
@@ -266,11 +307,19 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   assert.equal(outbox.hasPendingTerminal(c.run_id, 7), false);
   assert.equal(registry.size, 0);
   assert.deepEqual(removed, ["/checkout"]);
- } finally {
-  server.closeAllConnections();
-  await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
-  await fs.rm(root, { recursive: true, force: true });
+ } catch (error) { hasTestError = true; testError = error; }
+ finally {
+  try {
+   try {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+   } finally { await fs.rm(root, { recursive: true, force: true }); }
+  } catch (error) {
+   if (!hasTestError) { hasTestError = true; testError = error; }
+  }
  }
+ if (hasHandlerError) throw handlerError;
+ if (hasTestError) throw testError;
 });
 }
 
