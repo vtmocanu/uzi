@@ -17,7 +17,7 @@ describe("health scenario routing", () => {
   it("appends healthy Codex pricing metadata with empty evidence", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-silent");
     const doc = await healthApi.getAdminHealth();
-    expect(doc.checks).toHaveLength(18);
+    expect(doc.checks).toHaveLength(19);
     expect(doc.checks[doc.checks.length - 1]).toMatchObject({
       id: "pricing.codex", scope: "instance", group: "housekeeping", title: "Codex price coverage",
       doc: "admin-health", severity: "ok", summary: "no recent Codex usage on unpriced models", evidence: [],
@@ -78,7 +78,7 @@ describe("health scenario routing", () => {
     expect(doc.blocking).toBe(false);
     expect(doc.episode_id).toBeNull();
     expect(doc.snoozed_until).toBeNull();
-    expect(doc.counts).toEqual({ ok: 18, warn: 0, danger: 0, unknown: 0, na: 0 });
+    expect(doc.counts).toEqual({ ok: 19, warn: 0, danger: 0, unknown: 0, na: 0 });
     expect(doc.checks.find((c) => c.id === "fleet.roll")).toMatchObject({
       scope: "instance", severity: "ok", summary: "All 4 hosted workers are rolling cleanly.",
     });

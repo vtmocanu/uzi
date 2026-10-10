@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 18 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all 19 of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
@@ -28,6 +28,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
   { id: "board.drift", scope: "owner", group: "housekeeping", title: "Board drift", doc: null },
   { id: "custody.holds", scope: "owner", group: "housekeeping", title: "Recovery custody holds", doc: null },
+  { id: "recovery.storage", scope: "owner", group: "housekeeping", title: "Recovery storage", doc: null },
   { id: "release.check", scope: "owner", group: "housekeeping", title: "Upstream release", doc: null },
   { id: "pricing.codex", scope: "instance", group: "housekeeping", title: "Codex price coverage", doc: "admin-health" },
 ];
@@ -50,6 +51,7 @@ const OK_SUMMARY: Record<string, string> = {
   "schedules.paused": "No user has paused schedules while owning enabled ones.",
   "board.drift": "No column move has been given up in the last 24 hours.",
   "custody.holds": "No owner is at the custody-hold admission limit.",
+  "recovery.storage": "0 captures currently marked quota-refused.",
   "release.check": "This instance is on a recent release.",
   "pricing.codex": "no recent Codex usage on unpriced models",
 };

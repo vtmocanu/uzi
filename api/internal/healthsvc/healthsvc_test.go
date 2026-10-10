@@ -30,6 +30,9 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
+	storageRows            []store.RecoveryStorageHealthRow
+	storageErr             error
+	storageRead            func(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error)
 	custodyAggregateErr    error
 	custodyAggregate       store.GetCustodyAggregateForOwnerRow
 	custodyListParams      []store.ListOwnersOverCustodyLimitParams
@@ -61,6 +64,16 @@ type fakeStore struct {
 	ciwatchErr             error
 	runDisk                []store.WorkerRunDisk
 	runDiskErr             error
+}
+
+func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
+	if f.storageRead != nil {
+		return f.storageRead(ctx, p)
+	}
+	if f.storageRows == nil && f.storageErr == nil {
+		return []store.RecoveryStorageHealthRow{{}}, nil
+	}
+	return f.storageRows, f.storageErr
 }
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
@@ -880,11 +893,11 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
-	// fleet.quarantine (workers); pricing.codex follows release.check, making 18.
+	// fleet.quarantine (workers); pricing.codex follows release.check, making 19 with recovery.storage.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
-		"schedules.paused", "board.drift", "custody.holds", "release.check", "pricing.codex",
+		"schedules.paused", "board.drift", "custody.holds", "recovery.storage", "release.check", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {
 		t.Fatalf("doc has %d checks, want %d", len(doc.Checks), len(wantIDs))
