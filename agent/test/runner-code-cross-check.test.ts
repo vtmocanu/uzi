@@ -175,8 +175,9 @@ for (const failure of ["refused import", "failed import", "unavailable reap", "u
       return reply;
     });
     const importBranch = git.fetchAgentBranch.bind(git);
-    let fail = false, imported = 0, refused = 0, reapFailures = 0, blockedProofs = 0;
+    let fail = false, imported = 0, refused = 0, reapFailures = 0, blockedProofs = 0, failedPhaseImports = 0;
     t.mock.method(git, "fetchAgentBranch", async (...args: Parameters<typeof git.fetchAgentBranch>) => {
+      if (fail) failedPhaseImports++;
       if (fail && (failure === "refused import" || failure === "failed import")) {
         refused++;
         if (failure === "failed import") throw new Error("fixture import failed");
@@ -226,7 +227,7 @@ for (const failure of ["refused import", "failed import", "unavailable reap", "u
       assert.ok(checkpointError instanceof Error);
     } else if (failure === "unverified quiescence") {
       assert.equal(blockedProofs, 1);
-      assert.equal(refused, 0, "unverified quiescence prevented import");
+      assert.equal(failedPhaseImports, 0, "unverified quiescence prevented import");
     } else {
       assert.equal(refused, 1, "second checkpoint attempted import despite the unchanged tip");
     }
