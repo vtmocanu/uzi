@@ -186,7 +186,8 @@ changes it); trust it over a handover's claim.
    `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (a completion question about a milestone
-   the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate
+   the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
+   a plain answer cannot exempt it, then open the PR); `awaiting_approval` → the plan gate
    is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (they resume on their own). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
@@ -409,7 +410,8 @@ changes it); trust it over a handover's claim.
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
    file), 3 no run appeared, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
-   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line.
+   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line. Read
+   the poller's own `EXIT=` line before reporting any of them (*Waiting, uniformly*).
    A post-merge publish step (a workflow dispatch, tag push, or tap publish) follows
    references/merge-mechanics.md, *Post-merge publish steps*.
 8. **Finish.** Remove the worktrees and branches you or your local reviewer created
