@@ -5,6 +5,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 )
 
 // The bounds include all three band headings and two inter-band spacers even
@@ -229,9 +230,6 @@ func (m tuiModel) withSplitNote(footer string) string {
 }
 
 func (m tuiModel) splitFooterLine() string {
-	if line, ok := m.restartFooter(" ? keys · q quit"); ok {
-		return line
-	}
 	var hints []string
 	if m.view == viewBoard {
 		hints = []string{"enter/→ open", "tab pane", "/ filter", "a scope", "h fold done", "r refresh", "? keys", "q quit"}
@@ -245,14 +243,40 @@ func (m tuiModel) splitFooterLine() string {
 	if m.view == viewPulls {
 		hints = []string{"enter/→ open", "tab pane", "R repo", "/ filter", "r refresh", "? keys", "q quit"}
 	}
+	if m.showVersion && m.updatePrompt.installedVersion != "" {
+		hint := m.restartHintText()
+		if m.profile != colorprofile.Ascii {
+			hint = m.pal.faint.Render(hint)
+		}
+		hw := visualWidth(hint)
+		// One column separates the key hints from the right-aligned restart hint.
+		if left, ok := fitSplitHints(hints, "", m.width-hw-1); ok {
+			return padVisual(left, m.width-hw) + hint
+		}
+		if line, ok := m.restartFooter(" ? keys · q quit"); ok {
+			return line
+		}
+	}
 	suffix := ""
 	if m.showVersion {
 		suffix = " " + m.versionReadout()
 	}
+	left, fits := fitSplitHints(hints, suffix, m.width)
+	if fits {
+		return padVisual(left, m.width)
+	}
+	return clampVisual(left, m.width)
+}
+
+// fitSplitHints drops optional key hints in a fixed order until the joined
+// hints plus suffix fit within width. fits reports whether the returned line
+// does; when false the line is the narrowest candidate reached.
+func fitSplitHints(hints []string, suffix string, width int) (line string, fits bool) {
+	hints = append([]string(nil), hints...)
 	for len(hints) > 2 {
-		line := " " + strings.Join(hints, " · ") + suffix
-		if visualWidth(line) <= m.width {
-			return padVisual(line, m.width)
+		line = " " + strings.Join(hints, " · ") + suffix
+		if visualWidth(line) <= width {
+			return line, true
 		}
 		removed := false
 		for _, key := range []string{"r refresh", "h fold done", "a scope", "/ filter"} {
@@ -268,10 +292,10 @@ func (m tuiModel) splitFooterLine() string {
 			}
 		}
 		if !removed {
-			return clampVisual(line, m.width)
+			return line, false
 		}
 	}
-	return clampVisual(" "+strings.Join(hints, " · ")+suffix, m.width)
+	return " " + strings.Join(hints, " · ") + suffix, false
 }
 
 // splitHeader is the sole source of shared header lines and their row count.

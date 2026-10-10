@@ -791,14 +791,20 @@ func (m tuiModel) restartFooter(help string) (string, bool) {
 	return m.restartFooterContent(help, nil)
 }
 
+// restartHintText is the unstyled full restart hint shared by the board and
+// split footers, so the wording cannot drift between them.
+func (m tuiModel) restartHintText() string {
+	installed := m.renderer.Plain(m.updatePrompt.installedVersion, 256)
+	return "v" + strings.TrimPrefix(installed, "v") + " installed, restart uzi to use it"
+}
+
 // restartFooterContent reserves essential help before choosing the installed
 // banner. Board hints shed within that budget; split hint selection stays intact.
 func (m tuiModel) restartFooterContent(help string, hints []footerHint) (string, bool) {
 	if !m.showVersion || m.updatePrompt.installedVersion == "" {
 		return "", false
 	}
-	installed := m.renderer.Plain(m.updatePrompt.installedVersion, 256)
-	hint := "v" + strings.TrimPrefix(installed, "v") + " installed, restart uzi to use it"
+	hint := m.restartHintText()
 	width := max(0, m.width)
 	essentialW := visualWidth(help)
 	if hints != nil {
