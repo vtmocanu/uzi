@@ -20,6 +20,8 @@ import type { Executor, RunContext } from "../src/executor.js";
 import { GitLabClient, type FetchFn } from "../src/forge.js";
 import { RunRunner } from "../src/runner.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
+import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
+import type { AdviceRequest, AdviceResult, AdviceResultPolicy } from "../src/harness.js";
 
 const TOKEN = "tkn-nowsummary-123456";
 const HAIKU = "claude-haiku-4-5-20251001";
@@ -77,7 +79,7 @@ function promptCapturingQuery(texts: string[]): SdkQueryFn {
   }) as unknown as SdkQueryFn;
 }
 
-function runnerFor(executor: Executor, nowSummary?: { homeRoot: string; queryFn: SdkQueryFn }): RunRunner {
+function runnerFor(executor: Executor, nowSummary?: { homeRoot: string; queryFn: SdkQueryFn; codexAdviceHarnessFactory?: CodexAdviceHarnessFactory }): RunRunner {
   return new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, {
     pollMs: 5,
     planApprovalTimeoutMs: 0,
@@ -171,12 +173,82 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     assert.equal(notesOf(claim.run_id).length, 0);
   });
 
-  it("makes no call for a Codex-harness claim (M1 is Claude only)", async () => {
+  const CODEX_SECRETS = {
+    forge_pat: "fixture-forge-pat-000000",
+    // Carries an Anthropic token too, so ONLY the Codex term of the claim gate decides.
+    anthropic_oauth_token: "oauth-fixture-token",
+    codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
+  };
+
+  /** A fake production factory: records the build params and each request, answers like luna. */
+  function lunaFactory(rec: { builds: unknown[]; requests: AdviceRequest[] }, text = "Running the api gate for the docs milestone"): CodexAdviceHarnessFactory {
+    return (async (params: unknown) => {
+      rec.builds.push(params);
+      return {
+        kind: "codex",
+        async run(request: AdviceRequest, _policy: AdviceResultPolicy): Promise<AdviceResult> {
+          rec.requests.push(request);
+          request.usageObserver?.({ "gpt-6-luna": { inputTokens: 90, outputTokens: 12, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.000015 } });
+          return { text, end: { kind: "terminal", terminal: { outcome: "success" } } } as unknown as AdviceResult;
+        },
+      };
+    }) as unknown as CodexAdviceHarnessFactory;
+  }
+
+  it("a Codex-harness claim with a binding posts a luna note with its usage through the injected factory", async () => {
+    const claim = claimFor(2606, { secrets: CODEX_SECRETS });
+    api.nowSummary.set(claim.run_id, true);
+    const rec = { builds: [] as unknown[], requests: [] as AdviceRequest[] };
+    const sdkCalls: { options: unknown; prompt: unknown }[] = [];
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0), { homeRoot, queryFn: summaryQuery(sdkCalls), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    assert.equal(sdkCalls.length, 0, "a Codex run never reaches the Claude SDK");
+    const notes = notesOf(claim.run_id);
+    assert.equal(notes.length, 1);
+    const p = notes[0]!.payload as Record<string, unknown>;
+    assert.equal(p.text, "Running the api gate for the docs milestone");
+    assert.deepEqual((p.model_usage as Record<string, unknown>)["gpt-6-luna"], { inputTokens: 90, outputTokens: 12, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.000015 });
+    assert.equal(rec.requests.length, 1);
+    assert.equal(rec.requests[0]!.model, "gpt-6-luna");
+    assert.equal(rec.requests[0]!.effort, "low");
+    assert.equal(rec.requests[0]!.timeoutMs, 30_000);
+    assert.equal(rec.requests[0]!.label, "now");
+    assert.match(rec.requests[0]!.prompt, /Run the api gate/);
+    const built = rec.builds[0] as { runId: string; refresh?: string; binding: { authMode: string; capability: string } };
+    assert.equal(built.runId, claim.run_id);
+    assert.equal(built.refresh, "deny");
+    assert.equal(built.binding.authMode, "subscription");
+  });
+
+  it("a Codex account that refuses the model leaves the run unaffected and shows no summary", async () => {
+    const claim = claimFor(2608, { secrets: CODEX_SECRETS });
+    api.nowSummary.set(claim.run_id, true);
+    const statuses: string[] = [];
+    api.onState(claim.run_id, (body) => void statuses.push(body.status));
+    let builds = 0;
+    const refusing = (async () => {
+      builds++;
+      throw new Error("model gpt-6-luna is not available to this account");
+    }) as unknown as CodexAdviceHarnessFactory;
+    let frames = 0;
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(workingExecutor(() => ++frames > 40, 3000), { homeRoot, queryFn: summaryQuery([]), codexAdviceHarnessFactory: refusing }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    assert.equal(builds, 1, "tried once; the failed call holds the 5 minute window");
+    assert.equal(notesOf(claim.run_id).length, 0);
+    assert.ok(statuses.includes("completed") && !statuses.includes("failed"), `the run is unaffected: ${statuses.join(",")}`);
+  });
+
+  it("makes no call for a Codex-harness claim when no advice factory is wired", async () => {
     const calls: { options: unknown; prompt: unknown }[] = [];
-    const claim = claimFor(2606, {
-      // Carries an Anthropic token too, so ONLY the Codex term of the claim gate keeps the call out.
-      secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "oauth-fixture-token", codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null } },
-    });
+    const claim = claimFor(2609, { secrets: CODEX_SECRETS });
     api.nowSummary.set(claim.run_id, true);
     let frames = 0;
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
@@ -186,6 +258,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
     assert.equal(calls.length, 0);
+    assert.equal(notesOf(claim.run_id).length, 0);
   });
 
   it("makes no call while the executor is parked on askUser, and calls once the answer ends the hold", async () => {

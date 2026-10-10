@@ -97,7 +97,7 @@ function usage(input: number, output: number, extra: Partial<AdviceUsageSnapshot
   };
 }
 
-function harness(over: { claude?: boolean; issueRun?: boolean; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
+function harness(over: { claude?: boolean; codex?: boolean; issueRun?: boolean; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
   const clock = new FakeClock();
   const emitted: EmittedMessage[] = [];
   const calls: PassCall[] = [];
@@ -115,7 +115,13 @@ function harness(over: { claude?: boolean; issueRun?: boolean; enabled?: boolean
   const log = { ...nullLogger(), warn: (m: string) => void warns.push(m) };
   const deps: NowSummaryDeps = {
     steering,
-    claim: { issueRun: over.issueRun ?? true, claude: over.claude ?? true },
+    claim: {
+      issueRun: over.issueRun ?? true,
+      claude: over.codex ? false : (over.claude ?? true),
+      ...(over.codex
+        ? { codex: { runId: "run-1", binding: { authMode: "api_key", capability: "cap" } as never, buildHarness: (() => { throw new Error("the controller must go through runPass"); }) as never } }
+        : {}),
+    },
     emit: (m) => void emitted.push(m),
     ...(over.redact ? { redact: over.redact } : {}),
     runPass: (opts) =>
@@ -271,6 +277,83 @@ describe("NowSummaryController: triggers and the rate window", () => {
   });
 });
 
+describe("NowSummaryController: Codex harness (PRD #2603 M2)", () => {
+  const luna = (input: number, output: number, extra: Partial<AdviceUsageSnapshot[string]> = {}): AdviceUsageSnapshot => ({
+    "gpt-6-luna": { inputTokens: input, outputTokens: output, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "metered", ...extra },
+  });
+
+  it("calls through the Codex binding on gpt-6-luna at low effort with the 30 s timeout, never the Anthropic token", async () => {
+    const h = harness({ codex: true });
+    await running(h);
+    assert.equal(h.calls.length, 1);
+    const o = h.calls[0]!.opts;
+    assert.equal(o.model, "gpt-6-luna");
+    assert.equal(o.effort, "low");
+    assert.equal(o.timeoutMs, 30_000);
+    assert.equal(o.label, "now");
+    assert.equal(o.token, undefined);
+    assert.equal(o.codex?.runId, "run-1");
+    assert.equal(o.codex?.refresh, "deny", "an advice-side refresh must never advance the run's credential generation");
+  });
+
+  it("AC1 and AC3: a lane change yields a note from the luna answer, whose prompt carries the active-lane frames and no Bash command", async () => {
+    const h = harness({ codex: true });
+    await running(h);
+    h.calls[0]!.resolve("Reviewing the change");
+    await settle();
+    h.c.observeFrame(agentDispatch("tester", "run the api gate"));
+    h.c.observeFrame(toolUse("tester", "Bash", { command: "SECRET_CMD --token=abc", description: "Run the api gate" }, "run the api gate"));
+    await h.clock.advance(5 * MIN);
+    assert.equal(h.calls.length, 2);
+    const prompt = h.calls[1]!.opts.prompt;
+    assert.match(prompt, /"role":"tester"/);
+    assert.ok(!prompt.includes("SECRET_CMD"));
+    h.calls[1]!.resolve("Testing the api gate");
+    await settle();
+    assert.deepEqual(h.notes().map((n) => n.text), ["Reviewing the change", "Testing the api gate"]);
+  });
+
+  it("posts the luna usage with the note exactly once", async () => {
+    const h = harness({ codex: true });
+    await running(h);
+    h.calls[0]!.opts.onUsage?.(luna(120, 18, { costUSD: 0.0000211 }));
+    h.calls[0]!.resolve("Running the api gate");
+    await settle();
+    const withUsage = h.notes().filter((n) => n.model_usage);
+    assert.equal(withUsage.length, 1);
+    assert.deepEqual((withUsage[0]!.model_usage as AdviceUsageSnapshot)["gpt-6-luna"], luna(120, 18, { costUSD: 0.0000211 })["gpt-6-luna"]);
+  });
+
+  it("a refused model or binding failure is swallowed, counts against the window, and leaves the run untouched", async () => {
+    const h = harness({ codex: true });
+    await running(h);
+    h.calls[0]!.reject(new Error("now model call returned an error result"));
+    await settle();
+    assert.deepEqual(h.notes(), []);
+    assert.ok(h.warns.some((w) => w.includes("call failed")));
+    h.c.observeProgress(progress(["m2"], ["m1"]));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
+    await h.clock.advance(NOW_MIN_INTERVAL_MS - 1);
+    assert.equal(h.calls.length, 1, "the failed call still holds the 5 minute window");
+    await h.clock.advance(1);
+    assert.equal(h.calls.length, 2, "no fallback model: the next call is the same luna call");
+    assert.equal(h.calls[1]!.opts.model, "gpt-6-luna");
+  });
+
+  it("abort after usage evidence posts the usage only, once; abort without evidence posts nothing", async () => {
+    const a = harness({ codex: true });
+    await running(a);
+    a.calls[0]!.opts.signal!.addEventListener("abort", () => a.calls[0]!.opts.onUsage!(luna(50, 7)), { once: true });
+    await a.c.stop();
+    assert.equal(a.notes().length, 1);
+    assert.equal(a.notes()[0]!.text, "");
+    const b = harness({ codex: true });
+    await running(b);
+    await b.c.stop();
+    assert.deepEqual(b.notes(), []);
+  });
+});
+
 describe("NowSummaryController: gate", () => {
   it("makes no call when the setting is off, and starts once a poll turns it on", async () => {
     const h = harness({ enabled: false });
@@ -282,7 +365,7 @@ describe("NowSummaryController: gate", () => {
     assert.equal(h.calls.length, 1);
   });
 
-  it("a Codex claim makes no call", async () => {
+  it("a Codex run with no usable binding (none selected, factory unwired) makes no call", async () => {
     const h = harness({ claude: false });
     await running(h);
     h.c.observeFrame(toolUse("lead", "Read", { file_path: "a" }));

@@ -197,7 +197,7 @@ import {
 } from "./pr-description-publisher.js";
 import { renderCompletionBlock, type KindSection } from "./pr-description.js";
 import type { SummaryRunner } from "./summary-runner.js";
-import { NowSummaryController, holdContextCallbacks } from "./now-summary.js";
+import { NowSummaryController, holdContextCallbacks, nowSummaryCodexClaim } from "./now-summary.js";
 import { runReadOnlyModelPass } from "./model-pass.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
@@ -2115,8 +2115,8 @@ export interface RunnerOptions {
   /** PRD #2603: the collaborators of the model-written "Now" summary (now-summary.ts), on the same
    *  SDK HOME root and query function as the other advice passes. There is NO default: without it
    *  the run makes no summary call (main.ts omits it under the stub executor, so an e2e spends
-   *  nothing). `codexAdviceHarnessFactory` is the injected production factory a later Codex
-   *  milestone threads through; M1 (Claude) does not call it and this adds no Codex construction. */
+   *  nothing). `codexAdviceHarnessFactory` is the injected production factory the Codex
+   *  harness's summary call is built through (M2); this adds no Codex construction site. */
   nowSummary?: {
     homeRoot: string;
     queryFn: SdkQueryFn;
@@ -9693,8 +9693,8 @@ export class RunRunner {
       throw new PlanCrossCheckFailure(reason, { cause: error });
     };
     // PRD #2603: the model-written "Now" summary. Absent collaborators (the stub executor, a test)
-    // or a claim that is not an issue run on the Claude harness with a token ⇒ no controller and
-    // not a single summary call. The controller only reads steering state and the frames the run
+    // or a claim that is not an issue run (on the Claude harness with a token, or on the Codex
+    // harness with a valid binding and a wired advice factory) ⇒ no summary call. The controller only reads steering state and the frames the run
     // already emits; everything it does is advisory and swallowed (now-summary.ts).
     const nowSummary =
       this.nowSummaryOpts !== undefined
@@ -9703,6 +9703,7 @@ export class RunRunner {
             claim: {
               issueRun: resolveRunKind(claim.kind) === "issue",
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,

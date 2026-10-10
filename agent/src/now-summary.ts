@@ -16,8 +16,10 @@
 // skipped call counts against the window (the window starts when a call starts).
 //
 // Gate (checked when a call is due AND again, synchronously, before the result is emitted): the
-// newest poll says the setting is on, the run is an issue run on the Claude harness (a Codex run
-// makes no call in M1), the controller is not stopped, no park/gate/question is open (hold depth
+// newest poll says the setting is on, the run is an issue run on the Claude harness with its
+// token or on the Codex harness with a validated binding (PRD #2603 M2: the call is then made
+// through the injected Codex advice-harness factory on `gpt-6-luna`, never a fallback model; a
+// refusal, an unknown model or a binding failure is a swallowed failed call like any other), the controller is not stopped, no park/gate/question is open (hold depth
 // 0), the lifecycle signal has not aborted, the claim is not fenced, and the frozen milestone
 // list names an active milestone. A result that completes after the gate closed is DISCARDED, but
 // its usage is still posted as an empty-text note (spend counts, specs/human.md "Failed and
@@ -33,8 +35,10 @@
 // and text caps cut it (issue #1583), in the frames, the milestone title and the model's answer.
 
 import type { EmittedMessage, RunContext } from "./executor.js";
-import type { AdviceUsageSnapshot } from "./harness.js";
+import type { AdviceUsageSnapshot, HarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
+import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { ReadOnlyModelPassOpts } from "./model-pass.js";
 import type { Milestone, MilestoneProgress } from "./protocol.js";
 import { fenceNonce } from "./prompt.js";
@@ -50,6 +54,12 @@ const NOW_TIMEOUT_MS = 30_000;
 const NOW_MAX_OUTPUT_TOKENS = 256;
 /** The cheapest Claude tier, the same default the delivery summary uses (summary-runner.ts). */
 const NOW_MODEL = "haiku";
+/** The cheapest Codex tier (PRD #2603 D3). No fallback to another model on refusal. */
+const NOW_MODEL_CODEX = "gpt-6-luna";
+/** The Codex reasoning effort. The pinned 0.159.3 contract (adr/1106-codex-harness.md) has no
+ *  lower value than `low`: HarnessEffort and the renderer's closed set start there, and the
+ *  app-server's string wire type would only pass an unlisted value through as a custom one. */
+const NOW_EFFORT_CODEX: HarnessEffort = "low";
 /** The newest tool frames sent to the model. */
 export const NOW_MAX_FRAMES = 20;
 /** The note's display cap. */
@@ -154,6 +164,24 @@ function activeMilestone(frozen: readonly Pick<Milestone, "id" | "title">[], p: 
   return undefined;
 }
 
+/** The `claim.codex` half of {@link NowSummaryDeps}: the pass's Codex option for a claim whose
+ *  `secrets.codex` block validates, else `{}` (no call). A malformed block or an unwired factory is
+ *  a run that simply makes no summary call: the selection error is swallowed, never raised into
+ *  the run (the run lane itself fails closed on the same block elsewhere). */
+export function nowSummaryCodexClaim(
+  runId: string,
+  codexBlock: unknown,
+  buildHarness: CodexAdviceHarnessFactory | undefined,
+): { codex?: NonNullable<ReadOnlyModelPassOpts["codex"]> } {
+  if (codexBlock === undefined || buildHarness === undefined) return {};
+  try {
+    const selection = selectCodexBinding({ codex: codexBlock });
+    return selection.kind === "codex" ? { codex: { runId, binding: selection.binding, buildHarness } } : {};
+  } catch {
+    return {};
+  }
+}
+
 export interface NowSummaryDeps {
   /** The steering channel's read-only facts; the controller never mutates it. */
   steering: {
@@ -162,8 +190,10 @@ export interface NowSummaryDeps {
     nowSummaryEnabled(): boolean;
   };
   /** What the claim says about the run. `claude` is true only for a Claude-harness run that
-   *  carries the Anthropic token the pass uses; a Codex run makes no call in M1. */
-  claim: { issueRun: boolean; claude: boolean };
+   *  carries the Anthropic token the pass uses. `codex` is set only for a Codex-harness run whose
+   *  claim carries a validated binding and a wired advice-harness factory (the shape
+   *  ReadOnlyModelPassOpts.codex takes); both absent ⇒ the run never makes a call. */
+  claim: { issueRun: boolean; claude: boolean; codex?: NonNullable<ReadOnlyModelPassOpts["codex"]> };
   /** Post a run message (the runner binds the run's batcher). Must not feed observeFrame. */
   emit(m: EmittedMessage): void;
   /** The model pass. Production passes runReadOnlyModelPass. */
@@ -322,7 +352,7 @@ export class NowSummaryController {
     return (
       d.steering.nowSummaryEnabled() &&
       d.claim.issueRun &&
-      d.claim.claude &&
+      (d.claim.claude || d.claim.codex !== undefined) &&
       !this.stopped &&
       this.holdDepth === 0 &&
       !d.steering.lifecycleSignal().aborted &&
@@ -389,9 +419,11 @@ export class NowSummaryController {
     this.inflight = call;
     call.done = (async () => {
       try {
+        const codex = this.deps.claim.codex;
         text = await this.deps.runPass({
           ...this.deps.pass,
-          model: NOW_MODEL,
+          // The Codex harness ignores the token, so a Codex call never carries the Anthropic one.
+          ...(codex ? { token: undefined, model: NOW_MODEL_CODEX, effort: NOW_EFFORT_CODEX, codex: { ...codex, refresh: "deny" as const } } : { model: NOW_MODEL }),
           systemPrompt: SYSTEM_PROMPT,
           prompt: buildPrompt(this.redact(title), frames),
           homePrefix: "uzi-now-",

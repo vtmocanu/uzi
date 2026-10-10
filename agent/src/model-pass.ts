@@ -109,6 +109,9 @@ export interface ReadOnlyModelPassOpts {
     readonly runId: string;
     readonly binding: CodexBinding;
     readonly buildHarness: CodexAdviceHarnessFactory;
+    /** PRD #2603: "deny" ⇒ the call may not refresh the shared credential (see
+     *  CodexAdviceHarnessBuildParams.refresh). Existing callers pass none. */
+    readonly refresh?: "deny";
   };
 }
 
@@ -380,7 +383,12 @@ async function runCodexAdviceModelPass(
     ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
   const runPromise = (async (): Promise<string> => {
-    const harness = await codex.buildHarness({ runId: codex.runId, binding: codex.binding, signal: abort.signal });
+    const harness = await codex.buildHarness({
+      runId: codex.runId,
+      binding: codex.binding,
+      signal: abort.signal,
+      ...(codex.refresh ? { refresh: codex.refresh } : {}),
+    });
     const result = await harness.run(request, policy);
     return result.text;
   })();

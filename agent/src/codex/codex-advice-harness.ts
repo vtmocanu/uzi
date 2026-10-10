@@ -49,6 +49,7 @@ import {
   pickCodexClassification,
   type CodexErrorClassification,
 } from "./terminal-normalize.js";
+import { CodexUsageAccountant } from "./token-accounting.js";
 import { errMessage } from "../util.js";
 
 import type { Logger } from "../log.js";
@@ -57,6 +58,8 @@ import type {
   AdviceRequest,
   AdviceResult,
   AdviceResultPolicy,
+  AdviceModelUsage,
+  AdviceUsageSnapshot,
   HarnessError,
   HarnessTerminal,
   HarnessThrownFailure,
@@ -137,6 +140,11 @@ export interface CodexAdviceHarnessOptions {
   readonly appServerAuth?: CodexAppServerAuthSession;
   /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
+  /** PRD #2603: the credential mode the price table projects usage cost under. Absent ⇒ the
+   *  usage snapshot carries tokens with an `unreported` cost. */
+  readonly authMode?: "subscription" | "api_key";
+  /** Injected clock for the price table's promotional boundary. Defaults to the wall clock. */
+  readonly now?: () => Date;
   readonly log: Logger;
 }
 
@@ -216,9 +224,13 @@ export class CodexAdviceHarness implements AdviceHarness {
   private readonly appServerAuth?: CodexAppServerAuthSession;
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
+  private readonly authMode?: "subscription" | "api_key";
+  private readonly now: () => Date;
   private readonly log: Logger;
 
   constructor(opts: CodexAdviceHarnessOptions) {
+    this.authMode = opts.authMode;
+    this.now = opts.now ?? (() => new Date());
     this.launchRoot = opts.launchRoot;
     this.provider = opts.provider;
     if (opts.appServerAuth !== undefined && opts.credentialValue !== undefined) {
@@ -301,7 +313,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
       disposeSeam = launched.dispose;
       transportSeam = launched.transport;
-      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal);
+      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver);
     })();
 
     // Late-disposal owner: a launch that resolves AFTER the finally already ran (a slow
@@ -357,10 +369,16 @@ export class CodexAdviceHarness implements AdviceHarness {
     model: string | undefined,
     policy: AdviceResultPolicy,
     signal: AbortSignal,
+    usageObserver?: AdviceRequest["usageObserver"],
   ): Promise<AdviceResult> {
     // Authentication is setup, so it completes before any thread/model work.
     await this.appServerAuth?.authenticate(transport, signal);
     const threadId = await this.startThread(transport, cwd, rendered, model, signal);
+    // PRD #2603: a fresh accountant per call, one fresh (non-resumed) thread, so a duplicate or
+    // stale `thread/tokenUsage/updated` note is never counted twice (the accountant's magnitude
+    // gate) and nothing carries over from another call.
+    const accountant = new CodexUsageAccountant();
+    accountant.registerThread(threadId, model ?? this.provider.model, false);
     const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal);
 
     // Single-consumer: obtain the notifications iterator exactly once.
@@ -425,6 +443,18 @@ export class CodexAdviceHarness implements AdviceHarness {
           continue;
         }
 
+        if (note.kind === "token_usage_updated") {
+          // Bound to the active thread; a foreign thread or turn is ignored. The snapshot is the
+          // reconciled per-model view after EVERY accepted note, so an abort that never reaches
+          // a terminal still leaves the tokens and cost observed so far with the observer.
+          if (usageObserver && note.threadId === threadId && note.turnId === turnId) {
+            accountant.record(threadId, note.usage);
+            const snapshot = this.usageSnapshot(accountant);
+            if (snapshot) usageObserver(snapshot);
+          }
+          continue;
+        }
+
         if (note.kind === "turn_completed") {
           // A same-chunk refresh is owned by the auth interceptor. Advice cannot return a
           // terminal verdict until it settles, and a sticky auth poison fails closed.
@@ -467,6 +497,28 @@ export class CodexAdviceHarness implements AdviceHarness {
       // The outer run owner closes auth admission, transport, and owned auth tasks in
       // cycle-free order after this work settles. Policy still runs before that closure.
     }
+  }
+
+  /** The reconciled per-model usage as the wire `AdviceUsageSnapshot`. Cost comes from the price
+   *  table under the claim's credential mode (the accountant leaves it `unreported` when the
+   *  mode is unknown or the model cannot be priced), never invented. */
+  private usageSnapshot(accountant: CodexUsageAccountant): AdviceUsageSnapshot | undefined {
+    const byModel = accountant.aggregateByModel(
+      this.authMode === undefined ? undefined : { authMode: this.authMode, now: this.now() },
+    );
+    if (byModel === undefined) return undefined;
+    const out: Record<string, AdviceModelUsage> = {};
+    for (const [model, e] of Object.entries(byModel)) {
+      out[model] = {
+        inputTokens: e.inputTokens,
+        outputTokens: e.outputTokens,
+        cacheReadInputTokens: e.cacheReadInputTokens,
+        cacheCreationInputTokens: e.cacheCreationInputTokens,
+        costStatus: e.costStatus,
+        ...(e.costUSD !== undefined ? { costUSD: e.costUSD } : {}),
+      };
+    }
+    return out;
   }
 
   /** The isolated advice thread config: native effectful tools/agents/MCP disabled
