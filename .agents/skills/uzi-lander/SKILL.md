@@ -176,8 +176,11 @@ changes it); trust it over a handover's claim.
 
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
    `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
-   with `SEQ` the approved plan's seq (`uzi run logs RUN --json | jq -rs '[.[]|select(.kind=="plan")|.seq]|max // 0'`,
-   or `0` for a seeded run), so the stale gate is ignored but a NEW plan stops it, and `MAX` polls covering the run's remaining budget (`budget_total_seconds` minus
+   with `SEQ` the seq of the plan that was approved, carried from the approval or the watcher's
+   handoff and kept across re-arms (`0` for a seeded run), so the stale gate is ignored but a NEW
+   plan stops it. Never recompute it as the latest plan seq: an unapproved re-plan would then
+   pass as the approved gate. Without the approved seq and with the run at `awaiting_approval`,
+   treat it as the re-plan case below. `MAX` polls cover the run's remaining budget (`budget_total_seconds` minus
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
    `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
