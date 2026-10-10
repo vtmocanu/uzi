@@ -10,12 +10,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// dbSizeCacheTTL is how long one replica reuses a db.size result, success or failure, so a
-// frequently polled health page does not scan pg_class on every evaluation.
 // maxLargestRelations caps the largest-relation evidence rows.
 const maxLargestRelations = 3
 
+// dbSizeCacheTTL is how long one replica reuses a db.size result, success or failure, so a
+// frequently polled health page does not scan pg_class on every evaluation.
 const dbSizeCacheTTL = 60 * time.Second
+
+// dbSizeProbeTimeout bounds one probe, which runs detached from the caller's context.
+const dbSizeProbeTimeout = 5 * time.Second
 
 // checkDBSize compares pg_database_size with the configured database-size budget
 // (DB_STORAGE_CAPACITY_BYTES). The budget is operator-declared, not a measured volume
@@ -24,13 +27,13 @@ func (s *Service) checkDBSize(ctx context.Context, now time.Time) apitypes.Healt
 	s.dbSizeMu.Lock()
 	defer s.dbSizeMu.Unlock()
 	if s.dbSizeInitialized && now.Sub(s.dbSizeRefreshedAt) < dbSizeCacheTTL {
-		return copyPricingCheck(s.dbSizeResult)
+		return copyCheck(s.dbSizeResult)
 	}
 	c := s.evalDBSize(ctx)
 	s.dbSizeResult = c
 	s.dbSizeRefreshedAt = now
 	s.dbSizeInitialized = true
-	return copyPricingCheck(c)
+	return copyCheck(c)
 }
 
 func (s *Service) evalDBSize(ctx context.Context) apitypes.HealthCheckDTO {
@@ -43,12 +46,17 @@ func (s *Service) evalDBSize(ctx context.Context) apitypes.HealthCheckDTO {
 	if s.probeDBSize == nil {
 		err = errDBSizeProbeMissing
 	} else {
-		size, err = s.probeDBSize(ctx)
+		// Detached from the request: a cancelled or expired caller must not make the probe
+		// fail and cache unknown for every other reader. The timeout still bounds it.
+		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dbSizeProbeTimeout)
+		defer cancel()
+		// The relations are evidence for a configured budget only; skip them for na.
+		size, err = s.probeDBSize(pctx, capacity > 0)
 	}
 
 	if capacity <= 0 {
 		c.Severity = sevNA
-		c.Summary = "No database storage capacity is configured (DB_STORAGE_CAPACITY_BYTES)."
+		c.Summary = "No valid database storage capacity is configured (DB_STORAGE_CAPACITY_BYTES)."
 		if err == nil {
 			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Size", Value: humanBytes(size.SizeBytes)})
 		}
@@ -81,6 +89,9 @@ func (s *Service) evalDBSize(ctx context.Context) apitypes.HealthCheckDTO {
 		apitypes.HealthEvidenceDTO{Label: "Capacity", Value: humanBytes(capacity)},
 		apitypes.HealthEvidenceDTO{Label: "Used", Value: fmt.Sprintf("%d.%d%%", tenths/10, tenths%10)},
 	)
+	if size.RelationsUnavailable {
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Largest relations", Value: "Unavailable (the query timed out waiting for a table lock)"})
+	}
 	for i, r := range size.Largest {
 		if i == maxLargestRelations {
 			break
@@ -114,18 +125,23 @@ func percentTenths(size, capacity int64) int64 {
 	return n.Int64()
 }
 
-// humanBytes renders a byte count with binary units, e.g. "1.5 GiB".
+// humanBytes renders a byte count with binary units, e.g. "1.5 GiB". A value that would
+// round to 1024.0 of a unit is shown in the next unit up instead.
 func humanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
-	div, exp := int64(unit), 0
-	for v := n / unit; v >= unit; v /= unit {
-		div *= unit
+	div, exp := float64(unit), 0
+	f := float64(n) / div
+	for exp < 5 {
+		if f < unit-0.05 {
+			break
+		}
+		f /= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %ciB", f, "KMGTPE"[exp])
 }
 
 type dbSizeProbeError string
@@ -134,9 +150,10 @@ func (e dbSizeProbeError) Error() string { return string(e) }
 
 const errDBSizeProbeMissing = dbSizeProbeError("database size probe not configured")
 
-// livePoolSizeProbe is the production db.size probe, bounded by a 5s timeout.
-func (s *Service) livePoolSizeProbe(ctx context.Context) (store.DatabaseSize, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+// livePoolSizeProbe is the production db.size probe. checkDBSize bounds its context.
+func (s *Service) livePoolSizeProbe(ctx context.Context, withRelations bool) (store.DatabaseSize, error) {
+	if !withRelations {
+		return store.DatabaseSizeOnly(ctx, s.cfg.Pool)
+	}
 	return store.DatabaseSizeStatus(ctx, s.cfg.Pool)
 }

@@ -4,9 +4,137 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func dbSizeTestPool(t *testing.T) (context.Context, string, *pgxpool.Pool) {
+	t.Helper()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return ctx, dsn, pool
+}
+
+func dbSizeTestSchema(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+name+" CASCADE"); err != nil {
+		t.Fatalf("drop stale schema: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+name); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+name+" CASCADE")
+	})
+}
+
+// TestDatabaseSizeStatusNamesLargestRelationLiveDB seeds a ~1 MB table in its own schema and
+// expects it first, schema-qualified, while a larger TEMP table on a pinned connection is
+// excluded.
+func TestDatabaseSizeStatusNamesLargestRelationLiveDB(t *testing.T) {
+	ctx, _, pool := dbSizeTestPool(t)
+	dbSizeTestSchema(ctx, t, pool, "dbsize_it_big")
+	if _, err := pool.Exec(ctx, `CREATE TABLE dbsize_it_big.big AS SELECT g, repeat('x',500) AS pad FROM generate_series(1,2000) g`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE dbsize_it_temp AS SELECT g, repeat('y',500) AS pad FROM generate_series(1,20000) g`); err != nil {
+		t.Fatalf("temp seed: %v", err)
+	}
+
+	got, err := store.DatabaseSizeStatus(ctx, pool)
+	if err != nil {
+		t.Fatalf("DatabaseSizeStatus: %v", err)
+	}
+	if got.RelationsUnavailable || len(got.Largest) == 0 {
+		t.Fatalf("relations missing: %+v", got)
+	}
+	if got.Largest[0].Name != "dbsize_it_big.big" {
+		t.Errorf("Largest[0] = %q, want dbsize_it_big.big (all: %+v)", got.Largest[0].Name, got.Largest)
+	}
+	for _, r := range got.Largest {
+		if r.Name == "dbsize_it_temp" || r.Name == "pg_temp.dbsize_it_temp" {
+			t.Errorf("temp table listed: %+v", r)
+		}
+	}
+}
+
+// TestDatabaseSizeStatusSurvivesAccessExclusiveLockLiveDB holds ACCESS EXCLUSIVE on a table
+// from a second connection: the size must still come back quickly, with the relations
+// reported unavailable instead of failing the probe.
+func TestDatabaseSizeStatusSurvivesAccessExclusiveLockLiveDB(t *testing.T) {
+	ctx, dsn, pool := dbSizeTestPool(t)
+	dbSizeTestSchema(ctx, t, pool, "dbsize_it_lock")
+	if _, err := pool.Exec(ctx, `CREATE TABLE dbsize_it_lock.locked AS SELECT g FROM generate_series(1,10) g`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	holder, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect holder: %v", err)
+	}
+	defer holder.Close(context.Background())
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE dbsize_it_lock.locked IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+
+	start := time.Now()
+	got, err := store.DatabaseSizeStatus(ctx, pool)
+	if err != nil {
+		t.Fatalf("DatabaseSizeStatus under lock: %v", err)
+	}
+	// The 500ms lock_timeout must settle this well before the 2s relations-context
+	// backstop; a budget at or above the backstop could not tell the two apart.
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Errorf("took %v, want <= 1.5s (lock_timeout, not the context backstop)", elapsed)
+	}
+	if got.SizeBytes <= 0 {
+		t.Errorf("SizeBytes = %d, want > 0", got.SizeBytes)
+	}
+	if !got.RelationsUnavailable || len(got.Largest) != 0 {
+		t.Errorf("want relations unavailable and empty, got %+v", got)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	got, err = store.DatabaseSizeStatus(ctx, pool)
+	if err != nil || got.RelationsUnavailable || len(got.Largest) == 0 {
+		t.Errorf("after release: %+v, %v", got, err)
+	}
+}
+
+// TestDatabaseSizeOnlyLiveDB: the size-only read returns a size and never reads relations.
+func TestDatabaseSizeOnlyLiveDB(t *testing.T) {
+	ctx, _, pool := dbSizeTestPool(t)
+	got, err := store.DatabaseSizeOnly(ctx, pool)
+	if err != nil || got.SizeBytes <= 0 || got.Largest != nil || got.RelationsUnavailable {
+		t.Errorf("DatabaseSizeOnly = %+v, %v", got, err)
+	}
+}
 
 // TestDatabaseSizeStatusLiveDB proves the db.size probe SQL against a real Postgres: a
 // positive size and at most three non-empty relation names, largest first.

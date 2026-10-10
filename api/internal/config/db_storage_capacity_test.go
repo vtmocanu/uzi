@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -37,12 +40,23 @@ func TestLoadDBStorageCapacityBytes(t *testing.T) {
 			if tc.set {
 				t.Setenv("DB_STORAGE_CAPACITY_BYTES", tc.raw)
 			}
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
 			cfg, err := Load()
 			if err != nil {
 				t.Fatalf("Load(): %v", err)
 			}
 			if cfg.DBStorageCapacityBytes != tc.want {
 				t.Errorf("DBStorageCapacityBytes = %d, want %d", cfg.DBStorageCapacityBytes, tc.want)
+			}
+			wantWarn := 0
+			if tc.set && strings.TrimSpace(tc.raw) != "" && tc.want == 0 {
+				wantWarn = 1
+			}
+			if got := strings.Count(logs.String(), "DB_STORAGE_CAPACITY_BYTES"); got != wantWarn {
+				t.Errorf("DB_STORAGE_CAPACITY_BYTES warnings = %d, want %d; log: %s", got, wantWarn, logs.String())
 			}
 		})
 	}

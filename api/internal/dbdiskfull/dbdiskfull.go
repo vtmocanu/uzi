@@ -84,6 +84,25 @@ func (s *Signal) Active(now time.Time) bool {
 	return now.UnixNano()-last <= int64(Window)
 }
 
+// Snapshot returns the active state, the newest sighting and the current incident's start
+// read under one lock, so start <= last whenever active. last and start are zero when
+// nothing was ever seen.
+func (s *Signal) Snapshot(now time.Time) (active bool, last, start time.Time) {
+	if s == nil {
+		return false, time.Time{}, time.Time{}
+	}
+	s.mu.Lock()
+	l, st := s.lastSeen, s.start
+	s.mu.Unlock()
+	if l == 0 {
+		return false, time.Time{}, time.Time{}
+	}
+	if st == 0 || st > l {
+		st = l
+	}
+	return now.UnixNano()-l <= int64(Window), time.Unix(0, l), time.Unix(0, st)
+}
+
 // LastSeen returns the most recent sighting time, if any.
 func (s *Signal) LastSeen() (time.Time, bool) {
 	if s == nil {
@@ -143,7 +162,8 @@ func (t *Tracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQu
 	return ctx
 }
 
-// TraceQueryEnd records a disk-full error; it never logs, blocks or panics.
+// TraceQueryEnd records a disk-full error; it never logs or panics and takes only a brief
+// lock on the error path.
 func (t *Tracer) TraceQueryEnd(_ context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
 	if t == nil {
 		return

@@ -192,6 +192,8 @@ expect_bytes "(f) size=0.<64 zeros>1Ki" 1 --set-string "database.simple.storage.
 # the documented intent, not a resource.Quantity comparison: the exponent clamps to 18 nines,
 # a huge positive one fails the bound, a huge negative one rounds a nonzero value up to 1.
 N20=$(awk 'BEGIN { for (i = 0; i < 20; i++) printf "9" }')
+# This row documents the chart's exact behaviour only (Kubernetes itself rejects this
+# quantity); it does not guard the clamp's negative half.
 expect_bytes "(f) size=1e-<20 nines> (chart intent: rounds up to 1)" 1 --set-string "database.simple.storage.size=1e-${N20}"
 # A YAML plain integer arrives as a float64 (the %v form is 1.073741824e+10); --set gives an int64.
 printf 'database:\n  simple:\n    storage:\n      size: 10737418240\n' > "$WORK/int.yaml"

@@ -1635,11 +1635,10 @@ database:
       # quantity (8Gi, 500M, 1.5Gi, 8e9, a plain integer of bytes), positive, at most 1Ei
       # (2^60 bytes); anything else fails the render. The simple-mode PVC comes from a
       # StatefulSet volumeClaimTemplate, so the rendered capacity tracks the size at creation.
-      # After expanding the PVC by hand, update this value to match and recreate the
-      # StatefulSet object before upgrading (kubectl delete statefulset <name>
-      # --cascade=orphan keeps the pods and PVCs): Kubernetes forbids updating
-      # volumeClaimTemplates, so helm upgrade fails otherwise. Until then db.size keeps
-      # the creation-time capacity.
+      # After expanding the PVC by hand, update this value to match, delete the StatefulSet
+      # with `kubectl delete statefulset <name> --cascade=orphan` (pods and PVCs are kept),
+      # then helm upgrade recreates it: Kubernetes forbids updating volumeClaimTemplates,
+      # so helm upgrade fails otherwise. Until then db.size keeps the creation-time capacity.
       size: 8Gi
       # "" => the cluster's default StorageClass. On a multi-node cluster prefer a
       # WaitForFirstConsumer class so the PVC binds to the pod's node.

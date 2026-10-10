@@ -150,3 +150,30 @@ func TestIncidentStartHoldsWithinWindowAndResetsAfterGap(t *testing.T) {
 		t.Fatalf("gen = %d, want 2", s.Generation())
 	}
 }
+
+func TestSnapshotStartNeverAfterLast(t *testing.T) {
+	c := newClock()
+	s := New(c.now)
+	if active, last, start := s.Snapshot(c.t); active || !last.IsZero() || !start.IsZero() {
+		t.Fatalf("empty snapshot = %v %v %v", active, last, start)
+	}
+	s.Observe(pgErr(CodeDiskFull))
+	first := c.t
+	// The clock steps backwards for the next sighting; lastSeen must not follow it.
+	c.t = first.Add(-time.Second)
+	s.Observe(pgErr(CodeDiskFull))
+	active, last, start := s.Snapshot(first)
+	if !active {
+		t.Fatal("want active")
+	}
+	if !last.Equal(first) {
+		t.Errorf("last = %v moved from %v", last, first)
+	}
+	if start.After(last) {
+		t.Errorf("start %v after last %v", start, last)
+	}
+	var nilSig *Signal
+	if a, _, _ := nilSig.Snapshot(first); a {
+		t.Error("nil Signal active")
+	}
+}

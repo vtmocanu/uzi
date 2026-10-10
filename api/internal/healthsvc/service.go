@@ -188,8 +188,9 @@ type Service struct {
 	cfg     Config
 	now     func() time.Time
 	probeDB func(ctx context.Context) dbStat
-	// probeDBSize reads the database size for db.size; nil without a pool.
-	probeDBSize func(ctx context.Context) (store.DatabaseSize, error)
+	// probeDBSize reads the database size for db.size (the bool asks for the largest-relations
+	// evidence too); nil without a pool.
+	probeDBSize func(ctx context.Context, withRelations bool) (store.DatabaseSize, error)
 
 	mu                     sync.Mutex
 	slackNonConnectedSince *time.Time

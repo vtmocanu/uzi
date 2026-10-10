@@ -11,15 +11,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-func dbSizeSvc(capacity int64, probe func(context.Context) (store.DatabaseSize, error)) *Service {
+func dbSizeSvc(capacity int64, probe func(context.Context, bool) (store.DatabaseSize, error)) *Service {
 	s := newSvc(&fakeStore{}, &fakeSettings{})
 	s.cfg.DBStorageCapacityBytes = capacity
 	s.probeDBSize = probe
 	return s
 }
 
-func sizeProbe(size int64, rels ...store.RelationSize) func(context.Context) (store.DatabaseSize, error) {
-	return func(context.Context) (store.DatabaseSize, error) {
+func sizeProbe(size int64, rels ...store.RelationSize) func(context.Context, bool) (store.DatabaseSize, error) {
+	return func(context.Context, bool) (store.DatabaseSize, error) {
 		return store.DatabaseSize{SizeBytes: size, Largest: rels}, nil
 	}
 }
@@ -119,8 +119,10 @@ func TestCheckDBSizeNA(t *testing.T) {
 			t.Errorf("capacity %d: na with a successful read should carry Size evidence", capacity)
 		}
 	}
-	failing := func(context.Context) (store.DatabaseSize, error) { return store.DatabaseSize{}, errors.New("boom") }
-	for name, probe := range map[string]func(context.Context) (store.DatabaseSize, error){"read error": failing, "nil probe": nil} {
+	failing := func(context.Context, bool) (store.DatabaseSize, error) {
+		return store.DatabaseSize{}, errors.New("boom")
+	}
+	for name, probe := range map[string]func(context.Context, bool) (store.DatabaseSize, error){"read error": failing, "nil probe": nil} {
 		c := dbSizeSvc(0, probe).checkDBSize(context.Background(), fixedNow)
 		if c.Severity != sevNA || len(c.Evidence) != 0 {
 			t.Errorf("%s: %+v", name, c)
@@ -129,7 +131,7 @@ func TestCheckDBSizeNA(t *testing.T) {
 }
 
 func TestCheckDBSizeUnknown(t *testing.T) {
-	failing := func(context.Context) (store.DatabaseSize, error) {
+	failing := func(context.Context, bool) (store.DatabaseSize, error) {
 		return store.DatabaseSize{}, errors.New("secret detail")
 	}
 	c := dbSizeSvc(1000, failing).checkDBSize(context.Background(), fixedNow)
@@ -145,7 +147,7 @@ func TestCheckDBSizeUnknown(t *testing.T) {
 func TestCheckDBSizeCache(t *testing.T) {
 	calls := 0
 	size := int64(100)
-	probe := func(context.Context) (store.DatabaseSize, error) {
+	probe := func(context.Context, bool) (store.DatabaseSize, error) {
 		calls++
 		return store.DatabaseSize{SizeBytes: size}, nil
 	}
@@ -164,7 +166,7 @@ func TestCheckDBSizeCache(t *testing.T) {
 
 	// Failures are cached for the same interval.
 	fcalls := 0
-	fs := dbSizeSvc(1000, func(context.Context) (store.DatabaseSize, error) {
+	fs := dbSizeSvc(1000, func(context.Context, bool) (store.DatabaseSize, error) {
 		fcalls++
 		return store.DatabaseSize{}, errors.New("x")
 	})
@@ -172,5 +174,73 @@ func TestCheckDBSizeCache(t *testing.T) {
 	fs.checkDBSize(ctx, fixedNow.Add(30*time.Second))
 	if fcalls != 1 {
 		t.Errorf("failure re-probed within TTL: %d calls", fcalls)
+	}
+}
+
+func TestHumanBytesNeverShows1024(t *testing.T) {
+	cases := map[int64]string{
+		1023:               "1023 B",
+		1024:               "1.0 KiB",
+		1024*1024 - 1:      "1.0 MiB",
+		1024*1024 - 52:     "1023.9 KiB",
+		3 << 29:            "1.5 GiB",
+		int64(1)<<30 - 100: "1.0 GiB",
+	}
+	for n, want := range cases {
+		if got := humanBytes(n); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestCheckDBSizeRelationsUnavailableEvidence(t *testing.T) {
+	probe := func(context.Context, bool) (store.DatabaseSize, error) {
+		return store.DatabaseSize{SizeBytes: 500, RelationsUnavailable: true}, nil
+	}
+	c := dbSizeSvc(1000, probe).checkDBSize(context.Background(), fixedNow)
+	if c.Severity != sevOK {
+		t.Fatalf("severity = %q, want ok", c.Severity)
+	}
+	if v, ok := evidenceValue(c, "Largest relations"); !ok || !strings.Contains(v, "Unavailable") {
+		t.Errorf("missing unavailable-relations evidence: %+v", c.Evidence)
+	}
+}
+
+// A caller whose context is already cancelled must not make the probe fail, and the
+// healthy result is what the next reader gets from the cache.
+func TestCheckDBSizeProbeDetachedFromCallerContext(t *testing.T) {
+	calls := 0
+	probe := func(ctx context.Context, _ bool) (store.DatabaseSize, error) {
+		calls++
+		if err := ctx.Err(); err != nil {
+			return store.DatabaseSize{}, err
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("probe context has no deadline")
+		}
+		return store.DatabaseSize{SizeBytes: 100}, nil
+	}
+	s := dbSizeSvc(1000, probe)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if c := s.checkDBSize(cancelled, fixedNow); c.Severity != sevOK {
+		t.Fatalf("cancelled caller: %+v", c)
+	}
+	if c := s.checkDBSize(context.Background(), fixedNow.Add(time.Second)); c.Severity != sevOK || calls != 1 {
+		t.Fatalf("next reader: severity %q calls %d", c.Severity, calls)
+	}
+}
+
+func TestCheckDBSizeSkipsRelationsWhenNA(t *testing.T) {
+	for capacity, want := range map[int64]bool{0: false, -1: false, 1000: true} {
+		var got *bool
+		probe := func(_ context.Context, withRelations bool) (store.DatabaseSize, error) {
+			got = &withRelations
+			return store.DatabaseSize{SizeBytes: 1}, nil
+		}
+		dbSizeSvc(capacity, probe).checkDBSize(context.Background(), fixedNow)
+		if got == nil || *got != want {
+			t.Errorf("capacity %d: withRelations = %v, want %v", capacity, got, want)
+		}
 	}
 }
