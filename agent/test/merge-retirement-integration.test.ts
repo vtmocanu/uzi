@@ -8,6 +8,8 @@ import { PassThrough } from "node:stream";
 import { WorkerClient } from "../src/client.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
+import { Outbox, type ReportRetirementContext } from "../src/outbox.js";
+import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
@@ -16,6 +18,53 @@ import { reportRetirementFixture } from "./report-retirement-fixture.js";
 import { nullLogger } from "./helpers.js";
 
 installHarness();
+
+it("inventory wrapper propagates recovery cancellation instead of returning unknown", async () => {
+  const abort = new AbortController();
+  const pending = git.withRecoveryOperation(abort.signal, Date.now() + 5000, async () => {
+    abort.abort(new Error("recovery cancelled"));
+    return git.readInventoryCloneHeads("/unused-bare", "00000000-0000-4000-8000-000000002652");
+  });
+  await assert.rejects(pending);
+});
+
+for (const lane of ["archive", "ordinary"] as const) {
+  it(`worker preserves the admission fence after ${lane} finalize unlink`, async t => {
+    const root = await fs.mkdtemp(path.resolve(import.meta.dirname, "../../.uzi/scratch/worker-fence-"));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1024 * 1024,
+      maxBytes: 16 * 1024 * 1024, retentionMs: 86400000 });
+    await outbox.init();
+    const run = "00000000-0000-4000-8000-000000002652", generation = 2;
+    await outbox.journalFinalize(run, generation);
+    let worker!: { admittedRunIds: Map<string, number>; sweepPendingFinalizes(): Promise<void> };
+    let notifications = 0;
+    const runner = {
+      recoveryInventoryPending: async () => lane === "archive",
+      isExecuting: () => false,
+      retireRecoveryReport: async (_run: string, _generation: number, context: ReportRetirementContext) => {
+        if (lane !== "archive") return false;
+        return outbox.retireFinalizeIfEligible(run, generation, () => true, context.signal!, context.expectedIdentity!);
+      },
+      notifyPublicationCompletionRetired: async () => { notifications++; },
+    };
+    const unlink = fs.unlink.bind(fs);
+    const file = path.join(root, run, "finalize-2.json");
+    t.mock.method(fs, "unlink", async (target: Parameters<typeof unlink>[0]) => {
+      await unlink(target);
+      if (String(target) === file) worker.admittedRunIds.set(run, generation);
+    });
+    t.mock.method(client, "capturePublicationCompletionRetirement", () => Object.freeze({}));
+    t.mock.method(client, "getRunOwnership", async () => ({ status: "cancelled", claim_generation: generation }));
+    worker = new Worker({} as Config, client, runner as unknown as RunRunner, {} as ChatRunner,
+      {} as JudgeRunner, {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }),
+      outbox) as unknown as typeof worker;
+    await worker.sweepPendingFinalizes();
+    assert.equal(outbox.finalizeRecordIdentity(run, generation), undefined, "unlink succeeded");
+    await assert.rejects(fs.access(file), { code: "ENOENT" });
+    assert.equal(notifications, 0, "readmission during unlink must keep completion bookkeeping");
+  });
+}
 
 it("combined report and recovery cancellation settles both before releasing the bare lock", async t => {
   const f = await reportRetirementFixture(t);
@@ -152,7 +201,7 @@ it("worker notifies exactly once after successful archive finalize unlink, never
     return result;
   });
   let notifications = 0;
-  t.mock.method(f.r, "notifyPublicationCompletionRetired", async (run, generation, observed) => {
+  t.mock.method(f.r, "notifyPublicationCompletionRetired", async (...[run, generation, observed]: Parameters<typeof f.r.notifyPublicationCompletionRetired>) => {
     assert.equal(run, f.claim.run_id);
     assert.equal(generation, 2);
     assert.equal(observed, incarnation);
@@ -163,7 +212,7 @@ it("worker notifies exactly once after successful archive finalize unlink, never
   let failUnlink = true;
   let unlinks = 0;
   const unlink = fs.unlink;
-  t.mock.method(fs, "unlink", async target => {
+  t.mock.method(fs, "unlink", async (target: Parameters<typeof fs.unlink>[0]) => {
     if (String(target) === finalize) {
       unlinks++;
       if (failUnlink) throw Object.assign(new Error("fixture unlink failure"), { code: "EACCES" });

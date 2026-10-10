@@ -35,6 +35,21 @@ export interface ReportRetirementContext {
   eligible?: () => boolean;
 }
 
+type ProofBudget = Pick<ReportRetirementContext, "signal" | "deadline">;
+
+function checkProofBudget(budget?: ProofBudget): void {
+  budget?.signal?.throwIfAborted();
+  if (budget?.deadline !== undefined && Date.now() >= budget.deadline) throw new Error("outbox proof deadline");
+}
+
+function fileLifetime(stat: { dev: bigint; ino: bigint; birthtimeNs: bigint }): string {
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+}
+
+function fileVersion(stat: { dev: bigint; ino: bigint; birthtimeNs: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint }): string {
+  return `${fileLifetime(stat)}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
 function terminalRetirementPayload(record: Record<string, unknown>): string {
   return canonicalJson({ run: record.run_id, generation: record.claim_generation,
     body: record.body, fence: record.messages_through_seq, phase: record.phase_at_journal });
@@ -251,6 +266,7 @@ interface RunState {
 interface FinalizeMeta {
   claimGeneration: number;
   since: number;
+  lifetime?: string;
 }
 
 /** Issue #1742: one pending finalize record listed by {@link Outbox.listPendingFinalizes}. */
@@ -740,6 +756,7 @@ export class Outbox {
         });
         continue;
       }
+      meta.lifetime = this.authenticatedLifetimes.get(parsed!);
       this.ensureInMemoryRun(runId, meta.since).finalizes.set(meta.claimGeneration, meta);
     }
   }
@@ -1600,21 +1617,25 @@ export class Outbox {
   ): Promise<{ journal: PendingTerminalJournal; context: ReportRetirementContext } | undefined> {
     if (this.disabled) return undefined;
     return this.withRunLock(runId, async () => {
-      const parsed = await this.readTerminalAuthed(runId, generation);
+      const parsed = await this.readTerminalAuthed(runId, generation, undefined, context);
       const meta = this.runs.get(runId)?.terminals.get(generation);
       const journal = parsed && coerceTerminalRecord(parsed, runId, generation);
       if (!meta || !journal) return undefined;
       const payload = terminalRetirementPayload(parsed!);
       let binding = this.terminalRetirementIdentities.get(meta);
-      if (!binding || binding.payload !== payload) {
-        binding = { identity: Object.freeze({}), payload };
+      const lifetime = this.authenticatedLifetimes.get(parsed!);
+      if (!lifetime) return undefined;
+      if (!binding || binding.payload !== payload || binding.lifetime !== lifetime) {
+        binding = { identity: Object.freeze({}), payload, lifetime };
         this.terminalRetirementIdentities.set(meta, binding);
       }
       return { journal, context: { ...context, expectedIdentity: binding.identity } };
     }, context.signal);
   }
 
-  private readonly terminalRetirementIdentities = new WeakMap<object, { identity: Readonly<object>; payload: string }>();
+  private readonly authenticatedLifetimes = new WeakMap<object, string>();
+  private readonly authenticatedFileVersions = new WeakMap<object, string>();
+  private readonly terminalRetirementIdentities = new WeakMap<object, { identity: Readonly<object>; payload: string; lifetime: string }>();
 
   /** Report-only unlink: no asynchronous proof callback runs under O. Once unlink starts,
    * its actual settlement owns O, even when the caller deadline expires. */
@@ -1624,12 +1645,14 @@ export class Outbox {
       const meta = this.runs.get(runId)?.terminals.get(generation);
       const binding = meta && this.terminalRetirementIdentities.get(meta);
       if (!meta || !binding || binding.identity !== context.expectedIdentity || meta.blocked) return false;
-      const parsed = await this.readTerminalAuthed(runId, generation);
-      if (!parsed || parsed.blocked || terminalRetirementPayload(parsed) !== binding.payload ||
+      const parsed = await this.readTerminalAuthed(runId, generation, undefined, context);
+      if (!parsed || this.authenticatedLifetimes.get(parsed) !== binding.lifetime || parsed.blocked || terminalRetirementPayload(parsed) !== binding.payload ||
           this.runs.get(runId)?.terminals.get(generation) !== meta ||
           context.signal?.aborted || (context.deadline !== undefined && Date.now() >= context.deadline) ||
           context.eligible?.() === false) return false;
-      await fs.unlink(path.join(this.runDir(runId), meta.fileName));
+      const file = path.join(this.runDir(runId), meta.fileName);
+      if (!await this.installedLifetimeMatches(file, binding.lifetime, context, this.authenticatedFileVersions.get(parsed)) || context.eligible?.() === false) return false;
+      await fs.unlink(file);
       this.runs.get(runId)?.terminals.delete(generation);
       return true;
     }, context.signal);
@@ -1730,7 +1753,6 @@ export class Outbox {
         const record: FinalizeRecordData = { run_id: runId, claim_generation: claimGeneration, since };
         const serialized = this.seal(MAC_DOMAIN_FINALIZE, record);
         const dst = path.join(dir, finalizeFileName(claimGeneration));
-        let adopted = false;
         try {
           await this.withReserveOnEnospc(async () => {
             await this.rawWrite(
@@ -1740,13 +1762,13 @@ export class Outbox {
               { path: dir, kind: "finalize" },
             );
             await this.fsyncDir(this.root, true);
-            adopted = await this.installExclusive(dst, serialized, "finalize");
+            await this.installExclusive(dst, serialized, "finalize");
           });
         } catch (err) {
           return fail(isENOSPC(err) ? "enospc" : `write_failed: ${errText(err)}`);
         }
-        if (adopted) {
-          // An existing winner was adopted: keep ITS on-disk `since`, not this call's clock.
+        {
+          // Bind new installs and adopted winners to authenticated descriptor metadata.
           const existing = await this.readAuthed(dst, MAC_DOMAIN_FINALIZE);
           const meta = existing ? coerceFinalize(existing, runId, claimGeneration) : null;
           if (!meta) {
@@ -1754,9 +1776,11 @@ export class Outbox {
             return fail("existing_finalize_invalid");
           }
           since = meta.since;
+          meta.lifetime = this.authenticatedLifetimes.get(existing!);
+          const rs = this.ensureInMemoryRun(runId, since);
+          const previous = rs.finalizes.get(claimGeneration);
+          if (!previous || previous.lifetime !== meta.lifetime || previous.since !== since) rs.finalizes.set(claimGeneration, meta);
         }
-        const rs = this.ensureInMemoryRun(runId, since);
-        if (!rs.finalizes.has(claimGeneration)) rs.finalizes.set(claimGeneration, { claimGeneration, since });
         this.log.info("finalize record durable", { run_id: runId, claim_generation: claimGeneration });
         return { written: true };
       });
@@ -1812,7 +1836,8 @@ export class Outbox {
 
   /** Opaque stable identity of the authenticated in-memory record; timestamps are not identity. */
   finalizeRecordIdentity(runId: string, generation: number): Readonly<object> | undefined {
-    return this.runs.get(runId)?.finalizes.get(generation);
+    const meta = this.runs.get(runId)?.finalizes.get(generation);
+    return meta?.lifetime ? meta : undefined;
   }
 
   /** Retry only the authorized exact generation. Recheck custody and synchronous eligibility
@@ -1837,9 +1862,16 @@ export class Outbox {
         const parsed = await this.readAuthed(file, MAC_DOMAIN_FINALIZE, proofBudget);
         const authenticated = parsed && coerceFinalize(parsed, runId, claimGeneration);
         const meta = rs.finalizes.get(claimGeneration);
-        if (!authenticated || !meta || authenticated.since !== meta.since ||
+        const lifetime = parsed && this.authenticatedLifetimes.get(parsed);
+        if (authenticated && lifetime && meta && lifetime !== meta.lifetime) {
+          // A newly authenticated physical record requires a fresh caller proof.
+          rs.finalizes.set(claimGeneration, { ...authenticated, lifetime });
+          return false;
+        }
+        if (!authenticated || !meta || !meta.lifetime || this.authenticatedLifetimes.get(parsed!) !== meta.lifetime || authenticated.since !== meta.since ||
             meta !== expectedIdentity || signal.aborted || proofBudget?.signal.aborted ||
             (proofBudget && Date.now() >= proofBudget.deadline) || !eligible()) return false;
+        if (!await this.installedLifetimeMatches(file, meta.lifetime, proofBudget, this.authenticatedFileVersions.get(parsed!)) || signal.aborted || !eligible()) return false;
         await fs.unlink(file);
       } else await fs.unlink(file);
       rs.finalizes.delete(claimGeneration);
@@ -2107,50 +2139,65 @@ export class Outbox {
     return (await this.inspectTerminal(runId, generation, fileName)).observation;
   }
 
-  private async readTerminalAuthed(runId: string, generation: number, fileName = this.runs.get(runId)?.terminals.get(generation)?.fileName ?? terminalFileName(generation)): Promise<Record<string, unknown> | null> {
-    const result = await this.inspectTerminal(runId, generation, fileName);
+  private async readTerminalAuthed(runId: string, generation: number, fileName = this.runs.get(runId)?.terminals.get(generation)?.fileName ?? terminalFileName(generation), budget?: ProofBudget): Promise<Record<string, unknown> | null> {
+    const result = await this.inspectTerminal(runId, generation, fileName, budget);
+    try { checkProofBudget(budget); } catch { return null; }
     return result.record ?? null;
   }
 
-  private async terminalDirectorySafe(runId: string): Promise<boolean> {
+  private async terminalDirectorySafe(runId: string, budget?: ProofBudget): Promise<boolean> {
     if (!this.validRunId(runId)) return false;
+    checkProofBudget(budget);
     const root = await fs.lstat(this.root);
+    checkProofBudget(budget);
     const dir = await fs.lstat(this.runDir(runId));
+    checkProofBudget(budget);
     if (!root.isDirectory() || root.isSymbolicLink() || !dir.isDirectory() || dir.isSymbolicLink()) return false;
     const realRoot = await this.realpath(this.root);
+    checkProofBudget(budget);
     const realRun = await this.realpath(this.runDir(runId));
+    checkProofBudget(budget);
     const expected = path.join(realRoot, runId);
     return realRun === expected || (terminalRunUUID(runId) &&
       path.dirname(realRun) === realRoot &&
       path.basename(realRun).toLowerCase() === path.basename(expected).toLowerCase());
   }
 
-  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
+  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string, budget?: ProofBudget): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
     const observation: TerminalAuthenticationObservation = { runId: terminalRunUUID(runId) ? runId.toLowerCase() : runId, physicalRunId: runId, generation, fileName, kind: "malformed" };
     const result = { observation } as { observation: TerminalAuthenticationObservation; record?: Record<string, unknown> };
     if (!this.validRunId(runId) || generation === undefined || !Number.isSafeInteger(generation) || generation < 0 || parseTerminalFileName(fileName) !== generation) return result;
     let fh: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
-      if (!await this.terminalDirectorySafe(runId)) { observation.kind = "symlink"; return result; }
+      if (!await this.terminalDirectorySafe(runId, budget)) { observation.kind = "symlink"; return result; }
       const filePath = path.join(this.runDir(runId), fileName);
+      checkProofBudget(budget);
       const before = await fs.lstat(filePath, { bigint: true });
+      checkProofBudget(budget);
       if (before.isSymbolicLink()) { observation.kind = "symlink"; return result; }
       if (!before.isFile()) { observation.kind = "unreadable"; return result; }
       fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      checkProofBudget(budget);
       const stat = await fh.stat({ bigint: true });
+      checkProofBudget(budget);
       if (!stat.isFile() || stat.ino !== before.ino || stat.dev !== before.dev) { observation.kind = "unreadable"; return result; }
       const raw = Buffer.alloc(this.terminalReadMaxBytes + 1);
       let length = 0;
       // At most cap+1 bytes and cap+1 nonempty read attempts; EOF ends sooner.
       while (length < raw.length) {
+        checkProofBudget(budget);
         const { bytesRead } = await fh.read(raw, length, raw.length - length, null);
+        checkProofBudget(budget);
         if (!bytesRead) break;
         length += bytesRead;
       }
       if (length > this.terminalReadMaxBytes) { observation.kind = "oversized"; return result; }
+      checkProofBudget(budget);
       const after = await fs.lstat(filePath, { bigint: true });
+      checkProofBudget(budget);
       const final = await fh.stat({ bigint: true });
-      if (after.ino !== stat.ino || after.dev !== stat.dev || final.size !== stat.size || final.mtimeNs !== stat.mtimeNs || final.ctimeNs !== stat.ctimeNs || !await this.terminalDirectorySafe(runId)) { observation.kind = "unreadable"; return result; }
+      checkProofBudget(budget);
+      if (after.ino !== stat.ino || after.dev !== stat.dev || final.size !== stat.size || final.mtimeNs !== stat.mtimeNs || final.ctimeNs !== stat.ctimeNs || !await this.terminalDirectorySafe(runId, budget)) { observation.kind = "unreadable"; return result; }
       observation.fingerprint = { dev: String(stat.dev), ino: String(stat.ino), sha256: createHash("sha256").update(raw.subarray(0, length)).digest("hex") };
       if (!this.key) { observation.kind = "key_unavailable"; return result; }
       let parsed: unknown;
@@ -2169,6 +2216,12 @@ export class Outbox {
       }
       if (!coerceTerminalRecord(obj, runId, generation)) return result;
       observation.kind = "authenticated";
+      const lifetime = fileLifetime(stat);
+      this.authenticatedLifetimes.set(obj, lifetime);
+      this.authenticatedFileVersions.set(obj, fileVersion(stat));
+      const meta = this.runs.get(runId)?.terminals.get(generation);
+      const binding = meta && this.terminalRetirementIdentities.get(meta);
+      if (meta?.fileName === fileName && binding && binding.lifetime !== lifetime) this.terminalRetirementIdentities.delete(meta);
       result.record = obj;
       return result;
     } catch (err) {
@@ -2348,32 +2401,54 @@ export class Outbox {
     }
   }
 
-  /** Read + authenticate a record file. Returns the parsed body (minus `mac`) when
-   *  the MAC verifies, else null (a missing file, a symlink refused by O_NOFOLLOW,
-   *  an unparseable body, or a MAC mismatch — the last two are logged). */
+  /** Recheck the installed physical lifetime under O immediately before report unlink. */
+  private async installedLifetimeMatches(file: string, lifetime: string, budget?: ProofBudget, version?: string): Promise<boolean> {
+    try {
+      checkProofBudget(budget);
+      const stat = await fs.lstat(file, { bigint: true });
+      checkProofBudget(budget);
+      return stat.isFile() && !stat.isSymbolicLink() && fileLifetime(stat) === lifetime &&
+        (version === undefined || fileVersion(stat) === version);
+    } catch { return false; }
+  }
+
+  /** Read and authenticate through a no-follow descriptor; finalize reads also bind its physical lifetime. */
   private async readAuthed(filePath: string, domain: string,
     proofBudget?: { signal: AbortSignal; deadline: number },
   ): Promise<Record<string, unknown> | null> {
     if (!this.key) return null;
     let raw: Buffer;
+    let lifetime: string | undefined;
+    let version: string | undefined;
     try {
-      const check = () => {
-        proofBudget?.signal.throwIfAborted();
-        if (proofBudget && Date.now() >= proofBudget.deadline) throw new Error("finalize proof deadline");
-      };
+      const check = () => checkProofBudget(proofBudget);
       check();
       const fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
         (proofBudget ? fsConstants.O_NONBLOCK : 0));
       try {
-        if (!proofBudget) raw = await fh.readFile();
-        else {
+        check();
+        if (!proofBudget) {
+          if (domain === MAC_DOMAIN_FINALIZE) {
+            const before = await fh.stat({ bigint: true });
+            if (!before.isFile()) return null;
+            raw = await fh.readFile();
+            const after = await fh.stat({ bigint: true });
+            if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs ||
+                !await this.installedLifetimeMatches(filePath, fileLifetime(before), undefined, fileVersion(before))) return null;
+            lifetime = fileLifetime(before);
+            version = fileVersion(before);
+          } else raw = await fh.readFile();
+        } else {
           const cap = 1024 * 1024;
-          const before = await fh.stat();
-          if (!before.isFile() || before.size > cap) return null;
+          const before = await fh.stat({ bigint: true });
+          check();
+          if (!before.isFile() || before.size > BigInt(cap)) return null;
           const same = (a: typeof before, b: typeof before) => b.isFile() &&
             a.dev === b.dev && a.ino === b.ino && a.size === b.size &&
-            a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
-          if (!same(before, await fs.lstat(filePath))) return null;
+            a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+          const installed = await fs.lstat(filePath, { bigint: true });
+          check();
+          if (!same(before, installed)) return null;
           const bytes = Buffer.alloc(cap + 1);
           let used = 0;
           // At most cap+1 bytes and cap+2 reads (including EOF); a short read is
@@ -2385,14 +2460,20 @@ export class Outbox {
             if (bytesRead === 0) break;
             used += bytesRead;
           }
-          if (used > cap || !same(before, await fh.stat()) ||
-              !same(before, await fs.lstat(filePath))) return null;
+          if (used > cap) return null;
+          const final = await fh.stat({ bigint: true });
           check();
+          const after = await fs.lstat(filePath, { bigint: true });
+          check();
+          if (!same(before, final) || !same(before, after)) return null;
+          lifetime = fileLifetime(before);
+          version = fileVersion(before);
           raw = bytes.subarray(0, used);
         }
       } finally {
         await fh.close();
       }
+      check();
     } catch {
       return null; // ENOENT (missing) or ELOOP (symlink) — nothing trustworthy here
     }
@@ -2412,6 +2493,8 @@ export class Outbox {
       this.log.warn("outbox: record MAC mismatch; refusing tampered record", { file: filePath });
       return null;
     }
+    if (lifetime) this.authenticatedLifetimes.set(obj, lifetime);
+    if (version) this.authenticatedFileVersions.set(obj, version);
     return obj;
   }
 

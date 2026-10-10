@@ -2334,6 +2334,7 @@ export class WorkerClient {
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string, options: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   async getRunOwnership(runId: string, signal?: AbortSignal): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse> {
     const budget = options && !(options instanceof AbortSignal) ? options : undefined;
     const signal = options instanceof AbortSignal ? options : budget

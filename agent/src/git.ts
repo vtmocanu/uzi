@@ -4933,6 +4933,7 @@ export class GitCache {
     try {
       return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
     } catch (err) {
+      this.checkRecoveryInterruption();
       if (this.reportProofs.getStore()) throw err;
       return { kind: "unknown", cause: "other" };
     }

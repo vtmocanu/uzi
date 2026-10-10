@@ -290,7 +290,7 @@ export class Worker {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
           }, "finalize", outbox);
           if (retired === true) {
-            if (incarnation) await this.runner.notifyPublicationCompletionRetired(
+            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
               entry.run_id, entry.claim_generation, incarnation);
             return true;
           }
@@ -302,7 +302,7 @@ export class Worker {
         if (!eligible()) return;
         const retired = await outbox.retireFinalizeIfEligible(
           entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
-        if (retired === true && incarnation)
+        if (retired === true && incarnation && eligible())
           await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
         return retired;
       });
