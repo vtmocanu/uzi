@@ -250,7 +250,8 @@ The largest-relations evidence reads "unavailable" when that query gives up
 helm chart sets the budget from the database storage size
 (`database.simple.storage.size`, or `postgres.cluster.storage.size` with CNPG);
 with `database.mode: external` set `api.config.DB_STORAGE_CAPACITY_BYTES`
-yourself. `db.size` is an instance check, so `danger` opens the same instance
+yourself, as a quoted string (`DB_STORAGE_CAPACITY_BYTES: "107374182400"`):
+an unquoted number renders as `1.073741824e+11`, which the api rejects. `db.size` is an instance check, so `danger` opens the same instance
 episode and sends the same admin Slack notice as any other instance danger.
 
 **Blind spots.** `db.size` is a database-size budget, not volume usage:

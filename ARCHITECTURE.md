@@ -2211,7 +2211,8 @@ Kubernetes access). A pgx query tracer on the pool
 replica and in memory, and the `db` check is danger for five minutes after it.
 `db.size` compares `pg_database_size` to the operator-declared
 `DB_STORAGE_CAPACITY_BYTES` (rendered by the chart from the database storage
-size), warning at 75% and danger at 85%, cached 60 seconds per replica; it is a
+size), warning at 75% and danger at 85% (the episode opens on the second consecutive
+failing tick, the usual debounce), cached 60 seconds per replica; it is a
 database-size budget, not volume usage, and excludes WAL. When the episode open,
 the notice claim or the notification insert itself fails with `53100`, the
 episode reconciler posts the admin Slack notice straight from memory

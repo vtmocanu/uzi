@@ -240,8 +240,9 @@ api:
   # safe defaults need setting; the environment-specific ones (FRONTEND_ORIGIN,
   # TRUSTED_PROXIES, FORGE_ALLOWED_BASE_URLS) live in deploy/values/<cluster>.yaml.
   # DB_STORAGE_CAPACITY_BYTES (admin-health db.size budget, positive base-10 bytes): under
-  # database.mode external set it HERE; under simple/cnpg the chart renders it from the
-  # database storage size and setting it here too fails the render (duplicate key).
+  # database.mode external set it HERE as a QUOTED string
+  # ("107374182400"; an unquoted number renders as 1.073741824e+11, which the api rejects);
+  # under simple/cnpg the chart renders it from the database storage size and setting it here too fails the render (duplicate key).
   config:
     API_ADDR: ":8080"
     # OIDC group-based roles/access (PRD #55) — all NON-secret ConfigMap values
