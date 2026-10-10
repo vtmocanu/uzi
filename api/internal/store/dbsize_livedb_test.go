@@ -43,13 +43,39 @@ func dbSizeTestSchema(ctx context.Context, t *testing.T, pool *pgxpool.Pool, nam
 	})
 }
 
-// TestDatabaseSizeStatusNamesLargestRelationLiveDB seeds a ~1 MB table in its own schema and
-// expects it first, schema-qualified, while a larger TEMP table on a pinned connection is
-// excluded.
+// TestDatabaseSizeStatusNamesLargestRelationLiveDB seeds a table in its own schema sized to
+// exceed every other user relation in the (possibly populated, shared) database and expects it
+// first, schema-qualified, while a still larger TEMP table on a pinned connection is excluded.
 func TestDatabaseSizeStatusNamesLargestRelationLiveDB(t *testing.T) {
+	const (
+		// Each row is a 500-byte pad plus tuple overhead, so the heap grows by at least
+		// ~500 bytes per row; sizing rows from bytes/500 therefore over-provisions.
+		bytesPerRow = 500
+		maxRows     = 400000 // ~200 MB of pad; beyond this the seed is no longer fast
+	)
 	ctx, _, pool := dbSizeTestPool(t)
 	dbSizeTestSchema(ctx, t, pool, "dbsize_it_big")
-	if _, err := pool.Exec(ctx, `CREATE TABLE dbsize_it_big.big AS SELECT g, repeat('x',500) AS pad FROM generate_series(1,2000) g`); err != nil {
+
+	// Same relation filters as store.DatabaseSizeStatus, read after the test schema is
+	// dropped so earlier tests' leftovers in the shared database are accounted for.
+	var otherMax int64
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(max(pg_total_relation_size(c.oid)), 0)
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','m')
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'`).Scan(&otherMax); err != nil {
+		t.Fatalf("read current largest relation: %v", err)
+	}
+	// Twice the current largest plus 1 MB of slack; the temp table is twice that again.
+	bigRows := (2*otherMax + 1<<20) / bytesPerRow
+	if bigRows < 2000 {
+		bigRows = 2000
+	}
+	if bigRows*2 > maxRows {
+		t.Skipf("largest existing relation is %d bytes; seeding a larger table would exceed %d rows", otherMax, maxRows)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TABLE dbsize_it_big.big AS SELECT g, repeat('x',500) AS pad FROM generate_series(1,$1::int) g`, bigRows); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	conn, err := pool.Acquire(ctx)
@@ -57,7 +83,7 @@ func TestDatabaseSizeStatusNamesLargestRelationLiveDB(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE dbsize_it_temp AS SELECT g, repeat('y',500) AS pad FROM generate_series(1,20000) g`); err != nil {
+	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE dbsize_it_temp AS SELECT g, repeat('y',500) AS pad FROM generate_series(1,$1::int) g`, bigRows*2); err != nil {
 		t.Fatalf("temp seed: %v", err)
 	}
 
