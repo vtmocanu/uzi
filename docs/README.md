@@ -11,6 +11,8 @@ and a `git blame` see.
 This file itself is exempt from the frontmatter contract below and from
 `check-docs.mjs`'s validation (it is the index/meta page, not a doc).
 
+Repo contributors: see the [Codex 0.160.0 worker UID blocker decision](./codex-0.160.0-worker-uid-blocker.md).
+
 ## Adding a page
 
 1. Create `docs/<slug>.md`. The slug is the filename; it becomes the route
