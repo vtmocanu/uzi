@@ -385,7 +385,7 @@ export type SdkQueryFn = (params: {
   prompt: AsyncIterable<unknown>;
   options: SdkOptions;
 }) => AsyncIterable<SDKMessage> & {
-  getContextUsage?(): Promise<ContextUsageReading>;
+  getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ContextUsageReading>;
 };
 
 /** PRD #516 R1: how long to wait on the `getContextUsage()` control call before

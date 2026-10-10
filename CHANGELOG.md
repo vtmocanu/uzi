@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **The lead context meter reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)).**
+  It skips the per-category token-count API calls the full reading made each turn; the summary answers from the last response's usage plus local estimates, and the meter's fields and timeout are unchanged.
+
 ### Fixed
 
 - **Checkpoint publication tolerates extra flush packets after a plain receive-pack report ([#2703](https://github.com/vtmocanu/uzi/issues/2703)).**

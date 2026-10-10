@@ -5192,7 +5192,7 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
    *  `getContextUsage()` control method, mirroring the real SDK `Query`. */
   function fakeTurnsWithContext(
     scripts: Script[],
-    getContextUsage?: () => Promise<ContextUsageReading>,
+    getContextUsage?: (opts?: { detail?: "summary" | "full" }) => Promise<ContextUsageReading>,
   ): { queryFn: SdkQueryFn; turns: Turn[] } {
     const turns: Turn[] = [];
     let i = 0;
@@ -5212,7 +5212,7 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
         else yield* s as AsyncIterable<SDKMessage>;
       })();
       const instance: AsyncIterable<SDKMessage> & {
-        getContextUsage?: () => Promise<ContextUsageReading>;
+        getContextUsage?: (opts?: { detail?: "summary" | "full" }) => Promise<ContextUsageReading>;
       } = gen;
       if (getContextUsage) instance.getContextUsage = getContextUsage;
       return instance;
@@ -5254,6 +5254,30 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
     const usageFrame = probe.emits.find((m) => m.payload["usage"] === USAGE);
     assert.ok(usageFrame, "the assistant usage frame still carries the per-call usage");
     assert.strictEqual(usageFrame!.payload["context"], undefined, "the usage frame carries no context");
+  });
+
+  it("issue #1300: asks getContextUsage for detail \"summary\" and still attaches the mapped context", async () => {
+    const calls: unknown[][] = [];
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      async (...args: unknown[]) => {
+        calls.push(args);
+        return { totalTokens: 50000, rawMaxTokens: 200000, percentage: 25 };
+      },
+    );
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.ok(calls.length > 0, "the lead turn read the context meter");
+    for (const args of calls) {
+      assert.deepStrictEqual(args, [{ detail: "summary" }], "summary mode skips the per-category token-count calls");
+    }
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.deepStrictEqual(carriers[0]!.payload["context"], { used: 50000, window: 200000, pct: 25 });
   });
 
   it("preserves an unclamped pct > 100 (near/over-compaction) verbatim", async () => {
