@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 18 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all 19 of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
