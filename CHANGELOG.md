@@ -54,6 +54,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **The split TUI footer keeps its key hints beside the restart hint ([#2609](https://github.com/vtmocanu/uzi/issues/2609)).**
+  When "vX installed, restart uzi to use it" shows, the split footer no longer collapses to `? keys · q quit` on wide terminals: it drops the optional hints only as far as needed and right-aligns the full restart text, falling back to the short footer when the hints cannot fit beside it.
+
 - **Retained recovery continues after a refused immediate or wall pause.**
   Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
 
