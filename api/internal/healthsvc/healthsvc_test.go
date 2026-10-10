@@ -12,9 +12,11 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/dbdiskfull"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -510,6 +512,54 @@ func TestDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDBDiskFull(t *testing.T) {
+	pg := func(code string) error { return fmt.Errorf("write: %w", &pgconn.PgError{Code: code}) }
+	clock := fixedNow
+	mk := func() (*Service, *dbdiskfull.Signal) {
+		sig := dbdiskfull.New(func() time.Time { return clock })
+		svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, DiskFull: sig, Now: func() time.Time { return clock }})
+		svc.probeDB = func(context.Context) dbStat { return dbStat{schemaAtHead: true, maxConns: 20} }
+		return svc, sig
+	}
+	t.Run("store write error and commit-shaped error go danger then recover", func(t *testing.T) {
+		for _, err := range []error{pg("53100"), fmt.Errorf("commit: %w", fmt.Errorf("tx: %w", &pgconn.PgError{Code: "53100"}))} {
+			clock = fixedNow
+			svc, sig := mk()
+			sig.Observe(err)
+			c := svc.checkDB(context.Background())
+			if c.Severity != sevDanger || c.Summary != "Database writes are failing: disk full (53100)." {
+				t.Fatalf("got %q / %q", c.Severity, c.Summary)
+			}
+			if len(c.Evidence) != 1 || c.Evidence[0].Label != "Last seen" || c.Evidence[0].Value != fixedNow.UTC().Format(time.RFC3339) {
+				t.Fatalf("evidence = %+v", c.Evidence)
+			}
+			clock = fixedNow.Add(dbdiskfull.Window + time.Second)
+			if c := svc.checkDB(context.Background()); c.Severity != sevOK {
+				t.Fatalf("after window: %q / %q", c.Severity, c.Summary)
+			}
+		}
+	})
+	t.Run("nil probe does not hide it", func(t *testing.T) {
+		clock = fixedNow
+		svc, sig := mk()
+		svc.probeDB = nil
+		sig.Observe(pg("53100"))
+		if c := svc.checkDB(context.Background()); c.Severity != sevDanger {
+			t.Fatalf("got %q", c.Severity)
+		}
+	})
+	t.Run("other errors stay ok", func(t *testing.T) {
+		for _, err := range []error{pg("53200"), pg("53300"), errors.New("unrelated")} {
+			clock = fixedNow
+			svc, sig := mk()
+			sig.Observe(err)
+			if c := svc.checkDB(context.Background()); c.Severity != sevOK {
+				t.Fatalf("%v: got %q / %q", err, c.Severity, c.Summary)
+			}
+		}
+	})
 }
 
 // ---- slack.socket ----------------------------------------------------------

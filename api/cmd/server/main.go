@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/dbdiskfull"
 	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
@@ -198,7 +199,10 @@ func run() error {
 		return err
 	}
 
-	pool, err := store.OpenPool(ctx, cfg.DatabaseURL)
+	// diskFull records SQLSTATE 53100 write failures seen on the api pool; the admin
+	// health db check reads it.
+	diskFull := dbdiskfull.New(time.Now)
+	pool, err := store.OpenPool(ctx, cfg.DatabaseURL, store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}))
 	if err != nil {
 		return err
 	}
@@ -1096,6 +1100,7 @@ func run() error {
 		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
 		Store:                      q,
 		Pool:                       pool,
+		DiskFull:                   diskFull,
 		Settings:                   settingsCache,
 		SlackState:                 slackManager.State,
 		Now:                        time.Now,
