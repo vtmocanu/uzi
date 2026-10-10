@@ -270,6 +270,11 @@ const (
 	// defaults; no seeded row (an absent row synthesizes to the default). The per-user
 	// opt-in lives on users.mr_rework_enabled, not here.
 	KeyMrReworkEnabled = "mr_rework_enabled"
+	// KeyNowSummaryEnabled (PRD #2603) is the admin kill-switch for the model-written "Now"
+	// line on the run progress card (text "true"/"false"). Ships ON like KeyMrReworkEnabled;
+	// the per-user opt-out lives on users.now_summary_enabled (NULL reads as ON). The
+	// effective value for a run is this switch AND the run owner's setting.
+	KeyNowSummaryEnabled = "now_summary_enabled"
 	// KeyDecisionsMemoEnabled (issue #2083) is the admin kill-switch for the run decisions memo
 	// (text "true"/"false"). Off by default: the worker-protocol routes fail closed and the read
 	// half answers enabled=false until an admin turns it on.
@@ -427,6 +432,8 @@ const (
 	// ci-autofix's maxAttempts). Both are the admin-side gates; the per-user opt-in
 	// (also default-on) lives on users.mr_rework_enabled.
 	DefaultMrReworkEnabled = "true"
+	// DefaultNowSummaryEnabled: the Now summary ships on (PRD #2603 D2).
+	DefaultNowSummaryEnabled = "true"
 	// DefaultDecisionsMemoEnabled: the memo ships dark (issue #2083).
 	DefaultDecisionsMemoEnabled = "false"
 	DefaultMrReworkCap          = "5"
@@ -569,6 +576,7 @@ var Defaults = map[string]string{
 	// judge keys: an absent row synthesizes to these defaults, so All/AdminView
 	// surface them to the settings page on every instance and no migration seeds them.
 	KeyMrReworkEnabled:      DefaultMrReworkEnabled,
+	KeyNowSummaryEnabled:    DefaultNowSummaryEnabled,
 	KeyDecisionsMemoEnabled: DefaultDecisionsMemoEnabled,
 	KeyMrReworkCap:          DefaultMrReworkCap,
 	KeyMrReviewTrustedBots:  "",

@@ -352,3 +352,33 @@ Only the fields the folds read are kept (`event`, `usage_basis`, `fresh_session`
 | vitest | `web/src/lib/runUsageContract.test.ts` | `model_totals` and `totals` via `deriveRunUsage` |
 
 The Go halves need `-count=1` (this directory is outside the `api` module).
+
+## The `notes` pair: Now-summary usage rows (PRD #2603)
+
+`result-frames-notes.json` / `run-usage-notes.json` pins how the usage of the model-written
+"Now" summary (the `progress_note` message kind) folds. Both files are **authored**: no live
+run exists yet, and the rollup is an independent hand reduction, not either production fold.
+
+One Claude leg: an `init` (seq 1), a lead result frame (seq 5) whose `modelUsage` includes
+`claude-haiku-4-5-20251001` (the model the summary also uses), and two `progress_note`
+frames (seq 6 and 9) in the same leg. The fold rule:
+
+- a note's `model_usage` is folded under `model = "progress_note:<model>"` and
+  `lineage_epoch = <the note's own seq>`, never the init-count epoch of a result frame;
+- so the lead's haiku row (epoch 1) and each note row are three separate groups, and the
+  `run_usage_totals` MAX-per-group sums them all: input 2600, output 2400, cache_read 50000,
+  cache_creation 3000, cost 1.5024;
+- the notes carry no `costUSD`, so the server prices them from the standard Anthropic table
+  (haiku: $1 per million input, $5 per million output) rather than storing a metered $0;
+- a note payload has no `event` and no `usage` key, so no result-frame reader counts it.
+
+The discriminator: dropping the prefix (or keying by the init count) collapses all three haiku
+rows into one group and under-counts haiku input by 900 and output by 100. The Go reader asserts
+the rows and totals and that collapsed reading differs.
+
+| | reads | asserts |
+|---|---|---|
+| Go unit | `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageNotesFoldMatchesAuthoredRollup`) | `rows` and `totals` through `AppendMessages` |
+| vitest | `web/src/lib/runUsageContract.test.ts` (added by the web unit) | `totals` via `deriveRunUsage` |
+
+The Go half needs `-count=1` (this directory is outside the `api` module).

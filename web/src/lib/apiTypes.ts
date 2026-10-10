@@ -198,6 +198,10 @@ export interface UserSettings {
    *  the user opted this account out, so the watcher stops auto-reworking their MRs.
    *  The admin global kill-switch is separate. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user switch for the model-written "Now" line on the run progress card (PRD #2603);
+   *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
+   *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
+  now_summary_enabled?: boolean | null;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -246,6 +250,9 @@ export interface UserSettingsPatch {
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
    *  present-true (or null clearing back to the default-ON) re-enables. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user "Now" summary switch (PRD #2603); present-false opts out, present-true (or
+   *  null clearing back to the default-ON) re-enables. */
+  now_summary_enabled?: boolean | null;
   /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
    *  present-null clears back to "no preference", absent leaves it unchanged. */
   default_harness?: Harness | null;
@@ -1001,6 +1008,11 @@ export interface AppSettings {
   // "true"). When OFF, no user's failed pipeline is auto-fixed regardless of their
   // per-user opt-in — the admin per-user CI-autofix toggle is inert while it is off.
   ci_autofix_enabled: string;
+  // Instance-wide kill-switch for the model-written "Now" summary on the run progress card
+  // (PRD #2603). The text "true"/"false" (default "true"). When OFF, no run shows or
+  // generates a summary regardless of a user's per-user setting. Optional so a response from
+  // an older server (and fixtures that predate the key) still type-check.
+  now_summary_enabled?: string;
   // Ephemeral worker auto-provisioning instance kill-switch (PRD #529 / #649 M1).
   // The text "true"/"false" (default "false"). When OFF, no run ever auto-provisions
   // a throwaway hosted worker regardless of a user's per-account opt-in; when ON,
@@ -2624,6 +2636,11 @@ export interface RunProgress {
   // GetRun only, while awaiting_input: a live run of the same owner and repo the open
   // question mentions as #<issue>. A hint from untrusted text, not a recorded dependency.
   maybe_blocked_by_run_id?: string;
+  // GetRun only (PRD #2603): the newest model-written one-sentence summary for the active
+  // milestone, present only while state is "percent" and the run owner's setting is on.
+  // `text` is model-authored UNTRUSTED plain text (render as text, never Markdown); `at` is
+  // when the worker posted it.
+  now_note?: { text: string; at: string } | null;
 }
 
 // Milestone is one item of a milestone-structured run (PRD #122): a stable id and a

@@ -1504,6 +1504,18 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if res.Receipts {
 		body["receipts"] = true
 	}
+	// PRD #2603: the effective model-written Now-summary setting for THIS run's owner (instance
+	// switch AND the owner's own switch). One cheap read per poll: the instance key is a cache
+	// hit and the user switch is a primary-key read. Left out on the consume-nothing early
+	// returns (OwnerID unset) and on a read error; the worker reads a missing field as off, so a
+	// failed read can never spend a token.
+	if res.OwnerID != uuid.Nil {
+		if on, err := h.EffectiveNowSummary(r.Context(), res.OwnerID); err != nil {
+			slog.Warn("worker run inputs: now summary setting", "run_id", runID, "error", err)
+		} else {
+			body["now_summary"] = on
+		}
+	}
 	httpx.JSON(w, http.StatusOK, body)
 }
 

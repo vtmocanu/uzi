@@ -461,7 +461,7 @@ func Validate(key, value string) error {
 		return validateTypeface(value)
 	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyCompletionInterlockRollout, KeyGithubProjectSyncEnabled,
-		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled, KeyDecisionsMemoEnabled,
+		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled, KeyDecisionsMemoEnabled, KeyNowSummaryEnabled,
 		KeyCiAutofixEnabled,
 		KeyReleaseCheckEnabled, KeyReleaseCheckBannerEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:

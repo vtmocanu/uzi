@@ -122,6 +122,19 @@ type RunProgress struct {
 	// mentions as #<issue>. It is a hint from untrusted question text, not a recorded
 	// dependency, and never names a run the owner could not see.
 	MaybeBlockedByRunID *string `json:"maybe_blocked_by_run_id,omitempty"`
+	// NowNote is set on GetRun only (never on a list read), only while State is percent, the
+	// active milestone is non-empty and the effective now-summary setting of the RUN OWNER is
+	// on (PRD #2603): the newest non-empty model-written note for that milestone. The text is
+	// model-authored UNTRUSTED plain text, sanitised and capped at 120 runes on ingest and again
+	// on read; a consumer renders it as plain text only.
+	NowNote *ProgressNote `json:"now_note,omitempty"`
+}
+
+// ProgressNote is the model-written one-sentence "Now" summary on RunProgress.NowNote
+// (PRD #2603): Text is at most 120 runes of plain text and At is when the worker posted it.
+type ProgressNote struct {
+	Text string    `json:"text"`
+	At   time.Time `json:"at"`
 }
 
 // IsTerminalRunStatus reports whether a run status is one a run never leaves — the

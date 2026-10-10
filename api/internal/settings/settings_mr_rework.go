@@ -76,3 +76,12 @@ func validateMrReworkCap(value string) error {
 	}
 	return nil
 }
+
+// NowSummaryEnabled reports the instance-wide kill-switch for the model-written "Now"
+// summary (PRD #2603). Same three-state, error-propagating read as MrReworkEnabled:
+// present-true / present-false / absent (the default ON) are values, a store read error
+// is returned to the caller, which owns the fail-closed mapping (a summary is a
+// nice-to-have, so the callers read an error as OFF).
+func (c *Cache) NowSummaryEnabled(ctx context.Context) (bool, error) {
+	return c.boolSetting(ctx, KeyNowSummaryEnabled)
+}

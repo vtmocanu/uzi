@@ -1155,7 +1155,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// of sidebar_token_ids).
 		"sidebar_codex_account_ids",
 		// PRD #1551 M1 (D2): the retained per-harness worker-model lanes (each null ⇒ inherit).
-		"default_claude_model", "default_codex_model")
+		"default_claude_model", "default_codex_model",
+		// PRD #2603: the per-user model-written "Now" summary switch (null ⇒ default ON).
+		"now_summary_enabled")
 }
 
 func TestCrossCheckPinDTOTags(t *testing.T) {

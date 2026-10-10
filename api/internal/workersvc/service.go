@@ -5329,6 +5329,11 @@ type ConsumeInputsResult struct {
 	// #1673). Absent, the reply was consumed on read: an older api pod mid-roll, or a legacy
 	// worker, and the worker routes it with no receipts.
 	Receipts bool
+	// OwnerID is the run owner's user id, set only on the paths that return the normal inputs
+	// reply (not on the pending-switch or released-claim early returns). The handler resolves the
+	// per-run now-summary setting for THIS user, never the caller's (PRD #2603); a nil id means
+	// "omit the field", which the worker reads as off.
+	OwnerID uuid.UUID
 }
 
 // ConsumeInputs returns steering inputs for a run the worker owns, FIFO.
@@ -5375,7 +5380,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		for _, row := range rows {
 			out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 		}
-		return ConsumeInputsResult{Inputs: out, Receipts: true}, nil
+		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
@@ -5398,7 +5403,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if consumedFollowUp && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return ConsumeInputsResult{Inputs: out}, nil
+	return ConsumeInputsResult{Inputs: out, OwnerID: run.UserID}, nil
 }
 
 // ConsumedFollowUps returns the already-consumed follow_up inputs of a run the worker owns,

@@ -1390,6 +1390,7 @@ type User struct {
 	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
 	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
 	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
+	NowSummaryEnabled       pgtype.Bool        `json:"now_summary_enabled"`
 }
 
 type UserCrossCheckPin struct {
