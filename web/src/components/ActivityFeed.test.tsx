@@ -1590,6 +1590,8 @@ describe("summary_usage exclusion (issue #2686)", () => {
     const r = renderFeed(messages, { status: "completed" });
     expect(r.getAllByText("real one").length).toBeGreaterThan(0);
     expect(r.queryByText(/unrenderable/i)).toBeNull();
+    // The feed filter, not only RunEventRow, must drop it: it is not counted as a message.
+    expect(r.getByText("1 messages")).toBeTruthy();
   });
 });
 

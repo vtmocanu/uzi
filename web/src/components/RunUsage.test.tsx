@@ -143,7 +143,7 @@ describe("RunUsagePanel", () => {
     expect(unpriced?.[5]).not.toMatch(/\$0/);
   });
 
-  it("shows Plan & PR summaries as its own row so Run total equals the sum of the rows", () => {
+  it("shows Intent, plan & PR summaries as its own row so Run total equals the sum of the rows", () => {
     seq = 0;
     const msgs: RunMessage[] = [
       m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
@@ -157,13 +157,13 @@ describe("RunUsagePanel", () => {
     const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
       Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
     );
-    expect(rows.find((r) => r[0] === "Plan & PR summaries")).toEqual(["Plan & PR summaries", "—", "400", "100", "50", "$0.01"]);
+    expect(rows.find((r) => r[0] === "Intent, plan & PR summaries")).toEqual(["Intent, plan & PR summaries", "—", "400", "100", "50", "$0.01"]);
     expect(rows.find((r) => r[0] === "Run total")?.slice(2, 5)).toEqual(["1.4k", "2.1k", "350"]);
   });
 
-  it("omits the Plan & PR summaries row when no pass carried usage", () => {
+  it("omits the Intent, plan & PR summaries row when no pass carried usage", () => {
     const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
-    expect(queryByText("Plan & PR summaries")).toBeNull();
+    expect(queryByText("Intent, plan & PR summaries")).toBeNull();
   });
 
   it("omits the Now summaries row when no note carried usage", () => {

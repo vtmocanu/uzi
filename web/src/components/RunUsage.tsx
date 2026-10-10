@@ -269,7 +269,7 @@ export function RunUsagePanel({
               )}
               {(summaryTotal.fresh + summaryTotal.cached + summaryTotal.out > 0 || summaryTotal.costUsd > 0) && (
                 <tr>
-                  <Td left>Plan &amp; PR summaries</Td>
+                  <Td left>Intent, plan &amp; PR summaries</Td>
                   <Td>—</Td>
                   <Td>{formatTokens(summaryTotal.fresh)}</Td>
                   <Td>{formatTokens(summaryTotal.cached)}</Td>
