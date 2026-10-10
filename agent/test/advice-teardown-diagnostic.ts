@@ -54,6 +54,11 @@ export class AdviceTeardownDiagnostic {
     this.record("phase", { phase });
   }
 
+  /** True when any recorded supervisor evidence reports a provider child_exit, before or after dispose_start. */
+  providerChildExitObserved(): boolean {
+    return this.events.some((e) => e.event === "evidence" && e.category === "child_exit");
+  }
+
   private failureSignature(warnings: Record<string, unknown>[]): Record<string, unknown> {
     const disposeStart = this.events.find((e) => e.event === "phase" && e.phase === "dispose_start");
     const known = disposeStart !== undefined && !this.truncated;

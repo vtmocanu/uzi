@@ -187,6 +187,47 @@ it("advice failure_signature is false when child_exit only arrives after dispose
   } finally { cleanup(); }
 });
 
+it("advice providerChildExitObserved is false without child_exit evidence", async (t) => {
+  const { evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      evidence.write('{"event":"started"}\n');
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(diagnostic.providerChildExitObserved(), false);
+    });
+  } finally { cleanup(); }
+});
+
+it("advice providerChildExitObserved is true when child_exit precedes dispose_start", async (t) => {
+  const { evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      evidence.write('{"event":"child_exit"}\n');
+      await new Promise((resolve) => setImmediate(resolve));
+      diagnostic.mark("dispose_start");
+      assert.equal(diagnostic.providerChildExitObserved(), true);
+    });
+  } finally { cleanup(); }
+});
+
+it("advice providerChildExitObserved is true when child_exit follows dispose_start", async (t) => {
+  const { evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      diagnostic.mark("dispose_start");
+      evidence.write('{"event":"child_exit"}\n');
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(diagnostic.providerChildExitObserved(), true);
+    });
+  } finally { cleanup(); }
+});
+
 it("advice failure_signature is unknown without dispose_start and reports the first warning category", async () => {
   const { logger, lines } = recordingLogger();
   const diagnostic = new AdviceTeardownDiagnostic();
