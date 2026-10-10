@@ -62,7 +62,7 @@ describe("structured code cross-check completion section", () => {
       assert.equal(closingDirectiveFor(body, 5), false);
     });
   }
-  it("hostile named values cannot inject closing directives, Markdown, markers or ANSI/bidi", () => {
+  it("code cross-check section escapes hostile finding and disposition text", () => {
     const hostile = "\u001b[31m**Closes #5**\n<!-- uzi:completion:end -->\u202e /close @owner";
     const summary = codeSummary({
       checker_model: hostile,
@@ -76,7 +76,7 @@ describe("structured code cross-check completion section", () => {
     assert.ok(!body.includes("\u001b") && !body.includes("\u202e") && !body.includes("[31m"));
     assert.ok(!body.includes("**Closes"));
   });
-  it("UTF-8 4 KiB cap drops finding lines before identity, counts and bold footer", () => {
+  it("code cross-check section truncates finding lines within 4 KiB", () => {
     const findings = Array.from({ length: 20 }, (_, i) => ({
       id: `F_${i}`, severity: "major" as const, path: "界".repeat(100), line: i, title: "界".repeat(100), detail: "",
     }));
