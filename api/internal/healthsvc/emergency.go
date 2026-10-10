@@ -17,7 +17,8 @@ const emergencyNoticeCooldown = 30 * time.Minute
 
 // emergencyDiskFullLine is the fixed server-authored line every emergency notice carries,
 // whether or not the evaluated document still lists the db disk-full danger check. It is
-// the same text the db check uses as its summary.
+// the single source of the db check's disk-full summary (checkDB uses this const), and
+// withDiskFullLine dedups against it.
 const emergencyDiskFullLine = "Database writes are failing: disk full (53100)."
 
 // emergencyKey identifies one admin's cooldown slot within one disk-full incident.
@@ -149,6 +150,6 @@ func withDiskFullLine(danger []dangerCheck) []dangerCheck {
 		}
 	}
 	out := make([]dangerCheck, 0, len(danger)+1)
-	out = append(out, dangerCheck{ID: "db.disk_full", Title: "Database", Summary: emergencyDiskFullLine})
+	out = append(out, dangerCheck{ID: "db", Title: "Database", Summary: emergencyDiskFullLine})
 	return append(out, danger...)
 }

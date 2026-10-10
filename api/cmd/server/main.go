@@ -1122,7 +1122,7 @@ func run() error {
 	// gate the custody-episode reconciler reuses, no new enable flag, D10). notifier and
 	// settingsCache are the same collaborators wired into custodyEpisodeRec above.
 	// WithEmergencySlack adds the in-memory disk-full DM for a database that refuses the
-	// claim/persist writes (SQLSTATE 53100); see EpisodeReconciler for its limits.
+	// episode-open/claim/persist writes (SQLSTATE 53100); see EpisodeReconciler for its limits.
 	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default()).
 		WithEmergencySlack(slackNotifier, diskFull)
 	healthEpisodeInterval := time.Minute

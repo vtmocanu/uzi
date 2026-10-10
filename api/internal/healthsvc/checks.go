@@ -624,7 +624,7 @@ func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthChe
 	// "probe not configured". It is a fixed server-authored string; no DB error text.
 	if active, last, start := s.cfg.DiskFull.Snapshot(now); active {
 		c.Severity = sevDanger
-		c.Summary = "Database writes are failing: disk full (53100)."
+		c.Summary = emergencyDiskFullLine
 		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Last seen", Value: last.UTC().Format(time.RFC3339)}}
 		c.Since = sincePtr(start)
 		c.Action = strPtr("The database volume is full. Free space or grow the volume; see the admin health docs for the recommended infrastructure free-space alert.")

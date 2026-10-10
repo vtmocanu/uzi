@@ -46,10 +46,16 @@ import (
 // That claim-based exactly-once guarantee holds for the normal path only. The optional
 // emergency path (WithEmergencySlack) exists for a database that refuses writes with
 // SQLSTATE 53100, where no claim or episode can be recorded: it publishes the Slack DM
-// directly, deduplicated only by per-replica, in-memory state that resets on restart, so
-// replicas may each notify the same admin once. It still needs database reads (the
-// HealthEnabled setting, ListAdmins and the Slack opt-in lookup), and its cooldown is armed
-// even when the enqueue is dropped or the admin has not opted in to Slack DMs.
+// directly, deduplicated only by per-replica, in-memory state (Signal, generation and
+// cooldown) that resets on restart. Each replica therefore keeps its own cooldown and may
+// notify an admin once per emergencyNoticeCooldown per incident, not once overall. It still
+// needs database reads (the HealthEnabled setting, ListAdmins and the Slack opt-in lookup),
+// and its cooldown is armed even when the enqueue is dropped or the admin has not opted in
+// to Slack DMs.
+//
+// Accepted overlap: after writes recover, the db check stays danger for dbdiskfull.Window,
+// so the episode can open and the normal claimed notice can follow an emergency notice to
+// the same admin within the cooldown. This is accepted, not deduplicated.
 //
 // Its decision logic is unit-tested with fakes (this is not a live-DB test — healthsvc is
 // not in the sweep-enumerated live-DB package list; the claim query's atomicity is proven in
@@ -119,18 +125,21 @@ func NewEpisodeReconciler(eval healthEvaluator, st episodeStore, notifier episod
 // Only instance danger opens an episode and fires the fan-out. Everything
 // else is a no-op. Best-effort: every error is logged, never returned.
 func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
-	doc, err := r.eval.Evaluate(ctx)
-	if err != nil {
-		r.logger.Error("health episode: evaluate", "error", err)
-		return
-	}
-	blocking := doc.Blocking
+	// Registered before Evaluate so every exit, including a failed evaluation, ends the
+	// consecutive-53100 run unless this tick's open fails with 53100 (openDiskFull).
 	openDiskFull := false
 	defer func() {
 		if !openDiskFull {
 			r.resetEmergencyStreak()
 		}
 	}()
+
+	doc, err := r.eval.Evaluate(ctx)
+	if err != nil {
+		r.logger.Error("health episode: evaluate", "error", err)
+		return
+	}
+	blocking := doc.Blocking
 
 	open, err := r.store.GetOpenHealthEpisode(ctx)
 	hasOpen := true

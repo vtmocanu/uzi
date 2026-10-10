@@ -196,6 +196,11 @@ func TestEmergency_StreakResets(t *testing.T) {
 			h.tick()
 			h.st.openRetErr = pg53100()
 		},
+		"evaluate fails": func(h *emergencyHarness) {
+			h.ev.err = errors.New("evaluate boom")
+			h.tick()
+			h.ev.err = nil
+		},
 		"open loses a unique race": func(h *emergencyHarness) {
 			h.st.openRetErr = &pgconn.PgError{Code: "23505"}
 			h.tick()
