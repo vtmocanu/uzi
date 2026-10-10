@@ -1205,9 +1205,10 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     assert.equal(handle.failed, undefined, "exactly cap");
     fake.evidence.write(Buffer.from("x"));
     await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.ok(handle.failed instanceof TrustedExecutionRefusal, "crossing write must immediately refuse without a delimiter");
-    assert.equal(handle.failed.message, "oversized evidence line (> 65536 bytes)");
-    assert.equal(classifyCodexLaunchFailure(handle.failed), "protocol_evidence");
+    const failure = handle.failed as Error | undefined;
+    assert.ok(failure instanceof TrustedExecutionRefusal, "crossing write must immediately refuse without a delimiter");
+    assert.equal(failure.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(classifyCodexLaunchFailure(failure), "protocol_evidence");
     assert.equal(fake.evidence.destroyed, true);
   });
 
