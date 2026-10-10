@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { decodeCodeFindings, decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
+import { decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
 import os from "node:os";
 import path from "node:path";
 import { RequestError, type WorkerClient, type PlanCrossCheckFindings } from "./client.js";
@@ -8,7 +8,7 @@ import type { GitCache, CodeSnapshotBootCandidate } from "./git.js";
 import type { Logger } from "./log.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Outbox } from "./outbox.js";
-import { CodexCrossCheck, CrossCheckMalformedError } from "./codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, validateCodeFindings } from "./codex/cross-check.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { ClaudeCrossCheck } from "./claude-cross-check.js";
 import { SECRET_PATH_PREFIXES } from "./guardrails.js";
@@ -146,7 +146,7 @@ export class CrossCheckRunner {
         || (candidate.stage !== "plan" && candidate.stage !== "code")
         || !Number.isInteger(candidate.round) || candidate.round < 1 || candidate.round > 5
         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)
-        || (code && (candidate.round !== 1 || checker !== this.model || !/^[a-f0-9]{40}$/.test(code.head_commit))))
+        || (code && (candidate.round !== 1 || !/^[a-f0-9]{40}$/.test(code.head_commit))))
         throw new Error("invalid checker claim");
       const deadline = Date.parse(candidate.deadline_at);
       const timeout = Math.min(this.opts.modelTimeoutMs ?? 15 * 60_000, deadline - Date.now());
@@ -170,7 +170,7 @@ export class CrossCheckRunner {
           ["diff", "--no-ext-diff", "--no-textconv", "--no-color", `${code.base_commit}...${code.head_commit}`],
           { maxBytes: 1024 * 1024, signal: cancel.signal });
         // Never present a truncated patch as a complete diff; file tools still see exact H.
-        code.code_diff = diff.truncated ? "Diff exceeds 1 MiB; inspect committed files through Read and Search." : diff.text;
+        code.code_diff = diff.truncated ? "Diff exceeds 1 MiB; inspect committed files through read-only tools." : diff.text;
       } else checkout = await this.git.runnerCloneAtCommit(bare, candidate.base_commit, runId);
       cancel.signal.throwIfAborted();
       await fs.mkdir(this.opts.homeRoot ?? os.tmpdir(), { recursive: true });
@@ -185,10 +185,8 @@ export class CrossCheckRunner {
       cancel.signal.throwIfAborted();
       reason = "malformed";
       if (code) {
-        if (Buffer.byteLength(text) > 32784) throw new CrossCheckMalformedError("code findings output exceeds cap");
-        const value = JSON.parse(text);
-        if (!value || Object.keys(value).join(",") !== "findings") throw new CrossCheckMalformedError("invalid code findings object");
-        const findings = decodeCodeFindings(value.findings);
+        if (!nativeCleanupConfirmed) throw new Error("cross-check cleanup unconfirmed");
+        const findings = validateCodeFindings(text);
         const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation }, cancel.signal);
         cancel.signal.throwIfAborted();
         if (probe?.staleClaim || steering.claimLost()) return;

@@ -1,4 +1,3 @@
-import os from "node:os";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
@@ -126,6 +125,8 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 
+await fs.mkdir(path.resolve(import.meta.dirname, "../../.uzi/scratch"), { recursive: true });
+
 for (const round of [1, 2]) for (const mode of ["approve", "approve-round2", "approve-pinned", "invalidfinding", "rejection", "terminal-rejection", "legacy-rejection", "default-rejection", "unrelated-rejection", "activity-rejection", "cleanup-rejection", "invalid-effort"] as const) {
  if (round === 2 && mode === "approve-round2") continue;
 it("outer checker uses real Read broker, actual HTTP verdict delivery and journaled child completion: " + mode + " round " + (mode === "approve-round2" ? 2 : round), async () => {
@@ -145,7 +146,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   verdict: "approve", summary: "Anchors checked",
   items: [{ file: "anchor.ts", severity: "invalid", summary: "Finding", rationale: "Read anchor" }],
  });
- const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "cross-check-test-"));
+ const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "cross-check-test-"));
  const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
   runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86400000 });
  await outbox.init();
@@ -276,7 +277,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
 
 for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "timeout", "cancel", "lost-ack", "lost-terminal-ack", "cancel-probe", "timeout-probe", "finding-schema"] as const) {
  it("outer checker fails closed or abandons: " + mode, async () => {
-  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "checker-failure-"));
+  const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "checker-failure-"));
   const states: string[] = [];
   const decisions: any[] = [];
   let modelCalls = 0;
@@ -356,7 +357,7 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
 }
 
 it("exact-commit clone stays on immutable base after default and tracking refs advance", async () => {
- const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "exact-check-"));
+ const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "exact-check-"));
  const exec = promisify(execFile);
  const origin = path.join(root, "origin");
  const git = async (...args: string[]) => (await exec("git", ["-C", origin, ...args],

@@ -1,5 +1,5 @@
-// The Claude plan checker (PRD #2460): a one-turn, read-only Claude SDK session that reviews a
-// Codex lead's plan candidate. It is the mirror of codex/cross-check.ts (CodexCrossCheck) and is
+// The Claude checker (PRDs #2460 and #2170): a read-only Claude SDK session that reviews a
+// Codex lead's plan candidate or committed code. It is the mirror of codex/cross-check.ts (CodexCrossCheck) and is
 // pluggable into CrossCheckRunner with the same `run` signature.
 //
 // Confinement is the isolated lane's, not a weaker copy (isolated-executor.ts):
@@ -21,7 +21,7 @@ import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, Spa
 import type { ClaimResponse } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateVerdict } from "./codex/cross-check.js";
+import { codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import {
   BUILTIN_PLUGINS_DISABLED,
@@ -35,7 +35,7 @@ import {
 } from "./isolated-executor.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { defaultQueryFn, isErrorResult, isResult, mapSdkMessage, promptStream } from "./sdk-messages.js";
-import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
+import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The checker's whole tool surface: read-only, no MCP, no plugin, no skill. */
@@ -142,6 +142,7 @@ export function buildClaudeCrossCheckOptions(input: {
   model?: string;
   effort?: EffortLevel;
   spawn?: (opts: SpawnOptions) => SpawnedProcess;
+  toolBudgetHook?: (input: HookInput) => Promise<HookJSONOutput>;
 }): SdkOptions {
   const options: SdkOptions = {
     cwd: input.cwd,
@@ -170,6 +171,7 @@ export function buildClaudeCrossCheckOptions(input: {
           secretPaths: input.secretPaths, sdkHomeDir: input.homeDir,
         }),
         { matcher: "Glob|Grep", hooks: [buildCheckerPatternGuard(input.log)] },
+        ...(input.toolBudgetHook ? [{ hooks: [input.toolBudgetHook] }] : []),
       ],
     },
     includePartialMessages: false,
@@ -190,12 +192,71 @@ function hasContent(msg: Record<string, unknown>): boolean {
   return Array.isArray(content) && content.length > 0;
 }
 
+/** Hook reservations and assistant tool_use blocks share IDs, so each call counts once.
+ * Root and nested frames both count; the latch refuses every call after exhaustion. */
+class CodeToolBudget {
+  private readonly ids = new Set<string>();
+  private readonly executed = new Set<string>();
+  private readonly observed = new Set<string>();
+  private exceeded = false;
+  constructor(private readonly abort: AbortController) {}
+  private admit(id: unknown): boolean {
+    if (this.exceeded) return false;
+    if (typeof id !== "string" || !id || (!this.ids.has(id) && this.ids.size >= 200)) {
+      this.exceeded = true;
+      this.abort.abort(new Error("cross-check tool budget exceeded"));
+      return false;
+    }
+    this.ids.add(id);
+    return true;
+  }
+  readonly hook = async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse") return {};
+    const id = input.tool_use_id;
+    if (!this.executed.has(id) && this.admit(id)) { this.executed.add(id); return {}; }
+    this.exceeded = true;
+    this.abort.abort(new Error("cross-check tool budget exceeded"));
+    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
+      permissionDecisionReason: "cross-check tool budget exceeded" } };
+  };
+  observe(frame: Record<string, unknown> | undefined): void {
+    if (frame?.["type"] !== "assistant") return;
+    const content = asRecord(frame["message"])?.["content"];
+    if (Array.isArray(content)) for (const raw of content) {
+      const block = asRecord(raw);
+      if (block?.["type"] === "tool_use") {
+        const id = block["id"];
+        if (!CHECKER_SURFACE.tools.includes(String(block["name"]))) throw new Error("cross-check confinement refused: unallowed tool block");
+        if (typeof id === "string" && this.observed.has(id)) throw new Error("cross-check confinement refused: repeated tool block");
+        if (this.admit(id)) this.observed.add(id as string);
+      }
+    }
+    this.assertWithinBudget();
+  }
+  assertWithinBudget(): void {
+    if (this.exceeded) throw new Error("cross-check confinement refused: tool budget exceeded");
+  }
+}
+
+/** A timeout never certifies a still-pending reader shutdown. */
+async function boundedCleanup<T>(work: Promise<T>, deadline: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("cleanup deadline exceeded")), Math.max(1, deadline - Date.now()));
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
 export interface ClaudeCrossCheckOptions {
   /** Worker credential paths the path guard denies. Required and non-empty. */
   secretPaths: readonly string[];
   queryFn?: SdkQueryFn;
   spawn?: (opts: SpawnOptions) => { pid?: number };
   kill?: (pid: number | undefined) => boolean;
+  /** Code cleanup uses group-only signals, never a reused bare PID. */
+  killGroupOnly?: (pgid: number) => boolean;
+  groupPresent?: (pgid: number) => boolean | undefined;
   maxTurns?: number;
 }
 
@@ -215,12 +276,13 @@ export class ClaudeCrossCheck {
 
   /** Same contract as CodexCrossCheck.run: returns the verdict JSON text or throws. */
   async run(claim: ClaimResponse, checkout: string, home: string, signal: AbortSignal,
-    postUsage: (payload: Record<string, unknown>) => Promise<void>): Promise<string> {
+    postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void): Promise<string> {
     if (claim.kind !== "cross_check") throw new Error("cross-check requires a cross_check claim");
     if (claim.secrets.codex) throw new Error("cross-check Claude path refuses a Codex credential");
     const token = claim.secrets.anthropic_oauth_token?.trim();
     if (!token) throw new CrossCheckCheckerUnavailableError();
     const prompt = crossCheckPrompt(claim);
+    const code = claim.cross_check?.stage === "code";
     const effort = claim.config?.default_effort;
     if (claim.cross_check?.effort_source === "pin" && !EFFORTS.includes(effort ?? "")) {
       throw new CrossCheckCheckerUnavailableError();
@@ -235,17 +297,24 @@ export class ClaudeCrossCheck {
     if (signal.aborted) abort.abort(signal.reason);
     else signal.addEventListener("abort", onCancel, { once: true });
     const pids = new Set<number>();
+    let unknownSpawn = false;
+    let iterator: AsyncIterator<unknown> | undefined;
+    let readersStopped = false;
+    let queryStarted = false;
+    const budget = code ? new CodeToolBudget(abort) : undefined;
     let usageInit = false;
     let resultPosted = false;
     let failed = true;
     try {
       const options = buildClaudeCrossCheckOptions({
         cwd: checkout, homeDir: home, oauthToken: token, log: this.log, secretPaths: this.opts.secretPaths, gate,
-        brief: crossCheckBrief("Read, Grep and Glob"), maxTurns: this.opts.maxTurns,
+        brief: code ? codeCrossCheckBrief("Read, Grep and Glob") : crossCheckBrief("Read, Grep and Glob"), maxTurns: this.opts.maxTurns,
+        ...(budget ? { toolBudgetHook: budget.hook } : {}),
         ...(model ? { model } : {}), ...(effort ? { effort } : {}),
         spawn: (spawnOpts) => {
           const proc = this.spawn(spawnOpts);
-          if (typeof proc.pid === "number") pids.add(proc.pid);
+          if (Number.isSafeInteger(proc.pid) && proc.pid! > 0) pids.add(proc.pid!);
+          else unknownSpawn = true;
           return proc as unknown as SpawnedProcess;
         },
       });
@@ -255,11 +324,18 @@ export class ClaudeCrossCheck {
       let resultFrame: Record<string, unknown> | undefined;
       // issue #2213: the last statement before the credential-bearing provider spawn.
       assertResidueQuarantineOpen("provider_turn");
-      for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
+      queryStarted = true;
+      iterator = this.queryFn({ prompt: promptStream(prompt), options })[Symbol.asyncIterator]();
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) { readersStopped = true; break; }
+        const msg = next.value;
         signal.throwIfAborted();
+        budget?.assertWithinBudget();
         const refusal = guardIsolatedFrame(msg, gate, CHECKER_SURFACE);
         if (refusal) throw new Error(`cross-check confinement refused: ${refusal}`);
         const frame = asRecord(msg);
+        budget?.observe(frame);
         if (frame?.["type"] === "system" && frame["subtype"] === "init") {
           for (const em of mapSdkMessage(msg)) {
             if (em.payload["event"] === "init") { await postUsage({ ...em.payload, harness: "claude" }); usageInit = true; }
@@ -290,13 +366,45 @@ export class ClaudeCrossCheck {
       if (typeof text !== "string" || Buffer.byteLength(text) > MAX_VERDICT_BYTES) {
         throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict");
       }
-      validateVerdict(text);
+      if (code) validateCodeFindings(text);
+      else validateVerdict(text);
       failed = false;
       return text;
+    } catch (err) {
+      budget?.assertWithinBudget();
+      throw err;
     } finally {
       signal.removeEventListener("abort", onCancel);
       abort.abort();
-      for (const pid of pids) this.kill(pid);
+      // Stop query readers before certifying owned native groups. One shared 5s deadline,
+      // no retry of reader shutdown; a failed group does not prevent sibling cleanup.
+      const deadline = Date.now() + 5000;
+      if (iterator && !readersStopped) {
+        try {
+          if (iterator.return) {
+            const stopped = await boundedCleanup(iterator.return(), deadline);
+            readersStopped = stopped.done === true;
+          }
+        } catch { readersStopped = false; }
+      }
+      let clean = !unknownSpawn && (!queryStarted || readersStopped);
+      if (code || confirmNativeCleanup) {
+        const present = this.opts.groupPresent ?? processGroupPresent;
+        const kill = this.opts.killGroupOnly ?? killProcessGroupOnly;
+        for (const pid of pids) {
+          try {
+            let state = present(pid);
+            if (state === true) {
+              kill(pid);
+              while (state === true && Date.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+                state = present(pid);
+              }
+            }
+            if (state !== false) clean = false;
+          } catch { clean = false; }
+        }
+      } else for (const pid of pids) this.kill(pid);
       try {
         if (usageInit && !resultPosted) {
           await postUsage({ event: "result", subtype: "cross_check", is_error: failed || signal.aborted, modelUsage: {} });
@@ -304,6 +412,8 @@ export class ClaudeCrossCheck {
       } finally {
         this.log.removeSecret(token);
       }
+      if ((code || confirmNativeCleanup) && !clean) throw new Error("cross-check confinement refused: cleanup unconfirmed");
+      if (clean) confirmNativeCleanup?.();
     }
   }
 }

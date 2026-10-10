@@ -33,7 +33,8 @@ Return exactly one complete JSON object, no prose, markdown fences or trailing t
 Only an evidenced plan merits approve. You cannot change files, run commands or delegate.`;
 }
 const BRIEF = crossCheckBrief("Read and Search");
-const CODE_BRIEF = `You are the code cross-checker. Use only Read and Search; you cannot change files, run commands or delegate.
+export function codeCrossCheckBrief(tools: string): string {
+ return `You are the code cross-checker. Use only ${tools}; you cannot change files, run commands or delegate.
 Check correctness against the issue and approved plan, regression tests that cannot fail,
 overstated security and data-integrity claims, inline environment variables in gate commands,
 missing changelog/docs, and scope beyond the issue.
@@ -43,6 +44,19 @@ Return exactly one complete JSON object, no prose, markdown fences or trailing t
 {"findings":[{"id":"ASCII_ID","severity":"critical|major|minor","path":"...","line":1,"title":"...","detail":"..."}]}
 Preserve distinct ASCII IDs matching [A-Za-z0-9_-], 1 to 64 characters.
 At most 20 findings, 2 KiB UTF-8 JSON each and 32 KiB for the findings array. Return {"findings":[]} when no defect is evidenced.`;
+}
+const CODE_BRIEF = codeCrossCheckBrief("Read and Search");
+
+/** Parse the complete bounded code output, shared by both native checker families. */
+export function validateCodeFindings(text: string): ReturnType<typeof decodeCodeFindings> {
+ try {
+  if (Buffer.byteLength(text) > 32784) throw new Error("code findings output exceeds cap");
+  const value: unknown = JSON.parse(text);
+  const findings = object(value);
+  if (!findings || Object.keys(findings).join(",") !== "findings") throw new Error("invalid code findings object");
+  return decodeCodeFindings(findings.findings);
+ } catch { throw new CrossCheckMalformedError("invalid code checker findings"); }
+}
 
 // No mutable Set is handed to the broker, renderer or caller.
 function immutableSet(values: string[]): ReadonlySet<string> {
@@ -319,12 +333,7 @@ export class CodexCrossCheck {
      }
      if (note.status !== "completed" || verdictText === undefined) throw new Error("cross-check terminal turn has no complete verdict");
      if (claim.cross_check?.stage === "code") {
-      try {
-       if (Buffer.byteLength(verdictText) > 32784) throw new Error("code findings output exceeds cap");
-       const value = JSON.parse(verdictText);
-       if (!object(value) || Object.keys(value).join(",") !== "findings") throw new Error("invalid code findings object");
-       decodeCodeFindings(value.findings);
-      } catch { throw new CrossCheckMalformedError("invalid code checker findings"); }
+      validateCodeFindings(verdictText);
      } else validateVerdict(verdictText);
      await auth.drainInterceptedRequests();
      signal.throwIfAborted();
