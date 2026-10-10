@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -38,30 +40,34 @@ func TestRunDetailRowsFitNarrowTerminal(t *testing.T) {
 	m = applyDetail(m, run, msgs)
 	m = answerUpdate(t, m, runInputsMsg{runID: m.detail.runID, gen: m.detail.gen})
 	m = answerUpdate(t, m, tea.WindowSizeMsg{Width: 30, Height: 8})
-	for _, dark := range []bool{false, true} {
-		for name, prof := range map[string]colorprofile.Profile{"default": colorprofile.TrueColor, "ascii": colorprofile.Ascii} {
-			mm := m
-			mm.pal = newPalette(dark)
-			if name == "ascii" {
-				mm = answerUpdate(t, mm, tea.ColorProfileMsg{Profile: prof})
-			}
-			assertNarrowFrame(t, name, mm.View().Content, 30)
-		}
-	}
+	assertNarrowThemes(t, "detail", m, 30)
 }
 
 func TestAnswerViewRowsFitNarrowTerminal(t *testing.T) {
 	m, _ := answerFlowModel(t, `{"question_id":"q","questions":[{"header":"H","question":"ok?","options":[{"label":"y"}]}]}`)
 	m = answerKeys(t, m, "i")
 	m = answerUpdate(t, m, tea.WindowSizeMsg{Width: 30, Height: 16})
+	assertNarrowThemes(t, "answer", m, 30)
+}
+
+// assertNarrowThemes renders m with both palettes, as-is and downgraded through an Ascii
+// colorprofile.Writer (what a NO_COLOR terminal receives), and checks each frame.
+func assertNarrowThemes(t *testing.T, view string, m tuiModel, width int) {
+	t.Helper()
 	for _, dark := range []bool{false, true} {
-		for _, ascii := range []bool{false, true} {
-			mm := m
-			mm.pal = newPalette(dark)
-			if ascii {
-				mm = answerUpdate(t, mm, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
-			}
-			assertNarrowFrame(t, "answer", mm.View().Content, 30)
+		mm := m
+		mm.pal = newPalette(dark)
+		raw := mm.View().Content
+		assertNarrowFrame(t, fmt.Sprintf("%s dark=%t", view, dark), raw, width)
+		var buf bytes.Buffer
+		w := colorprofile.NewWriter(&buf, nil)
+		w.Profile = colorprofile.Ascii
+		if _, err := w.Write([]byte(raw)); err != nil {
+			t.Fatal(err)
 		}
+		if out := buf.String(); strings.Contains(out, "38;") || strings.Contains(out, "48;") {
+			t.Fatalf("%s dark=%t: Ascii writer retained color SGR", view, dark)
+		}
+		assertNarrowFrame(t, fmt.Sprintf("%s dark=%t ascii", view, dark), buf.String(), width)
 	}
 }
