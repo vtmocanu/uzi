@@ -177,11 +177,13 @@ func (p *archiveRedundancyProver) prove(ctx context.Context, w store.Worker, run
 	}
 
 	// refuse remembers a refusal derived from forge evidence (or its absence). A database error, a
-	// binding mismatch, a missing forge and a cancelled request say nothing about the forge, so
-	// they use retain and are not memoized.
+	// binding mismatch and a missing forge say nothing about the forge, so they use retain and are
+	// not memoized. A definitive forge answer is memoized even when the client has since gone away
+	// (the memo is written detached from the request); only an inconclusive reason on a cancelled
+	// request is dropped, because the cancellation, not the forge, produced it.
 	refuse := func(reason string) apitypes.RecoveryArchiveRedundancyResponse {
+		inconclusive := reason == apitypes.RecoveryRedundancyAncestryUnknown || reason == apitypes.RecoveryRedundancyForgeTimeout
 		if ctx.Err() != nil {
-			// The client went away; whatever the forge calls returned is not evidence.
 			return retain(reason)
 		}
 		memoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), redundancyWriteDeadline)
@@ -203,8 +205,11 @@ func (p *archiveRedundancyProver) prove(ctx context.Context, w store.Worker, run
 		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
 	}
 	binding, err := p.q.GetCompletedPublicationBinding(proofCtx, store.GetCompletedPublicationBindingParams{RepoID: repoID, UserID: w.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return retain(apitypes.RecoveryRedundancyIdentityChanged), nil
+	}
 	if err != nil {
-		return retain(completedPublicationError(proofCtx, err)), nil
+		return apitypes.RecoveryArchiveRedundancyResponse{}, err
 	}
 	if binding.ConnectionID.String() != id.ConnectionID || binding.ProjectID != id.ProjectID ||
 		binding.ForgeType != id.ForgeType || binding.BaseUrl != id.BaseURL {
@@ -329,8 +334,9 @@ func (p *archiveRedundancyProver) expire(ctx context.Context, w store.Worker, ru
 		return apitypes.RecoveryArchiveRedundancyResponse{}, err
 	}
 	if len(ids) != 1 || ids[0] != captureID {
-		// Zero rows covers a WHERE mismatch, a lost race and the guard's silent drop of an
-		// identity-tuple change. Only exactly the requested capture counts as expired.
+		// Zero rows covers a WHERE mismatch and a lost race (an identity change under a proof is
+		// refused by the capture guard with 55000, handled above). Only exactly the requested
+		// capture counts as expired.
 		return retain(apitypes.RecoveryRedundancyNotExpired), nil
 	}
 	if err = tx.Commit(writeCtx); err != nil {
