@@ -57,14 +57,24 @@ batch and a full refold land on the same row, `GREATEST` makes the repeat a no-o
   `error`, so a full refold of a run equals the incremental fold. Dropping the kind would make
   a refold silently discard the summary spend the incremental fold had recorded.
 - **The web usage fold** (`web/src/lib/runUsage.ts`) keys notes the same way and shows them as
-  a separate "Now summaries" row, so the panel's rows add up to the Run total. The recorded
-  fixtures `fixtures/run-usage/result-frames-notes.json` and `run-usage-notes.json` pin the
-  server and client folds to the same rollup, per
+  a separate "Now summaries" row, so the panel's rows add up to the Run total. The fixtures
+  pin the server and client folds to the same rollup, per
   [ADR-195](0195-run-usage-per-model-fold.md)'s rule that two folds are pinned by a shared
-  fixture and not by a decision record.
+  fixture and not by a decision record: `fixtures/run-usage/result-frames-notes.json` (the
+  worker frames) and `run-usage-notes.json` (the rollup) pin the server fold, and
+  `stored-frames-notes.json` (those frames as the api stores them, itself pinned to the
+  normaliser) pins the client fold.
 - **Cost.** A Claude entry with no provider `costUSD` is priced from the standard Anthropic
   table; one the table cannot price stores `cost_status = 'unreported'` with its tokens, never
   a metered `$0`. Codex entries go through the same cost derivation as result frames.
+- **The stored note carries the resolved cost.** On ingest the api writes each entry's
+  resolved `costStatus` (`metered`, `subscription` or `unreported`, derived from the run's
+  harness, never from the worker's claim alone) into the stored payload, and `costUSD` only
+  when metered, quantized as `run_usage` stores it, through the same resolver the fold uses.
+  Readers (the web fold) show a note's cost only when it is metered and otherwise show it as
+  unavailable; they carry no price table. A refold of a stored entry gives the same row,
+  except that an unreported Claude entry is re-priced and would change if a later price table
+  learned its model.
 
 ## The payload must not look like a result frame
 
