@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -362,5 +363,70 @@ func TestM2LongOfferedUpgrade(t *testing.T) {
 	err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0+"+strings.Repeat("a", 210))
 	if err != nil || calls != 1 || !strings.Contains(out.String(), "Update complete") {
 		t.Fatalf("valid offered semver was rejected: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestRestartHintKeepsFooterKeyHints(t *testing.T) {
+	base := updatePromptModel(t)
+	base.updatePrompt.installedVersion = "v0.86.0"
+
+	at := func(m tuiModel, width int) tuiModel {
+		m.width = width
+		return m
+	}
+	b := at(base, 100)
+	if line := stripANSI(b.boardFooterLine()); !strings.Contains(line, "q quit") || !strings.Contains(line, "restart uzi") {
+		t.Fatalf("board footer lost hints or restart text: %q", line)
+	}
+
+	for _, tc := range []struct {
+		view tuiView
+		want string
+	}{{viewBoard, "tab pane"}, {viewWorkers, "ctrl+w focus"}, {viewCI, "R repo"}, {viewPulls, "R repo"}} {
+		m := at(base, 160)
+		m.view = tc.view
+		line := stripANSI(m.splitFooterLine())
+		if !strings.Contains(line, tc.want) || !strings.Contains(line, "restart uzi") {
+			t.Fatalf("split footer view %v at 160 lacks %q or restart text: %q", tc.view, tc.want, line)
+		}
+	}
+
+	type variant struct {
+		name    string
+		profile colorprofile.Profile
+		dark    bool
+	}
+	for _, v := range []variant{
+		{"ascii", colorprofile.Ascii, true},
+		{"dark", colorprofile.TrueColor, true},
+		{"light", colorprofile.TrueColor, false},
+	} {
+		for _, width := range []int{40, 80, 100, 160} {
+			m := at(base, width)
+			m.profile = v.profile
+			m.dark, m.pal = v.dark, newPalette(v.dark)
+			lines := map[string]string{"board": m.boardFooterLine()}
+			for name, view := range map[string]tuiView{"split-board": viewBoard, "split-workers": viewWorkers, "split-ci": viewCI, "split-pulls": viewPulls} {
+				sm := m
+				sm.view = view
+				lines[name] = sm.splitFooterLine()
+			}
+			for name, line := range lines {
+				where := fmt.Sprintf("%s/%s/w=%d", v.name, name, width)
+				if got := visualWidth(line); got > width {
+					t.Errorf("%s: width %d exceeds %d: %q", where, got, width, line)
+				}
+				plain := stripANSI(line)
+				// The board footer (unchanged by #2609) sheds "q quit" at 40 columns.
+				needQuit := name != "board" || width >= 80
+				if !strings.Contains(plain, "restart uzi") || (needQuit && !strings.Contains(plain, "q quit")) {
+					t.Errorf("%s: missing restart text or q quit: %q", where, plain)
+				}
+				assertNoRawControls(t, where, line)
+				if v.profile == colorprofile.Ascii && strings.Contains(line, "\x1b[") {
+					t.Errorf("%s: ANSI escape under Ascii: %q", where, line)
+				}
+			}
+		}
 	}
 }

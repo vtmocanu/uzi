@@ -60,6 +60,62 @@ function makeOutbox(root: string, over: OutboxOverrides = {}): Outbox {
   });
 }
 
+it("Unit 1: positive report absence requires both memory and canonical physical absence", async () => {
+  const root = await mkRoot();
+  const outbox = makeOutbox(root);
+  await outbox.init();
+  assert.equal(await outbox.confirmReportsAbsent("r1", 1), true);
+  await outbox.journalFinalize("r1", 1);
+  assert.equal(await outbox.confirmReportsAbsent("r1", 1), false);
+  assert.equal(await outbox.retireFinalize("r1", 1), true);
+  assert.equal(await outbox.retireFinalize("r1", 1), false, "no-op is no retirement event");
+  assert.equal(await outbox.confirmReportsAbsent("r1", 1), true);
+  await outbox.journalFinalize("r1", 1);
+  await fs.rm(path.join(root, "r1", "finalize-1.json"));
+  assert.equal(await outbox.retireFinalize("r1", 1), false, "absent file is no deletion");
+  assert.equal(await outbox.confirmReportsAbsent("r1", 1), false, "unremoved memory stays unresolved");
+});
+
+for (const protection of ["terminal alias", "finalize alias", "run alias", "symlink", "unreadable", "overflow"] as const) {
+  it("Unit 1: report absence fails closed on " + protection, async t => {
+    const root = await mkRoot();
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    const run = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await outbox.journalFinalize(run, 1);
+    assert.equal(await outbox.retireFinalize(run, 1), true);
+    const dir = path.join(root, run);
+    if (protection === "terminal alias") await fs.writeFile(path.join(dir, "terminal-01.json"), "{}");
+    if (protection === "finalize alias") await fs.writeFile(path.join(dir, "finalize-01.json"), "{}");
+    if (protection === "run alias") await fs.rename(dir, path.join(root, run.toUpperCase()));
+    if (protection === "symlink") await fs.symlink("missing", path.join(dir, "finalize-2.json"));
+    if (protection === "unreadable") {
+      const lstat = fs.lstat;
+      t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+        if (String(args[0]) === dir) throw Object.assign(new Error("unreadable"), { code: "EIO" });
+        return lstat(...args);
+      });
+    }
+    if (protection === "overflow") {
+      for (let n = 0; n < 256; n++) await fs.writeFile(path.join(dir, "other-" + n), "");
+    }
+    assert.equal(await outbox.confirmReportsAbsent(run, 1), false);
+  });
+}
+
+it("Unit 1: failed finalize unlink retains pending identity for both retirement APIs", async t => {
+  const root = await mkRoot();
+  const outbox = makeOutbox(root);
+  await outbox.init();
+  await outbox.journalFinalize("r1", 1);
+  const identity = outbox.finalizeRecordIdentity("r1", 1)!;
+  t.mock.method(fs, "unlink", async () => { throw Object.assign(new Error("failed unlink"), { code: "EIO" }); });
+  assert.equal(await outbox.retireFinalize("r1", 1), false);
+  await assert.rejects(outbox.retireFinalizeIfEligible("r1", 1, () => true, new AbortController().signal, identity));
+  assert.equal(outbox.finalizeRecordIdentity("r1", 1), identity);
+  assert.equal(await outbox.confirmReportsAbsent("r1", 1), false);
+});
+
 function textMsg(seq: number, text: string): OutgoingMessage {
   return { seq, kind: "text", payload: { text } };
 }

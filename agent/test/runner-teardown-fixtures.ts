@@ -6,6 +6,7 @@ import type { CommandWrapper } from "../src/rmtree.js";
 import { residualTestFixture } from "./residual-fixtures.js";
 import { RACED_DIRS, RACED_FILES } from "./swap-racer.js";
 import { AdviceTeardownDiagnostic } from "./advice-teardown-diagnostic.js";
+import type { CodexTransport } from "../src/codex/transport.js";
 
 /** Fixture commands carry only inert environment values, never the worker environment. */
 export function uidScript(wrap: CommandWrapper, script: string, ...args: string[]): void {
@@ -67,4 +68,20 @@ export async function assertGone(target: string): Promise<void> {
 
 export function writePrivateRunnerFile(target: string): void {
   uidScript(runnerCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1]+'/private',{mode:0o700});fs.writeFileSync(process.argv[1]+'/private/keep','keep');fs.chmodSync(process.argv[1]+'/private',0o555)", target);
+}
+
+/** The advice leaves mutate the owned root only after the app-server answered `initialize`.
+ * On the real worker-UID lane this prevented the reproduced teardown failures (issue #2397);
+ * that a mutation during provider startup is the exact cause remains inferred. */
+export async function awaitAdviceProviderReady(transport: CodexTransport, diagnostic: AdviceTeardownDiagnostic): Promise<void> {
+  try {
+    await transport.request("initialize", {
+      clientInfo: { name: "uzi", title: "uzi", version: "0.1.0-m4" },
+      capabilities: { experimentalApi: true, requestAttestation: false },
+    });
+  } catch {
+    diagnostic.mark("provider_not_ready");
+    assert.fail("advice provider was not ready before the root mutation");
+  }
+  diagnostic.mark("provider_ready");
 }

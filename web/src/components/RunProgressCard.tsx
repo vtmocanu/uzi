@@ -12,6 +12,8 @@
 //            current phase is known, so none is ever shown as passed. Drawn only in the
 //            percent state with a known phase (PRD D6, as the TUI does): a waiting or parked
 //            run has no active role, so a marked phase there would be stale
+//   now    → `Now: <text> · model summary · <age> ago` under the phase chip (PRD #2603), only
+//            in the percent state with a now_note; the text is model-authored plain text
 //   role   → the active role line, the same sanitised role + task the now-line shows; only
 //            while a role is actually working (percent, stalled), never on an idle run
 //   hint   → `⧗ may be blocked by <8>` linking to that run (GetRun only, awaiting_input)
@@ -25,6 +27,7 @@ import type { CSSProperties, ReactNode } from "react";
 import { Link } from "react-router-dom";
 import type { Run, RunActivity } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
+import { formatAgo } from "../lib/rateLimits";
 import { parkLabel } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
@@ -226,6 +229,11 @@ export function RunProgressCard({
   const roleTask = live ? stripUnsafeChars(live.agent_label) || stripUnsafeChars(live.tool) : "";
   const showPhase = p.state === "percent" && (PHASES as readonly string[]).includes(p.phase);
 
+  // PRD #2603: the model-written Now line. Model-authored UNTRUSTED text: folded through
+  // stripUnsafeChars and rendered as a plain React text node, never Markdown.
+  const nowText = p.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
+  const nowAge = nowText && p.now_note?.at ? formatAgo(p.now_note.at, now) : "";
+
   const blockedBy = p.maybe_blocked_by_run_id ? stripUnsafeChars(p.maybe_blocked_by_run_id) : "";
 
   return (
@@ -303,6 +311,16 @@ export function RunProgressCard({
             )}
             <span className="font-sans text-xs text-faint">current phase only, from the active role</span>
           </div>
+        )}
+
+        {nowText && (
+          <p data-progress-now className="m-0 min-w-0 [overflow-wrap:anywhere] text-[13px] text-fg">
+            <b className="font-semibold">Now:</b> {nowText}
+            <span className="text-faint">
+              {" "}
+              · model summary{nowAge && ` · ${nowAge}`}
+            </span>
+          </p>
         )}
 
         {role && (

@@ -1504,3 +1504,26 @@ describe("IssueView — the picked credential resets on issue navigation (PRD #1
     await waitFor(() => expect(pickerB.value).toBe("mode:inherit"));
   });
 });
+
+// Issue #2661: the run history reads the compact summary projection and still renders a
+// row that lacks the four heavy detail keys.
+describe("IssueView run history — summary projection (#2661)", () => {
+  it("requests view=summary and shows the duration from a summary row", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRunItem({
+      id: "run-1",
+      status: "completed",
+      first_started_at: "2026-07-05T10:00:00Z",
+      started_at: "2026-07-05T10:00:00Z",
+      finished_at: "2026-07-05T12:00:00Z",
+    });
+    mockApi.listRuns.mockResolvedValue({ runs: [summary as never] });
+    const { container } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(container.textContent).toContain("2h"));
+    expect(mockApi.listRuns).toHaveBeenCalledWith(
+      expect.objectContaining({ view: "summary", issueIid: expect.any(Number) }),
+    );
+  });
+});

@@ -188,13 +188,17 @@ func (q *Queries) ListAdmins(ctx context.Context) ([]uuid.UUID, error) {
 }
 
 const listRecentUnpricedCodexModels = `-- name: ListRecentUnpricedCodexModels :many
-SELECT model, COUNT(DISTINCT run_id) AS runs
-FROM run_usage
-WHERE harness = 'codex'
-  AND updated_at >= $1
-  AND model <> ALL($2::text[])
-GROUP BY model
-ORDER BY runs DESC, model ASC
+SELECT base AS model, COUNT(DISTINCT run_id) AS runs
+FROM (
+  SELECT run_id,
+         CASE WHEN model LIKE 'progress\_note:%' THEN substr(model, 15) ELSE model END::text AS base
+  FROM run_usage
+  WHERE harness = 'codex'
+    AND updated_at >= $1
+) u
+WHERE base <> ALL($2::text[])
+GROUP BY base
+ORDER BY runs DESC, base ASC
 LIMIT 11
 `
 
@@ -208,6 +212,9 @@ type ListRecentUnpricedCodexModelsRow struct {
 	Runs  int64  `json:"runs"`
 }
 
+// A "progress_note:<model>" row (PRD #2603, the Now summary's own usage key) is the same model
+// as "<model>": strip the prefix first so a note-only model is named, and counted with its
+// plain rows, under its real id. The LIMIT applies after this grouping.
 func (q *Queries) ListRecentUnpricedCodexModels(ctx context.Context, arg ListRecentUnpricedCodexModelsParams) ([]ListRecentUnpricedCodexModelsRow, error) {
 	rows, err := q.db.Query(ctx, listRecentUnpricedCodexModels, arg.Cutoff, arg.Priced)
 	if err != nil {

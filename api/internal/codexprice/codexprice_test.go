@@ -36,6 +36,7 @@ func TestCoverage(t *testing.T) {
 		{"gpt-6.1-sol", "2027-01-01T00:00:00Z", Priced},
 		{"gpt-6-sol", "2026-11-21T00:00:00Z", Priced},
 		{"gpt-6-astra", "2026-11-21T00:00:00Z", Priced},
+		{"gpt-6-luna", "2027-01-01T00:00:00Z", Priced},
 	} {
 		now, err := time.Parse(time.RFC3339, tc.clock)
 		if err != nil {
@@ -47,11 +48,44 @@ func TestCoverage(t *testing.T) {
 	}
 	before := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
 	after := before.AddDate(0, 0, 1)
-	if got := PricedModels(before); !reflect.DeepEqual(got, []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"}) {
+	if got := PricedModels(before); !reflect.DeepEqual(got, []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}) {
 		t.Fatalf("before: %v", got)
 	}
-	if got := PricedModels(after); !reflect.DeepEqual(got, []string{"gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"}) {
+	if got := PricedModels(after); !reflect.DeepEqual(got, []string{"gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}) {
 		t.Fatalf("after: %v", got)
+	}
+}
+
+// The Go side holds coverage only (no price function), so the luna row is pinned to its
+// published rates and the shared tier boundary: the agent's priceCodexResponse reads the same
+// bytes (TestCanonicalMirror) and its tests price exactly 272000 as low and 272001 as high.
+func TestLunaRowAndTierThreshold(t *testing.T) {
+	var table struct {
+		Threshold float64 `json:"input_tier_threshold_tokens"`
+		Models    map[string]struct {
+			VerifiedAt string             `json:"verified_at"`
+			Sources    []string           `json:"sources"`
+			Low        map[string]float64 `json:"low"`
+			High       map[string]float64 `json:"high"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(canonicalBytes, &table); err != nil {
+		t.Fatal(err)
+	}
+	if table.Threshold != 272000 {
+		t.Fatalf("tier threshold = %v, want 272000 (low tier at exactly the threshold, high above)", table.Threshold)
+	}
+	luna, ok := table.Models["gpt-6-luna"]
+	if !ok {
+		t.Fatal("gpt-6-luna is not in the table")
+	}
+	if luna.VerifiedAt != "2026-10-09" || !reflect.DeepEqual(luna.Sources, []string{"https://developers.openai.com/api/docs/pricing", "https://developers.openai.com/api/docs/models/gpt-6-luna"}) {
+		t.Fatalf("luna provenance = %+v", luna)
+	}
+	wantLow := map[string]float64{"uncached_input": 0.10, "cached_input": 0.01, "cache_write": 0.125, "output": 0.50}
+	wantHigh := map[string]float64{"uncached_input": 0.20, "cached_input": 0.02, "cache_write": 0.25, "output": 0.75}
+	if !reflect.DeepEqual(luna.Low, wantLow) || !reflect.DeepEqual(luna.High, wantHigh) {
+		t.Fatalf("luna rates low=%v high=%v", luna.Low, luna.High)
 	}
 }
 
@@ -203,7 +237,7 @@ func TestRawNumbersAndDuplicates(t *testing.T) {
 			t.Errorf("last-wins/own key: %v", err)
 		}
 	}
-	if _, err := loadPricing([]byte(strings.Replace(raw, `"version":"openai-standard-2026-10-01"`, `"version":"ok","version":null`, 1))); err == nil {
+	if _, err := loadPricing([]byte(strings.Replace(raw, `"version":"openai-standard-2026-10-09"`, `"version":"ok","version":null`, 1))); err == nil {
 		t.Fatal("accepted invalid final duplicate")
 	}
 }

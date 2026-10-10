@@ -42,7 +42,7 @@ const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
 // Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
 // and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
-const finalizeAuthorities = new Map<string, Promise<void>>();
+const finalizeAuthorities = new Map<string, Promise<unknown>>();
 type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
 const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
 
@@ -275,6 +275,7 @@ export class Worker {
     outbox: Outbox, entry: PendingFinalize, key: string, identity: Readonly<object>, signal: AbortSignal, deadline: number,
     registrationLower = false,
   ): Promise<void> {
+    const incarnation = this.client.capturePublicationCompletionRetirement?.();
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
@@ -285,17 +286,25 @@ export class Worker {
         const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
           !this.admittedRunIds.has(entry.run_id) && !(this.activeRuns?.has(entry.run_id) ?? false);
         if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
-          await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
+          const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
           }, "finalize", outbox);
+          if (retired === true) {
+            if (incarnation) await this.runner.notifyPublicationCompletionRetired(
+              entry.run_id, entry.claim_generation, incarnation);
+            return true;
+          }
         }
         if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
             !reportEligible()) return;
         if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return;
         const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
         if (!eligible()) return;
-        await outbox.retireFinalizeIfEligible(
+        const retired = await outbox.retireFinalizeIfEligible(
           entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
+        if (retired === true && incarnation)
+          await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+        return retired;
       });
       finalizeAuthorities.set(key, authority);
       const settled = () => {
@@ -683,6 +692,7 @@ export class Worker {
           "recovery_archive_v1",
           "recovery_archive_v2",
           "recovery_inventory_v1",
+          "recovery_completed_publication_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised

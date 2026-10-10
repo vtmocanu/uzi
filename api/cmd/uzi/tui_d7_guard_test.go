@@ -236,6 +236,8 @@ var d7UntrustedFields = []string{
 	// the phase and the blocked-by run id derive from untrusted repo/agent/question text and are
 	// drawn only through renderer.Plain. The hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.
 	"ActiveMilestoneID", "Phase", "MaybeBlockedByRunID",
+	// PRD #2603: the model-written Now summary on the PROGRESS block, drawn through renderer.Plain.
+	"NowNote",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

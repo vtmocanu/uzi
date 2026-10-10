@@ -106,3 +106,86 @@ func TestRecentUnpricedCodexModelsLiveDB(t *testing.T) {
 	exec("DELETE FROM run_usage WHERE harness='codex'")
 	assert(query([]string{}), []store.ListRecentUnpricedCodexModelsRow{})
 }
+
+// PRD #2603: the Now summary stores its usage under "progress_note:<model>". The health query
+// must name and count that row under the real model, so a priced model's note rows are not
+// reported as an unpriced model and an unpriced model's note rows join its plain rows.
+func TestRecentUnpricedCodexModelsProgressNoteLiveDB(t *testing.T) {
+	e := setupHarnessEnv(t)
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error(err)
+		}
+	}()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(e.ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec("DELETE FROM run_usage")
+	q := store.New(tx)
+	cutoff := time.Date(2041, 2, 3, 4, 5, 6, 0, time.UTC)
+	use := func(model string) {
+		t.Helper()
+		id := uuid.New()
+		exec(`INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,status)
+   VALUES($1,$2,$3,1,'pricing fixture','fixture','completed')`, id, e.userID, e.repoID)
+		exec(`INSERT INTO run_usage(run_id,model,harness,session_id,lineage_epoch,updated_at)
+   VALUES($1,$2,'codex','s',0,$3)`, id, model, cutoff)
+	}
+	query := func(priced []string) []store.ListRecentUnpricedCodexModelsRow {
+		t.Helper()
+		rows, err := q.ListRecentUnpricedCodexModels(e.ctx, store.ListRecentUnpricedCodexModelsParams{Cutoff: pgconv.Time(cutoff), Priced: priced})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	want := func(got, w []store.ListRecentUnpricedCodexModelsRow) {
+		t.Helper()
+		if !reflect.DeepEqual(got, w) {
+			t.Fatalf("rows=%+v want=%+v", got, w)
+		}
+	}
+
+	// A priced model's note row is not reported (it would otherwise appear as the unpriced
+	// "progress_note:gpt-6-luna").
+	use("progress_note:gpt-6-luna")
+	use("gpt-6-luna")
+	want(query([]string{"gpt-6-luna"}), []store.ListRecentUnpricedCodexModelsRow{})
+
+	// An unpriced model's note row and plain row, in different runs, group into one entry; a
+	// look-alike that only differs at the "_" (LIKE's single-character wildcard) is untouched.
+	use("progress_note:odd-model")
+	use("odd-model")
+	use("progressXnote:odd-model")
+	want(query([]string{"gpt-6-luna"}), []store.ListRecentUnpricedCodexModelsRow{
+		{Model: "odd-model", Runs: 2},
+		{Model: "progressXnote:odd-model", Runs: 1},
+	})
+
+	// The LIMIT applies after the normalisation: twelve distinct models, the first also seen as a
+	// note row, give eleven entries, with the merged one on top and the alphabetically last cut.
+	exec("DELETE FROM run_usage")
+	for i := 0; i < 12; i++ {
+		use(fmt.Sprintf("m-%02d", i))
+	}
+	use("progress_note:m-00")
+	got := query([]string{})
+	if len(got) != 11 {
+		t.Fatalf("len=%d want 11: %+v", len(got), got)
+	}
+	if got[0] != (store.ListRecentUnpricedCodexModelsRow{Model: "m-00", Runs: 2}) {
+		t.Fatalf("first=%+v", got[0])
+	}
+	for _, r := range got {
+		if r.Model == "m-11" || r.Model == "progress_note:m-00" {
+			t.Fatalf("unexpected row %+v", r)
+		}
+	}
+}

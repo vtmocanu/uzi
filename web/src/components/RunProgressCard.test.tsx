@@ -324,4 +324,48 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
     renderCard({ progress: progress({ active_milestone_id: "gh\u202Eost" }) });
     expect(screen.getByText("active milestone · ghost")).toBeTruthy();
   });
+
+  describe("model-written Now line (PRD #2603)", () => {
+    const noteAt = "2026-10-09T11:57:00Z";
+
+    it("renders `Now: <text> · model summary · <age>` in the percent state", () => {
+      const { container } = renderCard({
+        progress: progress({ now_note: { text: "Running the agent gate for the docs milestone", at: noteAt } }),
+      });
+      const now = container.querySelector("[data-progress-now]") as HTMLElement;
+      expect(now.textContent).toBe("Now: Running the agent gate for the docs milestone · model summary · 3m ago");
+    });
+
+    it("renders hostile note text inert, with no unsafe characters anywhere", () => {
+      const hostile = "\u001b[31mred\u001b[0m <img src=x onerror=alert(1)> **bold** a\u202Eb\u200Bc\u2066d\u0007";
+      const { container } = renderCard({ progress: progress({ now_note: { text: hostile, at: noteAt } }) });
+      const now = container.querySelector("[data-progress-now]") as HTMLElement;
+      // Escape bytes are stripped; the rest stays literal text.
+      expect(now.textContent).toContain("[31mred[0m <img src=x onerror=alert(1)> **bold** abcd");
+      // No element was created from the markup, and no Markdown emphasis was applied.
+      expect(container.querySelector("img")).toBeNull();
+      expect(now.querySelectorAll("b, strong, em")).toHaveLength(1); // only the static "Now:" label
+      const unsafe = (v: string) =>
+        [...v].some((ch) => {
+          const c = ch.codePointAt(0) ?? 0;
+          return c < 0x20 || c === 0x7f || c === 0x200b || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+        });
+      expect(unsafe(hostile)).toBe(true);
+      expect(unsafe(container.textContent ?? "")).toBe(false);
+      for (const el of container.querySelectorAll("*")) {
+        for (const a of el.getAttributeNames()) expect(unsafe(el.getAttribute(a) ?? "")).toBe(false);
+      }
+    });
+
+    it("renders nothing for an empty note or a note after the percent state", () => {
+      const note = { text: "stale note", at: noteAt };
+      expect(renderCard({ progress: progress({ now_note: { text: "  ", at: noteAt } }) }).container.querySelector("[data-progress-now]")).toBeNull();
+      cleanup();
+      for (const state of ["waiting", "parked", "queued", "stalled", "planning"] as const) {
+        const { container } = renderCard({ progress: progress({ state, pct: undefined, now_note: note }) });
+        expect(container.querySelector("[data-progress-now]"), state).toBeNull();
+        cleanup();
+      }
+    });
+  });
 });

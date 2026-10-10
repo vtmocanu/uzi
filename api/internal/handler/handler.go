@@ -937,12 +937,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
-				r.Get("/", h.ListRuns)
+				// gzip-compress the run list and the message history: both are large,
+				// key-repetitive JSON that compresses dramatically (a 200-row list was
+				// 5.0 MB plain vs 1.4 MB gzipped, and the TUI board and web Runs list poll
+				// it). gzip is transparent: the uzi CLI's Go transport and browsers both
+				// auto-negotiate Accept-Encoding and transparently decompress, so no caller
+				// changes.
+				r.With(chimw.Compress(5)).Get("/", h.ListRuns)
 				r.Get("/{id}", h.GetRun)
-				// gzip-compress this response only: a run's message history is large,
-				// key-repetitive JSON that compresses dramatically. gzip is transparent —
-				// the uzi CLI's Go transport and browsers both auto-negotiate
-				// Accept-Encoding and transparently decompress, so no caller changes.
 				r.With(chimw.Compress(5)).Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
 				// Dispatch a task run (PRD #400 Decision 6): the CLI calls this after it

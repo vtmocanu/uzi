@@ -160,7 +160,10 @@ The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A r
 message) and answer with `uzi run answer`. A completion-interlock question is different: a
 plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
 (`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
-live question or on a run already parked in the completion hold. A run at `limit_wait` is parked on an Anthropic
+live question or on a run already parked in the completion hold. **Never answer with "keep waiting"**
+(e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
+its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
+immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 

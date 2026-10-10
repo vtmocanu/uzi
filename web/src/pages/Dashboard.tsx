@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
+import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
 import {
   effectiveRunStatus,
@@ -38,7 +38,7 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskName, maskRepoPath } from "../lib/demoMask";
 
 interface Overview {
-  runs: RunListItem[];
+  runs: RunSummaryItem[];
   // The full fleet drives both the online/total count and the per-worker load lines
   // (PRD #49); the mount load and the 10s poll both already fetch it.
   workers: Worker[];
@@ -133,7 +133,7 @@ export function Dashboard() {
       try {
         const [{ runs }, { workers }, { repos }, { templates }, { secrets }, { connections }, selfUsage, adminUsage] =
           await Promise.all([
-            api.listRuns(),
+            api.listRuns({ view: "summary" }),
             api.listWorkers(),
             api.listRepos(),
             api.listAgentTemplates(),
@@ -187,7 +187,7 @@ export function Dashboard() {
   // skeletons.
   const poll = useCallback(async () => {
     try {
-      const [{ runs }, { workers }] = await Promise.all([api.listRuns(), api.listWorkers()]);
+      const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
       setData((prev) =>
         prev
           ? {
@@ -436,7 +436,7 @@ export function Dashboard() {
                 ? milestoneBadgeText(ms, (r.milestones_in_progress?.length ?? 0) > 0)
                 : null;
               // PRD #1064 M3: the "now" line under the title uses current_activity from
-              // the RunListItem. Hidden when null, terminal, or held; untrusted fields
+              // the RunSummaryItem. Hidden when null, terminal, or held; untrusted fields
               // render escaped through stripUnsafeChars.
               const activity = r.current_activity;
               // Verified 2026-09-08: the API includes all non-terminal runs in its last

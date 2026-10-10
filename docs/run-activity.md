@@ -526,6 +526,105 @@ differ in what they carry; the run page has more.
   `no milestones frozen yet`. It does not show the active-role line or the
   resume time; use the run page for those.
 
+### Now summary
+
+While an issue run is working a milestone, a small model can write one plain
+sentence (at most 120 characters) saying what the active lane is doing, and
+the progress card, the TUI detail and `uzi run get` show it next to the
+estimate. It is **on by default**; see [Turning it off](#turning-the-now-summary-off).
+
+- **Run page**: a `Now: <text> · model summary · <age>` line under the phase
+  chip.
+- **TUI run detail**: a `now <text> · model summary · 2m ago` line in the
+  `PROGRESS` block. The text wraps under the `now` label; the
+  `model summary · <age>` marking moves to its own row when it does not fit.
+- **CLI**: `uzi run get` appends ` · now: <text> (model summary, 2m ago)` to
+  the `PROGRESS` row.
+
+The text is the model's reading of the run's newest tool calls, not a status
+uzi has verified. The instruction forbids saying a step passed, failed or
+finished unless a tool call states it, but a model can still be wrong or
+vague; read the transcript when it matters. Every surface renders it as
+inert plain text: control and format characters are stripped when the API
+ingests it, and it is capped at 120 characters.
+
+**When it shows.** Only on the single-run read (the run page, `uzi run get`,
+the TUI detail), never on the dashboard, runs list or TUI board. It needs the
+progress state to be a percent (an executing, healthy issue run with a frozen
+milestone list), an active milestone, and the Now summary enabled both by the admin switch and
+in the run owner's settings.
+It shows the newest note written for the *current* milestone, so a note from
+an earlier milestone never lingers. A waiting, parked, queued or stalled run
+shows no note, even one written for its still-active milestone. The note
+messages are hidden from the activity transcript on the web, in the TUI and
+in `uzi run logs` (`--json` still carries them), and the run judge never sees
+them. A note does not count as run activity, so it never revives a run that
+is stalled or hides its stall.
+
+**When the worker writes one.** The worker calls the model when the active
+milestone changes, when the active role changes, or when 10 minutes have
+passed since the last call and at least one new tool call has appeared. It
+makes at most one call per 5 minutes (triggers inside that window coalesce
+into one call at its end), and a call that fails or whose result is discarded
+still counts against the window. Each call times out after 30 seconds. It makes no call while the run
+is held (a plan gate, a question, a pause or park, a credential switch), when
+the setting is off, or when no milestone is active; after a credential-switch
+attempt gives up, summaries resume at the next trigger. A result that arrives
+after one of those is discarded.
+
+**What the model sees.** The active milestone's title and the newest 20 tool
+calls, each cut down to role, label, tool and detail (the same fields the
+[`now` line](#milestones-and-the-now-line) reads; never a Bash command), with
+claim secrets redacted.
+
+| Harness | Model | Limits |
+|---|---|---|
+| Claude | `haiku`, extended thinking off | 256 output tokens |
+| Codex | `gpt-6-luna` at reasoning effort `low` | The Codex advice path cannot enforce an output-token cap, so the 30-second timeout is the only bound. `low` is the lowest effort uzi's Codex contract allows |
+
+There is no fallback to a more expensive model: if the account refuses the
+model, or the call fails or times out, that summary is skipped and the run is
+unaffected. A rate-limit error from the summary call never touches the run's
+own rate-limit state, never parks it and never triggers a credential switch.
+The Codex call is also denied credential refresh, so it can never move the
+run's credential generation; a summary that lands on an expired Codex token
+just fails.
+
+**Spend counts.** The summary calls are paid on the run owner's credential
+and their tokens and cost are part of the run's usage. They are stored under
+a separate per-note usage key (`progress_note:<model>`), so they never merge
+into the run's own rows for the same model, and the web usage panel shows
+them as a **Now summaries** row that adds up to the **Run total**. A Claude
+call with no provider cost is priced from the standard Anthropic price table;
+a call the table cannot price shows cost unreported, never `$0`, with its
+tokens kept. The Codex `gpt-6-luna` price row is in the pinned table
+(verified 2026-10-09). If a call is aborted (a park, the run ending, a
+cancel, a credential switch), the usage it had already received is still
+recorded once; spend is unavailable only when no usage arrived before the
+abort. If the worker loses its claim, usage frames from the stale claim are
+rejected as for every result frame, so that call's spend can be missing.
+With one call per 5 minutes at most, a run makes at most 12 calls per hour.
+The [Codex price coverage](admin-health.md#codex-price-coverage) health check
+counts summary usage under the plain model name.
+
+#### Turning the Now summary off
+
+Two switches, both on by default; the summary runs only while both are on:
+
+- **You**: **Settings → Run defaults → Run summaries → Model-written Now
+  line** (`now_summary_enabled` on `PUT /api/me/settings`; unset inherits
+  on). `uzi settings get` prints `Now summary: on (default)`, `on` or `off`.
+- **Your admin**: the instance kill switch in [Admin
+  settings](admin-settings.md#run-summaries). Off there stops it for every
+  user, whatever their own setting.
+
+The worker reads the effective value on its regular input poll, so turning it
+off reaches a running run: no further call is made, a call still in flight is
+discarded, and the line disappears from the run page. A worker that does not
+receive the setting treats it as off. See [Run
+summaries](run-summaries.md#the-now-summary) for how this differs from the
+intent and plan summaries.
+
 ### May be blocked by
 
 While a run is waiting on a question (`awaiting_input`), the run page, the TUI

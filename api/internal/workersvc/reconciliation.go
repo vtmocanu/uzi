@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -24,10 +25,12 @@ type LeadReconciliation struct {
 }
 
 type StateReportResult struct {
-	Run            store.Run           `json:"-"`
-	Applied        bool                `json:"-"`
-	GateRevision   int64               `json:"-"`
-	Reconciliation *LeadReconciliation `json:"-"`
+	CompletedPublicationReceipt *apitypes.CompletedPublicationReceipt `json:"-"`
+	CompletedPublicationReason  string                                `json:"-"`
+	Run                         store.Run                             `json:"-"`
+	Applied                     bool                                  `json:"-"`
+	GateRevision                int64                                 `json:"-"`
+	Reconciliation              *LeadReconciliation                   `json:"-"`
 }
 
 // PlanCrossCheckStatusResult keeps the existing active candidate internal.
@@ -77,11 +80,23 @@ func captureLeadReconciliation(ctx context.Context, q reconciliationReader, work
 // SetStateReportWithReconciliation exposes proof only after the state transaction commits.
 func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker store.Worker, runID uuid.UUID, req StateRequest) (StateReportResult, error) {
 	var result StateReportResult
+	if err := validateCompletedPublicationReport(worker, req); err != nil {
+		return result, err
+	}
+	if replay, err := s.replayCompletedPublication(ctx, worker, runID, req); replay != nil || err != nil {
+		if replay != nil {
+			return *replay, err
+		}
+		return result, err
+	}
 	run, applied, err := s.setState(ctx, worker, runID, req, &result.GateRevision, &result.Reconciliation)
 	if err != nil {
 		return StateReportResult{Run: run}, err
 	}
 	result.Run, result.Applied = run, applied
+	if req.State == "completed" && applied && completedPublicationCapable(worker, req) {
+		result.CompletedPublicationReceipt, result.CompletedPublicationReason = s.verifyCompletedPublication(ctx, worker, runID, req)
+	}
 	return result, nil
 }
 

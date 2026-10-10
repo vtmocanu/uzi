@@ -55,6 +55,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/pr-comments.sh"
 # shellcheck source=lib/required-checks.sh
 . "$HERE/lib/required-checks.sh"
+# shellcheck source=lib/net-retry.sh
+. "$HERE/lib/net-retry.sh"
+net_retry_install
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in

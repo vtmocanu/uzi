@@ -1345,16 +1345,56 @@ chain in the diagram above, with no intervening `running`.
   Local pins are not checkpoint durability. At a verified source/process
   boundary it freezes the roots and proves ancestry in a recovery-only
   aggregate with the current source tree; neither task nor checkpoint refs
-  advance to that aggregate. The API binds final release to the exact
+  advance to that aggregate. The archive path binds final release to the exact
   available capture/source/`coverage_digest` identity or an evidenced empty
-  inventory, rather than trusting completion or an earlier ready capture.
+  inventory, rather than trusting completion alone or an earlier ready capture.
   The digest is identity, not server-side Git ancestry proof. The final
   receipt is owner-readable across hold states; closed holds confer no new
   reserve/upload authority, and deleted workers fail worker authentication.
   Selected final bytes are protected while the local worker row exists;
   physical worker deletion renews the configured normal ready window.
   Earlier non-final/legacy TTL, quotas and explicit discard remain unchanged.
-  Dirty/unverified source, unproven quiescence, pending final ACK or feature
+  A separate synchronous completed-publication path (#2507, maintainer decision
+  2026-10-09) releases the exact completing-generation guarded hold for
+  COMPLETED `issue`, `mr_rework` and `self_improve` runs when worker and API
+  negotiate `recovery_completed_publication_v1`. Completion and immutable
+  identity commit before the bounded API forge proof. The server derives the
+  branch from `agentIssueBranch(issue)`, frozen MR-rework `pipeline_ref`, or
+  `selfImproveBranch(runID)` (`uzi/self-improve/<run-id>`), respectively;
+  tracking issues, self-improvement pipelines and worker-reported branches
+  are not proof authority. The recorded MR in the own repository must name
+  that branch; BranchHead H must equal MR HeadSHA and CompareAncestry must
+  prove H contains or equals the durably reported final SHA. A matching
+  own-repository copy qualifies without asserting non-fork status or branch
+  protection. Later user deletion or rewrite is outside this proof.
+  Forge requests hold no DB locks. Release revalidates under worker → run →
+  exact hold locks, then repository/configuration locks and identity CAS.
+  ACKs and owner hold DTOs expose `completed_publication_receipt` or
+  `completed_publication_reason`; exact stored-receipt replay precedes mutable
+  run/forge checks. Missing, mismatched, unknown or drifting evidence retains.
+  No capture, WIP, freeze or clean-source proof is needed for this receipt,
+  even with existing available/thin/needs-action captures; archive retention
+  is unchanged. Healthy custody release needs no heartbeat prerequisite.
+  When its existing outbox can journal the terminal report, the worker persists
+  the fixed original completion before preparation.
+  A valid receipt skips preparation and is saved/read back in an existing
+  MAC-authenticated generation recovery record before protected report
+  retirement. Other responses use original capture fallback; lost ACK plus
+  capture refusal cannot fail/reopen completion or authorize cleanup.
+  Attempted-send guards cover no-outbox/reserve failures without a new journal.
+  Physical destruction remains separate: quiescence, credential isolation,
+  exact canonical owned path, expected SHA and attribution, execution/adoption
+  exclusion through destruction, and bare locks remain required. Eligible
+  dirty/untracked completing-source leftovers may be discarded; sibling
+  generations, shared pins, metadata consumers, foreign/unknown inventory
+  and quarantine remain retained. Source metadata follows actual disposal
+  with one bounded EIO retry; an existing retired-attempt ledger can finish
+  exact old-journal clearing, while lost proof retains remaining artifacts.
+  See [ADR-1296](adr/1296-durable-run-recovery.md) and
+  [ADR-2417](adr/2417-guarded-local-retention.md) for the dated amendments.
+  Older/successor holds and unstamped older completions gain no authority;
+  failed/cancelled/parked runs and other kinds keep their existing policy.
+  Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature
   loss after guard latching retains custody with bounded retry. Credential-free
   boot cannot auto-capture dirty source. Unguarded APIs can retain local pins
   but do not provide complete terminal/reclamation protection.

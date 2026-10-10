@@ -44,6 +44,10 @@ cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
+  if [ -n "${GH_ALWAYS_FAIL:-}" ] || { [ -n "${GH_BLIP_FILE:-}" ] && [ -e "$GH_BLIP_FILE" ]; }; then
+    [ -z "${GH_BLIP_FILE:-}" ] || rm -f "$GH_BLIP_FILE"
+    echo "error connecting to api.github.com" >&2; exit 1
+  fi
   printf '%s\n' "$PR_JSON"
   exit 0
 fi
@@ -53,7 +57,13 @@ STUB
 cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 set -eu
-if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo '[]'; exit 0; fi
+if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then
+  if [ -n "${UZI_ALWAYS_FAIL:-}" ] || { [ -n "${UZI_BLIP_FILE:-}" ] && [ -e "$UZI_BLIP_FILE" ]; }; then
+    [ -z "${UZI_BLIP_FILE:-}" ] || rm -f "$UZI_BLIP_FILE"
+    echo "error connecting to uzi.example" >&2; exit 1
+  fi
+  echo '[]'; exit 0
+fi
 echo "unexpected uzi call: $*" >&2
 exit 1
 STUB
@@ -63,6 +73,14 @@ set -eu
 printf '%s\n' "$*" >> "$TASK_CALLS"
 [ "${1:-}" = gate:web ] || { echo "unexpected task: $*" >&2; exit 1; }
 STUB
+# Recording sleep stub: net_retry backoff must cost no real time (NET_RETRY_BASE_SLEEP=0).
+export NET_RETRY_BASE_SLEEP=0
+export SLEEP_LOG="$WORK/sleeps"; : > "$SLEEP_LOG"
+cat > "$WORK/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+echo "$1" >> "$SLEEP_LOG"
+STUB
+chmod +x "$WORK/bin/sleep"
 export TASK_CALLS="$WORK/task-calls"
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi" "$WORK/bin/task"
 
@@ -87,6 +105,40 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree
   || fail "--gate auto preparation failed: $(cat "$WORK/auto.out")"
 grep -qx 'gate:web' "$TASK_CALLS" || fail "--gate auto did not run gate:web: $(cat "$TASK_CALLS")"
 grep -q '^LOCAL_GATES=none' "$WORK/auto.out" && fail "--gate auto reported LOCAL_GATES=none"
+
+# Transient transport errors on the read-only lookups are retried (lib/net-retry.sh).
+: > "$SLEEP_LOG"
+run_lp() { # extra env via caller; prints rc
+  local rc=0
+  PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --skip-rebase --no-push --gate none "$@" > "$WORK/blip.out" 2>&1 || rc=$?
+  echo "$rc"
+}
+: > "$WORK/gh-blip"
+rc=$(GH_BLIP_FILE="$WORK/gh-blip" run_lp --no-rework-check)
+[ "$rc" -eq 0 ] || fail "a one-shot gh pr view blip failed land-prep (rc=$rc): $(cat "$WORK/blip.out")"
+grep -q 'gh pr view .* failed' "$WORK/blip.out" && fail "gh pr view blip surfaced as a failure"
+[ -s "$SLEEP_LOG" ] || fail "gh pr view blip was not retried through sleep"
+: > "$WORK/uzi-blip"
+rc=$(UZI_BLIP_FILE="$WORK/uzi-blip" run_lp)
+[ "$rc" -eq 0 ] || fail "a one-shot uzi repo list blip failed land-prep (rc=$rc): $(cat "$WORK/blip.out")"
+grep -q 'uzi repo list failed' "$WORK/blip.out" && fail "uzi repo list blip surfaced as a failure"
+rc=$(GH_ALWAYS_FAIL=1 run_lp --no-rework-check)
+[ "$rc" -eq 3 ] || fail "a persistent gh outage returned rc=$rc, want 3: $(cat "$WORK/blip.out")"
+grep -q 'gh pr view 99 failed' "$WORK/blip.out" || fail "persistent gh outage not named"
+rc=$(UZI_ALWAYS_FAIL=1 run_lp)
+[ "$rc" -eq 4 ] || fail "a persistent uzi outage returned rc=$rc, want 4: $(cat "$WORK/blip.out")"
+grep -q 'uzi repo list failed' "$WORK/blip.out" || fail "persistent uzi outage not named"
+# Retries never cost real time, and a PATH without uzi still hits the absent-uzi refusal.
+grep -qvx 0 "$SLEEP_LOG" && fail "non-zero backoff recorded: $(sort -u "$SLEEP_LOG" | tr '\n' ' ')"
+mkdir -p "$WORK/nouzi"
+for t in bash env git jq awk sed tr head cat rm mktemp grep date dirname basename uname sort cut tail wc mkdir sleep; do
+  p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$WORK/nouzi/$t"
+done
+ln -sf "$WORK/bin/gh" "$WORK/nouzi/gh"
+rc=0
+PATH="$WORK/nouzi" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --skip-rebase --no-push --gate none > "$WORK/blip.out" 2>&1 || rc=$?
+[ "$rc" -eq 4 ] || fail "no-uzi PATH returned rc=$rc, want 4: $(cat "$WORK/blip.out")"
+grep -q 'uzi CLI absent' "$WORK/blip.out" || fail "no-uzi PATH did not hit the absent-uzi refusal: $(cat "$WORK/blip.out")"
 
 # Move main after preparation, matching a long gate or delayed --skip-rebase re-entry. The
 # move touches base.txt, which the branch also changes, so it is not tolerated.

@@ -105,6 +105,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/required-checks.sh"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
+# shellcheck source=lib/net-retry.sh
+. "$HERE/lib/net-retry.sh"
+net_retry_install
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
 

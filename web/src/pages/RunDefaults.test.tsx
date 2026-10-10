@@ -990,6 +990,43 @@ describe("Run defaults — CI autofix tri-state display (PRD #914 M3)", () => {
 });
 
 
+// PRD #2603: the per-user Model-written Now line switch, tri-state like mr_rework_enabled.
+describe("Run defaults — Now line switch (PRD #2603)", () => {
+  const baseSettings = { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
+  const nowToggle = () => screen.getByLabelText("Model-written Now line") as HTMLInputElement;
+  const renderPage = () =>
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+
+  it("reads null as ON and an explicit false as OFF", async () => {
+    mockAuth({ ...baseUser });
+    mockApi.getMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: null } });
+    renderPage();
+    // The checkbox is disabled until the settings have loaded, so waiting for it to enable
+    // proves the null reading is the loaded one, not the pre-load default.
+    await waitFor(() => expect(nowToggle().disabled).toBe(false));
+    expect(nowToggle().checked).toBe(true);
+    cleanup();
+    mockApi.getMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: false } });
+    renderPage();
+    await waitFor(() => expect(nowToggle().checked).toBe(false));
+  });
+
+  it("saves the choice through putMySettings", async () => {
+    mockAuth({ ...baseUser });
+    mockApi.getMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: null } });
+    mockApi.putMySettings.mockResolvedValue({ settings: { ...baseSettings, now_summary_enabled: false } });
+    renderPage();
+    await waitFor(() => expect(nowToggle().disabled).toBe(false));
+    fireEvent.click(nowToggle());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ now_summary_enabled: false }));
+    await waitFor(() => expect(nowToggle().checked).toBe(false));
+  });
+});
+
 // PRD #1551 M3: the grouped "Harness and worker models" card. The default harness and
 // the two retained per-harness model lanes are one decision saved in ONE PUT; changing
 // the harness never touches a model; the active-lane badge follows the effective harness;

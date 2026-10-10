@@ -198,6 +198,10 @@ export interface UserSettings {
    *  the user opted this account out, so the watcher stops auto-reworking their MRs.
    *  The admin global kill-switch is separate. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user switch for the model-written "Now" line on the run progress card (PRD #2603);
+   *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
+   *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
+  now_summary_enabled?: boolean | null;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -246,6 +250,9 @@ export interface UserSettingsPatch {
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
    *  present-true (or null clearing back to the default-ON) re-enables. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user "Now" summary switch (PRD #2603); present-false opts out, present-true (or
+   *  null clearing back to the default-ON) re-enables. */
+  now_summary_enabled?: boolean | null;
   /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
    *  present-null clears back to "no preference", absent leaves it unchanged. */
   default_harness?: Harness | null;
@@ -1001,6 +1008,11 @@ export interface AppSettings {
   // "true"). When OFF, no user's failed pipeline is auto-fixed regardless of their
   // per-user opt-in — the admin per-user CI-autofix toggle is inert while it is off.
   ci_autofix_enabled: string;
+  // Instance-wide kill-switch for the model-written "Now" summary on the run progress card
+  // (PRD #2603). The text "true"/"false" (default "true"). When OFF, no run shows or
+  // generates a summary regardless of a user's per-user setting. Optional so a response from
+  // an older server (and fixtures that predate the key) still type-check.
+  now_summary_enabled?: string;
   // Ephemeral worker auto-provisioning instance kill-switch (PRD #529 / #649 M1).
   // The text "true"/"false" (default "false"). When OFF, no run ever auto-provisions
   // a throwaway hosted worker regardless of a user's per-account opt-in; when ON,
@@ -2624,6 +2636,11 @@ export interface RunProgress {
   // GetRun only, while awaiting_input: a live run of the same owner and repo the open
   // question mentions as #<issue>. A hint from untrusted text, not a recorded dependency.
   maybe_blocked_by_run_id?: string;
+  // GetRun only (PRD #2603): the newest model-written one-sentence summary for the active
+  // milestone, present only while state is "percent" and the run owner's setting is on.
+  // `text` is model-authored UNTRUSTED plain text (render as text, never Markdown); `at` is
+  // when the worker posted it.
+  now_note?: { text: string; at: string } | null;
 }
 
 // Milestone is one item of a milestone-structured run (PRD #122): a stable id and a
@@ -3575,14 +3592,13 @@ export interface UsageTail {
 // RunListItem is a run row for the index + admin overview: the run plus display
 // context. owner_email is present only on the admin (all-users) list.
 // RunListItem is the LIST row — GET /api/runs. It extends Run, and that inheritance is a
-// trap worth naming: on the Go side RunDTO and RunListItemDTO are SEPARATE structs, so a
-// field added to one is simply absent from the other. Here, a field added to `Run` is
-// silently inherited by RunListItem, so putting a list-only field at the wrong level
-// compiles fine and quietly claims that GET /runs/{id} returns something the API never
-// sends. Nothing fails at runtime until a caller reads the missing field.
-//
-// So: a field the API puts on RunListItemDTO belongs HERE, not on Run. (PRD #98 M4's judge
-// badge fields were caught doing exactly this, by tsc via the run-view fixtures.)
+// trap worth naming: here, a field added to `Run` is silently inherited by RunListItem,
+// so putting a list-only field at the wrong level compiles fine and quietly claims that
+// GET /runs/{id} returns something the API never sends. On the Go side RunListItemDTO
+// EMBEDS RunDTO, so the list row carries every RunDTO key; the rule that still holds is
+// that a field the API puts on RunListItemDTO alone belongs HERE, not on Run. (PRD #98
+// M4's judge badge fields were caught doing exactly this, by tsc via the run-view
+// fixtures.) The compact projection of this row is RunSummaryItem (?view=summary).
 export interface RunListItem extends Run {
   /** Judge badge (PRD #98 M4). judge_verdict is the run's review verdict, null when
    *  the run was never judged — rendered as NO badge, never a neutral one, since
@@ -3607,6 +3623,15 @@ export interface RunListItem extends Run {
   worker_name: string | null;
   owner_email?: string;
 }
+
+/** The compact run-list row served by GET /api/runs?view=summary and
+ *  GET /api/admin/runs?view=summary (Go RunSummaryItemDTO): exactly RunListItem minus the
+ *  four heavy, detail-only text fields. Every list surface that renders badges, durations
+ *  or ordering reads only these keys; the run detail page fetches the full Run. */
+export type RunSummaryItem = Omit<
+  RunListItem,
+  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+>;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
@@ -4834,6 +4859,25 @@ export interface RecoveryArchiveSummary {
 // checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
 // superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
+  // Publication proof is independent of capture coverage and physical retirement.
+  // Older servers omit both fields.
+  completed_publication_receipt?: {
+    hold_id: string;
+    run_id: string;
+    owner_id: string;
+    worker_id: string;
+    generation: number;
+    final_head: string;
+    repo_id: string;
+    connection_id: string;
+    project_id: number;
+    forge_type: string;
+    base_url: string;
+    branch: string;
+    mr_iid: number | null;
+    observed_branch_head: string;
+  };
+  completed_publication_reason?: string;
   inventory_guarded: boolean;
   final_receipt?: { kind: string; capture_id?: string; source_sha?: string; coverage_digest: string };
   terminal_record_rejection?: string;

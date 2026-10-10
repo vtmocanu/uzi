@@ -114,3 +114,129 @@ it("advice diagnostic bounds the producer sink and preserves assertions when the
   const broken = new AdviceTeardownDiagnostic(() => { throw new Error("sink failure"); });
   await assert.rejects(broken.run(async () => { throw original; }), (error) => error === original);
 });
+
+function fakeSupervisor(t: import("node:test").TestContext) {
+  const child = new EventEmitter() as import("node:child_process").ChildProcess;
+  const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+  const evidence = new PassThrough();
+  Object.assign(child, { stdin, stdout, stderr, stdio: [stdin, stdout, stderr, new PassThrough(), evidence] });
+  const spawn = t.mock.method(cp, "spawn", () => child);
+  syncBuiltinESMExports();
+  const cleanup = (): void => {
+    spawn.mock.restore(); syncBuiltinESMExports();
+    for (const stream of child.stdio) stream?.destroy();
+  };
+  return { child, evidence, cleanup };
+}
+
+it("advice diagnostic records each valid phase with its ordinal and ignores unknown phases", () => {
+  const diagnostic = new AdviceTeardownDiagnostic();
+  const phases = ["mutation_start", "mutation_end", "provider_ready", "provider_not_ready", "dispose_start", "dispose_end"] as const;
+  for (const phase of phases) diagnostic.mark(phase);
+  assert.doesNotThrow(() => diagnostic.mark("private-unknown-phase" as never));
+  const events = (diagnostic as unknown as { events: Record<string, unknown>[] }).events;
+  assert.deepEqual(events, phases.map((phase, i) => ({ ordinal: i + 1, event: "phase", phase })));
+});
+
+it("advice diagnostic counts phase marks toward the 64 event cap", async () => {
+  const diagnostic = new AdviceTeardownDiagnostic();
+  for (let i = 0; i < 70; i++) diagnostic.mark("provider_ready");
+  const snapshot = await diagnostic.snapshot();
+  assert.equal((snapshot.events as unknown[]).length, 64);
+  assert.equal(snapshot.truncated, true);
+  assert.deepEqual(snapshot.failure_signature, {
+    child_exit_before_dispose: "unknown", exit_status_before_dispose: "unknown", warning: "none",
+  });
+});
+
+it("advice failure_signature is true when a child_exit evidence event precedes dispose_start", async (t) => {
+  const { child, evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      diagnostic.mark("mutation_start");
+      evidence.write('{"event":"child_exit","private":"private-content"}\n');
+      child.emit("exit", null, "SIGKILL");
+      await new Promise((resolve) => setImmediate(resolve));
+      diagnostic.mark("dispose_start");
+      const snapshot = await diagnostic.snapshot();
+      assert.deepEqual(snapshot.failure_signature, {
+        child_exit_before_dispose: true, exit_status_before_dispose: "signalled", warning: "none",
+      });
+      assert.equal(JSON.stringify(snapshot).includes("private-"), false);
+    });
+  } finally { cleanup(); }
+});
+
+it("advice failure_signature is false when child_exit only arrives after dispose_start", async (t) => {
+  const { child, evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      diagnostic.mark("dispose_start");
+      evidence.write('{"event":"child_exit"}\n');
+      child.emit("exit", 0, null);
+      await new Promise((resolve) => setImmediate(resolve));
+      const snapshot = await diagnostic.snapshot();
+      assert.deepEqual(snapshot.failure_signature, {
+        child_exit_before_dispose: false, exit_status_before_dispose: "none", warning: "none",
+      });
+    });
+  } finally { cleanup(); }
+});
+
+it("advice providerChildExitObserved is false without child_exit evidence", async (t) => {
+  const { evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      evidence.write('{"event":"started"}\n');
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(diagnostic.providerChildExitObserved(), false);
+    });
+  } finally { cleanup(); }
+});
+
+it("advice providerChildExitObserved is true when child_exit precedes dispose_start", async (t) => {
+  const { evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      evidence.write('{"event":"child_exit"}\n');
+      await new Promise((resolve) => setImmediate(resolve));
+      diagnostic.mark("dispose_start");
+      assert.equal(diagnostic.providerChildExitObserved(), true);
+    });
+  } finally { cleanup(); }
+});
+
+it("advice providerChildExitObserved is true when child_exit follows dispose_start", async (t) => {
+  const { evidence, cleanup } = fakeSupervisor(t);
+  const diagnostic = new AdviceTeardownDiagnostic();
+  try {
+    await diagnostic.run(async () => {
+      cp.spawn("/bin/setpriv", ["/fixture/uzi-codex-supervisor"]);
+      diagnostic.mark("dispose_start");
+      evidence.write('{"event":"child_exit"}\n');
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(diagnostic.providerChildExitObserved(), true);
+    });
+  } finally { cleanup(); }
+});
+
+it("advice failure_signature is unknown without dispose_start and reports the first warning category", async () => {
+  const { logger, lines } = recordingLogger();
+  const diagnostic = new AdviceTeardownDiagnostic();
+  await diagnostic.watch("/nonexistent/advice-data", "/nonexistent/advice-cwd", lines);
+  logger.warn("Codex advice data cleanup failed", { error: "private-error" });
+  diagnostic.mark("mutation_start");
+  const snapshot = await diagnostic.snapshot();
+  assert.deepEqual(snapshot.failure_signature, {
+    child_exit_before_dispose: "unknown", exit_status_before_dispose: "unknown", warning: "cleanup_failed",
+  });
+  assert.equal(JSON.stringify(snapshot.failure_signature).includes("private-"), false);
+});

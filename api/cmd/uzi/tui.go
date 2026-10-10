@@ -672,12 +672,22 @@ func (m tuiModel) fetchRunsCmd(admin bool, reqID uint64) tea.Cmd {
 		// INSIDE the closure so the cancel fires when the poll returns, not immediately.
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
-		var runs []apitypes.RunListItemDTO
+		// The board polls the compact summary view (issue #2661): it never reads the
+		// heavy detail fields, so the server omits them. Rows are converted back to
+		// RunListItemDTO so the board code keeps its types.
+		var sums []apitypes.RunSummaryItemDTO
 		var err error
 		if admin {
-			runs, err = c.AdminListRuns(ctx)
+			sums, err = c.AdminListRunSummaries(ctx)
 		} else {
-			runs, err = c.ListRuns(ctx)
+			sums, err = c.ListRunSummaries(ctx)
+		}
+		var runs []apitypes.RunListItemDTO
+		if sums != nil {
+			runs = make([]apitypes.RunListItemDTO, len(sums))
+			for i, s := range sums {
+				runs[i] = s.ListItem()
+			}
 		}
 		return boardRunsMsg{runs: runs, admin: admin, err: err, reqID: reqID}
 	}

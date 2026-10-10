@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import type {
   Run,
   RunListItem,
+  RunSummaryItem,
   RunJob,
   Repo,
   AdminDockerAllowlistRepo,
@@ -83,6 +84,8 @@ import runZero from "../../../fixtures/api-contract/run.zero.json";
 import runFull from "../../../fixtures/api-contract/run.full.json";
 import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.json";
 import runListItemFull from "../../../fixtures/api-contract/run_list_item.full.json";
+import runSummaryItemZero from "../../../fixtures/api-contract/run_summary_item.zero.json";
+import runSummaryItemFull from "../../../fixtures/api-contract/run_summary_item.full.json";
 import repoZero from "../../../fixtures/api-contract/repo.zero.json";
 import repoFull from "../../../fixtures/api-contract/repo.full.json";
 import dockerAllowlistRepoZero from "../../../fixtures/api-contract/admin_docker_allowlist_repo.zero.json";
@@ -367,6 +370,32 @@ void _releaseCheckStatusFull;
   void _runListItemExtra;
   void _runListItemZero;
   void _runListItemFull;
+}
+
+// ── RunSummaryItem ──────────────────────────────────────────────────────────
+// RunSummaryItem is RunListItem minus plan_md, repo_agents, issue_description and
+// preserved_patch (GET /api/runs?view=summary, Go RunSummaryItemDTO). The ZeroOf
+// exemptions are the same as RunListItem's.
+{
+  const _runSummaryItemMissing: never = null as unknown as Exclude<keyof RunSummaryItem, keyof typeof runSummaryItemFull>;
+  const _runSummaryItemExtra: never = null as unknown as Exclude<keyof typeof runSummaryItemFull, keyof RunSummaryItem>;
+  const _runSummaryItemZero: ZeroOf<
+    RunSummaryItem,
+    | "plan_changed_files"
+    | "required_capabilities"
+    | "required_tools"
+    | "completion_unmet"
+    | "completion_deferred"
+    | "completion_accepted"
+    | "credential_epochs"
+    // nonNilStrings in runs_dto.go normalizes the recorded nil slice to [].
+    | "auto_approve_blocked_reasons"
+  > = runSummaryItemZero;
+  const _runSummaryItemFull: Widen<RunSummaryItem> = runSummaryItemFull;
+  void _runSummaryItemMissing;
+  void _runSummaryItemExtra;
+  void _runSummaryItemZero;
+  void _runSummaryItemFull;
 }
 
 // ── Repo (M2) ───────────────────────────────────────────────────────────────
@@ -1203,6 +1232,25 @@ it("recorded nested checker metadata always has the nullable member", () => {
   void _recoveryCustodyHoldFull;
 }
 
+it("recovery publication receipt matches the Go contract and permits older servers", () => {
+  const full: RecoveryCustodyHold = recoveryCustodyHoldFull;
+  const older: RecoveryCustodyHold = recoveryCustodyHoldZero;
+  expect(full.completed_publication_reason).toBe("x");
+  expect(full.completed_publication_receipt).toEqual({
+    hold_id: "x", run_id: "x", owner_id: "x", worker_id: "x", generation: 1,
+    final_head: "x", repo_id: "x", connection_id: "x", project_id: 1,
+    forge_type: "x", base_url: "x", branch: "x", mr_iid: 1,
+    observed_branch_head: "x",
+  });
+  expect(older.completed_publication_receipt).toBeUndefined();
+  expect(older.completed_publication_reason).toBeUndefined();
+  const withoutMR: NonNullable<RecoveryCustodyHold["completed_publication_receipt"]> = {
+    ...full.completed_publication_receipt!, mr_iid: null,
+  };
+  // This assignment checks nullable MR compatibility at compile time.
+  void withoutMR;
+});
+
 // ── RecoveryCustodyAggregate (PRD #1349 M1) ──────────────────────────────────
 // All four fields are ints, so the zero.json carries no null (declared nullable:false).
 {
@@ -1447,6 +1495,7 @@ function hasNull(v: unknown): boolean {
 const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "run", nullable: true },
   { stem: "run_list_item", nullable: true },
+  { stem: "run_summary_item", nullable: true },
   // PRD #1908 D-D: inputs (nil slice), origin members and result are null in zero.json.
   { stem: "run_job", nullable: true },
   { stem: "repo", nullable: true },
