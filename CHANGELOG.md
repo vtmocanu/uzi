@@ -24,8 +24,8 @@ through `[0.52.0]`.)
 
 ### Added
 
-- **Codex account holds at running checkpoints ([#1595](https://github.com/vtmocanu/uzi/issues/1595)).**
-  Capable workers receive a credential-free account-unavailable reason and may request a server-verified park that retains source custody and worker affinity, revokes the claim capability, and resumes after the same account becomes usable.
+- **Running Codex subscription runs can hold at checkpoints instead of failing on an unavailable account ([#1595](https://github.com/vtmocanu/uzi/issues/1595)).**
+  For issue, ci_fix, self_improve, prompt, task and mr_rework runs without an egress profile, an upgraded API and worker capture and verify work credential-free before a server-classified account park. Publication is best-effort; custody, the tracking ref, session and source-worker affinity remain for recovery, with no guaranteed server archive. The API revokes the claim capability, and the hold resumes without a timer after account recovery or verified same-identity re-login. Mid-turn refresh, startup release and other faults keep their handling. Maintainer-hosted acceptance is pending.
 
 - **Live issue runs show a progress percent ([#2602](https://github.com/vtmocanu/uzi/issues/2602)).**
   The server derives it from the frozen milestone list (`11% + 89% × completed / total`, capped at 99% until the run finishes) and shows it on the web dashboard and runs list, in a `PROG` column on the TUI board, and as a `PROGRESS` row in `uzi run get` (`progress` object in `--json`); a flag (waits on you, parked, queued, stalled, planning) replaces the number when it would mislead, other run kinds show none, and no time remaining is shown because the estimate is too unreliable.
