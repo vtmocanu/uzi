@@ -2,7 +2,7 @@
 // model on the run's own credential writes one plain sentence (at most 120 characters) of what
 // the run is doing, and the worker posts it as a `progress_note` run message.
 //
-// EVERYTHING here is advisory and must never cost the run anything:
+// EVERYTHING here is advisory and must never change the run's behaviour (it does spend tokens):
 //   - every error, rate limits included, is swallowed and logged. The pass is a plain
 //     runReadOnlyModelPass: `onResult` is never passed, so nothing reaches the run's
 //     RateLimitObserver, `limit_wait`, a credential switch or the steering channel;
@@ -26,6 +26,10 @@
 // cancelled runs still count their spend") unless the claim was lost (the api refuses a fenced
 // delivery anyway). stop() applies the same rule to a call it abandons after the stop bound: the
 // usage the pass already delivered is posted as an empty-text note when the claim is not fenced.
+// A call in flight when a hold begins is aborted (PRD D11), so a hold that opens and closes
+// while a call runs can never let the pre-hold text publish; a cacheCapBoundary hold therefore
+// drops a call spanning an iteration boundary. The same abort ends a call when the setting turns
+// off. Usage already received is posted once as a usage-only note.
 // When the setting turns off after a note was shown, one empty "clear" note (no usage) is emitted
 // so open pages refresh and the line disappears.
 //
@@ -295,8 +299,11 @@ export class NowSummaryController {
   }
 
   /** Run `fn` as a hold: while it is pending the run is parked, at a gate or asking a question
-   *  (or at a turn boundary), so no call starts and a result completing meanwhile is discarded. */
+   *  (or at a turn boundary), so no call starts. A call already in flight when the hold begins is
+   *  aborted (its text can never publish, even after a hold that closes before it settles; its
+   *  usage is posted once as a usage-only note). */
   async hold<T>(fn: () => Promise<T>): Promise<T> {
+    this.inflight?.ctrl.abort();
     this.holdDepth++;
     try {
       return await fn();
@@ -480,10 +487,19 @@ export class NowSummaryController {
     this.deps.emit({ kind: "progress_note", agent: "worker", payload: { text: "", milestone_id: milestoneId, model_usage: usage } });
   }
 
+  /** The steering channel saw a new poll value for the setting: re-sync now. */
+  observeSetting(): void {
+    this.guard(() => {
+      this.syncEnabled();
+      this.schedule();
+    });
+  }
+
   /** Track the setting; on on-to-off after a note was posted, emit one empty "clear" note so open
    *  pages refresh and the line disappears. */
   private syncEnabled(): void {
     const enabled = this.deps.steering.nowSummaryEnabled();
+    if (this.wasEnabled && !enabled) this.inflight?.ctrl.abort();
     if (this.wasEnabled && !enabled && this.postedMilestone !== undefined && !this.stopped) {
       this.deps.emit({ kind: "progress_note", agent: "worker", payload: { text: "", milestone_id: this.postedMilestone } });
       this.postedMilestone = undefined;

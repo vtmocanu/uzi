@@ -46,6 +46,41 @@ describe("SteeringChannel.nowSummaryEnabled (PRD #2603)", () => {
   });
 });
 
+describe("SteeringChannel.onNowSummaryChange (PRD #2603)", () => {
+  it("fires when a poll flips on to off, once, and not for an unchanged value", async () => {
+    const ch = channelFor([true, true, true, false, false]);
+    let fired = 0;
+    const seen: boolean[] = [];
+    ch.onNowSummaryChange(() => {
+      fired++;
+      seen.push(ch.nowSummaryEnabled());
+    });
+    ch.start();
+    await tick(150);
+    assert.deepEqual(seen, [true, false], "one call per change: off to on, then on to off");
+    assert.equal(fired, 2);
+  });
+
+  it("a throwing callback neither skips routing nor counts as an input-poll failure", async () => {
+    let n = 0;
+    const client = withReceipts({
+      getInputs: async () => (n++ === 0 ? { inputs: [{ id: 1, kind: "follow_up", body: "hello", created_at: "2026-01-01T00:00:00Z" }], nowSummary: true } : { inputs: [], nowSummary: true }),
+    } as unknown as WorkerClient);
+    const warns: string[] = [];
+    const log = { ...nullLogger(), warn: (m: string) => void warns.push(m) };
+    const ch = new SteeringChannel(client, "run-1", 1, log, new AbortController(), { sleep: () => tick(2) });
+    ch.onNowSummaryChange(() => {
+      throw new Error("boom");
+    });
+    ch.start();
+    await tick(60);
+    assert.equal(ch.nowSummaryEnabled(), true);
+    assert.ok(warns.some((w) => w.includes("now summary change callback failed")));
+    assert.ok(!warns.some((w) => w.includes("input poll failed")));
+    assert.equal(ch.pullFollowUp()?.body, "hello", "the input in the same poll was still routed");
+  });
+});
+
 describe("WorkerClient.getInputs now_summary (PRD #2603)", () => {
   async function read(body: unknown): Promise<boolean | undefined> {
     const c = new WorkerClient("http://api.test", "t", "0.1.0-test", nullLogger(), {

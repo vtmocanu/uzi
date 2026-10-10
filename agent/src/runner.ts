@@ -9719,6 +9719,8 @@ export class RunRunner {
             log: runLog,
           })
         : undefined;
+    // PRD #2603: a poll that flips the setting re-syncs the controller at once (clears a shown note).
+    if (nowSummary) steering.onNowSummaryChange(() => nowSummary.observeSetting());
     const ctx: RunContext = {
       runId,
       claimGeneration: claim.claim_generation,

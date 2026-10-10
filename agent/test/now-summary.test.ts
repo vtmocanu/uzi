@@ -555,6 +555,36 @@ describe("NowSummaryController: the posted note", () => {
     await held;
   });
 
+  it("discards the text of a call in flight when a hold opened and closed before it settled, posting its usage once", async () => {
+    const h = harness({ ignoreAbort: true });
+    await running(h);
+    await h.c.hold(async () => {});
+    assert.equal(h.calls[0]!.opts.signal!.aborted, true);
+    h.calls[0]!.opts.onUsage?.(usage(7, 3));
+    h.calls[0]!.resolve("stale pre-hold text");
+    await settle();
+    const notes = h.notes();
+    assert.deepEqual(notes.filter((n) => n.text !== ""), []);
+    const usageNotes = notes.filter((n) => n.model_usage !== undefined);
+    assert.equal(usageNotes.length, 1);
+    assert.equal(usageNotes[0]!.text, "");
+    assert.equal((usageNotes[0]!.model_usage as AdviceUsageSnapshot)["claude-haiku-4-5-20251001"]!.inputTokens, 7);
+  });
+
+  it("the setting turning off aborts a call in flight: its text is not published and its usage is posted once", async () => {
+    const h = harness({ ignoreAbort: true });
+    await running(h);
+    h.st.enabled = false;
+    h.c.observeSetting();
+    assert.equal(h.calls[0]!.opts.signal!.aborted, true);
+    h.calls[0]!.opts.onUsage?.(usage(5, 2));
+    h.calls[0]!.resolve("stale text");
+    await settle();
+    const notes = h.notes();
+    assert.deepEqual(notes.filter((n) => n.text !== ""), []);
+    assert.equal(notes.filter((n) => n.model_usage !== undefined).length, 1);
+  });
+
   it("posts nothing, not even the usage, once the claim was lost", async () => {
     const h = harness();
     await running(h);

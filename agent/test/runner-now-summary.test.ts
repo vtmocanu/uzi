@@ -151,6 +151,43 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     assert.equal(opts.env?.CLAUDE_CODE_OAUTH_TOKEN, "oauth-fixture-token", "the run's own credential");
   });
 
+  it("a poll that turns the setting off clears the shown note at once", async () => {
+    const calls: { options: unknown; prompt: unknown }[] = [];
+    const claim = claimFor(2603);
+    api.nowSummary.set(claim.run_id, true);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        const frozen = [{ id: "m1", title: "Write the docs" }] as never;
+        await ctx.reportProgress!({ completed: [], in_progress: ["m1"] }, frozen);
+        const emitFrame = () => ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "x", description: "Run the api gate" } } });
+        const until = Date.now() + 4000;
+        while (!notesOf(claim.run_id).some((m) => (m.payload as { text?: string }).text) && Date.now() < until) {
+          emitFrame();
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        api.nowSummary.set(claim.run_id, false);
+        // Quiet: no frames, so only the poll can clear the note.
+        const quietUntil = Date.now() + 3000;
+        while (!notesOf(claim.run_id).some((m) => (m.payload as { text?: string }).text === "" && !(m.payload as { model_usage?: unknown }).model_usage) && Date.now() < quietUntil) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        commitMarker(ctx.worktreePath);
+        return { branch: ctx.branch };
+      },
+    };
+    try {
+      await runnerFor(executor, { homeRoot, queryFn: summaryQuery(calls) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    const notes = notesOf(claim.run_id).map((m) => m.payload as Record<string, unknown>);
+    assert.equal(notes[0]!.text, "Running the api gate for the docs milestone");
+    const clears = notes.filter((p) => p.text === "" && p.model_usage === undefined);
+    assert.equal(clears.length, 1);
+    assert.equal(clears[0]!.milestone_id, "m1");
+  });
+
   it("makes no call when the poll never says on (an absent now_summary is off)", async () => {
     const calls: { options: unknown; prompt: unknown }[] = [];
     const claim = claimFor(2604);
