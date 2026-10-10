@@ -15,8 +15,11 @@
 # response that already carries its own Content-Encoding. A render that lints clean proves
 # none of that, so every property is asserted on real responses from real nginx.
 #
-# HOW. The image pinned in web/Dockerfile runs once per config (compose, chart, mock) next
-# to a stub upstream that answers as the api. Fixtures are generated here, deterministically,
+# HOW. The image pinned in web/Dockerfile runs, by its exact digest, once per config
+# (compose, chart, mock) next to a stub upstream that answers as the api. The digest is
+# fetched from mirror.gcr.io first, then Docker Hub (anonymous per-IP pull quota, #2621);
+# docker-pull-fallback.sh cannot be reused because it rejects @digest refs. Fixtures are
+# generated here, deterministically,
 # and compared byte for byte (curl never decodes; gzip -dc and cmp do). Nothing is
 # bind-mounted (the daemon may not see this host's paths): files are docker cp'd in. Every
 # container and the network are named wnginx-<pid>-*, never uzi-*. Only what this run created
@@ -79,9 +82,44 @@ case "$IMAGE" in
   *@sha256:*) ;;
   *) broken "no digest-pinned nginxinc/nginx-unprivileged FROM line in web/Dockerfile (got '${IMAGE}')" ;;
 esac
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  docker pull "$IMAGE" >/dev/null 2>"$W/pull.err" || { cat "$W/pull.err" >&2; broken "cannot pull $IMAGE"; }
+DIGEST=${IMAGE##*@}
+case "$DIGEST" in
+  sha256:?*) ;;
+  *) broken "unusable digest '${DIGEST}' in the web/Dockerfile nginx FROM line" ;;
+esac
+MIRROR_REF="mirror.gcr.io/nginxinc/nginx-unprivileged@$DIGEST"
+HUB_REF="docker.io/nginxinc/nginx-unprivileged@$DIGEST"
+# Pick the ref the containers run: a copy already present locally wins (no network), else
+# pull the mirror, else Docker Hub.
+NGINX_REF=""
+NGINX_SRC=""
+for ref in "$MIRROR_REF" "$HUB_REF"; do
+  if docker image inspect "$ref" >/dev/null 2>&1; then
+    NGINX_REF=$ref
+    NGINX_SRC="local cache"
+    break
+  fi
+done
+if [ -z "$NGINX_REF" ]; then
+  if docker pull "$MIRROR_REF" >/dev/null 2>"$W/pull-mirror.err"; then
+    NGINX_REF=$MIRROR_REF
+    NGINX_SRC="pulled"
+  elif docker pull "$HUB_REF" >/dev/null 2>"$W/pull-hub.err"; then
+    NGINX_REF=$HUB_REF
+    NGINX_SRC="pulled"
+  else
+    echo "pull of $MIRROR_REF failed:" >&2
+    cat "$W/pull-mirror.err" >&2
+    echo "pull of $HUB_REF failed:" >&2
+    cat "$W/pull-hub.err" >&2
+    broken "cannot get the nginx image: neither $MIRROR_REF nor $HUB_REF is present locally or pullable"
+  fi
 fi
+case "$NGINX_REF" in
+  mirror.gcr.io/*) NGINX_REGISTRY=mirror.gcr.io ;;
+  *) NGINX_REGISTRY=docker.io ;;
+esac
+echo "nginx image: $NGINX_REF (registry $NGINX_REGISTRY, $NGINX_SRC)"
 
 # --- chart render ------------------------------------------------------------------------
 CHART="$W/chart"
@@ -173,7 +211,7 @@ start_ctr() {
   local name="$1" conf="$2" doc="$3" id; shift 3
   # Record the container for cleanup only once create succeeded, and by the ID it printed:
   # a failed create (the name is held by a container this run did not make) records nothing.
-  id=$(docker create --name "$name" --network "$NET" "$@" "$IMAGE") || broken "docker create $name failed"
+  id=$(docker create --name "$name" --network "$NET" "$@" "$NGINX_REF") || broken "docker create $name failed"
   [ -n "$id" ] || broken "docker create $name printed no container id"
   CONTAINERS+=("$id")
   docker cp "$conf" "$name:/etc/nginx/conf.d/default.conf" || broken "docker cp conf to $name failed"
