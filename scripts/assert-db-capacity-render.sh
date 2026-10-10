@@ -180,6 +180,19 @@ MATRIX
 while IFS="	" read -r q want; do
   expect_bytes "(f) size=$q" "$want" --set-string "database.simple.storage.size=$q"
 done < "$WORK/matrix.txt"
+# Long fractions, built here rather than typed. Both are valid Kubernetes quantities whose
+# Value() rounds up: 1.(70 zeros)1 -> 2 exercises the chart's fraction truncation (the
+# sticky "dropped a nonzero digit" flag, a mutant clearing it renders 1), and
+# 0.(64 zeros)1Ki -> 1 exercises a tiny binary-suffixed value that still rounds up.
+Z70=$(awk 'BEGIN { for (i = 0; i < 70; i++) printf "0" }')
+Z64=$(awk 'BEGIN { for (i = 0; i < 64; i++) printf "0" }')
+expect_bytes "(f) size=1.<70 zeros>1" 2 --set-string "database.simple.storage.size=1.${Z70}1"
+expect_bytes "(f) size=0.<64 zeros>1Ki" 1 --set-string "database.simple.storage.size=0.${Z64}1Ki"
+# 20-digit exponents: Kubernetes itself rejects or wraps these, so the chart's behaviour is
+# the documented intent, not a resource.Quantity comparison: the exponent clamps to 18 nines,
+# a huge positive one fails the bound, a huge negative one rounds a nonzero value up to 1.
+N20=$(awk 'BEGIN { for (i = 0; i < 20; i++) printf "9" }')
+expect_bytes "(f) size=1e-<20 nines> (chart intent: rounds up to 1)" 1 --set-string "database.simple.storage.size=1e-${N20}"
 # A YAML plain integer arrives as a float64 (the %v form is 1.073741824e+10); --set gives an int64.
 printf 'database:\n  simple:\n    storage:\n      size: 10737418240\n' > "$WORK/int.yaml"
 expect_bytes "(f) YAML int 10737418240" 10737418240 -f "$WORK/int.yaml"
@@ -190,6 +203,10 @@ for q in 8GB abc 0 0.0Gi -1Gi 2Ei 1025Pi 1152921504606846976.5 11529215046068469
   expect_fail "(g) size=$q" "database.simple.storage.size must be a positive Kubernetes quantity" \
     --set-string "database.simple.storage.size=$q"
 done
+expect_fail "(g) size=1152921504606846976.<70 zeros>1" "database.simple.storage.size must be a positive Kubernetes quantity" \
+  --set-string "database.simple.storage.size=1152921504606846976.${Z70}1"
+expect_fail "(g) size=1e<20 nines> (chart intent: rejected)" "database.simple.storage.size must be a positive Kubernetes quantity" \
+  --set-string "database.simple.storage.size=1e${N20}"
 printf 'database:\n  simple:\n    storage:\n      size: ""\n' > "$WORK/empty.yaml"
 expect_fail "(g) size=<empty>" "database.simple.storage.size must be a positive Kubernetes quantity" -f "$WORK/empty.yaml"
 

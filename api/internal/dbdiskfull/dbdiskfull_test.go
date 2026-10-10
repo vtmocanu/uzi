@@ -98,6 +98,9 @@ func TestNilSignalIsSafe(t *testing.T) {
 	if _, ok := s.LastSeen(); ok {
 		t.Fatal("nil signal has no LastSeen")
 	}
+	if _, ok := s.IncidentStart(); ok {
+		t.Fatal("nil signal has no IncidentStart")
+	}
 	(&Tracer{}).TraceQueryEnd(context.Background(), nil, pgx.TraceQueryEndData{Err: pgErr(CodeDiskFull)})
 }
 

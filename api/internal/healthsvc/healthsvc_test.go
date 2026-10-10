@@ -514,6 +514,36 @@ func TestDB(t *testing.T) {
 	}
 }
 
+// Evaluate reads the clock once and judges db disk-full at that instant. A clock that
+// jumps past the window on later calls must not clear a sighting made at that instant.
+func TestEvaluateJudgesDiskFullAtItsSingleNow(t *testing.T) {
+	t0 := fixedNow
+	sig := dbdiskfull.New(func() time.Time { return t0 })
+	sig.Observe(fmt.Errorf("write: %w", &pgconn.PgError{Code: "53100"}))
+	calls := 0
+	svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, DiskFull: sig, Now: func() time.Time {
+		calls++
+		if calls == 1 {
+			return t0
+		}
+		return t0.Add(dbdiskfull.Window + time.Second)
+	}})
+	svc.probeDB = func(context.Context) dbStat { return dbStat{schemaAtHead: true, maxConns: 20} }
+	doc, err := svc.Evaluate(context.Background())
+	if err != nil || calls != 1 {
+		t.Fatalf("Evaluate err=%v clock calls=%d, want exactly 1", err, calls)
+	}
+	for _, check := range doc.Checks {
+		if check.ID == "db" {
+			if check.Severity != sevDanger {
+				t.Fatalf("db check severity=%q, want danger", check.Severity)
+			}
+			return
+		}
+	}
+	t.Fatal("no db check in the document")
+}
+
 func TestDBDiskFull(t *testing.T) {
 	pg := func(code string) error { return fmt.Errorf("write: %w", &pgconn.PgError{Code: code}) }
 	clock := fixedNow

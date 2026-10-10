@@ -7,7 +7,7 @@ package dbdiskfull
 import (
 	"context"
 	"errors"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -31,10 +31,12 @@ func Is(err error) bool {
 // Signal remembers the last disk-full sighting. The zero value is not usable; build one
 // with New. A nil *Signal is safe to use and never active.
 type Signal struct {
-	now      func() time.Time
-	lastSeen atomic.Int64 // unix nanoseconds; 0 means never seen
-	start    atomic.Int64 // unix nanoseconds of the current incident's first sighting
-	gen      atomic.Uint64
+	now func() time.Time
+
+	mu       sync.Mutex
+	lastSeen int64  // unix nanoseconds, the newest sighting; 0 means never seen
+	start    int64  // unix nanoseconds of the current incident's first sighting
+	gen      uint64 // distinct incidents observed so far
 }
 
 // New returns a Signal reading time from now (nil means time.Now).
@@ -47,16 +49,23 @@ func New(now func() time.Time) *Signal {
 
 // Observe records err when it is a disk-full error and reports whether it recorded.
 // The generation advances when this sighting starts a new incident: no earlier
-// sighting, or the earlier one is older than Window.
+// sighting, or the earlier one is older than Window. lastSeen never moves backwards,
+// and lastSeen, start and generation change together under one lock (Observe runs on
+// the error path only).
 func (s *Signal) Observe(err error) bool {
 	if s == nil || !Is(err) {
 		return false
 	}
 	t := s.now().UnixNano()
-	prev := s.lastSeen.Swap(t)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev := s.lastSeen
 	if prev == 0 || t-prev > int64(Window) {
-		s.start.Store(t)
-		s.gen.Add(1)
+		s.start = t
+		s.gen++
+	}
+	if t > prev {
+		s.lastSeen = t
 	}
 	return true
 }
@@ -66,7 +75,9 @@ func (s *Signal) Active(now time.Time) bool {
 	if s == nil {
 		return false
 	}
-	last := s.lastSeen.Load()
+	s.mu.Lock()
+	last := s.lastSeen
+	s.mu.Unlock()
 	if last == 0 {
 		return false
 	}
@@ -78,7 +89,9 @@ func (s *Signal) LastSeen() (time.Time, bool) {
 	if s == nil {
 		return time.Time{}, false
 	}
-	last := s.lastSeen.Load()
+	s.mu.Lock()
+	last := s.lastSeen
+	s.mu.Unlock()
 	if last == 0 {
 		return time.Time{}, false
 	}
@@ -91,7 +104,9 @@ func (s *Signal) IncidentStart() (time.Time, bool) {
 	if s == nil {
 		return time.Time{}, false
 	}
-	t := s.start.Load()
+	s.mu.Lock()
+	t := s.start
+	s.mu.Unlock()
 	if t == 0 {
 		return time.Time{}, false
 	}
@@ -103,7 +118,9 @@ func (s *Signal) Generation() uint64 {
 	if s == nil {
 		return 0
 	}
-	return s.gen.Load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gen
 }
 
 // Tracer is a pgx.QueryTracer that feeds query errors to Signal. pgx v5 traces Exec,
