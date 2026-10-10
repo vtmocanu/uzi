@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Run lists can be fetched as a compact summary, and the TUI board and web run lists now poll it ([#2661](https://github.com/vtmocanu/uzi/issues/2661)).**
+  `GET /api/runs?view=summary` and `GET /api/admin/runs?view=summary` return the same rows, filters, ordering and authorization as the default list, without `plan_md`, `repo_agents`, `issue_description` and `preserved_patch`, which no list renderer uses (a synthetic 200-row list shrinks from about 5.6 MB to 1.3 MB before compression). The `uzi` TUI board, the Runs page (owner and admin), the dashboard, the board's attention strip, the issue run history and the favicon poll request it; the default response, `uzi run list --json` and `uzi admin runs` are unchanged.
+
 - **Admin health warns when the database is nearly or completely full ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
   A new instance-scope `db.size` check compares `pg_database_size` with the `DB_STORAGE_CAPACITY_BYTES` budget (warn at 75%, danger at 85%; `na` when unset or invalid, `unknown` when unreadable; cached 60 seconds per api replica) and lists the size, capacity, percentage and up to three largest relations, or "unavailable" when that query gives up under a lock. It is a database-size budget, not volume usage: it excludes WAL, other databases, temp files and filesystem overhead, and can read below 75% while the volume fills, so keep an infrastructure free-space alert (for example kubelet volume stats) as the primary low-disk control. Because it is instance danger, 85% uses the existing instance-danger episode and admin notice (the admin health-notification setting and the Slack opt-in apply) and also shows the app-wide Danger banner ("uzi cannot run work"), even though work may still run at that size. See [Database storage signals](docs/admin-health.md#database-storage-signals) and [Database storage capacity](docs/configuration.md#database-storage-capacity).
 
