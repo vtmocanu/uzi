@@ -19,9 +19,11 @@
 # to a stub upstream that answers as the api. Fixtures are generated here, deterministically,
 # and compared byte for byte (curl never decodes; gzip -dc and cmp do). Nothing is
 # bind-mounted (the daemon may not see this host's paths): files are docker cp'd in. Every
-# container and the network are named wnginx-<pid>-*, never uzi-*, and exactly those are
-# removed on exit. The web containers use --dns-option ndots:0 so the chart's static
-# proxy_pass host "api" resolves to the stub alias and not to a search-domain lookalike.
+# container and the network are named wnginx-<pid>-*, never uzi-*. Only what this run created
+# is removed on exit: a container by the ID its successful docker create printed (never by
+# name), the network only once docker network create succeeded. The web containers use
+# --dns-option ndots:0 so the chart's static proxy_pass host "api" resolves to the stub
+# alias and not to a search-domain lookalike.
 #
 # Everything is read from <repo-root> (default: this script's parent directory), so it can
 # be pointed at a git archive export of an older commit to prove it goes red there.
@@ -54,7 +56,7 @@ done
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/assert-web-nginx.XXXXXX")
 NET="wnginx-$$-net"
-CONTAINERS=()
+CONTAINERS=() # IDs printed by a successful docker create, nothing else
 NET_MADE=0
 cleanup() {
   local c
@@ -168,9 +170,12 @@ container_logs() { docker logs "$1" 2>&1 | tail -n 20 >&2 || true; }
 
 # start_ctr <name> <conf> <docroot-or-empty> [extra docker create args...]
 start_ctr() {
-  local name="$1" conf="$2" doc="$3"; shift 3
-  CONTAINERS+=("$name")
-  docker create --name "$name" --network "$NET" "$@" "$IMAGE" >/dev/null || broken "docker create $name failed"
+  local name="$1" conf="$2" doc="$3" id; shift 3
+  # Record the container for cleanup only once create succeeded, and by the ID it printed:
+  # a failed create (the name is held by a container this run did not make) records nothing.
+  id=$(docker create --name "$name" --network "$NET" "$@" "$IMAGE") || broken "docker create $name failed"
+  [ -n "$id" ] || broken "docker create $name printed no container id"
+  CONTAINERS+=("$id")
   docker cp "$conf" "$name:/etc/nginx/conf.d/default.conf" || broken "docker cp conf to $name failed"
   if [ -n "$doc" ]; then
     docker cp "$doc/." "$name:/usr/share/nginx/html" || broken "docker cp docroot to $name failed"
