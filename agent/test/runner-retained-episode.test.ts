@@ -931,7 +931,7 @@ for (const scenario of ["refused now", "refused wall", "owner cancel", "shutdown
         if (scenario === "disk before rearm") steering.requestDiskStop();
         if (scenario !== "unrearmed pause") {
           observations.parked = scenario === "refused wall"
-            ? await ctx.parkForWall!() : await ctx.parkForPause!({ completedCount: 0 });
+            ? await ctx.parkForWall!({ completedCount: 0 }) : await ctx.parkForPause!({ completedCount: 0 });
           if (scenario === "refused wall") ctx.clearWallMode!();
         }
         observations.live = !steering.lifecycleSignal().aborted;
