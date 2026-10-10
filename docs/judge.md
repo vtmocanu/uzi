@@ -180,7 +180,8 @@ page shows a "judge incomplete" badge next to the verdict.
 
 The one exception is a usage limit: if the judge model call dies because the
 account hit its usage limit, no review is posted and the judge run fails with
-a failure reason built from the limit window and reset time.
+a failure reason naming the limit window and reset time (or a plain "usage
+limit reached" when the model reported neither).
 
 ## The failure-class signal
 
