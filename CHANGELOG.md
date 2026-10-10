@@ -24,10 +24,25 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Admin health warns when the database is nearly or completely full ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
+  A new instance-scope `db.size` check compares `pg_database_size` with the `DB_STORAGE_CAPACITY_BYTES` budget (warn at 75%, danger at 85%; `na` when unset or invalid, `unknown` when unreadable; cached 60 seconds per api replica) and lists the size, capacity, percentage and up to three largest relations, or "unavailable" when that query gives up under a lock. It is a database-size budget, not volume usage: it excludes WAL, other databases, temp files and filesystem overhead, and can read below 75% while the volume fills, so keep an infrastructure free-space alert (for example kubelet volume stats) as the primary low-disk control. Because it is instance danger, 85% opens the instance episode, sends the admin Slack notice and also shows the app-wide Danger banner ("uzi cannot run work"), even though work may still run at that size. See [Database storage signals](docs/admin-health.md#database-storage-signals) and [Database storage capacity](docs/configuration.md#database-storage-capacity).
+
+- **The `db` check goes danger while the database is refusing writes for lack of disk ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
+  For five minutes after the api last sees SQLSTATE `53100` on a pool statement or commit, `db` reads "Database writes are failing: disk full (53100)." The record is in memory per api replica and resets on restart. It does not see goose migrations at boot, connect or ping errors, a WAL-volume-full PANIC and restart, or a CNPG primary that shuts down after its data volume fills, and other class-53 codes are never labelled disk full.
+
+- **Admins still get the Slack notice when the database cannot record it ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
+  When opening the health episode, claiming the per-admin notice or inserting the notification fails with `53100`, the api posts the admin Slack notice from memory under the same health-notification gate, admin-only, Slack opt-in and escaping rules, at most once per admin per 30 minutes per incident. The cooldown is per replica and in memory (replicas can duplicate, a restart resets it), the episode-open path keeps its two-consecutive-tick debounce, it still needs database reads for settings, the admin list and the Slack link, so it cannot help during a database shutdown, failover or connection exhaustion, and the normal claimed notice can follow after recovery. Warning when the recovery-archive quota takes a large share of the budget is a follow-up ([#2544](https://github.com/vtmocanu/uzi/issues/2544)).
+
+- **The Helm chart sets the database capacity budget from the database storage size ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
+  `DB_STORAGE_CAPACITY_BYTES` is rendered from `database.simple.storage.size` (simple) or `postgres.cluster.storage.size` (CNPG), converting the Kubernetes quantity to bytes rounded up. The render fails for an invalid, nonpositive or over-1-EiB quantity, or when `api.config` also sets the key; with `database.mode: external` set `api.config.DB_STORAGE_CAPACITY_BYTES` yourself. In simple mode the PVC comes from a StatefulSet volume claim template, so the rendered value is the size at creation (see the comment in `values.yaml` for resizing). `task render:db-capacity-check` asserts the rendering and also runs from `task render:openshift-check` in CI.
+
 - **Answer agent questions from the TUI ([#2550](https://github.com/vtmocanu/uzi/issues/2550)).**
   Run owners can press `i` to compose option selections and details, review each answer before sending, and reopen drafts kept in the current TUI session; uncertain delivery blocks resending in that session and points to the web or Slack, which remain the fallback for read-only viewers and unsupported payloads.
 
 ### Fixed
+
+- **Chart-rendered api settings now reach the pod when `api.config` is empty ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
+  The api Deployment mounted its ConfigMap only when `api.config` or the hosted-workers flag was set, while the ConfigMap itself also rendered for the forge allowlist and release-check keys, so those keys were silently not loaded in that configuration. Both templates now share one condition, which also covers the new `DB_STORAGE_CAPACITY_BYTES`.
 
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.
