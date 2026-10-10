@@ -7890,10 +7890,14 @@ describe("production advice data teardown (#2324)", () => {
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
       await diagnostic.watch(owned, handle.cwd, lines);
       try {
+        diagnostic.mark("mutation_start");
         uidScript(runnerCommand, "require('node:fs').renameSync(process.argv[1],process.argv[1]+'.retained')", owned);
+        diagnostic.mark("mutation_end");
         await fs.mkdir(owned);
         await fs.writeFile(path.join(owned, "keep"), "keep");
+        diagnostic.mark("dispose_start");
         await handle.dispose();
+        diagnostic.mark("dispose_end");
         assert.equal(await fs.readFile(path.join(owned, "keep"), "utf8"), "keep");
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed" && /not owned/.test(String(rec(line).error))));
@@ -7911,9 +7915,13 @@ describe("production advice data teardown (#2324)", () => {
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
       await diagnostic.watch(owned, handle.cwd, lines);
       try {
+        diagnostic.mark("mutation_start");
         uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.symlinkSync(process.argv[2],process.argv[1])", owned, victim);
+        diagnostic.mark("mutation_end");
         await fs.writeFile(path.join(victim, "keep"), "outside");
+        diagnostic.mark("dispose_start");
         await handle.dispose();
+        diagnostic.mark("dispose_end");
         assert.ok((await fs.lstat(owned)).isSymbolicLink());
         assert.equal(await fs.readFile(path.join(victim, "keep"), "utf8"), "outside");
         await assertGone(handle.cwd);
@@ -7971,13 +7979,17 @@ describe("production advice data teardown (#2324)", () => {
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
       await diagnostic.watch(owned, handle.cwd, lines);
       try {
+        diagnostic.mark("mutation_start");
         uidScript(runnerCommand, "require('node:fs').renameSync(process.argv[1],process.argv[1]+'.retained')", owned);
+        diagnostic.mark("mutation_end");
         // The launcher requires the split. Exercise its actual disposal closure with
         // a single-uid ownership fixture, then restore split before fixture disposal.
         await fs.mkdir(owned);
         await fs.writeFile(path.join(owned, "file"), "remove");
         delete process.env.UZI_UID_SPLIT;
+        diagnostic.mark("dispose_start");
         await handle.dispose();
+        diagnostic.mark("dispose_end");
         await assertGone(owned);
         await assertGone(handle.cwd);
         assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
