@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, it, mock } from "node:test";
 import { WorkerClient } from "../src/client.js";
-import { RunRunner } from "../src/runner.js";
+import { RunRunner, StaleClaimError } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
 import type { ChatRunner } from "../src/chat-runner.js";
@@ -108,6 +108,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   const send = async (b: StateRequest): Promise<StateAck> => {
     const ack = await client.reportState(receipt.run_id, b);
     await run.observeSettlementTerminalAck(receipt.run_id, receipt.generation, b, ack);
+    if (ack.staleClaim) throw new StaleClaimError();
     return ack;
   };
   const terminal = (beforeResolve?: () => Promise<void>) => (run as unknown as {
@@ -146,6 +147,117 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
 
 type CompletionFixture = Awaited<ReturnType<typeof fixture>>;
 
+function barrier() {
+  let release!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  return { wait, release };
+}
+
+async function assertOverlapRetained(f: CompletionFixture) {
+  assert.equal(f.flight.completionSendAttempted, true);
+  assertAttempted(f.run, f);
+  await unit2Failure(f);
+  assert.equal(f.sent.every(b => b.status === "completed"), true, "no competing failed report");
+  assert.equal(await f.run.recoveryInventoryPending(f.receipt.run_id, 1), true);
+  assert.equal((await f.client.listRecoveryHolds(f.receipt.run_id)).holds
+    .some(h => h.generation === 1 && h.inventory_guarded === true), true, "current hold retained");
+  assert.equal(await f.recovery.hasPersistedCompletionReceipt(f.receipt.run_id, 1), false);
+}
+
+for (const mode of ["none", "reserve"] as const) {
+  for (const firstToSend of [0, 1]) {
+    it("Unit 2: " + mode + " concurrent preparation preserves ambiguity, send order " + firstToSend, async () => {
+      const f = await fixture("issue", mode);
+      const entered = [barrier(), barrier()];
+      const gates = [barrier(), barrier()];
+      const attempts: Promise<void>[] = [];
+      try {
+        for (let i = 0; i < 2; i++) {
+          attempts.push(assert.rejects(f.terminal(async () => {
+            entered[i]!.release();
+            await gates[i]!.wait;
+          })));
+          await entered[i]!.wait;
+        }
+        f.replies("lost", "lost");
+        gates[firstToSend]!.release();
+        await attempts[firstToSend];
+        f.replies("decode", "decode");
+        gates[1 - firstToSend]!.release();
+        await attempts[1 - firstToSend];
+        await assertOverlapRetained(f);
+      } finally {
+        gates.forEach(g => g.release());
+        await Promise.allSettled(attempts);
+        await f.close();
+      }
+    });
+  }
+
+  for (const refusalFirst of [false, true]) {
+    it("Unit 2: " + mode + " actual sends overlap, refusal settles first " + refusalFirst, async t => {
+      const f = await fixture("issue", mode);
+      const entered = [barrier(), barrier()];
+      const gates = [barrier(), barrier()];
+      const rawReport = f.client.reportState.bind(f.client);
+      let calls = 0;
+      const attempts: Promise<void>[] = [];
+      try {
+        t.mock.method(f.client, "reportState", async (...args: Parameters<WorkerClient["reportState"]>) => {
+          const i = calls++;
+          entered[i]!.release();
+          await gates[i]!.wait;
+          return rawReport(...args);
+        });
+        attempts.push(assert.rejects(f.terminal()));
+        await entered[0]!.wait;
+        attempts.push(assert.rejects(f.terminal()));
+        await entered[1]!.wait;
+        const first = refusalFirst ? 0 : 1;
+        f.replies(...(refusalFirst ? ["decode", "decode"] as const : ["lost", "lost"] as const));
+        gates[first]!.release();
+        await attempts[first];
+        assert.equal(f.flight.completionSendAttempted, true, "other unresolved send keeps marker");
+        f.replies(...(refusalFirst ? ["lost", "lost"] as const : ["decode", "decode"] as const));
+        gates[1 - first]!.release();
+        await attempts[1 - first];
+        await assertOverlapRetained(f);
+      } finally {
+        gates.forEach(g => g.release());
+        await Promise.allSettled(attempts);
+        await f.close();
+      }
+    });
+  }
+}
+
+it("Unit 2: reserve absence await cannot clear another send's marker", async t => {
+  const f = await fixture("issue", "reserve");
+  const entered = barrier(), gate = barrier();
+  const attempts: Promise<void>[] = [];
+  try {
+    t.mock.method(f.outbox!, "confirmTerminalAbsent", async () => {
+      entered.release();
+      await gate.wait;
+      return true;
+    });
+    f.replies("decode", "decode");
+    attempts.push(assert.rejects(f.terminal()));
+    await entered.wait;
+    assert.equal(f.client.hasFeature(feature), false, "decode refusal clears client features before overlap");
+    f.replies("lost", "lost");
+    attempts.push(assert.rejects(f.terminal()));
+    await attempts[1];
+    gate.release();
+    await attempts[0];
+    await assertOverlapRetained(f);
+  } finally {
+    gate.release();
+    await Promise.allSettled(attempts);
+    await f.close();
+  }
+});
+
 async function unit2Failure(f: CompletionFixture) {
   await (f.run as unknown as { reportGenericFailure(c: unknown, f: unknown, e: unknown, o: unknown): Promise<void> })
     .reportGenericFailure(makeClaim(), f.flight, new Error("completion refused"), { keepCustody: true });
@@ -158,7 +270,7 @@ for (const mode of ["none", "reserve"] as const) {
       f.replies("decode", "decode");
       await assert.rejects(f.terminal());
       assert.equal(f.flight.completionSendAttempted, false);
-      assert.equal((Reflect.get(f.run, "attemptedPublicationTerminals") as Set<string>).size, 0);
+      assert.equal((Reflect.get(f.run, "attemptedPublicationTerminals") as Map<string, object>).size, 0);
       await unit2Failure(f);
       assert.equal(f.sent.at(-1)?.status, "failed");
       assert.equal(f.sent.at(-1)?.completion_final_head, undefined);
@@ -199,7 +311,7 @@ for (const mode of ["none", "reserve"] as const) {
       f.replies("decode", "decode");
       await assert.rejects(f.terminal(), { name: "StateReportUnappliedError" });
       assert.equal(f.flight.completionSendAttempted, false);
-      assert.equal((Reflect.get(f.run, "attemptedPublicationTerminals") as Set<string>).size, 0);
+      assert.equal((Reflect.get(f.run, "attemptedPublicationTerminals") as Map<string, object>).size, 0);
       fallback.mock.restore();
       await unit2Failure(f);
       assert.equal(f.sent.at(-1)?.status, "failed");
@@ -236,7 +348,14 @@ for (const mode of ["none", "reserve"] as const) {
     const f = await fixture("issue", mode);
     try {
       f.replies("stale");
-      await f.terminal();
+      if (mode === "none") {
+        await assert.rejects(f.terminal(), StaleClaimError);
+        assert.equal(f.flight.terminalResolved, false, "direct stale throw skips resolution latch");
+      } else {
+        await f.terminal();
+        assert.equal(f.flight.terminalResolved, true, "reserve wrapper normalizes stale throw");
+      }
+      assert.equal(f.flight.completionSendAttempted, true);
       await unit2Failure(f);
       assert.equal(f.sent.length, 1);
       assert.equal(f.sent[0]?.status, "completed");
@@ -300,7 +419,7 @@ async function discardInventory(f: CompletionFixture, inventory: "pending" | "ab
 }
 
 function assertAttempted(run: RunRunner, f: CompletionFixture) {
-  assert.equal((Reflect.get(run, "attemptedPublicationTerminals") as Set<string>)
+  assert.equal((Reflect.get(run, "attemptedPublicationTerminals") as Map<string, object>)
     .has(f.receipt.run_id + ":1"), true, "replay restores attempted publication marker");
 }
 

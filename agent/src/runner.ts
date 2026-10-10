@@ -881,10 +881,10 @@ const REPO_AGENT_FOLDER_FEATURE = "repo_agent_folder";
  * terminal state (another claim owns the run now) and without setting a preserve flag
  * (normal teardown — the new claim has its own clone). Thrown from the flight.reportState
  * closure the moment any report is answered stale, and caught in executeClaim's catch chain
- * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Local, like
- * TerminalReportError: it is thrown and caught entirely within this file.
+ * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Runtime throws and
+ * catches stay in runner.ts; exported so tests can reproduce the reportState throw.
  */
-class StaleClaimError extends Error {
+export class StaleClaimError extends Error {
   constructor() {
     super("run claim superseded server-side (stale_claim)");
     this.name = "StaleClaimError";
@@ -901,8 +901,8 @@ class StaleClaimError extends Error {
  * non-terminal and a safe incarnation will resume it from the last checkpoint. Thrown from the
  * flight.reportState closure the moment any report reads that pair, AHEAD of the StaleClaimError
  * throw; caught in executeClaim's catch chain BEFORE the StaleClaimError arm, where it sets the
- * preserve flags, closes the batcher, reports NOTHING terminal, and keeps clone + HOME. Local, like
- * StaleClaimError: thrown and caught entirely within this file.
+ * preserve flags, closes the batcher, reports NOTHING terminal, and keeps clone + HOME.
+ * Thrown and caught entirely within runner.ts.
  */
 class ServerWallParkedError extends Error {
   constructor() {
@@ -920,7 +920,7 @@ class ServerWallParkedError extends Error {
  * `running` for the api's heartbeat missing-run requeue (M2b) to reclaim after the fence, the
  * snapshot entry is removed by the ordinary finally, and the claim loop is paused (via the
  * shared registry) so the e2e can observe the requeued run before a reclaim. Local, thrown
- * and caught entirely within this file, exactly like StaleClaimError. */
+ * and caught entirely within runner.ts. */
 class E2EDropExecutionError extends Error {
   constructor() {
     super("e2e drop-execution seam: ending flight with no terminal report");
@@ -2456,7 +2456,7 @@ export class RunRunner {
   private readonly unpersistedCompletionReceipts = new Set<string>();
   // Retirement only: physical cleanup still requires the authenticated on-disk receipt.
   private readonly persistedCompletionReceipts = new Set<string>();
-  private readonly attemptedPublicationTerminals = new Set<string>();
+  private readonly attemptedPublicationTerminals = new Map<string, object>();
 
   private completionKey(runId: string, generation: number): string {
     return runId + ":" + generation;
@@ -2487,7 +2487,7 @@ export class RunRunner {
     ack: StateAck,
   ): Promise<void> {
     if (body.status === "completed" && body.completion_final_head)
-      this.attemptedPublicationTerminals.add(this.completionKey(runId, claimGeneration));
+      this.attemptedPublicationTerminals.set(this.completionKey(runId, claimGeneration), {});
     const receipt = ack.completedPublicationReceipt;
     if (receipt && body.status === "completed" && receipt.run_id === runId &&
         receipt.generation === claimGeneration && receipt.final_head === body.completion_final_head) {
@@ -4188,15 +4188,33 @@ export class RunRunner {
       delete ordinary.completion_final_head;
       body = ordinary;
     }
-    // A fresh send may release only its attempt markers, never custody or receipt provenance.
-    // A prior attempt or any unavailable/pending journal keeps the original outcome selected.
-    const clearFreshUnappliedAttempt = async (err: unknown, publicationSend: boolean): Promise<void> => {
+    const key = this.completionKey(flight.runId, flight.claimGeneration);
+    // Capture freshness at the actual send, after asynchronous preparation. Replacing the
+    // single token fences an older caller without adding another per-generation authority.
+    const beginPublicationAttempt = (sentBody: StateRequest, publicationSend: boolean) => {
+      if (sentBody.status !== "completed" ||
+          (!publicationSend && !flight.completionSendAttempted && !this.attemptedPublicationTerminals.has(key))) return undefined;
+      const fresh = publicationSend && !flight.completionSendAttempted && !this.attemptedPublicationTerminals.has(key) &&
+        !preexistingPending && !(this.outbox?.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false);
+      const token = {};
+      flight.completionSendAttempted = true;
+      this.attemptedPublicationTerminals.set(key, token);
+      return { token, fresh };
+    };
+    // A fresh send may release only its own marker, never custody or receipt provenance.
+    const clearFreshUnappliedAttempt = async (
+      err: unknown, attempt: ReturnType<typeof beginPublicationAttempt>,
+    ): Promise<void> => {
+      const ownsFreshAttempt = () => attempt?.fresh === true &&
+        this.attemptedPublicationTerminals.get(key) === attempt.token &&
+        flight.steering?.claimFence() === undefined;
       if (!(err instanceof StateReportUnappliedError) || err.runId !== flight.runId ||
-          previouslyAttempted || preexistingPending || !publicationSend ||
-          flight.steering?.claimFence() !== undefined) return;
+          !ownsFreshAttempt()) return;
       if (this.outbox && !await this.outbox.confirmTerminalAbsent(flight.runId, flight.claimGeneration)) return;
+      // Absence checking can yield to another send or ACK; neither marker belongs to this caller.
+      if (!ownsFreshAttempt()) return;
       flight.completionSendAttempted = false;
-      this.attemptedPublicationTerminals.delete(this.completionKey(flight.runId, flight.claimGeneration));
+      this.attemptedPublicationTerminals.delete(key);
     };
     if (!deps) {
       const incarnation = this.client.capturePublicationCompletionRetirement?.();
@@ -4207,17 +4225,14 @@ export class RunRunner {
       const deferred = admitted;
       if (deferred) await this.bindCompletionSource(flight);
       else await flight.prepareTerminalInventory();
+      const attempt = beginPublicationAttempt(body, deferred);
       try {
-        if (deferred) {
-          flight.completionSendAttempted = true;
-          this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
-        }
         const ack = await send(body);
         if (ack.applied && ack.status === body.status &&
             (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, body, incarnation);
       } catch (err) {
-        await clearFreshUnappliedAttempt(err, deferred);
+        await clearFreshUnappliedAttempt(err, attempt);
         throw err;
       } finally {
         if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
@@ -4232,19 +4247,16 @@ export class RunRunner {
     // its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize the throw
     // into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a superseded
     // generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot lanes already
-    // return this shape via raw client.reportState). StaleClaimError is defined and caught entirely
-    // within this file — it never leaks into terminal-resolve.ts. A genuine transport error still
+    // return this shape via raw client.reportState). Runtime StaleClaimError handling stays in
+    // runner.ts; the export lets tests reproduce the throw. A genuine transport error still
     // propagates, and resolvePendingTerminal keeps the journal for a later resolve, exactly as
     // designed. #1539: this wrapper wraps the send passed to BOTH branches (the reserve-exhausted
     // unjournaled send and the journaled resolve), the same as journalAndResolveTerminal does today.
     const wrappedSend: SendTerminalState = async (b, sig) => {
       const incarnation = this.client.capturePublicationCompletionRetirement?.();
       const publicationSend = this.eligiblePublicationCompletion(flight, b);
+      const attempt = beginPublicationAttempt(b, publicationSend);
       try {
-        if (publicationSend) {
-          flight.completionSendAttempted = true;
-          this.attemptedPublicationTerminals.add(this.completionKey(flight.runId, flight.claimGeneration));
-        }
         const ack = await send(b, sig);
         if (ack.applied && ack.status === b.status &&
             (ack.status === "completed" || ack.status === "failed"))
@@ -4252,7 +4264,7 @@ export class RunRunner {
         return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
-        if (!installed.journaled && !("deferred" in installed)) await clearFreshUnappliedAttempt(err, publicationSend);
+        if (!installed.journaled && !("deferred" in installed)) await clearFreshUnappliedAttempt(err, attempt);
         throw err;
       }
     };
