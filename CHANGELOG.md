@@ -32,6 +32,8 @@ through `[0.52.0]`.)
   The push broker's refusals were all reported as `skipped: unsupported`. They now carry their own reason: `tip_missing` (the pack did not contain the declared commit), `pack_too_large` (the pack exceeded an inflation budget) or `pack_invalid` (empty or malformed pack). `unsupported` now means only a run kind with no checkpoint branch. The api logs each refusal at WARN as `worker run publish refused`, with the run id, the reason and a content-free detail naming the exceeded budget and its limit or the parse check that failed. The run feed shows `checkpoint publish skipped: <reason>`, including `superseded`, which used to show as `other`. Publishing is still best-effort: a refusal is a 200 skip and the run continues. Older workers show the new reasons as `other`.
 - **Release checks cover the full worker runtime ([#1466](https://github.com/vtmocanu/uzi/issues/1466)).**
   Changelog coverage and release promotion now share the worker autobump runtime paths, including templates and Codex assets, while excluding tests.
+- **Recovery release acknowledgments are bounded ([#2402](https://github.com/vtmocanu/uzi/issues/2402)).**
+  The worker rejects release ACKs exceeding 16 KiB and retains local recovery evidence when the server response overflows.
 
 ## [0.86.0] - 2026-10-06
 

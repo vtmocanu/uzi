@@ -2054,6 +2054,7 @@ describe("m1 credential-free owner cancel", () => {
       "info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules",
       "root-gitignore", "nested-gitignore"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
+    ...["oversized", "normal"].map(releaseTransport => ({ work: "clean", releaseTransport })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
     { work: "clean", trust: "missing" },
@@ -2070,17 +2071,24 @@ describe("m1 credential-free owner cancel", () => {
     { work: "clean", route: "deferred", terminal: "immediate" },
     ...["before-cancel", "settle", "inspect", "release-ack"].map(quarantine => ({ work: "clean", quarantine })),
   ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
-    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string; readinessDelayMs?: number }>;
+    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string; readinessDelayMs?: number;
+    releaseTransport?: string }>;
   for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
       (scenario.work !== "lossy-path" || process.platform === "linux") &&
       (!scenario.quarantine || process.platform === "linux")))
     it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async (t) => {
+      if (scenario.releaseTransport && process.platform !== "linux") {
+        t.skip("real-client owner-cancel transport requires Linux descriptor cleanliness proof");
+        return;
+      }
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
       const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
-        !scenario.trust && !scenario.inspect && !scenario.drain && !scenario.quarantine;
-      // A release ACK closes server custody even when quarantine retains local evidence.
-      const shouldCloseHold = shouldRelease || scenario.quarantine === "release-ack";
+        !scenario.trust && !scenario.inspect && !scenario.drain && !scenario.quarantine && scenario.releaseTransport !== "oversized";
+      // Server commitment and local cleanup are separate: an oversized ACK loses local proof.
+      const shouldCloseHold = shouldRelease || scenario.quarantine === "release-ack" || scenario.releaseTransport === "oversized";
+      const shouldAttemptRelease = process.platform === "linux" &&
+        (shouldRelease || scenario.quarantine === "release-ack" || !!scenario.release || !!scenario.releaseTransport);
       const quarantineReached = deferred<void>();
       const quarantineContinue = deferred<void>();
       let quarantineSeamReached = false;
@@ -2126,12 +2134,57 @@ describe("m1 credential-free owner cancel", () => {
         if (scenario.quarantine === "settle" && settlingCancel && !quarantineSeamReached) await pauseForQuarantine();
         return reap(...args);
       };
-      const client = new WorkerClient(url, "cancel-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
-      client.protocolFeatures = ["recovery_release_exact_echo"];
       const releases: unknown[][] = [];
       const openHolds = new Set([7, 8]);
+      const releasePosts: Array<{ url: string; method: string; body: unknown }> = [];
+      let releaseBytes = Buffer.alloc(0);
+      let deliveredReleaseBytes = 0;
+      let releaseCancelled = false;
+      let releaseEnded = false;
+      let releaseError: unknown;
+      const forwardFetch = globalThis.fetch;
+      const client = new WorkerClient(url, "cancel-worker", "test", noopLog, {
+        sleep: async () => {}, terminalRetrySchedule: [1, 1],
+        fetch: async (input, init) => {
+          const requestUrl = String(input);
+          if (!scenario.releaseTransport || init?.method !== "POST" ||
+              requestUrl !== `${url}/api/worker/runs/${claim.run_id}/archives/release`) {
+            return forwardFetch(input, init);
+          }
+          releasePosts.push({ url: requestUrl, method: init.method, body: JSON.parse(String(init.body)) });
+          // The simulated server commits the release before sending either ACK.
+          openHolds.delete(7);
+          const receipt = { run_id: claim.run_id, generation: 7, released: true, holds_released: 1, retained: false };
+          const text = JSON.stringify(scenario.releaseTransport === "oversized" ?
+            { ...receipt, reason: "界".repeat(10_000) } : receipt);
+          releaseBytes = Buffer.from(text);
+          const response = new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (deliveredReleaseBytes === releaseBytes.length) {
+                releaseEnded = true;
+                controller.close();
+                return;
+              }
+              const chunk = releaseBytes.subarray(deliveredReleaseBytes, deliveredReleaseBytes + 4096);
+              deliveredReleaseBytes += chunk.length;
+              controller.enqueue(chunk);
+            },
+            cancel() { releaseCancelled = true; },
+          }, { highWaterMark: 0 }), { headers: { "Content-Length": "1" } });
+          t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
+          return response;
+        },
+      });
+      client.protocolFeatures = ["recovery_release_exact_echo"];
+      const releaseCustody = client.releaseRecoveryCustody.bind(client);
       client.releaseRecoveryCustody = async (...args) => {
         releases.push(args);
+        if (scenario.releaseTransport) {
+          try { return await releaseCustody(...args); } catch (error) {
+            releaseError = error;
+            throw error;
+          }
+        }
         if (scenario.quarantine === "release-ack") await pauseForQuarantine();
         if (scenario.release === "error") throw new Error("lost release ACK");
         if (scenario.release === "missing") return {} as never;
@@ -2221,7 +2274,7 @@ describe("m1 credential-free owner cancel", () => {
       let dispositionObserved = false;
       let disposition: string | undefined;
       let preservationAfterDisposition: ObservedFlight | undefined;
-      if (scenario.quarantine) {
+      if (scenario.quarantine || scenario.releaseTransport) {
         const buildFlight = runnerSeams.buildFlight.bind(runner);
         runnerSeams.buildFlight = (...args) => { realFlight = buildFlight(...args); return realFlight; };
         const dispose = runnerSeams.disposeCredentialFreeOwnerCancel.bind(runner);
@@ -2491,6 +2544,38 @@ describe("m1 credential-free owner cancel", () => {
             disposition: "retained", preserveRecoveryClone: true, preserveSession: true,
           }, "both preservation flags are true immediately after genuine disposition returns");
         }
+        if (scenario.releaseTransport) {
+          assert.ok(realFlight, "real flight captured");
+          assert.equal(dispositionObserved, true);
+          assert.equal(settlementKind, "observed_empty");
+          assert.deepEqual({ disposition, ...preservationAfterDisposition }, {
+            disposition: shouldRelease ? "released" : "retained",
+            preserveRecoveryClone: !shouldRelease, preserveSession: !shouldRelease,
+          }, "actual disposition and both preservation flags follow ACK proof");
+          assert.deepEqual({ preserveRecoveryClone: realFlight.preserveRecoveryClone,
+            preserveSession: realFlight.preserveSession }, preservationAfterDisposition,
+            "preservation flags survive execution");
+          assert.deepEqual(releasePosts, [{
+            url: `${url}/api/worker/runs/${claim.run_id}/archives/release`,
+            method: "POST", body: { generation: 7 },
+          }]);
+          if (scenario.releaseTransport === "oversized") {
+            assert.ok(releaseError instanceof Error, "actual transport error captured outside runner catch");
+            assert.equal(releaseError.name, "ResponseBodyOverflowError");
+            assert.equal(releaseError.message, "response body exceeds 16384 bytes");
+            assert.ok(releaseBytes.length > 16 * 1024);
+            assert.ok(releaseBytes.toString("utf8").length < 16 * 1024);
+            assert.equal(deliveredReleaseBytes, 20 * 1024, "stops at first overflowing chunk");
+            assert.equal(releaseCancelled, true);
+            assert.equal(releaseEnded, false);
+            assert.ok(deliveredReleaseBytes < releaseBytes.length);
+          } else {
+            assert.equal(releaseError, undefined);
+            assert.equal(deliveredReleaseBytes, releaseBytes.length);
+            assert.equal(releaseEnded, true);
+            assert.equal(await fs.access(clone).then(() => true, () => false), false, "released clone removed");
+          }
+        }
         assert.deepEqual(seamViolations, [], "owner-cancel seam invariants (the runner's catch would otherwise swallow them)");
         assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
         assert.equal(rig.client.refreshCalls.length, 0, "cleanup never refreshes");
@@ -2500,9 +2585,9 @@ describe("m1 credential-free owner cancel", () => {
         if (work === "external-excludes") {
           assert.deepEqual(await fs.readFile(externalExclude), externalExcludeBytes, "external exclude bytes unchanged after cancellation");
         }
-        assert.equal(releases.length, process.platform === "linux" && (shouldCloseHold || scenario.release) ? 1 : 0);
+        assert.equal(releases.length, shouldAttemptRelease ? 1 : 0, "release attempts are distinct from server closure and local cleanup");
         assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
-        assert.equal(openHolds.has(7), !shouldCloseHold, "exact release ACK closes own server hold independently of local retention");
+        assert.equal(openHolds.has(7), !shouldCloseHold, "server release commitment closes own hold independently of local retention");
         assert.equal(openHolds.has(8), true, "sibling hold untouched");
         const records = await recovery.coord.inspect(claim.run_id);
         assert.ok(records.some(record => record.generation === 8), "sibling journal untouched");
