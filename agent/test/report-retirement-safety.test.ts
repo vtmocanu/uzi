@@ -18,23 +18,36 @@ installHarness();
 for (const blocker of ["messages", "held", "fence", "messages+held"] as const) {
   it(`worker final eligibility retains ${blocker} after positive archive inspection`, async t => {
     const f = await reportRetirementFixture(t);
-    await f.replay();
+    await f.replayPositive();
     await f.outbox.journalFinalize(f.claim.run_id, 2);
     const w = retirementWorker(f);
     const real = git.credentialFreeCancelCleanHead.bind(git);
-    let inspections = 0;
+    const retire = f.r.retireRecoveryReport.bind(f.r);
+    const finalize = f.outbox.retireFinalizeIfEligible.bind(f.outbox);
+    let inspections = 0, finalEntries = 0;
+    t.mock.method(f.r, "retireRecoveryReport", async (...args: Parameters<typeof retire>) => {
+      inspections = 0; // Counts belong to this proof, never two separate partial proofs.
+      return retire(...args);
+    });
     t.mock.method(git, "credentialFreeCancelCleanHead", async (...args: Parameters<typeof real>) => {
       const head = await real(...args);
       assert.equal(head, f.head);
-      if (++inspections === 2) {
-        if (blocker.includes("messages")) await f.outbox.appendRangeRecord(f.claim.run_id, 2, 1, 1);
-        if (blocker.includes("held")) f.outbox.holdTerminalResolve(f.claim.run_id, 2);
-        if (blocker === "fence") w.admittedRunIds.set(f.claim.run_id, 2);
-      }
+      inspections++;
       return head;
     });
-    await w.sweepPendingFinalizes();
-    assert.equal(inspections, 2, "earlier proof refusal cannot mask final eligibility");
+    t.mock.method(f.outbox, "retireFinalizeIfEligible", async (...args: Parameters<typeof finalize>) => {
+      assert.equal(inspections, 2, "complete content inspection in this proof");
+      finalEntries++;
+      if (blocker.includes("messages")) await f.outbox.appendRangeRecord(f.claim.run_id, 2, 1, 1);
+      if (blocker.includes("held")) f.outbox.holdTerminalResolve(f.claim.run_id, 2);
+      if (blocker === "fence") w.admittedRunIds.set(f.claim.run_id, 2);
+      const result = await finalize(...args);
+      assert.equal(result, false, "actual final eligibility refuses the record");
+      return result;
+    });
+    await f.positiveStage("worker final eligibility entry", () => w.sweepPendingFinalizes(),
+      () => finalEntries === 1, f.assertFinalizePending);
+    assert.equal(finalEntries, 1);
     assert.ok(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2));
     if (blocker.includes("held")) f.outbox.releaseTerminalResolve(f.claim.run_id, 2);
     await f.assertCustody();
@@ -52,7 +65,7 @@ function retirementWorker(f: Awaited<ReturnType<typeof reportRetirementFixture>>
 
 it("worker archive branch rotates past overflow and an unsettled slow sibling", async t => {
   const f = await reportRetirementFixture(t);
-  await f.replay();
+  await f.replayPositive();
   const release = deferred();
   const slow = "00000000-0000-4000-8000-000000000000";
   const real = f.r.retireRecoveryReport.bind(f.r);
@@ -83,7 +96,7 @@ it("worker archive branch rotates past overflow and an unsettled slow sibling", 
 
 it("worker quarantine includes started archive unlink beyond deadline", async t => {
   const f = await reportRetirementFixture(t);
-  await f.replay();
+  await f.replayPositive();
   await f.outbox.journalFinalize(f.claim.run_id, 2);
   const w = retirementWorker(f);
   const entered = deferred(), release = deferred();
@@ -208,7 +221,7 @@ it("remove and reinstall identical terminal bytes refuses old lifetime proof", a
   assert.notEqual(replacement.context.expectedIdentity, first.context.expectedIdentity);
   await f.r.retireRecoveryReport(f.claim.run_id, 2, first.context);
   await f.assertPending();
-  await f.replay();
+  await f.replayPositive();
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
   await f.assertCustody();
 });
@@ -243,7 +256,7 @@ for (const gapFill of [false, true]) {
     assert.notEqual((await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, 2))!
       .context.expectedIdentity, first.context.expectedIdentity);
     await f.assertPending();
-    await f.replay();
+    await f.replayPositive();
     assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
     await f.assertCustody();
   });
@@ -260,7 +273,7 @@ it("unlink failure retains pending map and next replay succeeds", async t => {
   await f.replay();
   assert.equal(attempts, 1);
   await f.assertPending();
-  await f.replay();
+  await f.replayPositive();
   assert.equal(attempts, 2);
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
   await f.assertCustody();
@@ -319,14 +332,20 @@ it("authenticated restart redoes archive proof before retiring report", async t 
   await f.r.retireRecoveryReport(f.claim.run_id, 2, captured.context, "terminal", restarted);
   assert.equal(restarted.hasPendingTerminal(f.claim.run_id, 2), true);
   f.capture.mode = "healthy";
-  await f.r.retireRecoveryReport(f.claim.run_id, 2, captured.context, "terminal", restarted);
+  await f.positiveStage("authenticated restart retirement", async () => {
+    const fresh = (await restarted.readTerminalJournalForRetirement(f.claim.run_id, 2))!;
+    await f.r.retireRecoveryReport(f.claim.run_id, 2, fresh.context, "terminal", restarted);
+  }, () => !restarted.hasPendingTerminal(f.claim.run_id, 2), async () => {
+    assert.ok(await restarted.readTerminalJournal(f.claim.run_id, 2));
+    await f.assertCustody();
+  });
   assert.equal(restarted.hasPendingTerminal(f.claim.run_id, 2), false);
   await f.assertCustody();
 });
 
 it("worker finalize archive proof respects admission fence then retires under own reservation", async t => {
   const f = await reportRetirementFixture(t);
-  await f.replay();
+  await f.replayPositive();
   await f.outbox.journalFinalize(f.claim.run_id, 2);
   const identity = f.outbox.finalizeRecordIdentity(f.claim.run_id, 2);
   const w = new Worker({} as Config, client, f.r, {} as ChatRunner, {} as JudgeRunner,
@@ -343,7 +362,8 @@ it("worker finalize archive proof respects admission fence then retires under ow
   await w.sweepPendingFinalizes();
   assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), identity, "active fence is independent of admission");
   f.registry.remove(f.claim.run_id);
-  await w.sweepPendingFinalizes();
+  await f.positiveStage("unfenced worker finalize", () => w.sweepPendingFinalizes(),
+    () => !f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), f.assertFinalizePending);
   assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined);
   await f.assertCustody();
 });

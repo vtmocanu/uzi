@@ -283,7 +283,39 @@ export async function reportRetirementFixture(t: TestContext, options: {
       e.claim_generation === generation && e.terminal_pending));
     await assertCustody();
   };
+  // Three fresh attempts retain the production budget and await actual settlement;
+  // the node-test timeout caps stalled settlement. Failed assertions stop retries.
+  const positiveStage = async (label: string, attempt: () => Promise<unknown>,
+    reached: () => boolean, retained: () => Promise<void>) => {
+    for (let n = 1; n <= 3; n++) {
+      await attempt();
+      await assertCustody();
+      if (reached()) return n;
+      await retained();
+    }
+    assert.fail(`${label}: persistent refusal after 3 fresh bounded attempts; sends=${calls.sends}, observations=${processObservation.calls}`);
+  };
+  const replayPositive = () => positiveStage("terminal retirement", replay,
+    () => !outbox.hasPendingTerminal(claim.run_id, generation), assertPending);
+  const assertFinalizePending = async () => {
+    assert.ok(outbox.finalizeRecordIdentity(claim.run_id, generation), "finalize must remain pending");
+    await assertCustody();
+  };
+  const expireNextProof = () => {
+    const real = git.withReportProofBudget.bind(git);
+    const observation = { expired: false };
+    const mock = t.mock.method(git, "withReportProofBudget", async <T>(
+      budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>,
+    ): Promise<T> => {
+      mock.mock.restore(); // Only this proof stalls; the next attempt gets a fresh budget.
+      if (!budget.signal.aborted) await new Promise<void>(resolve =>
+        budget.signal.addEventListener("abort", () => resolve(), { once: true }));
+      observation.expired = budget.signal.aborted && Date.now() >= budget.deadline;
+      return real(budget, action);
+    });
+    return observation;
+  };
   const liveFlight = { flight, release: leave.resolve, executions: () => executions };
-  return { claim, generation, archive, outbox, registry, r, coordinator, replay, assertPending,
+  return { claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }

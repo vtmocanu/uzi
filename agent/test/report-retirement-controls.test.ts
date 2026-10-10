@@ -82,7 +82,7 @@ it("captured WIP marker fixture has a clean source whose tree is in the actual a
   assert.match(f.cmd(f.clone, ["log", "-1", "--format=%s"]), /^wip\(park\):/);
   assert.equal(f.cmd(f.clone, ["status", "--porcelain"]), "");
   assert.equal(f.cmd(f.bare, ["show", f.archive.sourceSha + ":marker.txt"]), "captured WIP");
-  await f.replay();
+  await f.replayPositive();
   assert.equal(await f.outbox.readTerminalJournal(f.claim.run_id, 2), undefined);
   await f.assertCustody();
 });

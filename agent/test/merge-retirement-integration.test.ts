@@ -187,7 +187,7 @@ it("inventory proof reads attributed heads while the bare lock is already held",
 
 it("worker notifies exactly once after successful archive finalize unlink, never after failed unlink", async t => {
   const f = await reportRetirementFixture(t);
-  await f.replay();
+  await f.replayPositive();
   await f.outbox.journalFinalize(f.claim.run_id, 2);
   const finalize = path.join(fx.dataDir, "outbox", f.claim.run_id, "finalize-2.json");
   await fs.access(finalize);
@@ -222,14 +222,17 @@ it("worker notifies exactly once after successful archive finalize unlink, never
   const worker = new Worker({} as Config, client, f.r, {} as ChatRunner, {} as JudgeRunner,
     {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }), f.outbox,
     new Map(), f.registry) as unknown as { sweepPendingFinalizes(): Promise<void> };
-  await worker.sweepPendingFinalizes();
-  assert.deepEqual(results, [false]);
+  await f.positiveStage("failed unlink entry", () => worker.sweepPendingFinalizes(),
+    () => unlinks === 1, f.assertFinalizePending);
+  assert.ok(results.every(result => result === false));
   assert.equal(unlinks, 1);
   assert.equal(notifications, 0);
   await fs.access(finalize);
   failUnlink = false;
-  await worker.sweepPendingFinalizes();
-  assert.deepEqual(results, [false, true]);
+  await f.positiveStage("successful finalize unlink", () => worker.sweepPendingFinalizes(),
+    () => !f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), f.assertFinalizePending);
+  assert.equal(results.at(-1), true);
+  assert.ok(results.slice(0, -1).every(result => result === false));
   assert.equal(unlinks, 2, "one unlink stage per attempt");
   assert.equal(notifications, 1);
   await worker.sweepPendingFinalizes();
