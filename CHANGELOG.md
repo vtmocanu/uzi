@@ -24,6 +24,10 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Live issue runs show a progress percent ([#2602](https://github.com/vtmocanu/uzi/issues/2602)).**
+  The server derives it from the frozen milestone list (`11% + 89% × completed / total`, capped at 99% until the run finishes) and shows it on the web dashboard and runs list, in a `PROG` column on the TUI board, and as a `PROGRESS` row in `uzi run get` (`progress` object in `--json`); a flag (waits on you, parked, queued, stalled, planning) replaces the number when it would mislead, other run kinds show none, and no time remaining is shown because the estimate is too unreliable.
+  The run page gets a progress card (percent, segmented plan track, active milestone, the active role's current phase) and the TUI run detail a `PROGRESS` block above `MILESTONES`. On a run waiting on a question, the run page, TUI detail and `uzi run get` add `may be blocked by <run id>` when the open, unanswered question mentions `#N` and another live run of the same owner on the same repo is working issue N; it is a hint from the question text, not a recorded dependency, reads at most 5 references, and never matches another user's run, another repo or the run itself.
+
 - **Answer agent questions from the TUI ([#2550](https://github.com/vtmocanu/uzi/issues/2550)).**
   Run owners can press `i` to compose option selections and details, review each answer before sending, and reopen drafts kept in the current TUI session; uncertain delivery blocks resending in that session and points to the web or Slack, which remain the fallback for read-only viewers and unsupported payloads.
 
@@ -31,6 +35,9 @@ through `[0.52.0]`.)
 
 - **Settled halt notifications can be pruned without a later notification ([#2076](https://github.com/vtmocanu/uzi/issues/2076)).**
   Best-effort per-user pruning now follows a successful Slack delivery stamp (including terminal no-link outcomes) and the final retry claim, even for a corrupt stored render, so an idle user's log can converge toward the nominal 200-row retention target when pruning succeeds. Pending durable rows below the attempt cap stay exempt, timestamp ties may retain more than 200 rows, and logged prune failures do not undo delivery settlement or retry exhaustion. There is no historical settled-backlog sweep or unconditional cleanup guarantee.
+
+- **Full-screen TUI footers keep help and quit keys visible ([#2194](https://github.com/vtmocanu/uzi/issues/2194)).**
+  At 80 columns and wider, the board, CI and pulls footers shed lower-priority hints before help and quit; the board retains its partial-cost cue and client-only version fallback.
 
 - **Job file validation keeps the failure reason visible for long paths ([#2391](https://github.com/vtmocanu/uzi/issues/2391)).**
   Empty, nonregular and unreadable input files report the reason before the path, so the CLI’s bounded error line preserves it even for deeply nested files.

@@ -1,6 +1,6 @@
 # PRD #2602: Run progress estimate (percent and state flags)
 
-**Status**: Draft
+**Status**: Done (2026-10-09; both milestones shipped on branch agent/issue-2602)
 **Priority**: Medium
 **Umbrella**: #2601
 **Design mock**: `prds/mockups/2602-run-progress-mock.html` (open in a browser; light and dark) and `prds/mockups/2602-run-progress-tui-mock.sh` (`bash prds/mockups/2602-run-progress-tui-mock.sh`; prefix `NO_COLOR=1` for the glyph fallback).
@@ -119,3 +119,12 @@ Acceptance: example 2 on the run page, TUI detail and CLI; a match owned by anot
 | D6 | Phase is the current role's phase only, from closed sets | `current_activity` is the newest frame and alternates between lanes; a history needs data we do not keep; mapping to an enum keeps the untrusted role inert | A phase history with check marks (cannot be established from the newest frame) |
 | D7 | Per-milestone durations deferred | Doing them right needs a worker payload change, an index and version-skew handling | Parsing the worker's display text (fragile, unindexed) |
 | D8 | `health = looping` flags like `stalled` | A looping run is not making progress either | Showing a percent on a looping run |
+| D9 | `Derive` takes no role input and returns `*apitypes.RunProgress`; `phase` is set at the three CurrentActivity sites | `runToDTO` has no activity in reach; same behaviour as the specified seam (AI, implementation) | Passing activity into `runToDTO` (widens every caller) |
+| D10 | A live status this build does not know derives `none` | A rolling deploy can surface a newer status; a guessed percent would mislead (AI, implementation) | Treating every unknown non-terminal status as `percent` |
+| D11 | New partial index `idx_run_user_inputs_answer (run_id, question_id) WHERE kind = 'answer'`, built concurrently | Every existing `run_user_inputs` index is partial, so the answered check would seq-scan on each detail read (dba: 72 ms at 900k synthetic rows) (AI, implementation) | `AND applied_at IS NULL` on the replay index: the hint would reappear briefly after the worker applies an answer |
+| D12 | Any submitted answer (applied or not) suppresses the hint; the 5-reference cap counts valid references only | Matches "answered while the status still reads awaiting_input"; dropped or duplicate refs should not crowd out real ones (AI, implementation) | Counting raw `#` matches toward the cap |
+| D13 | TUI board: `PROG` shares MILES's width threshold on the own board (narrow 8-col form from the title's room; the bar has its own monotonic threshold); on the admin board PROG sheds before MILES | MILES must not be displaced by a new column (#379 shed order); the title keeps at least 20 columns (AI, implementation) | Raising the MILES threshold so both fit (hid MILES at 99–108 cols) |
+| D14 | Web board rows render queued, planning and parked as screen-reader text only, and the stalled flag replaces the health pill | Card rows have no column header, so a visible flag repeated the adjacent status pill (AI, implementation) | The mock's dim visible flags (designed for a table with a Progress header) |
+| D15 | TUI detail PROGRESS block is compact (`PROGRESS ≈70% · 2/4`, `phase ▸ …`) and counts toward the rail height but never triggers the crew fold on its own | The 26-column rail and the closed fold set (MILESTONES, SPEND, account meters); MILESTONES right below already shows position and title (AI, implementation) | The mock's multi-row block (folded the crew on the standard 100x34 screen) |
+| D16 | Web run page shows the phase steps only in the percent state, and the active-role line only while progressing or stalled | D6: current phase only; an idle run has no active role (AI, implementation) | Showing the last role on waiting or parked runs |
+| D17 | A parity fixture (`fixtures/run-progress/parity.json`) is recorded from `runToDTO` and read by the TUI counters, the web `milestoneBadge` and the web mock-store derivation | One cross-language check that the surfaces cannot disagree (AI, implementation) | Separate per-language expectations |

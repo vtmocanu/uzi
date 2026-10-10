@@ -278,6 +278,8 @@ var runDTOKeys = []string{
 	// overlaid on the single-run detail read only.
 	"outcome_pending",
 	"auto_approve_blocked_reasons", "issue_input_reason",
+	// PRD #2602: server-derived progress estimate (object, null for a terminal run).
+	"progress",
 }
 
 func TestRunDTOTags(t *testing.T) {
