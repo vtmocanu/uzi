@@ -596,6 +596,7 @@ wrapper always completes with 0.
   `scripts/lib/state.sh` the shared state dir/session identity; `scripts/lib/review-threads.sh`
   the fail-closed GitHub thread-resolution reader; `scripts/lib/pr-comments.sh` the
   every-author blockers; `scripts/lib/sanitize.sh` the UNTRUSTED-text renderer;
+  `scripts/lib/net-retry.sh` read-only `gh`/`uzi` transport retry (takeover, land-prep, watch-pr);
   `scripts/ack-comments.sh` acknowledges read comments.
 - `scripts/watch-pr.sh` readiness (CI + CR/Greptile on head + rework + rate-limit/skip exits);
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +

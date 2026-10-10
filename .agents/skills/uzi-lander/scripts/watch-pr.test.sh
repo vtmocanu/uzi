@@ -9,8 +9,11 @@ trap 'rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 mkdir -p "$WORK/bin"
+# Records its argument: net_retry backoff (NET_RETRY_BASE_SLEEP=0) must cost no real time.
+export NET_RETRY_BASE_SLEEP=0 SLEEP_LOG="$WORK/sleeps"; : > "$SLEEP_LOG"
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
+echo "$1" >> "$SLEEP_LOG"
 exit 0
 STUB
 cat > "$WORK/bin/uzi" <<'STUB'
@@ -65,6 +68,7 @@ esac
 # RULES_JSON = one page; RULES_FAIL=1 = unreadable. Default: none required.
 case "$*" in *'/rules/branches/main'*)
   [ "${RULES_FAIL:-0}" = 1 ] && exit 1
+  if [ -n "${RULES_BLIP_FILE:-}" ] && [ -e "$RULES_BLIP_FILE" ]; then rm -f "$RULES_BLIP_FILE"; echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
   if [ -n "${SEQ_DIR:-}" ]; then seq_reply rules; else echo "[${RULES_JSON:-[]}]"; fi
   exit 0 ;;
 esac
@@ -556,6 +560,20 @@ CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; export RULES_FAIL=1
 noreq_watch unreadable-rules 9
 grep -q 'required_rules' "$WORK/noreq-unreadable-rules.out" || fail "unreadable rules were treated as none required"
 unset CHECKS_REQUIRED_EMPTY CHECKS_JSON RULES_FAIL
+
+# A one-shot transport blip on the rules lookup is retried inside the poll (lib/net-retry.sh):
+# the poll is neither unknown nor exit 9, even with --max-unknown 1.
+export CHECKS_REQUIRED_EMPTY=1 MODE=greptile_clean CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+: > "$SLEEP_LOG"; : > "$WORK/rules-blip"; export RULES_BLIP_FILE="$WORK/rules-blip"
+set +e
+bash "$SCRIPT" test/repo 42 0 2 --reviewer none --max-unknown 1 > "$WORK/rules-blip.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "a one-shot rules blip failed the watch, rc=$rc: $(cat "$WORK/rules-blip.out")"
+grep -q 'unknown_lookups=' "$WORK/rules-blip.out" && fail "the rules blip was polled as unknown: $(cat "$WORK/rules-blip.out")"
+[ -s "$SLEEP_LOG" ] || fail "the rules blip was not retried through sleep"
+grep -qvx 0 "$SLEEP_LOG" && fail "non-zero backoff recorded: $(sort -u "$SLEEP_LOG" | tr '\n' ' ')"
+unset RULES_BLIP_FILE CHECKS_REQUIRED_EMPTY CHECKS_JSON
 
 # A classic required context must register even when rulesets have no requirements.
 export CHECKS_REQUIRED_EMPTY=1 CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["slow"],"checks":[{"context":"slow"}]}'
