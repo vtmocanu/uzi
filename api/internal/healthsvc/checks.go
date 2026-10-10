@@ -47,6 +47,7 @@ var checkMeta = map[string]struct {
 	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
 	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
 	"db":                 {"instance", groupControl, "Database", ""},
+	"db.size":            {"instance", groupControl, "Database size", "admin-health"},
 	"loops":              {"instance", groupControl, "Background loops", ""},
 	"forge.sync":         {"owner", groupIntegrations, "Forge issue sync", ""},
 	"forge.ciwatch":      {"owner", groupIntegrations, "CI watch capacity", ""},
@@ -618,8 +619,18 @@ func (s *Service) checkQueueUndispatched(ctx context.Context, now time.Time) api
 // checkDB warns on a slow ping or a saturated pool and is danger on a failed ping or a
 // migration-version mismatch. It reads the injected probe (the live pool in production, a
 // fake in unit tests). A nil probe (no pool wired) is `unknown`.
-func (s *Service) checkDB(ctx context.Context) apitypes.HealthCheckDTO {
+func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("db")
+	// Evaluated before the nil-probe return so a recorded 53100 is never hidden behind
+	// "probe not configured". It is a fixed server-authored string; no DB error text.
+	if active, last, start := s.cfg.DiskFull.Snapshot(now); active {
+		c.Severity = sevDanger
+		c.Summary = emergencyDiskFullLine
+		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Last seen", Value: last.UTC().Format(time.RFC3339)}}
+		c.Since = sincePtr(start)
+		c.Action = strPtr("The database volume is full. Free space or grow the volume; see the admin health docs for the recommended infrastructure free-space alert.")
+		return c
+	}
 	if s.probeDB == nil {
 		c.Severity = sevUnknown
 		c.Summary = "The database probe is not configured."

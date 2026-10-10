@@ -236,7 +236,7 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 			provider.refreshCalls, provider.discoverCalls)
 	}
 
-	assertResults := func(operationID uuid.UUID, wantService, wantRoute string) {
+	assertResults := func(operationID uuid.UUID, wantService, wantRoute, wantErrorClass string) {
 		t.Helper()
 		serviceCount, routeCount := 0, 0
 		for _, rec := range timings.snapshot() {
@@ -253,7 +253,10 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 				}
 			case codexTimingMsgRoute:
 				routeCount++
-				assertTimingKeySet(t, rec, "operation_id", "route_total_ms", "result")
+				assertTimingKeySet(t, rec, "operation_id", "route_total_ms", "result", "error_class")
+				if got := rec.attrs["error_class"].String(); got != wantErrorClass {
+					t.Fatalf("route error class for %s = %q, want %q", operationID, got, wantErrorClass)
+				}
 				if got := rec.attrs["result"].String(); got != wantRoute {
 					t.Fatalf("route result for %s = %q, want %q", operationID, got, wantRoute)
 				}
@@ -264,6 +267,6 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 				operationID, serviceCount, routeCount)
 		}
 	}
-	assertResults(refreshOpID, "ok", "ok")
-	assertResults(writeFailureOpID, "ok", "error")
+	assertResults(refreshOpID, "ok", "ok", "")
+	assertResults(writeFailureOpID, "ok", "error", "internal")
 }

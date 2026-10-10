@@ -54,8 +54,8 @@ It surfaces five ways:
   upgrade information at all for another user's worker.
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
-  `danger`. The current instance checks are `db`, `controller.report`, `loops`,
-  `fleet.roll` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains
+  `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
+  `loops`, `fleet.roll` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains
   instance infrastructure even when the hosted workers belong to a single owner.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
@@ -212,8 +212,85 @@ count; severity still uses the full population.
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `controller.report` | The fleet-independent "is the controller still posting" signal — a one-row singleton that advances on every report, including a zero-worker one | — | no report for 5+ minutes | `unknown` from 3 missed ~10s poll intervals up to 5 minutes, and for the first 5 minutes after api boot with no report received yet (also covers a stale row surviving a restart); `na` when no hosted workers are configured |
-| `db` | Postgres reachability, pool pressure, and schema currency | ping slower than 250ms, or the connection pool at 80%+ of max | ping fails, or the applied migration version differs from the embedded head | — |
+| `db` | Postgres reachability, pool pressure, schema currency, and recent disk-full write failures | ping slower than 250ms, or the connection pool at 80%+ of max | ping fails, the applied migration version differs from the embedded head, or the api saw SQLSTATE 53100 (disk full) on a pool statement or commit within the last 5 minutes (summary "Database writes are failing: disk full (53100)."); see [Database storage signals](#database-storage-signals) | — |
+| `db.size` | `pg_database_size(current_database())` against the operator-declared `DB_STORAGE_CAPACITY_BYTES` budget; evidence is the size, the capacity, the percentage used and up to three of the largest relations | 75% or more of the budget | 85% or more of the budget | `na` when `DB_STORAGE_CAPACITY_BYTES` is unset or invalid; `unknown` when the size cannot be read. Cached for 60 seconds per api replica; see [Database storage signals](#database-storage-signals) |
 | `loops` | Whether the four in-process background loops (forge poller, sweeper, run-lifecycle reconciler, scheduler) are still ticking, via an injected `Beat(name)` per loop | a loop's last beat is older than 3 of its own tick intervals | older than 10 intervals | `unknown` for a loop that has not beaten since it registered and is still within 3 intervals (it hasn't had a chance yet); a loop never started on this deployment (the scheduler, when disabled) is left out of the evidence entirely, not counted |
+
+### Database storage signals
+
+Two checks watch for a full database, and neither can read the volume itself
+(the api holds no Kubernetes or filesystem access; see [the boundary](#the-boundary-no-kubernetes-access-ever)).
+Treat them as a backstop, not as your low-disk alert.
+
+**Run an infrastructure free-space alert as the primary control.** Alert on the
+database volume's free space in your own monitoring (for example the kubelet's
+`kubelet_volume_stats_available_bytes`, or the CNPG exporter's metrics, into
+the alerting you already operate). That sees the volume as the filesystem does;
+the checks below do not.
+
+**`db` disk-full danger.** The api records the last time it saw SQLSTATE
+`53100` on any statement or commit through its connection pool (a pgx query
+tracer). For 5 minutes after the last sighting the `db` check is `danger` with
+the fixed summary "Database writes are failing: disk full (53100).", an
+action, and a "Last seen" timestamp. Limits:
+
+- The record is in the memory of each api replica and resets on restart.
+- Only `53100` counts. Other class-53 codes (out of memory, too many
+  connections, configuration limit exceeded) are never labelled disk full.
+- It does not see goose migrations at boot, connect or ping errors, a
+  WAL-volume-full PANIC and restart, or a CNPG primary that shuts down after the
+  data volume fills. In those cases the existing ping failure is the signal, if
+  there is one.
+
+**`db.size` budget.** The check compares `pg_database_size(current_database())`
+with `DB_STORAGE_CAPACITY_BYTES` ([configuration](configuration.md#database-storage-capacity)):
+`warn` at 75% or more, `danger` at 85% or more, evaluated on exact integers.
+The largest-relations evidence reads "unavailable" when that query gives up
+(for example under a table lock) while the size itself stays current. The
+helm chart sets the budget from the database storage size
+(`database.simple.storage.size`, or `postgres.cluster.storage.size` with CNPG);
+with `database.mode: external` set `api.config.DB_STORAGE_CAPACITY_BYTES`
+yourself, as a quoted string (`DB_STORAGE_CAPACITY_BYTES: "107374182400"`):
+an unquoted number renders as `1.073741824e+11`, which the api rejects. `db.size` is an instance check, so `danger` opens the same instance
+episode and sends the same admin Slack notice as any other instance danger.
+
+**Blind spots.** `db.size` is a database-size budget, not volume usage:
+
+- It excludes WAL. With the chart's default CNPG settings
+  (`walStorage.enabled`) WAL is on a separate volume; in simple mode it shares
+  the data volume.
+- It excludes other databases, temporary files, non-Postgres files and
+  filesystem overhead, and it can include tablespaces that live on other
+  volumes.
+- So it can read below 75% while the volume fills, and above it while the
+  volume has room.
+- Each api replica evaluates and caches it independently.
+
+**Banner side effect.** Because `db.size` is instance danger, reaching 85%
+raises the app-wide Danger banner, titled "uzi cannot run work: N blocking
+check(s)", even though work may still run at that size. This is accepted: an
+85% database is meant to be acted on, but the banner wording is not specific to
+storage.
+
+**Emergency notice when the database refuses writes.** Opening the episode and
+recording the per-admin notice both write to Postgres, which cannot work while
+it returns `53100`. When the episode open (on the second consecutive evaluation
+whose open fails with `53100`), the per-admin notice claim, or the notification
+insert fails with `53100`, the api posts the admin Slack notice from memory instead. The rules
+are the normal notice's: the same "Enable run-health detection"
+(`health_enabled`) gate, admins only, Slack DM opt-in, the same escaping. Limits:
+
+- At most one per admin per 30 minutes per incident; it re-arms once `53100`
+  has gone unseen for 5 minutes.
+- The cooldown is in memory per replica: it resets on restart and replicas can
+  each send one, so an admin may get duplicates.
+- It still needs database reads (the health setting, the admin list and the
+  Slack link lookup), so it cannot help during a database shutdown, failover or
+  connection exhaustion.
+- A dropped enqueue, or an admin who has not opted in to Slack DMs, still arms
+  the cooldown.
+- After recovery the `db` check stays `danger` for up to 5 minutes, so the
+  normal claimed notice can follow the emergency one.
 
 ### Integrations
 
@@ -403,6 +480,12 @@ Two checks shown in the accepted mock are **deferred**, not shipped:
   per-connection bookkeeping to read yet. The delivered `forge.sync` check
   measures per-repo poller failure streaks, not this independent freshness
   signal or a fix for an underlying transport problem.
+
+- **Database volume usage** — the volume's free space, WAL growth, or a full
+  WAL volume. `db.size` is a database-size budget and the disk-full signal sees
+  only `53100` on the api's own pool; see
+  [Database storage signals](#database-storage-signals) and run the
+  infrastructure free-space alert.
 
 And **pod-level health of the api, web, database, and controller pods is out
 of scope entirely** — see [the boundary](#the-boundary-no-kubernetes-access-ever)

@@ -239,6 +239,10 @@ api:
   # Non-secret env -> ConfigMap (envFrom). Only keys that differ from config.go's
   # safe defaults need setting; the environment-specific ones (FRONTEND_ORIGIN,
   # TRUSTED_PROXIES, FORGE_ALLOWED_BASE_URLS) live in deploy/values/<cluster>.yaml.
+  # DB_STORAGE_CAPACITY_BYTES (admin-health db.size budget, positive base-10 bytes): under
+  # database.mode external set it HERE as a QUOTED string
+  # ("107374182400"; an unquoted number renders as 1.073741824e+11, which the api rejects);
+  # under simple/cnpg the chart renders it from the database storage size and setting it here too fails the render (duplicate key).
   config:
     API_ADDR: ":8080"
     # OIDC group-based roles/access (PRD #55) — all NON-secret ConfigMap values
@@ -1627,6 +1631,15 @@ database:
     # for GitOps / reproducible installs — it MUST be URL-safe (it is embedded in the DSN).
     password: ""
     storage:
+      # The chart derives the api's DB_STORAGE_CAPACITY_BYTES (the admin-health db.size
+      # budget) from this size, so do not set that key in api.config here. Any Kubernetes
+      # quantity (8Gi, 500M, 1.5Gi, 8e9, a plain integer of bytes), positive, at most 1Ei
+      # (2^60 bytes); anything else fails the render. The simple-mode PVC comes from a
+      # StatefulSet volumeClaimTemplate, so the rendered capacity tracks the size at creation.
+      # After expanding the PVC by hand, update this value to match, delete the StatefulSet
+      # with `kubectl delete statefulset <name> --cascade=orphan` (pods and PVCs are kept),
+      # then helm upgrade recreates it: Kubernetes forbids updating volumeClaimTemplates,
+      # so helm upgrade fails otherwise. Until then db.size keeps the creation-time capacity.
       size: 8Gi
       # "" => the cluster's default StorageClass. On a multi-node cluster prefer a
       # WaitForFirstConsumer class so the PVC binds to the pod's node.
@@ -1694,6 +1707,10 @@ postgres:
     # render fails. Leave empty only with dbPriorityClass.enabled=false.
     priorityClassName: uzi-db
     storage:
+      # The chart derives the api's DB_STORAGE_CAPACITY_BYTES (the admin-health db.size
+      # budget) from this size (database.mode cnpg). Any Kubernetes quantity (5Gi, 500M,
+      # 1.5Gi, 8e9, a plain integer of bytes), positive, at most 1Ei (2^60 bytes);
+      # anything else fails the render. Do not also set it in api.config.
       size: 5Gi
       storageClass: ""        # per-cluster (e.g. standard)
     walStorage:

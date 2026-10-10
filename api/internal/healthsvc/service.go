@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/dbdiskfull"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -135,6 +136,11 @@ type Config struct {
 	Store             Store
 	Pool              *pgxpool.Pool
 	Settings          Settings
+	// DiskFull is the shared disk-full (SQLSTATE 53100) sighting signal fed by the api
+	// pool's query tracer. nil means the db check never reports disk-full.
+	DiskFull *dbdiskfull.Signal
+	// DBStorageCapacityBytes is cfg.DBStorageCapacityBytes; <= 0 makes db.size `na`.
+	DBStorageCapacityBytes int64
 	// SlackState reports the live Slack socket state (slacksvc.State* strings); nil reads
 	// as StateDisabled, so slack.socket is `na`.
 	SlackState func() string
@@ -187,6 +193,9 @@ type Service struct {
 	cfg     Config
 	now     func() time.Time
 	probeDB func(ctx context.Context) dbStat
+	// probeDBSize reads the database size for db.size (the bool asks for the largest-relations
+	// evidence too); nil without a pool.
+	probeDBSize func(ctx context.Context, withRelations bool) (store.DatabaseSize, error)
 
 	mu                     sync.Mutex
 	slackNonConnectedSince *time.Time
@@ -195,6 +204,11 @@ type Service struct {
 	pricingInitialized bool
 	pricingResult      apitypes.HealthCheckDTO
 	pricingRefreshedAt time.Time
+
+	dbSizeMu          sync.Mutex
+	dbSizeInitialized bool
+	dbSizeResult      apitypes.HealthCheckDTO
+	dbSizeRefreshedAt time.Time
 }
 
 // New builds a Service from cfg. The db probe defaults to the live-pool probe; a nil pool
@@ -208,6 +222,7 @@ func New(cfg Config) *Service {
 	s := &Service{cfg: cfg, now: now}
 	if cfg.Pool != nil {
 		s.probeDB = s.livePoolProbe
+		s.probeDBSize = s.livePoolSizeProbe
 	}
 	return s
 }
@@ -277,7 +292,8 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,
-		s.checkDB(ctx),
+		s.checkDB(ctx, now),
+		s.checkDBSize(ctx, now),
 		s.checkLoops(now),
 		s.checkForgeCIWatch(ctx, now),
 		s.checkForgeSync(ctx, now),

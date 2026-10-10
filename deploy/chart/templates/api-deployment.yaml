@@ -71,7 +71,7 @@ spec:
               containerPort: {{ .Values.api.tls.port }}
               protocol: TCP
             {{- end }}
-          {{- if or .Values.api.config (include "uzi.apiHostingEnabled" .) }}
+          {{- if include "uzi.apiConfigMapEnabled" . }}
           envFrom:
             - configMapRef:
                 name: {{ include "uzi.fullname" . }}-api-config

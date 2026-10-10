@@ -422,8 +422,12 @@ type Config struct {
 	RunMaxRequeues              int           // automatic worker-death requeues allowed per owner recovery episode (zero disables automatic requeues)
 	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + eligible runs re-queued within episode allowance, else held or failed by recorded state
-	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
-	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
+	// DBStorageCapacityBytes is DB_STORAGE_CAPACITY_BYTES: the database-size budget (bytes) the
+	// admin-health db.size check measures pg_database_size against. 0 means unset or invalid,
+	// and the check reports `na`.
+	DBStorageCapacityBytes int64
+	DiskPressureThreshold  float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
+	SweepInterval          time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	// SweeperBootGrace (PRD #1390 M1, D1): the three stale-worker passes
 	// (MarkStaleWorkersOffline, FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers)
 	// are skipped until this has elapsed since the LISTENER became ready — not since the
@@ -1120,6 +1124,18 @@ func Load() (Config, error) {
 			cfg.DiskPressureThreshold = v
 		} else {
 			slog.Warn("UZI_DISK_PRESSURE_THRESHOLD is not a float in (0,1]; keeping the 0.90 default (this is a display/lifecycle tuning knob, so a bad value is non-fatal)",
+				"value", raw)
+		}
+	}
+	// DB_STORAGE_CAPACITY_BYTES: a positive base-10 int64 byte count of at most 1 EiB (the same
+	// bound deploy/chart/templates/_helpers.tpl enforces). Unset is silently 0; a set but
+	// unparseable, nonpositive or oversized value is 0 with one boot warning. Non-fatal: it
+	// only feeds the db.size health check.
+	if raw := strings.TrimSpace(os.Getenv("DB_STORAGE_CAPACITY_BYTES")); raw != "" {
+		if v, perr := strconv.ParseInt(raw, 10, 64); perr == nil && v > 0 && v <= maxDBStorageCapacityBytes {
+			cfg.DBStorageCapacityBytes = v
+		} else {
+			slog.Warn("DB_STORAGE_CAPACITY_BYTES is not a positive integer of at most 1 EiB (1152921504606846976 bytes); ignoring it, so the db.size health check is `na`",
 				"value", raw)
 		}
 	}
@@ -2309,3 +2325,7 @@ func samePort(a, b string) bool {
 	}
 	return hostA == hostB
 }
+
+// maxDBStorageCapacityBytes is 1 EiB, the ceiling deploy/chart/templates/_helpers.tpl applies
+// to the rendered DB_STORAGE_CAPACITY_BYTES.
+const maxDBStorageCapacityBytes = int64(1) << 60

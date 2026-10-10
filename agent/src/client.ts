@@ -321,13 +321,9 @@ export function isRunOwnershipLost(err: unknown, runId: string): boolean {
   } catch { return false; }
 }
 
-/** Issue #1766: the typed Codex credential deferral a locked owner vault produces. A Codex
- *  refresh/release that passed authorization but hit a locked vault answers HTTP 409 with
- *  `{"reason":"vault_locked"}` in the body. Returns "vault_locked" ONLY for that exact shape
- *  (a {@link RequestError}, status 409, a JSON body whose `reason` is "vault_locked"), and
- *  undefined for anything else: another 409 reason, another status, a non-JSON body or a
- *  non-RequestError. It never reads the error's message text. */
-export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
+/** Typed credential deferrals require a RequestError, HTTP 409 and a JSON object with an
+ *  exact supported reason. Message text never determines credential state. */
+export function codexDeferralReason(err: unknown): "vault_locked" | "account_unavailable" | undefined {
   if (!(err instanceof RequestError) || err.status !== 409) return undefined;
   let parsed: unknown;
   try {
@@ -336,7 +332,8 @@ export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
     return undefined;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-  return (parsed as { reason?: unknown }).reason === "vault_locked" ? "vault_locked" : undefined;
+  const reason = (parsed as { reason?: unknown }).reason;
+  return reason === "vault_locked" ? "vault_locked" : reason === "codex_account_unavailable" ? "account_unavailable" : undefined;
 }
 
 /** Refresh retry decisions use only fixed classifications, never response text in diagnostics. */
