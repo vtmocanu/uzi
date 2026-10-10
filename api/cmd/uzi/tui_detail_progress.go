@@ -63,9 +63,9 @@ func wrapWords(text string, width, maxRows int) []string {
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
 // no-milestone run (renderMilestones returns "" for an empty frozen list). The rail is
-// laneRailWidth columns: the block is a top line (the percent or a state flag, plus the
-// milestone done/total counts) followed by optional phase, Now-note, since, planning and
-// may-be-blocked-by lines.
+// laneRailWidth columns: the block is a top line (the percent or a state flag, with the
+// milestone done/total counts when available in the percent state) followed by optional
+// phase, Now-note, since, planning and may-be-blocked-by lines.
 //
 // Every state has a text form, so the colorprofile Ascii/NoTTY downgrade loses only colour.
 // Phase and MaybeBlockedByRunID are server strings derived from untrusted repo/agent/question
