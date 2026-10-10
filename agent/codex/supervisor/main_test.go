@@ -10,7 +10,7 @@ func TestParseArgsValid(t *testing.T) {
 	// Assemble the UUID-shaped fixture at runtime: it exercises the real cleanup-token
 	// grammar without leaving a generic-api-key-shaped false positive in tracked text.
 	cleanupToken := strings.Join([]string{"01234567", "89ab", "cdef", "0123", "456789abcdef"}, "-")
-	uid, cleanup, dropCaps, child, err := parseArgs([]string{"--expect-uid", "10002", "--cleanup-token", cleanupToken, "--drop-controller-caps", "--", "/opt/uzi-codex/0.159.3/bin/codex", "app-server"})
+	uid, cleanup, dropCaps, child, err := parseArgs([]string{"--expect-uid", "10002", "--cleanup-token", cleanupToken, "--drop-controller-caps", "--", "/opt/uzi-codex/0.160.0/bin/codex", "app-server"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestParseArgsValid(t *testing.T) {
 	if !dropCaps {
 		t.Error("drop-controller-caps was not parsed")
 	}
-	want := []string{"/opt/uzi-codex/0.159.3/bin/codex", "app-server"}
+	want := []string{"/opt/uzi-codex/0.160.0/bin/codex", "app-server"}
 	if !reflect.DeepEqual(child, want) {
 		t.Errorf("child = %v, want %v", child, want)
 	}
