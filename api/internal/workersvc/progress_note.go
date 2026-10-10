@@ -18,7 +18,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -39,10 +41,9 @@ const (
 
 	// MaxProgressNoteTextRunes is the display cap of the note text (PRD #2603 Output).
 	MaxProgressNoteTextRunes = 120
-	// maxProgressNoteMilestoneRunes caps the milestone id the note was written for.
-	maxProgressNoteMilestoneRunes = 64
 	// maxProgressNoteModels bounds model_usage entries kept per note: one summary call names
-	// one model, so a handful is generous and a hostile object cannot fan out run_usage rows.
+	// one model, so a handful is generous and a hostile object cannot fan out run_usage rows. Past the cap the
+	// first models in sorted-name order are kept, so the kept set is deterministic per payload.
 	maxProgressNoteModels = 4
 	// maxProgressNoteMarkerRunes caps the service_tier / speed / inference_geo strings.
 	maxProgressNoteMarkerRunes = 32
@@ -61,9 +62,13 @@ func SanitizeProgressNoteText(s string) string {
 // decide whether an unpriced Claude entry can be priced from the standard table.
 type progressNoteModelUsage struct {
 	resultModelUsage
-	ServiceTier  string `json:"service_tier,omitempty"`
-	Speed        string `json:"speed,omitempty"`
-	InferenceGeo string `json:"inference_geo,omitempty"`
+	// CacheCreation5mInputTokens / CacheCreation1hInputTokens are the optional TTL split of
+	// the cache writes; anthropicprice.Price refuses to price cache writes without it.
+	CacheCreation5mInputTokens *int64 `json:"cacheCreation5mInputTokens,omitempty"`
+	CacheCreation1hInputTokens *int64 `json:"cacheCreation1hInputTokens,omitempty"`
+	ServiceTier                string `json:"service_tier,omitempty"`
+	Speed                      string `json:"speed,omitempty"`
+	InferenceGeo               string `json:"inference_geo,omitempty"`
 }
 
 // progressNotePayload is the whole stored shape of a progress_note payload.
@@ -88,24 +93,43 @@ func normalizeProgressNotePayload(raw json.RawMessage) json.RawMessage {
 		out.Text = SanitizeProgressNoteText(s)
 	}
 	if json.Unmarshal(in["milestone_id"], &s) == nil {
-		out.MilestoneID = truncateRunes(strings.TrimSpace(runactivity.Sanitize(s)), maxProgressNoteMilestoneRunes)
+		out.MilestoneID = truncateRunes(strings.TrimSpace(runactivity.Sanitize(s)), maxMilestoneIDRunes)
 	}
 	var usage map[string]json.RawMessage
 	if json.Unmarshal(in["model_usage"], &usage) == nil {
+		// Sanitise every key first, then keep the first maxProgressNoteModels in sorted order, so
+		// the kept subset is a pure function of the payload (map iteration order is random and a
+		// re-delivered batch must normalise to the same rows).
+		entries := make(map[string]json.RawMessage, len(usage))
 		for model, entry := range usage {
-			if len(out.ModelUsage) >= maxProgressNoteModels {
-				break
-			}
 			model = truncateRunes(strings.TrimSpace(runactivity.Sanitize(model)), maxUsageModelRunes-len(progressNoteModelPrefix))
-			if model == "" {
+			if model != "" {
+				entries[model] = entry
+			}
+		}
+		models := make([]string, 0, len(entries))
+		for model := range entries {
+			models = append(models, model)
+		}
+		sort.Strings(models)
+		dropped := 0
+		for _, model := range models {
+			mu, ok := normalizeProgressNoteModelUsage(entries[model])
+			if !ok {
 				continue
 			}
-			if mu, ok := normalizeProgressNoteModelUsage(entry); ok {
-				if out.ModelUsage == nil {
-					out.ModelUsage = map[string]progressNoteModelUsage{}
-				}
-				out.ModelUsage[model] = mu
+			if len(out.ModelUsage) >= maxProgressNoteModels {
+				dropped++
+				continue
 			}
+			if out.ModelUsage == nil {
+				out.ModelUsage = map[string]progressNoteModelUsage{}
+			}
+			out.ModelUsage[model] = mu
+		}
+		if dropped > 0 {
+			slog.Warn("progress_note model_usage entries dropped past the cap",
+				"kept", len(out.ModelUsage), "dropped", dropped, "cap", maxProgressNoteModels)
 		}
 	}
 	b, err := json.Marshal(out)
@@ -128,6 +152,8 @@ func normalizeProgressNoteModelUsage(raw json.RawMessage) (progressNoteModelUsag
 	mu.OutputTokens = tolerantTokens(f["outputTokens"])
 	mu.CacheReadInputTokens = tolerantTokens(f["cacheReadInputTokens"])
 	mu.CacheCreationInputTokens = tolerantTokens(f["cacheCreationInputTokens"])
+	mu.CacheCreation5mInputTokens = tolerantOptionalTokens(f["cacheCreation5mInputTokens"])
+	mu.CacheCreation1hInputTokens = tolerantOptionalTokens(f["cacheCreation1hInputTokens"])
 	if usd, ok := resolveCostUSD(f["costUSD"]); ok && usd >= 0 && usd <= maxCostUSD {
 		mu.CostUSD, _ = json.Marshal(usd)
 	}
@@ -137,7 +163,23 @@ func normalizeProgressNoteModelUsage(raw json.RawMessage) (progressNoteModelUsag
 	mu.ServiceTier = tolerantMarker(f["service_tier"])
 	mu.Speed = tolerantMarker(f["speed"])
 	mu.InferenceGeo = tolerantMarker(f["inference_geo"])
+	// An entry with nothing to fold would only add a zero-token row.
+	if mu.InputTokens == 0 && mu.OutputTokens == 0 && mu.CacheReadInputTokens == 0 &&
+		mu.CacheCreationInputTokens == 0 && len(mu.CostUSD) == 0 {
+		return progressNoteModelUsage{}, false
+	}
 	return mu, true
+}
+
+// tolerantOptionalTokens is tolerantTokens for a field whose absence matters: nil when the
+// key is missing or malformed, else a pointer to the clamped count.
+func tolerantOptionalTokens(raw json.RawMessage) *int64 {
+	var v float64
+	if len(raw) == 0 || json.Unmarshal(raw, &v) != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return nil
+	}
+	n := tolerantTokens(raw)
+	return &n
 }
 
 // tolerantTokens decodes a token count that must be a finite non-negative JSON number;
@@ -219,7 +261,7 @@ func foldProgressNoteUsage(ctx context.Context, q usageFoldQuerier, run store.Ru
 // table cannot price it (unknown model, non-standard tier/speed/geo, cache writes without a
 // 5m/1h split).
 func priceProgressNoteEntry(model string, mu progressNoteModelUsage) (string, pgtype.Numeric) {
-	c, ok := anthropicprice.Price(anthropicprice.Usage{
+	u := anthropicprice.Usage{
 		Model:                    model,
 		InputTokens:              nonNegTokens(mu.InputTokens),
 		CacheReadInputTokens:     nonNegTokens(mu.CacheReadInputTokens),
@@ -228,7 +270,10 @@ func priceProgressNoteEntry(model string, mu progressNoteModelUsage) (string, pg
 		ServiceTier:              mu.ServiceTier,
 		Speed:                    mu.Speed,
 		InferenceGeo:             mu.InferenceGeo,
-	})
+		CacheCreation5mTokens:    mu.CacheCreation5mInputTokens,
+		CacheCreation1hTokens:    mu.CacheCreation1hInputTokens,
+	}
+	c, ok := anthropicprice.Price(u)
 	if !ok {
 		return costStatusUnreported, numericUSD(0)
 	}

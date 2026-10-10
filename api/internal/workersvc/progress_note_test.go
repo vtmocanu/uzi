@@ -242,3 +242,68 @@ func TestProgressNoteOnlyBatchDoesNotCountAsActivity(t *testing.T) {
 		})
 	}
 }
+
+// A Claude note with cache writes and the 5m/1h split, and no provider cost, is priced from the
+// table (metered); the same note without the split stays unreported.
+func TestProgressNoteClaudeCacheWriteSplitPricing(t *testing.T) {
+	run := func(entry string) (string, int64) {
+		t.Helper()
+		w := worker()
+		fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgconv.UUID(w.ID)}}
+		svc := New(fs, newBox(t), testParams())
+		payload := `{"text":"x","milestone_id":"m1","model_usage":{"claude-haiku-4-5-20251001":` + entry + `}}`
+		if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID,
+			[]IncomingMessage{{Seq: 4, Kind: "progress_note", Agent: "worker", Payload: json.RawMessage(payload)}}); err != nil {
+			t.Fatal(err)
+		}
+		if len(fs.upsertedUsage) != 1 {
+			t.Fatalf("upserts = %d, want 1", len(fs.upsertedUsage))
+		}
+		u := fs.upsertedUsage[0]
+		return u.CostStatus, u.CostUsd.Int.Int64()
+	}
+	status, micros := run(`{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":50,"cacheCreation5mInputTokens":30,"cacheCreation1hInputTokens":20}`)
+	if status != "metered" || micros <= 600 {
+		t.Fatalf("with split: status=%s micros=%d, want metered and above the no-cache price", status, micros)
+	}
+	if status, micros = run(`{"inputTokens":400,"outputTokens":40,"cacheCreationInputTokens":50}`); status != "unreported" || micros != 0 {
+		t.Fatalf("without split: status=%s micros=%d, want unreported/0", status, micros)
+	}
+}
+
+// The model cap keeps a deterministic subset: the first four sanitised names in sorted order,
+// the same on every normalisation of the same payload.
+func TestProgressNoteModelCapIsDeterministic(t *testing.T) {
+	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{` +
+		`"m6":{"inputTokens":6},"m3":{"inputTokens":3},"m1":{"inputTokens":1},"m5":{"inputTokens":5},"m2":{"inputTokens":2},"m4":{"inputTokens":4}}}`)
+	first := string(normalizeProgressNotePayload(raw))
+	for i := 0; i < 50; i++ {
+		if got := string(normalizeProgressNotePayload(raw)); got != first {
+			t.Fatalf("normalisation differs between runs:\n%s\n%s", first, got)
+		}
+	}
+	var p progressNotePayload
+	if err := json.Unmarshal([]byte(first), &p); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.ModelUsage) != 4 {
+		t.Fatalf("kept %d models, want 4", len(p.ModelUsage))
+	}
+	for _, m := range []string{"m1", "m2", "m3", "m4"} {
+		if _, ok := p.ModelUsage[m]; !ok {
+			t.Fatalf("model %s missing from %v", m, p.ModelUsage)
+		}
+	}
+}
+
+// An entry whose numeric fields are all zero or malformed is dropped, not folded as a zero row.
+func TestProgressNoteDropsEmptyUsageEntry(t *testing.T) {
+	raw := json.RawMessage(`{"text":"x","milestone_id":"m","model_usage":{"a":{"inputTokens":0},"b":{"inputTokens":"lots","outputTokens":-3},"c":{"outputTokens":5}}}`)
+	var p progressNotePayload
+	if err := json.Unmarshal(normalizeProgressNotePayload(raw), &p); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.ModelUsage) != 1 || p.ModelUsage["c"].OutputTokens != 5 {
+		t.Fatalf("model_usage = %+v, want only c", p.ModelUsage)
+	}
+}

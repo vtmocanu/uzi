@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"testing"
@@ -273,4 +274,40 @@ func TestProgressNoteOnlyBatchLeavesStallClockLiveDB(t *testing.T) {
 	if seq != 4 || time.Since(at) > time.Minute {
 		t.Fatalf("after a mixed batch last_seq=%d last_activity_at=%v, want 4 and a fresh timestamp", seq, at)
 	}
+}
+
+// TestProgressNoteWorkerOnlyLiveDB: progress_note is worker-written only. A worker that does
+// not own the run is refused (ErrRunNotOwned) and a stale-generation batch returns
+// ErrStaleClaim; neither persists a message nor folds a usage row.
+func TestProgressNoteWorkerOnlyLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	wkr, runID := env.seedNoteRun(t, "claude")
+	svc := New(env.q, env.box, testParams())
+	batch := []IncomingMessage{noteFrame(1, "Not mine", "m1", map[string]any{"claude-haiku-4-5-20251001": mu(400, 40, nil)})}
+	assertNothingStored := func(label string) {
+		t.Helper()
+		var msgs, usage int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_messages WHERE run_id = $1`, runID).Scan(&msgs); err != nil {
+			t.Fatal(err)
+		}
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_usage WHERE run_id = $1`, runID).Scan(&usage); err != nil {
+			t.Fatal(err)
+		}
+		if msgs != 0 || usage != 0 {
+			t.Fatalf("%s: persisted %d messages and %d usage rows, want none", label, msgs, usage)
+		}
+	}
+
+	gen := int64(1)
+	other := store.Worker{ID: uuid.New(), UserID: wkr.UserID, Status: "online"}
+	if err := svc.AppendMessagesForClaim(env.ctx, other, runID, batch, &gen); !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("foreign worker err = %v, want ErrRunNotOwned", err)
+	}
+	assertNothingStored("foreign worker")
+
+	stale := int64(0)
+	if err := svc.AppendMessagesForClaim(env.ctx, wkr, runID, batch, &stale); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale generation err = %v, want ErrStaleClaim", err)
+	}
+	assertNothingStored("stale generation")
 }
