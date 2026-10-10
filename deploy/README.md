@@ -629,7 +629,7 @@ full reasoning.
   `docker:dind` image's automatic `0.0.0.0:2375` listener is suppressed), so the
   unauthenticated root daemon is never reachable off-pod.
 - Claim-time repo allowlist — the `docker_repo_allowlist`
-  setting (**Admin → Instance → Docker worker repo allowlist**): a docker-capable worker only claims runs whose repo is on it. This is
+  setting (**Admin → Instance → Docker worker repo allowlist**): a docker-capable worker only claims repo-bearing runs whose repo is on it (repo-less judge runs stay claimable, see `api/internal/store/queries/runtime.sql`). This is
   the acceptance's likelihood control and **must be populated before any real
   work runs on a non-rootless cluster**, not an optional follow-up.
 - Soft anti-affinity — keeps the api pod (holding `UZI_SECRET_KEY`) and CNPG off
