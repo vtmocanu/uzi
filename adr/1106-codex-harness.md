@@ -629,7 +629,7 @@ The GPT-6.1 Sol Standard row was verified against the official model page on
 tokens, and 4.00/0.20/5.00/15.00 above 272K input, applying to the full response.
 See https://developers.openai.com/api/docs/models/gpt-6.1-sol.
 
-## Amendment: coordinated runtime 0.160.0 candidate (2026-10-10)
+## Amendment: coordinated runtime 0.160.0 (2026-10-10)
 
 The native package advances from 0.159.3, source
 `01fc69f4026735edfdf6789820549727a4867b11`, to 0.160.0, source
@@ -703,20 +703,42 @@ is context only.
   ripgrep, bwrap and zsh layout. This inspection does not prove installation,
   execution or receipt/probe acceptance.
 
-### Evidence and pending acceptance
+### Upgrade evidence and durable checks
 
-The [candidate decision record](../docs/codex-0.160.0-worker-uid-blocker.md)
-retains the maintainer-supplied 0.159.3 control and lock-only 0.160.0 RED.
-The coordinate defect is consistent with that refusal; its historical operation
-and errno remain unproven. Local Alpine package-index connectivity blocked image
-building and is infrastructure evidence, not Codex RED.
+The historical real worker-UID comparison held source/posture fixed:
+[0.159.3 control 38019285046](https://github.com/vtmocanu/uzi/actions/runs/38019285046)
+at `37e0a4e1` passed, while
+[lock-only 0.160.0 run 38019435933](https://github.com/vtmocanu/uzi/actions/runs/38019435933)
+at `9ed69ac7` failed. The old executable path was inconsistent with the new
+installer destination. This establishes a coordinate defect consistent with the
+refusal, not the historical failing syscall or errno. Local Alpine connectivity
+prevented the implementing worker's image build; that was infrastructure
+evidence, not a runtime regression.
 
-The human clarification of 2026-10-10 permits publication of committed,
-independently reviewed candidate work with real-lane acceptance pending.
-Before merge, ordinary CI must verify the exact head's actual 0.160.0 executable,
-package, installer receipt and probe; the full current worker-UID inventory,
-including seven affected launch leaves and both EACCES leaves; and other required
-checks. No real-lane GREEN or native identity proof is claimed here. If failures
-remain, hold the PR unmerged and compare exact signatures against the supplied
-control and #2397. Launch fallout is only a hypothesis; broader adaptation needs
-a new plan gate.
+[Coordinated candidate CI 38037485971](https://github.com/vtmocanu/uzi/actions/runs/38037485971)
+at `93a4fd6b918236510ee093aebe18e50fd3efc7f7` installed the SHA-verified amd64
+package, wrote its 0.160.0 receipt and executed `codex-cli 0.160.0` as the runner
+UID. Its unchanged real worker-UID lane passed all 29 required leaves, including
+the seven historical launch failures and both EACCES leaves. Those failures
+cleared on the tested candidate; their historical errno and whether EACCES was
+launch fallout remain unproven. This receipt applies to that head, not an
+unobserved later revision.
+
+The production probe was then checked against a real installed tree: an arm64
+(`aarch64-unknown-linux-musl`) base image built from `73e794cba113b1cb627a109c81c2a3665dff228b`
+installed the SHA-verified arm64 package, wrote its 0.160.0 receipt (lock digest
+`7f0fe42ff22ecfa3a47bc4a34f5b22c4218b431a4ec0aba51c7d98299f07900c`), passed the
+runner-version guard, and `probeCodexRuntime()` run as the worker UID returned
+`capable: true`. This is one local build on one architecture; the amd64 receipt above
+comes from CI.
+
+Package installation and the runner-version guard are distinct from production
+receipt/probe capability acceptance. An upgrade must also check the real probe
+against its installed tree, rather than treating synthetic probe tests or
+coordinate equality as that evidence. Architecture-specific execution evidence
+must be identified separately from archive checksum/manifest verification.
+Keep the full worker-UID inventory, two-shard union, M4 once and required checks;
+never loosen refusal, isolation or retention to make an upgrade pass.
+
+The reusable procedure is [Coordinated Codex runtime upgrades](../docs/dev-conventions.md#coordinated-codex-runtime-upgrades).
+Broader runtime adaptations require their own verified cause and plan review.

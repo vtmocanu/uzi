@@ -11,7 +11,7 @@ and a `git blame` see.
 This file itself is exempt from the frontmatter contract below and from
 `check-docs.mjs`'s validation (it is the index/meta page, not a doc).
 
-Repo contributors: see the [Codex 0.160.0 worker UID blocker decision](./codex-0.160.0-worker-uid-blocker.md).
+Repo contributors: see [Coordinated Codex runtime upgrades](./dev-conventions.md#coordinated-codex-runtime-upgrades).
 
 ## Adding a page
 
