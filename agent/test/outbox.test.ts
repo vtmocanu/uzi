@@ -87,7 +87,7 @@ for (const protection of ["terminal alias", "finalize alias", "run alias", "syml
     const dir = path.join(root, run);
     if (protection === "terminal alias") await fs.writeFile(path.join(dir, "terminal-01.json"), "{}");
     if (protection === "finalize alias") await fs.writeFile(path.join(dir, "finalize-01.json"), "{}");
-    if (protection === "run alias") await fs.mkdir(path.join(root, run.toUpperCase()));
+    if (protection === "run alias") await fs.rename(dir, path.join(root, run.toUpperCase()));
     if (protection === "symlink") await fs.symlink("missing", path.join(dir, "finalize-2.json"));
     if (protection === "unreadable") {
       const lstat = fs.lstat;
