@@ -13129,6 +13129,27 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
 
+  it("unmet completion attempts do not call code until the successful done exit", async () => {
+    const rig = makeMultiEpochRig([
+      script("th-1", [(th, tn) => [done(11, th, tn)]]),
+      script("th-1", [(th, tn) => [done(21, th, tn)]]),
+    ]);
+    const events: string[] = [];
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true,
+      checkpoint: async () => { events.push("checkpoint"); },
+      recordCompletionAttempt: async () => {
+        events.push("attempt");
+        return { unmet: ++attempts === 1 ? ["M1"] : [], attemptCount: attempts };
+      },
+      codeCrossCheckGate: async () => { events.push("code"); return { action: "proceed" }; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "unmet completion code gate");
+    assert.equal(rig.epochs.flatMap((epoch) => turnTexts(epoch.transport)).length, 2);
+    assert.deepEqual(events, ["checkpoint", "attempt", "checkpoint", "attempt", "code"]);
+  });
+
   for (const interlocked of [false, true]) {
     it(`code advisory wait leaves the local wall disarmed and preserves persist ordering: ${interlocked ? "interlocked" : "legacy"}`, async () => {
       const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
@@ -13210,19 +13231,21 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
       const checkpoints: unknown[] = [];
       let attempts = 0;
+      let codeCalls = 0;
       const { ctx } = makeCtx({
         kind: "issue",
         ...(interlocked ? { completionInterlock: true } : {}),
         recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
         checkpoint: async (o) => { checkpoints.push(o); },
         secretRemediationGate: async () => ({ action: "fail" }),
-        codeCrossCheckGate: async () => { assert.fail("code gate after secret failure"); },
+        codeCrossCheckGate: async () => { codeCalls++; return { action: "proceed" }; },
       });
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1932 fail run");
       assert.equal(result.branch, "agent/issue-42", "the run returns a result, no throw");
       assert.equal(turnTexts(rig.epochs[0]!.transport).length, 1, "no further turn");
       assert.equal(checkpoints.length, 0, "no done checkpoint");
       assert.equal(attempts, 0, "no completion attempt");
+      assert.equal(codeCalls, 0, "no code gate after secret failure");
     });
   }
 });

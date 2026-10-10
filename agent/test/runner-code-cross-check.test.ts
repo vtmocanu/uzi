@@ -8,7 +8,7 @@ import type { Executor, RunContext } from "../src/executor.js";
 import { checkCode } from "../src/code-cross-check-gate.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, git, homeDir, runner, fakeGitlab, gitlabClaim, installHarness, planThenDoneQuery, input } from "./runner-harness.js";
+import { api, client, git, fx, homeDir, runner, fakeGitlab, gitlabClaim, installHarness, planThenDoneQuery, input } from "./runner-harness.js";
 
 installHarness();
 const record = (head = "a".repeat(40), base = "b".repeat(40)) => ({
@@ -96,6 +96,162 @@ it("legacy code gate snapshots committed work locally, ignoring dirty scratch an
   assert.deepEqual(gateResult, { action: "proceed" });
   assert.equal(publish.mock.callCount(), 0);
 });
+
+for (const movement of ["bridge", "concurrent clone tip"] as const) {
+  it(`interlocked code gate preserves original H after successful import and ${movement}`, async (t) => {
+    const status = t.mock.method(client, "codeCrossCheckStatus", async () => ({ stage: "code", result: "no_row" }));
+    const snapshots: Parameters<WorkerClient["submitCodeCrossCheck"]>[2][] = [];
+    const submit = t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _gen: number, snapshot: Parameters<WorkerClient["submitCodeCrossCheck"]>[2]) => {
+      snapshots.push(snapshot);
+      return "head_commit" in snapshot ? record(snapshot.head_commit, snapshot.base_commit) : record();
+    });
+    let base = "", originalH = "", movedTip = "", clone = "", branch = "", bare = "";
+    const publishedBranch = "feature/code-snapshot";
+    if (movement === "bridge") {
+      execFileSync("git", ["-C", fx.originPath, "checkout", "-b", publishedBranch]);
+      fs.writeFileSync(path.join(fx.originPath, "published.txt"), "published floor\n");
+      execFileSync("git", ["-C", fx.originPath, "add", "published.txt"]);
+      execFileSync("git", ["-C", fx.originPath, "-c", "user.name=test", "-c", "user.email=test@example.test", "commit", "-qm", "published floor"]);
+      execFileSync("git", ["-C", fx.originPath, "checkout", "main"]);
+    }
+    let moveOnPublish = false;
+    let reaps = 0;
+    t.mock.method(client, "publishCheckpoint", async (...args: Parameters<WorkerClient["publishCheckpoint"]>) => {
+      const pack = args[2];
+      for await (const _chunk of pack) { /* drain the real local Git pack */ }
+      if (moveOnPublish && movement === "concurrent clone tip") {
+        execFileSync("git", ["-C", clone, "-c", "user.name=test", "-c", "user.email=test@example.test",
+          "commit", "--allow-empty", "-qm", "concurrent tip"]);
+        movedTip = execFileSync("git", ["-C", clone, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      }
+      return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
+    });
+    const exec: Executor = {
+      killAgentTree: () => { reaps++; },
+      run: async (ctx) => {
+        clone = ctx.worktreePath;
+        branch = ctx.branch;
+        bare = git.barePathFor(fx.originPath);
+        base = execFileSync("git", ["-C", fx.originPath, "rev-parse", "main"], { encoding: "utf8" }).trim();
+        if (movement === "concurrent clone tip") commit(ctx);
+        if (movement === "bridge") {
+          execFileSync("git", ["-C", clone, "reset", "--hard", base]);
+          fs.writeFileSync(path.join(clone, "rewritten.txt"), "rewritten implementation\n");
+          execFileSync("git", ["-C", clone, "add", "rewritten.txt"]);
+          execFileSync("git", ["-C", clone, "-c", "user.name=test", "-c", "user.email=test@example.test", "commit", "-qm", "rewritten"]);
+        }
+        originalH = execFileSync("git", ["-C", clone, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+        moveOnPublish = true;
+        await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+        if (movement === "bridge") movedTip = await git.trackingTip(bare, branch) ?? "";
+        await ctx.codeCrossCheckGate!({ interlocked: true });
+        return { branch };
+      },
+    };
+    const forge = fakeGitlab();
+    await runner(exec, forge.gitlab).execute(gitlabClaim(2175, { code_cross_check_required: true, claim_generation: 1,
+      ...(movement === "bridge" ? { kind: "task", branch: publishedBranch, open_mr: false } : {}) }));
+    assert.ok(reaps > 0, "checkpoint reaped the executor");
+    assert.equal(status.mock.callCount(), 1);
+    assert.equal(submit.mock.callCount(), 1);
+    assert.deepEqual(snapshots, [{ head_commit: originalH, base_commit: base }]);
+    assert.match(originalH, /^[0-9a-f]{40}$/);
+    assert.match(movedTip, /^[0-9a-f]{40}$/);
+    assert.notEqual(movedTip, originalH, "the post-import movement actually happened");
+    if (movement === "bridge") {
+      assert.equal(await git.ancestry(bare, originalH, movedTip), "ancestor");
+      assert.equal(await git.revParse(bare, `${movedTip}^{tree}`), await git.revParse(bare, `${originalH}^{tree}`));
+    }
+  });
+}
+
+for (const failure of ["refused import", "failed import", "unavailable reap", "unverified quiescence"] as const) {
+  it(`interlocked code gate clears a cached snapshot after ${failure}`, async (t) => {
+    t.mock.method(client, "codeCrossCheckStatus", async () => ({ stage: "code", result: "no_row" }));
+    const snapshots: Parameters<WorkerClient["submitCodeCrossCheck"]>[2][] = [];
+    t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _gen: number, snapshot: Parameters<WorkerClient["submitCodeCrossCheck"]>[2]) => {
+      snapshots.push(snapshot);
+      const reply = { ...record(), head_commit: null, base_commit: null, outcome: "failed" as const, reason_class: "snapshot_failed" };
+      return reply;
+    });
+    const importBranch = git.fetchAgentBranch.bind(git);
+    let fail = false, imported = 0, refused = 0, reapFailures = 0, blockedProofs = 0;
+    t.mock.method(git, "fetchAgentBranch", async (...args: Parameters<typeof git.fetchAgentBranch>) => {
+      if (fail && (failure === "refused import" || failure === "failed import")) {
+        refused++;
+        if (failure === "failed import") throw new Error("fixture import failed");
+        return { kind: "not_updated", reason: "ownership_unknown" };
+      }
+      const result = await importBranch(...args);
+      if (result.kind === "updated") imported++;
+      return result;
+    });
+    let pinsBeforeFailure = 0, pinsAfterGate = 0;
+    const pin = t.mock.method(git, "pinCodeSnapshot", git.pinCodeSnapshot.bind(git));
+    let checkpointError: unknown, gateResult: unknown;
+    const exec: Executor = {
+      killAgentTree: () => {
+        if (fail && failure === "unavailable reap") { reapFailures++; throw new Error("fixture reap unavailable"); }
+      },
+      run: async (ctx) => {
+        commit(ctx);
+        await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+        pinsBeforeFailure = pin.mock.callCount();
+        fail = true;
+        try { await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" }); }
+        catch (err) { checkpointError = err; }
+        gateResult = await ctx.codeCrossCheckGate!({ interlocked: true });
+        pinsAfterGate = pin.mock.callCount();
+        fail = false;
+        return { branch: ctx.branch };
+      },
+    };
+    const forge = fakeGitlab();
+    await runner(exec, forge.gitlab, undefined, failure === "unverified quiescence" ? {
+      quiesceRun: async () => {
+        if (fail) blockedProofs++;
+        return {
+          process: { state: fail ? "unverified" : "quiescent", processes: [], killed: [], detail: fail ? "fixture proof unavailable" : "" },
+          docker: { state: "not_wired", removed: [], detail: "" },
+        };
+      },
+    } : {}).execute(gitlabClaim(2176, { code_cross_check_required: true, claim_generation: 1 }));
+    assert.ok(imported > 0, "first checkpoint successfully imported real Git work");
+    assert.equal(pinsBeforeFailure, 1, "first checkpoint captured a snapshot to invalidate");
+    assert.equal(pinsAfterGate, pinsBeforeFailure, "failed checkpoint cannot repin a cached tip");
+    assert.deepEqual(snapshots, [{ reason_class: "snapshot_failed" }], "failure submission contains neither SHA");
+    assert.deepEqual(gateResult, { action: "proceed" });
+    if (failure === "unavailable reap") {
+      assert.equal(reapFailures, 1);
+      assert.ok(checkpointError instanceof Error);
+    } else if (failure === "unverified quiescence") {
+      assert.equal(blockedProofs, 1);
+      assert.equal(refused, 0, "unverified quiescence prevented import");
+    } else {
+      assert.equal(refused, 1, "second checkpoint attempted import despite the unchanged tip");
+    }
+  });
+}
+
+for (const metadata of ["reportOnly", "notCode", "confirmedEmptyPrompt"] as const) {
+  it(`interlocked code gate skips ${metadata} completion metadata without status, submit or pin`, async (t) => {
+    const status = t.mock.method(client, "codeCrossCheckStatus", async () => { throw new Error("unexpected status"); });
+    const submit = t.mock.method(client, "submitCodeCrossCheck", async () => { throw new Error("unexpected submit"); });
+    const pin = t.mock.method(git, "pinCodeSnapshot", async () => { throw new Error("unexpected pin"); });
+    let result: unknown;
+    const exec: Executor = { run: async (ctx) => {
+      commit(ctx);
+      result = await ctx.codeCrossCheckGate!({ interlocked: true, [metadata]: true });
+      return { branch: ctx.branch };
+    } };
+    const forge = fakeGitlab();
+    await runner(exec, forge.gitlab).execute(gitlabClaim(2177, { code_cross_check_required: true, claim_generation: 1 }));
+    assert.deepEqual(result, { action: "proceed" });
+    assert.equal(status.mock.callCount(), 0);
+    assert.equal(submit.mock.callCount(), 0);
+    assert.equal(pin.mock.callCount(), 0);
+  });
+}
 
 it("interrupted code check cannot resubmit or replay old findings", async (t) => {
   const previous = { ...record(), candidate_generation: 1, interrupted_at: new Date().toISOString(),

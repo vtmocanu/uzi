@@ -133,19 +133,21 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
       ]);
       const checkpoints: unknown[] = [];
       let attempts = 0;
+      let codeCalls = 0;
       const ctx = makeCtx({
         kind: "issue",
         ...(interlocked ? { completionInterlock: true } : {}),
         recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
         checkpoint: async (o) => { checkpoints.push(o); },
         secretRemediationGate: async () => ({ action: "fail" }),
-        codeCrossCheckGate: async () => { assert.fail("code gate after secret failure"); },
+        codeCrossCheckGate: async () => { codeCalls++; return { action: "proceed" }; },
       });
       const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
       assert.strictEqual(result.branch, "agent/issue-5", "the run returns a result, no throw");
       assert.strictEqual(prompts.length, 2, "no further turn");
       assert.strictEqual(checkpoints.length, 0, "no done checkpoint");
       assert.strictEqual(attempts, 0, "no completion attempt");
+      assert.strictEqual(codeCalls, 0, "no code gate after secret failure");
     });
   }
 
