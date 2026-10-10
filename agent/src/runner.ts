@@ -607,7 +607,7 @@ function isCodexBoundaryTimeout(err: unknown): boolean {
 
 /** issue #1597 M1: the closed set of server best-effort skip labels a checkpoint publish can
  *  carry onto the run feed — the `Skipped:` values api/internal/workersvc/service.go returns
- *  (PublishCheckpoint): `unsupported` (run kind), `superseded`, and the broker refusals
+ *  (`Publish` / `publishOutcome`): `unsupported` (run kind), `superseded`, and the broker refusals
  *  `tip_missing` / `pack_too_large` / `pack_invalid`, besides the ref/scope skips. Anything
  *  else the body carries is untrusted free text and is folded to `other`, so no server-/forge-
  *  shaped string reaches the feed verbatim. */
