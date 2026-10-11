@@ -184,8 +184,8 @@ var (
 	// not a whole number of seconds >= 60 → 400. ErrExtendDisabled is the admin off-switch
 	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the PER-REQUEST gate: one
 	// request may not exceed run_extension_cap_seconds (the cumulative total is not capped by it),
-	// → 409. ErrExtensionLimitReached is the technical gate: the run's total wall time (budget +
-	// extensions + finalize allowance) must stay inside MaxRunWallSeconds, → 409. ErrExtendNotTimed
+	// → 409. ErrExtensionLimitReached is the admission gate: the request must fit the room
+	// under MaxRunWallSeconds after wall, extension and finalize reserves, → 409. ErrExtendNotTimed
 	// rejects a run of a kind that never times out (chat/judge/interactive) → 409. The last three
 	// are disambiguated from a 0-row CreateExtendInput by extendRefusalReason over the
 	// already-fetched run.
@@ -2207,10 +2207,11 @@ func (s *Service) notify(runID uuid.UUID, status string) {
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
 
-// MaxRunWallSeconds is the technical upper bound on a run's served wall total (frozen wall +
-// extensions + finalize allowance), in seconds. The worker arms its wall timer in milliseconds
-// with setTimeout, which clamps a delay above 2^31-1 ms to 1 ms (firing at once), so the total
-// must satisfy total*1000 <= math.MaxInt32 (about 24.8 days). Every extend path enforces it.
+// MaxRunWallSeconds is the retained extension-admission limit in seconds (about 24.8 days).
+// Extend room subtracts the reserved wall, existing extensions and finalize allowance from it.
+// It is not an absolute cap on served totals: later configuration increases are honored without
+// clamping by the worker's shared chunked monotonic relative timers (#2761). Native chunks are
+// at most 2147483646 ms; executor elapsed accounting and absolute-time predicates are unchanged.
 const MaxRunWallSeconds = math.MaxInt32 / 1000
 
 // MaxRunWallCeiling is the largest RUN_WALL_CEILING the configuration can ever have: the
@@ -2221,8 +2222,8 @@ const MaxRunWallSeconds = math.MaxInt32 / 1000
 const MaxRunWallCeiling = 72 * time.Hour
 
 // WallParkFinalizeSeconds is the one-time finalize allowance StopWallPark grants (SQL literal
-// budget_finalize_seconds = 1800). The extend bound reserves it so a later Stop cannot push the
-// served total past MaxRunWallSeconds; a LiveDB test pins it against the SQL.
+// budget_finalize_seconds = 1800). Extension admission reserves it before Stop grants it;
+// a LiveDB test pins it against the SQL. This reserve does not cap later served totals.
 const WallParkFinalizeSeconds = 1800
 
 // defaultDispatchGrace is the undispatched-task-run reaper window (issue #1367): a
