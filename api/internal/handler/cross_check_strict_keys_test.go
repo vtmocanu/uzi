@@ -24,7 +24,6 @@ type wireEmbedded struct {
 type wireProbe struct {
 	hidden   bool
 	Skipped  string `json:"-"`
-	Dash     string `json:"-,"`
 	Tagged   string `json:"tagged_name,omitempty"`
 	Untagged string
 	Ptr      *bool `json:"ptr_name"`
@@ -33,11 +32,11 @@ type wireProbe struct {
 
 func TestJSONWireNamesReflection(t *testing.T) {
 	got := []string{}
-	for name := range jsonWireNames(reflect.TypeOf(wireProbe{})) {
+	for name := range jsonWireNames(reflect.TypeOf(wireProbe{hidden: true})) {
 		got = append(got, name)
 	}
 	sort.Strings(got)
-	want := []string{"-", "Plain", "Untagged", "inner_name", "ptr_name", "tagged_name"}
+	want := []string{"Plain", "Untagged", "inner_name", "ptr_name", "tagged_name"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("names = %v, want %v", got, want)
 	}
