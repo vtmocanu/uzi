@@ -1,3 +1,4 @@
+import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
@@ -15853,5 +15854,179 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
     );
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
     assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
+  });
+});
+
+// M1 uses bounded readiness and selective native delivery; unrelated idle watchdogs do not fire.
+describe("Codex overflow scheduling M1", () => {
+  async function ready(predicate: () => boolean) {
+    for (let i = 0; i < 1000 && !predicate(); i++) await tick();
+    assert.ok(predicate(), "M1 rig reached requested public seam");
+    await drain();
+  }
+  for (const mode of ["initial", "resumed", "ACK"] as const) it(`Codex oversized ${mode} wall rearms then parks`, async t => {
+    const clock = overflowClock(t);
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, timeoutNow: clock.now, wallMs: mode === "ACK" ? 1000 : REPRO_DELAY };
+    rig.transport.push(threadStarted());
+    let parks = 0;
+    const { ctx } = makeCtx({
+      sessionId: mode === "resumed" ? "th-1" : null,
+      reportIteration: async () => ({ totalWallSeconds: REPRO_DELAY / 1000 }),
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => rig.transport.turnStartCount === 1);
+      clock.move(1); clock.deliver(); await drain();
+      assert.equal(parks, 0, "no 1ms overflow park");
+      clock.assertSafe();
+      clock.move(NATIVE_LIMIT - 1); clock.deliver(d => d >= NATIVE_LIMIT); await drain();
+      assert.equal(parks, 0, "first chunk only rearms");
+      assert.ok(clock.requests.some(r => r.delay === 98_999_354 && r.unrefs === 1));
+      clock.move(98_999_353); clock.deliver(d => d === 98_999_354); await drain();
+      assert.equal(parks, 0);
+      clock.move(1); clock.deliver(d => d === 98_999_354);
+      const result = await running;
+      assert.ok(result.walled);
+      assert.equal(parks, 1);
+      clock.assertSafe();
+    } finally {
+      // A failed assertion must still drain the public run.
+      rig.transport.push(signalDone()).push(turnCompleted());
+      await running.catch(() => undefined);
+    }
+  });
+
+  for (const mode of ["finish", "cancel"] as const) it(
+    `Codex oversized wall cleanup cancels rearmed chunk on ${mode}`, async t => {
+      const clock = overflowClock(t);
+      const controller = new AbortController();
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, timeoutNow: clock.now, wallMs: REPRO_DELAY };
+      rig.transport.push(threadStarted());
+      let parks = 0;
+      const { ctx } = makeCtx({ signal: controller.signal,
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      try {
+        await ready(() => rig.transport.turnStartCount === 1);
+        clock.move(NATIVE_LIMIT); clock.deliver(d => d >= NATIVE_LIMIT); await drain();
+        assert.ok(clock.pending().some(r => r.delay === REPRO_DELAY - NATIVE_LIMIT), "second chunk is live");
+        if (mode === "cancel") {
+          controller.abort();
+          await assert.rejects(running, { message: "run cancelled" });
+        } else {
+          rig.transport.push(signalDone()).push(turnCompleted());
+          assert.equal((await running).walled, undefined);
+        }
+        assert.equal(clock.pending().some(r => r.delay === REPRO_DELAY - NATIVE_LIMIT), false);
+        const abortCalls = t.mock.method(AbortController.prototype, "abort");
+        clock.move(REPRO_DELAY - NATIVE_LIMIT); clock.deliver(); await drain();
+        assert.equal(abortCalls.mock.callCount(), 0, "old remainder cannot abort after cleanup");
+        assert.equal(parks, 0, "cancel or finish cannot become a stale wall park");
+        clock.assertSafe();
+      } finally {
+        controller.abort();
+        rig.transport.push(signalDone()).push(turnCompleted());
+        await running.catch(() => undefined);
+      }
+    },
+  );
+
+  it("Codex capture install future deadline never returns early false M1", async t => {
+    const clock = overflowClock(t);
+    let finish!: (value: { results: []; truncated: boolean }) => void;
+    const install = new Promise<{ results: []; truncated: boolean }>(resolve => { finish = resolve; });
+    let invoked = false;
+    let aborted = false;
+    const controller = new AbortController();
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, timeoutNow: clock.now, installDeps: (_cwd, _env, opts) => {
+      invoked = true;
+      opts?.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return install;
+    } };
+    rig.transport.push(threadStarted());
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined }).ctx).catch(() => undefined);
+    let returned = false;
+    let capture: ReturnType<typeof executor.settleForCredentialFreeCapture> | undefined;
+    try {
+      await ready(() => invoked);
+      capture = executor.settleForCredentialFreeCapture(REPRO_DELAY).then(value => { returned = true; return value; });
+      await drain();
+      assert.equal(aborted, true, "capture aborts installer but must join it");
+      clock.move(1); clock.deliver(); await drain();
+      assert.equal(returned, false, "future install deadline must not return early false");
+      clock.assertSafe();
+      clock.move(NATIVE_LIMIT - 1); clock.deliver(d => d >= NATIVE_LIMIT); await drain();
+      assert.equal(returned, false, "install first chunk only rearms");
+      assert.ok(clock.requests.some(r => r.delay === 98_999_354 && r.unrefs === 0), "capture chunks stay ref'd");
+      clock.move(98_999_354); clock.deliver(d => d === 98_999_354); await drain();
+      const result = await capture;
+      assert.equal(result.kind, "incomplete", "still-pending install reaches its real deadline");
+      assert.match(JSON.stringify(result), /dependency install did not settle/);
+    } finally {
+      controller.abort(); finish({ results: [], truncated: false });
+      await capture;
+      await running;
+    }
+  });
+
+  it("Codex approval install schedules safely, polls independently, and actually joins M1", async t => {
+    const clock = overflowClock(t);
+    let finish!: (value: { results: []; truncated: boolean }) => void;
+    const install = new Promise<{ results: []; truncated: boolean }>(resolve => { finish = resolve; });
+    let approved = false;
+    let aborted = false;
+    let returned = false;
+    let parks = 0;
+    const plan = epochResponder("th-1", "tn-1", transport => {
+      transport.push(toolCall(1, "submit_plan", { plan_md: "M1" }, "th-1", "tn-1", "plan")).push(turnCompleted());
+    });
+    const rig = makeMultiEpochRig([plan]);
+    rig.deps = { ...rig.deps, timeoutNow: clock.now, wallMs: REPRO_DELAY, installDeps: (_cwd, _env, opts) => {
+      opts?.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return install;
+    } };
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => { approved = true; return { kind: "approve", selection: { status: "absent" } }; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).then(
+      value => { returned = true; return value; },
+      error => { returned = true; throw error; },
+    );
+    try {
+      await ready(() => approved && clock.pending().some(r => r.interval && r.delay === 25));
+      clock.move(1); clock.deliver(); await drain();
+      assert.equal(aborted, false, "overflow wake alone does not trip the absolute wall predicate");
+      assert.equal(returned, false);
+      clock.assertSafe();
+      assert.ok(clock.requests.some(r => r.delay === NATIVE_LIMIT && r.unrefs === 0), "approval deadline stays ref'd");
+      clock.move(NATIVE_LIMIT - 1); clock.deliver(d => d >= NATIVE_LIMIT); await drain();
+      assert.equal(aborted, false, "rearm does not interrupt install");
+      assert.ok(clock.pending().some(r => r.delay === 98_999_354 && r.unrefs === 0), "rearmed approval deadline is pending");
+      // Deliver one 25ms poll at a late wall time rather than iterate millions of intervals.
+      clock.move(98_999_354); clock.deliver((_d, interval) => interval); await drain();
+      assert.equal(aborted, true, "independent approval poll interrupts at spent budget");
+      assert.equal(returned, false, "abort notification cannot substitute for actual installer join");
+      assert.equal(rig.sessionOps.persist, 0);
+      assert.equal(parks, 0);
+      assert.ok(clock.pending().some(r => r.delay === 98_999_354 && r.unrefs === 0), "poll leaves the rearmed deadline pending until installer joins");
+      finish({ results: [], truncated: false });
+      const result = await running;
+      assert.ok(result.walled);
+      assert.equal(parks, 1);
+      assert.equal(clock.pending().some(r => r.delay === 98_999_354), false, "actual installer join cancels pending deadline chunks");
+      clock.move(98_999_354); clock.deliver(); await drain();
+      assert.equal(parks, 1, "old remainder cannot park again");
+      clock.assertSafe();
+    } finally {
+      finish({ results: [], truncated: false });
+      await running.catch(() => undefined);
+    }
   });
 });
