@@ -60,7 +60,8 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		t.Fatalf("registered evidence binding = %+v", evidence)
 	}
 	if evidence.HeartbeatAt == nil || !evidence.HeartbeatAt.Equal(at) ||
-		!evidence.EvaluatedAt.Equal(at) || !evidence.ValidUntil.Equal(at.Add(45*time.Second)) {
+		!evidence.EvaluatedAt.Equal(at) || !evidence.ValidUntil.Equal(at.Add(45*time.Second)) ||
+		evidence.LivenessValidUntil == nil || !evidence.LivenessValidUntil.Equal(at.Add(60*time.Second)) {
 		t.Fatalf("registered evidence timestamps = %+v", evidence)
 	}
 	if pending.DrainingReason != nil {
@@ -138,7 +139,7 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if unregistered.Version != 1 || unregistered.OwnerID != "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ||
 		unregistered.Registered || unregistered.OrdinaryCoverage || unregistered.CheckerCoverage ||
 		unregistered.RegisteredVersion != nil || unregistered.RegisterNonce != nil ||
-		unregistered.PodUID != nil || unregistered.HeartbeatAt != nil ||
+		unregistered.PodUID != nil || unregistered.HeartbeatAt != nil || unregistered.LivenessValidUntil != nil ||
 		unregistered.SchedulingCapabilities == nil || len(unregistered.SchedulingCapabilities) != 0 ||
 		unregistered.ProtocolCapabilities == nil || len(unregistered.ProtocolCapabilities) != 0 ||
 		!unregistered.EvaluatedAt.Equal(at) || !unregistered.ValidUntil.Equal(at) {

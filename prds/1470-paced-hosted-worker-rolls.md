@@ -34,6 +34,8 @@ Tick only items supported by direct execution evidence. Keep this PRD active unt
 7. **Skew:** deploy new API first, then the singleton controller, before changing the worker pin. Introducing pod UID environment itself causes a paced template roll. Old controllers retain legacy unpaced behavior.
 8. **Limits and verification:** compressed and decompressed polls have independent 4 MiB limits, accept one gzip member only, and are bounded before typed worker allocation; incomplete snapshots are rejected atomically. Existing KinD smoke is envelope coverage; maintainer hosted verification stays open.
 
+9. **Retained API capacity:** roll evidence adds nullable liveness_valid_until from online status and an ordinary heartbeat whose expiry is strictly after the API's evaluated_at, using the claim path's staleness bound. This distinguishes legacy registered workers with no pod UID/proven heartbeat; pod readiness alone does not establish API connectivity. Ordinary liveness never refreshes nonce-proven heartbeat_at or valid_until. M2 uses this evidence to retain the owner's last API-online provider; planner enforcement remains pending.
+
 ## Execution evidence
 
 M1 evidence (2026-10-11):

@@ -18,6 +18,7 @@
 -- entire snapshot when it exceeds 512; a truncated set would permit orphan teardown.
 SELECT w.id,
        w.user_id, w.capabilities, w.protocol_capabilities, w.version,
+       w.status, w.last_heartbeat_at,
        w.snapshot_register_nonce, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason,
        -- Checker eligibility by slot family, matching fn_cross_check_child_eligible:
        -- ordinary_coverage is the legacy run-slot fallback, NOT ordinary-job support.

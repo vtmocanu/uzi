@@ -18,6 +18,7 @@
         "register_nonce": "registration-nonce",
         "pod_uid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
         "heartbeat_at": "2026-01-02T03:04:05Z",
+        "liveness_valid_until": "2026-01-02T03:05:05Z",
         "evaluated_at": "2026-01-02T03:04:05Z",
         "valid_until": "2026-01-02T03:04:50Z"
       },
@@ -51,6 +52,7 @@
         "register_nonce": null,
         "pod_uid": null,
         "heartbeat_at": null,
+        "liveness_valid_until": null,
         "evaluated_at": "2026-01-02T03:04:05Z",
         "valid_until": "2026-01-02T03:04:05Z"
       },

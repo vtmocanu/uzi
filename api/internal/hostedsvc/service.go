@@ -216,6 +216,12 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			v := uuid.UUID(row.RegisteredPodUid.Bytes).String()
 			evidence.PodUID = &v
 		}
+		if row.Status == "online" && row.LastHeartbeatAt.Valid {
+			until := row.LastHeartbeatAt.Time.Add(s.heartbeatStale)
+			if until.After(evaluatedAt) {
+				evidence.LivenessValidUntil = &until
+			}
+		}
 		if row.RollHeartbeatAt.Valid {
 			at := row.RollHeartbeatAt.Time
 			evidence.HeartbeatAt = &at

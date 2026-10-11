@@ -620,6 +620,7 @@ const listHostedWorkersForController = `-- name: ListHostedWorkersForController 
 
 SELECT w.id,
        w.user_id, w.capabilities, w.protocol_capabilities, w.version,
+       w.status, w.last_heartbeat_at,
        w.snapshot_register_nonce, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason,
        -- Checker eligibility by slot family, matching fn_cross_check_child_eligible:
        -- ordinary_coverage is the legacy run-slot fallback, NOT ordinary-job support.
@@ -714,6 +715,8 @@ type ListHostedWorkersForControllerRow struct {
 	Capabilities             []string           `json:"capabilities"`
 	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
 	Version                  pgtype.Text        `json:"version"`
+	Status                   string             `json:"status"`
+	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
 	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
 	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
 	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
@@ -773,6 +776,8 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 			&i.Capabilities,
 			&i.ProtocolCapabilities,
 			&i.Version,
+			&i.Status,
+			&i.LastHeartbeatAt,
 			&i.SnapshotRegisterNonce,
 			&i.RegisteredPodUid,
 			&i.RollHeartbeatAt,

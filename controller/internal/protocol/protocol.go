@@ -225,8 +225,11 @@ type RollEvidence struct {
 	RegisterNonce          *string    `json:"register_nonce"`
 	PodUID                 *string    `json:"pod_uid"`
 	HeartbeatAt            *time.Time `json:"heartbeat_at"`
-	EvaluatedAt            time.Time  `json:"evaluated_at"`
-	ValidUntil             time.Time  `json:"valid_until"`
+	// LivenessValidUntil is ordinary API connectivity, independent of promotion proof.
+	// Null means there is no fresh API-online heartbeat at evaluation.
+	LivenessValidUntil *time.Time `json:"liveness_valid_until"`
+	EvaluatedAt        time.Time  `json:"evaluated_at"`
+	ValidUntil         time.Time  `json:"valid_until"`
 }
 
 // Pacing is separate from the pod-derived phase. Persistence and production

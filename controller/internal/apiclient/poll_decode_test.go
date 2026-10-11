@@ -42,8 +42,14 @@ func TestDecodePollAcceptsSharedEvidenceGolden(t *testing.T) {
 	if evidence == nil || !evidence.Registered || evidence.OrdinaryCoverage || !evidence.CheckerCoverage {
 		t.Fatalf("decodePoll lost registered coverage evidence: %+v", evidence)
 	}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if evidence.HeartbeatAt == nil || !evidence.HeartbeatAt.Equal(at) ||
+		!evidence.EvaluatedAt.Equal(at) || !evidence.ValidUntil.Equal(at.Add(45*time.Second)) ||
+		evidence.LivenessValidUntil == nil || !evidence.LivenessValidUntil.Equal(at.Add(60*time.Second)) {
+		t.Fatalf("decodePoll conflated liveness and promotion timestamps: %+v", evidence)
+	}
 	unregistered := got.Workers[1].RollEvidence
-	if unregistered == nil || unregistered.Registered ||
+	if unregistered == nil || unregistered.Registered || unregistered.LivenessValidUntil != nil ||
 		got.Workers[1].DrainingReason == nil || *got.Workers[1].DrainingReason != "image_roll" {
 		t.Fatalf("decodePoll lost unregistered evidence or drain reason: %+v", got.Workers[1])
 	}

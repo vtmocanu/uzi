@@ -180,6 +180,86 @@ func TestRollEvidencePollEligibilityDrainLiveDB(t *testing.T) {
 	}
 }
 
+func TestRollEvidenceLivenessProjectionLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	id := seedSnapshotWorker(t, env, env.seedUser(t), "current-registration")
+	env.exec("UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base' WHERE id=$1", id)
+	svc := snapshotSvc(env, testParams())
+	read := func() store.Worker {
+		t.Helper()
+		w, err := env.q.GetWorkerByID(env.ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	pollRow := func() store.ListHostedWorkersForControllerRow {
+		t.Helper()
+		rows, err := env.q.ListHostedWorkersForController(env.ctx, store.ListHostedWorkersForControllerParams{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.ID == id {
+				return row
+			}
+		}
+		t.Fatal("worker absent from poll")
+		return store.ListHostedWorkersForControllerRow{}
+	}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		status string
+		at     time.Time
+	}{
+		{"legacy_fresh", "online", at},
+		{"online_stale", "online", at.Add(-time.Hour)},
+		{"offline_fresh", "offline", at},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env.exec("UPDATE workers SET status=$2,last_heartbeat_at=$3 WHERE id=$1", id, tc.status, tc.at)
+			row := pollRow()
+			if row.Status != tc.status || !row.LastHeartbeatAt.Valid || !row.LastHeartbeatAt.Time.Equal(tc.at) ||
+				!row.SnapshotRegisterNonce.Valid || row.RegisteredPodUid.Valid || row.RollHeartbeatAt.Valid {
+				t.Fatalf("legacy liveness/proof projection = %+v", row)
+			}
+		})
+	}
+	// A legacy plain heartbeat refreshes API liveness without pod-bound proof.
+	w, err := svc.Heartbeat(env.ctx, read(), nil, nil, nil)
+	if err != nil || !w.LastHeartbeatAt.Valid || w.RollHeartbeatAt.Valid {
+		t.Fatalf("legacy heartbeat liveness/proof incorrect: %v", err)
+	}
+	// Establish proof through a pod-bound registration and actual current-nonce heartbeat.
+	w, nonce, err := svc.RegisterWithCrossCheckSlots(env.ctx, w, "1.2.3", "base", nil, nil, nil, nil, nil, uuid.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err = svc.Heartbeat(env.ctx, w, nil, nil, &ActiveSnapshot{RegisterNonce: nonce, SnapshotEpoch: 1})
+	if err != nil || !w.RollHeartbeatAt.Valid {
+		t.Fatalf("current-nonce heartbeat did not stamp proof: %v", err)
+	}
+	// Age that proof independently, then send newer ordinary and invalid-nonce heartbeats.
+	proven := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	env.exec("UPDATE workers SET roll_heartbeat_at=$2,last_heartbeat_at=$2 WHERE id=$1", id, proven)
+	for _, snap := range []*ActiveSnapshot{nil, {RegisterNonce: "invalid-registration", SnapshotEpoch: 2}} {
+		w, err = svc.Heartbeat(env.ctx, read(), nil, nil, snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := pollRow()
+		if row.Status != "online" || !row.LastHeartbeatAt.Valid || !row.LastHeartbeatAt.Time.After(proven) ||
+			!row.RollHeartbeatAt.Valid || !row.RollHeartbeatAt.Time.Equal(proven) {
+			t.Fatalf("ordinary/invalid-nonce heartbeat moved proof or lost liveness: %+v", row)
+		}
+	}
+	w, err = svc.Heartbeat(env.ctx, read(), nil, nil, &ActiveSnapshot{RegisterNonce: nonce, SnapshotEpoch: 2})
+	if err != nil || !w.RollHeartbeatAt.Valid || !w.RollHeartbeatAt.Time.After(proven) {
+		t.Fatalf("new current-nonce heartbeat did not advance proof: %v", err)
+	}
+}
+
 func TestRollEvidenceOfflineLadderLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
