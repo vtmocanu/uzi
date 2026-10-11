@@ -275,7 +275,7 @@ func (r *reader) byte1() byte {
 // parseRecords decodes a body into records. Payload slices alias into one copy of the body
 // owned by the caller, so a caller that keeps records must keep the body alive (Decode does).
 func parseRecords(body []byte, count int) ([]Record, error) {
-	out := make([]Record, 0, count)
+	out := make([]Record, 0, min(count, len(body)/7))
 	rd := &reader{b: body}
 	for len(rd.b) > 0 {
 		n := rd.uvarint()
@@ -417,6 +417,12 @@ func (e *Engine) Decode(data []byte) ([]Record, Header, error) {
 	}
 	if h.RawLen > e.maxRaw {
 		return nil, h, errChunkTooLarge
+	}
+	// Every record encodes to at least 7 bytes (length prefix, id, seq, kind length, flags,
+	// payload length, created_at), so a larger count is a corrupt header. The CRC covers the
+	// body only, so this check keeps a bad count from driving parseRecords' allocation.
+	if h.Count > h.RawLen/7 {
+		return nil, h, errChunkHeader
 	}
 	comp := data[chunkHeaderLen:]
 	var body []byte

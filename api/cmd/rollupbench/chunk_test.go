@@ -268,7 +268,9 @@ func TestTruncatedAndBitFlippedRejected(t *testing.T) {
 func TestBodyLengthPrefixLieRejected(t *testing.T) {
 	// A record whose length prefix runs past the body must fail, not panic or over-read.
 	e := newTestEngine(t, 1<<20)
-	body := binary.AppendUvarint(nil, 1<<40)
+	// One pad byte keeps RawLen at the 7-byte minimum record size, so the header count check
+	// passes and the length-prefix lie is caught by the record parser.
+	body := append(binary.AppendUvarint(nil, 1<<40), 0)
 	var buf bytes.Buffer
 	fw, _ := flate.NewWriter(&buf, 1)
 	_, _ = fw.Write(body)
@@ -346,5 +348,30 @@ func TestChunkKinds(t *testing.T) {
 	got := chunkKinds([]Record{{Kind: "b"}, {Kind: "a"}, {Kind: "b"}})
 	if fmt.Sprint(got) != "[a b]" {
 		t.Fatal(got)
+	}
+}
+
+// The CRC covers the body only, so a valid body behind a header whose Count is forged huge must
+// be refused before parseRecords sizes its slice from that count.
+func TestForgedHeaderCountRejectedBeforeAllocation(t *testing.T) {
+	const maxRaw = 1 << 20
+	e := newTestEngine(t, maxRaw)
+	for _, s := range testSpecs {
+		data, err := e.Encode(s, sampleRecords(20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		binary.LittleEndian.PutUint32(data[16:], 0xFFFFFFFF)
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, _, err = e.Decode(data)
+		runtime.ReadMemStats(&after)
+		if !errors.Is(err, errChunkHeader) {
+			t.Fatalf("%v: forged count: err = %v, want errChunkHeader", s, err)
+		}
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > 8*maxRaw {
+			t.Fatalf("%v: forged count allocated %d bytes", s, grew)
+		}
 	}
 }

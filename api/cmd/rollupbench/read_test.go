@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"testing"
 )
@@ -157,14 +156,17 @@ func TestArchivedFilteredReadSkipsChunksWithoutMatchingKinds(t *testing.T) {
 	eng := newTestEngine(t, 8<<20)
 	all := sampleRecords(300)
 	store := newMemStore(t, eng, all, 300, ChunkBounds{ByteBound: 1 << 20, CountCeiling: 10})
-	_, st, err := readArchived(context.Background(), store, eng, ReadSpec{Limit: 5})
+	sp := ReadSpec{Limit: 5}
+	got, st, err := readArchived(context.Background(), store, eng, sp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.ChunksFetched > 1 {
-		t.Fatalf("a 5-row page decoded %d chunks", st.ChunksFetched)
+	if !sameResult(oracle(all, sp), got, projFull) {
+		t.Fatalf("got %d rows, want the first 5", len(got))
 	}
-	_ = fmt.Sprint(st)
+	if st.ChunksFetched != 1 {
+		t.Fatalf("a 5-row page decoded %d chunks, want exactly 1", st.ChunksFetched)
+	}
 }
 
 func TestProjectJobsMirrorsPayloadTextOperator(t *testing.T) {
