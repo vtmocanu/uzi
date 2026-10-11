@@ -729,8 +729,8 @@ user's Claude worker default. A pinned Claude model rejected by the SDK
 See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
 decision and validation limits, and
 [configuration](docs/configuration.md#plan-cross-check-model-and-effort-pins)
-for the settings contract. Code cross-check (#2170) remains outside this
-implementation.
+for the settings contract. Code cross-check (#2170) is a separate advisory
+stage, described under [Code cross-check](#code-cross-check).
 
 PRD #2169 adds a third worker claim pool beside run and chat:
 `POST /api/worker/runs/claim?lane=cross_check`, bounded by
@@ -782,6 +782,56 @@ process residuals; the hosted uid split depends on the configured profile.
 See [ADR-2169](adr/2169-cross-check-lane.md) for the additional history
 column, rollback and proof limits, and [PRD #2169](prds/2169-cross-check-lane.md)
 for decisions and the pending acceptance checklist.
+
+### Code cross-check
+
+PRD #2170 adds an opt-in, advisory check of the lead's committed code by the
+other model family before publication (see
+[PRD #2170](prds/2170-code-cross-check.md) for decisions and
+[docs/cross-check.md](docs/cross-check.md#code-cross-check) for the user view).
+It never blocks publication. It shares the `cross_checks` table
+(`stage = 'code'`, one attempt per lead) and the dedicated lane of #2169, but
+has its own consent (`users.code_cross_check_enabled`, set by
+`PUT /api/me/cross-check`), snapshotted onto each eligible run as
+`runs.code_cross_check_required` at creation (`runkind.CodeCrossCheckable`).
+
+When the lead finishes, the worker pins its committed head under a local-only
+ref `refs/uzi-cross-check/<lead-run-id>` in its bare repository; the ref is
+never pushed. The api records the check (head, base, frozen guidance and
+instruction digests) and creates a read-only checker child on the opposite
+family. The child is claimable only by the lead's own worker, which must
+advertise `cross_check_code_v1` and `cross_check_lane_v1`
+(`fn_cross_check_child_eligible`); there is no worker fallback. The wait is
+credited back to the lead's wall budget, and `CODE_CROSS_CHECK_TIMEOUT` bounds
+the checker. A reclaim or requeue of the lead marks the attempt interrupted
+and it is not re-checked.
+
+With findings, the lead gets one repair turn and reports a disposition per
+finding through `report_cross_check_dispositions` (worker-authenticated,
+write-once). The worker renders the outcome into the MR description's "Code
+cross-check" section (`renderCodeCrossCheck` in `agent/src/pr-description.ts`);
+the run page and `uzi run get` read the same stored summary.
+
+Trust boundaries: owner guidance (per repository, `PATCH /api/repos/{id}`,
+cookie-only, at most 8 KiB) is appended to the checker's trusted brief after
+the locked base brief, so it can add checks but not remove required ones or
+change the output format or read-only rules. Repository instructions are a
+separate consent (`repos.cross_check_repo_instructions_enabled`): the worker
+reads the root `CLAUDE.md` from the **base commit** (the merge base with the
+default branch) out of its bare repository, never the run's worktree, and
+hands it to the checker as fenced advisory data. A run therefore cannot
+author or rewrite the instructions it is checked against; the accepted limit
+is that a run forked from an older default-branch commit is checked against
+that older file, or none. See the amendment in
+[ADR-246](adr/0246-trusted-repo-instructions.md). Guidance and the instruction
+text are frozen into the check row, with digests the worker verifies on claim.
+
+The local snapshot ref is deleted once the checker has settled. A boot sweep
+deletes leftovers only on positive server evidence matching the lead id, claim
+generation and head (or, for a lead with no check row, only when the ref was
+never read and the lead is finished or not held by that worker), and keeps the
+ref on any doubt. Roll out the api and migrations 00322 to 00325 before workers
+that advertise `cross_check_code_v1`.
 
 ### Run lifecycle
 

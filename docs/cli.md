@@ -2470,6 +2470,37 @@ A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
 
+### Code cross-check evidence
+
+The [Code cross-check](./cross-check.md#code-cross-check) consent is set in
+**Settings → Run defaults → Cross-check**; there is no CLI write verb for it.
+
+`uzi run get <id>` prints a `CODE_CHECK` row for a run that took the setting
+at creation: `Pending`, `Completed` or `Incomplete`, or `Pending · evidence
+unavailable` / `Incomplete · outcome unavailable` when no summary is stored.
+The rows after it, all prefixed `CODE_CHECK_`, are `REASON` (the reason class
+with underscores shown as spaces), `CHECKED_SHA`, `CHECKER_ID`, `FAMILY`,
+`MODEL`, `EFFORT`, `COST` and, when owner guidance applied, `GUIDANCE`
+(`custom guidance applied (sha256 <12 hex>)`). `DISPOSITIONS` reads `Pending
+report`, `Finalized` or `Dispositions unavailable`; once finalized on a
+completed check, `COUNTS` reads `N addressed, N declined, N not reported`.
+Each finding adds `_ID`, `_SEVERITY`, `_PATH`, `_TITLE` and `_DETAIL` rows
+(plus `_LINE` and, when reported, `_DISPOSITION` and `_DISPOSITION_REASON`),
+numbered from 1 and bounded to 20 findings; `CODE_CHECK_MORE` counts the
+rest. An interrupted attempt changes the prefix to `EARLIER_CODE_CHECK` and
+reads `Earlier attempt evidence · incomplete: interrupted`. Displayed text
+goes through the same terminal sanitization as the Plan rows.
+
+`uzi run get <id> --json` carries `code_cross_check_required` and the
+structured `code_cross_check_summary`.
+
+`uzi repo list` has two columns for the per-repository owner settings:
+`CHECK_GUIDANCE` is `none` or `set (N bytes)` and never prints the text, and
+`CHECK_REPO_INSTRUCTIONS` is the instructions toggle. `--json` carries the
+stored `code_cross_check_guidance` and `cross_check_repo_instructions_enabled`.
+The CLI never writes either; use the **Code cross-check** panel on the Repos
+page.
+
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
 declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and <!-- check-docs:ignore-path: didactic example path, not a real PRD -->

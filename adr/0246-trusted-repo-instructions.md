@@ -365,3 +365,35 @@ per root unchanged. `settingSources: []` is likewise untouched — neither root 
 read through the SDK's project loader. The net effect is that a repo on the
 cross-agent layout loads the same skills it always intended to, through the same
 controlled, symlink-refusing channel.
+
+## Amendment — PRD #2170: the code cross-checker as a second, separately consented recipient
+
+The decision above stands for the lead: only the lead receives the repo's
+`CLAUDE.md`, and "Subagents receive nothing" remains true of subagents. PRD
+[#2170](../prds/2170-code-cross-check.md) adds one more recipient, the read-only
+checker child of the opt-in Code cross-check ([docs](../docs/cross-check.md#code-cross-check)).
+It is not a subagent: it is a separate run on the other model family.
+
+- **Its own consent.** The per-repo flag `cross_check_repo_instructions_enabled`
+  (default off, written with the checker guidance through `PATCH /api/repos/{id}`,
+  owner or admin, cookie-only) controls it. The lead's `repo_claudemd_enabled`
+  is unchanged and neither implies the other; the check freezes the setting
+  when it is created.
+- **Base-commit sourcing.** The worker reads the root `CLAUDE.md` as of the
+  run's base commit (the merge base with the default branch) from its bare
+  repository with git plumbing, never the worktree the agent can write
+  (`agent/src/repo-instructions-at-commit.ts`). A symlink is followed only
+  inside that commit's tree: at most 8 hops, never outside the repo root or into
+  `.git/`, and the target must be a regular file. A file over 64 KiB is dropped,
+  never truncated, and line-leading `@` imports are stripped by the same helper
+  as the lead's reader.
+- **Framing.** The text reaches the checker as nonce-fenced advisory data in
+  its data prompt, with a fixed sentence that a `CLAUDE.md` change in the diff
+  is review evidence, not instruction. It does not enter the checker's trusted
+  brief; owner guidance is the only owner text that does.
+- **Accepted limit.** A run cannot author or rewrite the instructions it is
+  checked against, since they come from the base commit. Because that base is a
+  merge base, a run forked from an older default-branch commit is checked
+  against that older `CLAUDE.md`, or none. This is not a guarantee that a run
+  cannot relax its own check, and the design does not claim one.
+

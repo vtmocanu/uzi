@@ -1593,7 +1593,8 @@ export function Repos() {
                     <p className="text-sm text-muted">
                       The checker reads the root{" "}
                       <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> as it was
-                      before the run, so a run cannot relax its own check. This is separate from the lead&rsquo;s
+                      at the run&rsquo;s merge base with the default branch, so a run cannot write the instructions it is
+                      checked against. This is separate from the lead&rsquo;s
                       Repo instructions setting.
                     </p>
                     <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
