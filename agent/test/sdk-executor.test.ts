@@ -5828,6 +5828,41 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     assert.doesNotMatch(err.message, /success/, "never the self-contradictory 'success'");
   });
 
+  // PRD #1733: the runner types the park from this marker alone.
+  it("marks a sustained provider outage providerOrigin (final attempt failed with the provider error)", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)], [resultApiError(529, OVERLOADED_529)]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(makeCtx().ctx));
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.strictEqual(err.providerOrigin, true);
+  });
+
+  it("does NOT mark a positively-empty exhaustion providerOrigin", async () => {
+    const { queryFn } = fakeTurns([[resultEmpty()], [resultEmpty()]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(makeCtx().ctx));
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.strictEqual(err.providerOrigin, false);
+  });
+
+  it("does NOT mark providerOrigin when an earlier attempt hit the provider error but the final one was empty", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)], [resultEmpty()]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(makeCtx().ctx));
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.strictEqual(err.providerOrigin, false);
+    assert.doesNotMatch(err.message, /529/, "the message does not blame a provider error the final attempt did not see");
+  });
+
+  it("notifies onModelTurnSettled once per COMPLETED turn: the failed provider attempt is not counted", async () => {
+    const { queryFn } = fakeTurns([
+      [resultApiError(529, OVERLOADED_529)], // failed attempt: never reaches the hook
+      [submitPlan("# The Plan"), resultSuccess()], // planning turn
+      [assistantText("impl"), signalDone(), resultSuccess()], // implement turn
+    ]);
+    let settled = 0;
+    const probe = makeCtx({ agents: [lead, coder, reviewer], onModelTurnSettled: async () => { settled++; } });
+    await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.strictEqual(settled, 2, "plan + implement; the 529 attempt is excluded");
+  });
+
   it("does NOT over-park a permanent 401 — it fails, labelled with 401 and never 'success'", async () => {
     const { queryFn, turns } = fakeTurns([[resultApiError(401, "API Error: 401 Unauthorized")]]);
     const err = await rejection(

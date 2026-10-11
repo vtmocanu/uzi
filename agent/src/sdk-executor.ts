@@ -227,11 +227,17 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  * runner catch route it to the non-terminal park instead of the generic failure path.
  */
 export class TransientRecoveryError extends Error {
+  /** PRD #1733: true only when the FINAL in-process attempt failed with a transient provider
+   *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
+   *  empty-turn and gate-recovery throws stay unmarked. */
+  public readonly providerOrigin: boolean;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
+    opts: { providerOrigin?: boolean } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
+    this.providerOrigin = opts.providerOrigin === true;
   }
 }
 
@@ -4363,6 +4369,9 @@ export class SdkExecutor implements Executor {
       lastProviderErr
         ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
         : undefined,
+      // lastProviderErr is cleared by any attempt that returned (even positively empty), so it
+      // is set here only when the FINAL attempt threw the provider error.
+      { providerOrigin: lastProviderErr !== undefined },
     );
   }
 

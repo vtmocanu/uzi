@@ -14369,6 +14369,16 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
+  it("(b1) the exhausted transient park is marked providerOrigin (PRD #1733)", async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    tinyBackoff(rig);
+    const { ctx } = makeCtx();
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient exhausted"),
+      (e: Error) => e instanceof TransientRecoveryError && e.providerOrigin === true,
+    );
+  });
+
   it("(b2) transientRetryMax bounds the retries", async () => {
     const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
     tinyBackoff(rig, { transientRetryMax: 0 });

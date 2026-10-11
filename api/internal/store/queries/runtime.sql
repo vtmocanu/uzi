@@ -3151,6 +3151,94 @@ WHERE run_id = @run_id
   AND state = 'open'
 FOR UPDATE;
 
+-- name: SetRunProviderRecoveryWait :one
+-- PRD #1733: the TYPED provider-transient park, the dedicated arm's ordinary (not yet held)
+-- outcome. Identical to SetRunRecoveryWait (same positive source guard, same fence, same backoff
+-- bookkeeping, same health reset) except that it stores recovery_wait_cause = 'provider_outage'
+-- and writes the open streak the Go caller (workersvc/providerpark.go) computed from the LOCKED
+-- row: provider_park_count and provider_park_streak_started_at are SET, never incremented here,
+-- so the one writer of the streak decides it from one snapshot. RETURNING runs.* so the caller
+-- can answer from the committed row.
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = 'provider_outage',
+    recovery_retry_not_before = @retry_not_before,
+    provider_park_count       = @provider_park_count,
+    provider_park_streak_started_at = @provider_park_streak_started_at,
+    session_id                = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind NOT IN ('judge', 'job', 'cross_check')
+  AND claim_released_at IS NULL
+  AND claim_generation = @claim_generation::bigint
+RETURNING *;
+
+-- name: SetRunProviderHold :one
+-- PRD #1733: the bounded provider park's OWNER HOLD. running -> paused, hold_reason
+-- 'provider_unavailable', NON-TERMINAL. Mirrors SetRunWallPark (the worker-side park), NOT the
+-- server sweep's ParkRunsAtWall: claim_released_at stays NULL, worker_id is kept and no
+-- worker_active_runs row is deleted, because a verified but unpublished capture may exist only
+-- on that worker and releasing the claim would null worker_id on resume. The streak columns are
+-- written so the surfaces can show the count and the streak start.
+--
+-- The leading CTE settles EVERY unapplied owner pause input (kind 'pause' of any body: wall, now,
+-- milestone, plus the 'pause_cancel' flag-clear), extending SetRunWallPark's consumed_wall
+-- pattern: the hold already satisfies the owner's pending pause, and a resumed flight must never
+-- be handed a stale abort (SetRunPaused needs pause_requested_at, so it would fail to re-park).
+-- The pause_* columns are cleared for the same reason. This departs from SetRunPaused's rule that
+-- involuntary parks keep pause_*, because here the involuntary park is itself an owner-facing
+-- pause. The CTE's EXISTS mirrors this UPDATE's WHERE.
+--
+-- THE FENCE is SetRunRecoveryWait's: the positive status guard, claim_released_at IS NULL, and a
+-- REQUIRED claim generation (a typed provider park without one is refused before any SQL).
+-- Health is reset for SetRunPaused's allowlist reason. session_id is COALESCE'd.
+WITH consumed_pause AS (
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
+    WHERE u.kind IN ('pause', 'pause_cancel') AND u.applied_at IS NULL
+      AND EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = u.run_id AND r.id = @id AND r.worker_id = @worker_id
+            AND r.status = 'running'
+            AND r.kind NOT IN ('judge', 'job', 'cross_check')
+            AND r.claim_released_at IS NULL
+            AND r.claim_generation = @claim_generation::bigint)
+)
+UPDATE runs SET
+    status             = 'paused',
+    status_since       = now(),
+    session_id         = COALESCE(sqlc.narg('session_id'), runs.session_id),
+    hold_reason        = 'provider_unavailable',
+    provider_park_count = @provider_park_count,
+    provider_park_streak_started_at = @provider_park_streak_started_at,
+    pause_requested_at = NULL,
+    pause_mode         = NULL,
+    pause_after_count  = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+-- Outer refs are qualified `runs.` because the leading CTE puts run_user_inputs in the analyzer's
+-- outer name scope (bare `id`/`status` would read ambiguous, as in SetRunWallPark).
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.status = 'running'
+  AND runs.kind NOT IN ('judge', 'job', 'cross_check')
+  AND runs.claim_released_at IS NULL
+  AND runs.claim_generation = @claim_generation::bigint
+RETURNING runs.*;
+
+-- name: ResetProviderParkStreakForOwner :execrows
+-- PRD #1733: clear the open provider-park streak as part of an owner's credential switch on a
+-- run that is NOT recovery_wait (queued, limit_wait, pool_wait), run in the SAME transaction and
+-- under the SAME row lock as the transition that moved the run (SetRunCredential). Owner- and
+-- status-scoped: @status is the status the preceding transition LEFT the run in, so a run a
+-- racing writer moved (a claim, a provider re-park) matches 0 rows and the caller rolls the whole
+-- switch back instead of erasing the newer streak. A recovery_wait run folds the same reset into
+-- PromoteRecoveryWaitRunNow instead.
+UPDATE runs SET provider_park_count = 0, provider_park_streak_started_at = NULL, updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = @status::text;
+
 -- name: PromoteRecoveryWaitRuns :many
 -- The sweeper's transient-recovery promotion pass (issue #1197): recovery_wait -> queued
 -- once the clock passes recovery_retry_not_before. Backed by idx_runs_recovery_wait_retry,
@@ -3323,6 +3411,10 @@ UPDATE runs SET
     status_since = now(),
     started_at = NULL,
     budget_paused_seconds = 0,
+    -- PRD #1733: the owner's early promote (set-token / credential switch) is the decision to try
+    -- again, so it clears the open provider-park streak. The automatic promotions
+    -- (PromoteRecoveryWaitRuns, PromoteVaultLockedRecoveryWaitRuns) PRESERVE it.
+    provider_park_count = 0, provider_park_streak_started_at = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -3579,6 +3671,11 @@ UPDATE runs SET
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
     hold_reason = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
+    -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
+    -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
+    -- hold_reason stays 'provider_unavailable' until the next claim, like completion_blocked.
+    provider_park_count = CASE WHEN runs.hold_reason = 'provider_unavailable' THEN 0 ELSE runs.provider_park_count END,
+    provider_park_streak_started_at = CASE WHEN runs.hold_reason = 'provider_unavailable' THEN NULL ELSE runs.provider_park_streak_started_at END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
@@ -3775,6 +3872,9 @@ UPDATE runs SET
     claim_released_at     = now(),
     budget_paused_seconds = runs.budget_paused_seconds
         + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
+    -- PRD #1733: a credential switch is the owner's decision to try again, so it clears the open
+    -- provider-park streak in the same statement as the applied release.
+    provider_park_count = 0, provider_park_streak_started_at = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
@@ -3906,7 +4006,11 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND claim_released_at IS NULL
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
+  -- into a question/follow-up park. Only provider_unavailable: every other paused reason keeps
+  -- today's behaviour.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -4013,7 +4117,11 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND claim_released_at IS NULL
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
+  -- into a question/follow-up park. Only provider_unavailable: every other paused reason keeps
+  -- today's behaviour.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -4201,7 +4309,7 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -4253,7 +4361,7 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -4539,7 +4647,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -4581,7 +4689,7 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: FailRunAutoStop :execrows

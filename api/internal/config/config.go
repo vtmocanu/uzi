@@ -532,6 +532,12 @@ type Config struct {
 	// fail_origin='data_volume_full'. A PREVENTIVE park (the worker stopped the run before the
 	// volume filled) is neither counted nor capped. 0 = unlimited; the default (3) lives in Load.
 	RunDiskParkMax int
+	// Provider-transient park bound (PRD #1733, RUN_PROVIDER_PARK_MAX_DURATION). An unbroken
+	// streak of typed provider_outage recovery parks is bounded in ELAPSED time: the first
+	// provider park at or past this age since the streak began becomes a paused owner hold
+	// (hold_reason 'provider_unavailable') instead of another recovery_wait. It never fails a
+	// run. 0 disables the hold (typing and counting stay on); the default (24h) lives in Load.
+	RunProviderParkMaxDuration time.Duration
 
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
@@ -1232,6 +1238,11 @@ func Load() (Config, error) {
 	// UZI_RUN_DISK_PARK_MAX=0 is legal and means "unlimited" (never fail on the count), and an
 	// invalid or negative value falls back to the default of 3 counted disk parks.
 	cfg.RunDiskParkMax = parseNonNegInt("UZI_RUN_DISK_PARK_MAX", 3)
+
+	// Provider-transient park bound (PRD #1733). parseNonNegDuration, NOT parseDuration:
+	// RUN_PROVIDER_PARK_MAX_DURATION=0 is legal and disables the hold (parseDuration would turn
+	// it into the default), while a negative or malformed value falls back to 24h.
+	cfg.RunProviderParkMaxDuration = parseNonNegDuration("RUN_PROVIDER_PARK_MAX_DURATION", 24*time.Hour)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)

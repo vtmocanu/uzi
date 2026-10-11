@@ -421,6 +421,14 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_data_volume_full"},
+		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
+		// with the optional productive_turns count, stores and counts the typed park, bounds an
+		// unbroken streak of them in elapsed time, and may answer the park with status "paused"
+		// (hold_reason provider_unavailable). Advertised UNCONDITIONALLY (RUN_PROVIDER_PARK_MAX_DURATION=0
+		// only lifts the hold): a worker sends the typed body ONLY after seeing this token, both
+		// because an older api's strict decoder 400s productive_turns and because only a worker
+		// that handles a "paused" ack may receive one.
+		{"recovery_cause_provider_outage"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
 		// /state limit_wait / recovery_wait / paused reports and the wall-park report) and stores
 		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a
@@ -1642,7 +1650,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1668,6 +1676,11 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
+	}
+	// PRD #1733: hold_reason (additive) only for a paused run with a reason, so a worker that lost
+	// the ack of a provider park can recognise the provider_unavailable hold.
+	if holdReason != nil {
+		body["hold_reason"] = *holdReason
 	}
 	httpx.JSON(w, http.StatusOK, body)
 }

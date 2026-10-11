@@ -81,6 +81,7 @@ type stateRequestMinusGateRevision struct {
 	SizeClass                 *string                    `json:"size_class"`
 	RecoveryCause             *string                    `json:"recovery_cause"`
 	DiskParkPreventive        *bool                      `json:"disk_park_preventive"`
+	ProductiveTurns           *int32                     `json:"productive_turns"`
 	CheckpointContainsLatest  *bool                      `json:"checkpoint_contains_latest"`
 }
 

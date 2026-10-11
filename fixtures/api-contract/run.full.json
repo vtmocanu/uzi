@@ -144,6 +144,7 @@
   "hold_context": "x",
   "worker_name": "x",
   "can_stop_at_wall": true,
+  "can_stop_at_provider_hold": true,
   "completion_phase": "x",
   "completion_revision": 1,
   "completion_deferred": [
@@ -387,6 +388,8 @@
   "forge_park_count": 1,
   "forge_park_max": 1,
   "disk_park_count": 1,
+  "provider_park_count": 1,
+  "provider_park_streak_started_at": "2020-01-02T03:04:05Z",
   "checkpoint_contains_latest": true,
   "home_bytes": 1,
   "cache_bytes": 1,

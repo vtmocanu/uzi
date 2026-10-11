@@ -2559,6 +2559,11 @@ export interface StateRequest {
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
+  /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
+   *  the count of model turns this run completed since the previous provider-outage park, so the api
+   *  can tell a streak of unproductive outages from one that made progress in between. Gated on
+   *  `recovery_cause_provider_outage` and sent together with that cause; omitted otherwise. */
+  productive_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
    *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
@@ -2820,6 +2825,10 @@ export interface RunOwnershipResponse {
    *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
    *  to "retry after backoff". */
   recovery_retry_not_before?: string;
+  /** PRD #1733: the run's `hold_reason`, when the api exposes it on the probe. The worker reads a
+   *  `paused` + `provider_unavailable` pair as an accepted provider-outage park whose ack was lost;
+   *  absent (an api that does not expose it) is never read as that pair. */
+  hold_reason?: string;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps

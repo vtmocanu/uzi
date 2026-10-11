@@ -361,6 +361,11 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// CreateStopVerdictInput (no stop_kind='stopped') — the scope-capped disposition is
 		// stamped at finalize by the worker in m3, not here.
 		if milestoneIssueRun {
+			// PRD #1733: Stop on a provider hold is this same scope write followed by the owner's
+			// resume, so with nothing complete it would finalize nothing; refuse it up front.
+			if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "provider_unavailable" && len(completed) < 1 {
+				return SubmitInputResult{}, ErrProviderHoldStopUnavailable
+			}
 			reason, _ := stripNUL(body)
 			reason = strings.TrimSpace(reason)
 			auditBody := fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", len(completed))

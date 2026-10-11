@@ -967,6 +967,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, workersvc.ErrExtensionCapExceeded),
 			errors.Is(err, workersvc.ErrExtendNotTimed),
 			errors.Is(err, workersvc.ErrWallParkChanged),
+			errors.Is(err, workersvc.ErrWallParkStopUnavailable),
+			errors.Is(err, workersvc.ErrProviderHoldStopUnavailable),
 			errors.Is(err, workersvc.ErrWallParkCrossCheckIneligible):
 			// PRD #1189 M1: extending is off instance-wide, the request exceeds the per-run
 			// cap, or the run's kind never times out; a wall-park extend whose park changed or

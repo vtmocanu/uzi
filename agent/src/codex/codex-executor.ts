@@ -3988,7 +3988,10 @@ export class CodexExecutor implements Executor {
             if (!stopAfter) continue;
             err = stopAfter;
           } else {
-            throw new TransientRecoveryError(`provider transient error persisted after bounded in-process retries: ${caught.message}`);
+            throw new TransientRecoveryError(
+              `provider transient error persisted after bounded in-process retries: ${caught.message}`,
+              { providerOrigin: true },
+            );
           }
         }
         const msg = err instanceof Error ? err.message : "";

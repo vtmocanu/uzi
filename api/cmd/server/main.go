@@ -371,6 +371,9 @@ func run() error {
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
 		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
 		RunDiskParkMax: cfg.RunDiskParkMax,
+		// PRD #1733: elapsed-time bound on an unbroken provider-outage park streak; past it the next
+		// provider park becomes a paused 'provider_unavailable' hold. 0 disables the hold.
+		RunProviderParkMaxDuration: cfg.RunProviderParkMaxDuration,
 		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
 		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
 		// custody hold (source retained). Non-positive disables the pass.

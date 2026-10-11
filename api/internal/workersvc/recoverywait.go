@@ -123,8 +123,9 @@ func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter
 
 // recoveryCauseStored is the recovery_wait_cause the ordinary park writes for a reported cause
 // (issue #1766 M2). Only 'vault_locked' is persisted; every other cause, and an absent one, is
-// stored NULL — empty_turn/provider_outage stay the untyped park (PRD #1392 D9), and
-// forge_unreachable never reaches this park (SetState routes it to parkForgeUnreachable), nor
+// stored NULL — empty_turn stays the untyped park (PRD #1392 D9); provider_outage never reaches
+// this park either (PRD #1733: SetState routes it to parkProviderOutage, which stores and counts
+// it), nor does forge_unreachable (SetState routes it to parkForgeUnreachable), nor
 // does data_volume_full (routed to parkDataVolumeFull, PRD #1809 M5).
 func recoveryCauseStored(cause *string) pgtype.Text {
 	if cause != nil && *cause == recoveryCauseVaultLocked {
