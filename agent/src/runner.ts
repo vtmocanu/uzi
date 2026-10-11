@@ -3703,8 +3703,9 @@ export class RunRunner {
         // PRD #1391 Run B M4: phaseClone's first `running` report was refused with a TERMINAL status
         // (the run reached completed/failed/cancelled out from under this claim). STOP with NO
         // terminal report (the authoritative outcome already landed). The refusal comes before
-        // ensureClone, so normally no clone exists and retainStoppedSource answers `no_source`
-        // (ordinary teardown); issue #1786: a source that does exist is kept, not discarded. Caught
+        // ensureClone, so no clone path exists and retainStoppedSource answers `no_source`
+        // (ordinary teardown); the call is a control that keeps a source, were one ever set, from
+        // being discarded (issue #1786). Caught
         // here BEFORE the generic terminal path so this never becomes a `failed` run.
         const stopped = await this.retainStoppedSource(flight, executor, "running_ack_terminal");
         runLog.info("run reached a terminal status before the phase clone started; stopping this flight", {
@@ -15830,27 +15831,34 @@ export class RunRunner {
    * attributed containers quiet (`own` mode, forced process scan), which kills only attributed
    * processes; (3) when the proof holds and the clone is clean at a head the bare's tracking ref
    * already holds under this run's committed ownership, hand teardown back its normal retire
-   * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock); otherwise (4) record
+   * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
+   * local branch, tag and the absence of a stash to be reachable from that head); otherwise (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
    * clone. Step 4 runs whatever the proof said; it only protects. A blocked or throwing proof, an
    * unreadable bare or a refused record gives `unknown` (the record, when written, stays): the
    * clone and its journal stay.
    *
-   * `no_source`: there was no clone, or the covered case above (ordinary teardown proceeds).
+   * `no_source`: there was no clone (ordinary teardown proceeds). `covered`: the covered case above
+   * (ordinary teardown proceeds and retires the clone). A flight already held by retained-recovery
+   * custody takes steps (1) and (2) only, then answers `retained_local` (`unknown` when the proof
+   * was blocked): no record is written for it, and `stoppedSourceKept` stays set so the verified
+   * successor retire in the finally never runs for a stopped flight.
    * `retained_local`: the source is kept and recorded for the operator channel (or already held by
-   * retained-recovery custody, which this does not touch). `unknown`: kept, not recorded. None of the three grants custody release or successor authority.
+   * retained-recovery custody, which this does not touch). `unknown`: kept, not recorded. None of the
+   * four grants custody release or successor authority.
    */
   private async retainStoppedSource(
     flight: RunFlight, executor: Executor, reason: string,
-  ): Promise<"no_source" | "retained_local" | "unknown"> {
+  ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
     const clonePath = flight.worktreePath;
     if (clonePath === undefined) return "no_source";
     // A retained-recovery flight (its retained source journaled, an episode, a predecessor capture)
-    // is already held by its own custody: the finally latches it, and its ledger and journal stay.
-    // The proof and the record below would only reap and rewrite what that machinery owns.
-    if (flight.retainedLocalCustody || flight.retainedEpisode || flight.retainedEpisodeCustody ||
-        flight.completedRetainedSuccessor || flight.predecessorCapture) return "retained_local";
+    // is already held by its own custody: its ledger and journal stay and no stopped-source record
+    // is written for it. It still takes the latch and the process proof below: stopping the flight
+    // must not leave its writers running over a source that custody keeps.
+    const custodyHeld = flight.retainedLocalCustody || flight.retainedEpisode || flight.retainedEpisodeCustody ||
+      flight.completedRetainedSuccessor || flight.predecessorCapture;
     const priorPreserve = flight.preserveRecoveryClone;
     flight.preserveRecoveryClone = true;
     flight.stoppedSourceKept = true;
@@ -15867,6 +15875,7 @@ export class RunRunner {
     if (blocked) {
       log.warn("stopped source: unresolved writers; the clone is kept and not provably quiet", { clone: clonePath, reason });
     }
+    if (custodyHeld) return blocked ? "unknown" : "retained_local";
     const barePath = flight.barePath, branch = flight.branch;
     if (barePath === undefined || branch === undefined) {
       log.warn("stopped source: no bare or branch to record the retention in; the clone is kept", { clone: clonePath, reason });
@@ -15897,7 +15906,7 @@ export class RunRunner {
             flight.preserveRecoveryClone = priorPreserve;
             flight.stoppedSourceKept = false;
             log.info("stopped source: clean and fully held by the worker's tracking ref; teardown proceeds", { clone: clonePath, reason });
-            return "no_source";
+            return "covered";
           }
         }
       } catch (err) {

@@ -477,6 +477,38 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "not_covered", "HEAD moved past the captured head");
   });
 
+  it("is not covered while a local branch holds a commit the captured head does not, and covered again once it is reachable", async () => {
+    const { a, head } = await captured();
+    gitIn(a.path, ["checkout", "-q", "-b", "side"]);
+    fs.writeFileSync(path.join(a.path, "side.txt"), "only on a side branch\n");
+    gitIn(a.path, ["add", "side.txt"]);
+    gitIn(a.path, ["commit", "-m", "side work"]);
+    gitIn(a.path, ["checkout", "-q", "--detach", head]);
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "the tree is clean at the captured head");
+    assert.equal(await verify(a, head), "not_covered", "the side branch's commit is held by nothing");
+    gitIn(a.path, ["branch", "-D", "side"]);
+    gitIn(a.path, ["branch", "behind", head]);
+    assert.equal(await verify(a, head), "covered", "a branch at the captured head itself loses nothing");
+  });
+
+  it("is not covered while a tag or a stash entry holds worker-only source", async () => {
+    const { a, head } = await captured();
+    fs.appendFileSync(path.join(a.path, "work.txt"), "stashed bytes\n");
+    gitIn(a.path, ["-c", "user.email=t@t", "-c", "user.name=t", "stash", "push"]);
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "the tree is clean at the captured head");
+    assert.equal(await verify(a, head), "not_covered", "a stash entry exists");
+    gitIn(a.path, ["stash", "drop"]);
+    assert.equal(await verify(a, head), "covered");
+    gitIn(a.path, ["checkout", "-q", "-b", "tmp"]);
+    fs.writeFileSync(path.join(a.path, "tagged.txt"), "tagged\n");
+    gitIn(a.path, ["add", "tagged.txt"]);
+    gitIn(a.path, ["commit", "-m", "tagged"]);
+    gitIn(a.path, ["tag", "keep-me"]);
+    gitIn(a.path, ["checkout", "-q", "--detach", head]);
+    gitIn(a.path, ["branch", "-D", "tmp"]);
+    assert.equal(await verify(a, head), "not_covered", "a tag names a commit the head does not hold");
+  });
+
   it("is not covered for a missing or replaced path, a blocked or throwing proof, or a degraded capture", async () => {
     const { a, head } = await captured();
     assert.equal(await verify(a, head, async () => false), "not_covered", "blocked proof before");

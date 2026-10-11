@@ -311,9 +311,8 @@ separately from head notices.
 
 ### When a run is stopped by a stale or fenced claim
 
-A worker stops a flight when its claim has gone stale (`stale_claim`), when an
-input receipt fenced it, or when its first running report came back with a terminal
-status. In each case the worker keeps the clone's unfetched commits and its dirty
+A worker stops a flight when its claim has gone stale (`stale_claim`) or when an
+input receipt fenced it. In each case the worker keeps the clone's unfetched commits and its dirty
 and untracked files instead of tearing the clone down. It stops the flight's own
 processes first, then makes no further report, publish or tracking write through
 the stopped claim, and records the source as retained:
@@ -322,14 +321,20 @@ the stopped claim, and records the source as retained:
   `reclaimed` and the plain recovery journal is cleared.
 - **Canonical clone:** a `uzi-stopped` marker is written and the journal is kept.
 
-A clean clone sitting at a tracking tip owned by this run and generation still
-tears down, because there is nothing in it to lose.
+A clean clone whose HEAD is already anchored still tears down: the anchor is a
+tracking tip this run and generation owns, or an owed pin of this run, and every
+local branch, tag and other non-remote ref of the clone must be reachable from
+that HEAD with no stash entry. A commit on another local branch or a stash entry
+keeps the clone. Gitignored files are not covered by any capture, so they do not
+keep a clone that is otherwise anchored.
 
 What a successor sees depends on the worker. On a Docker-wired (attempt-path)
 worker, a successor for the same run starts in a fresh attempt and leaves the
 retained clone alone. On a non-Docker worker, a successor that would reuse the
 retained canonical clone fails with `fail_origin` `worker_residue_blocked`; its
-message names the worker-local inspect command.
+message names the worker-local inspect command. That refusal applies to any later
+run of the same issue on that worker, not only the stopped run: each such run
+fails once until an operator discards the retained clone.
 
 This is **local retention only**. It is not a published checkpoint, an archive or
 server custody, and nothing about it appears in the feed or in `uzi run recovery`

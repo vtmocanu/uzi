@@ -1259,9 +1259,9 @@ PRD at `prds/done/2603-run-now-summary.md`.
 
 PRD at `prds/1786-preserve-worker-only-work.md`.
 
-- A worker that stops a run because its claim went stale or was fenced keeps that generation's exact clone (unfetched commits, dirty and untracked files) and makes no further report, publish or tracking write through the stopped claim. Only a clone already proven covered (clean, at a tracking tip this run and generation owns) is torn down. A successor's claim never counts as proof. (AI-synced 2026-10-11, #1786)
+- A worker that stops a run because its claim went stale or was fenced keeps that generation's exact clone (unfetched commits, dirty and untracked files) and makes no further report, publish or tracking write through the stopped claim. Only a clone already proven covered (clean, HEAD anchored at a tracking tip this run and generation owns or at an owed pin of this run, and every other local ref reachable from it with no stash) is torn down; gitignored files are not covered by any capture. A successor's claim never counts as proof. (AI-synced 2026-10-11, #1786)
 - A retained source is deleted only by explicit operator discard through the worker-local inspect/discard command, after the server shows no open hold of this worker on the run, no local recovery, settlement or terminal record remains, and the worker is idle with the run reserved; there is no TTL or cap eviction of an unverified source. [maintainer 2026-10-11] (AI-synced 2026-10-11, #1786)
-- A same-run successor on a Docker-wired worker starts in a fresh attempt; a successor that would reuse a retained canonical clone is refused with an explicit retained-source error instead of adopting the stale tip. [maintainer 2026-10-11] (AI-synced 2026-10-11, #1786)
+- A same-run successor on a Docker-wired worker starts in a fresh attempt; a successor that would reuse a retained canonical clone is refused with an explicit retained-source error instead of adopting the stale tip; the refusal applies to any later run of that issue on that worker (it fails once with `worker_residue_blocked` naming the inspect command) until an operator discards the retained clone. [maintainer 2026-10-11] (AI-synced 2026-10-11, #1786)
 
 ## Deferred (user, "later stuff")
 

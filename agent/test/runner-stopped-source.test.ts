@@ -373,8 +373,9 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
 
   for (const flavor of ["canonical", "attempt"] as const) {
     it(`${flavor} clone, clean and fully fetched under this run's tracking ownership: teardown proceeds and retains nothing`, async () => {
+      const rl = recordingLogger();
       const rig = stopRig(17883 + (flavor === "attempt" ? 1 : 0), flavor, "stale", {
-        cleanTree: true,
+        cleanTree: true, log: rl.logger,
         beforeStop: async (ctx) => {
           await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
         },
@@ -383,12 +384,122 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
       (rig.runner as unknown as { onSourceRetained: () => void }).onSourceRetained = () => { retained.push(1); };
       await rig.runner.execute(rig.claim);
       const facts = rig.facts();
+      const lines = rl.lines as Array<{ msg: string; stopped_source?: string }>;
+      assert.ok(lines.some((l) => l.stopped_source === "covered"), "the covered teardown is logged as `covered`, not `no_source`");
+      assert.ok(!lines.some((l) => l.stopped_source === "no_source"));
       assert.equal(fs.existsSync(facts.clonePath), false, "a fully covered clean clone is retired by the normal teardown");
       assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
       assert.deepEqual(retained, [], "nothing retained, nothing notified");
       assert.equal(gitIn(rig.bare, "rev-parse", `refs/uzi-runner/${rig.branch}`), facts.commit, "the tracking ref still holds the commit");
     });
   }
+
+  // The reviewer probe: HEAD equals the run's owned tracking tip and the tree is clean, but the
+  // clone also holds a commit on another local branch, or a stash entry. Neither is in any capture.
+  for (const flavor of ["canonical", "attempt"] as const) {
+    for (const extra of ["side-branch", "stash"] as const) {
+      for (const trigger of ["stale", "fence"] as const) {
+        it(`${flavor} clone, ${trigger}: clean at the owned tracking tip but holding a ${extra} is retained with that source intact`, async () => {
+          const iid = 17900 + (flavor === "attempt" ? 20 : 0) + (extra === "stash" ? 10 : 0) + (trigger === "fence" ? 5 : 0);
+          let sideTip = "";
+          const rig = stopRig(iid, flavor, trigger, {
+            cleanTree: true,
+            beforeStop: async (ctx, facts) => {
+              await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
+              if (extra === "side-branch") {
+                gitIn(ctx.worktreePath, "checkout", "-q", "-b", "side");
+                fs.writeFileSync(path.join(ctx.worktreePath, "side.txt"), "only on the side branch\n");
+                gitIn(ctx.worktreePath, "add", "side.txt");
+                gitIn(ctx.worktreePath, ...IDENT, "commit", "-q", "-m", "side work");
+                sideTip = gitIn(ctx.worktreePath, "rev-parse", "HEAD");
+                gitIn(ctx.worktreePath, "checkout", "-q", "--detach", facts.commit);
+              } else {
+                fs.writeFileSync(path.join(ctx.worktreePath, "assets", "blob.bin"), BIN_V2);
+                gitIn(ctx.worktreePath, ...IDENT, "stash", "push");
+              }
+              assert.equal(gitIn(ctx.worktreePath, "status", "--porcelain"), "", "the tree is clean at the tracked head");
+            },
+          });
+          await rig.runner.execute(rig.claim);
+          const facts = rig.facts();
+          assert.equal(gitIn(rig.bare, "rev-parse", `refs/uzi-runner/${rig.branch}`), facts.commit, "HEAD is the owned tracking tip");
+          assert.ok(fs.existsSync(facts.clonePath), "the clone is retained");
+          if (extra === "side-branch") assert.equal(gitIn(facts.clonePath, "rev-parse", "side"), sideTip, "the side branch's commit survives");
+          else assert.match(gitIn(facts.clonePath, "stash", "list"), /stash@\{0\}/, "the stash entry survives");
+          if (flavor === "canonical") assert.equal(markers(rig.bare, rig.runId).length, 1, "a stopped-source marker records the retention");
+          else assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed");
+        });
+      }
+    }
+  }
+
+  // Coverage needs an anchor this run and generation owns, or an owed pin of this run.
+  for (const owner of ["another run", "another generation"] as const) {
+    it(`clean clone whose tracking ref sits at its head under ${owner} (and no owed pin of this run) is retained`, async () => {
+      const iid = owner === "another run" ? 17950 : 17951;
+      const rig = stopRig(iid, "canonical", "stale", {
+        cleanTree: true,
+        beforeStop: async (ctx) => {
+          const bare = git.barePathFor(fx.originPath);
+          if (owner === "another run") {
+            await fixtureFetchTracking(git, bare, ctx.worktreePath, ctx.branch, "run-someone-else", 2);
+          } else {
+            await fixtureFetchTracking(git, bare, ctx.worktreePath, ctx.branch, ctx.runId, 1);
+            const head = gitIn(ctx.worktreePath, "rev-parse", "HEAD");
+            gitIn(bare, "update-ref", "-d", `refs/uzi-owed/${ctx.runId}/${head}`);
+          }
+        },
+      });
+      await rig.runner.execute(rig.claim);
+      const facts = rig.facts();
+      assert.equal(gitIn(rig.bare, "rev-parse", `refs/uzi-runner/${rig.branch}`), facts.commit, "the tracking ref is at the clone head");
+      assert.ok(fs.existsSync(facts.clonePath), "the clone is retained");
+      assert.equal(markers(rig.bare, rig.runId).length, 1);
+    });
+  }
+
+  it("the preserve latch is set before the stopped-source proof is awaited", async () => {
+    const seen: boolean[] = [];
+    let flight: { preserveRecoveryClone: boolean } | undefined;
+    let rig!: Rig;
+    rig = stopRig(17952, "canonical", "stale", {
+      runnerOpts: {
+        quiesceRun: async (req: QuiesceRunRequest) => {
+          if (req.site === "stopped_source") seen.push(flight!.preserveRecoveryClone === true);
+          return quiescentOutcome();
+        },
+      },
+    });
+    const phaseClone = (rig.runner as unknown as { phaseClone: (...a: unknown[]) => Promise<unknown> }).phaseClone.bind(rig.runner);
+    (rig.runner as unknown as { phaseClone: unknown }).phaseClone = async (...a: unknown[]) => {
+      flight = a[1] as { preserveRecoveryClone: boolean };
+      return phaseClone(...a);
+    };
+    await rig.runner.execute(rig.claim);
+    assert.deepEqual(seen, [true], "the proof ran once, with the latch already set");
+  });
+
+  it("a terminal refusal of the first running report ends with no clone: no_source, ordinary teardown, no record", async () => {
+    const claim = gitlabClaim(17953, { claim_generation: 2 });
+    const rl = recordingLogger();
+    const requests: QuiesceRunRequest[] = [];
+    let ran = 0;
+    api.failStateWhen(claim.run_id, (b) => b.status === "running", { httpStatus: 409, runStatus: "completed" });
+    const { gitlab } = fakeGitlab();
+    const runner = runnerWith(() => ({
+      executor: { run: async (): Promise<ExecutorResult> => { ran++; throw new Error("must not run"); } },
+    }), gitlab, undefined, rl.logger, {
+      quiesceRun: async (req: QuiesceRunRequest) => { requests.push(req); return quiescentOutcome(); },
+    });
+    await runner.execute(claim);
+    const lines = rl.lines as Array<{ msg: string; stopped_source?: string }>;
+    assert.equal(ran, 0);
+    assert.ok(lines.some((l) => l.stopped_source === "no_source"), "the stop result is no_source");
+    assert.equal(fs.existsSync(worktreeDirFor(17953)), false, "no clone path was ever created");
+    assert.deepEqual(markers(git.barePathFor(fx.originPath), claim.run_id), [], "no record");
+    assert.ok(!requests.some((r) => r.site === "stopped_source"), "no proof for a flight with no clone");
+    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), "no failed report");
+  });
 
   it("same-pod restart: a new GitCache over the same data dir finds the retained source", async () => {
     const rig = stopRig(17886, "canonical", "stale");

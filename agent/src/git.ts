@@ -5485,8 +5485,9 @@ export class GitCache {
    * when ALL hold: the active journal is still plain and names exactly this source and no stopped
    * marker exists for the run; the path is a real directory with a real `.git`; the clone HEAD
    * equals `capturedHead`; `git status` is readable and empty (no dirty tracked and no untracked
-   * non-ignored bytes beyond the capture; gitignored files are not part of any capture); and
-   * `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
+   * non-ignored bytes beyond the capture; gitignored files are not part of any capture); every
+   * non-remote local ref (branches, tags, any other namespace) is `capturedHead` or its ancestor and
+   * no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
    * under committed tracking ownership that still names `owner.runId` and `owner.generation`, or
    * by an owed pin of the run; `quiesce` answered true both before and after the reads. Anything
    * else, a thrown error included, is `not_covered` and the caller retains the source.
@@ -5517,6 +5518,7 @@ export class GitCache {
         if (!(await quiesce([src.clonePath]))) return "not_covered";
         if ((await this.worktreeHead(src.clonePath)) !== capturedHead) return "not_covered";
         if (!(await this.worktreeCleanHardened(src.clonePath))) return "not_covered";
+        if (!(await this.localRefsReachableFrom(src.clonePath, capturedHead))) return "not_covered";
         let anchored = false;
         if ((await this.checkedTrackingSha(barePath, branch)) === capturedHead) {
           anchored = (await this.committedTrackingOwnershipUnderLock(barePath, branch, owner.runId, capturedHead, owner.generation)).kind === "owned";
@@ -5533,6 +5535,35 @@ export class GitCache {
     } catch (err) {
       this.log.warn("stopped source coverage could not be revalidated; it is retained", { clone: source.clonePath, error: gitErrorMessage(err) });
       return "not_covered";
+    }
+  }
+
+  /**
+   * Is every non-remote ref of the clone (heads, tags, notes, any other namespace) reachable from
+   * `head`, and is there no stash? A commit on a side branch, a tag or a stash entry is worker-only
+   * source that a clean tree at `head` does not show, and no capture of `head` holds it. Runs as the
+   * runner uid in the clone itself. Any failed read or non-ancestor is `false`.
+   */
+  private async localRefsReachableFrom(cwd: string, head: string): Promise<boolean> {
+    try {
+      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"]);
+      for (const line of out.split("\n")) {
+        if (line === "") continue;
+        const sp = line.indexOf(" ");
+        const sha = line.slice(0, sp), ref = line.slice(sp + 1);
+        if (sp < 0 || !SHA40_RE.test(sha)) return false;
+        if (ref.startsWith("refs/remotes/")) continue;
+        if (ref === "refs/stash") return false;
+        try {
+          await this.runGitAsRunner(cwd, ["merge-base", "--is-ancestor", sha, head]);
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    } catch (err) {
+      this.log.debug("stopped source local refs could not be proven reachable", { cwd, error: gitErrorMessage(err) });
+      return false;
     }
   }
 
