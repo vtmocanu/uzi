@@ -99,7 +99,7 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
-import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch } from "./code-cross-check-contract.js";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -1612,9 +1612,13 @@ export class WorkerClient {
 
   async submitCodeCrossCheck(runId: string, generation: number,
     snapshot: { head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
-    signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    signal?: AbortSignal,
+    /** PRD #2170: the consent this submit was built under and, when on, the CLAUDE.md read at
+     *  base_commit. Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
+    instructions?: CodeCrossCheckInstructions): Promise<CodeCrossCheckStatus> {
     return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
-      { stage: "code", claim_generation: generation, ...snapshot }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+      { stage: "code", claim_generation: generation, ...snapshot, ...instructions },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
   }
 
   async reportCodeCrossCheckDispositions(lead: string, generation: number,

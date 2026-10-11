@@ -44,6 +44,13 @@ func codeCrossCheckResponse(cc store.CrossCheck) apitypes.CodeCrossCheck {
 		FinalizedAt: timestamp(cc.FinalizedAt), DeadlineAt: cc.DeadlineAt.Time}
 }
 
+// codeCrossCheckNoRowBody is the status reply before any code cross-check row exists. The worker's
+// decodeCodeCrossCheckStatus (agent/src/code-cross-check-contract.ts) accepts exactly these three
+// keys, so a change here must change that decoder too.
+func codeCrossCheckNoRowBody(repoInstructionsEnabled bool) map[string]any {
+	return map[string]any{"stage": "code", "result": "no_row", "repo_instructions_enabled": repoInstructionsEnabled}
+}
+
 // WorkerCodeCrossCheckDispositions finalizes a single stage-local batch.
 // The encoded cap also covers escaped reasons and unknown-length request bodies.
 func (h *Handler) WorkerCodeCrossCheckDispositions(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +116,7 @@ func (h *Handler) WorkerCodeCrossCheckStatus(w http.ResponseWriter, r *http.Requ
 			crossCheckError(w, settingsErr)
 			return
 		}
-		httpx.JSON(w, http.StatusOK, map[string]any{"stage": "code", "result": "no_row", "repo_instructions_enabled": enabled})
+		httpx.JSON(w, http.StatusOK, codeCrossCheckNoRowBody(enabled))
 		return
 	}
 	if err != nil {

@@ -773,7 +773,7 @@ it("U3 D9 root registration is opt-in in every phase and forbidden to explicitly
     assert.equal(off.leadGrants.allowedTools.has(name), false);
     const on = renderCodexRun(runRequest({ phase, codeCrossCheck: {
       generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
-      reportCrossCheckDispositions: async () => ({ stage: "code", result: "no_row" }),
+      reportCrossCheckDispositions: async () => ({ stage: "code", result: "no_row", repo_instructions_enabled: false }),
     }, agents: { inherited: agent(), explicit: agent({ tools: allow([name, "report_cross_check_dispositions"]) }) } }));
     assert.equal(on.leadGrants.allowedTools.has(name), true);
     assert.equal(toolsOf(on, "inherited").has(name), false);

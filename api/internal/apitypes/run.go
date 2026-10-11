@@ -249,9 +249,9 @@ type RunDTO struct {
 	AutoApprove               bool         `json:"auto_approve"`
 	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
 	IssueInputReason          *string      `json:"issue_input_reason"`
+	CodeCrossCheckRequired    bool         `json:"code_cross_check_required"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	CodeCrossCheckRequired   bool    `json:"code_cross_check_required"`
 	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
@@ -259,7 +259,9 @@ type RunDTO struct {
 	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
 	// Detail-only, populated only for the authenticated owner; omitted on other surfaces.
 	PlanCrossCheckSummary *PlanCrossCheckSummaryDTO `json:"plan_cross_check_summary,omitempty"`
-	CodeCrossCheckSummary *CodeCrossCheck           `json:"code_cross_check_summary,omitempty"`
+	// CodeCrossCheckSummary is detail-only, populated only for the authenticated owner on the
+	// single-run read; omitted on every other surface.
+	CodeCrossCheckSummary *CodeCrossCheck `json:"code_cross_check_summary,omitempty"`
 	// TriggerSource records what/how/who started the run (issue #857): one of
 	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
 	// task_review, then_fix, judge, judge_rerun, resume, cross_check. Always set (NOT NULL column,
@@ -1064,9 +1066,9 @@ type RunSummaryItemDTO struct {
 	AutoApprove               bool         `json:"auto_approve"`
 	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
 	IssueInputReason          *string      `json:"issue_input_reason"`
+	CodeCrossCheckRequired    bool         `json:"code_cross_check_required"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	CodeCrossCheckRequired   bool    `json:"code_cross_check_required"`
 	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
@@ -1074,7 +1076,9 @@ type RunSummaryItemDTO struct {
 	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
 	// Detail-only, populated only for the authenticated owner; omitted on other surfaces.
 	PlanCrossCheckSummary *PlanCrossCheckSummaryDTO `json:"plan_cross_check_summary,omitempty"`
-	CodeCrossCheckSummary *CodeCrossCheck           `json:"code_cross_check_summary,omitempty"`
+	// CodeCrossCheckSummary is detail-only, populated only for the authenticated owner on the
+	// single-run read; omitted on every other surface.
+	CodeCrossCheckSummary *CodeCrossCheck `json:"code_cross_check_summary,omitempty"`
 	// TriggerSource records what/how/who started the run (issue #857): one of
 	// manual, autopilot, schedule, self_improve, ci_fix, mr_rework, chat, task,
 	// task_review, then_fix, judge, judge_rerun, resume, cross_check. Always set (NOT NULL column,

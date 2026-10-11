@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
-import type { WorkerClient } from "./client.js";
-import { decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckRecord, type CodeCrossCheckStatus } from "./code-cross-check-contract.js";
+import { RequestError, type WorkerClient } from "./client.js";
+import { decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions, type CodeCrossCheckRecord, type CodeCrossCheckStatus } from "./code-cross-check-contract.js";
 import { buildAutomaticRevisionPrompt } from "./prompt.js";
 
 export type CodeCrossCheckSummary = CodeCrossCheckRecord | { incomplete: string };
@@ -137,6 +137,9 @@ export async function checkCode(options: {
   client: Pick<WorkerClient, "codeCrossCheckStatus" | "submitCodeCrossCheck">;
   runId: string; generation: number; signal: AbortSignal;
   snapshot(): Promise<{ head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" } | undefined>;
+  /** The root CLAUDE.md at `baseCommit` (readRepoInstructionsAtCommit), "" when absent or unreadable.
+   *  Called only while the server reports repository instructions enabled. */
+  readInstructions?(baseCommit: string, signal: AbortSignal): Promise<string>;
   pollMs?: number; requestMs?: number;
 }): Promise<CodeCrossCheckStatus | undefined> {
   const { client, runId, generation, signal } = options;
@@ -150,7 +153,30 @@ export async function checkCode(options: {
       signal.throwIfAborted();
       if (snapshot === undefined) return undefined;
       // One submit only: an ambiguous POST is never retried. A later gate reads persisted evidence.
-      current = await request((owned) => client.submitCodeCrossCheck(runId, generation, snapshot, owned));
+      // The instruction payload is always built from the consent the server last reported; text
+      // read under one setting is never carried into a submit built under another.
+      const instructionsFor = async (enabled: boolean): Promise<CodeCrossCheckInstructions | undefined> => {
+        if (!("base_commit" in snapshot)) return undefined;
+        if (!enabled) return { repo_instructions_enabled: false };
+        let text = "";
+        try { text = (await options.readInstructions?.(snapshot.base_commit, signal)) ?? ""; } catch { signal.throwIfAborted(); }
+        return { repo_instructions_enabled: true, repo_instructions_text: text };
+      };
+      const first = await instructionsFor(current.repo_instructions_enabled);
+      try {
+        current = await request((owned) => client.submitCodeCrossCheck(runId, generation, snapshot, owned, first));
+      } catch (err) {
+        // Only a definite HTTP 4xx refusal (e.g. consent changed between the status read and the
+        // submit) earns ONE re-read and at most ONE resubmit. A timeout, network error or 5xx is
+        // ambiguous: the row may exist, so it is never resubmitted and a later gate reads the status.
+        if (!(err instanceof RequestError) || err.status < 400 || err.status > 499) throw err;
+        signal.throwIfAborted();
+        const reread = await request((owned) => client.codeCrossCheckStatus(runId, generation, owned));
+        if ("result" in reread) {
+          const second = await instructionsFor(reread.repo_instructions_enabled);
+          current = await request((owned) => client.submitCodeCrossCheck(runId, generation, snapshot, owned, second));
+        } else current = reread;
+      }
     }
     if ("result" in current) return undefined;
     if (current.candidate_generation !== generation || current.interrupted_at !== null) return maskSupersededAdvice(current);

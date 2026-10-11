@@ -548,3 +548,47 @@ it("reader count limit preserves the existing OPEN history and refuses another l
     assert.equal(await f.git.codeSnapshotTip(f.bare, "lead"), f.head);
   } finally { f.fx.cleanup(); }
 });
+
+// Review note on snapshot retirement (PRD #2170 U2): the evidence must name THIS snapshot's exact
+// lead run id, pin generation and head; any mismatch keeps the ref. A refused retirement leaves the
+// operation fence (see the failed-fence test above), so each mismatch gets its own fixture.
+for (const proofKind of ["fresh", "latest-child"] as const) {
+  for (const mismatch of ["lead id", "head", "pin generation"] as const) {
+    it(`snapshot retirement keeps the ref when a ${proofKind} proof's sealed outcome has the wrong ${mismatch}`, async () => {
+      const f = await fixture();
+      try {
+        const lead = proofKind === "fresh" ? "fresh" : "lead";
+        const generation = proofKind === "fresh" ? 7 : 0;
+        const wrong = mismatch === "lead id" ? { leadId: "other" } : mismatch === "head" ? { head: f.base } : { pinGeneration: generation + 1 };
+        let proof: CodeSnapshotRetirementProof;
+        if (proofKind === "fresh") {
+          const created = await f.git.pinCodeSnapshot(f.bare, lead, f.head, f.base, true, generation);
+          assert.ok(created.freshReceipt);
+          proof = { sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId: lead, head: f.head, pinGeneration: generation, outcome: "failed" },
+            freshNoReader: { receipt: created.freshReceipt, serverAtomicallyTerminalNoChild: true } };
+        } else {
+          const childId = randomUUID();
+          await closeReader(f, await f.git.runnerCloneAtCommit(f.bare, f.head, childId, "lead", 1), childId, 1);
+          proof = retirement(f, childId, 1);
+        }
+        await assert.rejects(f.git.deleteCodeSnapshot(f.bare, lead, f.head, { ...proof, sealedOutcome: { ...proof.sealedOutcome, ...wrong } }), /evidence incomplete/);
+        assert.equal(await f.git.codeSnapshotTip(f.bare, lead), f.head, "the ref survives mismatched evidence");
+      } finally { f.fx.cleanup(); }
+    });
+  }
+}
+
+for (const field of ["leadId", "head", "pinGeneration"] as const) {
+  it(`snapshot retirement keeps the ref when the fresh receipt names another ${field}`, async () => {
+    const f = await fixture();
+    try {
+      const created = await f.git.pinCodeSnapshot(f.bare, "fresh", f.head, f.base, true, 7);
+      assert.ok(created.freshReceipt);
+      const receipt = { ...created.freshReceipt, [field]: field === "leadId" ? "other" : field === "head" ? f.base : 8 };
+      await assert.rejects(f.git.deleteCodeSnapshot(f.bare, "fresh", f.head, {
+        sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId: "fresh", head: f.head, pinGeneration: 7, outcome: "failed" },
+        freshNoReader: { receipt, serverAtomicallyTerminalNoChild: true } }), /fresh no-reader receipt/);
+      assert.equal(await f.git.codeSnapshotTip(f.bare, "fresh"), f.head);
+    } finally { f.fx.cleanup(); }
+  });
+}

@@ -1,4 +1,11 @@
+import { createHash } from "node:crypto";
 import type { ClaimPlanCrossCheck, ClaimCodeCrossCheck } from "./protocol.js";
+
+/** Cap on the repository-instructions text carried through a code cross-check; the same 64 KiB
+ *  as REPO_INSTRUCTIONS_MAX_BYTES (repo-instructions.ts), restated here so this wire contract
+ *  imports no filesystem code. */
+const CODE_CROSS_CHECK_INSTRUCTIONS_MAX_BYTES = 64 * 1024;
+const sha256Hex = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
 
 export interface CodeFinding {
   id: string;
@@ -35,8 +42,20 @@ export interface CodeCrossCheckRecord {
   dispositions?: CodeCrossCheckDisposition[] | null;
   finalized_at?: string | null;
   deadline_at: string;
+  // Frozen guidance/instruction metadata the server sends on every row. Optional so a row from an
+  // older server still decodes; when present each is validated by decodeCodeCrossCheckStatus.
+  custom_guidance_applied?: boolean;
+  guidance_digest?: string;
+  repo_instructions_enabled?: boolean;
+  repo_instructions_digest?: string;
 }
-export type CodeCrossCheckStatus = CodeCrossCheckRecord | { stage: "code"; result: "no_row" };
+/** The repository-instructions fields of a code cross-check submit: consent off sends no text. */
+export type CodeCrossCheckInstructions =
+  | { repo_instructions_enabled: false }
+  | { repo_instructions_enabled: true; repo_instructions_text: string };
+/** The no-row reply carries the live repository-instructions consent (WorkerCodeCrossCheckStatus). */
+type CodeCrossCheckNoRow = { stage: "code"; result: "no_row"; repo_instructions_enabled: boolean };
+export type CodeCrossCheckStatus = CodeCrossCheckRecord | CodeCrossCheckNoRow;
 
 export interface CodeSnapshotCleanup {
   protocol: "code_snapshot_cleanup_v1";
@@ -86,7 +105,20 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     if (!/^[A-Za-z0-9_-]+(?![\s\S])/.test(v.lead_run_id as string) || v.base_commit.length !== 40 || (v.candidate_digest as string).length !== 64 || v.round !== 1 || !/^[a-f0-9]{64}$/.test(v.candidate_digest as string) || typeof v.head_commit !== "string" || v.head_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.head_commit)
       || v.code_context === undefined || Buffer.byteLength(JSON.stringify(v.code_context)) > 512 * 1024
       || (v.guidance_snapshot !== undefined && !bounded(v.guidance_snapshot, 8192))) return invalid();
-    return { ...v, guidance_snapshot: v.guidance_snapshot ?? "" } as unknown as ClaimCodeCrossCheck;
+    // Frozen owner guidance and repository instructions (PRD #2170). The server omits empty
+    // values, so an absent text hashes as "". A digest that disagrees with the text it names, or
+    // instruction text while instructions are disabled, means the claim was altered in transit.
+    const guidance = (v.guidance_snapshot ?? "") as string;
+    const instructions = v.repo_instructions_text ?? "";
+    const digestOK = (digest: unknown, text: string) =>
+      digest === undefined ? text === "" : typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest) && digest === sha256Hex(text);
+    if ((v.repo_instructions_enabled !== undefined && typeof v.repo_instructions_enabled !== "boolean")
+      || (v.custom_guidance_applied !== undefined && typeof v.custom_guidance_applied !== "boolean")
+      || !bounded(instructions, CODE_CROSS_CHECK_INSTRUCTIONS_MAX_BYTES)
+      || (instructions !== "" && v.repo_instructions_enabled !== true)
+      || !digestOK(v.guidance_digest, guidance) || !digestOK(v.repo_instructions_digest, instructions as string)
+      || (v.custom_guidance_applied !== undefined && v.custom_guidance_applied !== (guidance !== ""))) return invalid();
+    return { ...v, guidance_snapshot: guidance } as unknown as ClaimCodeCrossCheck;
   }
   if (!Number.isInteger(v.round) || (v.round as number) < 1 || (v.round as number) > 5
     || !v.plan_md || !bounded(v.planning_diff, 512 * 1024)
@@ -138,8 +170,9 @@ export function decodeCodeCrossCheckStatus(v: unknown): CodeCrossCheckStatus {
   const invalid = (): never => { throw new Error("invalid code cross-check response"); };
   if (!record(v) || v.stage !== "code") return invalid();
   if (v.result === "no_row") {
-    if (Object.keys(v).sort().join(",") !== "result,stage") return invalid();
-    return { stage: "code", result: "no_row" };
+    if (Object.keys(v).sort().join(",") !== "repo_instructions_enabled,result,stage"
+      || typeof v.repo_instructions_enabled !== "boolean") return invalid();
+    return { stage: "code", result: "no_row", repo_instructions_enabled: v.repo_instructions_enabled };
   }
   const sha = (s: unknown) => typeof s === "string" && s.length === 40 && /^[a-f0-9]{40}$/.test(s);
   const date = (s: unknown) => typeof s === "string" && Number.isFinite(Date.parse(s));
@@ -153,6 +186,11 @@ export function decodeCodeCrossCheckStatus(v: unknown): CodeCrossCheckStatus {
     if (v.base_commit !== null || v.head_commit !== null || v.outcome !== "failed"
       || !["snapshot_failed", "worker_unsupported"].includes(v.reason_class as string)) return invalid();
   } else if ((v.candidate_digest as string).length !== 64 || !/^[a-f0-9]{64}$/.test(v.candidate_digest as string)) return invalid();
+  const hex64 = (x: unknown) => typeof x === "string" && /^[a-f0-9]{64}$/.test(x);
+  if ((v.custom_guidance_applied !== undefined && typeof v.custom_guidance_applied !== "boolean")
+    || (v.repo_instructions_enabled !== undefined && typeof v.repo_instructions_enabled !== "boolean")
+    || (v.guidance_digest !== undefined && !hex64(v.guidance_digest))
+    || (v.repo_instructions_digest !== undefined && !hex64(v.repo_instructions_digest))) return invalid();
   const findings = decodeCodeFindings(v.findings);
   if (v.outcome !== "completed" && findings.length !== 0) return invalid();
   if (v.outcome === "completed" && v.reason_class !== null && v.reason_class !== "interrupted") return invalid();

@@ -1219,6 +1219,13 @@ export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" |
   head_commit: string;
   code_context: unknown;
   guidance_snapshot: string;
+  /** Frozen repository-instructions consent and text (PRD #2170); text is "" unless enabled. */
+  repo_instructions_enabled?: boolean;
+  repo_instructions_text?: string;
+  custom_guidance_applied?: boolean;
+  /** sha256 hex of guidance_snapshot / repo_instructions_text, verified by decodeCrossCheckClaim. */
+  guidance_digest?: string;
+  repo_instructions_digest?: string;
   /** Worker-produced bounded evidence, never accepted from the server. */
   code_diff?: string;
   planning_diff?: string;

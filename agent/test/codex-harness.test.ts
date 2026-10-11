@@ -4749,7 +4749,7 @@ for (const optedIn of [false, true]) {
     const { harness, transport } = makeHarness();
     transport.push(threadStarted()).end();
     const access = { generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
-      reportCrossCheckDispositions: async () => ({ stage: "code" as const, result: "no_row" as const }) };
+      reportCrossCheckDispositions: async () => ({ stage: "code" as const, result: "no_row" as const, repo_instructions_enabled: false }) };
     await harness.startTurn(makeRequest({ phase: "plan", ...(optedIn ? { codeCrossCheck: access } : {}) })).events[Symbol.asyncIterator]().next();
     const params = rec(transport.requests.find(r => r.method === "thread/start")!.params);
     assert.equal((params.dynamicTools as Array<{ name: string }>).some(t => t.name === "report_cross_check_dispositions"), optedIn);

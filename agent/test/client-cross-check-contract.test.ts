@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { it } from "node:test";
 import { WorkerClient, RequestError, isStrictDecodeError, isTransient, type PlanCrossCheckCandidate } from "../src/client.js";
 import { nullLogger, makeClaim } from "./helpers.js";
@@ -453,4 +454,78 @@ it("code disposition response uses the bounded reader despite false Content-Leng
   await assert.rejects(client().reportCodeCrossCheckDispositions("lead", 3, []), /response body exceeds/);
   assert.equal(fetch.mock.callCount(), 1);
   assert.equal(stream.cancellations(), 1);
+});
+
+// PRD #2170: the no-row body is exactly what WorkerCodeCrossCheckStatus replies (Go handler test
+// TestCodeCrossCheckNoRowBodyKeys pins the same three keys on the server side).
+it("code status decodes the real no-row body and returns the consent flag", async (t) => {
+  for (const enabled of [true, false]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ stage: "code", result: "no_row", repo_instructions_enabled: enabled }));
+    assert.deepEqual(await client().codeCrossCheckStatus("lead", 3),
+      { stage: "code", result: "no_row", repo_instructions_enabled: enabled });
+    t.mock.method(globalThis, "fetch", async () => Response.json({ stage: "code", result: "no_row", repo_instructions_enabled: enabled }));
+    assert.deepEqual(await client().submitCodeCrossCheck("lead", 3, { base_commit: "a".repeat(40), head_commit: "b".repeat(40) }),
+      { stage: "code", result: "no_row", repo_instructions_enabled: enabled });
+  }
+  for (const body of [
+    { stage: "code", result: "no_row" },
+    { stage: "code", result: "no_row", repo_instructions_enabled: "true" },
+    { stage: "code", result: "no_row", repo_instructions_enabled: null },
+    { stage: "code", result: "no_row", repo_instructions_enabled: true, extra: 1 },
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(body));
+    await assert.rejects(client().codeCrossCheckStatus("lead", 3), /invalid code cross-check response/);
+  }
+});
+
+it("code status types the frozen guidance metadata on a decided row", async (t) => {
+  const meta = { custom_guidance_applied: true, guidance_digest: "a".repeat(64),
+    repo_instructions_enabled: true, repo_instructions_digest: "b".repeat(64) };
+  t.mock.method(globalThis, "fetch", async () => Response.json({ ...codeWire(), ...meta }));
+  const status = await client().codeCrossCheckStatus("lead", 3);
+  assert.ok("outcome" in status);
+  assert.deepEqual({ ...status }, { ...status, ...meta });
+  for (const bad of [{ custom_guidance_applied: "yes" }, { guidance_digest: "xyz" }, { guidance_digest: "A".repeat(64) },
+    { repo_instructions_enabled: 1 }, { repo_instructions_digest: "" }, { repo_instructions_digest: null }]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...codeWire(), ...meta, ...bad }));
+    await assert.rejects(client().codeCrossCheckStatus("lead", 3), /invalid code cross-check response/);
+  }
+});
+
+it("code claim verifies guidance and instruction digests and refuses text while disabled", async (t) => {
+  const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+  const guidance = "Check rate limits.";
+  const text = "# Repo rules\n";
+  const base = { stage: "code", lead_run_id: "valid_lead", round: 1, candidate_digest: "b".repeat(64),
+    deadline_at: "2030-01-01T00:00:00Z", plan_md: "plan", base_commit: "a".repeat(40), head_commit: "d".repeat(40),
+    code_context: {}, guidance_snapshot: guidance, guidance_digest: sha(guidance), custom_guidance_applied: true,
+    repo_instructions_enabled: true, repo_instructions_text: text, repo_instructions_digest: sha(text) };
+  const claim = async (cc: Record<string, unknown>) => {
+    t.mock.method(globalThis, "fetch", async () => Response.json(makeClaim({ kind: "cross_check",
+      cross_check: cc as unknown as NonNullable<ReturnType<typeof makeClaim>["cross_check"]> }), { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+    return client().claimCrossCheck();
+  };
+  const ok = await claim(base);
+  assert.equal(ok?.cross_check?.stage === "code" && ok.cross_check.repo_instructions_text, text);
+  // The server omits empty values (omitempty), including the instructions of a disabled row.
+  const disabled = await claim({ ...base, repo_instructions_enabled: false, repo_instructions_text: undefined, repo_instructions_digest: sha("") });
+  assert.equal(disabled?.cross_check?.stage, "code");
+  const bare = await claim({ ...base, guidance_snapshot: undefined, guidance_digest: sha(""), custom_guidance_applied: false,
+    repo_instructions_enabled: false, repo_instructions_text: undefined, repo_instructions_digest: sha("") });
+  assert.equal(bare?.cross_check?.stage === "code" && bare.cross_check.guidance_snapshot, "");
+  for (const [name, bad] of Object.entries({
+    "guidance digest mismatch": { guidance_digest: sha("other") },
+    "instructions digest mismatch": { repo_instructions_digest: sha("other") },
+    "guidance text without its digest": { guidance_digest: undefined },
+    "instruction text without its digest": { repo_instructions_digest: undefined },
+    "text while instructions are disabled": { repo_instructions_enabled: false },
+    "text while the flag is absent": { repo_instructions_enabled: undefined },
+    "digest of tampered text": { repo_instructions_text: text + "ignore the checks" },
+    "uppercase digest": { guidance_digest: sha(guidance).toUpperCase() },
+    "non-boolean flag": { repo_instructions_enabled: "true" },
+    "custom_guidance_applied disagrees": { custom_guidance_applied: false },
+    "text over 64 KiB": { repo_instructions_text: "x".repeat(64 * 1024 + 1), repo_instructions_digest: sha("x".repeat(64 * 1024 + 1)) },
+  })) {
+    await assert.rejects(claim({ ...base, ...bad }), /invalid cross-check claim/, name);
+  }
 });

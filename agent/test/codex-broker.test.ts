@@ -1278,4 +1278,50 @@ describe("U3 D9 live code repair broker", () => {
     }
     assert.equal(effects, 0);
   });
+  // PRD #2170 carried-over D9 regressions: the three windows in which a retained registration must
+  // not act. Each is named for the window it pins; the guard each one fails against is in the
+  // repair-active checks of authorizeCodeDispositions and handleToolCall.
+  it("refuses report_cross_check_dispositions before the repair pass has begun", async () => {
+    let effects = 0, repairReads = 0;
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["mcp__uzi__report_cross_check_dispositions"]) }),
+      codeCrossCheck: { generation: 7, codeCrossCheckRepairActive: () => false,
+        codeCrossCheckRepair: async () => { repairReads++; return row as import("../src/code-cross-check-contract.js").CodeCrossCheckRecord; },
+        reportCrossCheckDispositions: async () => { throw new Error("unused"); } },
+      toolHandlers: new Map([["mcp__uzi__report_cross_check_dispositions", async () => { effects++; return {}; }]]),
+    });
+    assertDenied(await h.broker.handleToolCall(rt(), "report_cross_check_dispositions", args, "root"), "denied_tool");
+    assert.equal(effects, 0);
+    assert.equal(repairReads, 0, "no server read is made on behalf of an inactive pass");
+  });
+  it("refuses report_cross_check_dispositions after the repair pass has closed, fresh and cached", async () => {
+    let active = true, effects = 0;
+    const h = makeBroker({
+      grants: grants({ allowedTools: new Set(["mcp__uzi__report_cross_check_dispositions"]) }),
+      codeCrossCheck: { generation: 7, codeCrossCheckRepairActive: () => active,
+        codeCrossCheckRepair: async () => row as import("../src/code-cross-check-contract.js").CodeCrossCheckRecord,
+        reportCrossCheckDispositions: async () => { throw new Error("unused"); } },
+      toolHandlers: new Map([["mcp__uzi__report_cross_check_dispositions", async () => { effects++; return {}; }]]),
+    });
+    const same = rt();
+    assert.equal((await h.broker.handleToolCall(same, "report_cross_check_dispositions", args, "root")).ok, true);
+    active = false;
+    assertDenied(await h.broker.handleToolCall(same, "report_cross_check_dispositions", args, "root"), "denied_tool");
+    assertDenied(await h.broker.handleToolCall(rt(), "report_cross_check_dispositions", args, "root"), "denied_tool");
+    assert.equal(effects, 1);
+  });
+  it("refuses report_cross_check_dispositions on a resume whose runtime generation is older or newer than the row", async () => {
+    let effects = 0;
+    for (const generation of [6, 8]) {
+      const h = makeBroker({
+        grants: grants({ allowedTools: new Set(["mcp__uzi__report_cross_check_dispositions"]) }),
+        codeCrossCheck: { generation, codeCrossCheckRepairActive: () => true,
+          codeCrossCheckRepair: async () => row as import("../src/code-cross-check-contract.js").CodeCrossCheckRecord,
+          reportCrossCheckDispositions: async () => { throw new Error("unused"); } },
+        toolHandlers: new Map([["mcp__uzi__report_cross_check_dispositions", async () => { effects++; return {}; }]]),
+      });
+      assertDenied(await h.broker.handleToolCall(rt(), "report_cross_check_dispositions", args, "root"), "denied_tool");
+    }
+    assert.equal(effects, 0);
+  });
 });

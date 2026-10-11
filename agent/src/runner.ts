@@ -1,4 +1,5 @@
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
+import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
@@ -10907,6 +10908,12 @@ export class RunRunner {
           const decision = await this.runGatedSink(flight, async () => {
             codeGate ??= new CodeCrossCheckGate({
             client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
+            readInstructions: async (baseCommit: string, signal: AbortSignal) => {
+              if (!barePath) return "";
+              const read = await readRepoInstructionsAtCommit(this.git, barePath, baseCommit, { timeoutMs: 15_000, signal });
+              if (!("text" in read)) runLog.warn("code cross-check repository instructions not read", { reason: read.dropped });
+              return "text" in read ? read.text : "";
+            },
             snapshot: async () => {
               if (!barePath) return { reason_class: "snapshot_failed" as const };
               if (!completion.interlocked) {

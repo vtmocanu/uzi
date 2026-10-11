@@ -4,9 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import type { HookInput, HookJSONOutput, Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
+import { createHash } from "node:crypto";
 import { ClaudeCrossCheck, stubClaudeCrossCheckQueryFn } from "../src/claude-cross-check.js";
 import { CrossCheckRunner } from "../src/cross-check-runner.js";
-import { CrossCheckMalformedError } from "../src/codex/cross-check.js";
+import { CrossCheckMalformedError, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief } from "../src/codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 import { processGroupPresent } from "../src/sdk-spawn.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -94,6 +95,68 @@ it("Claude code stub returns exact empty findings and confirms cleanup despite p
     assert.equal(text, '{"findings":[]}');
   });
   assert.equal(confirmed, 1);
+});
+
+// PRD #2170. Goldens: sha256 of the pre-change Claude code brief and nonce-stripped DATA prompt for
+// this file's claim(), computed from the tree before owner guidance and repository instructions existed.
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
+const GOLDEN_CLAUDE_CODE_PROMPT = "030823da82006dae7ab936b3092ae4acd6b9ea957d5e70b929a2563f4ec54836";
+const GOLDEN_CLAUDE_CODE_BRIEF = "27f677678fbf3ffb78c08ec6d5549ca4ceaf722b6997e8599a5fe03092413192";
+
+async function claudeRequest(c: ClaimResponse): Promise<{ brief: string; prompt: string }> {
+  let brief = "";
+  let prompt = "";
+  const model = checker(p => (async function* () {
+    const sp = p.options.systemPrompt;
+    brief = typeof sp === "object" && !Array.isArray(sp) && sp.type === "preset" ? sp.append ?? "" : "";
+    for await (const frame of p.prompt) prompt += (frame as { message: { content: string } }).message.content;
+    yield init;
+    yield result(output());
+  })());
+  await model.run(c, "/checkout", "/home", new AbortController().signal, async () => {}, () => {});
+  return { brief, prompt };
+}
+
+it("Claude code run with empty guidance and instructions off is byte-identical to the previous brief and DATA prompt", async () => {
+  const plain = await claudeRequest(claim());
+  assert.equal(sha256(plain.brief), GOLDEN_CLAUDE_CODE_BRIEF);
+  assert.equal(sha256(stripNonces(plain.prompt)), GOLDEN_CLAUDE_CODE_PROMPT);
+  const off = claim();
+  Object.assign(off.cross_check!, { repo_instructions_enabled: false, custom_guidance_applied: false });
+  assert.deepEqual(await claudeRequest(off).then(r => [sha256(r.brief), sha256(stripNonces(r.prompt))]),
+    [GOLDEN_CLAUDE_CODE_BRIEF, GOLDEN_CLAUDE_CODE_PROMPT]);
+});
+
+it("Claude code run puts owner guidance in the trusted brief after the locked text, never in the DATA prompt", async () => {
+  const c = claim();
+  const guidance = "Check rate limits.";
+  Object.assign(c.cross_check!, { guidance_snapshot: guidance, custom_guidance_applied: true });
+  const { brief, prompt } = await claudeRequest(c);
+  const locked = codeCrossCheckBrief("Read, Grep and Glob");
+  assert.ok(brief.startsWith(locked));
+  const block = /^\n\n(Owner guidance: .*)\n<owner_guidance_([a-f0-9]{32})>\n([\s\S]*)\n<\/owner_guidance_\2>$/.exec(brief.slice(locked.length));
+  assert.ok(block, "one labelled, nonce-delimited block follows the locked text");
+  assert.equal(block[1], OWNER_GUIDANCE_LABEL);
+  assert.equal(block[3], guidance);
+  assert.ok(!prompt.includes(guidance));
+  assert.equal(sha256(stripNonces(prompt)), GOLDEN_CLAUDE_CODE_PROMPT);
+});
+
+it("Claude code run gives repository instructions to the DATA prompt only", async () => {
+  const c = claim();
+  Object.assign(c.cross_check!, { repo_instructions_enabled: true, repo_instructions_text: "Use tabs." });
+  const { brief, prompt } = await claudeRequest(c);
+  assert.equal(sha256(brief), GOLDEN_CLAUDE_CODE_BRIEF);
+  assert.match(prompt, /<untrusted_repo_instructions_([a-f0-9]{16})>\nUse tabs\.\n<\/untrusted_repo_instructions_\1>/);
+  assert.ok(prompt.endsWith(REPO_INSTRUCTIONS_DIFF_NOTE));
+});
+
+it("Claude code stub still returns code output with guidance appended to the brief", async () => {
+  const c = claim();
+  Object.assign(c.cross_check!, { guidance_snapshot: "Check rate limits.", custom_guidance_applied: true });
+  const model = new ClaudeCrossCheck(nullLogger(), { secretPaths: ["/run/secrets/"], queryFn: stubClaudeCrossCheckQueryFn });
+  assert.equal(await model.run(c, "/checkout", "/home", new AbortController().signal, async () => {}, () => {}), '{"findings":[]}');
 });
 
 it("cleanup failure overrides model failure, while confirmed cleanup preserves it", async () => {

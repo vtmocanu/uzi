@@ -56,8 +56,9 @@ func TestJSONWireNamesIncludeEmbeddedPlanCandidate(t *testing.T) {
 	}
 }
 
-// A json:"-" field with no json:"-," sibling must contribute no name at all;
-// wireProbe cannot pin this because its Dash field also yields the name "-".
+// A json:"-" field must contribute no name at all, not even "-". TestJSONWireNamesReflection
+// covers the same tag through wireProbe's Skipped field among other tag forms; this isolates it
+// in a struct whose only other field is a plain tagged one.
 func TestJSONWireNamesSkipsDashTag(t *testing.T) {
 	type onlySkipped struct {
 		Skipped string `json:"-"`

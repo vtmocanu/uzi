@@ -2,6 +2,8 @@ package handler
 
 import (
 	"encoding/json"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -48,5 +50,31 @@ func TestCodeCrossCheckSummaryFrozenMetadata(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "private") || len(body["guidance_text"]) != 0 || len(body["repo_instructions_text"]) != 0 {
 		t.Fatalf("raw summary text: %s", raw)
+	}
+}
+
+// The worker decodes this body with a strict key set; pin it here so the two sides cannot drift.
+func TestCodeCrossCheckNoRowBodyKeys(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		raw, err := json.Marshal(codeCrossCheckNoRowBody(enabled))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatal(err)
+		}
+		keys := make([]string, 0, len(body))
+		for key := range body {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		if got := strings.Join(keys, ","); got != "repo_instructions_enabled,result,stage" {
+			t.Fatalf("no-row keys = %s", got)
+		}
+		if string(body["stage"]) != `"code"` || string(body["result"]) != `"no_row"` ||
+			string(body["repo_instructions_enabled"]) != strconv.FormatBool(enabled) {
+			t.Fatalf("no-row body = %s", raw)
+		}
 	}
 }

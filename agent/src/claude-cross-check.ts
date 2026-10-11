@@ -21,7 +21,7 @@ import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, Spa
 import type { ClaimResponse } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
+import { codeCrossCheckBrief, codeCrossCheckBriefWithGuidance, codeGuidanceOf, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import {
   BUILTIN_PLUGINS_DISABLED,
@@ -311,7 +311,7 @@ export class ClaudeCrossCheck {
     try {
       const options = buildClaudeCrossCheckOptions({
         cwd: checkout, homeDir: home, oauthToken: token, log: this.log, secretPaths: this.opts.secretPaths, gate,
-        brief: code ? codeCrossCheckBrief("Read, Grep and Glob") : crossCheckBrief("Read, Grep and Glob"), maxTurns: this.opts.maxTurns,
+        brief: code ? codeCrossCheckBriefWithGuidance("Read, Grep and Glob", codeGuidanceOf(claim)) : crossCheckBrief("Read, Grep and Glob"), maxTurns: this.opts.maxTurns,
         ...(budget ? { toolBudgetHook: budget.hook } : {}),
         ...(model ? { model } : {}), ...(effort ? { effort } : {}),
         spawn: (spawnOpts) => {
@@ -433,7 +433,9 @@ export class ClaudeCrossCheck {
 export const stubClaudeCrossCheckQueryFn: SdkQueryFn = (async function* ({ options }: Parameters<SdkQueryFn>[0]) {
   const systemPrompt = options.systemPrompt;
   const code = typeof systemPrompt === "object" && !Array.isArray(systemPrompt) &&
-    systemPrompt.type === "preset" && systemPrompt.append === codeCrossCheckBrief("Read, Grep and Glob");
+    systemPrompt.type === "preset" && typeof systemPrompt.append === "string" &&
+    // The locked brief is the prefix; the owner-guidance block, when frozen, follows it.
+    systemPrompt.append.startsWith(codeCrossCheckBrief("Read, Grep and Glob"));
   const init = { type: "system", subtype: "init", model: "stub", session_id: "stub", tools: [...CHECKER_SURFACE.tools],
     mcp_servers: [], plugins: [], agents: [], skills: [] };
   if (checkIsolatedInit(init, CHECKER_SURFACE) !== undefined) throw new Error("stub init frame drifted from the checker surface");
