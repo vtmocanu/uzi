@@ -323,9 +323,10 @@ the stopped claim, and records the source as retained:
 
 A clean clone whose HEAD is already anchored still tears down: the anchor is a
 tracking tip this run and generation owns, or an owed pin of this run, and every
-local branch, tag and other non-remote ref of the clone must be reachable from
-that HEAD with no stash entry. A commit on another local branch or a stash entry
-keeps the clone. Gitignored files are not covered by any capture, so they do not
+local ref of the clone, in any namespace, must point at a commit reachable from
+that HEAD or from a ref of the worker's bare repository, with no stash entry. A
+commit that only the clone holds (on another local branch, under a tag or under
+`refs/remotes/`) or a stash entry keeps the clone. Gitignored files are not covered by any capture, so they do not
 keep a clone that is otherwise anchored.
 
 What a successor sees depends on the worker. On a Docker-wired (attempt-path)

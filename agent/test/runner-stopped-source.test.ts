@@ -433,6 +433,96 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     }
   }
 
+  // The seed gives the clone a local default branch at the bare's HEAD and every bare tag, and a
+  // resumed branch can be older than main: refs the bare already holds must not look like unfinished work.
+  it("clean clone at the owned tracking tip whose local default branch and tag are held by the bare is retired, not retained", async () => {
+    const rig = stopRig(17960, "canonical", "stale", {
+      cleanTree: true,
+      beforeStop: async (ctx, facts) => {
+        await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
+        const bare = git.barePathFor(fx.originPath);
+        const wt = ctx.worktreePath;
+        gitIn(wt, "checkout", "-q", "-b", "newer-main", facts.baseHead);
+        fs.writeFileSync(path.join(wt, "main-moved.txt"), "main moved on\n");
+        gitIn(wt, "add", "main-moved.txt");
+        gitIn(wt, ...IDENT, "commit", "-q", "-m", "main moved on");
+        gitIn(wt, "tag", "off-branch-release");
+        gitIn(bare, "fetch", "-q", wt, "refs/heads/newer-main:refs/remotes/origin/newer-main", "refs/tags/off-branch-release:refs/tags/off-branch-release");
+        gitIn(wt, "checkout", "-q", "--detach", facts.commit);
+      },
+    });
+    await rig.runner.execute(rig.claim);
+    const facts = rig.facts();
+    assert.equal(fs.existsSync(facts.clonePath), false, "refs the bare holds do not keep a fully fetched clone");
+    assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
+  });
+
+  it("clean clone at the owned tracking tip holding a commit only under refs/remotes/ is retained", async () => {
+    const rig = stopRig(17961, "canonical", "stale", {
+      cleanTree: true,
+      beforeStop: async (ctx, facts) => {
+        await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
+        const wt = ctx.worktreePath;
+        gitIn(wt, "checkout", "-q", "-b", "planted", facts.baseHead);
+        fs.writeFileSync(path.join(wt, "planted.txt"), "only under refs/remotes\n");
+        gitIn(wt, "add", "planted.txt");
+        gitIn(wt, ...IDENT, "commit", "-q", "-m", "planted");
+        gitIn(wt, "update-ref", "refs/remotes/origin/x", gitIn(wt, "rev-parse", "HEAD"));
+        gitIn(wt, "checkout", "-q", "--detach", facts.commit);
+        gitIn(wt, "branch", "-D", "planted");
+      },
+    });
+    await rig.runner.execute(rig.claim);
+    const facts = rig.facts();
+    assert.ok(fs.existsSync(facts.clonePath), "the clone is retained");
+    assert.equal(markers(rig.bare, rig.runId).length, 1);
+  });
+
+  it("a stale_claim stop of a completed retained successor whose cleanup the api acknowledged keeps the clone and never runs the verified-successor retire", async () => {
+    const rc = guardedRecovery("open");
+    const verifiedRetires: unknown[] = [];
+    const real = git.retireRunnerClone.bind(git);
+    git.retireRunnerClone = (async (...a: Parameters<typeof real>) => {
+      if ((a[4] as { verifiedSuccessor?: unknown } | undefined)?.verifiedSuccessor !== undefined) verifiedRetires.push(a[4]);
+      return real(...a);
+    }) as typeof git.retireRunnerClone;
+    let flight: Record<string, unknown> | undefined;
+    const rig = stopRig(17962, "attempt", "stale", {
+      guarded: true, recovery: rc.coordinator,
+      beforeStop: async (ctx) => {
+        // Synthetic: a settled retained-successor flight whose terminal was already resolved.
+        flight!.completedRetainedSuccessor = { runId: ctx.runId, clonePath: ctx.worktreePath };
+        flight!.terminalResolved = true;
+      },
+    });
+    const phaseClone = (rig.runner as unknown as { phaseClone: (...a: unknown[]) => Promise<unknown> }).phaseClone.bind(rig.runner);
+    (rig.runner as unknown as { phaseClone: unknown }).phaseClone = async (...a: unknown[]) => {
+      flight = a[1] as Record<string, unknown>;
+      return phaseClone(...a);
+    };
+    await rig.runner.execute(rig.claim);
+    assert.deepEqual(verifiedRetires, [], "the stopped flight never attempts the verified successor retire");
+    assertRecoverableFromExport(rig.facts(), "retained successor stopped by a stale claim");
+  });
+
+  it("a NEW run of the same issue on the same worker, after a retained stale stop, fails once with worker_residue_blocked and starts no model", async () => {
+    let modelled = false;
+    const rig = stopRig(17963, "canonical", "stale", {
+      executorFor: (n) => (n === 0 ? undefined : { run: async () => { modelled = true; throw new Error("the new run must not model"); } }),
+    });
+    await rig.runner.execute(rig.claim);
+    const first = rig.facts();
+    const newRunId = "22222222-0000-4000-8000-000000001963";
+    await rig.runner.execute({ ...rig.claim, run_id: newRunId, claim_generation: 1 });
+    const failed = api.states.filter((st) => st.runId === newRunId && st.body.status === "failed");
+    assert.equal(failed.length, 1, `the new run fails once: ${reportsFor(newRunId).join(",")}`);
+    assert.equal(failed[0]!.body.fail_origin, "worker_residue_blocked");
+    assert.match(String(failed[0]!.body.failure_reason), /^worker_residue_blocked: retained stopped work: run /);
+    assert.equal(modelled, false, "no model started");
+    assertRecoverableFromExport(first, "the retained source of the stopped run");
+    assert.equal(markers(rig.bare, rig.runId).length, 1, "the marker is kept");
+  });
+
   // Coverage needs an anchor this run and generation owns, or an owed pin of this run.
   for (const owner of ["another run", "another generation"] as const) {
     it(`clean clone whose tracking ref sits at its head under ${owner} (and no owed pin of this run) is retained`, async () => {

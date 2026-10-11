@@ -791,6 +791,12 @@ const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 
 /** A full 40-hex commit SHA (issue #1597 M2: pinned checkpoint ranges are validated with it). */
 const SHA40_RE = /^[0-9a-f]{40}$/;
+/** Env that stops replace refs from bending reachability or tree reads in the stopped-source proof. */
+const NO_REPLACE_ENV: NodeJS.ProcessEnv = { GIT_NO_REPLACE_OBJECTS: "1" };
+const NO_REPLACE = { env: NO_REPLACE_ENV };
+/** Bounds for the stopped-source ref proof: shas per rev-list argv, and refs beyond which coverage is not claimed. */
+const LOCAL_REF_REVLIST_CHUNK = 500;
+const MAX_LOCAL_REF_SHAS = 20000;
 
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
@@ -5486,8 +5492,8 @@ export class GitCache {
    * marker exists for the run; the path is a real directory with a real `.git`; the clone HEAD
    * equals `capturedHead`; `git status` is readable and empty (no dirty tracked and no untracked
    * non-ignored bytes beyond the capture; gitignored files are not part of any capture); every
-   * non-remote local ref (branches, tags, any other namespace) is `capturedHead` or its ancestor and
-   * no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
+   * local ref (branches, tags, remotes, any other namespace) is reachable from `capturedHead` or
+   * from a ref of the worker bare, and no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
    * under committed tracking ownership that still names `owner.runId` and `owner.generation`, or
    * by an owed pin of the run; `quiesce` answered true both before and after the reads. Anything
    * else, a thrown error included, is `not_covered` and the caller retains the source.
@@ -5518,7 +5524,7 @@ export class GitCache {
         if (!(await quiesce([src.clonePath]))) return "not_covered";
         if ((await this.worktreeHead(src.clonePath)) !== capturedHead) return "not_covered";
         if (!(await this.worktreeCleanHardened(src.clonePath))) return "not_covered";
-        if (!(await this.localRefsReachableFrom(src.clonePath, capturedHead))) return "not_covered";
+        if (!(await this.localRefsReachableFrom(barePath, src.clonePath, capturedHead))) return "not_covered";
         let anchored = false;
         if ((await this.checkedTrackingSha(barePath, branch)) === capturedHead) {
           anchored = (await this.committedTrackingOwnershipUnderLock(barePath, branch, owner.runId, capturedHead, owner.generation)).kind === "owned";
@@ -5539,30 +5545,41 @@ export class GitCache {
   }
 
   /**
-   * Is every non-remote ref of the clone (heads, tags, notes, any other namespace) reachable from
-   * `head`, and is there no stash? A commit on a side branch, a tag or a stash entry is worker-only
-   * source that a clean tree at `head` does not show, and no capture of `head` holds it. Runs as the
-   * runner uid in the clone itself. Any failed read or non-ancestor is `false`.
+   * Is every local ref of the clone, in every namespace (heads, tags, notes, `refs/remotes/` and
+   * any other), already held by the worker bare, and is there no stash? A ref value is acceptable
+   * iff its commit is reachable from `head` OR from any ref of the worker bare: the seed gives the
+   * clone a local default branch and every bare tag, and a resumed branch can be older than main,
+   * so those must not make a fully fetched clone look unfinished. A commit that only the clone
+   * holds (a side branch, a tag, a commit planted under `refs/remotes/`) is worker-only source that
+   * a clean tree at `head` does not show, and no capture of `head` holds it. The ref values are read
+   * as the runner uid in the clone; the reachability question is ONE `rev-list <shas> --not <head>
+   * --all` in the bare (worker uid, replace refs disabled in both repositories), where any output
+   * means "not covered" and any error, a clone-local commit missing from the bare included, also
+   * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
+   * from the bare. Any failed read is `false`.
    */
-  private async localRefsReachableFrom(cwd: string, head: string): Promise<boolean> {
+  private async localRefsReachableFrom(barePath: string, cwd: string, head: string): Promise<boolean> {
     try {
-      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"]);
+      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: NO_REPLACE_ENV });
+      const shas = new Set<string>();
       for (const line of out.split("\n")) {
         if (line === "") continue;
         const sp = line.indexOf(" ");
         const sha = line.slice(0, sp), ref = line.slice(sp + 1);
-        if (sp < 0 || !SHA40_RE.test(sha)) return false;
-        if (ref.startsWith("refs/remotes/")) continue;
+        if (sp < 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return false;
         if (ref === "refs/stash") return false;
-        try {
-          await this.runGitAsRunner(cwd, ["merge-base", "--is-ancestor", sha, head]);
-        } catch {
-          return false;
-        }
+        shas.add(sha);
+      }
+      if (shas.size > MAX_LOCAL_REF_SHAS) return false;
+      const all = [...shas];
+      for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
+        const chunk = all.slice(i, i + LOCAL_REF_REVLIST_CHUNK);
+        const extra = await this.runGitWithEnv(barePath, ["rev-list", "-n", "1", ...chunk, "--not", head, "--all"], NO_REPLACE_ENV);
+        if (extra.trim() !== "") return false;
       }
       return true;
     } catch (err) {
-      this.log.debug("stopped source local refs could not be proven reachable", { cwd, error: gitErrorMessage(err) });
+      this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
       return false;
     }
   }
@@ -5596,7 +5613,7 @@ export class GitCache {
       if (attributes) return false;
       // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
       // config.worktree exactly as `status` does, which `--local` would not.
-      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"]);
+      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"], NO_REPLACE);
       const entries = config.split("\0");
       if (entries.some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
       // A case-folding clone could hide a tracked `readme` behind an untracked `README`. The
@@ -5612,9 +5629,9 @@ export class GitCache {
         if (v === "true" || v === "yes" || v === "on") return false;
         if (/^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v)) return false;
       }
-      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain"]);
+      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain"], NO_REPLACE);
       if (status.split("\n").some((l) => l.length > 0)) return false;
-      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"]);
+      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], NO_REPLACE);
       for (const entry of flags.split("\0")) {
         if (entry.length === 0) continue;
         // `H` is a normal entry; a lowercase tag is assume-unchanged and `S`/`s` is skip-worktree.
@@ -10787,8 +10804,8 @@ export class GitCache {
    * issue #1783: carries the worker spawn mark only for {@link runnerGitCarriesWorkerMark}'s
    * subcommands; every other runner git runs unmarked (its plants stay reapable).
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number } = {}): Promise<string> {
-    const base = gitEnv();
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+    const base = { ...gitEnv(), ...opts.env };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
     // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an

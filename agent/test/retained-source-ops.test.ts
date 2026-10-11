@@ -509,6 +509,52 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "not_covered", "a tag names a commit the head does not hold");
   });
 
+  /** A commit on a throwaway branch built on the clone's first parent-less base, left on `refName` only. */
+  function commitOffBranch(a: Attempt, head: string, refName: string, file: string): string {
+    gitIn(a.path, ["checkout", "-q", "-b", "tmp-off", `${head}~1`]);
+    fs.writeFileSync(path.join(a.path, file), `${file}\n`);
+    gitIn(a.path, ["add", file]);
+    gitIn(a.path, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", file]);
+    const sha = gitIn(a.path, ["rev-parse", "HEAD"]);
+    gitIn(a.path, ["update-ref", refName, sha]);
+    gitIn(a.path, ["checkout", "-q", "--detach", head]);
+    gitIn(a.path, ["branch", "-D", "tmp-off"]);
+    return sha;
+  }
+
+  it("is covered when the clone's local default branch sits ahead of an older resumed head and the bare holds it (seed shape)", async () => {
+    const { a, head } = await captured();
+    const ahead = commitOffBranch(a, head, "refs/heads/main", "ahead.txt");
+    gitIn(bare, ["fetch", "-q", a.path, "refs/heads/main:refs/remotes/origin/ahead"]);
+    assert.equal(gitIn(bare, ["rev-parse", "refs/remotes/origin/ahead"]), ahead);
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "");
+    assert.equal(await verify(a, head), "covered", "a local ref the bare already holds loses nothing");
+  });
+
+  it("is covered when an off-branch tag exists in both the clone and the bare", async () => {
+    const { a, head } = await captured();
+    commitOffBranch(a, head, "refs/tags/release", "release.txt");
+    gitIn(bare, ["fetch", "-q", a.path, "refs/tags/release:refs/tags/release"]);
+    assert.equal(await verify(a, head), "covered");
+  });
+
+  it("is not covered when a commit exists only under refs/remotes/ in the clone", async () => {
+    const { a, head } = await captured();
+    commitOffBranch(a, head, "refs/remotes/origin/x", "planted.txt");
+    assert.equal(await verify(a, head), "not_covered", "a remote-tracking ref is no exemption");
+  });
+
+  it("is not covered when a clone replace ref would hide a staged change from status", async () => {
+    // Defense in depth: the refusal also comes from the replace ref's own commit being absent from the bare.
+    const { a, head } = await captured();
+    fs.appendFileSync(path.join(a.path, "work.txt"), "staged only\n");
+    gitIn(a.path, ["add", "work.txt"]);
+    const tree = gitIn(a.path, ["write-tree"]);
+    const fake = gitIn(a.path, ["-c", "user.email=t@t", "-c", "user.name=t", "commit-tree", tree, "-p", `${head}~1`, "-m", "fake"]);
+    gitIn(a.path, ["update-ref", `refs/replace/${head}`, fake]);
+    assert.equal(await verify(a, head), "not_covered");
+  });
+
   it("is not covered for a missing or replaced path, a blocked or throwing proof, or a degraded capture", async () => {
     const { a, head } = await captured();
     assert.equal(await verify(a, head, async () => false), "not_covered", "blocked proof before");

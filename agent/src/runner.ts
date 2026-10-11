@@ -15832,7 +15832,8 @@ export class RunRunner {
    * processes; (3) when the proof holds and the clone is clean at a head the bare's tracking ref
    * already holds under this run's committed ownership, hand teardown back its normal retire
    * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
-   * local branch, tag and the absence of a stash to be reachable from that head); otherwise (4) record
+   * local ref, in every namespace, to be reachable from that head or from a ref of the worker bare,
+   * and the absence of a stash); otherwise (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
    * clone. Step 4 runs whatever the proof said; it only protects. A blocked or throwing proof, an
@@ -15841,9 +15842,10 @@ export class RunRunner {
    *
    * `no_source`: there was no clone (ordinary teardown proceeds). `covered`: the covered case above
    * (ordinary teardown proceeds and retires the clone). A flight already held by retained-recovery
-   * custody takes steps (1) and (2) only, then answers `retained_local` (`unknown` when the proof
-   * was blocked): no record is written for it, and `stoppedSourceKept` stays set so the verified
-   * successor retire in the finally never runs for a stopped flight.
+   * custody latches `preserveRecoveryClone`, `stoppedSourceKept` and `keepGuardedInventoryOpen` like
+   * any other and runs the quiescence proof, but skips the coverage check and the record: it
+   * answers `retained_local` (`unknown` when the proof was blocked), and `stoppedSourceKept` stays
+   * set so the verified successor retire in the finally never runs for a stopped flight.
    * `retained_local`: the source is kept and recorded for the operator channel (or already held by
    * retained-recovery custody, which this does not touch). `unknown`: kept, not recorded. None of the
    * four grants custody release or successor authority.
