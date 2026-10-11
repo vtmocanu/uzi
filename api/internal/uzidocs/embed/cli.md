@@ -1443,7 +1443,10 @@ A newer release is available.
   the offered version. If it is older, the command exits nonzero with
   `Installed CLI is vY; requested vX was not reached. Try again later.`
   (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
-  On verified success it tells you to rerun `uzi tui`; there is no automatic re-exec.
+  On verified success it restarts the TUI on the new version, running the
+  verified formula-owned binary with your original arguments (`--context` and
+  the rest). If that restart fails, the command exits nonzero saying the update
+  succeeded; run `uzi tui` yourself.
   For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to

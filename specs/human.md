@@ -806,6 +806,7 @@ Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
 - The interactive demo is rebuilt on the shipped views (not retired, not a separate prototype). [user, D1]
 - The run detail opens on the run and its newest messages first and fills older history in the background, so a slow link never sits on an empty pane; refetches continue from what is already held. [user, #1137]
 - The run view's crew rail folds by itself when the expanded roster would push MILESTONES, SPEND or the run's own account meters off the rail; a roster that fits stays open; `c` overrides for that run. [user 2026-09-12, #1257]
+- After the startup update prompt's "Update now" upgrades and verifies the new version, the TUI starts again on it by itself, with the same arguments, instead of asking the user to rerun `uzi tui`. (AI-synced 2026-10-11, PRD #1251 D12)
 
 ## Feature #1093 — Pause all schedules
 
