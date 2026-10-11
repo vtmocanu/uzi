@@ -566,87 +566,12 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 // authorizeCodexCredentialOp retains coordinates on a quarantine-only refresh refusal.
 // Those coordinates authorize only an evidence check, never credential access.
 func (s *Service) authorizeCodexCredentialOp(ctx context.Context, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope, deferQuarantine bool) (CodexAuthContext, error) {
-	q, ok := s.codexStore()
-	if !ok {
-		return CodexAuthContext{}, errCodexStoreUnavailable
-	}
-	if !scope.valid() {
-		return CodexAuthContext{}, ErrCodexScopeNotApplicable
-	}
-
-	row, err := q.GetRunCodexAuthContext(ctx, runID)
+	row, err := s.codexCredentialPrelude(ctx, wkr, runID, presentedCapability, scope)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// No row means the run is not Codex-bound (the state join found nothing).
-			return CodexAuthContext{}, ErrCodexRunNotBound
-		}
-		return CodexAuthContext{}, fmt.Errorf("codex authorize: read auth context: %w", err)
+		return CodexAuthContext{}, err
 	}
-
-	// (1) bound + valid mode. Scope-applicability is DELIBERATELY not checked here — it
-	// depends on authMode, so it runs only AFTER the ownership gate below (step 3), else a
-	// mode-dependent reject on an unowned run would leak the run's auth_mode (see step 2).
-	if !row.CodexSecretID.Valid || !row.CodexAuthMode.Valid {
-		return CodexAuthContext{}, ErrCodexRunNotBound
-	}
+	q, _ := s.codexStore()
 	authMode := row.CodexAuthMode.String
-	if authMode != codexAuthModeSubscription && authMode != codexAuthModeAPIKey {
-		return CodexAuthContext{}, ErrCodexRunNotBound
-	}
-
-	// (2) currently-owning worker — the tenant gate, checked BEFORE both the
-	// scope-applicability check (step 3) and the capability check (step 4). It MUST precede
-	// scope.appliesTo because that reject is mode-dependent: on an UNOWNED run it would leak
-	// the run's auth_mode — a worker probing a foreign run with ScopeStartRefresh would get
-	// ErrCodexScopeNotApplicable (handler → 403) iff the run is api_key and
-	// ErrCodexWorkerMismatch (→ 404) otherwise, a cross-tenant single-bit disclosure of the
-	// auth_mode. Ownership-first likewise stops the capability/epoch sentinels being an oracle
-	// for the run's claim epoch (GetRunCodexAuthContext reads by run id, so the row belongs to
-	// whatever run the guessed id names; the ownership gate is the tenant boundary and must
-	// precede any mode-dependent or capability-specific reject).
-	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
-		return CodexAuthContext{}, ErrCodexWorkerMismatch
-	}
-
-	// (3) scope applies to the run's auth mode (start-refresh / persist-recovery are
-	// subscription-only; release applies to both). Now safe to reveal: the caller owns the
-	// run, so ErrCodexScopeNotApplicable here is no longer a cross-tenant auth_mode signal.
-	if !scope.appliesTo(authMode) {
-		return CodexAuthContext{}, ErrCodexScopeNotApplicable
-	}
-
-	// (4) capability: epoch first (a stale-epoch capability is rejected even if its
-	// hash was cleared or would otherwise match), then the constant-time hash compare.
-	presentedEpoch, secret, parsed := parseCodexCapability(presentedCapability)
-	if !parsed {
-		return CodexAuthContext{}, ErrCodexCapabilityMismatch
-	}
-	if presentedEpoch != row.CodexClaimEpoch {
-		return CodexAuthContext{}, ErrCodexCapabilityEpoch
-	}
-	if len(row.CodexCapHash) == 0 {
-		return CodexAuthContext{}, ErrCodexCapabilityMismatch
-	}
-	if subtle.ConstantTimeCompare(hashCodexCapability(secret), row.CodexCapHash) != 1 {
-		return CodexAuthContext{}, ErrCodexCapabilityMismatch
-	}
-
-	// (5) The scope-family predicate. This is the SINGLE SOURCE OF TRUTH for the
-	// frozen-vs-current authority set, replacing the former inline checks 4-6 AND adding
-	// the audit-flagged quarantine + kind↔mode checks. Two families, deliberately
-	// asymmetric (PRD #1147 audit #3):
-	//
-	//   - the RELEASE family (release-access-token, start-refresh) runs the FULL predicate
-	//     — actively-claimed, material_revision, and (subscription) tuple + credential_
-	//     revision + NOT quarantined + kind↔mode consistent.
-	//   - ScopePersistRecovery runs a REDUCED predicate that DELIBERATELY SKIPS
-	//     credential_revision, quarantine and kind↔mode: a run must still be able to
-	//     persist recoverable material before parking even after a revoke or while
-	//     quarantined (D4 persist-before-park). Losing release permission must not lose the
-	//     authority to protect material. See evalCodexPersistRecoveryPredicate.
-	if row.ClaimReleasedAt.Valid {
-		return CodexAuthContext{}, ErrCodexRunNotActivelyClaimed
-	}
 	var decisionErr error
 	inputs := codexReleaseInputsFromAuthRow(row)
 	switch scope {
@@ -692,6 +617,78 @@ func (s *Service) authorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 	}
 
 	return authCtx, decisionErr
+}
+
+func (s *Service) codexCredentialPrelude(ctx context.Context, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope) (store.GetRunCodexAuthContextRow, error) {
+	q, ok := s.codexStore()
+	if !ok {
+		return store.GetRunCodexAuthContextRow{}, errCodexStoreUnavailable
+	}
+	if !scope.valid() {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexScopeNotApplicable
+	}
+
+	row, err := q.GetRunCodexAuthContext(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No row means the run is not Codex-bound (the state join found nothing).
+			return store.GetRunCodexAuthContextRow{}, ErrCodexRunNotBound
+		}
+		return store.GetRunCodexAuthContextRow{}, fmt.Errorf("codex authorize: read auth context: %w", err)
+	}
+
+	// (1) bound + valid mode. Scope-applicability is DELIBERATELY not checked here — it
+	// depends on authMode, so it runs only AFTER the ownership gate below (step 3), else a
+	// mode-dependent reject on an unowned run would leak the run's auth_mode (see step 2).
+	if !row.CodexSecretID.Valid || !row.CodexAuthMode.Valid {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexRunNotBound
+	}
+	authMode := row.CodexAuthMode.String
+	if authMode != codexAuthModeSubscription && authMode != codexAuthModeAPIKey {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexRunNotBound
+	}
+
+	// (2) currently-owning worker — the tenant gate, checked BEFORE both the
+	// scope-applicability check (step 3) and the capability check (step 4). It MUST precede
+	// scope.appliesTo because that reject is mode-dependent: on an UNOWNED run it would leak
+	// the run's auth_mode — a worker probing a foreign run with ScopeStartRefresh would get
+	// ErrCodexScopeNotApplicable (handler → 403) iff the run is api_key and
+	// ErrCodexWorkerMismatch (→ 404) otherwise, a cross-tenant single-bit disclosure of the
+	// auth_mode. Ownership-first likewise stops the capability/epoch sentinels being an oracle
+	// for the run's claim epoch (GetRunCodexAuthContext reads by run id, so the row belongs to
+	// whatever run the guessed id names; the ownership gate is the tenant boundary and must
+	// precede any mode-dependent or capability-specific reject).
+	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexWorkerMismatch
+	}
+
+	// (3) scope applies to the run's auth mode (start-refresh / persist-recovery are
+	// subscription-only; release applies to both). Now safe to reveal: the caller owns the
+	// run, so ErrCodexScopeNotApplicable here is no longer a cross-tenant auth_mode signal.
+	if !scope.appliesTo(authMode) {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexScopeNotApplicable
+	}
+
+	// (4) capability: epoch first (a stale-epoch capability is rejected even if its
+	// hash was cleared or would otherwise match), then the constant-time hash compare.
+	presentedEpoch, secret, parsed := parseCodexCapability(presentedCapability)
+	if !parsed {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexCapabilityMismatch
+	}
+	if presentedEpoch != row.CodexClaimEpoch {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexCapabilityEpoch
+	}
+	if len(row.CodexCapHash) == 0 {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexCapabilityMismatch
+	}
+	if subtle.ConstantTimeCompare(hashCodexCapability(secret), row.CodexCapHash) != 1 {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexCapabilityMismatch
+	}
+
+	if row.ClaimReleasedAt.Valid {
+		return store.GetRunCodexAuthContextRow{}, ErrCodexRunNotActivelyClaimed
+	}
+	return row, nil
 }
 
 // FreezeCodexBinding freezes a run's Codex binding at creation (PRD #1147 M2, B6),

@@ -169,7 +169,7 @@ func TestTUIDetailTailErrorLeavesHeaderUp(t *testing.T) {
 }
 
 // M4 seam 4: a live frame that beats the tail page renders instead of hiding — the transcript
-// gate is tailLoaded || len(frames) > 0, so an early streamEventsMsg is shown, not held.
+// gate is tailLoaded || visible lanes exist, so an early visible stream frame is shown.
 func TestTUIDetailLiveFrameBeforeTailRenders(t *testing.T) {
 	now := time.Now()
 	runID := "prog-4"

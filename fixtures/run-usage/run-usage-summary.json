@@ -1,0 +1,75 @@
+{
+  "note": "Authored for issue #2686 by hand from result-frames-summary.json: one row per (model, lineage_epoch). The lead result frame sits at epoch 1 (one init before it); the progress_note row sits at its seq (6) under progress_note:, and each summary pass sits at its OWN seq (7 intent, 8 plan, 11 and 14 the two pr_description passes) under the model prefix summary_pass:, so no pass collapses into the lead's haiku row of the same leg, into the note, or into another pass. The two pr_description rows are two rows that sum (a regeneration is real spend). Costs are the standard-table price (haiku: $1/M input, $5/M output, $0.10/M cache read): 1200*1e-6 + 150*5e-6 = 0.00195; 2000*1e-6 + 300*5e-6 + 10000*1e-7 = 0.0045; 3000*1e-6 + 500*5e-6 = 0.0055; 3500*1e-6 + 700*5e-6 + 4000*1e-7 = 0.0074. totals = SUM over rows per column.",
+  "rows": [
+    {
+      "model": "claude-opus-4-8",
+      "lineage_epoch": 1,
+      "input_tokens": 1000,
+      "cache_read_tokens": 50000,
+      "cache_creation_tokens": 3000,
+      "output_tokens": 2000,
+      "cost_usd": 1.5
+    },
+    {
+      "model": "claude-haiku-4-5-20251001",
+      "lineage_epoch": 1,
+      "input_tokens": 700,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 300,
+      "cost_usd": 0.001
+    },
+    {
+      "model": "progress_note:claude-haiku-4-5-20251001",
+      "lineage_epoch": 6,
+      "input_tokens": 400,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 40,
+      "cost_usd": 0.0006
+    },
+    {
+      "model": "summary_pass:claude-haiku-4-5-20251001",
+      "lineage_epoch": 7,
+      "input_tokens": 1200,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 150,
+      "cost_usd": 0.00195
+    },
+    {
+      "model": "summary_pass:claude-haiku-4-5-20251001",
+      "lineage_epoch": 8,
+      "input_tokens": 2000,
+      "cache_read_tokens": 10000,
+      "cache_creation_tokens": 0,
+      "output_tokens": 300,
+      "cost_usd": 0.0045
+    },
+    {
+      "model": "summary_pass:claude-haiku-4-5-20251001",
+      "lineage_epoch": 11,
+      "input_tokens": 3000,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 500,
+      "cost_usd": 0.0055
+    },
+    {
+      "model": "summary_pass:claude-haiku-4-5-20251001",
+      "lineage_epoch": 14,
+      "input_tokens": 3500,
+      "cache_read_tokens": 4000,
+      "cache_creation_tokens": 0,
+      "output_tokens": 700,
+      "cost_usd": 0.0074
+    }
+  ],
+  "totals": {
+    "input_tokens": 11800,
+    "cache_read_tokens": 64000,
+    "cache_creation_tokens": 3000,
+    "output_tokens": 3990,
+    "cost_usd": 1.52095
+  }
+}

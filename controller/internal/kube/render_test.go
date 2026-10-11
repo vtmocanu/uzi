@@ -136,8 +136,8 @@ func TestRenderedPodPosture(t *testing.T) {
 	if sc.FSGroup == nil || *sc.FSGroup != 10001 {
 		t.Error("fsGroup must be 10001: an RWO PVC mounts root:root 0755 and a Secret volume is owned root:<fsGroup>")
 	}
-	// The default (Always) recursively chowns a ~1.7GB store on EVERY pod start, and
-	// Decision 9 rolls every worker on every release.
+	// The default (Always) recursively chowns the measured ~1.7GB store when the
+	// volume mounts on pod (re)start, including rolls triggered by a changed pod template.
 	if sc.FSGroupChangePolicy == nil || *sc.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
 		t.Error("fsGroupChangePolicy must be OnRootMismatch")
 	}
@@ -1103,7 +1103,7 @@ func TestSpecHashTracksTheRenderingNotTheGeneration(t *testing.T) {
 		t.Fatal("the spec hash is not stable across renders: every reconcile would roll every pod")
 	}
 
-	// A new release's image tag.
+	// An operator advances the independent worker image tag.
 	newTag, err := preset.NewResolver("harbor.example.com/uzi", "v2.0.0")
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
@@ -1113,7 +1113,7 @@ func TestSpecHashTracksTheRenderingNotTheGeneration(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if SpecHashOf(cfg, w, spec2) == base {
-		t.Error("a new agent image tag must change the spec hash: nothing else would ever roll the worker onto a new release")
+		t.Error("a new agent image tag must change the spec hash so reconciliation detects the desired worker image change")
 	}
 
 	// A bigger preset.

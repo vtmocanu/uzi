@@ -103,7 +103,11 @@ export function applyFrame(
       created_at: frame.created_at ?? new Date().toISOString(),
     };
     const r = ingest(state, msg);
-    return { state: r.state, effects: { replay: r.gap, refreshRun: false } };
+    // A progress_note (PRD #2603) updates Run.progress.now_note, which only a run re-read
+    // carries, so an open page refreshes on it; every other message does not. An EMPTY-text
+    // note is the worker's "clear" note and must refresh too, so the line disappears (AC2):
+    // do not skip the refresh for empty text.
+    return { state: r.state, effects: { replay: r.gap, refreshRun: msg.kind === "progress_note" } };
   }
   if (frame.type === "state") {
     return { state, effects: { replay: true, refreshRun: true } };

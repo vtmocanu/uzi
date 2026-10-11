@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // t0 is a fixed "now" so every age is deterministic.
@@ -26,6 +27,14 @@ type healthFakeStore struct {
 	eligibility      store.CountOnlineWorkersClaimableForRunRow
 	eligibilityErr   error
 	eligibilityCalls []store.CountOnlineWorkersClaimableForRunParams
+
+	// owner is the canned GetUserByID answer (the zero User is a non-admin), ownerErr forces
+	// the read to fail, and ownerCalls records every lookup's id.
+	owner      store.User
+	ownerErr   error
+	ownerCalls []uuid.UUID
+	// onlineErr forces CountOnlineWorkersForUser to fail.
+	onlineErr error
 
 	Store
 	liveCrossCheck        map[uuid.UUID]bool
@@ -50,7 +59,7 @@ type healthFakeStore struct {
 	freeSlotWorkers int64
 	// eligibleWorkers is the canned CountOnlineEligibleWorkersForRepo answer (PRD #361):
 	// how many online workers fn_worker_can_claim accepts for the run's repo/kind. 0 with
-	// onlineWorkers>0 and a non-allowlisted repo drives reasonRepoNotDockerAllowed.
+	// onlineWorkers>0 and a non-allowlisted repo drives reasonRepoNotDockerAllowedMember (the zero owner is a non-admin).
 	eligibleWorkers int64
 	eligibleErr     error
 	// eligCalls records every CountOnlineEligibleWorkersForRepo lookup's params, mirroring
@@ -250,7 +259,14 @@ func (f *healthFakeStore) GetCustodyAdmissionForRun(_ context.Context, arg store
 	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.custodyHolds, AdmissionCountedHolds: counted, ContinuationExempt: f.custodyExempt}, nil
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {
+	if f.onlineErr != nil {
+		return 0, f.onlineErr
+	}
 	return f.onlineWorkers, nil
+}
+func (f *healthFakeStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
+	f.ownerCalls = append(f.ownerCalls, id)
+	return f.owner, f.ownerErr
 }
 func (f *healthFakeStore) CountOnlineWorkersWithFreeSlotForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.freeSlotWorkers, nil
@@ -852,7 +868,7 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 
 // TestHealthQueuedRepoNotDockerAllowed drives PRD #361's new queued arm through
 // detectRunHealth: a repo-bearing run no online worker is eligible to claim (all-Docker
-// fleet, repo off the allowlist) reports reasonRepoNotDockerAllowed, while a merely-busy
+// fleet, repo off the allowlist) reports reasonRepoNotDockerAllowedMember, while a merely-busy
 // eligible worker, an idle eligible worker, and a repo-less run all fall through. The
 // FLAG stays healthWaitingWorker in every case (the enum never changes).
 func TestHealthQueuedRepoNotDockerAllowed(t *testing.T) {
@@ -870,7 +886,7 @@ func TestHealthQueuedRepoNotDockerAllowed(t *testing.T) {
 		want            string
 	}{
 		// (a) all-Docker fleet, repo not allowlisted: no eligible worker → the new reason.
-		{"all-docker not allowlisted", validRepo, "task", 1, 0, 0, nil, nil, nil, reasonRepoNotDockerAllowed},
+		{"all-docker not allowlisted", validRepo, "task", 1, 0, 0, nil, nil, nil, reasonRepoNotDockerAllowedMember},
 		// (b) an eligible worker exists but is busy: eligible>0 must NOT fire the docker
 		// reason, and with no free slot it falls through to all-busy.
 		{"eligible worker busy", validRepo, "task", 2, 1, 0, nil, nil, nil, reasonAllWorkersBusy},
@@ -925,7 +941,7 @@ func TestHealthQueuedRepoNotDockerAllowed(t *testing.T) {
 // (issue #512 M2): rung 5's CountOnlineEligibleWorkersForRepo is now a TRUE claim-time
 // count, so a cap-requiring run whose fleet HAS the caps (rung 3 skipped, satisfyingCaps>0)
 // but that no worker can actually CLAIM (eligibleWorkers==0, empty allowlist) reports
-// reasonRepoNotDockerAllowed with the flag ON — and the recorded lookup proves
+// reasonRepoNotDockerAllowedMember with the flag ON — and the recorded lookup proves
 // RequiredCapabilities and CapabilityAware were threaded so the count agrees with the claim
 // path. The discriminating power needs BOTH satisfyingCaps>0 (else rung 3 would fire the
 // capability reason) AND eligibleWorkers==0 (else rung 5 falls through), so both are pinned;
@@ -967,8 +983,8 @@ func TestHealthQueuedRepoNotDockerAllowedThreadsCaps(t *testing.T) {
 			if w.Health != healthWaitingWorker {
 				t.Fatalf("health = %q, want waiting_worker", w.Health)
 			}
-			if w.HealthReason.String != reasonRepoNotDockerAllowed {
-				t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonRepoNotDockerAllowed)
+			if w.HealthReason.String != reasonRepoNotDockerAllowedMember {
+				t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonRepoNotDockerAllowedMember)
 			}
 			// Rung 5 fired with the flag ON: its recorded lookup threads the run's required
 			// set and the capability-aware flag, so the count agrees with the claim path.
@@ -999,6 +1015,118 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// TestHealthQueuedRepoNotDockerAllowedPastThresholdAdmin pins the Admin variant on the
+// past-threshold rung: the variant follows the run OWNER's is_admin.
+func TestHealthQueuedRepoNotDockerAllowedPastThresholdAdmin(t *testing.T) {
+	r := runRow("queued")
+	r.StatusSince = ago(15 * time.Minute)
+	r.Kind = "task"
+	r.DispatchedAt = ago(15 * time.Minute)
+	r.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	fs := &healthFakeStore{
+		active:        []store.ListActiveRunsForHealthRow{r},
+		onlineWorkers: 1,
+		owner:         store.User{IsAdmin: true},
+	}
+	svc := healthSvc(fs, defaultHealthSettings())
+	svc.SetDockerAllowlist(fakeAllowlistReader{})
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthWaitingWorker || w.HealthReason.String != reasonRepoNotDockerAllowedAdmin {
+		t.Fatalf("got %q/%q, want waiting_worker/%q", w.Health, w.HealthReason.String, reasonRepoNotDockerAllowedAdmin)
+	}
+}
+
+// TestHealthQueuedRepoNotDockerAllowedEarly drives the early docker-allowlist probe: a
+// repo-bearing queued run UNDER the queued threshold whose owner has an online worker but
+// none eligible for the repo reports the docker-allowlist reason at once, while every
+// other shape stays healthOK and issues no ladder lookups it should not.
+func TestHealthQueuedRepoNotDockerAllowedEarly(t *testing.T) {
+	cases := []struct {
+		name         string
+		online       int64
+		eligible     int64
+		owner        store.User
+		ownerErr     error
+		onlineErr    error
+		allowErr     error
+		eligibleErr  error
+		queued       int // 0 = use the default (600)
+		lockedVault  bool
+		capGap       bool
+		wantReason   string // "" = healthOK
+		wantNoLadder bool   // priority/caps/custody/owner lookups all zero
+	}{
+		{name: "regression non-admin", online: 1, wantReason: reasonRepoNotDockerAllowedMember},
+		{name: "admin owner", online: 1, owner: store.User{IsAdmin: true}, wantReason: reasonRepoNotDockerAllowedAdmin},
+		{name: "owner read error degrades to member", online: 1, ownerErr: errors.New("boom"), wantReason: reasonRepoNotDockerAllowedMember},
+		{name: "eligible worker exists", online: 1, eligible: 1, wantNoLadder: true},
+		{name: "no online worker", online: 0, wantNoLadder: true},
+		{name: "vault locked owner", online: 1, lockedVault: true},
+		{name: "capability gap", online: 1, capGap: true},
+		{name: "online count error", online: 1, onlineErr: errors.New("boom"), wantNoLadder: true},
+		{name: "allowlist read error", online: 1, allowErr: errFakeAllowlist, wantNoLadder: true},
+		{name: "eligible count error", online: 1, eligibleErr: errFakeEligible, wantNoLadder: true},
+		{name: "queued threshold disabled", online: 1, queued: -1, wantNoLadder: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.StatusSince = ago(1 * time.Minute) // under the 600s threshold
+			r.Kind = "task"
+			r.DispatchedAt = ago(1 * time.Minute)
+			r.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			if tc.capGap {
+				r.RequiredCapabilities = []string{"docker"}
+			}
+			fs := &healthFakeStore{
+				active:          []store.ListActiveRunsForHealthRow{r},
+				onlineWorkers:   tc.online,
+				onlineErr:       tc.onlineErr,
+				eligibleWorkers: tc.eligible,
+				eligibleErr:     tc.eligibleErr,
+				owner:           tc.owner,
+				ownerErr:        tc.ownerErr,
+			}
+			st := defaultHealthSettings()
+			if tc.queued == -1 {
+				st.queued = 0
+			}
+			svc := healthSvc(fs, st)
+			svc.SetDockerAllowlist(fakeAllowlistReader{err: tc.allowErr})
+			if tc.capGap {
+				svc.capabilitySettings = fakeCapabilitySettings{on: true}
+			}
+			if tc.lockedVault {
+				svc.SetVault(vault.New(newBox(t), newMemVaultStore())) // r.UserID never unlocked
+			}
+
+			svc.detectRunHealth(context.Background(), t0)
+			if tc.wantReason == "" {
+				// healthOK equals the run's current health, so no write may carry a flag.
+				for _, w := range fs.writes {
+					if w.ID == r.ID && w.Health != healthOK {
+						t.Fatalf("health = %q (%q), want ok", w.Health, w.HealthReason.String)
+					}
+				}
+			} else {
+				w := lastWrite(t, fs, r.ID)
+				if w.Health != healthWaitingWorker || w.HealthReason.String != tc.wantReason {
+					t.Fatalf("got %q/%q, want waiting_worker/%q", w.Health, w.HealthReason.String, tc.wantReason)
+				}
+			}
+			if tc.wantNoLadder {
+				if n := len(fs.priorityCalls) + len(fs.capsCalls) + len(fs.custodyRunCalls) + len(fs.ownerCalls); n != 0 {
+					t.Fatalf("issued %d ladder lookups (priority %d, caps %d, custody %d, owner %d), want 0",
+						n, len(fs.priorityCalls), len(fs.capsCalls), len(fs.custodyRunCalls), len(fs.ownerCalls))
+				}
+			}
+		})
+	}
+}
+
+// A repo-less fresh run never reaches the early docker-allowlist probe, so nothing flags it.
 func TestHealthQueuedBelowThresholdNotFlagged(t *testing.T) {
 	r := runRow("queued")
 	r.StatusSince = ago(5 * time.Minute) // < 10m

@@ -54,6 +54,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_daily_budget: "0",
   ephemeral_workers_enabled: "false",
   ci_autofix_enabled: "true",
+  now_summary_enabled: "true",
   release_check_enabled: "true",
   release_check_banner_enabled: "true",
   summary_model: "haiku",
@@ -718,6 +719,27 @@ describe("AdminSettings — run summaries (PRD #362)", () => {
     expect(btn.disabled).toBe(false);
     fireEvent.click(btn);
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "opus" }));
+  });
+
+  it("reads the Now-line kill switch, defaulting to on", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: "false" }));
+    renderPage();
+    expect((await screen.findByLabelText("Model-written Now line") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("reads an absent Now-line kill switch (older server) as on", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: undefined }));
+    renderPage();
+    expect((await screen.findByLabelText("Model-written Now line") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("saves only the Now-line kill switch when the model is unchanged (PRD #2603)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: "true" }));
+    mockApi.updateSettings.mockResolvedValue(response({ now_summary_enabled: "false" }));
+    renderPage();
+    fireEvent.click(await screen.findByLabelText("Model-written Now line"));
+    fireEvent.click(screen.getByRole("button", { name: /save run summary settings/i }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ now_summary_enabled: "false" }));
   });
 
   it("blocks an empty summary model client-side without calling the API", async () => {

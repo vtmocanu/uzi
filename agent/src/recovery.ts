@@ -30,6 +30,7 @@ import type { Logger } from "./log.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
+  CompletedPublicationReceipt,
   RecoveryReconcileRequest,
   RecoveryReconcileResponse,
   RecoveryFinalDisposition,
@@ -72,8 +73,16 @@ export function isCodePublishingKind(kind: RunKind): boolean {
  *   - `needs_action`: a producer/upload/quota/oversize failure; the source is retained. */
 export type RecoveryLocalState = "pinned" | "bundled" | "uploaded" | "needs_action";
 
-/** One authenticated journal record. The MAC (stored alongside, not in this object)
- *  covers a canonical serialization of every field here, so editing any field is refused. */
+/** Completing attempt provenance stored within an authenticated generation record. */
+export interface CompletionSource {
+  context: PositiveOwedCandidateContext;
+  clonePath: string;
+  attemptId?: string;
+  expectedHead: string;
+  roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>;
+}
+
+/** One authenticated journal record; its MAC covers every field. */
 export interface RecoveryRecord {
   version: 1;
   inventoryGuarded?: boolean;
@@ -86,6 +95,10 @@ export interface RecoveryRecord {
   coverageContext?: PositiveOwedCandidateContext;
   finalRequest?: { disposition: RecoveryFinalDisposition; evidence?: string };
   finalAcknowledged?: boolean;
+  /** Completion proof is independent of archive coverage and never covers another generation. */
+  completionReceipt?: CompletedPublicationReceipt;
+  /** Exact completing attempt provenance, not a pending terminal intent. */
+  completionSource?: CompletionSource;
   /** The run this capture belongs to. Uniqueness by run_id (a per-run UUID) prevents a
    *  later run on the same ISSUE from overwriting or adopting this capture (D1). */
   runId: string;
@@ -197,7 +210,7 @@ export interface RecoveryArchiveClient {
   hasFeature?(feature: string): boolean;
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
-  getRecoveryCaptureStatus(runId: string, captureId: string): Promise<RecoveryCaptureStatusResponse>;
+  getRecoveryCaptureStatus(runId: string, captureId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RecoveryCaptureStatusResponse>;
   uploadRecoveryBundle(
     runId: string,
     captureId: string,
@@ -215,7 +228,7 @@ export interface RecoveryArchiveClient {
     releaseEvidence?: string,
     finalDisposition?: RecoveryFinalDisposition,
   ): Promise<RecoveryReleaseResponse>;
-  getRunOwnership?(runId: string): Promise<RunOwnershipResponse>;
+  getRunOwnership?(runId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   /** The worker's own open custody holds on a run — the post-clone generation-exact inventory
    *  (PRD #1349 M1/M2, D3). */
   listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
@@ -223,6 +236,10 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
+  withReportProofBudget?: GitCache["withReportProofBudget"];
+  withBareLock?: GitCache["withBareLock"];
+  readInventoryCloneHeadsUnderLock?: GitCache["readInventoryCloneHeadsUnderLock"];
+  enumerateOwedUnderLock?: GitCache["enumerateOwedUnderLock"];
   cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
   readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
@@ -332,6 +349,10 @@ function inventorySourceReason(diagnostic?: InventorySourceDiagnostic): string {
 }
 
 export interface RecoveryCoordinatorOptions {
+  withCompletionSourceBoundary?: (
+    source: CompletionSource,
+    action: (canDelete: () => boolean) => Promise<void>,
+  ) => Promise<"passed" | "retained">;
   withInventorySourceBoundary?: (
     context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
@@ -399,6 +420,7 @@ const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "capture_error",
   "restart_upload_failed",
   "upload_transient",
+  "storage_quota_exceeded",
   "credential_rejected",
   "inventory_source_not_quiescent",
   "inventory_source_not_quiescent:inventory_read_not_verified",
@@ -433,7 +455,7 @@ function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRe
  *  Legacy records need a journaled bundle that is bundled or needs_action for a
  *  transient/credential reason; pinned, bundle-less and permanent legacy records are skipped. */
 function isLiveCandidate(record: RecoveryRecord): boolean {
-  if (record.inventoryGuarded && record.finalAcknowledged) return true;
+  if (record.inventoryGuarded && (record.finalAcknowledged || record.completionReceipt)) return true;
   if (record.inventoryGuarded && record.coverageDigest && !record.finalAcknowledged) {
     if (record.reason === "inventory_quiescence_breach" || record.reason === "inventory_snapshot_changed") return false;
     return record.state !== "needs_action" || (!!record.reason && LIVE_RETRY_REASONS.has(record.reason));
@@ -458,7 +480,7 @@ function pinFactsDiffer(snapshot: RecoveryRecord, current: RecoveryRecord): bool
  *  changes. Only a `pinned` record may re-point its source or take the finalization facts; any other
  *  state may only fill an absent attempted head or generation (issue #1995). */
 function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
-  if (current.coverageDigest) return current; // a frozen inventory is immutable
+  if (current.coverageDigest || current.completionReceipt) return current; // acknowledged authority is immutable
   const next: RecoveryRecord = { ...current };
   let changed = false;
   if (input.inventoryGuarded === true && current.inventoryGuarded !== true) {
@@ -550,20 +572,21 @@ async function runCaptureCycle<T>(
 
 /** The typed disposition of a failed reserve/upload RPC (issue #1995). */
 export type UploadFailureClass =
-  | { kind: "transient" }
+  | { kind: "transient"; reason?: "storage_quota_exceeded" }
   | { kind: "permanent"; reason: string }
   | { kind: "credential"; reason: "credential_rejected" };
 
 /** Recompute the size, SHA-256 and chunk count of the journaled bundle file and compare them with
  *  the journaled facts. False on a mismatch or an unreadable file. */
-async function verifyJournaledBytes(record: RecoveryRecord): Promise<boolean> {
+async function verifyJournaledBytes(record: RecoveryRecord, signal?: AbortSignal): Promise<boolean> {
   if (!hasJournaledBundle(record)) return false;
   try {
     const hash = createHash("sha256");
     let size = 0;
-    for await (const chunk of createReadStream(record.bundlePath)) {
+    for await (const chunk of createReadStream(record.bundlePath, { signal })) {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
       size += buf.length;
+      if (size > record.byteSize) return false;
       hash.update(buf);
     }
     return (
@@ -618,6 +641,7 @@ export async function classifyUploadFailure(err: unknown, record?: RecoveryRecor
     case "integrity":
       return integrity();
     case "quota":
+      return { kind: "transient", reason: "storage_quota_exceeded" };
     case "busy":
     case "internal":
       return { kind: "transient" };
@@ -673,6 +697,7 @@ const recoveryJournalLocks = new RunDiskLocks();
  */
 export class RecoveryCoordinator {
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
+  private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
@@ -703,6 +728,7 @@ export class RecoveryCoordinator {
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
+    this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
     this.onAuthoritativeGenerationReleased = opts.onAuthoritativeGenerationReleased;
@@ -1069,6 +1095,102 @@ export class RecoveryCoordinator {
     return outcome;
   }
 
+  /** C -> S -> J -> B -> O. This operation consumes archive observations only;
+   * the callback performs the conditional exact unlink before any boundary releases.
+   * At most 256 journals and their captures are considered; a bad candidate retains
+   * its report, without granting FINAL, capture or cleanup authority. */
+  async retireArchivedReport(
+    runId: string, generation: number,
+    budget: { signal: AbortSignal; deadline: number },
+    reserve: (action: (ownTailEligible: () => boolean) => Promise<void>) => Promise<void>,
+    inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
+      laterHead: (head: string) => boolean) => Promise<boolean>,
+    remove: (ownTailEligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
+        !this.git.withBareLock || !this.git.withReportProofBudget ||
+        !this.git.enumerateOwedUnderLock || !this.git.readInventoryCloneHeads ||
+        !this.git.ancestry || !this.client.getRunOwnership) return;
+    const check = () => {
+      budget.signal.throwIfAborted();
+      if (Date.now() >= budget.deadline || residueQuarantine() !== undefined) throw new Error("report proof unavailable");
+    };
+    await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
+      () => reserve(ownTailEligible => this.withJournalLock(runId, async () => {
+        check();
+        const sources = await this.checkedRecords(runId, budget);
+        const records = sources.filter(r => r.generation === generation && r.inventoryGuarded === true &&
+          r.state === "uploaded" && r.serverCaptureId && r.coverageDigest && r.coverageContext &&
+          r.originalSourceSha && r.inventoryCurrentSha && Array.isArray(r.originalRoots) &&
+          /^[0-9a-f]{40}$/.test(r.sourceSha) && /^[0-9a-f]{64}$/.test(r.checksum ?? "") &&
+          Number.isSafeInteger(r.byteSize) && r.byteSize! > 0 &&
+          r.reason !== "inventory_snapshot_changed" && r.reason !== "inventory_quiescence_breach");
+        if (records.length !== 1) return;
+        for (const record of records) {
+          check();
+          const bare = record.bareDir && await this.git.withReportProofBudget!(budget,
+            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined));
+          if (!bare || bare !== record.coverageContext!.barePath) continue;
+          const removed = await this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
+            check();
+            const ownership = await this.client.getRunOwnership!(runId, budget);
+            if (!ownership || !["completed", "failed", "cancelled"].includes(ownership.status) ||
+                !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
+                (ownership.inventory_guarded !== undefined && typeof ownership.inventory_guarded !== "boolean")) return false;
+            const status = await this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget);
+            if (!healthyInventoryStatus(status, record, this.now())) return false;
+            check();
+            const owed = await this.git.enumerateOwedUnderLock!(bare, runId);
+            const settledEarlier = await this.settledEarlierGenerations(sources, generation);
+            const laterContext = (c: OwedCandidate["contexts"][number]) =>
+              Number.isSafeInteger(c.generation) && c.generation! > generation;
+            const laterHead = (sha: string) => {
+              const journals = sources.filter(r => !r.coverageDigest && r.sourceSha === sha);
+              const producers = owed.filter(c => c.sha === sha).flatMap(c => c.contexts);
+              return journals.length + producers.length > 0 &&
+                journals.every(r => Number.isSafeInteger(r.generation) && r.generation! > generation) &&
+                producers.every(laterContext);
+            };
+            const covered = async (head: string) => {
+              check();
+              return /^[0-9a-f]{40}$/.test(head) &&
+                await this.git.ancestry!(bare, head, record.sourceSha) === "ancestor";
+            };
+            for (const source of sources) {
+              if (source.captureId === record.captureId ||
+                  (Number.isSafeInteger(source.generation) &&
+                    (source.generation! > generation || settledEarlier.has(source.generation!)))) continue;
+              if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha ||
+                  !Array.isArray(source.originalRoots))) return false;
+              const heads = source.coverageDigest
+                ? [source.originalSourceSha!, source.inventoryCurrentSha!, ...source.originalRoots!.map(r => r.sha)]
+                : [source.sourceSha];
+              for (const head of heads) if (!await covered(head)) return false;
+            }
+            for (const root of owed) {
+              const contexts = root.contexts.filter(c => !laterContext(c) &&
+                !(Number.isSafeInteger(c.generation) && settledEarlier.has(c.generation!)));
+              if (!contexts.length) continue;
+              if (!record.originalRoots!.some(frozen => root.sha === frozen.sha &&
+                  contexts.every(c => frozen.contexts.some(p => canonicalJson(p) === canonicalJson(c)))) ||
+                  !await covered(root.sha)) return false;
+            }
+            // Frozen original/current heads remain requirements even if their pins disappeared.
+            for (const head of [record.originalSourceSha!, record.inventoryCurrentSha!,
+                ...record.originalRoots!.map(r => r.sha)]) if (!await covered(head)) return false;
+            if (!await inspectSources(bare, covered, laterHead)) return false;
+            check();
+            if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
+                canonicalJson(await this.git.enumerateOwedUnderLock!(bare, runId)) !== canonicalJson(owed)) return false;
+            if (!ownTailEligible()) return false;
+            await remove(ownTailEligible);
+            return true;
+          }));
+          if (removed) return;
+        }
+      }, budget.signal)));
+  }
+
   private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>, reconcile: boolean): Promise<RecoveryOutcome | void> {
     let record = await this.requireRecord(snapshot);
     // issue #2213 (ADR-2213 "Nothing is uploaded or released while latched"): the guarded FINAL is a
@@ -1188,7 +1310,7 @@ export class RecoveryCoordinator {
       const reconciled = await this.reconcileInventory(record, prove, observedStatus);
       if (reconciled) return reconciled;
       return { state: record.state, captureId: record.captureId,
-        reason: cls.kind === "transient" ? "upload_transient" : cls.reason };
+        reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
     }
   }
 
@@ -1274,6 +1396,10 @@ export class RecoveryCoordinator {
   }
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting): Promise<RecoveryOutcome | void> {
+    if (record.completionReceipt) {
+      await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting);
+      return;
+    }
     if (record.finalAcknowledged) {
       await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting);
       return;
@@ -1382,6 +1508,19 @@ export class RecoveryCoordinator {
    * authenticated LATEST journaled record rather than the caller's copy, and never re-produces
    * bytes a record already journaled.
    */
+  /** Positive local capture proof for claim-local adoption, independent of upload/final ACK.
+   * This proof grants no cleanup or custody-release authority. */
+  async verifiedLocalCapture(record: RecoveryRecord, signal?: AbortSignal): Promise<RecoveryRecord | undefined> {
+    const latest = await this.readLatest(record);
+    if (latest.kind !== "ok") return undefined;
+    const local = latest.record;
+    if (!hasJournaledBundle(local) || !await verifyJournaledBytes(local, signal)) return undefined;
+    const header = await readRecoveryBundleHeader(local.bundlePath, local.sourceSha);
+    if (header.selfContained !== local.selfContained ||
+        canonicalJson(header.prerequisiteShas) !== canonicalJson(local.prerequisiteShas)) return undefined;
+    return local;
+  }
+
   async captureAndUpload(input: CaptureInput): Promise<RecoveryOutcome> {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
@@ -1610,9 +1749,10 @@ export class RecoveryCoordinator {
    * issue #1995: every journal write is guarded (a removed record is never recreated, a newer
    * state is never overwritten), the record's existence is re-checked before the reserve and
    * right before the stream opens, and an RPC failure is classified ({@link classifyUploadFailure}):
-   * permanent and credential dispositions are journaled as such, a transient one under the mode's
-   * retry reason (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds
-   * the record's capture-cycle lock.
+   * permanent and credential dispositions are journaled as such. A transient failure preserves
+   * its typed quota reason when present, otherwise using the mode's retry reason
+   * (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds the record's
+   * capture-cycle lock.
    */
   private async uploadJournaledBundle(
     record: RecoveryRecord,
@@ -1734,7 +1874,7 @@ export class RecoveryCoordinator {
       { run_id: record.runId, capture_id: record.captureId, disposition: cls.kind, error: errText(err) },
     );
     if (cls.kind === "credential") this.credentialBlockedAt = this.now();
-    const reason = cls.kind === "transient" ? TRANSIENT_UPLOAD_REASON[mode] : cls.reason;
+    const reason = cls.kind === "transient" ? cls.reason ?? TRANSIENT_UPLOAD_REASON[mode] : cls.reason;
     return this.markFailure(record, reason, mode === "capture");
   }
 
@@ -2165,14 +2305,14 @@ export class RecoveryCoordinator {
       // Executing runs are filtered BEFORE the per-pass cap so they cannot hold its slots.
       const candidates = all
         .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId) &&
-          (!credentialsBlocked || (r.inventoryGuarded && r.finalAcknowledged)))
+          (!credentialsBlocked || (r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
       // A blocked pass with no local ACK work must not delay a newer authenticated heartbeat.
       if (credentialsBlocked && candidates.length === 0) return;
       let uploadsStopped = credentialsBlocked;
       for (const snap of candidates) {
-        if (uploadsStopped && !(snap.inventoryGuarded && snap.finalAcknowledged)) continue;
+        if (uploadsStopped && !(snap.inventoryGuarded && (snap.finalAcknowledged || snap.completionReceipt))) continue;
         if (opts.signal?.aborted) break;
         const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
         if (!res.ran) {
@@ -2220,7 +2360,7 @@ export class RecoveryCoordinator {
     const record = res.record;
     // Re-checked inside the lock: the record may have moved on, or the run started executing.
     if (!isLiveCandidate(record) || opts.isExecuting(record.runId) ||
-        (!(record.inventoryGuarded && record.finalAcknowledged) && this.credentialBlockedAt !== undefined &&
+        (!(record.inventoryGuarded && (record.finalAcknowledged || record.completionReceipt)) && this.credentialBlockedAt !== undefined &&
          opts.authenticatedAtMs <= this.credentialBlockedAt)) return "ok";
     this.lastAttemptAt.set(record.captureId, this.now());
     try {
@@ -2244,7 +2384,7 @@ export class RecoveryCoordinator {
         capture_id: record.captureId,
         error: errText(err),
       });
-      if (!record.finalAcknowledged) await this.markFailure(record, "upload_transient").catch(() => undefined);
+      if (!record.finalAcknowledged && !record.completionReceipt) await this.markFailure(record, "upload_transient").catch(() => undefined);
       log("needs_action", "upload_transient");
       return "transient";
     }
@@ -2265,6 +2405,63 @@ export class RecoveryCoordinator {
     if (!this.enabled) return;
     await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
       () => this.forgetGenerationWithinCycle(runId, generation));
+  }
+
+  /** Receipt cleanup visits only this authenticated generation. No archive ancestry or capture RPC.
+   * One attempt per existing sweep; any failed proof stops this generation and retains authority. */
+  private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean): Promise<void> {
+    if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return;
+    await this.withJournalLock(runId, async () => {
+      const records = await this.checkedRecords(runId);
+      const selected = records.filter(r => r.generation === generation);
+      const authority = selected.find(r => r.completionReceipt && r.completionSource);
+      if (!authority || !this.git.cleanupRecoveryGeneration || residueQuarantine() !== undefined) return;
+      const source = authority.completionSource!;
+      const ctx = source.context;
+      if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
+          (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
+      const bare = await this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath));
+      if (bare !== ctx.barePath) return;
+      const bundles = new Set<string>();
+      for (const record of selected) {
+        if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
+            (record.recoveryPinBareDir && record.recoveryPinBareDir !== path.basename(bare)) ||
+            (record.coverageContext && record.coverageContext.barePath !== bare) ||
+            (record.completionSource && canonicalJson(record.completionSource) !== canonicalJson(source))) return;
+        const canonical = path.resolve(this.bundlePath(record));
+        if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
+        if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
+        try {
+          const stat = await fs.lstat(canonical);
+          if (!stat.isFile() || stat.isSymbolicLink()) return;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+        bundles.add(canonical);
+      }
+      const pins = selected.filter(r => r.coverageDigest).map(r => ({ fingerprint: r.coverageDigest!, sha: r.sourceSha }));
+      const recoverySources = [...new Set(selected.flatMap(r =>
+        [r.sourceSha, r.originalSourceSha, r.inventoryCurrentSha].filter((sha): sha is string => !!sha)))];
+      // Refuse malformed/unknown attribution before moving the physical completing source.
+      const preflight = await this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
+        recoverySources, authority.completionReceipt!.final_head,
+        () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check");
+      if (preflight !== "verified") return;
+      await this.withCompletionSourceBoundary!(source, async canDelete => {
+        const result = await this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
+          recoverySources, authority.completionReceipt!.final_head, canDelete, "completion");
+        if (result !== "removed") return;
+        const unlink = async (file: string): Promise<void> => {
+          if (!canDelete()) throw new Error("completion cleanup protection changed");
+          try { await fs.unlink(file); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+        };
+        for (const bundle of bundles) await unlink(bundle);
+        for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
+        await unlink(this.recordPath(authority));
+        await fs.rmdir(this.runDir(runId)).catch(() => undefined);
+      });
+    });
   }
 
   /** Caller owns the generation cycle. The journal lock spans selection and every destructive
@@ -2341,6 +2538,70 @@ export class RecoveryCoordinator {
     return this.listRecords(runId);
   }
 
+  async bindCompletionSource(source: CompletionSource): Promise<boolean> {
+    if (!this.enabled || !this.key || !validCompletionSource(source)) return false;
+    const ctx = source.context;
+    try {
+      return await this.withJournalLock(ctx.runId, async () => {
+        const records = await this.checkedRecords(ctx.runId);
+        if (records.some(r => r.generation === undefined)) return false;
+        const selected = records.filter(r => r.generation === ctx.generation);
+        if (!selected.length) return false;
+        // Only HEAD and roots may advance for the same completing attempt before a receipt.
+        // Validate the entire cohort before writing so foreign attribution is never replaced.
+        const bareDir = path.basename(ctx.barePath);
+        if (selected.some(r => !r.inventoryGuarded || r.runId !== ctx.runId ||
+            r.branch !== ctx.branch || r.kind !== ctx.kind || r.completionReceipt ||
+            (r.bareDir && r.bareDir !== bareDir) ||
+            (r.recoveryPinBareDir && r.recoveryPinBareDir !== bareDir) ||
+            (r.coverageContext && canonicalJson(r.coverageContext) !== canonicalJson(ctx)) ||
+            (r.bundlePath && path.resolve(r.bundlePath) !== path.resolve(this.bundlePath(r))) ||
+            (r.completionSource && (canonicalJson(r.completionSource.context) !== canonicalJson(ctx) ||
+              r.completionSource.clonePath !== source.clonePath ||
+              r.completionSource.attemptId !== source.attemptId)))) return false;
+        // One pass bounded by the existing cohort; a failed write/readback stops siblings.
+        for (const record of selected) {
+          await this.writeRecordUnlocked({ ...record, completionSource: source });
+        }
+        for (const record of selected) {
+          const readback = await this.requireRecord(record);
+          if (canonicalJson(readback.completionSource) !== canonicalJson(source)) return false;
+        }
+        return true;
+      });
+    } catch { return false; }
+  }
+
+  /** One bounded authenticated write/readback, only to an existing exact-generation record.
+   * Failure retains sources and terminal evidence; no record is created after release. */
+  async persistCompletionReceipt(receipt: CompletedPublicationReceipt): Promise<boolean> {
+    if (!this.enabled || !this.key || !validCompletionReceipt(receipt)) return false;
+    try {
+      return await this.withJournalLock(receipt.run_id, async () => {
+        const records = await this.checkedRecords(receipt.run_id);
+        const eligible = records.filter(r => r.inventoryGuarded && r.generation === receipt.generation &&
+          r.branch === receipt.branch && ["issue", "mr_rework", "self_improve"].includes(r.kind));
+        const existing = eligible.find(r => r.completionReceipt) ?? eligible.find(r => r.completionSource) ?? eligible[0];
+        if (!existing) return false;
+        if (existing.completionReceipt && canonicalJson(existing.completionReceipt) !== canonicalJson(receipt)) return false;
+        await this.writeRecordUnlocked({ ...existing, completionReceipt: receipt });
+        const readback = await this.requireRecord(existing);
+        return canonicalJson(readback.completionReceipt) === canonicalJson(receipt);
+      });
+    } catch (err) {
+      this.log.warn("recovery: completion receipt not persisted; source and terminal evidence retained", {
+        run_id: receipt.run_id, error: errText(err),
+      });
+      return false;
+    }
+  }
+
+  async hasPersistedCompletionReceipt(runId: string, generation: number): Promise<boolean> {
+    try {
+      return (await this.checkedRecords(runId)).some(r => r.generation === generation && !!r.completionReceipt);
+    } catch { return false; }
+  }
+
   /** Cleanup authority requires a complete authenticated physical journal, unlike inspect. */
   async inventoryCleanupState(runId: string, generation: number): Promise<"absent" | "legacy" | "pending" | "acknowledged"> {
     const records = await this.checkedRecords(runId);
@@ -2405,7 +2666,7 @@ export class RecoveryCoordinator {
 
   /** One bounded pass over physical JSON files; any failed read blocks authority.
    * Paths must resolve inside this coordinator's root, with no symlink file reads. */
-  private async checkedRecords(runId: string): Promise<RecoveryRecord[]> {
+  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }): Promise<RecoveryRecord[]> {
     if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("unsafe recovery run id");
     const root = path.resolve(this.recoveryRoot);
     const dir = this.runDir(runId);
@@ -2427,15 +2688,32 @@ export class RecoveryCoordinator {
       throw new Error("symlink recovery directory");
     }
     // Disappearance after a positive directory check is unknown, not empty proof.
-    names = await fs.readdir(dir);
+    const before = await fs.lstat(dir);
+    if (budget) {
+      names = [];
+      const directory = await fs.opendir(dir);
+      try {
+        for (;;) {
+          budget.signal.throwIfAborted();
+          if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+          const entry = await directory.read();
+          if (!entry) break;
+          if (names.length >= 256) throw new Error("report journal entry budget");
+          names.push(entry.name);
+        }
+      } finally { await directory.close(); }
+    } else names = await fs.readdir(dir);
     const records: RecoveryRecord[] = [];
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
-      const result = await this.readRecordResult(path.join(dir, name), true);
+      const result = await this.readRecordResult(path.join(dir, name), true, budget);
       if (result.kind !== "ok" || result.record.runId !== runId ||
           name !== result.record.captureId + ".json") throw new Error("unverified recovery journal");
       records.push(result.record);
     }
+    const after = await fs.lstat(dir);
+    if (budget && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
+        before.ctimeMs !== after.ctimeMs)) throw new Error("report journal directory changed");
     return records;
   }
 
@@ -2471,13 +2749,13 @@ export class RecoveryCoordinator {
       .some(r => r.generation === record.generation && r.inventoryGuarded === true);
   }
 
-  private withJournalLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn);
+  private withJournalLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn, signal);
   }
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
   private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
-    if (!this.key) return;
+    if (!this.key) throw new Error("recovery: MAC key unavailable");
     const mac = this.computeMac(record);
     const dir = this.runDir(record.runId);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -2502,6 +2780,7 @@ export class RecoveryCoordinator {
   private async readRecordResult(
     filePath: string,
     noFollow = false,
+    budget?: { signal: AbortSignal; deadline: number },
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
     if (!this.key) return { kind: "unreadable" };
     let raw: string;
@@ -2509,8 +2788,27 @@ export class RecoveryCoordinator {
       if (noFollow) {
         const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         try {
-          if (!(await file.stat()).isFile()) return { kind: "unreadable" };
-          raw = await file.readFile("utf8");
+          const before = await file.stat({ bigint: true });
+          if (!before.isFile()) return { kind: "unreadable" };
+          if (budget) {
+            if (before.size > BigInt(1024 * 1024)) return { kind: "unreadable" };
+            const bytes = Buffer.alloc(1024 * 1024 + 1);
+            let length = 0;
+            while (length < bytes.length) {
+              budget.signal.throwIfAborted();
+              if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+              const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
+              if (!bytesRead) break;
+              length += bytesRead;
+            }
+            if (length > 1024 * 1024) return { kind: "unreadable" };
+            const after = await file.stat({ bigint: true });
+            const named = await fs.lstat(filePath, { bigint: true });
+            if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
+                before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+                before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) return { kind: "unreadable" };
+            raw = bytes.subarray(0, length).toString("utf8");
+          } else raw = await file.readFile("utf8");
         } finally { await file.close(); }
       } else {
         raw = await fs.readFile(filePath, "utf8");
@@ -2787,8 +3085,46 @@ function validInventoryContext(value: unknown, runId: string, barePath?: string)
     typeof identity.sha === "string" && /^[0-9a-f]{40}$/.test(identity.sha);
 }
 
-/** Validate the untrusted parsed object into a RecoveryRecord (shape only; the MAC is the
- *  integrity gate). Returns null on any type mismatch. */
+/** Completion source shape is checked before authenticating the containing record. */
+function validCompletionSource(value: unknown): value is CompletionSource {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const s = value as CompletionSource;
+  const keys = Object.keys(s).sort().join(",");
+  if (keys !== "clonePath,context,expectedHead,roots" && keys !== "attemptId,clonePath,context,expectedHead,roots") return false;
+  const ctx = s.context;
+  return !!ctx && validInventoryContext(ctx, ctx.runId, ctx.barePath) && !("legacy" in ctx) && !("origin" in ctx) &&
+    ["issue", "mr_rework", "self_improve"].includes(ctx.kind) &&
+    typeof s.clonePath === "string" && path.isAbsolute(s.clonePath) && path.resolve(s.clonePath) === s.clonePath &&
+    typeof s.expectedHead === "string" && /^[0-9a-f]{40}$/.test(s.expectedHead) &&
+    (s.attemptId === undefined || (typeof s.attemptId === "string" &&
+      new RegExp("^[0-9]{8}T[0-9]{6}Z-g" + ctx.generation + "-[0-9a-f]{16}$").test(s.attemptId))) &&
+    Array.isArray(s.roots) && s.roots.every(r => r && /^[0-9a-f]{40}$/.test(r.sha) &&
+      Array.isArray(r.contexts) && r.contexts.length > 0 &&
+      r.contexts.every(c => validInventoryContext(c, ctx.runId, ctx.barePath) &&
+        !("legacy" in c) && !("origin" in c) && c.generation === ctx.generation &&
+        c.branch === ctx.branch && c.kind === ctx.kind));
+}
+
+/** Strict persisted shape. Live identity validation belongs to WorkerClient; MAC binds it at rest. */
+function validCompletionReceipt(value: unknown): value is CompletedPublicationReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  const fields = ["hold_id", "run_id", "owner_id", "worker_id", "generation", "final_head", "repo_id",
+    "connection_id", "project_id", "forge_type", "base_url", "branch", "mr_iid", "observed_branch_head"];
+  if (Object.keys(r).sort().join(",") !== fields.sort().join(",")) return false;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  for (const key of ["hold_id", "run_id", "owner_id", "worker_id", "repo_id", "connection_id"])
+    if (typeof r[key] !== "string" || !uuid.test(r[key])) return false;
+  for (const key of ["final_head", "observed_branch_head"])
+    if (typeof r[key] !== "string" || !/^[0-9a-f]{40}$/.test(r[key])) return false;
+  for (const key of ["generation", "project_id", "mr_iid"])
+    if (!Number.isSafeInteger(r[key]) || (r[key] as number) <= 0) return false;
+  for (const key of ["base_url", "branch"])
+    if (typeof r[key] !== "string" || !r[key] || Buffer.byteLength(r[key]) > 2048 || /[\p{Cc}\p{Cf}]/u.test(r[key])) return false;
+  return ["gitlab", "forgejo", "github"].includes(r.forge_type as string);
+}
+
+/** Validate journal shape; the MAC remains the integrity gate. */
 function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
   const str = (v: unknown): v is string => typeof v === "string";
   const num = (v: unknown): v is number => typeof v === "number";
@@ -2889,6 +3225,21 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
         !["publication", "forge_no_output"].includes(req.evidence ?? "") ||
         req.disposition.capture_id !== undefined || req.disposition.source_sha !== undefined)) return null;
     record.finalRequest = req;
+  }
+  if (obj.completionSource !== undefined) {
+    if (!validCompletionSource(obj.completionSource)) return null;
+    const source = obj.completionSource;
+    if (!record.inventoryGuarded || source.context.runId !== record.runId ||
+        source.context.generation !== record.generation || source.context.branch !== record.branch ||
+        source.context.kind !== record.kind) return null;
+    record.completionSource = source;
+  }
+  if (obj.completionReceipt !== undefined) {
+    if (!validCompletionReceipt(obj.completionReceipt)) return null;
+    const receipt = obj.completionReceipt;
+    if (!record.inventoryGuarded || receipt.run_id !== record.runId || receipt.generation !== record.generation ||
+        receipt.branch !== record.branch || !["issue", "mr_rework", "self_improve"].includes(record.kind)) return null;
+    record.completionReceipt = receipt;
   }
   if (obj.finalAcknowledged !== undefined) {
     if (typeof obj.finalAcknowledged !== "boolean" || !record.finalRequest) return null;

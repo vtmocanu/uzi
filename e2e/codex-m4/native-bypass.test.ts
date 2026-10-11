@@ -62,7 +62,7 @@ function leadEffectGrants(): RunGrants {
   };
 }
 
-/** One contract model per catalog `shell_type` spelling. The 0.159.3 catalog gives gpt-6-astra (and
+/** One contract model per catalog `shell_type` spelling. The 0.160.0 catalog gives gpt-6-astra (and
  *  gpt-5.6-sol) `shell_type: "unified_exec"` but gpt-6-sol and gpt-6.1-sol `shell_type: "shell_command"` (a serde
  *  alias of the same internal type, gated by `shell_tool = false`), so the native-disabled template
  *  is proven for both catalog shapes, not only the default model. */

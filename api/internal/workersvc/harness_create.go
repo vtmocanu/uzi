@@ -57,7 +57,9 @@ type RawCredentialOverride struct {
 // codexModels is the CLOSED Codex model vocabulary (PRD #1429 D6; gpt-6-sol added with the Codex
 // 0.156.1 pin, whose catalog requires client >= 0.155.0): the product-owned picker is EXACTLY these
 // ids and catalog discovery never adds more. It mirrors the agent's
-// agent/src/codex/render.ts CONTRACT_MODELS and codex-pricing.ts price table.
+// agent/src/codex/render.ts CONTRACT_MODELS and codex-pricing.ts price table, except
+// gpt-6-luna: the agent's set carries it (the Now summary model, PRD #2603, and so also honoured
+// as a template role pin), while this picker and frozen-run vocabulary deliberately leave it out.
 var codexModels = map[string]bool{
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true,

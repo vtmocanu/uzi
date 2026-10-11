@@ -15,7 +15,7 @@ import {
   type Board as BoardData,
   type Card as CardData,
   type Harness,
-  type RunListItem,
+  type RunSummaryItem,
   type SecretMeta,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -418,19 +418,19 @@ export function Board() {
   }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
-  const [awaitingRuns, setAwaitingRuns] = useState<RunListItem[]>([]);
+  const [awaitingRuns, setAwaitingRuns] = useState<RunSummaryItem[]>([]);
   // The viewer's runs on this repo parked on a clarification question (PRD #88). A
   // SEPARATE bucket from awaitingRuns, not a widening of it: the strip below names what
   // the run needs, and "needs approval" pointed at a parked question would send the user
   // looking for a plan gate that is not there. Same visual treatment, different words —
   // which is the whole reason awaiting_input is its own status.
-  const [questionRuns, setQuestionRuns] = useState<RunListItem[]>([]);
+  const [questionRuns, setQuestionRuns] = useState<RunSummaryItem[]>([]);
   // PRD #517: the viewer's runs on this repo parked awaiting their next follow-up
   // (awaiting_followup). Its OWN bucket, a sibling to questionRuns rather than folded into
   // it: a follow-up park is not an unanswered question, so the strip names a distinct
   // action ("awaiting follow-up"). Same needs-you classification and loud ring as the two
   // parks above (needsHumanAttention), so it belongs in the "how many need me" tally.
-  const [followupRuns, setFollowupRuns] = useState<RunListItem[]>([]);
+  const [followupRuns, setFollowupRuns] = useState<RunSummaryItem[]>([]);
   // The viewer's runs on this repo the health detector flagged as looking stuck
   // (PRD #47): any non-ok flag on a run the two buckets above do not already carry.
   // Issue runs only (a ci_fix run has no board card to link to).
@@ -444,7 +444,7 @@ export function Board() {
   // on r.id), and a summary reading "1 run needs approval · 1 run looks stuck" for one
   // run. Keying on the status makes the exclusion mean what it always said it meant, and
   // survives any future flag on these statuses.
-  const [stuckRuns, setStuckRuns] = useState<RunListItem[]>([]);
+  const [stuckRuns, setStuckRuns] = useState<RunSummaryItem[]>([]);
 
   // Toasts announce auto-moves the poll observes ("#42 → Human Review").
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
@@ -540,7 +540,7 @@ export function Board() {
       const [{ workers }, { secrets }, { runs }, { settings }] = await Promise.all([
         api.listWorkers(),
         api.listSecrets(),
-        api.listRuns({ repoId }),
+        api.listRuns({ repoId, view: "summary" }),
         // PRD #1429 M4a review Fix 1: the viewer's own default_harness, mirroring
         // IssueView's start dialog so a card's effective-Codex gate agrees with it.
         api.getMySettings(),

@@ -3,7 +3,7 @@
 // This is the reusable library the production worker adapter (and the m3a lifecycle
 // test) calls to launch ONE supervisor root: a static Go supervisor
 // (`/usr/local/bin/uzi-codex-supervisor`, built by a sibling unit) which forks the
-// pinned Codex app-server (`/opt/uzi-codex/0.159.3/bin/codex app-server`). It
+// pinned Codex app-server (`/opt/uzi-codex/0.160.0/bin/codex app-server`). It
 // composes the worker→runner/runner-cmd uid boundaries in `runner-uid.ts`.
 //
 // SUPPORTED PROFILE (fail-closed): this primitive is supported ONLY under the A1
@@ -36,7 +36,7 @@ import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "
 import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import type { Readable, Writable } from "node:stream";
+import { Transform, type Readable, type Writable } from "node:stream";
 
 import {
   CODEX_SESSION_GID,
@@ -72,7 +72,7 @@ const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 /** The pinned, image-baked Codex app-server binary. Exported so the production adapter
  *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
  *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */
-export const CODEX_BIN = "/opt/uzi-codex/0.159.3/bin/codex";
+export const CODEX_BIN = "/opt/uzi-codex/0.160.0/bin/codex";
 /** The pinned, image-baked supervisor trust anchor. Exported for the same reason. */
 export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 /** The fixed provider child argv (`codex app-server`). Exported so the production
@@ -223,6 +223,8 @@ export interface LauncherDeps {
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
+  /** Trusted tests only; arms the started await without altering its supplied budget or clock. */
+  readonly armStartedDeadlineForTest?: (fire: () => void, ms: number) => () => void;
   /** Boundary checkpoint only: identity and absolute budget survive every wrapper. */
   readonly startupCleanup?: StartupCleanupAuthorization;
   /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
@@ -725,7 +727,29 @@ export class SupervisedChildExitTimeoutError extends Error {
   }
 }
 
-function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error): Promise<T> {
+function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error,
+  armForTest?: LauncherDeps["armStartedDeadlineForTest"]): Promise<T> {
+  if (armForTest) {
+    return new Promise<T>((resolve, reject) => {
+      let done = false;
+      let cancel = () => {};
+      const settle = (action: () => void): void => {
+        if (done) return;
+        done = true;
+        cancel();
+        action();
+      };
+      cancel = armForTest(() => settle(() => reject(timeoutError?.() ??
+        new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`))), ms);
+      // A trusted arm may fire synchronously before returning its cancellation handle.
+      if (done) cancel();
+      p.then(
+        value => settle(() => resolve(value)),
+        (error: unknown) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))),
+      );
+    });
+  }
+  // Keep the production timer path unchanged, including unref and native cancellation.
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(timeoutError?.() ?? new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`)), ms);
     if (typeof timer.unref === "function") timer.unref();
@@ -862,7 +886,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
-  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
+  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind,
+    undefined, deps.armStartedDeadlineForTest);
   return withOwnedTreeCleanup(
     handle,
     { uid, kind: spec.kind, root: spec.ownedDataRoot },
@@ -957,7 +982,8 @@ async function launchEffectRoot(spec: CodexEffectLaunchSpec, deps: LauncherDeps)
     launchClassifications.set(error, error.classification);
     throw error;
   }
-  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup);
+  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup,
+    deps.armStartedDeadlineForTest);
 }
 
 async function createHandle(
@@ -966,6 +992,7 @@ async function createHandle(
   deadlines: LauncherDeadlines,
   kind: CodexRootKind,
   startupCleanup?: StartupCleanupAuthorization,
+  armStartedDeadlineForTest?: LauncherDeps["armStartedDeadlineForTest"],
 ): Promise<CodexRootHandle> {
   const control = asWritable(child.stdio[3], "control");
   const evidence = asReadable(child.stdio[4], "evidence");
@@ -1022,8 +1049,51 @@ async function createHandle(
     try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* primary failure already recorded */ }
   }
 
-  const lines = createInterface({ input: evidence });
+  let currentLineBytes = 0;
+  let oversizedTermination = false;
+  let guardReleased = false;
+  const guardedEvidence = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      for (const byte of chunk) {
+        if (byte === 0x0a || byte === 0x0d) currentLineBytes = 0;
+        else if (++currentLineBytes > MAX_EVIDENCE_LINE_BYTES) {
+          oversizedTermination = true;
+          fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`));
+          evidence.destroy();
+          lines.close();
+          releaseGuard();
+          // Teardown may occur during a write; still settle its callback exactly once.
+          callback();
+          return;
+        }
+      }
+      this.push(chunk);
+      callback();
+    },
+  });
+  const lines = createInterface({ input: guardedEvidence });
+  function releaseGuard(): void {
+    if (guardReleased) return;
+    guardReleased = true;
+    evidence.unpipe(guardedEvidence);
+    evidence.off("close", onEvidenceClose);
+    guardedEvidence.destroy();
+  }
+  function onEvidenceClose(): void {
+    // A close without end must not manufacture EOF for disposal proof.
+    lines.close();
+    releaseGuard();
+  }
+  function onEvidenceError(err: Error): void {
+    fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err }));
+    lines.close();
+    releaseGuard();
+  }
+  evidence.on("error", onEvidenceError);
+  evidence.on("close", onEvidenceClose);
+  guardedEvidence.on("error", onEvidenceError);
   lines.on("line", (line) => {
+    if (oversizedTermination) return;
     lineCount += 1;
     if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); lines.close(); return; }
     if (Buffer.byteLength(line) > MAX_EVIDENCE_LINE_BYTES) { fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`)); return; }
@@ -1033,6 +1103,7 @@ async function createHandle(
   });
   lines.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err })));
   lines.on("close", () => {
+    releaseGuard();
     resolveEvidenceEnd();
     if (failure || cleanDisposed || exited || abandoningStartup) return;
     if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
@@ -1254,6 +1325,9 @@ async function createHandle(
     }
   }
 
+  // All consumers and lifecycle handlers must be ready before prebuffered evidence flows.
+  evidence.pipe(guardedEvidence);
+
   // Await `started` (bounded). A pre-started failure/exit rejects the launch; we end
   // the control channel so the supervisor runs its own bounded abnormal cleanup — we
   // NEVER process-group kill.
@@ -1264,7 +1338,7 @@ async function createHandle(
         const error = new CodexLaunchError("started_deadline", "unconfirmed", undefined);
         launchClassifications.set(error, "started_deadline");
         return error;
-      });
+      }, armStartedDeadlineForTest);
   } catch (error) {
     let verified = false;
     let cleanupFailure: unknown;

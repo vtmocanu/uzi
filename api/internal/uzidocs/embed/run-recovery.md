@@ -17,9 +17,11 @@ even after the worker and its disk are gone.
 uzi captures at other boundaries too, not only at final failure: when a run
 is parked (a usage limit or a recovery wait) or gracefully stopped while it
 holds committed work, uzi archives that exact work before its source can be
-torn down. For guarded generations, release requires final acknowledgment
-of a covering, prerequisite-free archive or a verified empty inventory, not
-just publication of the current head. Legacy generations can release on proof that their
+torn down. For guarded generations, release normally requires final acknowledgment
+of a covering, prerequisite-free archive or a verified empty inventory.
+Eligible completed issue, MR-rework and self-improvement runs can instead
+release their exact completing-generation hold after the API verifies the
+published final commit against the run's branch and MR (see below). Legacy generations can release on proof that their
 recorded work is published. If the boundary cannot verify and resolve the
 source, it keeps the source held for you to decide (see below). A hard
 crash with no shutdown window — a killed node, an out-of-memory kill — is
@@ -47,7 +49,9 @@ reaches a final status. Each retained capture is in one of these six states:
   downloadable yet.
 - **Available** — the original committed history is ready to download.
 - **Needs action** — the archive could not be completed (for example, a
-  storage limit was hit); the source is still retained and will be retried.
+  storage limit was hit); the source stays retained. Retries depend on the
+  recovery path's budget; terminal retained-source failure does not cycle
+  automatically or offer Resume.
 - **Expired** — the ready download window passed and the bytes were purged.
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
 
@@ -87,6 +91,57 @@ Every download surface warns that the original may contain secrets: review
 it before publishing anywhere, and if it exposed a real credential, revoke
 and rotate it and remove it from the affected history — deleting the
 archive alone does not undo that exposure.
+
+## Retained-source failure and local proof
+
+A claim discovers retained source before forge refresh or disk preflight
+and recovers it within that claim. Its source-bound durable budget reserves at most **3 total
+iterations**, blocked and nonblocked together, within **five minutes from
+the first reservation**, using the existing exponential retry cap of 16
+times the base delay. Crash, reclaim, capture, publication and successor
+handoff preserve that budget. Reset requires a trusted, successfully settled
+real model turn. Recovery adopts work on a fresh attempt path and model
+session even on an unwired worker; ordinary unwired keys that never entered
+retained recovery keep same-path continuity.
+
+Permanent blockers or exhaustion end the run **failed** with custody kept,
+without automatic reclaim or failed-run Resume. The reason names the
+blocker: missing source, invalid clock, preservation/adoption failure,
+missing or unverifiable needed prerequisites, or a fallback still oversized.
+`worker_residue_blocked` identifies an actual quiescence failure, not an
+archive or prerequisite failure. Transient capture, forge and disk failures
+spend the same reservation budget. These bounds are separate from healthy
+provider/empty-turn parks and the owner worker-recovery-exhaustion hold.
+
+A verified thin bundle within the cap, with its needed prerequisites locally
+available and verified, permits local adoption and model execution even
+when remote publication is unknown. Nonempty prerequisites alone do not
+block it. Local verification reads reachable history and checks object hashes.
+Decoded history above 1 GiB fails closed with work and custody retained, even
+when the thin archive is below 64 MiB. `uzi run recovery` and the worker log
+show the recorded blocker. Local proof does not establish independent recovery
+or remote durability and does not release custody: predecessor sources, pins, journals
+and descriptors remain until the existing verified final disposition or
+explicit discard. The guarded prerequisite-free archive/empty-inventory
+release conditions below remain unchanged.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).
+
+A healthy run with an unknown publish outcome continues in the same claim
+generation, retaining its tip, owed roots and publication time gate.
+Confirmed durability requires positive proof. External restarts require a
+genuinely fenced successor; loss of local storage can still lose work.
+
+For a failed source-only run, an operator must recover from retained worker
+storage. `uzi run export` still requires a manifest-bound available archive;
+there is no new source download API or failed-run Resume. Downgrade during
+pending recovery is unsupported because older workers may drop recovery
+fields. See [bounded retained-source recovery](./run-recovery-wait.md#bounded-retained-source-recovery).
 
 ## Downloading an archive
 
@@ -177,13 +232,28 @@ operator-configurable environment variable on the API:
 | Limit | Default | Meaning |
 |---|---|---|
 | Max bundle size | 64 MiB | A larger archive is refused, not truncated. Guarded capture may fall back to a capped thin bundle; if capture still fails, the source stays retained. Historical oversized captures are not automatically reproduced. |
-| Ready payload per owner | 1 GiB | Total bytes of *your* ready (downloadable) archives. |
-| Instance byte quota | 4 GiB | Total ready bytes across the whole deployment (scoped to the owner who breached it, never a global stop). |
+| Ready payload per owner | 1 GiB | Your available archive bytes plus preparing/uploading reservations. |
+| Instance byte quota | 4 GiB | Available archive bytes plus preparing/uploading reservations across the deployment; a refusal retains the affected source. |
 | Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. |
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
-| Retained captures per owner | 256 | Total captures you can have on file at once. |
+| Retained captures per owner | 256 | Non-discarded captures on file, including expired metadata. |
 | Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+
+A byte refusal keeps the source retained. The archive's **Needs action**
+reason can read `storage quota exceeded`; current workers preserve a typed
+API quota refusal as `storage_quota_exceeded` and retry with backoff.
+An untyped HTTP 507 remains a generic transient failure.
+`uzi run recovery` joins hold and capture identities but omits capture
+reason in both human and JSON output; read the web archive or owner archive
+API for that reason. A new capture can also be refused at a capture-count
+ceiling before a capture row exists.
+
+For exact limits, byte accounting, custody counts and a read-only
+reproduction, see [Recovery storage diagnosis](./recovery-storage-diagnosis.md).
+Admins can use [Recovery storage health](./admin-health.md#recovery-storage)
+to find current persisted quota-refused captures. This warning does not
+show historical refusals or measure physical disk capacity.
 
 ### Shared stored-file budget
 
@@ -191,7 +261,7 @@ Recovery archives and [job files](./jobs.md#job-files) live in the same database
 
 - When a recovery upload would not fit the budget, uzi first reclaims job files to make room, in this order: files already past their expiry, then the oldest `available` job files (those of finished jobs). It **never** reclaims a file attached to a job that is still running, a file whose upload is in flight, or an unattached upload still inside its one-hour window. A reclaimed job file becomes expired: its bytes are deleted and a later download is a 410.
 - Admission itself deletes nothing: it only checks that enough reclaimable job-file bytes exist. The reclaim runs once the upload's size and checksum have verified, and only for the bytes that upload actually delivered, so a worker that declares a size and never sends the bytes cannot expire anyone's files.
-- Only if reclaiming everything reclaimable still would not fit is the archive refused, exactly as an over-quota archive is refused above. Job files never reclaim recovery archives; a job-file upload over the budget is refused 507 `storage_quota_exceeded`.
+- Shared-budget admission refuses if reclaimable job bytes cannot cover the declared excess. After size/checksum verification, bind sizes reclaim from committed bytes plus the verified archive size, excluding reservations; it then checks committed bytes after reclaim plus reserved job bytes plus the verified size. That later check can also refuse, rolling back reclaim and the upload. Job files do not reclaim recovery archives; a job-file upload over the budget is refused 507 `storage_quota_exceeded`.
 
 The owner and instance recovery quotas in the table above still apply on top of the shared budget. If you raise the budget or either store's quota, size the database volume for the budget plus your ordinary data ([Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909)). The design is recorded in [ADR-1909](../adr/1909-stored-file-budget.md).
 
@@ -242,21 +312,23 @@ separately from head notices.
 ### Guarded inventory and final custody transfer
 
 A claim is inventory-guarded when it has `inventory_guarded: true` and the
-API supports `recovery_inventory_v1`. Its hold stays **open** despite run
-completion or an earlier **Available** archive. At a verified source/process
+API supports `recovery_inventory_v1`. An earlier **Available** archive or
+completion alone keeps its hold **open**. The completed-publication exception
+below requires a separate API proof and receipt for the exact generation. At a verified source/process
 boundary, the worker freezes the unresolved inventory and constructs a
 recovery-only aggregate covering the retained roots by ancestry, with one
 current source tree. This aggregate never becomes the task branch or a
 checkpoint, and introduces no new publication path.
 
-Custody transfers only after the API acknowledges the final disposition:
-either the exact selected available, prerequisite-free archive (capture id,
+For the archive path, custody transfers after the API acknowledges the final
+disposition: either the exact selected available, prerequisite-free archive (capture id,
 source SHA and `coverage_digest`) or a verified empty inventory with settlement
-evidence. A thin archive is downloadable but never authorizes archive-backed
-FINAL or source cleanup, even when it covers every original root. Holds, pins and
-clones remain retained until independently verified empty-inventory settlement
-or explicit owner discard. There is no automatic thin-archive pod retirement;
-pod, PVC and hold costs continue.
+evidence. A thin archive is downloadable but does not authorize archive-backed
+FINAL or source cleanup, even when it covers every original root. Without a
+completed-publication receipt, holds, pins and clones remain retained until
+independently verified empty-inventory settlement or explicit owner discard.
+Thin-archive availability alone does not retire a pod; pod, PVC and hold costs
+continue while custody is open.
 The owner-readable receipt remains visible through `uzi run recovery`, and
 the selected available archive remains downloadable through `uzi run export`
 after the hold closes, including after worker deletion. This receipt is an
@@ -276,16 +348,38 @@ custody. Shared owed-head pins, sibling generations and lightweight context
 metadata still referenced by tracking or publication records remain intact.
 Archive coverage is not evidence that the work was published to your forge.
 
-The server keeps the durable disposition receipt and selected archive after
-local cleanup; the worker adds no new local receipt or tombstone. Execution
+The server keeps the durable archive disposition receipt and selected archive
+after local cleanup; this archive path adds no new local receipt or tombstone.
+The completed-publication path below stores its receipt in an existing
+authenticated recovery record. Execution
 or worker quarantine keeps the local evidence. Rejected credentials stop
 network recovery work, but bounded local cleanup of an already acknowledged
 inventory can still retry when execution and quarantine guards permit it.
 Boot discovery does not recreate journals for closed or discarded holds.
 
 Retiring a queued completion or finalization report is a separate decision.
-Without a covering acknowledgment, the worker needs fresh proof of terminal
-ownership and a complete, nonempty custody decision for that exact generation,
+An authenticated report for generation G can retire after real execution ends
+when fresh ownership is terminal (`completed`, `failed` or `cancelled`) at
+exactly G, and an authenticated exact-G reservation/upload journal identifies
+a fresh, healthy **Available** server archive with a matching bound manifest.
+The worker must also prove complete current source coverage and strictly clean
+actual clone contents; archive byte verification alone does not establish
+source completeness. Dirty, untracked or reset-soft WIP retains the report;
+a clean, covered WIP commit can qualify. A thin capture can support this
+**report-only** decision, without authorizing FINAL, custody release, source
+or pin deletion, or clone cleanup. Busy execution, queued duplicates, changed
+report identity, missing old-contract evidence, uncertain reads, input overflow
+or an expired proof budget retain the report. Proof is bounded to one second
+and any shorter caller budget; restart requires fresh proof. Once live execution
+has ended and the report retires, the next accepted heartbeat omits its
+terminal-pending active-run row. See
+[ADR-2652](../adr/2652-report-only-retirement.md) for the protected boundary,
+cancellation and rollout limits.
+
+Outside that archive-backed exception, without a covering acknowledgment or a persisted
+exact-generation completed-publication receipt,
+the worker needs fresh proof of terminal ownership and a complete, nonempty
+custody decision for that exact generation,
 with no open sibling holds on that worker. Pending guarded inventory requires
 every exact hold to be **discarded**; a mixture of released and discarded
 holds is insufficient. With absent recovery journals, released or discarded
@@ -295,8 +389,8 @@ Missing ownership, transferred ownership or unavailable evidence keeps the
 report. A `stale_claim` response supersedes the report; it does not settle or
 delete recovery inventory. Exact discard authorizes report retirement alone:
 physical clone or recovery-source retirement still requires the existing
-quiescence and retention rules, and guarded recovery journals require a
-covering final acknowledgment. See [ADR-2417](../adr/2417-guarded-local-retention.md)
+quiescence and retention rules. Guarded recovery journals require a covering
+final acknowledgment or the distinct completed-publication cleanup authority. See [ADR-2417](../adr/2417-guarded-local-retention.md)
 for the exact checks; the [bad-MAC terminal-record cleanup](#when-a-terminal-record-fails-authentication-after-restart)
 below remains a distinct policy.
 
@@ -328,6 +422,59 @@ quotas, owner-only access and explicit discard behavior are unchanged.
 
 Operational rollout: deploy the API's prerequisite-release guard before deploying
 the worker producer that can emit guarded thin archives.
+
+### Automatic release after verified completion
+
+A completed **issue**, **MR-rework** (`mr_rework`) or **self-improvement**
+(`self_improve`) run can release its inventory-guarded hold without preparing
+another archive. Both worker and API must support
+`recovery_completed_publication_v1`. After completion is committed, the API
+checks that the run's recorded MR names the expected branch in its own
+repository, that the branch head matches the MR head, and that this head
+contains or equals the fixed final commit reported at completion. A matching
+copy in that repository qualifies; this is not a branch-protection or non-fork
+guarantee. Later user deletion or rewriting of the published copy is outside
+this proof.
+
+The release applies to the **exact completing generation**. It does not
+release older or successor holds or backfill older completed runs, including
+earlier self-improvement runs without a stamped completion identity. Failed,
+cancelled and parked runs, and `ci_fix`, `prompt` and `task`, keep their
+existing rules. Healthy completion release needs no heartbeat prerequisite.
+
+A successful receipt needs no capture, WIP commit, frozen inventory or
+clean-source proof. Existing available, thin or needs-action captures do not
+block it, and retained archives keep their existing retention policy.
+Unavailable forge evidence, missing or mismatched identities, inconclusive
+ancestry or identity drift keeps custody open with a bounded reason.
+Replaying the exact original completion returns the stored receipt without
+depending on current forge or mutable run state.
+
+When its existing outbox can journal the terminal report, the worker saves
+the original completion before archive preparation. A valid receipt skips that preparation and must be persisted and read back in an
+existing authenticated generation recovery record before protected report
+retirement. Without a valid receipt, including a refusal, unknown ACK or a
+mixed-version or excluded-kind response, the existing capture path remains
+the fallback. If the API released custody but its ACK was lost, a later
+capture refusal grants no cleanup authority and does not fail or reopen the
+completed run; replaying its original completion recovers the receipt.
+
+**Custody release and physical cleanup are separate.** Local cleanup still
+requires process quiescence, credential isolation, exact owned paths and
+source attribution under execution, adoption and repository locks. It may
+discard eligible dirty or untracked leftovers of that completing source.
+Sibling generations, shared pins, referenced metadata, foreign or unknown
+inventory and quarantine remain protected. The receipt does not prove that
+the worker's disk has already been cleaned.
+
+`uzi run recovery <run-id>` shows the receipt's fixed final SHA, observed
+branch head, branch and MR, separately from archive availability and physical
+retirement. Open holds show a bounded completed-publication refusal reason.
+JSON exposes additive `completed_publication_receipt` and
+`completed_publication_reason` fields on hold records; older responses can
+omit them. See [ADR-1296](../adr/1296-durable-run-recovery.md) and
+[ADR-2417](../adr/2417-guarded-local-retention.md) for the identity and cleanup
+boundaries.
 
 ### Published checkpoint refs
 
@@ -373,7 +520,9 @@ that governs the recovery archives above.
 
 The ancestry settlement below applies to legacy, unguarded holds. Guarded
 holds use the [final inventory disposition](#guarded-inventory-and-final-custody-transfer)
-above; publishing one adopted head does not settle their divergent inventory.
+above; the completed-publication exception settles only the completing generation,
+not an older adopted generation. Publishing one adopted head does not settle
+that older generation's divergent inventory.
 
 When a run is resumed on the same worker (after a rate-limit park, a
 recovery restart, or a similar restart), the new generation may adopt an
@@ -438,7 +587,8 @@ you. Each row offers the right action for its state:
   export`). Downloading does not itself release custody. Legacy holds can
   release automatically when an archive becomes ready; guarded holds await
   a verified final disposition even if an archive is available; prerequisites
-  prevent archive-backed final custody release.
+  prevent archive-backed final custody release. Eligible completed runs can
+  instead release through the separate completed-publication proof below.
   An Export-only row is not proof that guarded custody has closed.
 - **Discard held work** — for a hold whose source may be the only copy (no
   ready archive can restore it), permanently release custody so the worker
@@ -488,7 +638,7 @@ available archive remains exportable; a latest preparing/uploading capture is no
 yet downloadable, and an earlier archive may omit latest worker-local work. These
 capture facts do not settle the owner decision or implicitly release custody.
 Other terminal holds without a verified available capture report `source_only`,
-rather than `active_protected`. An inventory-guarded hold also reports `source_only` while an
+rather than `active_protected`. An open inventory-guarded hold also reports `source_only` while an
 archive is downloadable: coverage may be incomplete, or the archive may require
 external commits even when it covers every root. Availability does not settle
 custody. Recorded evidence or uncertainty at exhaustion holds the
@@ -551,8 +701,9 @@ a terminal status alone does not make the older work disposable.
    do not prove dirty or untracked bytes disposable during orphan reclaim.
 
 This reclaim does not request custody release. The server-proof automatic
-settlement described above governs eligible legacy holds; guarded holds
-require final inventory acknowledgment.
+settlement described above governs eligible legacy holds. Guarded source
+retirement requires final inventory acknowledgment or the separate exact-generation
+completed-publication authority; orphan reclaim itself supplies neither.
 
 #### Reading orphan-reclaim diagnostics
 

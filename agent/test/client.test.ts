@@ -1064,6 +1064,23 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
   });
 });
 
+describe("W1 account boundary deferral", () => {
+  it("recognises only the typed RequestError 409 JSON object", () => {
+    const body = JSON.stringify({ error: "private body", reason: "codex_account_unavailable" });
+    assert.equal(codexDeferralReason(new RequestError("POST", "/x", 409, body)), "account_unavailable");
+    for (const error of [
+      new Error(body),
+      new RequestError("POST", "/x", 400, body),
+      new RequestError("POST", "/x", 500, body),
+      new RequestError("POST", "/x", 409, "codex_account_unavailable"),
+      new RequestError("POST", "/x", 409, JSON.stringify(["codex_account_unavailable"])),
+      new RequestError("POST", "/x", 409, "null"),
+      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "account_unavailable" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ error: "codex_account_unavailable" })),
+    ]) assert.equal(codexDeferralReason(error), undefined);
+  });
+});
+
 // Issue #1766: the typed 409 vault_locked reply on the Codex credential routes.
 describe("codexDeferralReason", () => {
   const locked = JSON.stringify({ error: "codex credential vault is locked; retry after unlock", reason: "vault_locked" });

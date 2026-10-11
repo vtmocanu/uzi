@@ -636,6 +636,8 @@ SELECT
     h.final_capture_id,
     h.final_source_sha,
     h.final_coverage_digest,
+    h.completed_publication_receipt,
+    h.completed_publication_reason,
     COALESCE(w.name, '')::text AS worker_name,
     f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed,
     cr.ref AS checkpoint_ref,

@@ -635,9 +635,14 @@ below.
 controller-managed k8s worker (see [Hosted workers](./hosted-workers.md)) the cap
 comes from the chart value `workers.maxConcurrentRuns` (default 1), which the
 controller renders into the pod's `WORKER_MAX_CONCURRENT_RUNS` env for you. Raising
-it is an operator action: update the controller/chart configuration and size
-the preset to hold that many concurrent runs. Desired spec changes use the
-existing worker roll process. It's the same knob described above, and raising
+it is an operator action: apply updated chart values with the new cap. The
+controller Deployment gets the updated `UZI_WORKER_MAX_CONCURRENT_RUNS` env and
+restarts; the restarted controller renders a changed worker pod-template hash.
+Reconciliation then rolls each worker under the existing drain rules: busy workers
+are cordoned and allowed to finish, bounded by the drain deadline and the operator
+force-roll override (see [ADR-422](../adr/0422-decouple-worker-version.md)). No new
+published controller or chart release is required. Size the preset to hold that
+many concurrent runs. It's the same knob described above, and raising
 it opts into the same intra-user residuals just covered. An ephemeral (run-bound)
 hosted worker is recorded with a run cap of 1, whatever it advertises, since
 its run lane serves its bound run (or an eligible lease follow-up). Its separate

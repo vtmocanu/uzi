@@ -1,0 +1,75 @@
+{
+  "note": "Authored (not recorded) for PRD #2603: one Claude leg whose lead result frame names claude-haiku-4-5-20251001 (the model the Now summary also uses) plus two progress_note frames in the SAME leg. progress_note payloads carry only text, milestone_id and model_usage (no event, no usage key: either would be read as a result frame). The notes carry no costUSD, so the server prices them from the standard Anthropic table.",
+  "run_id": "2603aaaa-0000-4000-8000-000000000001",
+  "frames": [
+    {
+      "seq": 1,
+      "kind": "status",
+      "payload": {
+        "event": "init",
+        "model": "claude-opus-4-8"
+      }
+    },
+    {
+      "seq": 5,
+      "kind": "status",
+      "payload": {
+        "event": "result",
+        "usage": {
+          "input_tokens": 1700,
+          "output_tokens": 2300,
+          "cache_read_input_tokens": 50000,
+          "cache_creation_input_tokens": 3000
+        },
+        "modelUsage": {
+          "claude-opus-4-8": {
+            "inputTokens": 1000,
+            "outputTokens": 2000,
+            "cacheReadInputTokens": 50000,
+            "cacheCreationInputTokens": 3000,
+            "costUSD": 1.5
+          },
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 700,
+            "outputTokens": 300,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.001
+          }
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "kind": "progress_note",
+      "payload": {
+        "text": "Reviewing the changes for the first milestone",
+        "milestone_id": "m1",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 400,
+            "outputTokens": 40,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "kind": "progress_note",
+      "payload": {
+        "text": "Running the tests for the first milestone",
+        "milestone_id": "m1",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 500,
+            "outputTokens": 60,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    }
+  ]
+}

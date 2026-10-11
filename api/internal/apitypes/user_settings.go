@@ -40,8 +40,12 @@ type UserSettingsDTO struct {
 	// MrReworkEnabled is the CLI decode mirror of the per-user MR review-watcher
 	// opt-in (PRD #700 M5). Fidelity only — carried so a decode never drops it; null
 	// means unset = the default-ON state.
-	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
-	SidebarTokenIds []string `json:"sidebar_token_ids"`
+	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	// NowSummaryEnabled is the CLI decode mirror of the per-user model-written "Now" summary
+	// switch (PRD #2603); null means unset = the default-ON state, an explicit false is the
+	// opt-out. The effective value is this AND the instance switch.
+	NowSummaryEnabled *bool    `json:"now_summary_enabled"`
+	SidebarTokenIds   []string `json:"sidebar_token_ids"`
 	// SidebarCodexAccountIds is the CLI decode mirror of the linked Codex accounts the
 	// user surfaced on the sidebar rail (PRD #1209 M1), the codex sibling of
 	// SidebarTokenIds. Fidelity only — carried so a decode never drops it.

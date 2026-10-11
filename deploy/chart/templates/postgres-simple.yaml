@@ -123,7 +123,7 @@ spec:
               protocol: TCP
           readinessProbe:
             exec:
-              command: ["sh", "-c", "pg_isready -U {{ $user }} -d {{ $db }}"]
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -U {{ $user }} -d {{ $db }}"]
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3

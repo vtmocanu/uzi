@@ -65,8 +65,9 @@ VALUES="deploy/chart/values.yaml"
 ASSERT="scripts/assert-worker-tag-decoupled.sh"
 [ -f "$VALUES" ] || { echo "worker-tag-autobump: $VALUES not found (run from repo root)" >&2; exit 2; }
 
-# The agent runtime surface -- see the header. Space-separated, repo-relative.
-AGENT_PATHS="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex"
+# The shared agent runtime surface -- see the header. Resolve next to this script.
+# shellcheck source=scripts/lib/shipping-paths.sh
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/lib/shipping-paths.sh"
 
 # Read `workers.image.tag`: the `tag:` under the FIRST `image:` that is a direct (two-space)
 # child of the top-level `workers:` key. workers.docker.image / workers.controller.image

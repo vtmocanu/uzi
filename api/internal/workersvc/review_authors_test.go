@@ -38,10 +38,11 @@ var (
 
 // lookupFake scripts RepositoryAuthorEligibility per author id. An unscripted id is an error.
 type lookupFake struct {
-	mu      sync.Mutex
-	answers map[int64]forge.AuthorEligibility
-	hang    map[int64]bool // block until the lookup's context is done
-	calls   []int64
+	mu       sync.Mutex
+	answers  map[int64]forge.AuthorEligibility
+	hang     map[int64]bool // block until the lookup's context is done
+	calls    []int64
+	canceled map[int64]error
 }
 
 func (f *lookupFake) RepositoryAuthorEligibility(ctx context.Context, _ int64, id int64) (forge.AuthorEligibility, error) {
@@ -52,6 +53,9 @@ func (f *lookupFake) RepositoryAuthorEligibility(ctx context.Context, _ int64, i
 	f.mu.Unlock()
 	if hang {
 		<-ctx.Done()
+		f.mu.Lock()
+		f.canceled[id] = ctx.Err()
+		f.mu.Unlock()
 		return forge.AuthorUnknown, ctx.Err()
 	}
 	if !ok {
@@ -68,8 +72,9 @@ func (f *lookupFake) looked() []int64 {
 
 func newLookup() *lookupFake {
 	return &lookupFake{
-		answers: map[int64]forge.AuthorEligibility{memberID: forge.AuthorEligible, outsiderID: forge.AuthorNotEligible},
-		hang:    map[int64]bool{},
+		answers:  map[int64]forge.AuthorEligibility{memberID: forge.AuthorEligible, outsiderID: forge.AuthorNotEligible},
+		hang:     map[int64]bool{},
+		canceled: map[int64]error{},
 	}
 }
 
@@ -399,13 +404,18 @@ func TestOneHangingLookupDoesNotConsumeTheAssessment(t *testing.T) {
 	h := newHarness()
 	h.timeout = 50 * time.Millisecond
 	h.lookup.hang[flakyID] = true
-	start := time.Now()
 	res := h.snapshot(t, h.params(
 		inline(1, flakyID, "hanger", "x", raT0),
 		inline(2, memberID, "carol", "member", raT0.Add(time.Second)),
 	))
-	if took := time.Since(start); took > 5*time.Second {
-		t.Fatalf("assessment took %s: the per-lookup timeout did not bound the hanging lookup", took)
+	h.lookup.mu.Lock()
+	lookupErr := h.lookup.canceled[flakyID]
+	h.lookup.mu.Unlock()
+	if !errors.Is(lookupErr, context.DeadlineExceeded) {
+		t.Fatalf("hanging lookup cancellation = %v, want DeadlineExceeded", lookupErr)
+	}
+	if got := h.lookup.looked(); !slices.Equal(got, []int64{flakyID, memberID}) {
+		t.Fatalf("lookups = %v, want hanging author followed by member", got)
 	}
 	if got := bodies(res); !slices.Equal(got, []string{"member"}) {
 		t.Fatalf("bodies = %v, want the member's comment despite the hanging lookup", got)

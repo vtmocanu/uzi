@@ -292,7 +292,7 @@ describe("the mid-turn tick spawner (issue #2213)", () => {
     try {
       latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
       const sp = new TickSpawner({ signal: new AbortController().signal });
-      const h = await sp.spawn({ argv: ["/bin/true"], cwd: dir, env: { PATH: "/usr/bin:/bin" }, identity: "worker_pat" });
+      const h = await sp.spawn({ argv: [process.execPath, "-e", ""], cwd: dir, env: { PATH: "/usr/bin:/bin" }, identity: "worker_pat" });
       assert.deepEqual(await h.completed, { code: 0 });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

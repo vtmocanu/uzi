@@ -57,6 +57,13 @@ COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
 # Same reason for the shared schedule presets (#2344): schedulePresets.test.ts statically imports
 # `../../../fixtures/schedule-presets/canonical.json`, shared with the Go preset tests.
 COPY fixtures/schedule-presets/ /app/fixtures/schedule-presets/
+# Same reason for the TUI/web answer parity fixture (#2550): runQuestion.test.ts and
+# QuestionPanel.test.tsx statically import `../../../fixtures/run-question-answer.json`.
+COPY fixtures/run-question-answer.json /app/fixtures/run-question-answer.json
+# PlanPanel.test.tsx statically imports this typed JSON fixture.
+COPY fixtures/plan-revision/ /app/fixtures/plan-revision/
+# runProgressParity.test.ts and mocks/runProgress.test.ts import the run-progress parity fixture (#2602).
+COPY fixtures/run-progress/ /app/fixtures/run-progress/
 RUN npm run build
 
 # --- runtime stage ---

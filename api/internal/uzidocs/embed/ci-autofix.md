@@ -35,7 +35,7 @@ instance-wide kill-switch (`ci_autofix_enabled`, default **on**) that turns
 automatic CI fixes off for every user at once regardless of their own
 setting — the same pattern as [MR review rework](./mr-review-watcher.md#enablement)'s
 kill-switch, and set the same way: through the settings API rather than a
-dedicated Admin Settings control today. A settings-read hiccup is treated as
+dedicated Admin → Instance control today. A settings-read hiccup is treated as
 off (fail closed), never as silently on.
 
 ### Upgrading from an older uzi

@@ -125,6 +125,30 @@ describe("timezone suggestions", () => {
   });
 });
 
+describe("label sweep eligibility copy", () => {
+  it.each([
+    {
+      uziLabel: "uzi",
+      expected: "Empty ⇒ the uzi label. A selector chooses candidates; a candidate fires only when it also carries the uzi label or is assigned to the uzi bot.",
+    },
+    {
+      uziLabel: "runnable",
+      expected: "Empty ⇒ the runnable label. A selector chooses candidates; a candidate fires only when it also carries the runnable label or is assigned to the uzi bot.",
+    },
+  ])("explains label or bot-assignment eligibility with $uziLabel", async ({ uziLabel, expected }) => {
+    vi.mocked(useAuth).mockReturnValue({ uziLabel } as unknown as ReturnType<typeof useAuth>);
+    await act(async () => {
+      renderModal();
+    });
+
+    fireEvent.click(screen.getByRole("radio", { name: /Label sweep/ }));
+
+    const paragraph = screen.getByText(/Empty ⇒/);
+    expect(paragraph.tagName).toBe("P");
+    expect(paragraph.textContent?.replace(/\s+/g, " ").trim()).toBe(expected);
+  });
+});
+
 describe("target switching swaps the fields", () => {
   it("issue → sweep → prompt reveals the right control each time", async () => {
     renderModal();

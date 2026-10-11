@@ -34,6 +34,7 @@
   "updated_at": "0001-01-01T00:00:00Z",
   "next_fires": null,
   "last_fire": null,
+  "recent_fires": null,
   "credential_override": null,
   "harness": null
 }

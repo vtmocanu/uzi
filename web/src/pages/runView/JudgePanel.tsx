@@ -19,7 +19,7 @@ import { stripUnsafeChars } from "../../lib/safeText";
 import { useAsyncData } from "../../lib/useAsyncData";
 import { formatDuration } from "../../components/RunEvent";
 import { formatTokens } from "../../lib/formatTokens";
-import { costDisplay, costHeadline } from "../../lib/costStatus";
+import { costDisplay, costHeadline, costSubLabel } from "../../lib/costStatus";
 import { Markdown } from "../../components/Markdown";
 import { Alert, Badge, Button, Card, Spinner, cx } from "../../components/ui";
 import { TriageActions } from "../../components/triage/TriageActions";
@@ -93,7 +93,10 @@ export function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview[
       <JudgeStat label="Tokens in" value={formatTokens(usage.input_tokens)} />
       <JudgeStat label="Tokens out" value={formatTokens(usage.output_tokens)} />
       <JudgeStat label="Duration" value={durationMs !== null ? formatDuration(durationMs) : "—"} />
-      <JudgeStat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"} />
+      <div>
+        <JudgeStat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"} />
+        <div className="bg-raised/75 px-3.5 pb-2 text-[11px] text-muted">{costSubLabel(cost)}</div>
+      </div>
     </div>
   );
 }

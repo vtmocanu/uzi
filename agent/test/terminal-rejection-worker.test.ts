@@ -79,7 +79,7 @@ test("heartbeat runs immediately after Register while offered finalize retiremen
   const retire = deferred<void>();
   const realRetire = r.outbox.retireFinalizeIfEligible.bind(r.outbox);
   let retiring = false;
-  r.outbox.retireFinalizeIfEligible = async (...args) => { retiring = true; await retire.promise; await realRetire(...args); };
+  r.outbox.retireFinalizeIfEligible = async (...args) => { retiring = true; await retire.promise; return await realRetire(...args); };
   let heartbeats = 0;
   let claims = 0;
   const client = {

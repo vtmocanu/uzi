@@ -423,8 +423,12 @@ type Config struct {
 	RunMaxRequeues              int           // automatic worker-death requeues allowed per owner recovery episode (zero disables automatic requeues)
 	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + eligible runs re-queued within episode allowance, else held or failed by recorded state
-	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
-	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
+	// DBStorageCapacityBytes is DB_STORAGE_CAPACITY_BYTES: the database-size budget (bytes) the
+	// admin-health db.size check measures pg_database_size against. 0 means unset or invalid,
+	// and the check reports `na`.
+	DBStorageCapacityBytes int64
+	DiskPressureThreshold  float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
+	SweepInterval          time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	// SweeperBootGrace (PRD #1390 M1, D1): the three stale-worker passes
 	// (MarkStaleWorkersOffline, FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers)
 	// are skipped until this has elapsed since the LISTENER became ready — not since the
@@ -463,9 +467,12 @@ type Config struct {
 	ActiveSnapshotDisabled bool
 	WorkerPollInterval     time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace    time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling  time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace      time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace  time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	// WorkerStaleRequeueGrace (#2705): how long a run the stale-worker sweeper requeued stays
+	// pinned to its (heartbeat-stale) previous worker so a returning worker can resume it. 0 disables.
+	WorkerStaleRequeueGrace time.Duration
+	WorkerAffinityCeiling   time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace   time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -1135,6 +1142,18 @@ func Load() (Config, error) {
 				"value", raw)
 		}
 	}
+	// DB_STORAGE_CAPACITY_BYTES: a positive base-10 int64 byte count of at most 1 EiB (the same
+	// bound deploy/chart/templates/_helpers.tpl enforces). Unset is silently 0; a set but
+	// unparseable, nonpositive or oversized value is 0 with one boot warning. Non-fatal: it
+	// only feeds the db.size health check.
+	if raw := strings.TrimSpace(os.Getenv("DB_STORAGE_CAPACITY_BYTES")); raw != "" {
+		if v, perr := strconv.ParseInt(raw, 10, 64); perr == nil && v > 0 && v <= maxDBStorageCapacityBytes {
+			cfg.DBStorageCapacityBytes = v
+		} else {
+			slog.Warn("DB_STORAGE_CAPACITY_BYTES is not a positive integer of at most 1 EiB (1152921504606846976 bytes); ignoring it, so the db.size health check is `na`",
+				"value", raw)
+		}
+	}
 	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
 	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
 	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)
@@ -1167,6 +1186,11 @@ func Load() (Config, error) {
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+	// #2705: a stale-requeued run stays pinned to its previous worker this long while that
+	// worker's row exists; 0 disables the pin. The pin runs from status_since (the requeue, or
+	// a later Codex account promotion, which opens a new queued episode). WORKER_AFFINITY_CEILING
+	// bounds each queued episode, not the total.
+	cfg.WorkerStaleRequeueGrace = parseNonNegDuration("WORKER_STALE_REQUEUE_GRACE", 10*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
 	// to its prior worker while its row exists and it is heartbeating or draining
 	// (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment
@@ -2321,3 +2345,7 @@ func samePort(a, b string) bool {
 	}
 	return hostA == hostB
 }
+
+// maxDBStorageCapacityBytes is 1 EiB, the ceiling deploy/chart/templates/_helpers.tpl applies
+// to the rendered DB_STORAGE_CAPACITY_BYTES.
+const maxDBStorageCapacityBytes = int64(1) << 60

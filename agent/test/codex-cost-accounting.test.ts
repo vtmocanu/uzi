@@ -10,12 +10,8 @@ import {
 import type { CodexThreadTokenUsage, CodexUsageBreakdown } from "../src/codex/transport.js";
 
 // PRD #1332 (M5A, C4b) — the cost projection D5 layers over C4a's token accounting, exercised
-// through the accountant. These pin: a subscription run marks every entry `subscription` with no
-// costUSD (even an unknown model); a fully-observed supported api-key run is `metered` with the
-// summed per-response Standard price; a missed-update gap and an unknown model degrade to
-// `unreported` while RETAINING tokens; a duplicate never double-counts cost; the Sol review-date
-// flip degrades only Sol (astra stays metered); and conservative dominance taints a whole model
-// on any unpriceable/unreconciled response. Run-level rollup is checked via deriveCodexRunCost.
+// through the accountant. Both auth modes use API-equivalent per-response prices.
+// Incomplete evidence and reconciliation gaps retain tokens as unreported.
 
 const ASTRA = "gpt-6-astra";
 const SOL = "gpt-5.6-sol";
@@ -68,25 +64,52 @@ function assertTokens(
   assert.equal(entry.reasoningOutputTokens, want.reasoning);
 }
 
-describe("CodexUsageAccountant cost: a subscription run marks every entry subscription, no costUSD", () => {
-  it("every model — including an unknown one — is subscription with tokens retained and no dollar figure", () => {
+describe("subscription API-equivalent pricing", () => {
+  it("gpt-6.1-sol identical responses have independent literal dollar parity with per-response tiers", () => {
     const acct = new CodexUsageAccountant();
-    acct.registerThread(ROOT, ASTRA, false);
-    acct.registerThread(CHILD, UNKNOWN, false);
-    acct.record(ROOT, usage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }));
-    acct.record(CHILD, usage({ inputTokens: 80, outputTokens: 40, totalTokens: 120 }, { inputTokens: 80, outputTokens: 40, totalTokens: 120 }));
-    const agg = acct.aggregateByModel(SUBSCRIPTION);
-    for (const model of [ASTRA, UNKNOWN]) {
-      const entry = get(agg, model);
-      assert.equal(entry.costStatus, "subscription");
-      assert.ok(!("costUSD" in entry), `no costUSD on a subscription ${model} entry`);
+    acct.registerThread(ROOT, "gpt-6.1-sol", false);
+    const first = { inputTokens: 200000, cachedInputTokens: 60000, cacheWriteInputTokens: 10000, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 200200 };
+    const second = { inputTokens: 300000, cachedInputTokens: 60000, cacheWriteInputTokens: 10000, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 300200 };
+    acct.record(ROOT, usage(first, first));
+    acct.record(ROOT, usage({ inputTokens: 500000, cachedInputTokens: 120000, cacheWriteInputTokens: 20000, outputTokens: 400, reasoningOutputTokens: 100, totalTokens: 500400 }, second));
+    // Low: (130000*2 + 60000*.1 + 10000*2.5 + 200*10)/1e6 = .293.
+    // High: (230000*4 + 60000*.2 + 10000*5 + 200*15)/1e6 = .985.
+    for (const pricing of [API_KEY_EARLY, SUBSCRIPTION]) {
+      const agg = acct.aggregateByModel(pricing);
+      const entry = get(agg, "gpt-6.1-sol");
+      assert.equal(entry.costStatus, "metered");
+      assert.equal(micro(entry.costUSD), 1278000);
+      assert.deepEqual(deriveCodexRunCost(agg), { kind: "metered", usd: 1.278, source: "price_table" });
     }
-    assertTokens(get(agg, ASTRA), { input: 300, output: 200, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
-    assertTokens(get(agg, UNKNOWN), { input: 80, output: 40, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
-    // Run-level rollup: a subscription run is subscription regardless of usage.
-    assert.deepEqual(deriveCodexRunCost(agg, "subscription"), { kind: "subscription" });
-    assert.deepEqual(deriveCodexRunCost(undefined, "subscription"), { kind: "subscription" });
+    assert.deepEqual(acct.aggregateByModel(SUBSCRIPTION), acct.aggregateByModel(API_KEY_EARLY));
+    assert.equal(get(acct.aggregateByModel(), "gpt-6.1-sol").costStatus, "unreported");
+    assert.deepEqual(deriveCodexRunCost(undefined), { kind: "unreported" });
   });
+
+  for (const authMode of ["subscription", "api_key"] as const) {
+    for (const scenario of ["unknown", "stale", "malformed", "cache split", "missed", "dominance", "incomplete resume"] as const) {
+      it(`${authMode}: ${scenario} fails pricing closed`, () => {
+        const acct = new CodexUsageAccountant();
+        const model = scenario === "unknown" ? "gpt-5.5" : scenario === "stale" ? SOL : "gpt-6.1-sol";
+        acct.registerThread(ROOT, model, scenario === "incomplete resume");
+        const b = { inputTokens: 100, cachedInputTokens: scenario === "cache split" ? 101 : 0, outputTokens: 60, totalTokens: 160 };
+        acct.record(ROOT, { ...usage(b, scenario === "missed" ? { inputTokens: 50, outputTokens: 30, totalTokens: 80 } : b), pricingEvidenceComplete: scenario !== "malformed" });
+        if (scenario === "dominance") {
+          acct.registerThread(CHILD, model, false);
+          acct.record(CHILD, usage({ inputTokens: 100, outputTokens: 60, totalTokens: 160 }, { inputTokens: 50, outputTokens: 30, totalTokens: 80 }));
+        }
+        const agg = acct.aggregateByModel({ authMode, now: new Date("2026-11-21T00:00:00Z") });
+        if (scenario === "incomplete resume") assert.equal(agg, undefined);
+        else {
+          const entry = get(agg, model);
+          assert.equal(entry.costStatus, "unreported");
+          assert.ok(!("costUSD" in entry));
+          assert.equal(entry.outputTokens, scenario === "dominance" ? 120 : 60);
+        }
+        assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
+      });
+    }
+  }
 });
 
 describe("CodexUsageAccountant cost: a fully-observed api-key run is metered at the Standard price", () => {
@@ -102,7 +125,7 @@ describe("CodexUsageAccountant cost: a fully-observed api-key run is metered at 
     assert.equal(astra.costStatus, "metered");
     // 300*10 + 600*1 + 100*12.5 + 200*50 = 14850 µ$. Reasoning (50) NOT added to output.
     assert.equal(micro(astra.costUSD), 14850);
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "metered", usd: astra.costUSD!, source: "price_table" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "metered", usd: astra.costUSD!, source: "price_table" });
   });
 
   it("sums per-response prices across growing notes (cost is Σ last, tokens are the cumulative delta)", () => {
@@ -160,7 +183,7 @@ describe("CodexUsageAccountant cost: an unreconciled gap keeps tokens but report
     assertTokens(astra, { input: 700, output: 500, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
     assert.equal(astra.costStatus, "unreported");
     assert.ok(!("costUSD" in astra), "no costUSD on an unreconciled entry");
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 
   it("an unknown model on an api-key run is unreported with tokens retained", () => {
@@ -190,7 +213,7 @@ describe("CodexUsageAccountant cost: mixed status across models in one run", () 
     assert.ok(!("costUSD" in unknown));
     assertTokens(unknown, { input: 80, output: 40, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
     // Run-level dominance: any unreported entry makes the whole run unreported.
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 });
 
@@ -210,7 +233,7 @@ describe("CodexUsageAccountant cost: the Sol review date flips only Sol", () => 
     assert.equal(micro(get(agg, ASTRA).costUSD), 1000 * 10 + 200 * 50); // 20000 µ$
     assert.equal(get(agg, SOL).costStatus, "metered");
     assert.equal(micro(get(agg, SOL).costUSD), 1000 * 4 + 200 * 20); // 8000 µ$
-    assert.equal(deriveCodexRunCost(agg, "api_key").kind, "metered");
+    assert.equal(deriveCodexRunCost(agg).kind, "metered");
   });
 
   it("2026-11-21: gpt-5.6-sol becomes unreported (tokens retained), gpt-6-astra stays metered", () => {
@@ -223,7 +246,7 @@ describe("CodexUsageAccountant cost: the Sol review date flips only Sol", () => 
     assert.ok(!("costUSD" in sol));
     assertTokens(sol, { input: 1000, output: 200, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
     // One unreported entry dominates the run rollup.
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 });
 
@@ -291,13 +314,13 @@ describe("CodexUsageAccountant cost: per-response dominance within ONE reconcile
     // Tokens RETAINED from the cumulative delta: uncached 150-40-30 = 80, cacheRead 40, cacheCreation 30, output 100.
     assertTokens(astra, { input: 80, output: 100, cacheRead: 40, cacheCreation: 30, reasoning: 0 });
     // Run-level rollup: the unreported entry dominates.
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 });
 
 describe("deriveCodexRunCost: api-key rollup edges", () => {
   it("no usage on an api-key run is unreported (never a metered $0)", () => {
-    assert.deepEqual(deriveCodexRunCost(undefined, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(undefined), { kind: "unreported" });
   });
 
   it("all-metered entries sum into one metered run cost", () => {
@@ -306,7 +329,7 @@ describe("deriveCodexRunCost: api-key rollup edges", () => {
       [SOL]: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "metered", costUSD: 0.25 },
     };
     // 0.5 + 0.25 = 0.75 is exact in binary float, so an equality assert is safe here.
-    assert.deepEqual(deriveCodexRunCost(entries, "api_key"), { kind: "metered", usd: 0.75, source: "price_table" });
+    assert.deepEqual(deriveCodexRunCost(entries), { kind: "metered", usd: 0.75, source: "price_table" });
   });
 
   it("any unreported entry makes the run unreported even alongside metered entries", () => {
@@ -314,6 +337,6 @@ describe("deriveCodexRunCost: api-key rollup edges", () => {
       [ASTRA]: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "metered", costUSD: 0.5 },
       [SOL]: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, costStatus: "unreported" },
     };
-    assert.deepEqual(deriveCodexRunCost(entries, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(entries), { kind: "unreported" });
   });
 });

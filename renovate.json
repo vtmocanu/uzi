@@ -155,6 +155,11 @@
       "description": "Agent runtime core: every bump gets an adoption read of its release notes (uzi-lander references/renovate.md), so it is never automerged.",
       "matchPackageNames": ["@anthropic-ai/claude-agent-sdk"],
       "automerge": false
+    },
+    {
+      "description": "Postgres is pinned twice: docker-compose.yml (`postgres`) and ci.yml's test-api-store-it service, which pulls through the mirror.gcr.io Docker Hub cache (`mirror.gcr.io/library/postgres`, #2621). Both must stay on the same tag and digest so the CI LiveDB lane tests the engine the stack ships, so they share one branch (#2622); scripts/check-postgres-pin-parity.sh gates the result.",
+      "matchDepNames": ["postgres", "mirror.gcr.io/library/postgres"],
+      "groupName": "postgres"
     }
   ]
 }

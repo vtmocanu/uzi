@@ -342,7 +342,7 @@ func TestRollHealthStaysRollingAcrossTicksWhileThePodIsNotReady(t *testing.T) {
 	desired := protocol.DesiredWorker{ID: id, Template: "base", Size: "m", Generation: 1}
 
 	// A deployment already in the cluster at a STALE spec hash — i.e. drifted, which
-	// is what a release does to every worker.
+	// is what a changed desired pod template does to this worker.
 	stale := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "uzi-hw-" + id, Namespace: ns, Labels: objectLabels(id)},
 		Spec: appsv1.DeploymentSpec{
@@ -866,8 +866,8 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 
 	// --- 4. THE HEALTHY ROLL. Ready, 0 restarts. Must not regress. ---
 	//
-	// This is every worker on every release. If it moves, the fix has turned the whole
-	// fleet's badge red — the cry-wolf failure the roll-health feature exists to prevent.
+	// This is a healthy settled worker after a roll. If it moves, the fix flags healthy
+	// workers — the cry-wolf failure the roll-health feature exists to prevent.
 	healthy := ready(runningFor(workerPod("w4", want, 3*time.Minute), "worker", 0, 90*time.Second, nil, false),
 		testNow.Add(-90*time.Second))
 	hh := deriveRollHealth([]corev1.Pod{*healthy}, want, "", testNow)
@@ -1223,8 +1223,9 @@ func TestRecreateGapReportsRollingRatherThanNoRow(t *testing.T) {
 // attention set — and past the INV-5 ceiling fell through to `unknown`, also silent.
 //
 // The fix is one condition lookup. The DANGER in the fix is the opposite failure: a
-// healthy Recreate roll passes through pod-less for ~1.4s on every release, so reporting
-// `stuck` for pod-lessness as such would turn the whole fleet red every time uzi ships.
+// healthy Recreate roll passes through pod-less (measured at ~1.4s on a real roll,
+// not a timing guarantee), so reporting `stuck` for pod-lessness as such would flag
+// healthy rolling workers.
 //
 // So the only thing worth testing is that the two are SEPARATED, and that is a claim
 // about a pair, not about either case alone. Two independent subtests each asserting one
@@ -1233,14 +1234,14 @@ func TestRecreateGapReportsRollingRatherThanNoRow(t *testing.T) {
 func TestPodlessIsStuckOnlyWithReplicaFailure(t *testing.T) {
 	const want = "hash-new"
 
-	// The healthy Recreate gap. MEASURED at ~1.4s on a real roll, on every release.
+	// The healthy Recreate gap. MEASURED at ~1.4s on a real roll, not a timing guarantee.
 	gap := deriveRollHealth(nil, want, "", testNow)
 	// The permanently-blocked worker. Same empty pod list, same hash, same clock.
 	blocked := deriveRollHealth(nil, want, "FailedCreate", testNow)
 
 	if gap.Phase != protocol.PhaseRolling {
 		t.Errorf("the healthy Recreate gap reports %q, want %q. Reporting stuck for pod-lessness AS SUCH "+
-			"cries wolf on every release — which is the failure PRD #113 exists to prevent, arriving "+
+			"cries wolf during healthy rolls — which is the failure PRD #113 exists to prevent, arriving "+
 			"through the branch that fixes #148.", gap.Phase, protocol.PhaseRolling)
 	}
 	if blocked.Phase != protocol.PhaseStuck {
@@ -1252,7 +1253,7 @@ func TestPodlessIsStuckOnlyWithReplicaFailure(t *testing.T) {
 	if gap.Phase == blocked.Phase {
 		t.Fatalf("both pod-less cases report %q. The condition is not the discriminator — whatever this "+
 			"implementation keys on, it is not ReplicaFailure, and one of the two failure modes "+
-			"(silent broken worker, or a red fleet on every release) is live.", gap.Phase)
+			"(silent broken worker, or healthy rolling workers flagged red) is live.", gap.Phase)
 	}
 	if blocked.BlockingReason != "FailedCreate" {
 		t.Errorf("BlockingReason = %q, want the condition's reason forwarded. Without it the api's "+
@@ -1369,7 +1370,7 @@ func TestObserveReadsReplicaFailureOffTheDeployment(t *testing.T) {
 	}
 	if got := byID["gap"].Phase; got != protocol.PhaseRolling {
 		t.Errorf("a pod-less worker with NO conditions reports %q, want %q. This is the healthy Recreate "+
-			"gap — measured at ~1.4s and traversed on every release — so a %q here turns the whole "+
-			"fleet's badge red every time uzi ships", got, protocol.PhaseRolling, got)
+			"gap — measured at ~1.4s on a real roll, not a timing guarantee — so a %q here "+
+			"flags a healthy rolling worker red", got, protocol.PhaseRolling, got)
 	}
 }

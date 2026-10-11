@@ -1,6 +1,10 @@
 """Exercise the fail-closed leaf report checker with Node-shaped JUnit."""
 import unittest
 import xml.etree.ElementTree as ET
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from check import check
 
 
@@ -15,6 +19,124 @@ class CheckerTest(unittest.TestCase):
 
     def test_pass(self):
         self.assertEqual(check(self.expected, self.report(self.case())), [])
+
+    def test_capture_identities_must_run_not_skip_or_disappear(self):
+        titles = [
+            "cancels while the object-store snapshot streams and leaves no temp tree",
+            "cancels while many tiny object files are copied and leaves no temp tree",
+            "never reads a symlink target's content",
+            "reads each symlink only through its still-open pinned parent descriptor",
+            "refuses a leaf swapped to a regular file before readlink without resolving the pathname",
+            "refuses leaf and parent symlink escapes, nonregular ignores and an unavailable base",
+            "captures an unchanged tracked symlink tree as an empty patch",
+            "captures edits elsewhere next to unchanged tracked symlinks",
+            "treats a symlinked .gitignore as absent while the path stays a candidate",
+        ]
+        suite = "Unit2 runner source capture"
+        expected = [{"file": "agent/test/git-planning-diff.test.ts", "names": [suite, title]}
+                    for title in titles]
+
+        def report():
+            root = ET.Element("testsuites")
+            parent = ET.SubElement(root, "testsuite", name=suite)
+            for title in titles:
+                ET.SubElement(parent, "testcase", name=title, file="/app/test/git-planning-diff.test.ts")
+            return root, parent
+
+        root, _ = report()
+        self.assertEqual(check(expected, root), [])
+        for index, title in enumerate(titles):
+            for mode in ("missing", "skipped", "wrong-file", "wrong-suite"):
+                with self.subTest(title=title, mode=mode):
+                    root, parent = report()
+                    leaf = parent[index]
+                    if mode == "missing":
+                        parent.remove(leaf)
+                    elif mode == "skipped":
+                        ET.SubElement(leaf, "skipped", message="not selected")
+                    elif mode == "wrong-file":
+                        leaf.set("file", "/app/test/other.test.ts")
+                    else:
+                        parent.set("name", "Unit2 bounded runner stdout transport")
+                    errors = "\n".join(check(expected, root))
+                    self.assertIn(f"agent/test/git-planning-diff.test.ts: {suite} > {title}", errors)
+
+    def test_failed_leaf_captured_output(self):
+        root = self.report(self.case('<failure message="controlled"/><system-err>'
+                                     'private unrelated output\nadvice-teardown-diagnostic {"failure":true}'
+                                     '</system-err>'))
+        output = "\n".join(check(self.expected, root))
+        self.assertIn('advice-teardown-diagnostic {"failure":true}', output)
+        self.assertNotIn('private unrelated', output)
+
+    def test_passing_leaf_captured_output_stays_silent(self):
+        self.assertEqual(check(self.expected, self.report(self.case(
+            '<system-out>advice-teardown-diagnostic {"passing":true}</system-out>'))), [])
+
+    def test_node_junit_comments_are_scoped_to_preceding_failed_leaf(self):
+        xml = ('<testsuites><testsuite name="suite">'
+               '<testcase name="pass" file="/app/test/example.test.ts"/>'
+               '<!-- advice-teardown-diagnostic {"passing":true} -->'
+               + self.case('<failure message="controlled"/>')
+               + '<!-- unrelated private output -->'
+               '<!-- advice-teardown-diagnostic {"failure":true} -->'
+               '</testsuite><!-- advice-teardown-diagnostic {"global":true} --></testsuites>')
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        expected = [*self.expected, {"file": "agent/test/example.test.ts", "names": ["suite", "pass"]}]
+        output = "\n".join(check(expected, ET.fromstring(xml, parser=parser)))
+        self.assertIn('advice-teardown-diagnostic {"failure":true}', output)
+        for private in ('"passing"', '"global"', 'unrelated private'):
+            self.assertNotIn(private, output)
+
+    def test_diagnostic_output_is_bounded_and_control_free(self):
+        text = '\n'.join('advice-teardown-diagnostic ' + '\x1b\u202e' + 'é' * 10000 for _ in range(20))
+        # C0 escape is not legal XML, so assign it after parsing the structural fixture.
+        root = self.report(self.case('<failure/><system-out/>'))
+        root.find('.//system-out').text = text
+        lines = [line for line in check(self.expected, root) if line.startswith('advice-teardown-diagnostic ')]
+        self.assertLessEqual(len(lines), 8)
+        self.assertLessEqual(sum(len((line + '\n').encode('utf-8')) for line in lines), 16384)
+        self.assertTrue(lines)
+        self.assertNotIn('\x1b', ''.join(lines))
+        self.assertNotIn('\u202e', ''.join(lines))
+
+    def test_cli_keeps_node_diagnostic_comments(self):
+        scratch = Path(__file__).resolve().parents[2] / ".uzi/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            expected = Path(directory) / 'expected.json'
+            report = Path(directory) / 'results.xml'
+            expected.write_text('[{"file":"agent/test/example.test.ts","names":["suite","leaf"]}]')
+            report.write_text('<testsuites><testsuite name="suite">' + self.case('<failure/>')
+                              + '<!-- advice-teardown-diagnostic {"failure":true} -->'
+                              '</testsuite></testsuites>')
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name('check.py')),
+                                     str(expected), str(report)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('advice-teardown-diagnostic {"failure":true}', result.stderr)
+
+    def test_ancestor_failure_does_not_expose_passing_leaf_output(self):
+        root = self.report('<failure message="suite failed"/>' + self.case(
+            '<system-out>advice-teardown-diagnostic {"passing":true}</system-out>'))
+        self.assertNotIn('"passing"', "\n".join(check(self.expected, root)))
+
+    def test_total_report_budget_preserves_prefixes(self):
+        from check import MAX_DIAGNOSTIC_BYTES, DIAGNOSTIC_PREFIX
+        first = DIAGNOSTIC_PREFIX + 'x' * (MAX_DIAGNOSTIC_BYTES - 30 - len(DIAGNOSTIC_PREFIX))
+        root = self.report(self.case('<failure/><system-out/>'))
+        root.find('.//system-out').text = first + '\n' + DIAGNOSTIC_PREFIX + 'y' * 100
+        lines = [line for line in check(self.expected, root) if line.startswith(DIAGNOSTIC_PREFIX)]
+        self.assertEqual(lines, [first])
+
+    def test_line_budget_is_global_across_failing_leaves(self):
+        expected = [self.expected[0], {"file": "agent/test/example.test.ts", "names": ["suite", "other"]}]
+        text = '\n'.join('advice-teardown-diagnostic {"event":1}' for _ in range(20))
+        root = self.report(self.case('<failure/><system-err/>') +
+                           self.case('<failure/><system-out/>').replace('name="leaf"', 'name="other"'))
+        root.find('.//system-err').text = text
+        root.find('.//system-out').text = text
+        lines = [line for line in check(expected, root) if line.startswith('advice-teardown-diagnostic ')]
+        self.assertEqual(len(lines), 8)
 
     def test_missing_duplicate_and_skipped(self):
         for body in ("", self.case() * 2, self.case('<skipped/>')):

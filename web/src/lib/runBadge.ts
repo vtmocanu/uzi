@@ -140,6 +140,30 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
   return run.status === "awaiting_approval" && run.is_revising === true;
 }
 
+// PARK_LABELS is today's wording for each parked (held, not working) effective status:
+// the single source runBadge's pills and the PRD #2602 progress cell's parked text both
+// use, so the board badge and the progress cell can never name one park two ways. The
+// paused pill prefixes its "‖" glyph at the call site; the progress cell prints the bare
+// label as screen-reader text, since the pill beside it already shows the park.
+const PARK_LABELS = {
+  limit_wait: "limit wait",
+  pool_wait: "waiting for pool",
+  recovery_wait: "recovery wait",
+  worker_requeue_exhausted: "recovery needs decision",
+  paused: "paused",
+  credential_disabled: "waiting: credential disabled",
+  completion_blocked: "Completion blocked",
+} as const;
+
+// parkLabel names a parked run's hold in today's words (PRD #2602 rule 3: "surfaces keep
+// today's park wording"). It folds through effectiveRunStatus so a credential or
+// completion hold (raw status "paused") and an exhausted recovery read as they do on the
+// status pill. An unlisted status falls back to its de-underscored enum, never "".
+export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+  const eff = effectiveRunStatus(run);
+  return (PARK_LABELS as Record<string, string>)[eff] ?? eff.replace(/_/g, " ");
+}
+
 // effectiveRunStatus is the status a run should RENDER as: "planning" while it is in
 // its planning phase, "revising" while it is re-planning after a revise, else its raw
 // status. This is the single seam every status surface flows through so the planning and
@@ -543,7 +567,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "completion_blocked":
       return {
         kind: "badge",
-        label: "Completion blocked",
+        label: PARK_LABELS.completion_blocked,
         tone: "warning",
         pulse: false,
       };
@@ -553,7 +577,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "credential_disabled":
       return {
         kind: "badge",
-        label: "waiting: credential disabled",
+        label: PARK_LABELS.credential_disabled,
         tone: "warning",
         pulse: false,
         title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
@@ -607,7 +631,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "limit_wait":
       return {
         kind: "badge",
-        label: "limit wait",
+        label: PARK_LABELS.limit_wait,
         tone: "warning",
         pulse: false,
         title:
@@ -622,7 +646,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "pool_wait":
       return {
         kind: "badge",
-        label: "waiting for pool",
+        label: PARK_LABELS.pool_wait,
         tone: "warning",
         pulse: false,
         title:
@@ -632,7 +656,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "worker_requeue_exhausted":
       return {
         kind: "badge",
-        label: "recovery needs decision",
+        label: PARK_LABELS.worker_requeue_exhausted,
         tone: "warning",
         pulse: false,
         title: [
@@ -647,7 +671,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "recovery_wait":
       return {
         kind: "badge",
-        label: "recovery wait",
+        label: PARK_LABELS.recovery_wait,
         tone: "warning",
         pulse: false,
         title:
@@ -661,7 +685,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "paused":
       return {
         kind: "badge",
-        label: "‖ paused",
+        label: `‖ ${PARK_LABELS.paused}`,
         tone: "info",
         pulse: false,
         title: "Paused by its owner. Resume it from the run page or with `uzi run resume`.",

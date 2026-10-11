@@ -136,6 +136,10 @@ var (
 	// param) bypasses ONLY this guard, never the active-run gate.
 	ErrOpenMRExists = errors.New("issue already has an open MR")
 	ErrRunTerminal  = errors.New("run has already finished")
+	// ErrApprovalMilestonesMoved is the unbound approve's answer (issue #2680) when the plan's
+	// milestone list kept changing between the contract build and the freeze, or the run left the
+	// plan gate while the approve retried: nothing was written. → 409 approval_milestones_moved.
+	ErrApprovalMilestonesMoved = errors.New("the plan's milestones changed while approving; re-read the plan and approve again")
 	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
 	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
 	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
@@ -463,6 +467,10 @@ type Store interface {
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
 	DeleteEphemeralWorkerForRun(ctx context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
+	// Issue #2602: the run-detail blocked-by hint (MaybeBlockedByRun).
+	GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]byte, error)
+	RunQuestionAnswerExists(ctx context.Context, arg store.RunQuestionAnswerExistsParams) (bool, error)
+	GetMaybeBlockingRun(ctx context.Context, arg store.GetMaybeBlockingRunParams) (uuid.UUID, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 
 	// Runs.
@@ -1412,6 +1420,10 @@ type Params struct {
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration
+	// WorkerStaleRequeueGrace (#2705): how long ClaimRun keeps a run the stale-worker sweeper
+	// requeued pinned to its previous worker (while that worker's row exists). Zero or negative
+	// disables the pin (NULL cutoff); the zero value keeps existing tests unaffected.
+	WorkerStaleRequeueGrace time.Duration
 	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
 	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
 	WorkerSpreadGrace time.Duration
@@ -3080,6 +3092,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
 		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		StaleRequeueCutoff:       StaleRequeueCutoff(claimNow, s.p.WorkerStaleRequeueGrace),
 		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
 		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:           isDocker,
@@ -3625,7 +3638,9 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
+	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -4001,11 +4016,24 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
 	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
 	// own counted park transaction; disk_park_preventive is valid only alongside it.
+	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable &&
+		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexAccountParkV1) {
+		return store.Run{}, false, fmt.Errorf("%w: codex account park capability required", ErrInvalidState)
+	}
+	// The account park requires a generation regardless of credential-switch capability.
+	// Validate before the generic generation fence so this malformed request stays a 400.
+	if req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		*req.RecoveryCause == recoveryCauseCodexAccountUnavailable && req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: account park requires claim_generation", ErrInvalidState)
+	}
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	if err := validateCompletedPublicationReport(wkr, req); err != nil {
+		return store.Run{}, false, err
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
 		return store.Run{}, false, err
@@ -4167,18 +4195,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
-		// PRD #2006: an ephemeral worker's terminal report locks the WORKER row before the run
-		// row, the canonical order Claim, Register, Heartbeat and the sweepers use, so the lease
-		// entry below serializes against a claim, a cordon and the reaper. Only a terminal fenced
-		// report on an ephemeral worker with the lease on; every other report is unchanged.
-		if s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed") {
+		// Completed publication and ephemeral leasing serialize on the worker before the run.
+		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
+		leaseFence = s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
+		if leaseFence || completedPublicationCapable(wkr, req) {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
 				}
 				return store.Run{}, false, werr
 			}
-			leaseFence = true
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
@@ -4588,7 +4614,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// Interlocked completion derives its stamp from the locked row; leave audit
 		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
-			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
+			CompletionFinalHead:  completedPublicationHead(wkr, req),
+			CompletionGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
+			Branch:               stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
 			// Checker report-only is a server-owned kind invariant. Checker
@@ -4701,7 +4729,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go. Issue
 		// #1766 M2: a vault_locked report parks here too and is the one cause this park stores;
 		// the timer promoter re-queues it and Claim holds it idle while the vault stays locked.
-		rows, err = s.setRecoveryWait(ctx, owned, wkr, req, sessionID)
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable {
+			var crun store.Run
+			crun, rows, err = s.parkRunningCodexAccountUnavailable(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return crun, false, err
+			}
+			break
+		}
+		rows, err = s.setRecoveryWait(ctx, s.q, recoveryCauseStored(req.RecoveryCause), owned, wkr, req, sessionID)
 	case "paused":
 		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard
 		// ack contract as limit_wait — the worker keys off the RETURNED status being literally
@@ -5308,6 +5344,11 @@ type ConsumeInputsResult struct {
 	// #1673). Absent, the reply was consumed on read: an older api pod mid-roll, or a legacy
 	// worker, and the worker routes it with no receipts.
 	Receipts bool
+	// OwnerID is the run owner's user id, set only on the paths that return the normal inputs
+	// reply (not on the pending-switch or released-claim early returns). The handler resolves the
+	// per-run now-summary setting for THIS user, never the caller's (PRD #2603); a nil id means
+	// "omit the field", which the worker reads as off.
+	OwnerID uuid.UUID
 }
 
 // ConsumeInputs returns steering inputs for a run the worker owns, FIFO.
@@ -5354,7 +5395,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		for _, row := range rows {
 			out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 		}
-		return ConsumeInputsResult{Inputs: out, Receipts: true}, nil
+		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
@@ -5377,7 +5418,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if consumedFollowUp && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return ConsumeInputsResult{Inputs: out}, nil
+	return ConsumeInputsResult{Inputs: out, OwnerID: run.UserID}, nil
 }
 
 // ConsumedFollowUps returns the already-consumed follow_up inputs of a run the worker owns,
@@ -5832,14 +5873,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
-// "superseded"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
 	Skipped   string
+	// Detail is a bounded, content-free reason behind Skipped (the broker's error text with
+	// secrets scrubbed), for the operator log only. It is never serialized to the worker.
+	Detail string
 }
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
@@ -5850,7 +5894,7 @@ type PublishResult struct {
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker
-// treats as "origin moved, nothing to do" — a diverged tip or an unsupported pack —
+// treats as "origin moved, nothing to do" — a diverged tip or an unusable pack —
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
@@ -6131,13 +6175,17 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
-	case errors.Is(err, pushbroker.ErrTipMissing),
-		errors.Is(err, pushbroker.ErrPackTooLarge),
-		errors.Is(err, pushbroker.ErrPackInvalid):
-		// A tip the pack never delivered, a pack over the reconstruction budget, or a
-		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
-		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
+	case errors.Is(err, pushbroker.ErrTipMissing):
+		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
+		// broker's content-free reason for the operator log (never serialized to the worker).
+		return PublishResult{Published: false, Ref: ref, Skipped: "tip_missing", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackTooLarge):
+		// A pack over the reconstruction budget: a best-effort skip. A worker pack may not
+		// OOM or 5xx-storm the shared api.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_too_large", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackInvalid):
+		// A malformed (or empty) pack: a best-effort skip, never a 5xx.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_invalid", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT

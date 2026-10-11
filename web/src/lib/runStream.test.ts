@@ -76,6 +76,20 @@ describe("applyFrame", () => {
     expect(seqs(r.state.messages)).toEqual([1, 2]);
   });
 
+  it("asks for a run refresh on a progress_note frame, and on no other message (PRD #2603)", () => {
+    const s = ingestMany(emptyStream(), [msg(1)]).state;
+    const note = applyFrame(s, { type: "message", seq: 2, kind: "progress_note", payload: { text: "x" } });
+    expect(note.effects).toEqual({ replay: false, refreshRun: true });
+    const other = applyFrame(note.state, { type: "message", seq: 3, kind: "status", payload: {} });
+    expect(other.effects.refreshRun).toBe(false);
+  });
+
+  it("asks for a run refresh on an empty-text progress_note (the clear note, PRD #2603 AC2)", () => {
+    const s = ingestMany(emptyStream(), [msg(1)]).state;
+    const clear = applyFrame(s, { type: "message", seq: 2, kind: "progress_note", payload: { text: "" } });
+    expect(clear.effects).toEqual({ replay: false, refreshRun: true });
+  });
+
   it("carries agent_instance + agent_label off the live frame, defaulting to null", () => {
     // PRD #99 Decision 6: applyFrame is the ONLY place a live message becomes a
     // RunMessage — there is no REST re-read — so a subagent frame that loses its

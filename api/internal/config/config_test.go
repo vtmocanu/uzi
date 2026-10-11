@@ -132,6 +132,7 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		{"WorkerPollInterval", cfg.WorkerPollInterval, 3 * time.Second},
 		{"WorkerAffinityGrace", cfg.WorkerAffinityGrace, 2 * time.Minute},
 		{"WorkerAffinityCeiling", cfg.WorkerAffinityCeiling, 2 * time.Hour},
+		{"WorkerStaleRequeueGrace", cfg.WorkerStaleRequeueGrace, 10 * time.Minute},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -1177,6 +1178,43 @@ func TestImplicitRunCeilingPreservesLongTimeout(t *testing.T) {
 			}
 			if _, err := Load(); err != nil {
 				t.Fatalf("unset ceiling: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadWorkerStaleRequeueGrace pins WORKER_STALE_REQUEUE_GRACE (#2705): 10m default, "0" is
+// the legitimate DISABLE value, and a malformed or negative value falls back to the default.
+func TestLoadWorkerStaleRequeueGrace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  bool
+		val  string
+		want time.Duration
+	}{
+		{"default when unset", false, "", 10 * time.Minute},
+		{"zero disables the pin", true, "0", 0},
+		{"explicit value", true, "3m", 3 * time.Minute},
+		{"invalid falls back to default", true, "soon", 10 * time.Minute},
+		{"negative falls back to default", true, "-5m", 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+			t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+			varied := make([]byte, secretbox.KeySize)
+			for i := range varied {
+				varied[i] = byte(i + 1)
+			}
+			t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+			if tc.set {
+				t.Setenv("WORKER_STALE_REQUEUE_GRACE", tc.val)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WorkerStaleRequeueGrace != tc.want {
+				t.Fatalf("WorkerStaleRequeueGrace = %v, want %v", cfg.WorkerStaleRequeueGrace, tc.want)
 			}
 		})
 	}

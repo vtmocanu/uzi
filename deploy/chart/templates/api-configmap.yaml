@@ -1,4 +1,4 @@
-{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs .Values.releaseCheck (include "uzi.apiHostingEnabled" .)) }}
+{{- if include "uzi.apiConfigMapEnabled" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -65,6 +65,24 @@ data:
   UZI_RELEASE_CHECK_ENABLED: {{ .Values.releaseCheck.enabled | quote }}
   UZI_RELEASE_CHECK_BANNER_ENABLED: {{ .Values.releaseCheck.bannerEnabled | quote }}
   UZI_RELEASE_CHECK_INTERVAL: {{ .Values.releaseCheck.interval | quote }}
+  {{- end }}
+  {{- /*
+    DB_STORAGE_CAPACITY_BYTES rendered EXPLICITLY from the managed database's storage size
+    (database.simple.storage.size, or postgres.cluster.storage.size under cnpg), NOT left to
+    the api.config freeform map: the api's admin-health db.size budget then tracks the PVC
+    the chart actually provisions. database.mode external renders nothing here (the chart
+    cannot know the size); set api.config.DB_STORAGE_CAPACITY_BYTES (bytes) there.
+
+    Setting api.config.DB_STORAGE_CAPACITY_BYTES in a managed mode would emit a DUPLICATE
+    ConfigMap key (the range above already emitted it), so that combination is a hard render
+    failure rather than a last-wins silent pick (same convention as FORGE_ALLOWED_BASE_URLS).
+  */ -}}
+  {{- $dbCapacity := include "uzi.dbStorageCapacityBytes" . }}
+  {{- if $dbCapacity }}
+  {{- if hasKey .Values.api.config "DB_STORAGE_CAPACITY_BYTES" }}
+  {{- fail "The chart sets DB_STORAGE_CAPACITY_BYTES from the database storage size (database.simple.storage.size / postgres.cluster.storage.size); do not also set api.config.DB_STORAGE_CAPACITY_BYTES: both set would emit a duplicate DB_STORAGE_CAPACITY_BYTES ConfigMap key. Only database.mode external takes it from api.config." }}
+  {{- end }}
+  DB_STORAGE_CAPACITY_BYTES: {{ $dbCapacity | quote }}
   {{- end }}
   {{- if include "uzi.apiHostingEnabled" . }}
   # Hosted workers (PRD #58 Decision 12). Rendered from the chart rather than left to

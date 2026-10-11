@@ -14,6 +14,7 @@
   "requeue_count": 0,
   "iteration_count": 0,
   "is_planning": false,
+  "progress": null,
   "auto_approve": false,
   "auto_approve_blocked_reasons": null,
   "issue_input_reason": null,

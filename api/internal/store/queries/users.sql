@@ -84,6 +84,19 @@ RETURNING *;
 UPDATE users SET mr_rework_enabled = @mr_rework_enabled WHERE id = @id
 RETURNING mr_rework_enabled;
 
+-- name: SetUserNowSummaryEnabled :one
+-- Set (or clear, when @now_summary_enabled is NULL) the current user's switch for the
+-- model-written "Now" line on the run progress card (PRD #2603). Ships ON, so the column is
+-- nullable and a NULL/absent value reads as ENABLED, exactly like mr_rework_enabled.
+UPDATE users SET now_summary_enabled = @now_summary_enabled WHERE id = @id
+RETURNING now_summary_enabled;
+
+-- name: GetUserNowSummaryEnabled :one
+-- The narrow read of one user's now-summary switch (PRD #2603), returned RAW (NULL = the
+-- default-ON state). The caller combines it with the instance switch; the run owner's id is
+-- passed, never the viewer's. A missing user is no row.
+SELECT now_summary_enabled FROM users WHERE id = $1;
+
 -- name: SetUserEphemeralWorkersEnabled :one
 -- Flip a user's ephemeral worker auto-provisioning opt-in (PRD #529 M2). Per-user
 -- consent to have the api spin a run-bound throwaway hosted worker when one of the
@@ -252,7 +265,7 @@ RETURNING summary_model;
 -- default_claude_model and default_codex_model (PRD #1551 M1 / D2) ride it too — the retained
 -- per-harness worker-model lanes; each NULL means "inherit". The settings surface exposes both
 -- lanes, and projects the deprecated default_model from the effective harness's lane.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort FROM users WHERE id = $1;
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

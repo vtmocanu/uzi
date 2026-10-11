@@ -11,6 +11,7 @@ import (
 )
 
 const AssessmentTimeout = 30 * time.Second
+const InteractiveAssessmentTimeout = 5 * time.Second
 const MaxDistinctAuthors = 200
 
 var ErrAuthorBudget = errors.New("issueinput: distinct author lookup budget exhausted")
@@ -43,7 +44,16 @@ type Assessment struct {
 
 // NewAssessment starts the child deadline immediately, before raw issue capture.
 func NewAssessment(parent context.Context, lookup AuthorLookup, projectID int64) *Assessment {
-	ctx, cancel := context.WithTimeout(parent, AssessmentTimeout)
+	return NewAssessmentWithTimeout(parent, lookup, projectID, AssessmentTimeout)
+}
+
+// NewAssessmentWithTimeout starts one total deadline, bounded by AssessmentTimeout.
+// Nonpositive timeouts use the background default; parent deadlines still win.
+func NewAssessmentWithTimeout(parent context.Context, lookup AuthorLookup, projectID int64, timeout time.Duration) *Assessment {
+	if timeout <= 0 || timeout > AssessmentTimeout {
+		timeout = AssessmentTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	return &Assessment{ctx: forge.BeginAuthorAssessment(ctx), cancel: cancel,
 		lookup: lookup, project: projectID, decisions: make(map[identity]decision)}
 }

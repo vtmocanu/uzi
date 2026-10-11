@@ -380,6 +380,19 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// write, not only an unbounded column. Capped after the strip so the cap
 		// counts runes the row will actually hold; `agent` is capped further down.
 		m.Kind = truncateRunes(m.Kind, maxKindRunes)
+		// PRD #2603: a progress_note payload is rebuilt from only its allowed keys (text stripped
+		// of control and format runes and capped, milestone_id, model_usage) AFTER the byte
+		// sanitation above and on the final stripped kind, so the stored row, the WS frame and
+		// the usage fold all see the same normalised note, whose usage entries carry the cost
+		// resolved for this run's harness.
+		if m.Kind == KindProgressNote {
+			m.Payload = normalizeProgressNotePayload(m.Payload, run.Harness)
+		}
+		// Issue #2686: a summary_usage payload is rebuilt the same way, from only {pass,
+		// model_usage}, so `event` and `usage` can never reach the usage tail or the web fold.
+		if m.Kind == KindSummaryUsage {
+			m.Payload = normalizeSummaryUsagePayload(m.Payload, run.Harness)
+		}
 		if c.any() {
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
 				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,
@@ -492,7 +505,13 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// `claim_released_at IS NULL` conjunct, so a nil generation advances only on a LIVE
 		// (unreleased) claim — a released claim is now rejected even for a generation-less (legacy)
 		// report; a live claim still honours a NULL generation.
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen)}); err != nil {
+		//
+		// PRD #2603 / issue #2686: a batch of ONLY progress_note or summary_usage messages
+		// (onlyUsageSideChannel) advances last_seq WITHOUT bumping
+		// last_activity_at. A Now-summary is the worker talking about the run, not the run
+		// working, so it must not turn a stalled run healthy, show a Now line on it, or make the
+		// stall nudge flap. Any other message in the batch restores the normal bump.
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen), QuietActivity: onlyUsageSideChannel(msgs)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two
 			}
@@ -613,6 +632,23 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 	// capped per-frame inside the loop, since each frame carries its own.
 	sessionID = truncateRunes(sessionID, maxUsageSessionRunes)
 	for _, m := range frames {
+		// PRD #2603: a Now-summary note carries the usage of the small-model call that wrote it.
+		// It is folded under its own run_usage key (see foldProgressNoteUsage) and is NOT a
+		// result frame, so it takes this branch before the status/error gate below.
+		if m.Kind == KindProgressNote {
+			if err := foldProgressNoteUsage(ctx, q, run, sessionID, m); err != nil {
+				return err
+			}
+			continue
+		}
+		// Issue #2686: a summary pass's usage folds under summary_pass:<model>, likewise not a
+		// result frame.
+		if m.Kind == KindSummaryUsage {
+			if err := foldSummaryUsage(ctx, q, run, sessionID, m); err != nil {
+				return err
+			}
+			continue
+		}
 		// Result frames are only ever kind status (success) or error; skip the
 		// rest without paying an unmarshal for every text/tool_use message.
 		if m.Kind != "status" && m.Kind != "error" {
@@ -846,8 +882,8 @@ func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
 //     and no marker resolves to metered" — so Claude accounting is unchanged. An unexpected harness
 //     (impossible under the runs CHECK) also lands here, preserving accounting rather than zeroing.
 //   - Codex (harness == codex): HONOR the closed marker the agent emits per model (D5).
-//     'subscription' → cost_status='subscription', cost_usd=0 (that credential mode has no
-//     per-token charge, so zero is neutral, not a metered $0). 'metered' → cost_status='metered',
+//     'subscription' → cost_status='subscription', cost_usd=0 (stored legacy usage has no
+//     estimate; tokens remain, and zero is a placeholder rather than a metered $0). 'metered' → cost_status='metered',
 //     cost_usd = the agent's price-table amount (emittedCostUSD) — but ONLY when that amount is
 //     genuinely present and usable (costPresent, finite, >= 0, and within numeric(12,6)); an ABSENT
 //     or INVALID metered amount resolves to cost_status='unreported',
@@ -892,4 +928,19 @@ func nonNegTokens(n int64) int64 {
 		return 0
 	}
 	return n
+}
+
+// onlyUsageSideChannel reports whether a non-empty batch holds nothing but progress_note
+// (PRD #2603) or summary_usage (issue #2686) messages: such a batch is accounting written by
+// a side-channel model call and must not count as run activity.
+func onlyUsageSideChannel(msgs []IncomingMessage) bool {
+	if len(msgs) == 0 {
+		return false
+	}
+	for _, m := range msgs {
+		if m.Kind != KindProgressNote && m.Kind != KindSummaryUsage {
+			return false
+		}
+	}
+	return true
 }

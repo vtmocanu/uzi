@@ -1583,6 +1583,11 @@ func TestRunNowDoesNotPersistLastFire(t *testing.T) {
 	if len(h.st.advanceCalls) != 0 {
 		t.Fatalf("RunNow must NOT advance (and so must not persist last_fire): advance calls = %d, want 0", len(h.st.advanceCalls))
 	}
+	// AdvanceSchedule and RecordScheduleHeldFire are the only writers of recent_fires (and
+	// last_fire), so no call to either means recent_fires is untouched.
+	if len(h.st.heldFireCalls) != 0 {
+		t.Fatalf("RunNow must NOT record a held fire: held fire calls = %d, want 0", len(h.st.heldFireCalls))
+	}
 }
 
 // TestRunNowOnceIssueBranchInUseSkips (issue #1626): a once issue schedule refused with
@@ -2572,6 +2577,11 @@ func TestTickTransientDoesNotPersistLastFire(t *testing.T) {
 	if len(h.st.advanceCalls) != 0 {
 		t.Fatalf("transient error must NOT write last_fire (no advance): advance calls = %d, want 0", len(h.st.advanceCalls))
 	}
+	// AdvanceSchedule and RecordScheduleHeldFire are the only writers of recent_fires (and
+	// last_fire), so no call to either means recent_fires is untouched.
+	if len(h.st.heldFireCalls) != 0 {
+		t.Fatalf("a transient error must NOT record a held fire: held fire calls = %d, want 0", len(h.st.heldFireCalls))
+	}
 }
 
 // TestTickParkDoesNotPersistLastFire pins Decision 5: a permanent (park) fire error routes
@@ -2585,6 +2595,11 @@ func TestTickParkDoesNotPersistLastFire(t *testing.T) {
 
 	if len(h.st.advanceCalls) != 0 {
 		t.Fatalf("park must NOT write last_fire (no advance): advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+	// AdvanceSchedule and RecordScheduleHeldFire are the only writers of recent_fires (and
+	// last_fire), so no call to either means recent_fires is untouched.
+	if len(h.st.heldFireCalls) != 0 {
+		t.Fatalf("park must NOT record a held fire: held fire calls = %d, want 0", len(h.st.heldFireCalls))
 	}
 	if len(h.st.statusCalls) != 1 || h.st.statusCalls[0].Status != "error" {
 		t.Fatalf("park must SetRunScheduleStatus to error, got %+v", h.st.statusCalls)

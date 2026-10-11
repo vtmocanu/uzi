@@ -1,0 +1,434 @@
+[
+  {
+    "name": "frozen list, nothing reported",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "percent",
+      "pct": 11,
+      "milestone_done": 0,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "two of three done, third in progress",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1",
+      "m2"
+    ],
+    "milestones_in_progress": [
+      "m3"
+    ],
+    "progress": {
+      "state": "percent",
+      "pct": 70,
+      "milestone_done": 2,
+      "milestone_total": 3,
+      "active_milestone_id": "m3",
+      "phase": ""
+    }
+  },
+  {
+    "name": "completed id outside the frozen list is ignored",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1",
+      "dropped"
+    ],
+    "milestones_in_progress": [
+      "m2"
+    ],
+    "progress": {
+      "state": "percent",
+      "pct": 40,
+      "milestone_done": 1,
+      "milestone_total": 3,
+      "active_milestone_id": "m2",
+      "phase": ""
+    }
+  },
+  {
+    "name": "in-progress id that is also completed is not active",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1"
+    ],
+    "milestones_in_progress": [
+      "m1",
+      "m3"
+    ],
+    "progress": {
+      "state": "percent",
+      "pct": 40,
+      "milestone_done": 1,
+      "milestone_total": 3,
+      "active_milestone_id": "m3",
+      "phase": ""
+    }
+  },
+  {
+    "name": "two in progress, first in frozen order is active",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": null,
+    "milestones_in_progress": [
+      "m3",
+      "m2"
+    ],
+    "progress": {
+      "state": "percent",
+      "pct": 11,
+      "milestone_done": 0,
+      "milestone_total": 3,
+      "active_milestone_id": "m2",
+      "phase": ""
+    }
+  },
+  {
+    "name": "all done is capped below 100",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1",
+      "m2",
+      "m3"
+    ],
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "percent",
+      "pct": 99,
+      "milestone_done": 3,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "empty frozen list",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [],
+    "milestones_completed": [
+      "m1"
+    ],
+    "milestones_in_progress": [
+      "m1"
+    ],
+    "progress": {
+      "state": "none",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "no frozen list",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "none",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "awaiting input outranks stalled health",
+    "kind": "issue",
+    "status": "awaiting_input",
+    "health": "stalled",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1"
+    ],
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "waiting",
+      "pct": null,
+      "milestone_done": 1,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "plan gate waits",
+    "kind": "issue",
+    "status": "awaiting_approval",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "waiting",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "limit wait is parked",
+    "kind": "issue",
+    "status": "limit_wait",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "parked",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "claimed is queued",
+    "kind": "issue",
+    "status": "claimed",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "queued",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "looping health is stalled",
+    "kind": "issue",
+    "status": "running",
+    "health": "looping",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": [
+      "m1"
+    ],
+    "milestones_in_progress": [
+      "m2"
+    ],
+    "progress": {
+      "state": "stalled",
+      "pct": null,
+      "milestone_done": 1,
+      "milestone_total": 3,
+      "active_milestone_id": "m2",
+      "phase": ""
+    }
+  },
+  {
+    "name": "planning turn",
+    "kind": "issue",
+    "status": "running",
+    "health": "ok",
+    "is_planning": true,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "planning",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
+    "name": "non-issue kind with a frozen list shows none",
+    "kind": "mr_rework",
+    "status": "running",
+    "health": "ok",
+    "is_planning": false,
+    "milestones": [
+      {
+        "id": "m1",
+        "title": "One"
+      },
+      {
+        "id": "m2",
+        "title": "Two"
+      },
+      {
+        "id": "m3",
+        "title": "Three"
+      }
+    ],
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "none",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 3,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  }
+]

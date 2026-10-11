@@ -1,3 +1,4 @@
+import { isAccountingStatus, isProgressNote, isSummaryUsage } from "../lib/accountingStatus";
 import { PlanCrossCheckEvent } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
@@ -577,7 +578,7 @@ function MetaLine({ text, usage }: { text: string; usage?: PhaseUsage }) {
 
 // FinishTokens renders a result frame's PER-PHASE token/cost figures on its finish
 // line (PRD #40 §1). Tokens are the delta this phase spent (fresh in · cached · out,
-// derived in lib/runUsage.ts); cost too. A $0 cost (subscription auth) is dropped
+// derived in lib/runUsage.ts); cost too. A zero phase-cost delta is dropped
 // rather than shown as "$0.00". Mono + tabular so figures line up down the log.
 function FinishTokens({ usage }: { usage: PhaseUsage }) {
   return (
@@ -1061,6 +1062,7 @@ export const RunEventRow = memo(function RunEventRow({
   phaseUsage?: PhaseUsage;
   onFindingMutation?: () => void;
 }) {
+  if (isAccountingStatus(msg) || isProgressNote(msg) || isSummaryUsage(msg)) return null;
   const rec = asRecord(msg.payload);
   switch (msg.kind) {
     case "text": {

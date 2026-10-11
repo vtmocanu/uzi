@@ -1703,23 +1703,86 @@ describe("RunRunner — worker-shutdown fetch-back (PRD #218 M1)", () => {
       ).activeRuns;
       assert.strictEqual(doneActive.size, 0, "no registry entry leaks after a terminal run");
 
-      // Part 2 — a run that registers AFTER shutdown() has fired: the late-register
-      // guard must abort it at once so it snapshots its committed work rather than
-      // running to completion past the grace window.
+      // Part 2 — late registration must start no new execution, while existing
+      // retained commits, dirty work, session and custody survive undiscovered.
       const iid = 241;
-      const { factory, sha } = shutdownExecutorFactory(homeRoot, "LATE.txt");
-      const lateRunner = runnerWith(factory, gitlab);
-      lateRunner.shutdown(); // global flag set before any run registers
-      await lateRunner.execute(gitlabClaim(iid, { wait_on_limit: true }));
-      assert.strictEqual(
-        shaInBare(git.barePathFor(fx.originPath), trackingRef(iid)),
-        sha(),
-        "a run that starts during shutdown still snapshots its work",
-      );
-      const lateActive = (
-        lateRunner as unknown as { activeRuns: Map<string, unknown> }
-      ).activeRuns;
-      assert.strictEqual(lateActive.size, 0, "and deregisters afterwards");
+      const retainedClaim = gitlabClaim(iid, { wait_on_limit: true, inventory_guarded: true, claim_generation: 2 });
+      const bare = await git.ensureClone(fx.originPath);
+      const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, retainedClaim.run_id);
+      const committed = commitInTree(clone.path, "LATE.txt", "predecessor committed work\n");
+      await git.markRecoveryCapture(bare, clone.path, clone.branch, retainedClaim.run_id);
+      fs.writeFileSync(path.join(clone.path, "dirty.txt"), "predecessor dirty work\n");
+      const configBefore = fs.readFileSync(path.join(bare, "config"));
+      let models = 0, fetches = 0, releases = 0;
+      git.ensureClone = async () => { fetches++; throw new Error("must not fetch during shutdown"); };
+      client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+      const lateFactory: ExecutorFactory = runId => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: { run: async () => { models++; throw new Error("must not execute during shutdown"); } },
+      });
+      for (const lateIid of [iid, iid + 1]) {
+        const claim = lateIid === iid ? retainedClaim : gitlabClaim(lateIid, { wait_on_limit: true, inventory_guarded: true, claim_generation: 2 });
+        const sessionPath = path.join(homeRoot, claim.run_id, "session.jsonl");
+        fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+        fs.writeFileSync(sessionPath, "predecessor session\n");
+        const lateRunner = runnerWith(lateFactory, gitlab);
+        lateRunner.shutdown();
+        await lateRunner.execute(claim);
+        assert.equal(fs.readFileSync(sessionPath, "utf8"), "predecessor session\n");
+        const lateActive = (lateRunner as unknown as { activeRuns: Map<string, unknown> }).activeRuns;
+        assert.equal(lateActive.size, 0, "late claim deregisters without execution");
+        assert.deepEqual(api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status), ["running"]);
+      }
+      assert.equal(models, 0);
+      assert.equal(fetches, 0);
+      assert.equal(releases, 0);
+      assert.equal(shaInBare(clone.path, "HEAD"), committed, "retained commit survives shutdown");
+      assert.equal(fs.readFileSync(path.join(clone.path, "dirty.txt"), "utf8"), "predecessor dirty work\n");
+      assert.deepEqual(fs.readFileSync(path.join(bare, "config")), configBefore);
+      assert.equal(shaInBare(bare, trackingRef(iid)), null, "shutdown does not invent a capture of undiscovered work");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+  it("shutdown during retained reservation leaves predecessor work in place without a new checkpoint", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-retained-shutdown-"));
+    try {
+      const claim = gitlabClaim(242, { claim_generation: 2 });
+      const bare = await git.ensureClone(fx.originPath);
+      fs.chmodSync(path.dirname(bare), 0o700);
+      fs.chmodSync(bare, 0o700);
+      const clone = await git.createOrAttachRunnerClone(bare, 242, noProofReseed, claim.run_id);
+      const committed = commitInTree(clone.path, "COMMITTED.txt", "predecessor commit\n");
+      await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+      fs.writeFileSync(path.join(clone.path, "dirty.txt"), "uncommitted predecessor\n");
+      const before = fs.readFileSync(path.join(bare, "config"));
+      const sessionPath = path.join(homeRoot, claim.run_id, "session.jsonl");
+      fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+      fs.writeFileSync(sessionPath, "predecessor session\n");
+      let models = 0, fetches = 0, reservations = 0, releases = 0;
+      const factory: ExecutorFactory = runId => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: { run: async () => { models++; throw new Error("must not execute"); } },
+      });
+      const r = runnerWith(factory, gitlab);
+      git.reserveRecoveryIteration = async () => {
+        reservations++;
+        r.shutdown();
+        throw new Error("reservation interrupted by shutdown");
+      };
+      git.ensureClone = async () => { fetches++; throw new Error("must not fetch"); };
+      client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+      await r.execute(claim);
+      assert.equal(reservations, 1, "shutdown interrupts an actually discovered retained source");
+      assert.equal(models, 0);
+      assert.equal(fetches, 0);
+      assert.equal(releases, 0);
+      assert.equal(shaInBare(clone.path, "HEAD"), committed, "shutdown must not commit the predecessor dirty work");
+      assert.equal(fs.readFileSync(path.join(clone.path, "dirty.txt"), "utf8"), "uncommitted predecessor\n");
+      assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
+      assert.equal(fs.readFileSync(sessionPath, "utf8"), "predecessor session\n");
+      assert.deepEqual(api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status), ["running"]);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }

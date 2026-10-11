@@ -40,8 +40,9 @@ It surfaces five ways:
 - **Overview**, for an admin: a self-hiding card beside the custody-hold
   alert. When every check passes it collapses to one quiet line ("System
   health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, with one Open health link to the Health tab. It
-  makes no request at all for a non-admin.
+  three attention items, including each item's evidence and docs link,
+  with one Open health link to the Health tab. It makes no request at all
+  for a non-admin.
 - **An app-wide Danger banner**, admins only, shown while `blocking` is
   `true`. It carries the instance-blocker verdict, the first instance danger
   check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger
@@ -53,9 +54,9 @@ It surfaces five ways:
   upgrade information at all for another user's worker.
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
-  `danger`. The current instance checks are `db`, `controller.report`, `loops`
-  and `fleet.roll`; the rest are `owner`. `fleet.roll` remains instance
-  infrastructure even when the hosted workers belong to a single owner.
+  `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
+  `loops`, `fleet.roll` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains
+  instance infrastructure even when the hosted workers belong to a single owner.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
   next still-blocking evaluation claims one notice per admin. Another instance
@@ -153,7 +154,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
-| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
+| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility; runs held for a returning worker (see below) are excluded | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
@@ -184,7 +185,7 @@ union, so an owner in both groups is counted once.
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
-| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
+| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains and runs held for a returning worker | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `queue.undispatched` | A queued task run that never got dispatched (the [#1367](https://github.com/vtmocanu/uzi/issues/1367) failure class) | — | any `kind = 'task'`, `status = 'queued'` run with no dispatch for 10+ minutes | — |
 
 The queue evaluates the full waiting population, including owners with usable
@@ -196,6 +197,18 @@ and current eligibility with `DrainingEligible > 0`, `NonDrainingEligible == 0`
 and `SuitableOwnDraining == 0`. An unconfirmed wait stays on the genuine path.
 Confirmed drains remain excluded from `queue.waiting` even when overdue;
 `fleet.capacity` owns the 24-hour overlap rule above.
+
+A run requeued because its worker went stale is held for that worker for
+`WORKER_STALE_REQUEUE_GRACE` (default 10m, [configuration](configuration.md)), and shows
+`waiting_worker` with the reason "waiting until <time, RFC3339 UTC> for its previous worker
+<name> to return; another worker may take it after that". That wait is expected, so both
+`queue.waiting` and `fleet.capacity` exclude rows carrying that reason, so the early explanation does not trip
+either alarm. Both keep their previous timing, measured from the end of the hold: for an owner
+whose only worker died, `fleet.capacity` reports danger about max(`WORKER_STALE_REQUEUE_GRACE`,
+`health_queued_seconds`) + 5 minutes after the requeue, which is about 15 minutes by default.
+When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the run, or the worker
+row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
+genuine wait again.
 
 Capacity runs first with a shared per-evaluation confirmation coordinator,
 memoized by run (including failed reads). It permits at most 200 distinct
@@ -211,8 +224,85 @@ count; severity still uses the full population.
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `controller.report` | The fleet-independent "is the controller still posting" signal — a one-row singleton that advances on every report, including a zero-worker one | — | no report for 5+ minutes | `unknown` from 3 missed ~10s poll intervals up to 5 minutes, and for the first 5 minutes after api boot with no report received yet (also covers a stale row surviving a restart); `na` when no hosted workers are configured |
-| `db` | Postgres reachability, pool pressure, and schema currency | ping slower than 250ms, or the connection pool at 80%+ of max | ping fails, or the applied migration version differs from the embedded head | — |
+| `db` | Postgres reachability, pool pressure, schema currency, and recent disk-full write failures | ping slower than 250ms, or the connection pool at 80%+ of max | ping fails, the applied migration version differs from the embedded head, or the api saw SQLSTATE 53100 (disk full) on a pool statement or commit within the last 5 minutes (summary "Database writes are failing: disk full (53100)."); see [Database storage signals](#database-storage-signals) | — |
+| `db.size` | `pg_database_size(current_database())` against the operator-declared `DB_STORAGE_CAPACITY_BYTES` budget; evidence is the size, the capacity, the percentage used and up to three of the largest relations | 75% or more of the budget | 85% or more of the budget | `na` when `DB_STORAGE_CAPACITY_BYTES` is unset or invalid; `unknown` when the size cannot be read. Cached for 60 seconds per api replica; see [Database storage signals](#database-storage-signals) |
 | `loops` | Whether the four in-process background loops (forge poller, sweeper, run-lifecycle reconciler, scheduler) are still ticking, via an injected `Beat(name)` per loop | a loop's last beat is older than 3 of its own tick intervals | older than 10 intervals | `unknown` for a loop that has not beaten since it registered and is still within 3 intervals (it hasn't had a chance yet); a loop never started on this deployment (the scheduler, when disabled) is left out of the evidence entirely, not counted |
+
+### Database storage signals
+
+Two checks watch for a full database, and neither can read the volume itself
+(the api holds no Kubernetes or filesystem access; see [the boundary](#the-boundary-no-kubernetes-access-ever)).
+Treat them as a backstop, not as your low-disk alert.
+
+**Run an infrastructure free-space alert as the primary control.** Alert on the
+database volume's free space in your own monitoring (for example the kubelet's
+`kubelet_volume_stats_available_bytes`, or the CNPG exporter's metrics, into
+the alerting you already operate). That sees the volume as the filesystem does;
+the checks below do not.
+
+**`db` disk-full danger.** The api records the last time it saw SQLSTATE
+`53100` on any statement or commit through its connection pool (a pgx query
+tracer). For 5 minutes after the last sighting the `db` check is `danger` with
+the fixed summary "Database writes are failing: disk full (53100).", an
+action, and a "Last seen" timestamp. Limits:
+
+- The record is in the memory of each api replica and resets on restart.
+- Only `53100` counts. Other class-53 codes (out of memory, too many
+  connections, configuration limit exceeded) are never labelled disk full.
+- It does not see goose migrations at boot, connect or ping errors, a
+  WAL-volume-full PANIC and restart, or a CNPG primary that shuts down after the
+  data volume fills. In those cases the existing ping failure is the signal, if
+  there is one.
+
+**`db.size` budget.** The check compares `pg_database_size(current_database())`
+with `DB_STORAGE_CAPACITY_BYTES` ([configuration](configuration.md#database-storage-capacity)):
+`warn` at 75% or more, `danger` at 85% or more, evaluated on exact integers.
+The largest-relations evidence reads "unavailable" when that query gives up
+(for example under a table lock) while the size itself stays current. The
+helm chart sets the budget from the database storage size
+(`database.simple.storage.size`, or `postgres.cluster.storage.size` with CNPG);
+with `database.mode: external` set `api.config.DB_STORAGE_CAPACITY_BYTES`
+yourself, as a quoted string (`DB_STORAGE_CAPACITY_BYTES: "107374182400"`):
+an unquoted number renders as `1.073741824e+11`, which the api rejects. `db.size` is an instance check, so `danger` opens the same instance
+episode and sends the same admin Slack notice as any other instance danger.
+
+**Blind spots.** `db.size` is a database-size budget, not volume usage:
+
+- It excludes WAL. With the chart's default CNPG settings
+  (`walStorage.enabled`) WAL is on a separate volume; in simple mode it shares
+  the data volume.
+- It excludes other databases, temporary files, non-Postgres files and
+  filesystem overhead, and it can include tablespaces that live on other
+  volumes.
+- So it can read below 75% while the volume fills, and above it while the
+  volume has room.
+- Each api replica evaluates and caches it independently.
+
+**Banner side effect.** Because `db.size` is instance danger, reaching 85%
+raises the app-wide Danger banner, titled "uzi cannot run work: N blocking
+check(s)", even though work may still run at that size. This is accepted: an
+85% database is meant to be acted on, but the banner wording is not specific to
+storage.
+
+**Emergency notice when the database refuses writes.** Opening the episode and
+recording the per-admin notice both write to Postgres, which cannot work while
+it returns `53100`. When the episode open (on the second consecutive evaluation
+whose open fails with `53100`), the per-admin notice claim, or the notification
+insert fails with `53100`, the api posts the admin Slack notice from memory instead. The rules
+are the normal notice's: the same "Enable run-health detection"
+(`health_enabled`) gate, admins only, Slack DM opt-in, the same escaping. Limits:
+
+- At most one per admin per 30 minutes per incident; it re-arms once `53100`
+  has gone unseen for 5 minutes.
+- The cooldown is in memory per replica: it resets on restart and replicas can
+  each send one, so an admin may get duplicates.
+- It still needs database reads (the health setting, the admin list and the
+  Slack link lookup), so it cannot help during a database shutdown, failover or
+  connection exhaustion.
+- A dropped enqueue, or an admin who has not opted in to Slack DMs, still arms
+  the cooldown.
+- After recovery the `db` check stays `danger` for up to 5 minutes, so the
+  normal claimed notice can follow the emergency one.
 
 ### Integrations
 
@@ -313,12 +403,86 @@ These are bounded observations, not a globally ordered snapshot:
 | `schedules.paused` | A user with a [pause-all](scheduling.md#pausing-everything-at-once) in force while still owning enabled schedules — their labelled issues look queued but will not fire | any such user | — | — |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
 | `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `na` when custody admission is disabled |
+| `recovery.storage` | Current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any matching capture | — | `unknown` when the read fails or exceeds four seconds |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
+| `pricing.codex` | Recent Codex usage on models without a currently valid price in this release's table | any such model | — | `unknown` when the usage query fails or exceeds its five-second deadline |
 
 `unknown` and `na` are first-class outcomes, not edge cases to squint past: a
 check reading `unknown` means its observation is missing, stale, unreadable,
 or turned off, and a check reading `na` means it genuinely does not apply here (no
 hosted workers, no Slack). Neither is ever folded into, or displayed as, `ok`.
+
+### Recovery storage
+
+`recovery.storage` is an owner-scoped housekeeping check for
+[#2544](https://github.com/vtmocanu/uzi/issues/2544). It is `warn` when
+the current persisted capture count is greater than zero for the exact pair
+`state = needs_action`, `reason = storage quota exceeded`; otherwise it
+is `ok`. A failed read, missing aggregate or four-second read deadline
+is `unknown`. There is no danger or percentage-capacity band.
+
+Evidence reports global bytes and counts across owners: available recovery
+captures, preparing/uploading reservations, non-expired job files, quota
+refusals and owners, plus reclaimable job bytes, recovery/shared totals and
+the effective owner/instance/shared byte limits (`<= 0` reads disabled).
+At most eight owner examples follow, ordered by refusal count then owner
+ID, with an omitted-owner count. The totals are computed before this cap;
+the cap does not narrow the global accounting.
+
+Custody release does not remove a persisted refusal, so a released hold can
+still warn. An admitted retry clears the marker as it becomes uploading,
+**before success**, so a cleared warning is not proof of an available archive.
+Discard, a nonquota reason or a stalled-upload reason replacing the quota
+marker also removes that capture from the warning. Capture-count reserve
+refusals that create no capture row are absent from this signal.
+
+Upload-failure recording is best-effort. The check observes current state,
+not history, and its logical byte totals are not PostgreSQL/PVC physical
+capacity. It adds no quota, retention or custody policy.
+See [Recovery storage diagnosis](./recovery-storage-diagnosis.md) for
+snapshot SQL and the evidence needed to distinguish owner, instance,
+shared and count refusals; `uzi run recovery` alone omits capture reason.
+
+Implementation:
+[checkRecoveryStorage](../api/internal/healthsvc/recovery_storage.go) and
+[RecoveryStorageHealth](../api/internal/store/queries/recovery_storage_health.sql).
+
+### Codex price coverage
+
+`pricing.codex` ([PRD #2560](../prds/done/2560-pricing-freshness.md)) is a
+read-only coverage check, not a rate fetch or price-freshness verification.
+It looks at Codex `run_usage` rows whose `updated_at` is within the last
+seven days, including the cutoff. That timestamp is the last usage fold,
+including redelivery, not the exact inference time.
+
+The check compares observed model IDs with the API's embedded price table
+for this release. The currently priced set and the distinction between
+**no price** and **promotional price expired** use the same UTC clock;
+promotions expire at midnight UTC on their review date. Counts are distinct
+runs per model, not usage rows. Priced models are excluded before the
+evidence limit. Evidence lists at most ten models, ordered by run count
+descending then model ID, with an **and more** row when further models exist.
+
+Usage from the [Now summary](run-activity.md#now-summary) is stored under a
+`progress_note:<model>` key; this check strips that prefix, so a summary-only
+model is named and counted under its real ID together with the run's own usage
+of it. Usage from the intent, plan and PR-description summary passes is stored
+under `summary_pass:<model>`, and the check strips that prefix the same way.
+
+Any finding is `warn`; this check has no `danger` band. With no findings it
+is `ok`, with the summary **"no recent Codex usage on unpriced models"**.
+A failed query, including its five-second deadline, reads `unknown`.
+Every result, including `ok`, `warn` and `unknown`, is cached for ten
+minutes per API replica, so a new finding, cleared warning or recovered
+query can take up to ten minutes to appear. These bounds are fixed; there
+is no new index or admin setting.
+
+Workers price runs with their own copy of the table. During a worker roll,
+or with a worker image tag override, that copy can differ from the API's
+embedded table. This accepted skew means the check describes release
+coverage, not why an individual run's cost was unavailable. A maintainer
+must verify rates against official sources before updating the table; see
+[Updating prices](run-cost.md#updating-prices).
 
 ## What it cannot see
 
@@ -334,6 +498,12 @@ Two checks shown in the accepted mock are **deferred**, not shipped:
   per-connection bookkeeping to read yet. The delivered `forge.sync` check
   measures per-repo poller failure streaks, not this independent freshness
   signal or a fix for an underlying transport problem.
+
+- **Database volume usage** — the volume's free space, WAL growth, or a full
+  WAL volume. `db.size` is a database-size budget and the disk-full signal sees
+  only `53100` on the api's own pool; see
+  [Database storage signals](#database-storage-signals) and run the
+  infrastructure free-space alert.
 
 And **pod-level health of the api, web, database, and controller pods is out
 of scope entirely** — see [the boundary](#the-boundary-no-kubernetes-access-ever)
@@ -356,6 +526,12 @@ Text output includes `blocking: true (instance-wide)` or
 `blocking: false (instance-wide)` alongside the overall status and tally.
 Owner-only danger still exits `8`; `blocking` does not change `--strict`,
 transport/auth handling or malformed-document handling.
+
+The text table's `EVIDENCE` column prints bounded evidence entries, using
+continuation rows for additional entries, including the capped model list
+and `and more` marker.
+Both the default attention view and `--all` print those entries; `--json`
+continues to return the endpoint's document unchanged.
 
 The exit code is the probe contract:
 

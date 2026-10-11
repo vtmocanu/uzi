@@ -5,8 +5,9 @@
 // Slack outage, an unlinked user, or a full notifier queue never loses the row.
 //
 // Since PRD #1650 retired the in-app inbox, nothing reads the table back to a user:
-// it is a pruned, write-only event log (capped per user by DefaultUserCap, so not a
-// durable audit log). The user-facing delivery is the Slack DM.
+// it is a pruned, write-only event log (nominal per-user retention of DefaultUserCap,
+// with pending durable rows exempt and timestamp ties retained, so not a durable audit
+// log). The user-facing delivery is the Slack DM.
 //
 // One exception (issue #1675): a notification that opts into Notification.DurableSlack
 // (only the CI-autofix and MR-rework halt kinds) stores its Slack render on the row and
@@ -33,9 +34,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// DefaultUserCap is the per-user retention cap: the newest this-many notifications
-// are kept, older ones pruned on write (Decision 6 — pruning ships with the table,
-// not later), so the table can't grow without bound. Overridable via New for tests.
+// DefaultUserCap is the nominal per-user retention target (Decision 6): pruning
+// keeps the newest this-many notifications and rows tied at their timestamp boundary.
+// Pending durable Slack rows below MaxSlackAttempts are exempt. Pruning is best-effort
+// after inserts, successful delivery stamps, and final retry claims (issue #2076),
+// so this is not a hard row limit. Overridable via New for tests.
 const DefaultUserCap = 200
 
 // MaxSlackAttempts bounds the delivery attempts of a durable Slack notification
@@ -197,9 +200,11 @@ type Notification struct {
 	DurableSlack bool
 }
 
-// Notify persists the notification row, then prunes the user's rows to the cap
-// (best-effort), then enqueues the Slack DM (best-effort; a DurableSlack notification
-// is additionally redelivered by the Redeliverer until posted). The persisted row is
+// Notify persists the notification row, then best-effort prunes older eligible rows
+// toward the user's retention target, then enqueues the Slack DM (best-effort; a
+// DurableSlack notification is additionally redelivered by the Redeliverer until
+// posted or MaxSlackAttempts is spent). Pending durable rows and timestamp ties
+// can leave more rows than the nominal cap. The persisted row is
 // returned. Only a failure to persist is fatal to the call; prune/Slack failures
 // are logged and swallowed. The prune and
 // Slack steps run after the durable write so neither can cost the caller the row.
@@ -239,8 +244,9 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 	}
 
 	// Retention prune, best-effort and off the durable write. The query no-ops when
-	// the user is under the cap (a bounded index probe), so calling it every write
-	// keeps the cap tight without a scan.
+	// the user is under the cap (a bounded index probe). Pending durable rows are
+	// exempt and timestamp ties survive; settlement paths also attempt pruning
+	// so cleanup need not wait for another Notify (issue #2076).
 	if _, err := s.q.PruneNotificationsForUser(ctx, store.PruneNotificationsForUserParams{
 		UserID:      n.UserID,
 		Keep:        s.cap,

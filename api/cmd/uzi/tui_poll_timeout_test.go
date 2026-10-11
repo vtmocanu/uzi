@@ -15,7 +15,7 @@ import (
 // short-poll window. On UNFIXED code the captured ctx has NO deadline (ok == false), so the
 // assertion fails deterministically with no blocking fake and no goroutine hang.
 
-// The board poll (fetchRunsCmd) must hand ListRuns a ctx whose deadline is ≈ now +
+// The board poll (fetchRunsCmd) must hand ListRunSummaries a ctx whose deadline is ≈ now +
 // boardPollTimeout and strictly < 30s (proving it is the short poll bound, not the 30s client
 // timeout). boardPollTimeout is shrunk under the test to make the window tight and deterministic.
 func TestTUIBoardPollDerivesShortDeadline(t *testing.T) {
@@ -36,9 +36,9 @@ func TestTUIBoardPollDerivesShortDeadline(t *testing.T) {
 		t.Fatalf("fetchRunsCmd produced %T, want boardRunsMsg", msg)
 	}
 
-	ctx := fake.LastListRunsCtx
+	ctx := fake.LastListRunSummariesCtx
 	if ctx == nil {
-		t.Fatal("ListRuns was handed a nil ctx; the board poll did not pass its derived context")
+		t.Fatal("ListRunSummaries was handed a nil ctx; the board poll did not pass its derived context")
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {

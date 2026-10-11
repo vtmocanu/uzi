@@ -24,6 +24,7 @@ assert_contains() { grep -Fq -- "$2" "$1" || fail "$1 does not contain: $2"; }
 assert_not_contains() { ! grep -Fq -- "$2" "$1" || fail "$1 unexpectedly contains: $2"; }
 file_bytes() { wc -c < "$1" | tr -d ' '; }
 
+REAL_MKTEMP="$(command -v mktemp)"
 REAL_SHA256SUM="$(command -v sha256sum || true)"
 [ -n "$REAL_SHA256SUM" ] || fail "sha256sum is required to build the fixture digest"
 sha_of() { "$REAL_SHA256SUM" "$1" | awk '{print $1}'; }
@@ -125,14 +126,29 @@ FAKE
 printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/sleep"
 chmod +x "$FAKE_BIN/uname" "$FAKE_BIN/sha256sum" "$FAKE_BIN/curl" "$FAKE_BIN/wget" "$FAKE_BIN/sleep"
 
+# Model BSD's bare -d behavior on every host, and record the returned path so
+# the cleanup assertion cannot pass vacuously when scratch escapes TMPDIR.
+cat > "$FAKE_BIN/mktemp" <<'STUB'
+#!/bin/sh
+set -eu
+if [ "$#" -eq 1 ] && [ "$1" = -d ]; then
+  scratch="$("$FAKE_REAL_MKTEMP" -d "${TMPDIR%/tmp}/escaped.XXXXXX")"
+else
+  scratch="$("$FAKE_REAL_MKTEMP" "$@")"
+fi
+printf '%s\n' "$scratch" >> "$FAKE_MKTEMP_LOG"
+printf '%s\n' "$scratch"
+STUB
+chmod +x "$FAKE_BIN/mktemp"
+
 # A PATH with curl absent, for the wget cases: only the tools the wrapper needs.
 NOCURL_BIN="$TMP/nocurl"
 mkdir -p "$NOCURL_BIN"
-for tool in awk cat chmod cmp cp mkdir mktemp mv rm sort tr wc tar gzip head dirname; do
+for tool in awk cat chmod cmp cp mkdir mv rm sort tr wc tar gzip head dirname; do
   p="$(command -v "$tool")" || fail "required tool not found: $tool"
   ln -s "$p" "$NOCURL_BIN/$tool"
 done
-for f in uname sha256sum wget sleep; do ln -s "$FAKE_BIN/$f" "$NOCURL_BIN/$f"; done
+for f in uname sha256sum wget sleep mktemp; do ln -s "$FAKE_BIN/$f" "$NOCURL_BIN/$f"; done
 
 # --- runner -------------------------------------------------------------------------------
 CASE=0
@@ -151,17 +167,26 @@ run_case() {
   CURL_LOG="$CASEDIR/curl.log"
   WGET_COUNT="$CASEDIR/wget.count"
   WGET_LOG="$CASEDIR/wget.log"
+  : > "$CASEDIR/mktemp.log"
   : > "$CURL_LOG"
   : > "$WGET_LOG"
   rm -f "$WGET_COUNT"
   CACHE="${CACHE_OVERRIDE:-$CASEDIR/cache}"
   RC=0
   env PATH="$path" TMPDIR="$CASEDIR/tmp" UZI_OASDIFF_DIR="$CACHE" HOME="$CASEDIR" \
+    FAKE_REAL_MKTEMP="$REAL_MKTEMP" FAKE_MKTEMP_LOG="$CASEDIR/mktemp.log" \
     FAKE_UNAME_S="$us" FAKE_UNAME_M="$um" FAKE_ARCHIVE="$archive" \
     FAKE_EXPECTED_PIN="$(pin "$pinvar")" FAKE_REAL_SHA256SUM="$REAL_SHA256SUM" FAKE_GOOD_SHA="$GOOD_SHA" \
     FAKE_CURL_LOG="$CURL_LOG" FAKE_WGET_COUNT="$WGET_COUNT" FAKE_WGET_LOG="$WGET_LOG" \
     FAKE_STUB_RC="$FAKE_STUB_RC" FAKE_DOWNLOAD_FAIL="$FAKE_DOWNLOAD_FAIL" FAKE_WGET_FAIL_FIRST="$FAKE_WGET_FAIL_FIRST" \
     /bin/sh "$WRAPPER" "$@" > "$OUT" 2>&1 || RC=$?
+  while IFS= read -r scratch; do
+    case "$scratch" in
+      "$CASEDIR/tmp/"*) ;;
+      *) fail "$name: temporary extraction outside case scratch: $scratch" ;;
+    esac
+    [ ! -e "$scratch" ] || fail "$name: temporary extraction was not cleaned: $scratch"
+  done < "$CASEDIR/mktemp.log"
   # Whatever the outcome, the private extraction must be gone.
   leftover="$(ls -A "$CASEDIR/tmp")"
   [ -z "$leftover" ] || fail "$name: the wrapper left temp files behind: $leftover"
@@ -184,6 +209,7 @@ assert_contains "$OUT" "unsupported host Linux/mips"
 # 2. happy path: the right asset URL, retrying download, args forwarded, archive cached --------
 run_case "linux amd64" Linux x86_64 "$TMP/good.tar.gz" OASDIFF_LINUX_AMD64_SHA256 "$WITH_CURL" "$TASK_PIN" breaking a.yaml b.yaml --fail-on ERR
 assert_eq 0 "$RC" "linux amd64"
+[ -s "$CASEDIR/mktemp.log" ] || fail "linux amd64: no temporary extraction observed"
 assert_contains "$OUT" "stub oasdiff args: breaking a.yaml b.yaml --fail-on ERR"
 assert_contains "$CURL_LOG" "https://github.com/oasdiff/oasdiff/releases/download/v${VER_NO_V}/oasdiff_${VER_NO_V}_linux_amd64.tar.gz"
 assert_contains "$CURL_LOG" "--retry-all-errors"

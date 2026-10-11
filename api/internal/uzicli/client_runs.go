@@ -22,6 +22,17 @@ func (c *HTTPClient) ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, e
 	return env.Runs, nil
 }
 
+// ListRunSummaries is the compact run list (issue #2661): GET /api/runs?view=summary.
+func (c *HTTPClient) ListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error) {
+	var env struct {
+		Runs []apitypes.RunSummaryItemDTO `json:"runs"`
+	}
+	if err := c.get(ctx, "/api/runs?view=summary", &env); err != nil {
+		return nil, err
+	}
+	return env.Runs, nil
+}
+
 func (c *HTTPClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`

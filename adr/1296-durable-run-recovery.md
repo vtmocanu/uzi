@@ -71,8 +71,10 @@ dependencies. Production verifies the bundle in the trusted worker bare;
 conformance tests verify and import it in isolated no-alternates destination
 clones. These checks do not guarantee fresh public availability. A thin archive remains
 owner-downloadable but never authorizes archive-backed FINAL or source cleanup,
-even with complete root coverage. Holds, pins and clones stay retained until
-independently verified empty-inventory settlement or explicit owner discard.
+even with complete root coverage. Without the distinct completed-publication
+receipt described in the 2026-10-09 amendment, holds, pins and clones stay
+retained until independently verified empty-inventory settlement or explicit
+owner discard.
 Non-final capture TTL remains normal; custody does not expire and pod/PVC/hold
 costs continue. Deploy the API release guard before the worker producer. Legacy
 fresh-forge capture is unchanged. Historical oversized captures are not
@@ -259,7 +261,7 @@ preferred over a guess that could drop the last copy.
 
 ### Release only from per-hold durable evidence, ancestry-checked at disposition time (D2)
 
-One exact hold may leave `open` only after one of: (1) that generation's full head was
+For legacy holds, one exact hold may leave `open` only after one of: (1) that generation's full head was
 published, (2) an available archive is bound to that hold, (3) the hold's own source-holding
 worker proves no unpublished committed output against freshly fetched forge history, or (4) the
 owner explicitly discards that exact held source. A current generation may settle an *earlier*
@@ -421,7 +423,9 @@ prerequisite to satisfy. The bundle is journaled and uploaded at the record's ex
 the legacy hold becomes `archive_ready`. Restart and quarantine capture without
 an explicit guarded cached-dependency fallback option remains self-contained.
 The guarded D5 exception above can produce a downloadable thin archive, but
-never closes custody through archive-backed FINAL or retires the source or pod.
+thin availability alone never closes custody through archive-backed FINAL or
+retires the source or pod. The independent completed-publication receipt in
+the 2026-10-09 amendment can release the exact eligible completing generation.
 Three limits carry over from the rest of D5:
 
 - The size cap (`RECOVERY_MAX_BUNDLE_BYTES`, 64 MiB) is enforced on the bytes written while
@@ -433,7 +437,9 @@ Three limits carry over from the rest of D5:
   `early_pin_only_after_restart`. A finalization-pinned head already reachable from the default
   ref is marked `no_unpublished_work_after_restart`, and a head or bare that cannot be verified
   `source_not_verifiable_after_restart`.
-- Release evidence is unchanged: the hold leaves `open` only on one of the five classes above.
+- The restart-capture path leaves release evidence unchanged: it uses the five
+  classes recorded above. The independent completed-publication class was
+  added by the 2026-10-09 amendment.
 
 See [adr/1742-finalize-resume-allowance.md](1742-finalize-resume-allowance.md) (D4).
 
@@ -472,7 +478,9 @@ The disposition is stored in the record's existing `reason` string, not a new fi
 MAC-covered field would make a rolled-back worker recompute a different MAC and refuse the record.
 The permanent reasons are honoured at every entry point (capture, boot sweep, live pass): a record
 carrying one is never uploaded again. A permanent refusal leaves the worker's record `needs_action`
-with its bundle and source pin kept; the worker releases nothing, and release evidence is unchanged.
+with its bundle and source pin kept; that upload-refusal path releases nothing.
+The independent completed-publication class in the 2026-10-09 amendment does
+not change this upload-refusal decision.
 A rolled-back (pre-#1995) worker still reads such a record but does not honour the disposition: its
 boot sweep retries it once per boot.
 
@@ -514,3 +522,86 @@ This accepts the MAC compatibility boundary noted above: an old worker refuses j
 this new field, while the new worker reads old field-absent journals. Rollback restores retries,
 inspection and adoption by returning to a compatible worker; refusal erases neither bytes nor pins.
 No server rollout is required.
+
+## Amendment 2026-10-09 — #2507: synchronous completed-publication release
+
+**Status**: Implemented in API and worker; this amendment records the maintainer
+policy, not production acceptance or deployment evidence. It qualifies the
+current D2 release classes and D5 thin/source-retention rules. Archive-backed
+FINAL still requires a selected available, prerequisite-free covering archive;
+thin availability supplies no cleanup authority.
+
+### Exact completed identity and API proof
+
+For an inventory-guarded COMPLETED `issue`, `mr_rework` or `self_improve`
+run, both worker and API must support `recovery_completed_publication_v1`.
+Completion commits with an immutable identity before proof runs synchronously
+in the state-report path. Identity binds the exact hold, owner, originating
+worker, run, completing generation, repository, forge connection/project,
+branch, recorded MR and fixed reported final SHA.
+
+The server branch is `agentIssueBranch(issue)` for issue runs, the frozen
+`pipeline_ref` candidate for MR rework, and `selfImproveBranch(runID)`
+(`uzi/self-improve/<run-id>`) for self-improvement. The latter is not derived
+from a tracking issue or pipeline, and worker-reported branch text is not
+proof authority.
+
+`api/internal/workersvc/completed_publication.go` reads the server-recorded
+MR summary in the run's own repository, requires SourceBranch equal to the
+frozen branch, obtains BranchHead H, requires H equal to MR HeadSHA, and
+requires `CompareAncestry(H, finalSHA)` to prove containment or equality.
+This proves a matching own-repository copy; it asserts neither non-fork origin
+nor branch protection. Later user deletion or rewriting is outside the proof.
+
+Proof uses bounded forge requests without database locks. Release then locks
+worker → run → exact hold, locks repository/configuration rows, and revalidates
+identity with the CAS in
+`api/internal/store/queries/completed_publication.sql`. Successful release
+stores `completed_publication_receipt` atomically and clears the live custody
+pointers. Missing, mismatched, erroring, unknown or drifting evidence retains
+the hold with `completed_publication_reason`; completion remains committed.
+The state ACK and owner hold DTO expose these fields. Exact receipt replay
+authenticates original provenance and fixed final SHA before mutable
+run/forge eligibility, so it does not depend on current forge state, a
+surviving run row or a later claim.
+
+### Independent of archive preparation
+
+A valid receipt needs no capture, WIP commit, inventory freeze or clean-source
+proof, including when available, thin or needs-action captures already exist.
+Their retention policy remains unchanged. Healthy completion custody release
+adds no heartbeat prerequisite. The worker installs the fixed original
+terminal outcome before preparation when its existing outbox is usable.
+Completion-first ordering is negotiated; a valid receipt skips preparation.
+Before protected report retirement, it must be written and read back in an
+existing MAC-authenticated exact-generation recovery record. This is separate
+from archive FINAL coverage authority, with no standalone receipt or tombstone.
+
+No receipt, refusal, unknown ACK or mixed-version operation uses the original
+capture fallback. An API advertising the feature but excluding a kind returns
+no valid receipt and takes that fallback. If release succeeded but the ACK was
+lost, a later capture refusal grants no cleanup authority and cannot fail or
+reopen completion; replay of the fixed original completion recovers the stored
+receipt. No-outbox and reserve-failure paths keep attempted-send guards to
+prevent a false failed report; they gain no invented durable journal.
+
+### Scope and physical retention
+
+Only the exact completing-generation hold gains this authority. Older and
+successor holds remain independent; unstamped older completed holds, including
+earlier self-improvement runs, are not backfilled. Failed, cancelled and parked
+runs and `ci_fix`, `prompt` and `task` retain their existing policy.
+
+Physical destruction is a separate guarded decision, recorded in the
+[ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2026-10-09--completed-publication-receipt-authority).
+Process quiescence, credential isolation, exact canonical owned paths,
+expected SHA and attribution, execution/adoption exclusion through destruction
+and bare locks remain required. Eligible dirty/untracked completing-source
+leftovers may be discarded, while sibling generations, shared pins, metadata
+consumers, foreign/unknown inventory and quarantine stay protected.
+
+Existing archive source-boundary diagnostics, including failed/cancelled
+foreground `execution_tail_present`, remain applicable to capture fallback.
+This amendment adds no intent, endpoint, crash discovery, forge driver or E2E
+mechanism and does not implement #2544 quota, #2545 failed publication or
+#2506 failed thin release.

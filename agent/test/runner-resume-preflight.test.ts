@@ -354,9 +354,11 @@ describe("RunRunner — resume preflight (issue #105)", () => {
   });
 });
 
-it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LINUX_ONLY }, async () => {
+it("a retained Codex runner turn adopts the session artifact but starts a fresh thread", { skip: LINUX_ONLY }, async () => {
   const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-  const turnId = "resumed-turn";
+  const freshSid = "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const turnId = "retained-fresh-turn";
+  let seenContext: RunContext | undefined;
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-runner-resume-"));
   const source = path.join(homeRoot, "source");
   const { gitlab } = fakeGitlab();
@@ -367,12 +369,13 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LI
   };
   const firstClaim = gitlabClaim(1627, {
     plan_approved: true,
+    plan_source: "agent",
     plan_md: "Approved plan",
     secrets: {
       forge_pat: "fixture-forge", forge_username: "bot", anthropic_oauth_token: "fixture-oauth", codex,
     },
   });
-  const claim = { ...firstClaim, session_id: sid };
+  const claim = { ...firstClaim, session_id: sid, claim_generation: 2 };
   const requests: Array<{ method: string; params: unknown }> = [];
   const runHome = path.join(homeRoot, claim.run_id);
   const sessionFile = `rollout-2026-09-25-${sid}.jsonl`;
@@ -396,18 +399,16 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LI
       requests.push({ method, params });
       if (method === "initialize") return { userAgent: "codex/0.153.2", codexHome: source, platformFamily: "unix", platformOs: "linux" } as T;
       if (method === "account/login/start") return { type: (params as { type: string }).type } as T;
-      if (method === "thread/resume") {
-        if (!artifactAtLaunch || !artifact || !fs.existsSync(artifact) || fs.readFileSync(artifact, "utf8") !== sessionBytes) {
-          throw new Error("claimed thread artifact was not adopted before resume");
-        }
-        return { thread: { id: sid } } as T;
+      if (method === "thread/resume") throw new Error("retained recovery must not resume the old thread");
+      if (method === "thread/start") {
+        assert.equal(artifactAtLaunch, true, "old session artifact was adopted before starting a fresh thread");
+        return { thread: { id: freshSid } } as T;
       }
-      if (method === "thread/start") throw new Error("resumed claim started a new thread");
       if (method === "turn/start") {
         push({ kind: "activity", method: "item/tool/call", requestId: 1,
-          params: { threadId: sid, turnId, callId: "done-1", tool: "signal_done", arguments: { report_only: true, summary: "Resumed turn completed" } } });
-        push({ kind: "turn_completed", method: "turn/completed", threadId: sid, turnId,
-          status: "completed", params: { threadId: sid, turn: { id: turnId, status: "completed" } } });
+          params: { threadId: freshSid, turnId, callId: "done-1", tool: "signal_done", arguments: { report_only: true, summary: "Fresh retained turn completed" } } });
+        push({ kind: "turn_completed", method: "turn/completed", threadId: freshSid, turnId,
+          status: "completed", params: { threadId: freshSid, turn: { id: turnId, status: "completed" } } });
         completedTurn = true;
         ended = true;
         return { turn: { id: turnId } } as T;
@@ -463,15 +464,15 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LI
     assert.equal(fs.existsSync(store), true, "held per-run HOME keeps the persisted session");
     assert.equal(await CodexSessionStore.inspectSession(store, sid), "present");
 
-    // The retained clone journal makes the first reclaim capture and park at recovery_wait.
-    // That park retires the captured clone while preserving the same run HOME for requeue.
-    await runnerWith(() => ({
-      homeDir: runHome,
-      executor: { run: async () => { throw new Error("recovery reclaim reached the executor"); } },
-    }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
-    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "recovery_wait"));
-    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"));
-    assert.equal(fs.existsSync(store), true, "recovery park preserves the held session");
+    const canonical = worktreeDirFor(1627);
+    fs.writeFileSync(path.join(canonical, "retained.txt"), "held local work\n");
+    const bare = git.barePathFor(fx.originPath);
+    const journalKey = `uzi-recovery.agent/issue-1627.clone`;
+    const readJournal = () => JSON.parse(execFileSync("git", ["-C", bare, "config", journalKey], { encoding: "utf8" }));
+    const journalBefore = readJournal();
+    assert.equal(journalBefore.clonePath, canonical);
+    const canonicalHead = execFileSync("git", ["-C", canonical, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    api.setOwnershipStatus(claim.run_id, "running", 2);
     claim.last_seq = api.messages(claim.run_id).at(-1)?.seq ?? 0;
 
     const selected = selectCodexBinding({ codex });
@@ -513,6 +514,18 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LI
           idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
         });
         return { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          assert.equal(seenContext, undefined, "one successor claim reaches the actual executor once");
+          seenContext = ctx;
+          assert.equal(ctx.sessionId, undefined, "retained recovery drops claimed session lineage");
+          assert.notEqual(ctx.worktreePath, canonical);
+          assert.match(ctx.worktreePath, /\.attempt-.*-g2-/);
+          assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "held local work\n");
+          const journal = readJournal();
+          assert.equal(journal.clonePath, ctx.worktreePath);
+          assert.equal(journal.recovery.stage, "ready-for-model");
+          assert.equal(journal.recovery.attempts, 1);
+          assert.equal(journal.recovery.source.clonePath, canonical);
+          assert.equal(journal.recovery.successor.clonePath, ctx.worktreePath);
           const result = await codexExecutor.run(ctx);
           git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
           git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
@@ -524,14 +537,26 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", { skip: LI
       })(),
     }), gitlab).execute(claim);
     const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
-    assert.ok(events.includes(RESUME_CONTINUED_EVENT), "runner accepted the persisted claimed thread");
+    assert.equal(events.includes(RESUME_CONTINUED_EVENT), false, "fresh checkout does not continue the old lineage");
+    assert.ok(seenContext, "the actual Codex executor received the recovered context");
     assert.equal(artifactAtLaunch, true, `session artifact missing at launch; requests=${JSON.stringify(requests.map((r) => r.method))} messages=${JSON.stringify(api.messages(claim.run_id).map((m) => [m.kind, m.payload.event, m.payload.text]))}`);
     const resume = requests.find((r) => r.method === "thread/resume");
     const turn = requests.find((r) => r.method === "turn/start");
-    assert.equal((resume?.params as { threadId?: string })?.threadId, sid);
-    assert.equal((turn?.params as { threadId?: string })?.threadId, sid);
-    assert.equal(completedTurn, true, "the resumed turn emitted completion");
-    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), "resumed hold did not fail");
+    assert.equal(resume, undefined);
+    assert.equal(requests.filter(r => r.method === "thread/start").length, 1);
+    assert.equal((turn?.params as { threadId?: string })?.threadId, freshSid);
+    assert.equal(completedTurn, true, "the fresh actual Codex turn emitted completion");
+    assert.equal(fs.readFileSync(path.join(canonical, "retained.txt"), "utf8"), "held local work\n");
+    assert.equal(await CodexSessionStore.inspectSession(store, sid), "present");
+    assert.ok(fs.existsSync(runHome), "the per-run HOME survives");
+    const journalAfter = readJournal();
+    assert.ok(journalAfter.retainedSources.some((s: { clonePath: string; runId: string }) => s.clonePath === canonical && s.runId === claim.run_id));
+    execFileSync("git", ["-C", canonical, "merge-base", "--is-ancestor", canonicalHead, "HEAD"]);
+    const retainedSource = journalAfter.retainedSources.find((s: { clonePath: string }) => s.clonePath === canonical);
+    assert.equal(retainedSource.restoreTip, execFileSync("git", ["-C", canonical, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), "the retained descriptor pins the captured canonical HEAD");
+    assert.ok(execFileSync("git", ["-C", bare, "for-each-ref", "--format=%(refname)", `refs/uzi-recovery-episode/${claim.run_id}`], { encoding: "utf8" }).trim(), "recovery evidence stays pinned");
+    assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "recovery_wait"), false);
+    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), `fresh retained hold did not fail: ${JSON.stringify(api.states.filter(s => s.runId === claim.run_id))} messages=${JSON.stringify(api.messages(claim.run_id))}`);
     assert.equal(api.completionHoldRequests.length, 2, "both completion holds were acknowledged");
   } finally {
     git.worktreeStatus = originalStatus;

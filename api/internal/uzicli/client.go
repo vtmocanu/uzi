@@ -34,6 +34,11 @@ type Client interface {
 	// is additive to Whoami, which stays `{user}`-only so `uzi whoami` is unchanged.
 	WhoamiVault(ctx context.Context) (apitypes.UserDTO, bool, error)
 	ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
+	// ListRunSummaries is ListRuns' compact projection (GET /api/runs?view=summary, issue
+	// #2661): the same rows without the heavy detail fields (plan_md, repo_agents,
+	// issue_description, preserved_patch). The TUI board polls this; `uzi run list --json`
+	// keeps ListRuns so its output is unchanged.
+	ListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error)
 	GetRun(ctx context.Context, id string) (apitypes.RunDTO, error)
 	// RunLogs returns a run's persisted messages after seq (0 = from the start);
 	// `uzi run logs` polls it with the highest seq seen (Decision: REST polling, not
@@ -205,6 +210,9 @@ type Client interface {
 	BuildInfo(ctx context.Context) (apitypes.BuildInfoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
+	// AdminListRunSummaries is AdminListRuns' compact projection
+	// (GET /api/admin/runs?view=summary, issue #2661), polled by the admin TUI board.
+	AdminListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
 	// AdminHealth reads the admin health document (PRD #1484 M3): GET
 	// /api/admin/health, in the admin READ group (RequireUser + RequireAdminRO), so a

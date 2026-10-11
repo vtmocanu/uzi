@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { diffLines } from "diff";
+import { LineDiff } from "../../components/LineDiff";
 import {
   api,
   type AgentSelectionInput,
@@ -76,6 +78,67 @@ export function derivePlanRevision(messages: RunMessage[]): PlanRevision {
     latestFeedback,
     priorPlans,
   };
+}
+
+// Only the immediately preceding plan can be the base, with feedback strictly
+// between it and the target. Invalid payloads never become empty comparisons.
+export function derivePlanDiffBase(messages: RunMessage[], targetSeq?: number): {
+  base: { text: string; seq: number; version: number };
+  target: { text: string; seq: number; version: number };
+} | null {
+  const sorted = [...messages].sort((a, b) => a.seq - b.seq);
+  const plans = sorted.filter((m) => m.kind === "plan");
+  const index = targetSeq === undefined
+    ? plans.length - 1
+    : plans.findIndex((m) => m.seq === targetSeq);
+  if (index < 1) return null;
+  const target = plans[index];
+  const base = plans[index - 1];
+  const baseText = (base.payload as { plan_md?: unknown } | null)?.plan_md;
+  const targetText = (target.payload as { plan_md?: unknown } | null)?.plan_md;
+  if (typeof baseText !== "string" || typeof targetText !== "string") return null;
+  if (!sorted.some((m) => m.kind === "plan_feedback" && base.seq < m.seq && m.seq < target.seq)) return null;
+  return {
+    base: { text: baseText, seq: base.seq, version: index },
+    target: { text: targetText, seq: target.seq, version: index + 1 },
+  };
+}
+
+function PlanChanges({ comparison }: {
+  comparison: NonNullable<ReturnType<typeof derivePlanDiffBase>>;
+}) {
+  const [open, setOpen] = useState(false);
+  const { base, target } = comparison;
+  const tooLarge = new TextEncoder().encode(base.text).length > 200 * 1024 ||
+    new TextEncoder().encode(target.text).length > 200 * 1024;
+  const stripEnding = (s: string) => s.replace(/[\r\n]+$/, "");
+  const identical = stripEnding(base.text) === stripEnding(target.text);
+  const parts = useMemo(() => {
+    if (tooLarge) return [];
+    const normalize = (s: string) => {
+      const text = s.replace(/[\r\n]+$/, "");
+      return text === "" ? "" : text + "\n";
+    };
+    return diffLines(normalize(base.text), normalize(target.text));
+  }, [base.text, target.text, tooLarge]);
+  const added = parts.reduce((n, p) => n + (p.added ? p.count ?? 0 : 0), 0);
+  const removed = parts.reduce((n, p) => n + (p.removed ? p.count ?? 0 : 0), 0);
+  return (
+    <div className="space-y-2">
+      {identical && <p role="alert" className="text-warn">
+        This revision is identical to v{base.version}. Your requested changes were not applied.
+      </p>}
+      {tooLarge ? <p>Plan too large to compare</p> : <>
+        <Button variant="secondary" size="sm" aria-expanded={open} onClick={() => setOpen(!open)}>
+          Show changes since v{base.version}
+        </Button>
+        {open && <div className="overflow-auto whitespace-pre-wrap font-mono text-xs">
+          <p>+{added} / -{removed} lines</p>
+          <LineDiff parts={parts} tone="revision" addedLabel="Added line" removedLabel="Removed line" />
+        </div>}
+      </>}
+    </div>
+  );
 }
 
 // VersionChip is the mono v1/v2 badge in the panel head. Info-toned in the revising
@@ -259,6 +322,8 @@ export function PlanPanel({
     ) : null;
 
   const rev = useMemo(() => derivePlanRevision(messages), [messages]);
+  const diffBase = useMemo(() => derivePlanDiffBase(messages), [messages]);
+  const displayedComparison = diffBase?.target.text === run.plan_md ? diffBase : null;
 
   // A revision round that has started ends the request-changes composer: the feedback was
   // accepted, the plan it was written against is gone, and the next plan is a new decision.
@@ -653,6 +718,11 @@ export function PlanPanel({
         ) : (
           <p className="text-sm text-faint">The agent has not attached a plan body.</p>
         )}
+
+        {displayedComparison && <PlanChanges
+          key={JSON.stringify([displayedComparison.target.seq, displayedComparison.target.text])}
+          comparison={displayedComparison}
+        />}
 
         {/* PRD #212: the git-status porcelain lines the plan turn wrote to the worktree,
             surfaced at the gate so the approving human sees writes that would otherwise be

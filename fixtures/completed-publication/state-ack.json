@@ -1,0 +1,32 @@
+{
+  "request": {
+    "status": "completed",
+    "claim_generation": 1,
+    "completion_final_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "branch": "agent/issue-7",
+    "mr_iid": 17
+  },
+  "ack": {
+    "run": {
+      "id": "25070000-0000-4000-8000-000000000002",
+      "status": "completed",
+      "worker_id": "25070000-0000-4000-8000-000000000004"
+    },
+    "completed_publication_receipt": {
+      "hold_id": "25070000-0000-4000-8000-000000000001",
+      "run_id": "25070000-0000-4000-8000-000000000002",
+      "owner_id": "25070000-0000-4000-8000-000000000003",
+      "worker_id": "25070000-0000-4000-8000-000000000004",
+      "generation": 1,
+      "final_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repo_id": "25070000-0000-4000-8000-000000000005",
+      "connection_id": "25070000-0000-4000-8000-000000000006",
+      "project_id": 2507,
+      "forge_type": "gitlab",
+      "base_url": "https://forge.e2e",
+      "branch": "agent/issue-7",
+      "mr_iid": 17,
+      "observed_branch_head": "dddddddddddddddddddddddddddddddddddddddd"
+    }
+  }
+}

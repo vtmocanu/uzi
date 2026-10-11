@@ -42,6 +42,7 @@ type fakeSettingsDB struct {
 	summary         pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
+	nowSummary      pgtype.Bool
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -143,6 +144,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if b, ok := args[0].(pgtype.Bool); ok {
 			f.mrRework = b // SetUserMrReworkEnabled: $1 = mr_rework_enabled
 		}
+	case strings.Contains(sql, "UPDATE users SET now_summary_enabled") && len(args) >= 1:
+		if b, ok := args[0].(pgtype.Bool); ok {
+			f.nowSummary = b // SetUserNowSummaryEnabled: $1 = now_summary_enabled (PRD #2603)
+		}
 	case strings.Contains(sql, "UPDATE users SET sidebar_token_ids") && len(args) >= 1:
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
@@ -190,6 +195,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		summary:         f.summary,
 		theme:           f.theme,
 		mrRework:        f.mrRework,
+		nowSummary:      f.nowSummary,
 		sidebarIDs:      f.sidebarIDs,
 		sidebarCodexIDs: f.sidebarCodexIDs,
 		apprMode:        f.apprMode,
@@ -210,6 +216,7 @@ type fakeSettingsRow struct {
 	summary         pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
+	nowSummary      pgtype.Bool
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -248,7 +255,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 16:
+	case 17:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -303,6 +310,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[15].(*pgtype.Text); ok {
 			*p = r.codexEffort
+		}
+		// now_summary_enabled (PRD #2603) rides the read as the 17th column.
+		if p, ok := dest[16].(*pgtype.Bool); ok {
+			*p = r.nowSummary
 		}
 	}
 	return nil
@@ -1540,5 +1551,56 @@ func TestPutMySettingsRejectsInvalidDefaultHarness(t *testing.T) {
 	}
 	if db.defaultHarness.Valid {
 		t.Fatalf("a rejected harness must write nothing, got %+v", db.defaultHarness)
+	}
+}
+
+// decodeNowSummary pulls settings.now_summary_enabled (PRD #2603) out of a settings response body;
+// nil means JSON null (unset = the default-ON state).
+func decodeNowSummary(t *testing.T, body []byte) *bool {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			NowSummaryEnabled *bool `json:"now_summary_enabled"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	return resp.Settings.NowSummaryEnabled
+}
+
+func TestPutMySettingsNowSummaryRoundTripAndClear(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.PutMySettings(rec, authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(body)))))
+		return rec
+	}
+	rec := put(`{"now_summary_enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeNowSummary(t, rec.Body.Bytes()); got == nil || *got {
+		t.Fatalf("response now_summary_enabled = %v, want false", got)
+	}
+	if !db.nowSummary.Valid || db.nowSummary.Bool {
+		t.Fatalf("stored now_summary_enabled = %+v, want a set false (opt-out)", db.nowSummary)
+	}
+	// An unrelated PUT leaves the switch alone.
+	if rec := put(`{"summary_model":null}`); rec.Code != http.StatusOK || !db.nowSummary.Valid {
+		t.Fatalf("an absent field must leave now_summary_enabled alone: %d %+v", rec.Code, db.nowSummary)
+	}
+	// A non-bool body is a 400 and writes nothing.
+	if rec := put(`{"now_summary_enabled":"yes"}`); rec.Code != http.StatusBadRequest || !db.nowSummary.Valid || db.nowSummary.Bool {
+		t.Fatalf("non-bool: status %d stored %+v, want 400 and the stored false untouched", rec.Code, db.nowSummary)
+	}
+	// present-null clears back to NULL = default ON.
+	rec = put(`{"now_summary_enabled":null}`)
+	if rec.Code != http.StatusOK || db.nowSummary.Valid {
+		t.Fatalf("null clear: status %d stored %+v, want 200 and NULL", rec.Code, db.nowSummary)
+	}
+	if got := decodeNowSummary(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("response now_summary_enabled = %v, want null", *got)
 	}
 }

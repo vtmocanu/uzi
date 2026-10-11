@@ -52,6 +52,11 @@ const (
 	dbPingWarn      = 250 * time.Millisecond
 	dbPoolWarnRatio = 0.80
 
+	// db.size: percent of DB_STORAGE_CAPACITY_BYTES at or above which the database size
+	// warns or is danger.
+	dbSizeWarnPercent   = 75
+	dbSizeDangerPercent = 85
+
 	// slack.socket: configured but not connected for at least this long warns. Below it a
 	// reconnect blip is not worth alarming (the manager auto-reconnects).
 	slackDisconnectedWarn = 5 * time.Minute

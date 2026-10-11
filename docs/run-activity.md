@@ -92,8 +92,11 @@ labels; unknown or inconsistent verdict/reason pairs show unavailable.
 
 Findings use hardened Markdown, capped at 16,384 source characters across
 20 items, with a notice when truncated. Metadata is bounded and sanitized;
-missing model/effort is unreported, missing cost unavailable, and subscription
-usage is labelled separately from metered spend. New plan cross-check events
+missing model/effort is unreported, missing or unreported cost unavailable,
+and legacy `subscription` usage shows **No estimate**. Priced Codex checks
+in either auth mode show API-equivalent cost, not a bill; see
+[run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+New plan cross-check events
 refresh detail; a failed refresh waits for a later new event rather than
 retrying indefinitely.
 
@@ -447,6 +450,201 @@ carries its own now line under the in-progress row (`↳ <role> · <age>`,
 with the task label beneath it), and the board's selected row gains a
 second line with the same information. `uzi run get` shows the same now
 line as a `NOW` row — see [the CLI docs](./cli.md#commands).
+
+## Progress estimate
+
+Live issue runs show a progress percent on the web dashboard and runs list,
+on the TUI board and in `uzi run get`, so you can tell at a glance how far
+along a run is without opening it. The server derives it from the run's
+frozen milestone list: `11% + 89% × completed / total`, capped at 99% until
+the run finishes. The 11% is planning, the measured median share of a run's
+time spent before the first milestone starts. A run with three milestones
+and two reported complete shows `70%`. As with the [milestone
+marks](#milestones-and-the-now-line), "completed" is what the worker
+reported, not something uzi has verified.
+
+Only issue runs with a frozen milestone list get a percent; other run kinds
+show no percent. A flag replaces the number whenever a number would
+mislead:
+
+| Flag | When |
+|---|---|
+| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds `since HH:MM`); the TUI board shows only `waits on you` (`on you` on a narrow terminal) |
+| Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI and TUI board say which: `limit wait`, `pool wait`, `recovery wait` or `paused` (the board abbreviates to `⏸ limit`, `⏸ pool`, `⏸ recov`, `⏸ paused`). On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
+| Queued | The run has not started yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+| Stalled | The run's health is stalled or looping. The web row (`◼ stalled` over a `since HH:MM` line, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
+| Planning | The run is planning and has no frozen milestone list yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+
+When there is no estimate at all, the web cell shows `—`, the TUI board cell
+is blank and `uzi run get` omits the row.
+
+**No time remaining or finish time is shown.** The estimate is too
+unreliable to display: in a backtest of completed issue runs, only 59% of
+the estimates fell within 2x of the actual time remaining.
+
+Where it appears:
+
+- **Web** (dashboard and runs list rows): a Progress cell, `70%` with a thin
+  bar, or `● waits on you` / `◼ stalled` as above. On the Dashboard the cell
+  is hidden at phone widths; the runs list keeps it.
+- **TUI board**: a `PROG` column after `MILES`, e.g. `70% ▰▰▰▰▰▰▱▱`. The bar
+  drops before the percent on narrow terminals, leaving the percent or a
+  short flag. Every flag is text, so `NO_COLOR` keeps all of them. The board
+  shows no "since" time.
+- **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
+  of 3`, `stalled · since 14:05` or `waits on you · plan gate`; a run
+  waiting on a question may add ` · may be blocked by <id>` (see [May be
+  blocked by](#may-be-blocked-by)). The row is omitted when there is no estimate and once the run is terminal. See [the CLI docs](./cli.md#commands).
+
+### Run page and TUI detail
+
+The run page and the TUI run detail show the estimate in more depth. The two
+differ in what they carry; the run page has more.
+
+- **Run page**: a progress card under the budget facts. It shows the percent
+  large (`≈70%`), then `milestone k of M · <active milestone title>` (or
+  `N of M milestones done` when no milestone is active), and a segmented plan
+  track: one segment for planning plus one per milestone, each marked done, in
+  progress or pending. While the run is progressing with a known role, it also
+  shows the **phase** steps `review`, `validate` and `implement`, with the
+  current one marked `▸`. The phase is mapped from the active role:
+  `reviewer`, `auditor`, `fact-checker`, `architect`, `web-ux`, `tui-ux` and
+  `dba` are `review`, `tester` is `validate`, and any other role is
+  `implement`. It is the phase right now, not a history. An **Active role**
+  line shows only while the run is progressing or stalled. The flags from the
+  table above replace the number when it would mislead: `◼ stalled · since
+  HH:MM`, `● waits on you · plan gate|question|follow-up since HH:MM`, the park
+  word (`limit wait`, `paused`, ...), `queued`, and `planning · no
+  milestones frozen yet`. A parked card adds `resumes HH:MM` only for a
+  usage-limit or recovery wait whose resume time is known and in the future.
+  There is no card when the run has no estimate.
+- **TUI run detail**: a compact `PROGRESS` block above `MILESTONES` in the
+  rail: a `PROGRESS ≈70% · 3/4` line, plus `phase ▸ implement` while the run is
+  progressing. The flags are shown as `◼ stalled` with `since HH:MM`,
+  `● waits on you` with `plan gate|question|follow-up since HH:MM`,
+  `⏸ <park word>` (no resume time), `queued`, and `planning` with
+  `no milestones frozen yet`. It does not show the active-role line or the
+  resume time; use the run page for those.
+
+### Now summary
+
+While an issue run is working a milestone, a small model can write one plain
+sentence (at most 120 characters) saying what the active lane is doing, and
+the progress card, the TUI detail and `uzi run get` show it next to the
+estimate. It is **on by default**; see [Turning it off](#turning-the-now-summary-off).
+
+- **Run page**: a `Now: <text> · model summary · <age>` line under the phase
+  chip.
+- **TUI run detail**: a `now <text> · model summary · 2m ago` line in the
+  `PROGRESS` block. The text wraps under the `now` label; the
+  `model summary · <age>` marking moves to its own row when it does not fit.
+- **CLI**: `uzi run get` appends ` · now: <text> (model summary, 2m ago)` to
+  the `PROGRESS` row.
+
+The text is the model's reading of the run's newest tool calls, not a status
+uzi has verified. The instruction forbids saying a step passed, failed or
+finished unless a tool call states it, but a model can still be wrong or
+vague; read the transcript when it matters. Every surface renders it as
+inert plain text: control and format characters are stripped when the API
+ingests it, and it is capped at 120 characters.
+
+**When it shows.** Only on the single-run read (the run page, `uzi run get`,
+the TUI detail), never on the dashboard, runs list or TUI board. It needs the
+progress state to be a percent (an executing, healthy issue run with a frozen
+milestone list), an active milestone, and the Now summary enabled both by the admin switch and
+in the run owner's settings.
+It shows the newest note written for the *current* milestone, so a note from
+an earlier milestone never lingers. A waiting, parked, queued or stalled run
+shows no note, even one written for its still-active milestone. The note
+messages are hidden from the activity transcript on the web, in the TUI and
+in `uzi run logs` (`--json` still carries them), and the run judge never sees
+them. A note does not count as run activity, so it never revives a run that
+is stalled or hides its stall.
+
+**When the worker writes one.** The worker calls the model when the active
+milestone changes, when the active role changes, or when 10 minutes have
+passed since the last call and at least one new tool call has appeared. It
+makes at most one call per 5 minutes (triggers inside that window coalesce
+into one call at its end), and a call that fails or whose result is discarded
+still counts against the window. Each call times out after 30 seconds. It makes no call while the run
+is held (a plan gate, a question, a pause or park, a credential switch), when
+the setting is off, or when no milestone is active; after a credential-switch
+attempt gives up, summaries resume at the next trigger. A result that arrives
+after one of those is discarded.
+
+**What the model sees.** The active milestone's title and the newest 20 tool
+calls, each cut down to role, label, tool and detail (the same fields the
+[`now` line](#milestones-and-the-now-line) reads; never a Bash command), with
+claim secrets redacted.
+
+| Harness | Model | Limits |
+|---|---|---|
+| Claude | `haiku`, extended thinking off | 256 output tokens |
+| Codex | `gpt-6-luna` at reasoning effort `low` | The Codex advice path cannot enforce an output-token cap, so the 30-second timeout is the only bound. `low` is the lowest effort uzi's Codex contract allows |
+
+There is no fallback to a more expensive model: if the account refuses the
+model, or the call fails or times out, that summary is skipped and the run is
+unaffected. A rate-limit error from the summary call never touches the run's
+own rate-limit state, never parks it and never triggers a credential switch.
+The Codex call is also denied credential refresh, so it can never move the
+run's credential generation; a summary that lands on an expired Codex token
+just fails.
+
+**Spend counts.** The summary calls are paid on the run owner's credential
+and their tokens and cost are part of the run's usage. They are stored under
+a separate per-note usage key (`progress_note:<model>`), so they never merge
+into the run's own rows for the same model, and the web usage panel shows
+them as a **Now summaries** row that adds up to the **Run total**. A Claude
+call with no provider cost is priced from the standard Anthropic price table;
+a call the table cannot price shows cost unreported, never `$0`, with its
+tokens kept. The Codex `gpt-6-luna` price row is in the pinned table
+(verified 2026-10-09). If a call is aborted (a park, the run ending, a
+cancel, a credential switch), the usage it had already received is still
+recorded once; spend is unavailable only when no usage arrived before the
+abort. If the worker loses its claim, usage frames from the stale claim are
+rejected as for every result frame, so that call's spend can be missing.
+With one call per 5 minutes at most, a run makes at most 12 calls per hour.
+
+The intent, plan and PR-description summary passes are counted too. They are
+paid on the same credential, are stored under their own
+`summary_pass:<model>` key (one row per pass, so they add up and never merge
+into the run's own rows), and show in the usage panel as an **Intent, plan &
+PR summaries** row that adds up to the **Run total**.
+The [Codex price coverage](admin-health.md#codex-price-coverage) health check
+counts summary usage under the plain model name.
+
+#### Turning the Now summary off
+
+Two switches, both on by default; the summary runs only while both are on:
+
+- **You**: **Settings → Run defaults → Run summaries → Model-written Now
+  line** (`now_summary_enabled` on `PUT /api/me/settings`; unset inherits
+  on). `uzi settings get` prints `Now summary: on (default)`, `on` or `off`.
+- **Your admin**: the instance kill switch in [Admin
+  settings](admin-settings.md#run-summaries). Off there stops it for every
+  user, whatever their own setting.
+
+The worker reads the effective value on its regular input poll, so turning it
+off reaches a running run: no further call is made, a call still in flight is
+discarded, and the line disappears from the run page. A worker that does not
+receive the setting treats it as off. See [Run
+summaries](run-summaries.md#the-now-summary) for how this differs from the
+intent and plan summaries.
+
+### May be blocked by
+
+While a run is waiting on a question (`awaiting_input`), the run page, the TUI
+detail and `uzi run get` can add `may be blocked by <short run id>`, linking to
+that run on the run page. It appears when the open, not-yet-answered question
+mentions `#N` and another live run of the **same run owner** on the **same
+repo** is working issue N: an issue run for N, or an MR rework or CI fix run
+on branch `agent/issue-N`.
+
+It is a hint, not a recorded dependency: a mention in the question text is all
+it goes on. It never matches another user's run, another repo or the run
+itself, and at most 5 `#N` references in the question are read. Once the
+question is answered the hint disappears. It is shown on the detail views
+only, not on the board or runs list.
 
 ## Stopping or narrowing a run
 

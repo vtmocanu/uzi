@@ -96,16 +96,25 @@ delete and let a stale pruner reset a waiting author's position. `CACHE 1`
 keeps values monotonic in lock order across sessions, which the guard needs;
 `NO CYCLE` stops a wrapped value repeating.
 
-**Per-lookup timeout.** Each author lookup is cut off after 5 seconds inside the
-30-second, 200-author assessment, so one hanging forge call costs one slot, not
-the tick.
+**Per-lookup timeout.** Author-specific identity and permission requests keep
+one 5-second child deadline per lookup inside the 200-author assessment budget:
+30 seconds for the background watcher, 5 seconds for on-demand rework across
+Begin and Snapshot (#2372). Shared repository evidence uses the remaining
+assessment context, not that child deadline; it can consume the remaining
+assessment time. The total deadline can cut a lookup short. In the background
+watcher, one hanging author-specific call costs one slot, not the tick.
 
-**Shared-evidence condition.** On GitHub, eligibility evidence (the
-repository-wide collaborator list) is shared across lookups. A tick only
-makes progress for the queue when that shared evidence answered within the
-per-lookup timeout; a tick where it did not is uncounted in the bound below.
-GitLab lookups are per-user calls with no shared evidence, so the condition
-does not apply there; only each lookup's own timeout does.
+**Shared-evidence condition.** GitHub's repository-wide collaborator list and
+Forgejo's shared repository, ownership and direct-collaborator evidence use the
+remaining assessment deadline. GitHub can finish from shared results even after
+the author's child deadline expires. Forgejo's author-specific permission
+fallback retains the original child context: if it has expired, the fallback
+yields permission-unknown, while a later author with a fresh child can succeed.
+Shared reads remain subject to assessment cancellation and existing pagination
+checks; a listing is not guaranteed to succeed. A tick counts in the bound
+below only when the required shared evidence answers within the remaining
+assessment time. GitLab lookups are per-user calls with no shared evidence; each
+is bounded by its child timeout and the assessment deadline.
 
 **Conditional delay bound.** For a waiting author X with R_0 entries ahead that
 are not eligible (not-eligible or permission-unknown), let A_t be the lookups actually attempted on tick t (logged; only
@@ -115,10 +124,11 @@ first counted tick k where the sum of (A_t - E_t) over counted ticks reaches
 R_0 + 1; with a constant p = A_t - E_t that is ceil((R_0 + 1) / p) counted
 ticks (R_0 = 2, A = 2: tick 2). X fires on that tick if the other gates pass,
 otherwise keeps its front place. Uncounted ticks never move anyone ahead of X.
-Assumptions: X's own lookup answers within the per-lookup timeout on the counted
-tick (otherwise X becomes permission-unknown, re-queues at the back, and the
-bound restarts from its new position); forge calls honor context cancellation; locked queue writes
-succeed; shared evidence arrives within the per-lookup timeout; the connection
+Assumptions: X's author-specific requests answer within the original per-lookup
+child deadline and its verdict arrives within the remaining assessment time on
+the counted tick (otherwise X becomes permission-unknown, re-queues at the back,
+and the bound restarts from its new position); forge calls honor context cancellation; locked queue writes
+succeed; required shared evidence arrives within the remaining assessment time; the connection
 token's rate limit (shared with other MRs) is not exhausted; other MRs don't
 touch this MR's queue (they share only the verdict cache, the rate limit and the
 repository's serial detect loop; each MR's assessment has its own 30-second
@@ -159,6 +169,9 @@ this bound but is never dropped or suppressed.
 - Two forges on one host under different paths share an allowlist key.
 - A stale GitHub REST listing can cost a queue position; that affects fairness
   only, never who is trusted.
-- The on-demand handler shares the 30-second assessment deadline while the API
-  write timeout is 15 seconds (same mismatch as #2372); deferred.
+- Resolved in #2372: the on-demand handler selects a 5-second total assessment
+  deadline while the background watcher retains 30 seconds. Queue and verdict
+  writes and Snapshot keep the original parent context. This leaves headroom in
+  the 15-second HTTP write budget when earlier work is prompt; it does not enforce
+  an overall request or creation deadline or provide idempotency.
 - Not shipped: the CLI cannot edit the allowlist (cookie-only endpoint).

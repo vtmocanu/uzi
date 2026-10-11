@@ -24,12 +24,13 @@ type Store interface {
 }
 
 // SettingsReader is the typed release-check settings surface the check reads, plus
-// Invalidate so a persist is visible to the next read, and ReleaseCheckInterval so the
-// interval Runner (PRD #836 M2) can read the poll cadence. *settings.Cache satisfies it.
+// Invalidate so a persist is visible to the next read. The Runner uses the interval
+// and raw checked-at timestamp to schedule checks. *settings.Cache satisfies it.
 type SettingsReader interface {
 	ReleaseCheckEnabled(ctx context.Context) (bool, error)
 	ReleaseCheckToken(ctx context.Context) (string, error)
 	ReleaseCheckInterval(ctx context.Context) (time.Duration, error)
+	ReleaseCheckedAt(ctx context.Context) (string, error)
 	Invalidate()
 }
 
@@ -55,6 +56,7 @@ type Result struct {
 	Status  string
 	Message string
 	Facts   Facts
+	Partial bool
 }
 
 // Reconciler fetches the constant releases/latest endpoint and, when the master
@@ -170,7 +172,7 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 	}
 	r.settings.Invalidate()
 	if rcErr != nil {
-		return Result{Status: statusError, Facts: facts, Message: "stable release updated; RC fetch failed: " + rcErr.Error()}, nil
+		return Result{Status: statusError, Facts: facts, Partial: true, Message: "stable release updated; RC fetch failed: " + rcErr.Error()}, nil
 	}
 	return Result{Status: statusOK, Facts: facts}, nil
 }

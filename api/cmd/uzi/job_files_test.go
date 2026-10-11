@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -354,6 +357,93 @@ func TestJobCreateFileFailuresCreateNoJob(t *testing.T) {
 			}
 			if len(fs.jobBodies) != 0 {
 				t.Errorf("a job was created after a failed upload")
+			}
+		})
+	}
+}
+
+func TestJobCreateLongFileFailuresCreateNoJob(t *testing.T) {
+	for _, kind := range []string{"empty", "directory", "missing"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			// Fixed short components exceed the render cap without exceeding NAME_MAX.
+			for range 8 {
+				dir = filepath.Join(dir, "nested-long-path-component")
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "input.txt")
+			wantReason := "empty file"
+			switch kind {
+			case "empty":
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				path = dir
+				wantReason = "not a regular file"
+			case "missing":
+				_, err := os.Stat(path)
+				var pe *os.PathError
+				if !errors.As(err, &pe) {
+					t.Fatalf("missing child stat = %v, want PathError", err)
+				}
+				wantReason = "cannot read file: " + pe.Err.Error()
+			}
+			if utf8.RuneCountInString(path) <= 200 {
+				t.Fatalf("fixture path is too short: %q", path)
+			}
+			fs := &filesServer{}
+			srv := httptest.NewServer(fs.handler(t))
+			defer srv.Close()
+			out, errOut, code := runCLI(t, httpEnv(srv), "job", "create", "--type", "research", "--prompt", "p", "--file", path)
+			if code != 2 || out != "" {
+				t.Errorf("exit = %d, stdout = %q; want exit 2 and no stdout", code, out)
+			}
+			if !strings.HasPrefix(errOut, "uzi: "+wantReason+": \"") {
+				t.Errorf("reason must precede path: stderr = %q, want reason %q", errOut, wantReason)
+			}
+			if !strings.HasSuffix(errOut, "…\n") || strings.Count(errOut, "\n") != 1 {
+				t.Errorf("stderr must be one truncated line: %q", errOut)
+			}
+			if n := utf8.RuneCountInString(errOut); n > len("uzi: ")+200+1+1 {
+				t.Errorf("stderr has %d runes, exceeds prefix + 200 + ellipsis + newline", n)
+			}
+			assertNoTerminalControl(t, "long file failure", errOut)
+			fs.mu.Lock()
+			defer fs.mu.Unlock()
+			if len(fs.uploads) != 0 || len(fs.jobBodies) != 0 {
+				t.Errorf("failed local validation sent uploads/jobs: %v / %v", fs.uploads, fs.jobBodies)
+			}
+		})
+	}
+}
+
+func TestJobFileReadErrorCauseBeforeLongPath(t *testing.T) {
+	path := strings.Repeat("long-component/", 20) + "input.txt"
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"stat", &os.PathError{Op: "stat", Path: path, Err: os.ErrNotExist}, os.ErrNotExist.Error()},
+		{"open", &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}, os.ErrPermission.Error()},
+		{"wrapped", fmt.Errorf("outer: %w", &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}), os.ErrPermission.Error()},
+		{"fallback", errors.New("reader unavailable"), "reader unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := jobFileReadError(path, tc.err)
+			if code := uzicli.ExitCodeFor(err); code != 2 {
+				t.Errorf("exit = %d, want 2", code)
+			}
+			rendered := cellText(err.Error())
+			wantPrefix := "cannot read file: " + tc.want + ": \"long-component/"
+			if !strings.HasPrefix(rendered, wantPrefix) {
+				t.Errorf("rendered cause/path = %q, want prefix %q", rendered, wantPrefix)
+			}
+			if !strings.HasSuffix(rendered, "…") || utf8.RuneCountInString(rendered) != 201 {
+				t.Errorf("final cellText did not cap long path: %q", rendered)
 			}
 		})
 	}

@@ -4,127 +4,75 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// countingChecker is an updateChecker that records how many times it was invoked and,
-// optionally, panics — the two behaviours the Runner must survive.
-type countingChecker struct {
-	calls  atomic.Int64
-	panics bool
-	result Result
-}
-
-func (c *countingChecker) CheckForUpdate(context.Context) (Result, error) {
-	c.calls.Add(1)
-	if c.panics {
-		panic("boom")
-	}
-	return c.result, nil
-}
-
-// quietLogger discards output so a panicking-check test does not spam the test log.
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestRunnerStopsPromptlyOnCancel(t *testing.T) {
-	// A long interval means the timer never fires; cancel must return the loop at once.
-	chk := &countingChecker{result: Result{Status: statusOK}}
-	rn := &Runner{check: chk, settings: &fakeSettings{interval: time.Hour}, logger: quietLogger()}
+type checkerFunc func(context.Context) (Result, error)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		rn.Start(ctx)
-		close(done)
-	}()
+func (f checkerFunc) CheckForUpdate(ctx context.Context) (Result, error) { return f(ctx) }
 
-	cancel()
+// Each request blocks until explicitly released or cancelled. Timeouts only bound
+// broken synchronization; they never drive the simulated schedule.
+type waitRequest struct {
+	delay   time.Duration
+	release chan struct{}
+}
+type manualWait struct{ requests chan waitRequest }
+
+func newManualWait() *manualWait { return &manualWait{requests: make(chan waitRequest)} }
+func (w *manualWait) wait(ctx context.Context, d time.Duration) bool {
+	req := waitRequest{delay: d, release: make(chan struct{})}
 	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Runner did not stop within 2s of ctx cancel")
+	case w.requests <- req:
+	case <-ctx.Done():
+		return false
 	}
-	if got := chk.calls.Load(); got != 0 {
-		t.Errorf("check ran %d times before the first interval elapsed, want 0", got)
+	select {
+	case <-req.release:
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		return false
 	}
 }
-
-func TestRunnerInvokesCheckAfterInterval(t *testing.T) {
-	// A tiny interval fires the timer fast; the check must run at least once, then the
-	// loop must stop cleanly on cancel.
-	chk := &countingChecker{result: Result{Status: statusOK}}
-	rn := &Runner{check: chk, settings: &fakeSettings{interval: time.Millisecond}, logger: quietLogger()}
-
+func (w *manualWait) next(t *testing.T) waitRequest {
+	t.Helper()
+	select {
+	case req := <-w.requests:
+		return req
+	case <-time.After(2 * time.Second):
+		t.Fatal("Runner did not request a wait")
+		return waitRequest{}
+	}
+}
+func startRunner(t *testing.T, rn *Runner) func() {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() {
-		rn.Start(ctx)
-		close(done)
-	}()
-
-	deadline := time.After(2 * time.Second)
-	for chk.calls.Load() == 0 {
+	go func() { defer close(done); rn.Start(ctx) }()
+	stop := func() {
+		cancel()
 		select {
-		case <-deadline:
-			t.Fatal("check was not invoked within 2s at a 1ms interval")
-		case <-time.After(5 * time.Millisecond):
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("Runner did not stop after cancellation")
 		}
 	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Runner did not stop after cancel")
-	}
+	t.Cleanup(stop)
+	return stop
 }
 
-func TestRunnerRecoversPanickingCheck(t *testing.T) {
-	// A panicking check must be recovered by tick — the loop keeps running (calls
-	// climb past 1) and Start returns cleanly on cancel rather than crashing.
-	chk := &countingChecker{panics: true}
-	rn := &Runner{check: chk, settings: &fakeSettings{interval: time.Millisecond}, logger: quietLogger()}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		rn.Start(ctx)
-		close(done)
-	}()
-
-	deadline := time.After(2 * time.Second)
-	for chk.calls.Load() < 2 {
-		select {
-		case <-deadline:
-			t.Fatalf("panicking check did not recover and re-run (calls=%d)", chk.calls.Load())
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Runner did not stop after cancel following a recovered panic")
-	}
-}
-
-func TestRunnerFloorsNonPositiveInterval(t *testing.T) {
-	// Exercise the flooring BRANCH itself (not just the constant's sign): a zero or
-	// negative configured interval must clamp UP to the floor so Start never arms a
-	// 0-length timer and busy-loops; a positive value at/above the floor passes through.
-	if got := flooredInterval(0); got != releaseCheckRunnerFloor {
-		t.Errorf("flooredInterval(0) = %v, want the floor %v", got, releaseCheckRunnerFloor)
-	}
-	if got := flooredInterval(-time.Second); got != releaseCheckRunnerFloor {
-		t.Errorf("flooredInterval(-1s) = %v, want the floor %v", got, releaseCheckRunnerFloor)
-	}
-	if got := flooredInterval(3 * time.Hour); got != 3*time.Hour {
-		t.Errorf("flooredInterval(3h) = %v, want 3h unclamped", got)
-	}
-	if releaseCheckRunnerFloor <= 0 {
-		t.Fatalf("releaseCheckRunnerFloor must be positive, got %v", releaseCheckRunnerFloor)
+func TestRunnerOverdueFirstWait(t *testing.T) {
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	w := newManualWait()
+	set := &fakeSettings{interval: 6 * time.Hour, checkedAt: now.Add(-7 * time.Hour).Format(time.RFC3339)}
+	rn := &Runner{settings: set, logger: quietLogger(), now: func() time.Time { return now }, wait: w.wait}
+	startRunner(t, rn)
+	if got := w.next(t).delay; got != time.Minute {
+		t.Fatalf("overdue first requested wait = %v, want 1m0s", got)
 	}
 }

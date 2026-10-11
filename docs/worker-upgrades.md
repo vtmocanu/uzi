@@ -24,8 +24,11 @@ by watching the pod rather than by asking the worker.
 | **upgrade failed** | The new container is not ready *and* stuck: a blocking reason, three restarts, or ten minutes — or no pod could be created at all | yes |
 | *(no badge)* | Nothing usable to compare | none |
 
-**outdated** — hosted workers are rolled for you when a release changes the image tag, so this
-usually means a roll has not happened yet or did not finish. If the worker is still busy when
+**outdated** — hosted workers are rolled for you when the independent `workers.image.tag` pin
+advances: a release whose agent runtime changed bumps the chart default, an app-only release
+does not, and an operator may override the pin per cluster
+([ADR-422](../adr/0422-decouple-worker-version.md)). This usually means a roll has not happened
+yet or did not finish. If the worker is still busy when
 its roll starts, the cluster may **cordon/drain** it first — it keeps finishing its current
 runs but stops claiming new ones until the roll completes; see
 [Draining and cordoned](hosted-workers.md#draining-and-cordoned). **External workers are never

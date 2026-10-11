@@ -25,7 +25,7 @@ import (
 // updatePromptState is the modal's whole state, held on tuiModel.updatePrompt.
 type updatePromptState struct {
 	// showing is whether the modal is currently drawn (and capturing keys). shownThisSession
-	// latches after the first eligible reply so the prompt fires at most once per `uzi tui`.
+	// latches only when a modal is shown, so it fires at most once per `uzi tui`.
 	showing          bool
 	shownThisSession bool
 	// sel is the highlighted choice index into updateChoices() (which varies by owner).
@@ -46,13 +46,20 @@ type updatePromptState struct {
 	latestRC    *apitypes.LatestReleaseDTO
 	// pendingUpgrade / upgradeArgv are the foreground-exit hand-off (D1): "Update now" sets
 	// these and quits, and newTUICmd's RunE runs env.Brew(true, upgradeArgv...) after p.Run().
-	pendingUpgrade bool
-	upgradeArgv    []string
+	pendingUpgrade   bool
+	upgradeArgv      []string
+	offeredTarget    string
+	candidate        updateCandidate
+	generation       uint64
+	request          uint64
+	probePending     bool
+	probeAgain       bool
+	installedVersion string
 }
 
-// maybeShowUpdatePrompt evaluates the show gate ONCE per session on the first eligible
-// buildInfoMsg only after the asynchronous brew ownership probe resolves. It returns nil (no command,
-// no state change) whenever the prompt should not show.
+// maybeShowUpdatePrompt evaluates each successful release poll after ownership
+// resolves. Installed-version observations run independently of the once-per-session
+// modal latch and persisted dismissal.
 //
 // The gate mirrors the skew warning's discipline plus the PRD #1251 axis rule: the wire
 // Latest and LatestRC are channel-specific presence signals (nil ⇒ no release fact), and
@@ -67,54 +74,149 @@ type updatePromptState struct {
 // "latest strictly newer than running", IsValid-guarded so a `dev`/malformed version reads
 // as "not behind" rather than a false prompt.
 func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleaseDTO) tea.Cmd {
-	if m.updatePrompt.shownThisSession {
-		return nil
-	}
-	// Same gate as the footer readout/auto-probe: a session not allowed to probe (--demo,
-	// direct test construction, --quiet, UZI_VERSION_CHECK=0, an unstamped `dev` build) never
-	// prompts. skewCheck already folds in the stamped-build requirement.
+	p := &m.updatePrompt
+	p.latest, p.latestRC = latest, latestRC
 	if !m.skewCheck || !m.showVersion {
+		m.setUpdateCandidate("", "")
 		return nil
 	}
-	if !m.updatePrompt.brewKnown {
-		m.updatePrompt.latest, m.updatePrompt.latestRC = latest, latestRC
-		if !m.updatePrompt.brewPending {
-			m.updatePrompt.brewPending = true
+	if !p.brewKnown {
+		if !p.brewPending {
+			p.brewPending = true
 			return m.detectBrewCmd()
 		}
 		return nil
 	}
-	wantRC := m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && rctag.IsPublishedTag(version))
-	// Validate each channel fact before choosing the newer one. An invalid fact
-	// cannot hide a valid release on the other channel or become an update target.
-	if latest != nil && !isStableTag(latest.Version) {
-		latest = nil
+	wantRC := p.owner == "uzi-cli-rc" || (p.owner == "" && rctag.IsPublishedTag(version))
+	channelFact := func(fact *apitypes.LatestReleaseDTO, rc bool) *apitypes.LatestReleaseDTO {
+		if fact == nil {
+			return nil
+		}
+		if (!rc && !isStableTag(fact.Version)) || (rc && !rctag.IsPublishedTag(fact.Version)) {
+			return nil
+		}
+		// Keep the release tag unchanged: persisted dismissals use its exact value.
+		return fact
 	}
-	if wantRC && latestRC != nil && rctag.IsPublishedTag(latestRC.Version) {
-		if latest == nil {
-			latest = latestRC
-		} else if cmp, ok := uzicli.CompareServerVersion(latest.Version, latestRC.Version); ok && cmp < 0 {
-			latest = latestRC
+	chosen := channelFact(latest, false)
+	if wantRC {
+		rc := channelFact(latestRC, true)
+		if rc != nil {
+			if chosen == nil {
+				chosen = rc
+			} else if cmp, _ := uzicli.CompareServerVersion(chosen.Version, rc.Version); cmp < 0 {
+				chosen = rc
+			}
 		}
 	}
-	if latest == nil {
+	if chosen == nil {
+		m.setUpdateCandidate("", "")
 		return nil
 	}
-	// Recompute the CLI axis locally: is THIS binary behind the latest? IsValid-guarded, so a
-	// `dev` or malformed version reads as "not behind" (never a false prompt).
-	if cmp, ok := uzicli.CompareServerVersion(version, latest.Version); !ok || cmp >= 0 {
+	if cmp, ok := uzicli.CompareServerVersion(version, chosen.Version); !ok || cmp >= 0 {
+		m.setUpdateCandidate("", "")
 		return nil
 	}
-	if m.dismissedForVersion(latest.Version) {
+	owner := p.owner
+	if !allowedFormula(owner) {
+		owner = ""
+	}
+	m.setUpdateCandidate(owner, chosen.Version)
+	p.latestVersion, p.latestName, p.latestNotesURL, p.security = chosen.Version, chosen.Name, chosen.NotesURL, chosen.Security
+	if owner == "" {
+		m.showUpdateCandidate()
 		return nil
 	}
-	m.updatePrompt.showing = true
-	m.updatePrompt.shownThisSession = true
-	m.updatePrompt.sel = 0
-	m.updatePrompt.latestVersion = latest.Version
-	m.updatePrompt.latestName = latest.Name
-	m.updatePrompt.latestNotesURL = latest.NotesURL
-	m.updatePrompt.security = latest.Security
+	if p.probePending {
+		p.probeAgain = true
+		return nil
+	}
+	return m.installedVersionCmd()
+}
+
+func (m *tuiModel) setUpdateCandidate(owner, target string) {
+	p := &m.updatePrompt
+	if p.candidate.owner == owner && p.candidate.target == target {
+		return
+	}
+	// An offer still open when a newer target arrives was never answered: let the new
+	// candidate re-show it once its own checks pass, instead of the session latch hiding it.
+	reopen := p.showing && target != ""
+	p.generation++
+	p.candidate = updateCandidate{owner: owner, target: target, generation: p.generation}
+	p.installedVersion = ""
+	p.showing = false
+	if reopen {
+		p.shownThisSession = false
+	}
+	p.probeAgain = p.probePending && target != "" && owner != ""
+}
+
+func (m *tuiModel) showUpdateCandidate() {
+	p := &m.updatePrompt
+	if p.candidate.target == "" || p.shownThisSession || m.dismissedForVersion(p.candidate.target) {
+		return
+	}
+	p.showing = true
+	p.shownThisSession = true
+	p.sel = 0
+}
+
+type updateCandidate struct {
+	owner, target string
+	generation    uint64
+}
+type installedVersionMsg struct {
+	candidate updateCandidate
+	request   uint64
+	version   string
+	err       error
+}
+
+// Only one installed observation runs at a time. Successful polls arriving during
+// it coalesce into one follow-up for the current candidate; a failure does not retry.
+func (m *tuiModel) installedVersionCmd() tea.Cmd {
+	p := &m.updatePrompt
+	p.probePending = true
+	p.probeAgain = false
+	p.request++
+	candidate, request, probe := p.candidate, p.request, m.installedVersion
+	return func() tea.Msg {
+		msg := installedVersionMsg{candidate: candidate, request: request}
+		if probe == nil {
+			msg.err = fmt.Errorf("no installed version probe is available")
+		} else {
+			msg.version, msg.err = probe(candidate.owner)
+		}
+		return msg
+	}
+}
+
+func (m *tuiModel) applyInstalledVersion(msg installedVersionMsg) tea.Cmd {
+	p := &m.updatePrompt
+	if !p.probePending || msg.request != p.request {
+		return nil
+	}
+	p.probePending = false
+	if msg.candidate == p.candidate && m.skewCheck && m.showVersion {
+		installed, ok := validatedVersion(msg.version)
+		p.installedVersion = ""
+		if msg.err == nil && ok {
+			cmp, valid := uzicli.CompareServerVersion(installed, p.candidate.target)
+			if valid && cmp >= 0 {
+				p.installedVersion = installed
+				p.showing = false
+			} else {
+				m.showUpdateCandidate()
+			}
+		} else {
+			m.showUpdateCandidate()
+		}
+	}
+	if p.probeAgain && p.candidate.target != "" && allowedFormula(p.candidate.owner) {
+		return m.installedVersionCmd()
+	}
+	p.probeAgain = false
 	return nil
 }
 
@@ -211,7 +313,7 @@ func (m tuiModel) updateChoices() []updateChoice {
 func (m tuiModel) updateChoiceLabel(c updateChoice) string {
 	switch c {
 	case updateChoiceUpdateNow:
-		return "Update now  (brew upgrade " + m.updatePrompt.owner + ")"
+		return "Update now  (brew upgrade vtmocanu/tap/" + m.updatePrompt.owner + ")"
 	case updateChoiceDismiss:
 		return "Don't remind me for " + cellText(m.updatePrompt.latestVersion)
 	default:
@@ -256,7 +358,8 @@ func (m tuiModel) selectUpdateChoice(choices []updateChoice) (tea.Model, tea.Cmd
 	switch choices[m.updatePrompt.sel] {
 	case updateChoiceUpdateNow:
 		m.updatePrompt.pendingUpgrade = true
-		m.updatePrompt.upgradeArgv = []string{"upgrade", m.updatePrompt.owner}
+		m.updatePrompt.upgradeArgv = []string{"upgrade", "vtmocanu/tap/" + m.updatePrompt.owner}
+		m.updatePrompt.offeredTarget = m.updatePrompt.latestVersion
 		m.updatePrompt.showing = false
 		return m, tea.Quit
 	case updateChoiceDismiss:
@@ -410,27 +513,54 @@ func (m tuiModel) updateChoiceRow(c updateChoice, selected, ascii bool, width in
 // runPendingUpgrade runs the selected formula upgrade in the FOREGROUND after the TUI has exited
 // (PRD #1251 M1 D1), so the from-source compile progress and any failure are visible and the
 // stale running process is replaced by a rerun. It is extracted from RunE so a test can
-// assert it calls the seam with foreground=true and argv ["upgrade","uzi-cli"] WITHOUT
+// assert it calls the seam with foreground=true and an allowlisted tap-qualified argv WITHOUT
 // running brew. A nil seam is reported cleanly rather than panicking.
-func runPendingUpgrade(env Env, argv []string) error {
-	if env.Brew == nil {
-		return uzicli.Exitf(uzicli.ExitGeneric, "update: no brew command is available")
-	}
-	// Clear the alt-screen residue and tell the user what is about to happen. The escape is
-	// built from a source escape at runtime (never a raw control byte in source). Write errors
-	// are dropped explicitly: this is a best-effort UX line, and env.Brew is the real work.
-	_, _ = fmt.Fprint(env.Stdout, "\x1b[H\x1b[2J")
+func runPendingUpgrade(env Env, argv []string, offered string) error {
 	formula := ""
-	if len(argv) == 2 && argv[0] == "upgrade" && (argv[1] == "uzi-cli" || argv[1] == "uzi-cli-rc") {
-		formula = argv[1]
+	if len(argv) == 2 && argv[0] == "upgrade" {
+		switch argv[1] {
+		case "vtmocanu/tap/uzi-cli":
+			formula = "uzi-cli"
+		case "vtmocanu/tap/uzi-cli-rc":
+			formula = "uzi-cli-rc"
+		}
 	}
 	if formula == "" {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update: invalid brew upgrade target")
 	}
+	target := "v" + strings.TrimPrefix(offered, "v")
+	if _, ok := uzicli.CompareServerVersion(target, target); !ok {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update: invalid offered version")
+	}
+	if env.Brew == nil {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update: no brew command is available")
+	}
+	_, _ = fmt.Fprint(env.Stdout, "\x1b[H\x1b[2J")
 	_, _ = fmt.Fprintf(env.Stdout, "Updating %s via Homebrew (this compiles from source)...\n", formula)
 	if _, err := env.Brew(true, argv...); err != nil {
-		_, _ = fmt.Fprintf(env.Stderr, "update failed: %v\n", err)
-		return uzicli.Exitf(uzicli.ExitGeneric, "brew upgrade %s: %v", formula, err)
+		diagnostic := cellText(err.Error())
+		_, _ = fmt.Fprintf(env.Stderr, "update failed: %s\n", diagnostic)
+		return uzicli.Exitf(uzicli.ExitGeneric, "brew upgrade %s: %s", argv[1], diagnostic)
+	}
+	if env.InstalledVersion == nil {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: no installed version probe is available")
+	}
+	raw, err := env.InstalledVersion(formula)
+	if err != nil {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: %s", cellText(err.Error()))
+	}
+	installed, ok := validatedVersion(raw)
+	if !ok {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: invalid installed version")
+	}
+	cmp, ok := uzicli.CompareServerVersion(installed, target)
+	if !ok {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: invalid version comparison")
+	}
+	if cmp < 0 {
+		line := fmt.Sprintf("Installed CLI is %s; requested %s was not reached. Try again later.", installed, cellText(target))
+		_, _ = fmt.Fprintln(env.Stderr, line)
+		return uzicli.Exitf(uzicli.ExitGeneric, "%s", line)
 	}
 	_, _ = fmt.Fprintln(env.Stdout, "Update complete. Start the TUI again to use the new version.")
 	return nil

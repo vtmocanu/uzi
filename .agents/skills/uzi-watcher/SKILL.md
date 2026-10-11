@@ -126,7 +126,8 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
    message naming the precise change (re-plans without ending the run; then watch for the
    gate again). Not sound → `uzi run reject` with a `-m` reason, then stop.
 5. **Hand off to `uzi-lander`.** Once approved, the run is landing work: load `uzi-lander`
-   and start at its snapshot (`takeover.sh RUN`). It polls the run blind to terminal, then
+   and start at its snapshot (`takeover.sh RUN`), carrying the approved plan's seq into its
+   step-1 poller. It polls the run blind to terminal, then
    drives the PR to merged and `main` green, one status line per state change. A `failed`
    or `cancelled` run comes back here (*When a run fails*, recovery below). First claim
    it so the board names its lander before a PR exists:
@@ -157,7 +158,13 @@ a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a q
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
-message) and answer with `uzi run answer`. A run at `limit_wait` is parked on an Anthropic
+message) and answer with `uzi run answer`. A completion-interlock question is different: a
+plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
+(`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
+live question or on a run already parked in the completion hold. **Never answer with "keep waiting"**
+(e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
+its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
+immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 
@@ -492,8 +499,9 @@ and falling back to the durable bare tracking ref when no clone survives:
   For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
   launchd refused a log path in Downloads before starting the job. Set the plist's
   `WorkingDirectory` to the checkout (or `UZI_REPO_SLUG` in `EnvironmentVariables`);
-  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing. The loop
-  self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
+  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing.
+  A new session rewrites the plist's run ids and `UZI_CTX` rather than reusing an old plist.
+  The loop self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
   (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
   terminal run after its first complete terminal cycle, and retries active runs, and a failed

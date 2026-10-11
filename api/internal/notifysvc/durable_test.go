@@ -85,14 +85,25 @@ func TestNotifyNonDurableStoresNoRender(t *testing.T) {
 }
 
 type fakeClaimer struct {
-	rows   []store.ClaimPendingSlackNotificationsRow
-	err    error
-	params []store.ClaimPendingSlackNotificationsParams
+	rows     []store.ClaimPendingSlackNotificationsRow
+	err      error
+	params   []store.ClaimPendingSlackNotificationsParams
+	pruned   []store.PruneNotificationsForUserParams
+	pruneErr error
+	onPrune  func()
 }
 
 func (f *fakeClaimer) ClaimPendingSlackNotifications(_ context.Context, a store.ClaimPendingSlackNotificationsParams) ([]store.ClaimPendingSlackNotificationsRow, error) {
 	f.params = append(f.params, a)
 	return f.rows, f.err
+}
+
+func (f *fakeClaimer) PruneNotificationsForUser(_ context.Context, a store.PruneNotificationsForUserParams) (int64, error) {
+	f.pruned = append(f.pruned, a)
+	if f.onPrune != nil {
+		f.onPrune()
+	}
+	return 0, f.pruneErr
 }
 
 type recordingSlacker struct {

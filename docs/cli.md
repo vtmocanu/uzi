@@ -84,6 +84,7 @@ see [Named contexts](#named-contexts) below.
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
 uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
+uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
@@ -171,15 +172,23 @@ uzi version
 Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 `--context <name>`/`-c <name>`.
 
+Cost is a recorded **API-equivalent** comparison, not a bill: Claude uses
+its SDK figure and Codex uzi's pinned Standard table for either auth mode.
+Subscription users may consume purchased credits. `uzi run get` marks
+priced cost API-equivalent; legacy `subscription` reads `no estimate`,
+unreported reads `cost unavailable`, and neither shows per-run dollars even
+when a partial cost is stored. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+
 A few worth knowing:
 
 - **`uzi admin usage --window lifetime|last_7_days` selects the human report's
   window (default `lifetime`).** The factory summary and per-user rows use
-  the same window for usage-bearing runs, tokens, metered cost, outcomes and
+  the same window for usage-bearing runs, tokens, API-equivalent cost, outcomes and
   recoverable failures. Failure rate is failed runs divided by finished runs,
   including runs without usage; `RUNS` counts runs with usage. Cost shows
-  `$0.00` for metered zero and discloses subscription/unreported run counts
-  whose costs are excluded. Recoverable work may already have been landed.
+  `$0.00` for metered zero and discloses runs without a cost estimate and
+  unreported runs. Incomplete totals include recorded partial costs.
+  Recoverable work may already have been landed.
   `--json` returns the complete API response with both windows and additive
   per-user seven-day fields; the flag selects only the human report. Invalid
   window values are rejected before a request, including with `--json`.
@@ -518,9 +527,16 @@ A few worth knowing:
   ahead of them were skipped (it no longer suggests raising `--max-issues`:
   the fix is to clear those skips, and a higher cap also raises how many runs
   one fire can start). A label sweep also prints how many open issues
-  match its selector but aren't eligible (`ineligible_matched`), when known;
-  a never-fired schedule reads `Last fire: never fired`, and `--json` carries
-  the same detail under `.last_fire` (including `.last_fire.ineligible_matched`
+  match its selector but aren't eligible (`ineligible_matched`), when known.
+  After it, a **Recent fires** block lists the schedule's
+  last 10 scheduled fires that started or skipped something, newest first
+  (nothing is printed when there are none): each entry is a summary line
+  (`<RFC 3339 UTC stamp> · started N · skipped M`), then one line per started
+  issue (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
+  schedule), then one line per skipped issue with its human reason label and
+  title.
+  A never-fired schedule reads `Last fire: never fired`, and `--json` carries
+  the same detail under `.last_fire` and the list under `.recent_fires` (including `.last_fire.ineligible_matched`
   when present — absent means unknown, not zero). `run-now` prints the
   matching per-candidate breakdown inline — a `Started N run(s)` header with
   the created run id(s), a line per started run, then an `Examined N
@@ -668,6 +684,92 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
+- **`run plan <run-id>` prints the latest plan Markdown verbatim.** It
+  appends no newline and does no terminal rendering or sanitation, even on a
+  TTY. `--version N` selects the Nth `plan` message in ascending `seq`
+  order, starting at 1. An integer outside `1..K` is a usage error
+  (`ExitUsage`, exit 2): `run has K plan version(s)`. A run with no plan
+  is not found (`ExitNotFound`, exit 4): `run has no plan`.
+  These version numbers count feed plans; they are not the approval
+  `gate_revision`. This read-only command changes no gate decisions; use
+  `--expected-gate-revision` on a verdict as described above.
+
+  **`--diff` compares a feedback revision with its immediate predecessor.**
+  For selected plan P, only the immediately preceding plan Q can be the
+  base, and at least one `plan_feedback` F must satisfy
+  `Q.seq < F.seq < P.seq`. Human and automatic feedback both qualify.
+  There is no backtracking to an older plan: a re-presentation without
+  intervening feedback has no base. Pending feedback after P creates no
+  new base and does not change an existing one. After two feedback rounds,
+  v3 compares with v2, not v1; selecting an earlier version uses only that
+  version's adjacent feedback interval.
+
+  The unified text diff has `--- vB` / `+++ vN` headers and
+  `@@ -start,count +start,count @@` hunks with up to three context lines
+  on each side. Comparison normalizes only trailing CR/LF characters;
+  meaningful spaces and interior text (including interior CR) are preserved.
+
+  - No base: stdout is the original plan, stderr says
+    `no revision base (no feedback preceded this version)`, exit 0.
+  - Identical after stripping trailing CR/LF: stdout is an empty diff,
+    stderr says
+    `This revision is identical to v{B}. Your requested changes were not applied.`,
+    exit 0.
+  - Either original side exceeds `200 * 1024` UTF-8 bytes: `--diff`
+    returns `ExitUsage` (exit 2), with empty stdout and
+    `plan too large to compare (limit 200 KiB)` through the standard CLI
+    error report on stderr. This cap also applies without a base;
+    without `--diff`, oversized plans print normally.
+
+  **`--json` emits one object** with `version`, `base_version` (number
+  or `null`), `plan_md`, `diff` (string or `null`) and
+  `identical_after_feedback` (boolean). `plan_md` preserves the original
+  Markdown string. Base and identical status are derived even without
+  `--diff`; `diff` is `null` unless `--diff` has a base, and `""`
+  for an identical comparison. With `--json --diff` and no base, stdout
+  contains only the object with `diff: null`; the no-base note remains
+  on stderr. Comparison notes and warnings never enter JSON stdout.
+
+  For a run `r` whose v1 is `alpha\nold\nomega\n`, followed by feedback
+  and v2 `alpha\nnew\nomega\n`:
+
+  ```sh
+  uzi run plan r                 # latest (v2)
+  uzi run plan r --version 1     # original (v1)
+  ```
+
+  Latest stdout (the stored string ends with a newline):
+
+  ```text
+  alpha
+  new
+  omega
+  ```
+
+  `uzi run plan r --version 2 --diff` prints:
+
+  ```diff
+  --- v1
+  +++ v2
+  @@ -1,3 +1,3 @@
+   alpha
+  -old
+  +new
+   omega
+  ```
+
+  `uzi run plan r --version 2 --diff --json` prints:
+
+  ```json
+  {"version":2,"base_version":1,"plan_md":"alpha\nnew\nomega\n","diff":"--- v1\n+++ v2\n@@ -1,3 +1,3 @@\n alpha\n-old\n+new\n omega\n","identical_after_feedback":false}
+  ```
+
+  In the web plan panel, **Show changes since vB** starts collapsed and
+  reveals line changes with added/removed counts. It uses the same feedback
+  base rule, but comparison is offered only when the newest feed plan text
+  exactly matches the displayed `run.plan_md`. Either side over 200 KiB
+  shows **Plan too large to compare**; an identical revision shows the
+  warning even while changes are collapsed.
 - **A message's content is under `payload`, not `body` or `content`.** Each
   `--json` line carries the text under `payload` (raw per-kind JSON); there is no
   `body`/`content` field, so reading either returns empty — indistinguishable from
@@ -805,7 +907,7 @@ A few worth knowing:
   bot's numeric forge user id) whose MR review comments the
   [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may ingest although
   they are not repo collaborators. It is **read-only by design**: edit the list
-  from Admin Settings in the web UI or through the cookie-only
+  from **Admin → Instance → Trusted review bots** in the web UI or through the cookie-only
   `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
   `STATUS` (`ok`, or `malformed` when the entry is not parseable as
   `<url>#<id>`; the CLI is lenient, so an entry the server skips can still show
@@ -1307,10 +1409,11 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ### Startup: an available update
 
 At startup, `uzi tui` checks for a newer release in the running CLI's channel
-and, if one exists, shows a modal on top of the board. A stable
-`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks the newer
-of the latest stable and latest release candidate, while staying on its opt-in
-formula. A stable install looks like this:
+and, when an upgrade is still needed, shows a modal on top of the board. If the
+formula-owned installed CLI already meets the offered release, it shows a restart
+hint instead. A stable `uzi-cli` install checks stable releases; an `uzi-cli-rc`
+install checks the newer of the latest stable and latest release candidate, while
+staying on its opt-in formula. A stable install needing an upgrade looks like this:
 
 ```
 ▲ Update available
@@ -1318,18 +1421,25 @@ uzi 0.83.0  →  0.85.0
 
 A newer release is available.
 
-▸ Update now  (brew upgrade uzi-cli)
+▸ Update now  (brew upgrade vtmocanu/tap/uzi-cli)
   Not now
   Don't remind me for 0.85.0
 ```
 
 - **A Homebrew install** gets the "Update now" action for the formula that owns
-  the running binary: `brew upgrade uzi-cli` for stable or
-  `brew upgrade uzi-cli-rc` for the RC channel, even when it currently runs a stable
-  version. Choosing it exits the TUI and runs the command in the foreground, so the source-build output and any failure stay
-  visible, then tells you to rerun
-  `uzi tui`. It never upgrades silently in the background while the TUI keeps
-  running. For an eligible **stamped** binary whose formula ownership cannot be
+  the running binary: `brew upgrade vtmocanu/tap/uzi-cli` for stable or
+  `brew upgrade vtmocanu/tap/uzi-cli-rc` for the RC channel, even when it currently
+  runs a stable version. These tap-qualified targets select uzi's stable and opt-in
+  RC formulae. Choosing it exits the TUI and runs Homebrew in the foreground, so
+  the source-build output and any failure stay visible. It does not force a tap
+  refresh: Homebrew inherits `HOMEBREW_AUTO_UPDATE_SECS` and
+  `HOMEBREW_NO_AUTO_UPDATE` from your environment. A zero exit from Homebrew is
+  not yet success: uzi verifies that the formula-owned installed CLI is at least
+  the offered version. If it is older, the command exits nonzero with
+  `Installed CLI is vY; requested vX was not reached. Try again later.`
+  (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
+  On verified success it tells you to rerun `uzi tui`; there is no automatic re-exec.
+  For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
   choose the information channel.
@@ -1346,6 +1456,15 @@ A newer release is available.
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
   per `uzi tui` invocation either way.
+- **An update installed outside the TUI** is detected after ownership is resolved,
+  on each successful five-minute build-info poll while a newer release is offered.
+  The local check runs even with the modal open, after "Not now", or for a dismissed
+  version; the existing modal gates still apply. If the formula-owned installed CLI
+  already meets or exceeds the offer, the modal closes and the footer shows the
+  actual version: `v<installed> installed, restart uzi to use it` (a narrow terminal
+  may shorten the hint). The running process keeps its old version until you restart
+  uzi yourself. Unknown ownership remains notes-only and runs no installed-CLI subprocess;
+  `UZI_VERSION_CHECK=0` and `--quiet` suppress these checks too.
 - **This is a third axis**, distinct from `version`'s own `update … available`
   row and from the CLI-vs-server skew banner above: it compares this CLI
   binary against the latest *published* release, not the CLI against the
@@ -1379,8 +1498,9 @@ A newer release is available.
   activity docs](./run-activity.md#milestones-and-the-now-line) describe for
   web and CLI. On your own board only, a right-aligned **COST** cell follows the micro-bar: `$N` in
   whole dollars (no cents, to keep the column width stable), `<$1` for a
-  real sub-dollar cost, `—` for a subscription-auth run the SDK prices at
-  $0, and a blank cell for a run with no recorded usage; it too is hidden on
+  real sub-dollar cost, `$0` for metered zero, `n/a` for a legacy
+  `subscription` or unreported run, and a blank cell for no recorded usage;
+  it too is hidden on
   a narrow terminal, dropping right after the micro-bar does so the title is
   never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
@@ -1397,7 +1517,8 @@ A newer release is available.
   board, `$N 7d` is the rounded `Last7Days.CostUSD` from the server's
   `GET /api/usage` response, covering the last seven days even when runs
   are outside the visible list window. A `+` after the dollar amount means
-  subscription or unreported run costs are excluded from that amount;
+  the total is incomplete: legacy runs have no estimate, and unreported
+  runs may contribute recorded partial costs;
   `$0+ 7d` can therefore appear. The cost segment is hidden while the
   initial fetch is pending, after a failed fetch, or when a fully metered
   total rounds to zero. It never appears on the admin/factory board. Each
@@ -1430,8 +1551,9 @@ A newer release is available.
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
   for what a lane's dot means. The header's status tag folds in the run's
   cost beside the elapsed time — e.g. `● running · 41m · $9.55` (with cents,
-  since a single run's precision matters); `—` for a subscription-auth run
-  the SDK prices at $0, and nothing shown for a run with no recorded usage.
+  since a single run's precision matters); metered zero reads `$0.00`,
+  legacy `subscription` and unreported runs read `n/a`, and nothing is shown
+  for a run with no recorded usage.
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
@@ -2260,7 +2382,7 @@ you *do* parse `--json`, use `printf '%s'` (never `echo`) or write it to a file.
 A `null` or absent field prints an empty line (so a nil array field is an empty
 line, not an error). An unknown field, or a **non-scalar** one that is populated
 — any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
-`usage`, `current_activity`), which you read with `--json` — is a usage error
+`usage`, `current_activity`, `progress`), which you read with `--json` — is a usage error
 (exit 2). `--field` and `--json` are mutually exclusive (two output modes).
 
 The model a schedule froze onto a run is readable this way too:
@@ -2308,6 +2430,13 @@ display as `pin` or `worker default`; missing or unfamiliar values show
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
 for resolution, validation and capability requirements.
 
+The human output ends with a `Now summary: on (default)`, `on` or `off` line:
+your own switch for the model-written [Now summary](./run-activity.md#now-summary)
+(`on (default)` means unset, which inherits on; the admin
+[kill switch](./admin-settings.md#run-summaries) can still turn it off for the
+instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
+**Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
@@ -2324,7 +2453,8 @@ unrecognized sources show `unknown`. JSON summary fields
 records. Settings changes do not rewrite this recorded evidence. A human
 revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
 warning that the check does not certify the current plan. Missing cost stays
-unavailable; subscription usage is distinguished from metered spend.
+unavailable; legacy `subscription` usage reads `no estimate`. Priced Codex
+checks in either auth mode show API-equivalent cost, not a bill.
 
 The human view bounds findings to 20 items and sends displayed text through
 `Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for
@@ -2377,6 +2507,22 @@ uniquely-matching lane and role · label alone on the rest; an in-progress
 milestone the lead did not attribute gets no `NOW` row at all, just its
 plain mark in the `MILESTONES` block. A run with no effective attribution
 keeps the single global `NOW` row unchanged.
+`run get` also prints a `PROGRESS` row for a live run: the server-derived
+estimate, e.g. `≈70% · milestone 3 of 3` (`3 of 3 done` when no milestone is active), or a flag when a number would
+mislead: `stalled · since HH:MM` (UTC), `waits on you · plan gate|question|follow-up`,
+`parked · limit wait|pool wait|recovery wait|paused`, `queued` or `planning`
+(see [Progress estimate](./run-activity.md#progress-estimate)). A run waiting
+on a question can add ` · may be blocked by <id>` when the open question
+mentions an issue another live run of the same owner and repo is working (a
+hint, not a recorded dependency; see
+[May be blocked by](./run-activity.md#may-be-blocked-by)). While the model-written
+[Now summary](./run-activity.md#now-summary) is on and a note exists for the active
+milestone, a percent row appends ` · now: <text> (model summary, 2m ago)`; the text is
+untrusted model output printed as plain text, and `--json` carries it as
+`progress.now_note` (`text`, `at`), present only on this single-run read. The row is
+omitted when the run has no estimate and once the run is terminal. `--json` carries `progress` as an object (`null` for a terminal
+run), so `--field progress` is a usage error (exit 2) while the run is live
+and prints an empty line once it is terminal, as for `milestones`.
 `--json` carries the full `current_activity` object; `current_activity` is
 an object, so `--field current_activity` is the documented usage error
 above (exit 2) even when the run has one — read it with `--json` instead.
@@ -2754,7 +2900,7 @@ So every command now compares its own version against the server's and prints
 one line to **stderr** when it is behind:
 
 ```
-uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
+uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli
 ```
 
 A CLI owned by the RC formula names that formula even when it runs a stable
@@ -2763,7 +2909,7 @@ version. Ownership is resolved from the executable's Homebrew path without runni
 For example:
 
 ```
-uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc
+uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli-rc
 ```
 
 - **stderr, never stdout.** `--json` output stays byte-exact and parseable.

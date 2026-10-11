@@ -296,10 +296,11 @@ func activeLaneKey(runStatus string, frames []laneFrame) string {
 	if runStatus != "running" && runStatus != "claimed" {
 		return ""
 	}
-	if len(frames) == 0 {
+	visible := presentationFrames(frames)
+	if len(visible) == 0 {
 		return ""
 	}
-	return laneKeyOf(frames[len(frames)-1])
+	return laneKeyOf(visible[len(visible)-1])
 }
 
 // crewStateFor is the D5 ladder (ActivityFeed.tsx:209-245). Precedence, in order:

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/packbudget"
 )
 
 // These internal tests exercise the delta-aware inflation budget directly (the
@@ -34,6 +36,11 @@ func TestScanPackBudgetRejectsDeltaBomb(t *testing.T) {
 	}
 	if err := scanPackBudget(context.Background(), pack); !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("err = %v, want ErrPackTooLarge", err)
+	} else {
+		var be *packbudget.BudgetError
+		if !errors.As(err, &be) || be.Bound != packbudget.BoundObjectBytes {
+			t.Fatalf("err = %v, want a wrapped *packbudget.BudgetError with the per-object bound", err)
+		}
 	}
 }
 
@@ -129,6 +136,11 @@ func TestScanPackBudgetMalformed(t *testing.T) {
 	t.Run("bad_signature", func(t *testing.T) {
 		if err := scanPackBudget(context.Background(), []byte("NOPExxxxxxxxxxxxxxxx")); !errors.Is(err, ErrPackInvalid) {
 			t.Fatalf("err = %v, want ErrPackInvalid", err)
+		} else {
+			var ie *packbudget.InvalidError
+			if !errors.As(err, &ie) {
+				t.Fatalf("err = %v, want a wrapped *packbudget.InvalidError", err)
+			}
 		}
 	})
 	t.Run("truncated_body", func(t *testing.T) {

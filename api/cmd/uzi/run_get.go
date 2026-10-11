@@ -121,7 +121,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 			p := env.printer(gf)
 			seq := after
 			// --tail N: fetch the newest N via one single-request page, render them,
-			// and advance seq to the highest rendered. Without --follow this is the
+			// and advance seq to the highest received. Without --follow this is the
 			// whole command; with --follow the drain loop below continues from there.
 			if tail > 0 {
 				msgs, err := c.RunLogsPage(cmd.Context(), args[0], uzicli.LogsPageQuery{Tail: tail})

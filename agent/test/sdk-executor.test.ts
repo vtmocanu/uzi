@@ -318,6 +318,109 @@ afterEach(() => {
   }
 });
 
+describe("settled model recovery notification", () => {
+  it("debits SDK cleanup time before deciding whether to notify", async t => {
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    let notifications = 0;
+    const { queryFn } = fakeTurns([() => (async function* () {
+      try {
+        yield assistantText("model output");
+        yield signalDone();
+        yield resultSuccess();
+      } finally {
+        // Spend the wall without yielding to its timer: only disarmWall can debit it.
+        now += 20_000;
+      }
+    })()]);
+    const { ctx } = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "# Approved",
+      config: { max_iterations: 1, run_timeout_seconds: 10 },
+      onModelTurnSettled: async () => { notifications++; },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).catch(() => undefined);
+    assert.equal(notifications, 0);
+  });
+
+  it("propagates a settlement journal handler failure", async () => {
+    const { queryFn } = fakeTurns([[assistantText("model output"), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "# Approved",
+      config: { max_iterations: 1 },
+      onModelTurnSettled: async () => { throw new Error("journal ownership rejected"); },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /journal ownership rejected/);
+  });
+  for (const mode of ["success", "abort", "reject"] as const) {
+    it(`waits for SDK iterator cleanup before notification (${mode})`, async () => {
+      let closing = false;
+      let closed = false;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const abort = new AbortController();
+      let notifications = 0;
+      const script: Script = () => (async function* () {
+        try {
+          yield assistantText("model output");
+          yield signalDone();
+          yield resultSuccess();
+        } finally {
+          closing = true;
+          await gate;
+          // eslint-disable-next-line no-unsafe-finally -- This fixture deliberately rejects iterator closure.
+          if (mode === "reject") throw new Error("SDK iterator closure rejected");
+          closed = true;
+        }
+      })();
+      const { queryFn } = fakeTurns([script]);
+      const { ctx } = makeCtx({
+        seeded: true, planApproved: true, approvedPlan: "# Approved",
+        config: { max_iterations: 1 }, signal: abort.signal,
+        terminalLifecycleSignal: abort.signal,
+        onModelTurnSettled: async () => { assert.equal(closed, true); notifications++; },
+      });
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      const outcome = running.catch(error => error);
+      try {
+        for (let attempts = 0; !closing && attempts < 200; attempts++)
+          await new Promise(resolve => setTimeout(resolve, 5));
+        assert.equal(closing, true);
+        assert.equal(notifications, 0);
+        if (mode === "abort") abort.abort();
+        release();
+        const result = await outcome;
+        if (mode === "reject") assert.match(String(result), /SDK iterator closure rejected/);
+        assert.equal(notifications, mode === "success" ? 1 : 0);
+      } finally {
+        release();
+        await outcome;
+      }
+    });
+  }
+  for (const kind of ["success", "EOF", "failed", "synthetic", "interrupted"] as const) {
+    it(`notifies only model evidence plus successful settled terminal (${kind})`, async () => {
+      let notifications = 0;
+      const abort = new AbortController();
+      const evidence = assistantText("real model evidence");
+      const scripts: Script[] = [kind === "failed"
+        ? [evidence, resultApiError(400, "permanent failure")]
+        : kind === "EOF" ? [evidence]
+        : kind === "synthetic" ? [{ ...evidence, message: { content: [{ type: "text", text: "worker notice" }], model: "<synthetic>" } } as unknown as SDKMessage, resultSuccess()]
+        : [evidence, signalDone(), resultSuccess()]];
+      const { queryFn } = fakeTurns(scripts);
+      const probe = makeCtx({
+        seeded: true, planApproved: true, approvedPlan: "# Approved", config: { max_iterations: 1 },
+        terminalLifecycleSignal: abort.signal,
+        onModelTurnSettled: async count => { assert.ok(count > 0); notifications++; },
+        emit: () => { if (kind === "interrupted") abort.abort(); },
+      });
+      const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+      await executor.run(probe.ctx).catch(() => undefined);
+      assert.equal(notifications, kind === "success" ? 1 : 0);
+    });
+  }
+});
+
 describe("SdkExecutor plan gate", () => {
   it("trusted refusal: submitted plan without a wired gate never starts implementation", async () => {
     const { queryFn, turns } = fakeTurns([
@@ -5089,7 +5192,7 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
    *  `getContextUsage()` control method, mirroring the real SDK `Query`. */
   function fakeTurnsWithContext(
     scripts: Script[],
-    getContextUsage?: () => Promise<ContextUsageReading>,
+    getContextUsage?: (opts?: { detail?: "summary" | "full" }) => Promise<ContextUsageReading>,
   ): { queryFn: SdkQueryFn; turns: Turn[] } {
     const turns: Turn[] = [];
     let i = 0;
@@ -5109,7 +5212,7 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
         else yield* s as AsyncIterable<SDKMessage>;
       })();
       const instance: AsyncIterable<SDKMessage> & {
-        getContextUsage?: () => Promise<ContextUsageReading>;
+        getContextUsage?: (opts?: { detail?: "summary" | "full" }) => Promise<ContextUsageReading>;
       } = gen;
       if (getContextUsage) instance.getContextUsage = getContextUsage;
       return instance;
@@ -5151,6 +5254,30 @@ describe("SdkExecutor lead context-window meter (PRD #516 M1)", () => {
     const usageFrame = probe.emits.find((m) => m.payload["usage"] === USAGE);
     assert.ok(usageFrame, "the assistant usage frame still carries the per-call usage");
     assert.strictEqual(usageFrame!.payload["context"], undefined, "the usage frame carries no context");
+  });
+
+  it("issue #1300: asks getContextUsage for detail \"summary\" and still attaches the mapped context", async () => {
+    const calls: unknown[][] = [];
+    const { queryFn } = fakeTurnsWithContext(
+      [
+        [submitPlan("plan"), resultSuccess()],
+        [leadUsageFrame("working"), signalDone(), resultSuccess()],
+      ],
+      async (...args: unknown[]) => {
+        calls.push(args);
+        return { totalTokens: 50000, rawMaxTokens: 200000, percentage: 25 };
+      },
+    );
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.ok(calls.length > 0, "the lead turn read the context meter");
+    for (const args of calls) {
+      assert.deepStrictEqual(args, [{ detail: "summary" }], "summary mode skips the per-category token-count calls");
+    }
+    const carriers = withContext(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.deepStrictEqual(carriers[0]!.payload["context"], { used: 50000, window: 200000, pct: 25 });
   });
 
   it("preserves an unclamped pct > 100 (near/over-compaction) verbatim", async () => {

@@ -288,6 +288,15 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if m.boardShowMile() {
 		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
 	}
+	// PROG (PRD #2602): shown with MILES (boardShowProg); a finished row has no progress (nil)
+	// and stays blank.
+	if m.boardShowProg() {
+		var prog string
+		if !terminal {
+			prog = m.boardProgCell(r.Progress, r.Status, bg, m.boardShowProgBar())
+		}
+		row += padSeg(prog, m.boardProgWidth(), bg) + gap
+	}
 
 	// WHICH credential this run spent, gated by its own harness:
 	// drawn after the milestone micro-bar and before the COST column, so the row reads
@@ -320,10 +329,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	} else if terminalRunStatuses[r.Status] {
 		text.runWorkerName = "—"
 	}
-	workerWidth := 0
-	if m.width >= 120 {
-		workerWidth = 18 // two spaces and a fixed 16-column worker cell
-	}
+	workerWidth := m.boardWorkerWidth()
 	contentWidth := m.width - workerWidth
 	avail := max(0, contentWidth-visualWidth(row)-markerAllow)
 	if avail > boardTitleMax {
@@ -381,7 +387,7 @@ func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string
 // render identically to a real metered $0. Four states: a nil Usage (a pre-#40 or unclaimed run)
 // draws a BLANK cell, matching boardCredSeg's empty convention; "metered" draws fmtCostBoard's
 // whole-dollar figure (0 < usd < 0.5 renders "<$1" so a real cost never shows as $0, and an exact
-// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "sub"
+// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "n/a"
 // label (never a dollar figure); anything else — "unreported", the pre-M1 empty string, or a
 // status this build has not heard of — draws "n/a", the same safe-unavailable fold web's
 // costCellText uses.
@@ -394,7 +400,7 @@ func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string
 	case costStatusMetered:
 		s = fmtCostBoard(r.Usage.CostUSD) // width-capped so a pathological cost can't blow the cell
 	case costStatusSubscription:
-		s = "sub"
+		s = "n/a"
 	default:
 		s = "n/a"
 	}

@@ -1,4 +1,21 @@
 {
+  "completed_publication_receipt": {
+    "hold_id": "x",
+    "run_id": "x",
+    "owner_id": "x",
+    "worker_id": "x",
+    "generation": 1,
+    "final_head": "x",
+    "repo_id": "x",
+    "connection_id": "x",
+    "project_id": 1,
+    "forge_type": "x",
+    "base_url": "x",
+    "branch": "x",
+    "mr_iid": 1,
+    "observed_branch_head": "x"
+  },
+  "completed_publication_reason": "x",
   "inventory_guarded": true,
   "final_receipt": {
     "kind": "x",

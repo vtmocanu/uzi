@@ -113,6 +113,30 @@ else
   fails=$((fails + 1))
 fi
 
+# Issue #2378: execute the CI service's actual health command against the same
+# socket-only init/final-TCP distinction. No Docker startup or wall-clock wait.
+health_cmd="$(awk -F '"' '/^[[:space:]]*--health-cmd / { print $2; n++ } END { if (n != 1) exit 1 }' \
+  "$HERE/../.github/workflows/ci.yml")"
+cat > "$FAKEBIN2/pg_isready" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$PROBE_LOG"
+if [ "$PG_STAGE" = final ]; then exit 0; fi
+case " $* " in *" -h 127.0.0.1 "*) exit 1 ;; *) exit 0 ;; esac
+STUB
+chmod +x "$FAKEBIN2/pg_isready"
+init_rc=0
+PATH="$FAKEBIN2:$PATH" PG_STAGE=init PROBE_LOG="$TMP/ci-probe.log" \
+  sh -c "$health_cmd" || init_rc=$?
+final_rc=0
+PATH="$FAKEBIN2:$PATH" PG_STAGE=final PROBE_LOG="$TMP/ci-probe.log" \
+  sh -c "$health_cmd" || final_rc=$?
+if [ "$init_rc" -ne 0 ] && [ "$final_rc" -eq 0 ] && [ -s "$TMP/ci-probe.log" ]; then
+  printf 'PASS: CI health command rejects socket-only initdb and accepts the final server\n'
+else
+  printf 'FAIL: CI health command accepted initdb or rejected the final server (#2378)\n'
+  fails=$((fails + 1))
+fi
+
 if [ "$fails" -eq 0 ]; then
   printf '\nrun-store-it teardown test: all assertions passed\n'
   exit 0

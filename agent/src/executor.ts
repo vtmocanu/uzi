@@ -118,6 +118,9 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Issue #2686: true once this run's claim is fenced (lost), so accounting-only side messages
+   *  (summary_usage) are suppressed. Absent = never fenced (stub/test executors). */
+  claimFenced?(): boolean;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;
@@ -344,6 +347,9 @@ export interface RunContext {
   signal?: AbortSignal;
   /** Stable terminal cancellation, independent of rearmed pause lifecycles. */
   terminalLifecycleSignal?: AbortSignal;
+  /** Worker-local evidence after successful terminal, stream settlement and turn cleanup.
+   * Async handlers must check live ownership before writing; handler failures propagate. */
+  onModelTurnSettled?(processedEvents: number): Promise<void>;
   /**
    * M4 plan gate. Called by the executor after the lead submits a plan: the
    * runner posts /state awaiting_approval with the plan and returns the user's
@@ -459,8 +465,13 @@ export interface RunContext {
    * (`could not report progress`) and swallowed — an informational field never fails a run
    * (#122 additive-optional). Absent on the stub/test executors, in which case the executor
    * still folds the value into `latestProgress` and the turn-boundary report carries it.
+   *
+   * PRD #2603: the optional `frozen` is the frozen milestone list the progress is over (the
+   * observer's own list, which is the gate's list or the claim's on a pre-approved resume). The
+   * runner hands it to the Now-summary controller, which needs the titles and the order; it does
+   * not change the report.
    */
-  reportProgress?(progress: MilestoneProgress): Promise<void>;
+  reportProgress?(progress: MilestoneProgress, frozen?: readonly Milestone[]): Promise<void>;
   /**
    * PRD #122 M6: durably checkpoint the run's committed work at a milestone boundary.
    * The executor calls it from the implement loop when a milestone completes.

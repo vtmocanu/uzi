@@ -468,6 +468,7 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 	}
 	chrome++ // the blank separator line before the body
 	chrome++ // the transcript pane's own title row (the first line of the body column)
+	chrome += len(m.answerNoticeLines())
 	chrome += lineCount(m.detailBanner())
 	chrome += lineCount(m.renderSteerBar())
 	if m.detail.steer.mode == steerIdle {
@@ -477,6 +478,14 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 }
 
 func (m tuiModel) transcriptViewport() int {
+	if m.detail.answer.open {
+		chrome := len(m.detailHeaderLines())
+		if m.transportLine() != "" {
+			chrome++
+		}
+		room := max(2, m.height-chrome)
+		return max(1, room-len(m.answerCardLines(room))-1)
+	}
 	return max(3, m.transcriptBudgetWithoutCard()-len(m.questionCardLines()))
 }
 
@@ -514,8 +523,8 @@ func (m tuiModel) renderTranscript() string {
 	// (PRD #1137 M4). With no frame to show yet, the pane alone reports its state: a failed
 	// tail page shows the error HERE (the header stays up — a page error never collapses the
 	// whole view), otherwise the loading placeholder until the newest page lands. A live
-	// frame that beat the tail (len(frames) > 0) renders instead of hiding.
-	if len(m.detail.frames) == 0 {
+	// visible frame that beat the tail renders instead of hiding.
+	if len(m.detail.lanes) == 0 {
 		var placeholder string
 		switch {
 		case m.detail.pageErr != nil:
@@ -572,8 +581,8 @@ func (m tuiModel) renderTranscript() string {
 }
 
 // backfillBadge reports the background history walk in the pane title, left of the follow badge
-// (PRD #1137 M5). held/total are free because seq is gapless from 1 (D5), so highSeq is the
-// total. It says nothing once the walk is complete; on a failed/stalled page it invites `r`.
+// (PRD #1137 M5). Raw sequence bounds include hidden accounting evidence, so the loading
+// badge has no message count. It says nothing once complete; on a failed page it invites `r`.
 func (m tuiModel) backfillBadge() string {
 	if m.detail.historyComplete {
 		return ""
@@ -582,11 +591,7 @@ func (m tuiModel) backfillBadge() string {
 		return lipgloss.NewStyle().Foreground(m.pal.amber).Render("⇡ earlier history unavailable · r")
 	}
 	if m.detail.backfilling {
-		// held is derived from the seq bounds, not len(frames): seq is gapless from 1 (D5), so
-		// highSeq-lowSeq+1 is the count of message frames held and never exceeds the highSeq
-		// total, whereas len(frames) would also count any seq-less infra frame (N > M).
-		held := int(m.detail.highSeq - m.detail.lowSeq + 1)
-		return m.pal.faint.Render("⇡ loading earlier · " + itoa(held) + " of " + itoa(int(m.detail.highSeq)))
+		return m.pal.faint.Render("⇡ loading earlier")
 	}
 	return ""
 }
@@ -653,7 +658,9 @@ func transcriptText(f laneFrame) string {
 // rail TALLER than that — a run with many lanes plus a long milestone block — is truncated to
 // it rather than pushing the total past the terminal height and clipping the footer below the
 // body (issue #379: the footer carries pane nav / esc / ? and must always render). A shorter
-// rail is padded, which is what fills the divider to the bottom.
+// rail is padded, which is what fills the divider to the bottom. Each joined row is bounded to
+// the terminal width (issue #2591); the rail keeps its fixed width, the right column is what is
+// clipped.
 func (m tuiModel) joinColumns(left, right string, width int) string {
 	l := strings.Split(left, "\n")
 	r := strings.Split(right, "\n")
@@ -668,7 +675,11 @@ func (m tuiModel) joinColumns(left, right string, width int) string {
 		if i < len(r) {
 			rv = r[i]
 		}
-		sb.WriteString(padVisual(clampVisual(lv, width), width) + div + rv + "\n")
+		row := padVisual(clampVisual(lv, width), width) + div + rv
+		if m.width > 0 {
+			row = clampVisual(row, m.width)
+		}
+		sb.WriteString(row + "\n")
 	}
 	return sb.String()
 }

@@ -7,8 +7,8 @@
 # the per-PR changelog check spared, scripts/lib/dependency-bump.sh), bump the chart, auto-bump
 # the worker tag, refresh links, commit, and verify with the coverage oracle. It does
 # NOT push. It tags only the promoted STABLE (locally, on a throwaway release branch);
-# the RC tag on main is applied by the lead after ci.yml is green. A tag push publishes
-# unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
+# the RC tag on main can follow its push immediately: publish gates enforce CI coverage.
+# A tag push publishes unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
 #
 #   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]
 #
@@ -46,7 +46,7 @@
 # Exit codes: 0 ready;  1 a step/verify failed (tree left recoverable);  3 usage /
 #             precondition failure, or a refusal that needs a verb.
 #
-# NEVER skip-ci a release commit (release.yml assumes ci.yml is green on it).
+# NEVER skip-ci a release commit: skip markers suppress tag publish workflows too.
 set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
@@ -163,26 +163,43 @@ prev_stable_below() {
 changelog_unreleased_body() {
   awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
 }
-# shipping_commits_since <ref> -> count of first-parent commits in <ref>..HEAD that touched
+# shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
 # a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
 # a docs/skill/prd/build-only commit after the RC must NOT force a next candidate that ships
-# nothing (it would leave an empty [X] section and, with an empty [Unreleased], fail the main
-# half and roll the stable tag back). Counting raw `git log` commits conflated the two.
+# nothing (with an empty [Unreleased] and no draft, preflight would refuse the promotion).
+# Counting raw `git log` commits conflated the two.
 shipping_commits_since() {
-  local c=0 sha f files
+  local sha f shipping files_fd files_pid
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
-    files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
-    while IFS= read -r f; do
+    shipping=0
+    # Two attempts at most; drain the whole producer before trusting its status.
+    exec {files_fd}< <(
+      listing_tmp="$(mktemp)" || exit 1
+      listing_rc=0
+      if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+         git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+        cat "$listing_tmp" || listing_rc=$?
+      else
+        listing_rc=$?
+      fi
+      rm -f "$listing_tmp"
+      exit "$listing_rc"
+    )
+    files_pid=$!
+    while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
-      if is_shipping "$f"; then c=$((c + 1)); break; fi
-    done <<EOF
-$files
-EOF
+      if is_shipping "$f"; then shipping=1; fi
+    done <&"$files_fd"
+    exec {files_fd}<&-
+    if ! wait "$files_pid"; then
+      echo "release-cut: could not list changed paths for $sha" >&2
+      return 1
+    fi
+    if [ "$shipping" = 1 ]; then printf '%s\n' "$sha"; fi
   done <<EOF
 $(git log --first-parent --format=%H "$1..HEAD" 2>/dev/null)
 EOF
-  echo "$c"
 }
 # rc_tag_on_remote <tag> -> 0 present on origin, 2 absent from origin, 3 origin
 # unreachable (network/auth). A promote re-tags the in-flight RC's PUBLISHED agent image
@@ -227,6 +244,20 @@ git fetch --tags --quiet origin >/dev/null 2>&1 || true
 BEHIND="$(git rev-list --count HEAD..refs/remotes/origin/main 2>/dev/null || echo 0)"
 if [ "${BEHIND:-0}" -gt 0 ]; then
   echo "release-cut: local main is $BEHIND commit(s) behind origin/main. Fast-forward first: git merge --ff-only origin/main" >&2; exit 3
+fi
+
+# Require green main-push CI and smoke on the exact prospective parent. The
+# same coverage policy gates publication remotely; local failures are early feedback.
+# A release push cancels in-flight parent CI on main, destroying inheritance evidence.
+# Only the offline fixture harness may omit network evidence.
+if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" = "1" ]; then
+  fixture_origin="$(git remote get-url origin 2>/dev/null || true)"
+  if [ "${GH_REPO:-}" != "test/uzi" ] || [ "$(git config user.email)" != "t@example.com" ] ||
+     { [ -n "$fixture_origin" ] && [ "${fixture_origin#/}" = "$fixture_origin" ]; }; then
+    echo "release-cut: offline exemption requires the local test fixture" >&2; exit 3
+  fi
+elif [ "$VERB" != "--promote-only" ]; then
+  python3 -I "$ROOT/scripts/release-ci-coverage.py" tip HEAD --wait 0 || exit 3
 fi
 
 # --- discovery ----------------------------------------------------------------
@@ -500,24 +531,40 @@ run_links() {
 # PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
 # carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
 dependency_merge_refs() {
-  local prev="$1" sha subject files f shipping manifest_only touched_cl pr short
+  local prev="$1" sha subject f shipping manifest_only touched_cl pr short files_fd files_pid
   [ -n "$prev" ] || return 0
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     subject="$(git log -1 --format=%s "$sha")"
     is_dependency_subject "$subject" || continue
     if git log -1 --format=%B "$sha" | grep -iE '^Changelog:[[:space:]]*none' >/dev/null; then continue; fi
-    files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
+    # A failed listing aborts this scan before any dependency citations are used.
+    exec {files_fd}< <(
+      listing_tmp="$(mktemp)" || exit 1
+      listing_rc=0
+      if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+         git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+        cat "$listing_tmp" || listing_rc=$?
+      else
+        listing_rc=$?
+      fi
+      rm -f "$listing_tmp"
+      exit "$listing_rc"
+    )
+    files_pid=$!
     shipping=0; manifest_only=1; touched_cl=0
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
       [ "$f" != CHANGELOG.md ] || touched_cl=1
       is_shipping "$f" || continue
       shipping=1
       is_dependency_manifest "$f" || manifest_only=0
-    done <<EOF
-$files
-EOF
+    done <&"$files_fd"
+    exec {files_fd}<&-
+    if ! wait "$files_pid"; then
+      echo "release-cut: could not list changed paths for $sha" >&2
+      return 1
+    fi
     [ "$shipping" = 1 ] && [ "$manifest_only" = 1 ] && [ "$touched_cl" = 0 ] || continue
     pr="$(printf '%s\n' "$subject" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')"
     short="$(git rev-parse --short "$sha")"
@@ -582,6 +629,9 @@ EOF
 # --- promote (D5): tag a stable vIB from a throwaway release branch -----------
 promote_inflight() {
   local relbranch="release/$IB" tagB="v$IB" wt
+  if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" != "1" ]; then
+    python3 -I "$ROOT/scripts/release-ci-coverage.py" coverage "$INFLIGHT" --wait 0 || exit 3
+  fi
   if git rev-parse -q --verify "refs/heads/$relbranch" >/dev/null; then
     echo "release-cut: branch $relbranch already exists (aborted prior promotion?). Remove it deliberately and re-run." >&2; exit 3
   fi
@@ -647,8 +697,8 @@ echo "=== release-cut $TAG (op=$OP) on $DEFBRANCH ==="
 # --- promote half (before touching main) --------------------------------------
 PROMOTED_TAG=""; PROMOTE_FINALIZED=0
 # The promote half tags a LOCAL (unpushed) stable vB before the main half runs. If the
-# main half then fails (an empty [Unreleased] with no --changelog-file, a bad oracle,
-# anything), roll that tag back so a re-run starts clean instead of refusing with "tag
+# main half then fails (a bad supplied changelog draft, a bad oracle, anything),
+# roll that tag back so a re-run starts clean instead of refusing with "tag
 # vB already exists". The tag is not pushed, so deleting it loses nothing; a successful
 # run sets PROMOTE_FINALIZED=1 first so the guard is a no-op.
 promote_guard() {
@@ -687,10 +737,29 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
   # to cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless. We
   # count SHIPPING first-parent commits, not raw commits: a docs/skill/prd/build-only commit
   # after the RC (e.g. a `docs(...) [skip ci]` anchor refresh) must still take promote-only,
-  # not drop through to the main half and fail on an empty [Unreleased] (which would roll the
-  # stable tag back). "Shipping" is is_shipping, the same predicate the coverage oracle uses.
-  merges="$(shipping_commits_since "$INFLIGHT")"
+  # not require entries for a next candidate. "Shipping" is is_shipping, the same
+  # path predicate the coverage oracle uses.
+  if ! SHIPPING_SHAS="$(shipping_commits_since "$INFLIGHT")"; then
+    exit 3
+  fi
+  merges=0
+  while IFS= read -r shipping_sha; do
+    [ -z "$shipping_sha" ] || merges=$((merges + 1))
+  done <<EOF
+$SHIPPING_SHAS
+EOF
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
+  # A combined promotion must have notes for the next candidate before tagging the stable.
+  # Dependency-only shipping work also requires notes here; plain cuts still autocite it.
+  if [ "$OP" = promote ] && [ "$merges" -gt 0 ] && [ -z "$unrel" ] && [ -z "$CL_FILE" ]; then
+    {
+      echo "release-cut: --promote REFUSED -- shipping commits landed since $INFLIGHT but [Unreleased] is empty and no --changelog-file given."
+      echo "  Shipping SHAs:"
+      printf '    %s\n' "$SHIPPING_SHAS"
+      echo "  Either write next candidate entries under [Unreleased] OR pass --changelog-file with a drafted ## [$BASE] section, then re-run."
+    } >&2
+    exit 3
+  fi
   trap promote_guard EXIT
   promote_inflight
   # --promote-only: the lead asked for the stable alone. Stop here whatever main carries:
@@ -723,7 +792,9 @@ if [ -n "$PREV_OVERRIDE" ]; then
 else
   PREV="$(prev_stable_below "$BASE")"
 fi
-DEP_REFS="$(dependency_merge_refs "$PREV")"
+if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
+  exit 3
+fi
 
 # --- CHANGELOG (main half) ----------------------------------------------------
 case "$OP" in
@@ -787,12 +858,12 @@ if [ -n "$PROMOTED_TAG" ]; then
   echo "  # push order (D5): STABLE tag, then main, then the RC tag —"
   echo "  git push origin $PROMOTED_TAG"
   echo "  git push origin main               # triggers ci.yml"
-  echo "  .../watch-run-ci.sh --sha \"\$(git rev-parse HEAD)\" --branch main   # validate exact release HEAD, then wait for green"
+  echo "  # Tag immediately after the push; release.yml enforces CI coverage."
   echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 else
   echo "  git show HEAD                 # review"
   echo "  git push origin main         # triggers ci.yml"
-  echo "  .../watch-run-ci.sh --sha \"\$(git rev-parse HEAD)\" --branch main   # validate exact release HEAD, then wait for green"
+  echo "  # Tag immediately after the push; release.yml enforces CI coverage."
   echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 fi
 echo "  .../release-watch.sh $CHARTVER && .../release-verify.sh $CHARTVER"

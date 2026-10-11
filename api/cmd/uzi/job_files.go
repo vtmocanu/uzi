@@ -211,23 +211,33 @@ func withUnattachedIDs(err error, ids []string) error {
 	return wrapped
 }
 
+// jobFileReadError puts the cause before the path so root's final cellText cap
+// preserves the reason even when the operator supplies a long path.
+func jobFileReadError(path string, err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return uzicli.Exitf(uzicli.ExitUsage, "cannot read file: %v: %q", err, cellText(path))
+}
+
 func uploadJobFile(ctx context.Context, c uzicli.Client, path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "--file needs a path")
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read file %q: %v", cellText(path), err)
+		return "", jobFileReadError(path, err)
 	}
 	if !fi.Mode().IsRegular() {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "file %q is not a regular file", cellText(path))
+		return "", uzicli.Exitf(uzicli.ExitUsage, "not a regular file: %q", cellText(path))
 	}
 	if fi.Size() == 0 {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "file %q is empty", cellText(path))
+		return "", uzicli.Exitf(uzicli.ExitUsage, "empty file: %q", cellText(path))
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|openNonblock, 0) //nolint:gosec // G304: the operator's own argument to their local CLI.
 	if err != nil {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read file %q: %v", cellText(path), err)
+		return "", jobFileReadError(path, err)
 	}
 	defer func() { _ = f.Close() }()
 	h := sha256.New()

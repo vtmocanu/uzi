@@ -25,18 +25,32 @@ PREV=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 greptile() { printf '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"%s","conclusion":%s,"output":{"summary":"%s"}}]}\n' "$1" "$2" "$3"; }
 none() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
+  if [ -n "${GH_ALWAYS_FAIL:-}" ] || { [ -n "${GH_BLIP_FILE:-}" ] && [ -e "$GH_BLIP_FILE" ]; }; then
+    [ -z "${GH_BLIP_FILE:-}" ] || rm -f "$GH_BLIP_FILE"
+    echo "error connecting to api.github.com" >&2; exit 1
+  fi
   printf '{"number":42,"state":"OPEN","isDraft":false,"headRefOid":"%s","headRefName":"agent/issue-1","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s","reviewDecision":"","title":"t"}\n' "$HEAD" "${MERGEABLE:-MERGEABLE}" "${MERGE_STATE:-CLEAN}"
   exit 0
 fi
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
+  if [ "${CHECKS_REQUIRED_EMPTY:-0}" = 1 ] && [[ " $* " == *' --required '* ]]; then echo '[]'; exit 0; fi
   # A conflicting PR gets no pull_request CI: gh reports no required checks and exits 1.
   if [ "${CHECKS_NONE:-0}" = 1 ]; then echo "no required checks reported on the 'agent/issue-1' branch" >&2; exit 1; fi
-  echo '[{"bucket":"pass"}]'; exit 0
+  if [ -n "${CHECKS_JSON:-}" ]; then echo "$CHECKS_JSON"; else echo '[{"name":"ci","bucket":"pass"}]'; fi
+  exit 0
 fi
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
+case "$*" in *'/protection/required_status_checks'*)
+  printf 'HTTP/2.0 %s Test\r\n\r\n' "${CLASSIC_HTTP:-404}"
+  if [ -n "${CLASSIC_BODY:-}" ]; then printf '%s' "$CLASSIC_BODY"; else printf '{"message":"Branch not protected"}'; fi
+  exit "${CLASSIC_RC:-1}" ;;
+esac
 # pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
 case "$*" in
+  *'/rules/branches/main'*)
+    [ "${RULES_FAIL:-0}" = 1 ] && exit 1
+    echo "[${RULES_JSON:-[]}]" ;;
   *"/commits/$HEAD/status"*) echo '{"statuses":[]}' ;;
   *'/code-scanning/alerts'*)
     # CS_MODE: unset = none; alert = one open alert; unavailable = 404 no analysis; broken = 502.
@@ -93,7 +107,13 @@ case "$*" in
   *) echo "unexpected gh api: $*" >&2; exit 1 ;;
 esac
 STUB
-chmod +x "$WORK/bin/gh" "$WORK/bin/uzi"
+# Recording sleep stub: net_retry backoff must cost no real time (NET_RETRY_BASE_SLEEP=0).
+export NET_RETRY_BASE_SLEEP=0 SLEEP_LOG="$WORK/sleeps"; : > "$SLEEP_LOG"
+cat > "$WORK/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+echo "$1" >> "$SLEEP_LOG"
+STUB
+chmod +x "$WORK/bin/gh" "$WORK/bin/uzi" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
 export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 export UZI_LANDER_STATE_DIR="$WORK/state"
@@ -267,5 +287,67 @@ has head_clean_ea_unavail 'EVERY_AUTHOR=threads=0 code_scanning=unavailable unac
 has head_clean_ea_unavail 'UNKNOWN=0'
 has head_clean_ea_unavail 'NEXT=ready'
 unset CS_MODE
+
+export CHECKS_REQUIRED_EMPTY=1
+snap head_clean noreq-green; has noreq-green 'NEXT=ready'
+export CHECKS_JSON='[{"name":"ci","bucket":"skipping"}]'
+snap head_clean noreq-skipping; has noreq-skipping 'NEXT=ready'
+CHECKS_JSON='[{"name":"ci","bucket":"pending"}]'; snap head_clean noreq-pending; has noreq-pending 'NEXT=ci_pending'
+CHECKS_JSON='[{"name":"ci","bucket":"fail"}]'; snap head_clean noreq-fail; has noreq-fail 'NEXT=ci_red'
+CHECKS_JSON='[{"name":"ci","bucket":"cancel"}]'; snap head_clean noreq-cancel; has noreq-cancel 'NEXT=ci_pending'
+CHECKS_JSON='[]'; snap head_clean noreq-empty; has noreq-empty 'NEXT=unknown'
+CHECKS_JSON='[{"name":"ci","bucket":"mystery"}]'; snap head_clean noreq-malformed; has noreq-malformed 'NEXT=unknown'
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'; export RULES_FAIL=1
+snap head_clean noreq-unreadable; has noreq-unreadable 'NEXT=unknown'
+unset CHECKS_REQUIRED_EMPTY CHECKS_JSON RULES_FAIL
+
+export CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+snap head_clean classic-partial; has classic-partial 'NEXT=ci_pending'
+CLASSIC_BODY='{"contexts":["slow"],"checks":[]}'
+export CHECKS_REQUIRED_EMPTY=1 CHECKS_JSON='[{"name":"fast","bucket":"pass"}]'
+snap head_clean classic-unregistered; has classic-unregistered 'NEXT=unknown'
+unset CHECKS_REQUIRED_EMPTY
+CLASSIC_HTTP=403; CLASSIC_RC=1; CLASSIC_BODY='{"message":"Forbidden"}'
+snap head_clean classic-forbidden; has classic-forbidden 'NEXT=unknown'
+CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
+snap head_clean rules-present-classic-forbidden; has rules-present-classic-forbidden 'NEXT=ready'
+unset RULES_JSON
+CLASSIC_HTTP=404; CLASSIC_BODY='{"message":"Required status checks not enabled"}'
+snap head_clean classic-disabled; has classic-disabled 'NEXT=ready'
+unset CLASSIC_HTTP CLASSIC_RC CLASSIC_BODY CHECKS_JSON
+
+# Transient transport errors on the read-only lookups are retried (lib/net-retry.sh).
+: > "$SLEEP_LOG"
+: > "$WORK/gh-blip"; export GH_BLIP_FILE="$WORK/gh-blip"
+snap head_clean pr-view-blip
+has pr-view-blip 'NEXT='
+hasnt pr-view-blip 'gh pr view 42 failed'
+[ -s "$SLEEP_LOG" ] || fail "gh pr view blip was not retried through sleep"
+unset GH_BLIP_FILE
+export GH_ALWAYS_FAIL=1 MODE=head_clean
+rc=0; bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/pr-view-down.out" 2>&1 || rc=$?
+[ "$rc" -eq 3 ] || fail "persistent gh pr view outage returned rc=$rc, want 3: $(cat "$WORK/pr-view-down.out")"
+has pr-view-down 'gh pr view 42 failed'
+unset GH_ALWAYS_FAIL
+grep -qvx 0 "$SLEEP_LOG" && fail "non-zero backoff recorded: $(sort -u "$SLEEP_LOG" | tr '\n' ' ')"
+# No uzi on PATH: the absent-uzi path (have_uzi=0) is unchanged, no function stands in for it.
+mkdir -p "$WORK/nouzi"
+for t in bash env git jq awk sed tr head cat rm mktemp grep date dirname basename uname sort cut tail wc mkdir sleep xargs find cmp od; do
+  p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$WORK/nouzi/$t"
+done
+ln -sf "$WORK/bin/gh" "$WORK/nouzi/gh"
+MODE=head_clean; export MODE
+rc=0; PATH="$WORK/nouzi" bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/nouzi.out" 2>&1 || rc=$?
+[ "$rc" -eq 0 ] || fail "no-uzi PATH takeover exited $rc: $(cat "$WORK/nouzi.out")"
+has nouzi 'NEXT='
+hasnt nouzi 'MR_REWORK=repo-not-on-uzi'
+has nouzi 'MR_REWORK_ACTIVE=0'
+# A stand-in uzi() would make the CLI look present but unreadable.
+hasnt nouzi 'UZI_REPO_LIST=unreadable'
+hasnt nouzi 'NEXT=unknown'
+snap head_clean with-uzi
+has with-uzi 'MR_REWORK=repo-not-on-uzi'
 
 echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit; a conflicting PR is NEXT=conflict"

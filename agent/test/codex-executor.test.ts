@@ -56,7 +56,7 @@ import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
-import type { CodexLaunchRootResult, CodexProviderConfig } from "../src/codex/codex-harness.js";
+import { CodexHarness, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
@@ -2054,6 +2054,7 @@ describe("m1 credential-free owner cancel", () => {
       "info-exclude", "external-excludes", "exclude-comments", "ignored-node-modules",
       "root-gitignore", "nested-gitignore"].map(work => ({ work })),
     ...["wrong", "missing", "retained", "error"].map(release => ({ work: "clean", release })),
+    ...["oversized", "normal"].map(releaseTransport => ({ work: "clean", releaseTransport })),
     ...["survivors", "unverified", "new-writer"].map(process => ({ work: "clean", process })),
     { work: "clean", docker: "docker_error" },
     { work: "clean", trust: "missing" },
@@ -2070,17 +2071,24 @@ describe("m1 credential-free owner cancel", () => {
     { work: "clean", route: "deferred", terminal: "immediate" },
     ...["before-cancel", "settle", "inspect", "release-ack"].map(quarantine => ({ work: "clean", quarantine })),
   ] as Array<{ work: string; release?: string; process?: string; docker?: string; trust?: string;
-    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string; readinessDelayMs?: number }>;
+    inspect?: string; drain?: string; terminal?: string; route?: string; quarantine?: string; readinessDelayMs?: number;
+    releaseTransport?: string }>;
   for (const scenario of cases.filter(scenario => (HAS_PROCFS || !scenario.process) &&
       (scenario.work !== "lossy-path" || process.platform === "linux") &&
       (!scenario.quarantine || process.platform === "linux")))
     it(`actual runner owner cancel ${JSON.stringify(scenario)}`, async (t) => {
+      if (scenario.releaseTransport && process.platform !== "linux") {
+        t.skip("real-client owner-cancel transport requires Linux descriptor cleanliness proof");
+        return;
+      }
       const { work } = scenario;
       // The bounded descriptor reader conservatively refuses unsupported platforms.
       const shouldRelease = process.platform === "linux" && ["clean", "symlink-dangling", "symlink-outside", "exclude-comments", "ignored-node-modules"].includes(work) && !scenario.release && !scenario.process &&
-        !scenario.trust && !scenario.inspect && !scenario.drain && !scenario.quarantine;
-      // A release ACK closes server custody even when quarantine retains local evidence.
-      const shouldCloseHold = shouldRelease || scenario.quarantine === "release-ack";
+        !scenario.trust && !scenario.inspect && !scenario.drain && !scenario.quarantine && scenario.releaseTransport !== "oversized";
+      // Server commitment and local cleanup are separate: an oversized ACK loses local proof.
+      const shouldCloseHold = shouldRelease || scenario.quarantine === "release-ack" || scenario.releaseTransport === "oversized";
+      const shouldAttemptRelease = process.platform === "linux" &&
+        (shouldRelease || scenario.quarantine === "release-ack" || !!scenario.release || !!scenario.releaseTransport);
       const quarantineReached = deferred<void>();
       const quarantineContinue = deferred<void>();
       let quarantineSeamReached = false;
@@ -2126,12 +2134,57 @@ describe("m1 credential-free owner cancel", () => {
         if (scenario.quarantine === "settle" && settlingCancel && !quarantineSeamReached) await pauseForQuarantine();
         return reap(...args);
       };
-      const client = new WorkerClient(url, "cancel-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
-      client.protocolFeatures = ["recovery_release_exact_echo"];
       const releases: unknown[][] = [];
       const openHolds = new Set([7, 8]);
+      const releasePosts: Array<{ url: string; method: string; body: unknown }> = [];
+      let releaseBytes = Buffer.alloc(0);
+      let deliveredReleaseBytes = 0;
+      let releaseCancelled = false;
+      let releaseEnded = false;
+      let releaseError: unknown;
+      const forwardFetch = globalThis.fetch;
+      const client = new WorkerClient(url, "cancel-worker", "test", noopLog, {
+        sleep: async () => {}, terminalRetrySchedule: [1, 1],
+        fetch: async (input, init) => {
+          const requestUrl = String(input);
+          if (!scenario.releaseTransport || init?.method !== "POST" ||
+              requestUrl !== `${url}/api/worker/runs/${claim.run_id}/archives/release`) {
+            return forwardFetch(input, init);
+          }
+          releasePosts.push({ url: requestUrl, method: init.method, body: JSON.parse(String(init.body)) });
+          // The simulated server commits the release before sending either ACK.
+          openHolds.delete(7);
+          const receipt = { run_id: claim.run_id, generation: 7, released: true, holds_released: 1, retained: false };
+          const text = JSON.stringify(scenario.releaseTransport === "oversized" ?
+            { ...receipt, reason: "界".repeat(10_000) } : receipt);
+          releaseBytes = Buffer.from(text);
+          const response = new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (deliveredReleaseBytes === releaseBytes.length) {
+                releaseEnded = true;
+                controller.close();
+                return;
+              }
+              const chunk = releaseBytes.subarray(deliveredReleaseBytes, deliveredReleaseBytes + 4096);
+              deliveredReleaseBytes += chunk.length;
+              controller.enqueue(chunk);
+            },
+            cancel() { releaseCancelled = true; },
+          }, { highWaterMark: 0 }), { headers: { "Content-Length": "1" } });
+          t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
+          return response;
+        },
+      });
+      client.protocolFeatures = ["recovery_release_exact_echo"];
+      const releaseCustody = client.releaseRecoveryCustody.bind(client);
       client.releaseRecoveryCustody = async (...args) => {
         releases.push(args);
+        if (scenario.releaseTransport) {
+          try { return await releaseCustody(...args); } catch (error) {
+            releaseError = error;
+            throw error;
+          }
+        }
         if (scenario.quarantine === "release-ack") await pauseForQuarantine();
         if (scenario.release === "error") throw new Error("lost release ACK");
         if (scenario.release === "missing") return {} as never;
@@ -2221,7 +2274,7 @@ describe("m1 credential-free owner cancel", () => {
       let dispositionObserved = false;
       let disposition: string | undefined;
       let preservationAfterDisposition: ObservedFlight | undefined;
-      if (scenario.quarantine) {
+      if (scenario.quarantine || scenario.releaseTransport) {
         const buildFlight = runnerSeams.buildFlight.bind(runner);
         runnerSeams.buildFlight = (...args) => { realFlight = buildFlight(...args); return realFlight; };
         const dispose = runnerSeams.disposeCredentialFreeOwnerCancel.bind(runner);
@@ -2491,6 +2544,38 @@ describe("m1 credential-free owner cancel", () => {
             disposition: "retained", preserveRecoveryClone: true, preserveSession: true,
           }, "both preservation flags are true immediately after genuine disposition returns");
         }
+        if (scenario.releaseTransport) {
+          assert.ok(realFlight, "real flight captured");
+          assert.equal(dispositionObserved, true);
+          assert.equal(settlementKind, "observed_empty");
+          assert.deepEqual({ disposition, ...preservationAfterDisposition }, {
+            disposition: shouldRelease ? "released" : "retained",
+            preserveRecoveryClone: !shouldRelease, preserveSession: !shouldRelease,
+          }, "actual disposition and both preservation flags follow ACK proof");
+          assert.deepEqual({ preserveRecoveryClone: realFlight.preserveRecoveryClone,
+            preserveSession: realFlight.preserveSession }, preservationAfterDisposition,
+            "preservation flags survive execution");
+          assert.deepEqual(releasePosts, [{
+            url: `${url}/api/worker/runs/${claim.run_id}/archives/release`,
+            method: "POST", body: { generation: 7 },
+          }]);
+          if (scenario.releaseTransport === "oversized") {
+            assert.ok(releaseError instanceof Error, "actual transport error captured outside runner catch");
+            assert.equal(releaseError.name, "ResponseBodyOverflowError");
+            assert.equal(releaseError.message, "response body exceeds 16384 bytes");
+            assert.ok(releaseBytes.length > 16 * 1024);
+            assert.ok(releaseBytes.toString("utf8").length < 16 * 1024);
+            assert.equal(deliveredReleaseBytes, 20 * 1024, "stops at first overflowing chunk");
+            assert.equal(releaseCancelled, true);
+            assert.equal(releaseEnded, false);
+            assert.ok(deliveredReleaseBytes < releaseBytes.length);
+          } else {
+            assert.equal(releaseError, undefined);
+            assert.equal(deliveredReleaseBytes, releaseBytes.length);
+            assert.equal(releaseEnded, true);
+            assert.equal(await fs.access(clone).then(() => true, () => false), false, "released clone removed");
+          }
+        }
         assert.deepEqual(seamViolations, [], "owner-cancel seam invariants (the runner's catch would otherwise swallow them)");
         assert.equal(lifecycle?.aborted, true, "real steering forwards genuine lifecycle abort");
         assert.equal(rig.client.refreshCalls.length, 0, "cleanup never refreshes");
@@ -2500,9 +2585,9 @@ describe("m1 credential-free owner cancel", () => {
         if (work === "external-excludes") {
           assert.deepEqual(await fs.readFile(externalExclude), externalExcludeBytes, "external exclude bytes unchanged after cancellation");
         }
-        assert.equal(releases.length, process.platform === "linux" && (shouldCloseHold || scenario.release) ? 1 : 0);
+        assert.equal(releases.length, shouldAttemptRelease ? 1 : 0, "release attempts are distinct from server closure and local cleanup");
         assert.equal(boundaryCalls, 0, "no credentialed cleanup boundary");
-        assert.equal(openHolds.has(7), !shouldCloseHold, "exact release ACK closes own server hold independently of local retention");
+        assert.equal(openHolds.has(7), !shouldCloseHold, "server release commitment closes own hold independently of local retention");
         assert.equal(openHolds.has(8), true, "sibling hold untouched");
         const records = await recovery.coord.inspect(claim.run_id);
         assert.ok(records.some(record => record.generation === 8), "sibling journal untouched");
@@ -2744,6 +2829,130 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /run cancelled/);
     assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
   });
+
+  it("settled model recovery notification preserves the shared transport for a second model turn", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const id = `tn-${c.turnStartCount}`;
+        c.transport.push(agentMessage(`model turn ${c.turnStartCount}`));
+        if (c.turnStartCount === 2) c.transport.push(signalDone("th-1", id));
+        c.transport.push(turnCompleted("completed", "th-1", id));
+        return { turn: { id } };
+      }
+      return {};
+    } });
+    let notifications = 0;
+    const { ctx } = makeCtx({
+      config: { max_iterations: 2 },
+      onModelTurnSettled: async count => {
+        assert.ok(count > 0);
+        assert.equal(rig.transport.closes, 0, "per-turn settlement must retain the provider transport");
+        notifications++;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "two settled turns");
+    assert.equal(rig.transport.turnStartCount, 2);
+    assert.equal(rig.providerLaunches(), 1);
+    assert.equal(notifications, 2);
+  });
+
+  for (const mode of ["success", "abort", "reject"] as const) {
+    it(`settled model recovery notification waits for deferred delegation settlement (${mode})`, async () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) {
+            c.transport.push(agentMessage("real root output"));
+            c.transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help" }, "th-1", "tn-1", "c-spawn"));
+            return { turn: { id: "tn-1" } };
+          }
+          c.transport.push(toolCall(11, "uzi_bash", { command: "echo child work" }, "th-child", "tn-child", "c-bash"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      } });
+      let shellStarted = false;
+      let shellSettled = false;
+      let effectsStopped = false;
+      let releaseShell!: () => void;
+      const shellGate = new Promise<void>(resolve => { releaseShell = resolve; });
+      rig.deps = { ...rig.deps, spawnCommand: async (_argv, opts) => {
+        shellStarted = true;
+        opts.signal?.addEventListener("abort", () => { effectsStopped = true; }, { once: true });
+        await shellGate;
+        shellSettled = true;
+        return { code: 0, stdout: "late", stderr: "" };
+      } };
+      const abort = new AbortController();
+      let notifications = 0;
+      const { ctx } = makeCtx({
+        terminalLifecycleSignal: abort.signal,
+        agents: [
+          { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+          { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+        ],
+        onModelTurnSettled: async () => {
+          assert.equal(shellSettled, true);
+          assert.ok(rig.transport.responses.some(r => r.requestId === 1), "delegation reply precedes notification");
+          notifications++;
+        },
+      });
+      let releaseTail!: () => void;
+      const tailGate = new Promise<void>(resolve => { releaseTail = resolve; });
+      let tailReached = false;
+      // Defer completion after the real harness tail, including its delegation reply.
+      const originalStart = CodexHarness.prototype.startTurn;
+      const startMock = mock.method(CodexHarness.prototype, "startTurn", function (this: CodexHarness, ...args: Parameters<typeof originalStart>) {
+        const turn = originalStart.apply(this, args);
+        return { ...turn, events: (async function* () {
+          yield* turn.events;
+          tailReached = true;
+          await tailGate;
+          if (mode === "reject") throw new Error("settlement closure rejected");
+        })() };
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const outcome = running.catch(error => error);
+      try {
+        await waitFor(() => shellStarted, "delegation shell admitted");
+        rig.transport.push(signalDone()).push(turnCompleted("completed"));
+        await waitFor(() => effectsStopped, "successful terminal cancels delegation effects");
+        assert.equal(notifications, 0, "pending delegation cannot notify");
+        if (mode === "abort") abort.abort();
+        releaseShell();
+        await waitFor(() => shellSettled && tailReached && rig.transport.responses.some(r => r.requestId === 11), "child callback and real harness tail settled");
+        assert.equal(notifications, 0, "iterator completion still pending");
+        releaseTail();
+        const result = await withTimeout(outcome, 3000, "deferred settlement");
+        if (mode === "reject") assert.match(String(result), /settlement closure rejected/);
+        if (mode === "success") assert.ok(!(result instanceof Error), String(result));
+        assert.equal(notifications, mode === "success" ? 1 : 0);
+      } finally {
+        releaseShell();
+        releaseTail();
+        await outcome;
+        startMock.mock.restore();
+      }
+    });
+  }
+
+  for (const completion of ["completed", "failed", "EOF", "interrupted"] as const) {
+    it(`settled model recovery notification requires successful terminal (${completion})`, async () => {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(agentMessage("actual model output"));
+      if (completion !== "EOF") rig.transport.push(turnCompleted(completion === "failed" ? "failed" : "completed"));
+      rig.transport.end();
+      const { ctx } = makeCtx();
+      let notifications = 0;
+      const abort = new AbortController();
+      ctx.terminalLifecycleSignal = abort.signal;
+      if (completion === "interrupted") ctx.emit = () => abort.abort();
+      ctx.onModelTurnSettled = async count => { assert.ok(count > 0); notifications++; };
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "settlement evidence").catch(() => undefined);
+      assert.equal(notifications, completion === "completed" ? 1 : 0);
+    });
+  }
 
   it("(9) a clean-EOF terminal returns and emits the accumulated result", async () => {
     const rig = makeRig();
@@ -4058,10 +4267,11 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
 
     // The coder subagent is configured with a DISTINCT valid contract model from the root
-    // (root = provider.model = "gpt-6-astra"); its usage must be charged to "gpt-5.6-sol".
+    // (root = provider.model = "gpt-6-astra"); use a non-promotional child model so
+    // the price assertion remains valid after the Sol promotional review date.
     const childModelAgents: AgentTemplate[] = [
       { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
-      { name: "coder", description: "a coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", model: "gpt-6.1-sol", tools: null, skills: [] },
     ];
     const { ctx, emitted } = makeCtx({ agents: childModelAgents });
     const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
@@ -4071,16 +4281,13 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
 
     const modelUsage = lastResultModelUsage(emitted);
     assert.ok(modelUsage, "the terminal carries per-model usage");
-    assert.deepEqual(Object.keys(modelUsage), ["gpt-5.6-sol"], "the child usage is charged to its own model, never the root's or dropped");
-    const child = rec(modelUsage["gpt-5.6-sol"]);
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6.1-sol"], "the child usage is charged to its own model, never the root's or dropped");
+    const child = rec(modelUsage["gpt-6.1-sol"]);
     assert.equal(child.inputTokens, 200, "the child's uncached input rode through the accountant");
     assert.equal(child.outputTokens, 100, "the child's output rode through the accountant");
-    // C4b: this run's binding is SUBSCRIPTION, so the child entry carries costStatus 'subscription'
-    // with no per-token dollar figure (updated from C4a's hard-coded 'unreported' — the marker the
-    // C4b milestone removes). The executor→accountant delegation wiring this test really pins
-    // (recordChildThreadModel) is unchanged; only the cost projection is.
-    assert.equal(child.costStatus, "subscription", "a subscription run's per-model entry is subscription");
-    assert.ok(!("costUSD" in child), "no costUSD on a subscription entry");
+    // Subscription child usage gets the same pinned API-equivalent estimate as API-key usage.
+    assert.equal(child.costStatus, "metered");
+    assert.equal(child.costUSD, 0.0014); // (200*2 + 100*10)/1e6
   });
 });
 
@@ -4625,6 +4832,56 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
   });
 });
 
+describe("CodexExecutor: m1 response usage", () => {
+  it("emits exactly two lead responses and one child response through ctx.emit before the first terminal", async () => {
+    const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
+    const total = { inputTokens: 200, cachedInputTokens: 60, cacheWriteInputTokens: 40, outputTokens: 80, totalTokens: 280 };
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(tokenUsageUpdated("th-child", "tn-child", last))
+          .push(turnCompleted("completed", "th-child", "tn-child"))
+          .push(signalDone())
+          .push(turnCompleted("completed"));
+        return { turn: { id: "tn-child" } };
+      }
+      return defaultResponder(c);
+    } });
+    rig.transport
+      .push(tokenUsageUpdated("th-1", "tn-1", last))
+      .push(tokenUsageUpdated("th-1", "tn-1", total, last))
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help", description: "[m1] usage" }, "th-1", "tn-1", "m1-child"));
+    const { ctx, emitted } = makeCtx({ agents: [
+      { name: "lead", description: "lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-5.6-sol", tools: null, skills: [] },
+    ] });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "m1 usage emission");
+    const usage = emitted.filter(m => m.payload.event === "codex_response_usage");
+    assert.equal(usage.length, 3, "the executor stops at its first terminal; every adopted response must already be emitted");
+    assert.equal(new Set(usage.map(m => m.payload.usage_response_id)).size, 3);
+    assert.deepEqual(usage.map(m => [m.agent, m.payload.model]), [
+      ["lead", provider.model], ["lead", provider.model], ["coder", "gpt-5.6-sol"],
+    ]);
+    for (const m of usage) {
+      assert.equal(m.kind, "status");
+      assert.match(String(m.payload.usage_response_id), /^[0-9a-f-]{36}$/);
+      assert.deepEqual(m.payload.usage, {
+        input_tokens: 50, cache_read_input_tokens: 30, cache_creation_input_tokens: 20, output_tokens: 40,
+      });
+    }
+    const dispatch = emitted.find(m => m.kind === "tool_use" && m.payload.name === "Agent");
+    assert.ok(dispatch);
+    assert.equal(usage[2]!.agentInstance, dispatch.payload.id);
+    assert.equal(usage[2]!.agentLabel, "[m1] usage");
+    const terminal = emitted.find(m => m.payload.event === "result");
+    assert.ok(terminal);
+    for (const m of usage) assert.ok(emitted.indexOf(m) < emitted.indexOf(terminal));
+    assert.equal(rig.transport.turnStartCount, 2, "one root turn and one child turn");
+  });
+});
+
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
   it("forwards the claim's medium and explicit effort to the actual turn/start wire field", async () => {
     for (const effort of ["medium", "xhigh"] as const) {
@@ -4640,13 +4897,7 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 
   it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
-    // The seam under test is codex-executor.ts's `authMode: binding.authMode` into new CodexHarness:
-    // the RUN's credential mode selects the terminal cost semantics in the token accountant.
-    // Harness-level cost tests pass authMode DIRECTLY (bypassing this wiring), and the only existing
-    // executor costStatus test drives a SUBSCRIPTION binding — so nothing exercises the api_key
-    // metered path THROUGH the real executor. Hardcoding authMode:"subscription" at that call site
-    // passes every other executor test; this pins it end-to-end: an api_key run's per-model entry
-    // must be `metered` with a real costUSD, never `subscription`.
+    // Exercise API-equivalent pricing through the executor's API-key binding.
     const rig = makeRig();
     // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6.1-sol")
     // with priceable buckets: input 1000 (cached 600, cacheWrite 100 → uncached 300), output 200
@@ -4668,9 +4919,8 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     assert.equal(sol61.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
     assert.equal(sol61.outputTokens, 200, "output rode through the accountant");
     // C4b: the api_key binding threads through `authMode: binding.authMode` so the entry is METERED
-    // with the summed Standard price, NOT subscription. If line ~1413 is hardcoded to
-    // "subscription", this becomes costStatus:'subscription' with no costUSD and both asserts fail.
-    assert.equal(sol61.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
+    // The pinned Standard table estimates this reconciled usage under either credential mode.
+    assert.equal(sol61.costStatus, "metered");
     // 300*2 + 600*0.1 + 100*2.5 + 200*10 = 2910 µ$. Reasoning (50) is a subset of output, never re-added.
     assert.equal(Math.round((sol61.costUSD as number) * 1e6), 2910, "the exact summed Standard price in microdollars");
   });
@@ -4811,7 +5061,8 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       150,
       "the claim-leg accountant reports the claim cumulative (150), NOT the resumed epoch's own delta (50)",
     );
-    assert.equal(astra.costStatus, "subscription", "a subscription run's per-model entry is subscription");
+    assert.equal(astra.costStatus, "metered", "subscription usage is API-equivalent");
+    assert.equal(astra.costUSD, 0.0015);
   });
 
   it("emits one init for the executor claim even if an internal resumed epoch reports thread/started", async () => {
@@ -7576,16 +7827,17 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
 
   describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
 describe("production advice data teardown (#2324)", () => {
-  it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async () => {
+  it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async (t) => {
     const { runnerTeardownFixture, uidScript, seedRunnerRacedTree } = await import("./runner-teardown-fixtures.js");
     const { startSwapRacer } = await import("./swap-racer.js");
     const { assertOutsideFiles } = await import("./residual-fixtures.js");
-    await runnerTeardownFixture(async (root, victim) => {
-      const { logger } = recordingLogger();
+    await runnerTeardownFixture(async (root, victim, diagnostic) => {
+      const { logger, lines } = recordingLogger();
       const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      await diagnostic.watch(owned, handle.cwd, lines);
       // A sibling runner can make its own root listable by the worker. This fixture
       // exposes the path-walk race rather than stopping at the baseline's private-root leak.
       uidScript(runnerCommand, "require('node:fs').chmodSync(process.argv[1],0o2770)", owned);
@@ -7602,6 +7854,7 @@ describe("production advice data teardown (#2324)", () => {
       syncBuiltinESMExports();
       let swaps = 0;
       try { await handle.dispose(); }
+      catch (error) { await diagnostic.failure(error); throw error; }
       finally {
         swaps = await racer.stop();
         preflight.mock.restore();
@@ -7609,14 +7862,14 @@ describe("production advice data teardown (#2324)", () => {
         await handle.dispose().catch(() => undefined);
       }
       await assertOutsideFiles(victim, swaps);
-    });
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("unclean advice disposal retains runner data after the supervisor is killed", async () => {
+  it("unclean advice disposal retains runner data after the supervisor is killed", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
     const { default: cp } = await import("node:child_process");
     const { syncBuiltinESMExports } = await import("node:module");
-    await runnerTeardownFixture(async (root) => {
+    await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
       const originalSpawn = cp.spawn.bind(cp);
       let supervisor: import("node:child_process").ChildProcess | undefined;
@@ -7626,13 +7879,23 @@ describe("production advice data teardown (#2324)", () => {
         if (args.some((arg) => arg.endsWith("/uzi-codex-supervisor"))) {
           supervisor = child;
           let pending = "";
+          let bytes = 0;
+          let frames = 0;
+          let stopped = false;
           (child.stdio[4] as import("node:stream").Readable).on("data", (chunk) => {
+            if (stopped) return;
+            bytes += Buffer.byteLength(chunk);
+            if (bytes > 65536) { stopped = true; pending = ""; return; }
             pending += String(chunk);
+            if (Buffer.byteLength(pending) > 8192) { stopped = true; pending = ""; return; }
             let end: number;
             while ((end = pending.indexOf("\n")) >= 0) {
-              const event = JSON.parse(pending.slice(0, end));
+              if (++frames > 64) { stopped = true; pending = ""; return; }
+              try {
+                const event = JSON.parse(pending.slice(0, end));
+                if (event.event === "started" && Number.isSafeInteger(event.childPid) && event.childPid > 0) providerPid = event.childPid;
+              } catch { /* No authority from malformed evidence. */ }
               pending = pending.slice(end + 1);
-              if (event.event === "started") providerPid = event.childPid;
             }
           });
         }
@@ -7645,6 +7908,7 @@ describe("production advice data teardown (#2324)", () => {
           kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
         });
         const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+        await diagnostic.watch(owned, handle.cwd, lines);
         assert.ok(supervisor?.pid && providerPid, "observe the exact supervisor and primary child this fixture launched");
         uidScript(runnerCommand, "require('node:fs').writeFileSync(process.argv[1]+'/forensic','retain')", owned);
         const exited = new Promise<void>((resolve) => supervisor!.once("exit", () => resolve()));
@@ -7656,7 +7920,7 @@ describe("production advice data teardown (#2324)", () => {
         uidScript(runnerCommand, "if(require('node:fs').readFileSync(process.argv[1]+'/forensic','utf8')!=='retain')process.exit(1)", owned);
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data retained: disposal was not confirmed clean"));
-      } finally {
+      } catch (error) { await diagnostic.failure(error); throw error; } finally {
         observe.mock.restore(); syncBuiltinESMExports();
         // Only this fixture's evidence-identified child is signalled. Settle its
         // stdout pipe before fixture tree disposal, even after a failed assertion.
@@ -7668,17 +7932,18 @@ describe("production advice data teardown (#2324)", () => {
         }
         await handle?.dispose().catch(() => undefined);
       }
-    });
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("ordinary advice ownedDataRoot removes private runner-only content without leaking", async () => {
+  it("ordinary advice ownedDataRoot removes private runner-only content without leaking", async (t) => {
     const { runnerTeardownFixture, writePrivateRunnerFile, assertGone } = await import("./runner-teardown-fixtures.js");
-    await runnerTeardownFixture(async (root) => {
+    await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
       const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      await diagnostic.watch(owned, handle.cwd, lines);
       // Exercise the executor fallback, rather than the launcher's earlier rm.
       const { default: syncFs } = await import("node:fs");
       const { syncBuiltinESMExports } = await import("node:module");
@@ -7693,61 +7958,76 @@ describe("production advice data teardown (#2324)", () => {
         await assertGone(owned);
         await assertGone(handle.cwd);
         assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
-      } finally {
+      } catch (error) { await diagnostic.failure(error); throw error; } finally {
         preflight.mock.restore(); syncBuiltinESMExports();
         await handle.dispose().catch(() => undefined);
       }
-    });
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice data owner refusal warns, retains content and still removes cwd", async () => {
-    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
-    await runnerTeardownFixture(async (root) => {
+  it("advice data owner refusal warns, retains content and still removes cwd", async (t) => {
+    const { runnerTeardownFixture, uidScript, assertGone, awaitAdviceProviderReady } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
       const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      await diagnostic.watch(owned, handle.cwd, lines);
       try {
+        await awaitAdviceProviderReady(handle.transport, diagnostic);
+        diagnostic.mark("mutation_start");
         uidScript(runnerCommand, "require('node:fs').renameSync(process.argv[1],process.argv[1]+'.retained')", owned);
+        diagnostic.mark("mutation_end");
         await fs.mkdir(owned);
         await fs.writeFile(path.join(owned, "keep"), "keep");
+        diagnostic.mark("dispose_start");
         await handle.dispose();
+        diagnostic.mark("dispose_end");
+        assert.equal(diagnostic.providerChildExitObserved(), false, "advice provider child exit observed");
         assert.equal(await fs.readFile(path.join(owned, "keep"), "utf8"), "keep");
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed" && /not owned/.test(String(rec(line).error))));
-      } finally { await handle.dispose().catch(() => undefined); }
-    });
+      } catch (error) { await diagnostic.failure(error); throw error; } finally { await handle.dispose().catch(() => undefined); }
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice data symlink refusal retains the link and outside content", async () => {
-    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
-    await runnerTeardownFixture(async (root, victim) => {
+  it("advice data symlink refusal retains the link and outside content", async (t) => {
+    const { runnerTeardownFixture, uidScript, assertGone, awaitAdviceProviderReady } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root, victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
       const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      await diagnostic.watch(owned, handle.cwd, lines);
       try {
+        await awaitAdviceProviderReady(handle.transport, diagnostic);
+        diagnostic.mark("mutation_start");
         uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.symlinkSync(process.argv[2],process.argv[1])", owned, victim);
+        diagnostic.mark("mutation_end");
         await fs.writeFile(path.join(victim, "keep"), "outside");
+        diagnostic.mark("dispose_start");
         await handle.dispose();
+        diagnostic.mark("dispose_end");
+        assert.equal(diagnostic.providerChildExitObserved(), false, "advice provider child exit observed");
         assert.ok((await fs.lstat(owned)).isSymbolicLink());
         assert.equal(await fs.readFile(path.join(victim, "keep"), "utf8"), "outside");
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"));
-      } finally { await handle.dispose().catch(() => undefined); }
-    });
+      } catch (error) { await diagnostic.failure(error); throw error; } finally { await handle.dispose().catch(() => undefined); }
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice data identity refusal retains both roots and still cleans cwd", async () => {
+  it("advice data identity refusal retains both roots and still cleans cwd", async (t) => {
     const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
-    await runnerTeardownFixture(async (root) => {
+    await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
       const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      await diagnostic.watch(owned, handle.cwd, lines);
       const { default: syncFs } = await import("node:fs");
       const { syncBuiltinESMExports } = await import("node:module");
       const originalLstat = syncFs.lstatSync.bind(syncFs);
@@ -7771,34 +8051,41 @@ describe("production advice data teardown (#2324)", () => {
         uidScript(runnerCommand, "const fs=require('node:fs');if(fs.readFileSync(process.argv[1]+'/planted','utf8')!=='keep'||!fs.existsSync(process.argv[1]+'.retained/codex/config.toml'))process.exit(1)", owned);
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"));
-      } finally {
+      } catch (error) { await diagnostic.failure(error); throw error; } finally {
         pin.mock.restore(); preflight.mock.restore(); syncBuiltinESMExports();
         await handle.dispose().catch(() => undefined);
       }
-    });
+    }, true, (line) => t.diagnostic(line));
   });
 
-  it("advice disposal single-uid removes the actual worker-owned data root", async () => {
-    const { runnerTeardownFixture, uidScript, assertGone } = await import("./runner-teardown-fixtures.js");
-    await runnerTeardownFixture(async (root) => {
+  it("advice disposal single-uid removes the actual worker-owned data root", async (t) => {
+    const { runnerTeardownFixture, uidScript, assertGone, awaitAdviceProviderReady } = await import("./runner-teardown-fixtures.js");
+    await runnerTeardownFixture(async (root, _victim, diagnostic) => {
       const { logger, lines } = recordingLogger();
       const handle = await makeProductionLaunchAdviceRoot(root, "api_key", logger)({
         kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
       });
       const owned = path.join(root, "codex-advice-data", path.basename(handle.cwd));
+      await diagnostic.watch(owned, handle.cwd, lines);
       try {
+        await awaitAdviceProviderReady(handle.transport, diagnostic);
+        diagnostic.mark("mutation_start");
         uidScript(runnerCommand, "require('node:fs').renameSync(process.argv[1],process.argv[1]+'.retained')", owned);
+        diagnostic.mark("mutation_end");
         // The launcher requires the split. Exercise its actual disposal closure with
         // a single-uid ownership fixture, then restore split before fixture disposal.
         await fs.mkdir(owned);
         await fs.writeFile(path.join(owned, "file"), "remove");
         delete process.env.UZI_UID_SPLIT;
+        diagnostic.mark("dispose_start");
         await handle.dispose();
+        diagnostic.mark("dispose_end");
+        assert.equal(diagnostic.providerChildExitObserved(), false, "advice provider child exit observed");
         await assertGone(owned);
         await assertGone(handle.cwd);
         assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);
-      } finally { process.env.UZI_UID_SPLIT = "1"; await handle.dispose().catch(() => undefined); }
-    });
+      } catch (error) { await diagnostic.failure(error); throw error; } finally { process.env.UZI_UID_SPLIT = "1"; await handle.dispose().catch(() => undefined); }
+    }, true, (line) => t.diagnostic(line));
   });
 });
 
@@ -12201,6 +12488,57 @@ function vaultLocked409(route: "refresh" | "release"): RequestError {
     JSON.stringify({ error: "codex credential vault is locked; retry after unlock", reason: "vault_locked", leak: FRESH_TOKEN }),
   );
 }
+
+describe("W2/W10 account boundary reconcile and unchanged bridge", () => {
+  const refusal = () => new RequestError("POST", "/x", 409, JSON.stringify({
+    error: "private-account-body", reason: "codex_account_unavailable",
+  }));
+  for (const ambiguous of [false, true]) {
+    it(`W2: typed account refusal terminates immediately; frozen tuple survives (ambiguous=${ambiguous})`, async () => {
+      const requests: unknown[] = [];
+      const client = { refreshCodex: async (_id: string, request: unknown) => {
+        requests.push(request);
+        if (ambiguous && requests.length === 1) throw new RequestError("POST", "/x", 500, "private-body");
+        throw refusal();
+      }};
+      const committed = { value: 3 };
+      const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION),
+        () => assert.fail("no credential"), committed);
+      const first = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(first.kind === "blocked" && first.deferral, "account_unavailable");
+      assert.equal(requests.length, ambiguous ? 2 : 1);
+      committed.value = 99;
+      const second = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+      assert.equal(second.kind === "blocked" && second.deferral, "account_unavailable");
+      assert.equal(requests.length, ambiguous ? 3 : 2);
+      for (const request of requests) assert.deepEqual(request, requests[0]);
+      assert.doesNotMatch(JSON.stringify(first), /private-account-body/);
+    });
+  }
+  it("W2: lifecycle abort accompanying typed refusal wins", async () => {
+    const lifecycle = new AbortController();
+    let calls = 0;
+    const client = { refreshCodex: async () => { calls++; lifecycle.abort(); throw refusal(); }};
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION),
+      () => assert.fail("no credential"), { value: 3 }, undefined, lifecycle.signal);
+    const outcome = await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+    assert.equal(outcome.kind === "blocked" && outcome.deferral, undefined);
+    assert.equal(calls, 1);
+  });
+  it("W10: account refusal preserves original RequestError without latch/callback or suppressing following API call", async () => {
+    const error = refusal();
+    let calls = 0;
+    let callbacks = 0;
+    const client = { refreshCodex: async () => { calls++; throw error; }};
+    const bridge = buildAppServerRefreshBridge("run-1", client as never, bindingOf(SUBSCRIPTION),
+      { value: 3 }, () => assert.fail("no credential"), () => { callbacks++; });
+    const operation = { operationId: "account-bridge-op", signal: RECONCILE_SIGNAL };
+    await assert.rejects(bridge.refresh(operation), (caught) => caught === error);
+    await assert.rejects(bridge.refresh({ ...operation, operationId: "following-op" }), (caught) => caught === error);
+    assert.equal(calls, 2);
+    assert.equal(callbacks, 0);
+  });
+});
 
 describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
   it("buildRunLaneReconcile: a 409 vault_locked refresh → blocked + deferral, secret-free", async () => {

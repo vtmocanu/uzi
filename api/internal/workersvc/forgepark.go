@@ -29,11 +29,12 @@ import (
 // volume filled; SetState routes it to its own park transaction (parkDataVolumeFull), which stores
 // the cause and counts it toward the disk-only lifetime cap (UZI_RUN_DISK_PARK_MAX).
 var recoveryWaitCauses = map[string]bool{
-	"forge_unreachable":         true,
-	"empty_turn":                true,
-	"provider_outage":           true,
-	recoveryCauseVaultLocked:    true,
-	recoveryCauseDataVolumeFull: true,
+	"forge_unreachable":                  true,
+	"empty_turn":                         true,
+	"provider_outage":                    true,
+	recoveryCauseVaultLocked:             true,
+	recoveryCauseDataVolumeFull:          true,
+	recoveryCauseCodexAccountUnavailable: true,
 }
 
 // recoveryCauseVaultLocked is the issue #1766 cause for a run parked because its owner's vault
@@ -49,14 +50,12 @@ const recoveryCauseDataVolumeFull = "data_volume_full"
 // quarantined subscription account or a same-alias re-login (D1/D2).
 const recoveryCauseCodexAccountUnavailable = "codex_account_unavailable"
 
-// serverRecoveryWaitCauses are the recovery_wait causes only the SERVER writes, kept apart
-// from the worker-reportable recoveryWaitCauses above. codex_account_unavailable is written
-// by finishRunClaim's exact-claim park (ParkRunCodexAccountUnavailable), never by a worker:
-// SetState refuses it as a reported cause. Together the two sets are exactly
-// runs_recovery_wait_cause_check (pinned by TestRecoveryWaitCauseVocabularyMatchesCheck).
+// serverRecoveryWaitCauses contains causes a worker cannot request.
+// codex_account_unavailable is worker-requested only with CodexAccountParkV1,
+// and is never written on the worker's word: the server re-derives it under lock.
+// Together these sets partition runs_recovery_wait_cause_check.
 var serverRecoveryWaitCauses = map[string]bool{
-	recoveryCauseCodexAccountUnavailable: true,
-	"worker_requeue_exhausted":           true,
+	"worker_requeue_exhausted": true,
 }
 
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).

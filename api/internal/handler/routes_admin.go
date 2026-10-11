@@ -6,6 +6,7 @@ package handler
 
 import (
 	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
@@ -40,7 +41,9 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Get("/slack/status", h.GetAdminSlackStatus)
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
-			r.Get("/runs", h.AdminListRuns)
+			// gzip: the all-users active run list is large, key-repetitive JSON (same
+			// reasoning as the owner /runs list in handler.go); transparent to clients.
+			r.With(chimw.Compress(5)).Get("/runs", h.AdminListRuns)
 			// Admin "All users" judge aggregate reads (PRD #1184 M1): every user's judge
 			// recommendations deduped by (category, target) with attribution hidden, plus the
 			// cross-user triage strip and filter-chip counts. Separate handlers calling distinct

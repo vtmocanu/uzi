@@ -465,8 +465,22 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			slog.Error("current activity", "run_id", run.ID, "error", err)
 		} else {
 			dto.CurrentActivity = activity[run.ID]
+			setProgressPhase(&dto)
 		}
 	}
+	// PRD #2602: the "may be blocked by" hint, GetRun only (a list read never runs it).
+	// Best-effort: an error is logged and the field stays absent. Owner scoping lives in
+	// MaybeBlockedByRun (the run's owner, not this viewer).
+	if dto.Progress != nil {
+		if blocker, err := h.wsvc.MaybeBlockedByRun(r.Context(), run); err != nil {
+			slog.Error("maybe blocked by run", "run_id", run.ID, "error", err)
+		} else if blocker != nil {
+			id := blocker.String()
+			dto.Progress.MaybeBlockedByRunID = &id
+		}
+	}
+	// PRD #2603: the model-written Now line, GetRun only (a list read never runs it). Best-effort.
+	h.overlayNowNote(r.Context(), run, &dto)
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)
@@ -897,6 +911,11 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 				"reason":                "gate_revision_mismatch",
 				"current_gate_revision": mismatch.Current,
 			})
+		case errors.Is(err, workersvc.ErrApprovalMilestonesMoved):
+			// Issue #2680: an unbound approve kept racing a republished milestone list (or the run
+			// left the plan gate while it retried). Nothing was written; distinct from
+			// gate_revision_mismatch, which names a revision the client sent.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "approval_milestones_moved")
 		case errors.Is(err, workersvc.ErrExpectedGateRevisionNotApplicable):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrRunNotFound):

@@ -37,6 +37,12 @@ type currentActivityJSON struct {
 	Seq        int32  `json:"seq"`
 }
 
+// progressJSON is the decode target for a RunDTO's progress object (PRD #2602).
+type progressJSON struct {
+	State string `json:"state"`
+	Phase string `json:"phase"`
+}
+
 // TestCurrentActivityDTO exercises PRD #1064 M2's current_activity population glue — the
 // wiring runToDTO deliberately does NOT do (it stays pure), set instead in the handler's
 // list builders and the GET path from the batched LatestToolUseForRuns lookup. It asserts
@@ -88,14 +94,32 @@ func TestCurrentActivityDTO(t *testing.T) {
 			Runs []struct {
 				ID              string               `json:"id"`
 				CurrentActivity *currentActivityJSON `json:"current_activity"`
+				Progress        *progressJSON        `json:"progress"`
 			} `json:"runs"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode body: %v", err)
 		}
 		byID := make(map[string]*currentActivityJSON, len(body.Runs))
+		progByID := make(map[string]*progressJSON, len(body.Runs))
 		for _, r := range body.Runs {
 			byID[r.ID] = r.CurrentActivity
+			progByID[r.ID] = r.Progress
+		}
+
+		// PRD #2602: progress.phase follows the activity role; absent without activity;
+		// a terminal run has no progress at all.
+		if p := progByID[runRead.String()]; p == nil || p.Phase != "implement" {
+			t.Errorf("runRead (coder) progress = %+v, want phase implement", p)
+		}
+		if p := progByID[runAgent.String()]; p == nil || p.Phase != "review" {
+			t.Errorf("runAgent (reviewer) progress = %+v, want phase review", p)
+		}
+		if p := progByID[runNoActivity.String()]; p == nil || p.State != "queued" || p.Phase != "" {
+			t.Errorf("runNoActivity progress = %+v, want state queued with empty phase", p)
+		}
+		if p := progByID[runTerminal.String()]; p != nil {
+			t.Errorf("terminal run progress = %+v, want null", p)
 		}
 
 		// runRead: a Read tool_use → Tool "Read", Detail the file_path, frame agent verbatim.
@@ -137,6 +161,45 @@ func TestCurrentActivityDTO(t *testing.T) {
 		}
 	})
 
+	// PRD #2602 / issue #2642: AdminListRuns sets progress.phase the same way ListRuns does.
+	t.Run("admin list builder: progress.phase follows the activity role", func(t *testing.T) {
+		admin := store.User{ID: uuid.New()}
+		runReview := uuid.New()
+		st := &runsStore{
+			activeRuns: []store.ListActiveRunsAllRow{
+				{Run: store.Run{ID: runReview, Kind: "issue", Status: "running"}},
+			},
+			latestToolUseRows: []store.LatestToolUseForRunsRow{
+				toolUseRow(runReview, 5, "reviewer", "review the diff",
+					`{"name":"Read","input":{"file_path":"api/internal/handler/runs.go"}}`),
+			},
+		}
+		h := newRunsHandler(t, st)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/runs", nil)
+		h.AdminListRuns(rec, req.WithContext(mw.ContextWithUser(req.Context(), admin)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("AdminListRuns = %d, want 200", rec.Code)
+		}
+
+		var body struct {
+			Runs []struct {
+				ID       string        `json:"id"`
+				Progress *progressJSON `json:"progress"`
+			} `json:"runs"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if len(body.Runs) != 1 || body.Runs[0].ID != runReview.String() {
+			t.Fatalf("AdminListRuns runs = %+v, want the one running run", body.Runs)
+		}
+		if p := body.Runs[0].Progress; p == nil || p.Phase != "review" {
+			t.Errorf("admin run (reviewer) progress = %+v, want phase review", p)
+		}
+	})
+
 	t.Run("get path: populates a non-terminal run's now line", func(t *testing.T) {
 		owner := store.User{ID: uuid.New()}
 		st := &runsStore{
@@ -154,10 +217,14 @@ func TestCurrentActivityDTO(t *testing.T) {
 		var body struct {
 			Run struct {
 				CurrentActivity *currentActivityJSON `json:"current_activity"`
+				Progress        *progressJSON        `json:"progress"`
 			} `json:"run"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode body: %v", err)
+		}
+		if p := body.Run.Progress; p == nil || p.Phase != "implement" {
+			t.Errorf("GetRun progress = %+v, want phase implement from the coder frame", p)
 		}
 		act := body.Run.CurrentActivity
 		if act == nil {

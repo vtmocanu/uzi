@@ -674,7 +674,7 @@ export class ExecutionRegistry {
   }
 
   /**
-   * Issue #1766: drain this epoch for a CREDENTIAL-FREE capture after a vault_locked or refresh_unknown deferral.
+   * Issue #1766: drain this epoch for a CREDENTIAL-FREE capture after a vault_locked, refresh_unknown or account_unavailable deferral.
    *
    * A registry `disposeTools` has run on answers `incomplete` at once, whether the disposal
    * succeeded ("disposed") or failed (left "poisoned"): it cleared the callback and launch

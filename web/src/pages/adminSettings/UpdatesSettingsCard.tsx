@@ -192,12 +192,14 @@ export function UpdatesSettingsCard() {
           {status.status === "error" && (
             <Alert
               tone="warning"
-              message={`Release check unavailable${status.message ? ` — ${status.message}` : " — the last check failed (rate-limited or unreachable)."}`}
+              message={status.partial === true
+                ? `Stable release updated, but RC check failed${status.message ? ` — ${status.message}` : "."}`
+                : `Release check unavailable${status.message ? ` — ${status.message}` : " — the last check failed (rate-limited or unreachable)."}`}
             />
           )}
 
           {/* Version delta — always shows the running version; the arrow + latest when a check ran. */}
-          {status.status === "ok" && (
+          {(status.status === "ok" || (status.status === "error" && status.partial === true)) && (
             <div className="space-y-3 rounded-xl border border-edge bg-raised/40 p-4">
               <div className="flex flex-wrap items-center gap-3">
                 <span className="font-mono text-xl font-semibold text-fg">

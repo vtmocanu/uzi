@@ -340,6 +340,15 @@ export const mockLaneRuns: Run[] = [
     branch: "agent/issue-99",
     status: "running",
     health: "ok",
+    // PRD #2602: two of three milestones done, the third in progress, so the mock's board
+    // shows the PRD's acceptance example 1 (`70%`); store.ts derives `progress` from this.
+    milestones: [
+      { id: "lanes-1", title: "Split the parser lane" },
+      { id: "lanes-2", title: "Split the renderer lane" },
+      { id: "lanes-3", title: "Merge the two lanes' results" },
+    ],
+    milestones_completed: ["lanes-1", "lanes-2"],
+    milestones_in_progress: ["lanes-3"],
   }),
   demoIssueRun({
     id: "run-busy",
@@ -404,6 +413,9 @@ export const mockLaneRuns: Run[] = [
     branch: "agent/issue-237",
     status: "running",
     health: "ok",
+    // Mid-first-turn with no persisted plan: the server derives is_planning, so the board's
+    // progress cell reads `planning` (PRD #2602) and the status pill reads "planning".
+    is_planning: true,
   }),
 ];
 

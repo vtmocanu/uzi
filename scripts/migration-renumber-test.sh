@@ -17,6 +17,9 @@
 #   E. a binary file in the branch diff is skipped with a notice (not scanned, not
 #      touched), and a non-UTF-8 text file is still scanned (issue 1581).
 #   F. a reference-scan failure refuses BEFORE any rename, leaving the tree unchanged.
+#   G. a colliding draft number rewrites only the branch filename/stem identity, leaving
+#      main identities and ambiguous references unchanged and reporting them for review.
+#   H. unresolved comments alone trigger the manual-review report and summary.
 #
 # 🔴 100% OFFLINE AND HERMETIC. Every git repo is built under `mktemp -d`; the "remote" is
 # a LOCAL bare repo (`git init --bare`), so the helper's `git fetch origin main` is a local
@@ -224,6 +227,68 @@ EOF
 }
 
 # =============================================================================
+echo "=== G. identity collision through public main entry ==="
+# =============================================================================
+CG="$ROOT/caseG"; build_base "$CG"; RG="$CG/repo"
+git -C "$RG" checkout -q main
+mk_goose "$RG/$MIGDIR/00260_main_change.sql" "main identity"
+git -C "$RG" add -- "$MIGDIR/00260_main_change.sql"
+git -C "$RG" commit -q -m "main: migration 260"
+git -C "$RG" push -q origin main
+git -C "$RG" checkout -q feature
+git -C "$RG" merge -q --ff-only main
+wf "$RG/$MIGDIR/00260_branch_change.sql" <<'SQL'
+-- +goose Up
+-- Branch: 00260_branch_change.sql, 00260_branch_change; api/internal/store/migrations/00260_branch_change.sql.
+-- Punctuation: (00260_branch_change.sql), [00260_branch_change]; 00260_branch_change.
+-- Main: 00260_main_change.sql and 00260_main_change; bare 00260.
+-- Ambiguous: 00260_branch_change.sql.bak, 00260_branch_change_extra, x00260_branch_change.
+SELECT '00260_branch_change.sql', 00260;
+-- +goose Down
+SELECT 1;
+SQL
+wf "$CG/expected.sql" <<'SQL'
+-- +goose Up
+-- Branch: 00261_branch_change.sql, 00261_branch_change; api/internal/store/migrations/00261_branch_change.sql.
+-- Punctuation: (00261_branch_change.sql), [00261_branch_change]; 00261_branch_change.
+-- Main: 00260_main_change.sql and 00260_main_change; bare 00260.
+-- Ambiguous: 00260_branch_change.sql.bak, 00260_branch_change_extra, x00260_branch_change.
+SELECT '00260_branch_change.sql', 00260;
+-- +goose Down
+SELECT 1;
+SQL
+git -C "$RG" add -- "$MIGDIR/00260_branch_change.sql"
+git -C "$RG" commit -q -m "branch: colliding identity"
+cp "$RG/$MIGDIR/00260_main_change.sql" "$CG/main-before.sql"
+G_BODY="$(body_lines "$RG/$MIGDIR/00260_branch_change.sql")"
+G_OUT="$( ( cd "$RG" && sh "$HELPER" ) 2>&1 )"; G_RC=$?
+G_NEW="$RG/$MIGDIR/00261_branch_change.sql"
+assert_eq "G: public collision entry succeeds" "0" "$G_RC"
+if cmp -s "$CG/expected.sql" "$G_NEW"; then pass "G: mixed identity whole-file comparison"; else fail "G: mixed identity whole-file comparison"; fi
+assert_contains "G: main slug and bare number unchanged" "-- Main: 00260_main_change.sql and 00260_main_change; bare 00260." "$(cat "$G_NEW")"
+assert_contains "G: ambiguous boundaries unchanged" "-- Ambiguous: 00260_branch_change.sql.bak, 00260_branch_change_extra, x00260_branch_change." "$(cat "$G_NEW")"
+assert_eq "G: body line content unchanged" "$G_BODY" "$(body_lines "$G_NEW")"
+assert_contains "G: unresolved comment path and line" "$MIGDIR/00261_branch_change.sql:4" "$G_OUT"
+assert_contains "G: ambiguous comment path and line" "$MIGDIR/00261_branch_change.sql:5" "$G_OUT"
+assert_contains "G: ambiguous comment content" "-- Ambiguous: 00260_branch_change.sql.bak, 00260_branch_change_extra, x00260_branch_change." "$G_OUT"
+assert_contains "G: unresolved comment content" "-- Main: 00260_main_change.sql and 00260_main_change; bare 00260." "$G_OUT"
+assert_contains "G: ambiguous-only summary requires manual review" "manual" "$G_OUT"
+if cmp -s "$CG/main-before.sql" "$RG/$MIGDIR/00260_main_change.sql"; then pass "G: main file byte-identical"; else fail "G: main file byte-identical"; fi
+
+# No identity cross-reference and no other-file hit: the unresolved comment alone
+# must still appear in postflight and make the final summary request manual review.
+CH="$ROOT/caseH"; build_base "$CH"; RH="$CH/repo"
+mk_goose "$RH/$MIGDIR/00230_ambiguous.sql" "bare draft 00230; main 00230_run_branch_moved.sql"
+git -C "$RH" add -- "$MIGDIR/00230_ambiguous.sql"
+git -C "$RH" commit -q -m "branch: ambiguous references only"
+cp "$RH/$MIGDIR/00230_ambiguous.sql" "$CH/expected.sql"
+H_OUT="$( ( cd "$RH" && sh "$HELPER" ) 2>&1 )"; H_RC=$?
+assert_eq "H: ambiguous-only renumber exits 0" "0" "$H_RC"
+if cmp -s "$CH/expected.sql" "$RH/$MIGDIR/00232_ambiguous.sql"; then pass "H: unresolved references unchanged"; else fail "H: unresolved references unchanged"; fi
+assert_contains "H: unresolved path/line/content reported" "$MIGDIR/00232_ambiguous.sql:2  | -- bare draft 00230; main 00230_run_branch_moved.sql" "$H_OUT"
+assert_contains "H: summary requests manual review without other-file hits" "auto-edited and still need manual review" "$H_OUT"
+
+# =============================================================================
 echo "=== A. --rewrite-comments unit (simultaneous comment remap; body untouched) ==="
 # =============================================================================
 CASE_A="$ROOT/caseA"
@@ -236,7 +301,8 @@ MAP="$CASE_A/map.txt"
 # map-key literal (00231) and a 6-digit literal (100232) that MUST survive byte-identical.
 wf "$FIX" <<'SQL'
 -- +goose Up
--- Pair header: this migration 00231 validates the constraint that base migration 00232 adds.
+-- Pair header: this migration 00231_pair validates the constraint that base migration 00232_validate_forge adds.
+-- Bare numbers 00231/00232 and other slug 00231_other remain unresolved.
 -- Its own validate companion step is 00232_validate_forge (a sibling draft).
 CREATE TABLE demo (id bigint, code integer);
 INSERT INTO demo (id, code) VALUES (1, 00231);
@@ -244,24 +310,124 @@ INSERT INTO demo (id, code) VALUES (2, 100232);
 -- +goose Down
 DROP TABLE demo;
 SQL
-wf "$MAP" <<'MAP'
-00231 00232
-00232 00233
-MAP
+printf '00231\t00232\t00231_pair.sql\n00232\t00233\t00232_validate_forge.sql\n' > "$MAP"
 BODY_BEFORE="$(body_lines "$FIX")"
 A_OUT="$( sh "$HELPER" --rewrite-comments "$MAP" "$FIX" 2>&1 )"
 A_RC=$?
 : "$A_OUT"
 assert_eq "A: --rewrite-comments exits 0" "0" "$A_RC"
 A_AFTER="$(cat "$FIX")"
-assert_contains "A: comment 00231 -> 00232"                 "this migration 00232 validates"  "$A_AFTER"
-assert_contains "A: comment 00232 -> 00233"                 "base migration 00233 adds"       "$A_AFTER"
+wf "$CASE_A/expected.sql" <<'SQL'
+-- +goose Up
+-- Pair header: this migration 00232_pair validates the constraint that base migration 00233_validate_forge adds.
+-- Bare numbers 00231/00232 and other slug 00231_other remain unresolved.
+-- Its own validate companion step is 00233_validate_forge (a sibling draft).
+CREATE TABLE demo (id bigint, code integer);
+INSERT INTO demo (id, code) VALUES (1, 00231);
+INSERT INTO demo (id, code) VALUES (2, 100232);
+-- +goose Down
+DROP TABLE demo;
+SQL
+if cmp -s "$CASE_A/expected.sql" "$FIX"; then pass "A: mixed overlapping references whole-file comparison"; else fail "A: mixed overlapping references whole-file comparison"; fi
+assert_contains "A: comment 00231 -> 00232"                 "this migration 00232_pair validates"  "$A_AFTER"
+assert_contains "A: comment 00232 -> 00233"                 "base migration 00233_validate_forge adds"       "$A_AFTER"
 assert_contains "A: aliased 00232 companion -> 00233"       "00233_validate_forge"            "$A_AFTER"
-assert_absent   "A: no double-substitution of 00231->00233" "this migration 00233"            "$A_AFTER"
+assert_absent   "A: no double-substitution of 00231->00233" "this migration 00233_pair"            "$A_AFTER"
 BODY_AFTER="$(body_lines "$FIX")"
 assert_eq       "A: NO SQL body line changed"               "$BODY_BEFORE"                    "$BODY_AFTER"
 assert_contains "A: body 5-digit map-key literal preserved" "VALUES (1, 00231);"              "$BODY_AFTER"
 assert_contains "A: body 6-digit literal preserved"         "VALUES (2, 100232);"             "$BODY_AFTER"
+
+# A dotted slug is a basename too; validation must not invent an alphanumeric-only
+# restriction beyond the existing migration-name contract.
+printf '00231\t00232\t00231_pair.v2.sql\n' > "$CASE_A/dotted-map.txt"
+printf '%s\n' '-- See 00231_pair.v2.sql and 00231_pair.v2.' 'SELECT 00231;' > "$CASE_A/dotted.sql"
+printf '%s\n' '-- See 00232_pair.v2.sql and 00232_pair.v2.' 'SELECT 00231;' > "$CASE_A/dotted-expected.sql"
+DOTTED_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/dotted-map.txt" "$CASE_A/dotted.sql" 2>&1)"
+DOTTED_RC=$?
+assert_eq "A: path-free dotted basename accepted" "0" "$DOTTED_RC"
+if cmp -s "$CASE_A/dotted-expected.sql" "$CASE_A/dotted.sql"; then pass "A: dotted filename/stem identities rewritten"; else fail "A: dotted filename/stem identities rewritten: $DOTTED_OUT"; fi
+
+# A-dot-tail: longer dotted identities must stay unchanged and be reported, even
+# when the character after the dot is a hyphen or underscore.
+printf '00231\t00233\t00231_pair.sql\n' > "$CASE_A/dot-tail-map.txt"
+wf "$CASE_A/dot-tail.sql" <<'SQL'
+-- See 00231_pair.-other.sql
+-- See 00231_pair._other.sql
+-- See 00231_pair.sql.-other.sql
+-- See 00231_pair.sql._other.sql
+SELECT '00231_pair.-other.sql';
+SQL
+cp "$CASE_A/dot-tail.sql" "$CASE_A/dot-tail-expected.sql"
+DOT_TAIL_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/dot-tail-map.txt" "$CASE_A/dot-tail.sql" 2>&1)"
+DOT_TAIL_RC=$?
+assert_eq "A-dot-tail: rewrite succeeds" "0" "$DOT_TAIL_RC"
+if cmp -s "$CASE_A/dot-tail-expected.sql" "$CASE_A/dot-tail.sql"; then pass "A-dot-tail: longer dotted identities whole-file comparison"; else fail "A-dot-tail: longer dotted identities whole-file comparison"; fi
+DOT_TAIL_EXPECTED="$(printf '%s:1\t%s\n%s:2\t%s\n%s:3\t%s\n%s:4\t%s\n' "$CASE_A/dot-tail.sql" '-- See 00231_pair.-other.sql' "$CASE_A/dot-tail.sql" '-- See 00231_pair._other.sql' "$CASE_A/dot-tail.sql" '-- See 00231_pair.sql.-other.sql' "$CASE_A/dot-tail.sql" '-- See 00231_pair.sql._other.sql')"
+assert_eq "A-dot-tail: unresolved path/line/content diagnostics" "$DOT_TAIL_EXPECTED" "$DOT_TAIL_OUT"
+
+# A-atomic-dotted: consume the whole matched identity so a mapped number inside
+# its slug is preserved, for both full basename and extensionless stem.
+printf '00231\t00233\t00231_x.00232_y.sql\n00232\t00234\t00232_y.sql\n' > "$CASE_A/atomic-dotted-map.txt"
+wf "$CASE_A/atomic-dotted.sql" <<'SQL'
+-- See 00231_x.00232_y.sql
+-- See 00231_x.00232_y.
+-- Path: api/internal/store/migrations/00231_x.00232_y.sql, (00232_y).
+SELECT '00231_x.00232_y.sql';
+SQL
+wf "$CASE_A/atomic-dotted-expected.sql" <<'SQL'
+-- See 00233_x.00232_y.sql
+-- See 00233_x.00232_y.
+-- Path: api/internal/store/migrations/00233_x.00232_y.sql, (00234_y).
+SELECT '00231_x.00232_y.sql';
+SQL
+ATOMIC_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/atomic-dotted-map.txt" "$CASE_A/atomic-dotted.sql" 2>&1)"
+ATOMIC_RC=$?
+assert_eq "A-atomic-dotted: rewrite succeeds" "0" "$ATOMIC_RC"
+if cmp -s "$CASE_A/atomic-dotted-expected.sql" "$CASE_A/atomic-dotted.sql"; then pass "A-atomic-dotted: filename/stem whole-file comparison"; else fail "A-atomic-dotted: filename/stem whole-file comparison"; fi
+assert_eq "A-atomic-dotted: no internal-number diagnostic" "" "$ATOMIC_OUT"
+
+# A-dot-left-boundary: the suffix of an unknown dotted filename or stem is not
+# a standalone mapped identity.
+wf "$CASE_A/dot-left.sql" <<'SQL'
+-- See unknown.00232_y.sql
+-- See unknown.00232_y.
+-- See 00231_unknown.00232_y.sql
+-- See 00231_unknown.00232_y.
+SELECT 'unknown.00232_y.sql';
+SQL
+cp "$CASE_A/dot-left.sql" "$CASE_A/dot-left-expected.sql"
+DOT_LEFT_OUT="$(sh "$HELPER" --rewrite-comments "$CASE_A/atomic-dotted-map.txt" "$CASE_A/dot-left.sql" 2>&1)"
+DOT_LEFT_RC=$?
+assert_eq "A-dot-left-boundary: rewrite succeeds" "0" "$DOT_LEFT_RC"
+if cmp -s "$CASE_A/dot-left-expected.sql" "$CASE_A/dot-left.sql"; then pass "A-dot-left-boundary: unknown filename/stem whole-file comparison"; else fail "A-dot-left-boundary: unknown filename/stem whole-file comparison"; fi
+DOT_LEFT_EXPECTED="$(printf '%s:1\t%s\n%s:2\t%s\n%s:3\t%s\n%s:4\t%s\n' "$CASE_A/dot-left.sql" '-- See unknown.00232_y.sql' "$CASE_A/dot-left.sql" '-- See unknown.00232_y.' "$CASE_A/dot-left.sql" '-- See 00231_unknown.00232_y.sql' "$CASE_A/dot-left.sql" '-- See 00231_unknown.00232_y.')"
+assert_eq "A-dot-left-boundary: unresolved path/line/content diagnostics" "$DOT_LEFT_EXPECTED" "$DOT_LEFT_OUT"
+
+# The main preflight accepts spaces in slugs. Drive the generated identity map through
+# the public entry and compare filename/stem rewrites and preserved SQL bytes together.
+CASPACE="$ROOT/caseAspace"; build_base "$CASPACE"; RASPACE="$CASPACE/repo"
+wf "$RASPACE/$MIGDIR/00230_x y.sql" <<'SQL'
+-- +goose Up
+-- See 00230_x y.sql and 00230_x y.
+SELECT '00230_x y.sql', 00230;
+-- +goose Down
+SELECT 1;
+SQL
+wf "$CASPACE/expected.sql" <<'SQL'
+-- +goose Up
+-- See 00232_x y.sql and 00232_x y.
+SELECT '00230_x y.sql', 00230;
+-- +goose Down
+SELECT 1;
+SQL
+git -C "$RASPACE" add -- "$MIGDIR/00230_x y.sql"
+git -C "$RASPACE" commit -q -m "branch: space-containing migration slug"
+SPACE_OUT="$( ( cd "$RASPACE" && sh "$HELPER" ) 2>&1 )"
+SPACE_RC=$?
+assert_eq "A: generated map accepts space-containing basename" "0" "$SPACE_RC"
+if cmp -s "$CASPACE/expected.sql" "$RASPACE/$MIGDIR/00232_x y.sql"; then pass "A: space filename/stem identities whole-file comparison"; else fail "A: space filename/stem identities whole-file comparison: $SPACE_OUT"; fi
+if [ ! -e "$RASPACE/$MIGDIR/00230_x y.sql" ]; then pass "A: old space-containing filename removed"; else fail "A: old space-containing filename removed"; fi
 
 # An empty or whitespace-only map must fail without truncating the SQL file. With the old
 # NR==FNR map detection, an empty first input made every SQL line look like a map record and
@@ -281,17 +447,17 @@ SQL
   else
     printf '   \n\t\n' > "$EMPTY_MAP"
   fi
-  EMPTY_BEFORE="$(cat "$EMPTY_FIX")"
+  cp "$EMPTY_FIX" "$CASE_A/rejected-before.sql"
   EMPTY_OUT="$(sh "$HELPER" --rewrite-comments "$EMPTY_MAP" "$EMPTY_FIX" 2>&1)"
   EMPTY_RC=$?
   assert_nonzero "A: $_map_kind map refused" "$EMPTY_RC"
   assert_contains "A: $_map_kind map names expected reason" "map file is empty, whitespace-only, or malformed" "$EMPTY_OUT"
-  assert_eq "A: $_map_kind map leaves SQL byte-identical" "$EMPTY_BEFORE" "$(cat "$EMPTY_FIX")"
+  if cmp -s "$CASE_A/rejected-before.sql" "$EMPTY_FIX"; then pass "A: $_map_kind map leaves SQL byte-identical"; else fail "A: $_map_kind map leaves SQL byte-identical"; fi
 done
 
 # A nonempty malformed map must also fail closed. A missing NEW value used to create an
 # empty mapping and silently delete the OLD token; duplicate OLD keys are ambiguous.
-for _bad_kind in missing-value duplicate-old; do
+for _bad_kind in missing-value duplicate-old duplicate-new numeric-only non-tab extra-field wrong-prefix path backslash-path bad-old bad-new bad-basename blank-row; do
   BAD_FIX="$CASE_A/${_bad_kind}_map.sql"
   BAD_MAP="$CASE_A/${_bad_kind}_map.txt"
   wf "$BAD_FIX" <<'SQL'
@@ -301,17 +467,27 @@ SELECT 00231;
 -- +goose Down
 SELECT 1;
 SQL
-  if [ "$_bad_kind" = "missing-value" ]; then
-    printf '%s\n' '00231' > "$BAD_MAP"
-  else
-    printf '%s\n' '00231 00232' '00231 00233' > "$BAD_MAP"
-  fi
-  BAD_BEFORE="$(cat "$BAD_FIX")"
+  case "$_bad_kind" in
+    missing-value) printf '00231\n' > "$BAD_MAP" ;;
+    duplicate-old) printf '00231\t00232\t00231_x.sql\n00231\t00233\t00231_y.sql\n' > "$BAD_MAP" ;;
+    duplicate-new) printf '00231\t00233\t00231_x.sql\n00232\t00233\t00232_y.sql\n' > "$BAD_MAP" ;;
+    numeric-only) printf '00231\t00232\n' > "$BAD_MAP" ;;
+    non-tab) printf '00231 00232 00231_x.sql\n' > "$BAD_MAP" ;;
+    extra-field) printf '00231\t00232\t00231_x.sql\textra\n' > "$BAD_MAP" ;;
+    wrong-prefix) printf '00231\t00232\t00230_x.sql\n' > "$BAD_MAP" ;;
+    path) printf '00231\t00232\tdir/00231_x.sql\n' > "$BAD_MAP" ;;
+    backslash-path) printf '00231\t00232\tdir\\\\00231_x.sql\n' > "$BAD_MAP" ;;
+    bad-old) printf '0231\t00232\t00231_x.sql\n' > "$BAD_MAP" ;;
+    bad-new) printf '00231\t100232\t00231_x.sql\n' > "$BAD_MAP" ;;
+    bad-basename) printf '00231\t00232\t00231_x.sql.bak\n' > "$BAD_MAP" ;;
+    blank-row) printf '00231\t00232\t00231_x.sql\n\n' > "$BAD_MAP" ;;
+  esac
+  cp "$BAD_FIX" "$CASE_A/rejected-before.sql"
   BAD_OUT="$(sh "$HELPER" --rewrite-comments "$BAD_MAP" "$BAD_FIX" 2>&1)"
   BAD_RC=$?
   assert_nonzero "A: $_bad_kind map refused" "$BAD_RC"
   assert_contains "A: $_bad_kind map names expected reason" "map file is empty, whitespace-only, or malformed" "$BAD_OUT"
-  assert_eq "A: $_bad_kind map leaves SQL byte-identical" "$BAD_BEFORE" "$(cat "$BAD_FIX")"
+  if cmp -s "$CASE_A/rejected-before.sql" "$BAD_FIX"; then pass "A: $_bad_kind map leaves SQL byte-identical"; else fail "A: $_bad_kind map leaves SQL byte-identical"; fi
 done
 
 # =============================================================================
@@ -564,6 +740,10 @@ D_OUT="$( ( cd "$REPOD" && sh "$HELPER" ) 2>&1 )"
 D_RC=$?
 : "$D_OUT"
 assert_eq "D: overlapping-range renumber exits 0 (single-phase git mv would collide)" "0" "$D_RC"
+assert_absent "D: clean identity-only summary has no manual review" "manual" "$D_OUT"
+assert_absent "D: overlap does not report inserted old-range number" "unresolved renamed-migration" "$D_OUT"
+assert_contains "D: first identity rewritten exactly once" "MARK_A: this file was drafted as 00232_dup" "$(cat "$MD_D/00232_dup.sql")"
+assert_contains "D: second identity rewritten exactly once" "MARK_B: this file was drafted as 00233_dup" "$(cat "$MD_D/00233_dup.sql")"
 if [ -f "$MD_D/00232_dup.sql" ]; then pass "D: 00232_dup.sql created"; else fail "D: 00232_dup.sql created"; fi
 if [ -f "$MD_D/00233_dup.sql" ]; then pass "D: 00233_dup.sql created"; else fail "D: 00233_dup.sql created"; fi
 if [ -f "$MD_D/00231_dup.sql" ]; then fail "D: old 00231_dup.sql removed"; else pass "D: old 00231_dup.sql removed"; fi

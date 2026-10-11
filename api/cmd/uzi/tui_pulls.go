@@ -912,17 +912,17 @@ func (m tuiModel) pullsEmptyState() string {
 // and f queues a CI-fix for the selected row's branch (always offered); u (↳ run) and w (rework)
 // are shown only when the selected PR has a linked run. R is dropped when only one repo is enabled.
 func (m tuiModel) pullsFooter() string {
-	parts := []string{m.keyHint("↑↓", "move"), m.keyHint("enter", "open")}
+	parts := []footerHint{m.footerHint("↑↓", "move"), m.footerHint("enter", "open")}
 	if pr, ok := m.pulls.selected(); ok && pr.RunID != nil && *pr.RunID != "" {
-		parts = append(parts, m.keyHint("u", "run"), m.keyHint("w", "rework"))
+		parts = append(parts, m.footerHint("u", "run"), m.footerHint("w", "rework"))
 	}
-	parts = append(parts, m.keyHint("f", "fix ci"), m.keyHint("/", "filter"))
+	parts = append(parts, m.footerHint("f", "fix ci"), m.footerHint("/", "filter"))
 	if len(m.repos) > 1 {
-		parts = append(parts, m.keyHint("R", "repo"))
+		parts = append(parts, m.footerHint("R", "repo"))
 	}
-	parts = append(parts, m.keyHint("tab", "views"), m.keyHint("r", "refresh"),
-		m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	return m.withSplitNote(" " + strings.Join(parts, m.pal.faint.Render(" · ")))
+	parts = append(parts, m.footerHint("tab", "views"), m.footerHint("r", "refresh"),
+		m.footerHint("?", "keys"), m.footerHint("q", "quit"))
+	return m.withSplitNote(m.fitFooterHints(parts, m.width))
 }
 
 // ---- links + errors -------------------------------------------------------

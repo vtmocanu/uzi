@@ -1001,7 +1001,7 @@ export function ScheduleModal({
                   <p className="text-[11px] text-faint">
                     Empty ⇒ the <span className="font-medium text-muted">{uziLabel}</span> label. A selector chooses
                     candidates; a candidate fires only when it also carries the{" "}
-                    <span className="font-medium text-muted">{uziLabel}</span> label.
+                    <span className="font-medium text-muted">{uziLabel}</span> label or is assigned to the uzi bot.
                   </p>
                   {/* Sweep-warn (success criterion 6): a selector label missing on a chosen
                       repo means the sweep matches nothing — advisory, never blocking. Edit

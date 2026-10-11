@@ -193,7 +193,7 @@ func main() {
 		"api_ca_pinned", cfg.APICAPool != nil,
 		"poll_interval", cfg.PollInterval.String(),
 		"worker_namespace", cfg.WorkerNamespace,
-		// The image tag is the thing that rolls the fleet on a release, so it belongs in
+		// Advancing the independent worker image tag changes the pod template, so it belongs in
 		// the line you read first when a worker is running the wrong code.
 		"worker_image", cfg.WorkerImageRepo+"/agent-<template>:"+cfg.WorkerImageTag,
 		"worker_ca_relayed", len(cfg.APICAPEM) > 0,

@@ -42,7 +42,7 @@ export function makeProgressObserver(
     // informational and must never fail the run (#122 additive-optional). The runner's own
     // implementation never rejects; this guards a mis-wired executor/test double.
     try {
-      void Promise.resolve(ctx.reportProgress?.(progress)).catch(() => undefined);
+      void Promise.resolve(ctx.reportProgress?.(progress, frozen ?? ctx.frozenMilestones ?? undefined)).catch(() => undefined);
     } catch {
       /* reportProgress threw synchronously — swallowed, see above */
     }

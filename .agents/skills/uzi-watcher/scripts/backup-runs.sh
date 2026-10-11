@@ -15,8 +15,9 @@
 # attempt and retains older ones in place (a delayed create can even leave a NEWER,
 # empty, root-owned attempt dir). So the clone is chosen by IDENTITY, never by the
 # newest path: a candidate counts only when the bare's recovery journal
-# (uzi-recovery.<branch>.clone) or attempt ledger (uzi-attempts.<branch>.entry, last
-# value per attemptId wins) names it for THIS run, and its .git reports the run's
+# (uzi-recovery.<branch>.clone), protected descriptor (uzi-retained.<runId>.journal),
+# or attempt ledger (uzi-attempts.<branch>.entry, last value per attemptId wins)
+# names it for THIS run, and its .git reports the run's
 # branch. The journal-named candidate wins, else the newest valid attemptId (the
 # canonical dir counts as oldest). .uzi-residue-* / .uzi-skills-* siblings are never
 # candidates. The host resolves the concrete dir and passes it to the capture.
@@ -56,7 +57,8 @@
 #   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
 # A failed run with a worker binding is captured like an active one while its clone or
 # owned tracking ref survives; once that source is gone it is status-only (SNAP).
-# Completed and cancelled runs are always status-only.
+# Completed and cancelled runs capture exact protected sources when present;
+# otherwise they are status-only.
 # Exit: 0 when every active target produced a verified recovery artifact (terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
 # surviving source could not be captured intact; 2 for bad usage.
@@ -413,7 +415,7 @@ aid_newer(){
 # (aid_newer).
 select_clone(){
   local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
-  local LC_ALL=C listing journal ledger ledger_ok jr="" jc="" ja="" path br name aid
+  local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_ok journal_ok="" journal_current="" retained="" path br name aid
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
   [ -n "$branch" ] || return 1
   local rc=0
@@ -433,11 +435,108 @@ select_clone(){
   ledger="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
   probe_absent "$rc" || ledger=""
-  if [ -n "$journal" ]; then
-    jr="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .runId // "" else "" end' 2>/dev/null)" || jr=""
-    jc="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .clonePath // "" else "" end' 2>/dev/null)" || jc=""
-    ja="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .attemptId // "" else "" end' 2>/dev/null)" || ja=""
+  rc=0
+  protected="$(kexec_probe "$ns" "$pod" \
+    git --git-dir="$bare" config --local --no-includes --get-all "uzi-retained.$rid.journal")" || rc=$?
+  case "$rc" in 0|1) ;; *) probe_inconclusive; return 1 ;; esac
+  if [ "$rc" -eq 0 ]; then
+    rc=0
+    protected_ledger="$(kexec_probe "$ns" "$pod" git --git-dir="$bare" config --local --no-includes \
+      --get-regexp '^uzi-attempts\..*\.entry$')" || rc=$?
+    case "$rc" in 0|1) ;; *) probe_inconclusive; return 1 ;; esac
+    # Validate the full exact-run descriptor and all source ledger identities in
+    # one pass. Malformed evidence refuses this pod, including a newer active slot.
+    # shellcheck disable=SC2016
+    protected_ok="$(printf '%s\n' "$protected" | "$JQ" -ers --arg rid "$rid" --arg branch "$branch" \
+      --arg stem "$stem" --arg root "$RUNNER_BASE" --arg ledger "$protected_ledger" --arg active "$journal" '
+      def fields($allowed): (keys - $allowed | length) == 0;
+      def aid: type == "string" and test("^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$");
+      def sha: type == "string" and test("^[0-9a-f]{40}$");
+      def integer: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+      def src:
+        type == "object" and fields(["runId","clonePath","attemptId","restoreTip"])
+        and .runId == $rid and (.clonePath | type) == "string"
+        and (if has("attemptId") then (.attemptId | aid) and .clonePath == ($root + "/" + $stem + ".attempt-" + .attemptId)
+             else .clonePath == ($root + "/" + $stem) end)
+        and (if has("restoreTip") then (.restoreTip | sha) else true end);
+      def same($s): .runId == $s.runId and .clonePath == $s.clonePath and .attemptId == $s.attemptId;
+      def progress:
+        type == "object" and fields(["version","source","attempts","startedAt","deadline","backoffMs","stage","restoreTip","successor","blocker"])
+        and .version == 1 and (.source | src)
+        and (.attempts | integer) and .attempts >= 1 and .attempts <= 3
+        and (.startedAt | integer) and (.deadline | integer) and .deadline == .startedAt + 300000
+        and (.backoffMs | integer) and .backoffMs <= 480000
+        and (.stage as $s | ["capturing","captured","adopting","ready-for-model","blocked"] | index($s) != null)
+        and (if has("restoreTip") then (.restoreTip | sha) else true end)
+        and (if has("successor") then (.successor | src) else true end)
+        and (if has("blocker") then (.blocker as $b | ["capture_failed","source_missing","adoption_failed","budget_exhausted","clock_invalid","oversize","prerequisites_unavailable","quiescence_failed","preservation_failed","decoded_history_limit"] | index($b) != null) else true end)
+        and (if .stage == "blocked" then has("blocker") else true end)
+        and (if .stage == "captured" or .stage == "adopting" or .stage == "ready-for-model" then has("restoreTip") else true end)
+        and (if .stage == "ready-for-model" then has("successor") else true end);
+      def journal:
+        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources"])
+        and ({runId,clonePath} + (if has("attemptId") then {attemptId} else {} end)
+          + (if has("restoreTip") then {restoreTip} else {} end) | src)
+        and (if has("retainedSources") then (.retainedSources | type) == "array" and all(.retainedSources[]; src) else true end)
+        and (if has("recovery") then
+          (.recovery | progress) and
+          (same(.recovery.source) or any((.retainedSources // [])[]; same($j)) or
+            (.recovery.successor != null and same(.recovery.successor)))
+          and (if (.recovery.stage == "captured" or .recovery.stage == "adopting" or .recovery.stage == "ready-for-model") then
+            .restoreTip == .recovery.restoreTip and (.restoreTip | sha) else true end)
+          and (if .recovery.stage == "adopting" or .recovery.stage == "ready-for-model" then
+            .recovery.successor.restoreTip == .recovery.restoreTip else true end)
+          and (if .recovery.stage == "ready-for-model" then same(.recovery.successor) else true end)
+          else true end);
+      if length != 1 then error("duplicate protected descriptor") else .[0] end
+      | if type != "object" or (keys != ["branch","journal","key","version"]) or
+          .version != 1 or .branch != $branch or .key != $stem or (.journal | journal | not) or
+          (.journal.recovery == null and (.journal.retainedSources // [] | length) == 0)
+        then error("invalid protected descriptor") else .journal end
+      | . as $j
+      | ($ledger | split("\n") | map(select(length > 0)
+          | capture("^(?<name>uzi-attempts[.].*[.]entry)(?: (?<value>.*))?$")
+          | . as $e | (.value | fromjson) + {ledgerBranch: ($e.name | ltrimstr("uzi-attempts.") | rtrimstr(".entry"))})) as $rows
+      | if all($rows[]; type == "object" and (.attemptId | aid) and (.runId | type) == "string" and
+          (.clonePath | type) == "string" and (.state as $s | ["live","abandoned","retired","reclaimed"] | index($s) != null))
+        then . else error("invalid ledger evidence") end
+      | (reduce $rows[] as $e ({}; .[$e.attemptId] = $e)) as $last
+      | if $active != "" then ($active | fromjson) as $a
+          | if ($a | type) != "object" or ($a.runId | type) != "string" or ($a.clonePath | type) != "string" or
+              ($a.runId == $rid and $a != $j) then error("active/protected conflict") else . end
+        else . end
+      | [$j, ($j.retainedSources // [])[], $j.recovery.source // empty, $j.recovery.successor // empty]
+      | if all(.[]; . as $s
+          | all($rows[]; if .attemptId == $s.attemptId or .clonePath == $s.clonePath then .ledgerBranch == $branch and same($s) else true end)
+          and (if has("attemptId") then $last[$s.attemptId] | same($s) else true end))
+        then . else error("protected source ledger mismatch") end
+      | .[] | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || {
+        probe_inconclusive; return 1;
+      }
+  elif [ "${terminal_capture:-0}" -eq 2 ]; then
+    return 1
   fi
+  # The journal also keeps canonical predecessors, which have no ledger identity.
+  # Only worker attribution is accepted; a recorded successor is not execution authority.
+  if [ -n "$journal" ]; then
+    # shellcheck disable=SC2016
+    journal_ok="$(printf '%s' "$journal" | "$JQ" -r --arg rid "$rid" '
+      def source: type == "object" and (.runId | type) == "string"
+        and (.clonePath | type) == "string"
+        and ((.attemptId // "") | type) == "string";
+      select(source and .runId == $rid)
+      | select(.recovery == null or (.recovery.version == 1
+        and (.recovery.attempts | type) == "number"
+        and .recovery.attempts >= 1 and .recovery.attempts <= 3
+        and .recovery.deadline == .recovery.startedAt + 300000
+        and .recovery.backoffMs >= 0 and .recovery.backoffMs <= 480000
+        and (.recovery.source | source)))
+      | [., (.retainedSources // [])[], .recovery.source // empty, .recovery.successor // empty]
+      | .[] | select(source and .runId == $rid)
+      | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || journal_ok=""
+  fi
+  if [ -n "$protected_ok" ]; then journal_ok="$protected_ok"; fi
+  journal_current="${journal_ok%%$'\n'*}"
   # Ledger: the LAST value per attemptId wins. Keep "<attemptId><TAB><clonePath>" for
   # each attempt whose winning entry names this run; unparseable values are skipped.
   # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
@@ -463,16 +562,20 @@ select_clone(){
     # clone may hold its work: that is an unfinished search, not absence. An unnamed
     # unreadable dir (e.g. an empty root-owned attempt) is still skipped silently.
     if [ -z "$br" ]; then
-      if { [ "$jr" = "$rid" ] && [ "$jc" = "$path" ]; } \
+      if { printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; } \
          || { [ -n "$aid" ] && printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path"; }; then
         probe_inconclusive
       fi
       continue
     fi
     [ "$br" = "$branch" ] || continue
-    if [ "$jr" = "$rid" ] && [ "$jc" = "$path" ] && { [ -z "$ja" ] || [ "$ja" = "$aid" ]; }; then
+    if [ "$journal_current" = "$aid$tab$path" ]; then
       printf '%s\n' "$path"
       return 0
+    fi
+    if printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; then
+      [ -n "$retained" ] || retained="$path"
+      continue
     fi
     [ -n "$aid" ] || continue
     printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path" || continue
@@ -480,6 +583,10 @@ select_clone(){
       best="$path"; best_aid="$aid"; have_best=1
     fi
   done <<< "$listing"
+  if [ -n "$retained" ]; then
+    printf '%s\n' "$retained"
+    return 0
+  fi
   [ "$have_best" -eq 1 ] || return 1
   printf '%s\n' "$best"
 }
@@ -613,8 +720,11 @@ for RID in "${RUNS[@]}"; do
   terminal_capture=0
   case "$st" in
     completed|cancelled)
-      log "SNAP $RID ($LBL) status=$st mr=${mr:-none} (status saved; no worker capture)"
-      continue ;;
+      if [ -z "$wid" ]; then
+        log "SNAP $RID ($LBL) status=$st mr=${mr:-none} (status saved; no worker capture)"
+        continue
+      fi
+      terminal_capture=2 ;;
     failed)
       # A just-failed run's work may exist only on its worker (an ephemeral worker's
       # PVC, held by recovery custody), so capture it while the source is still there.
@@ -663,7 +773,7 @@ for RID in "${RUNS[@]}"; do
 
   # No clone survived. Preserve the latest committed checkpoint from whichever
   # persistent worker still owns the runner tracking ref.
-  if [ -z "$capture_kind" ] && [ -n "$TRACK_REF" ]; then
+  if [ -z "$capture_kind" ] && [ -n "$TRACK_REF" ] && [ "$terminal_capture" -ne 2 ]; then
     if [ -n "$preferred" ]; then
       ns="${preferred%% *}"; pod="${preferred#* }"
       if pod_has_ref "$ns" "$pod" "$TRACK_REF" "$RUN_BRANCH" "$RID"; then capture_kind="bare"; fi
@@ -680,7 +790,7 @@ for RID in "${RUNS[@]}"; do
   fi
 
   if [ -z "$capture_kind" ]; then
-    if [ "$terminal_capture" -eq 1 ] && [ ! -e "$PROBE_ERR_FILE" ]; then
+    if [ "$terminal_capture" -ge 1 ] && [ ! -e "$PROBE_ERR_FILE" ]; then
       log "SNAP $RID ($LBL) status=$st (status saved; no live clone or tracking ref owned by this run in ctx=$CTX ns=[$NAMESPACES])"
       continue
     fi

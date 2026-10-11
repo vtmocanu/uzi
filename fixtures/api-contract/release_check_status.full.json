@@ -1,0 +1,19 @@
+{
+  "release_check_enabled": true,
+  "release_check_banner_enabled": true,
+  "interval": "x",
+  "running_version": "x",
+  "latest_tag": "x",
+  "latest_name": "x",
+  "body": "x",
+  "notes_url": "x",
+  "published_at": "x",
+  "checked_at": "x",
+  "update_available": true,
+  "far_behind": true,
+  "security": true,
+  "banner_snoozed": true,
+  "partial": true,
+  "status": "x",
+  "message": "x"
+}

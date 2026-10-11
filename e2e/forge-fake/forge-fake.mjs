@@ -290,6 +290,42 @@ function send(res, status, body) {
   res.end(payload);
 }
 
+// Legacy notes are normalized only when read; shared persisted state stays intact.
+function issueComments(project, iid) {
+  return state.notes
+    .filter((n) => (n.project_id ?? PROJECT.id) === project.id && n.issue_iid === iid)
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id)
+    .map(toIssueComment);
+}
+
+function toIssueComment(note) {
+  const author = note.author ?? { id: 1, username: "uzi-bot" };
+  return {
+    id: note.id, body: note.body,
+    user: { id: author.id, login: author.login ?? author.username },
+    created_at: note.created_at, updated_at: note.updated_at ?? note.created_at,
+  };
+}
+
+function sendPage(req, res, url, items, sizeKey, defaultSize) {
+  const positive = (key, fallback) => {
+    const raw = url.searchParams.get(key);
+    if (raw === null) return fallback;
+    return /^[1-9]\d*$/.test(raw) && Number.isSafeInteger(Number(raw)) ? Number(raw) : null;
+  };
+  const page = positive("page", 1);
+  const requestedSize = positive(sizeKey, defaultSize);
+  if (page === null || requestedSize === null) return send(res, 400, { message: "pagination must use positive integers" });
+  const size = Math.min(requestedSize, 100);
+  const start = (page - 1) * size;
+  if (start + size < items.length) {
+    const next = new URL(req.url, `https://${req.headers.host}`);
+    next.searchParams.set("page", String(page + 1));
+    res.setHeader("Link", `<${next.href}>; rel="next"`);
+  }
+  return send(res, 200, items.slice(start, start + size));
+}
+
 // pipelineInfo strips the internal jobs list to the GitLab PipelineInfo shape the
 // list endpoints return (PRD #6).
 function pipelineInfo(p) {
@@ -985,10 +1021,11 @@ const server = https.createServer(
       return send(res, 200, { id: 1, login: "uzi-bot", is_admin: false });
     }
     if (method === "GET" && path === "/api/v1/users/search") {
-      // GetUserByID (ProjectRole resolves the numeric bot id -> login). Only the
-      // bot (uid=1) is known.
+      // GetUserByID resolves the bot and recorded reviewer identities.
       const uid = url.searchParams.get("uid");
-      return send(res, 200, { data: uid === "1" ? [{ id: 1, login: "uzi-bot" }] : [] });
+      const data = uid === "1" ? [{ id: 1, login: "uzi-bot" }]
+        : uid === "2" ? [{ id: 2, login: "reviewer" }] : [];
+      return send(res, 200, { data });
     }
     const fjTokens = path.match(/^\/api\/v1\/users\/([^/]+)\/tokens$/);
     if (method === "GET" && fjTokens) {
@@ -1053,6 +1090,10 @@ const server = https.createServer(
     if (fjRepo) {
       const project = resolveProject(`${fjRepo[1]}/${fjRepo[2]}`);
       const rest = fjRepo[3] || "";
+      if (method === "GET" && (rest === "/teams" || rest === "/collaborators")) {
+        if (!PROJECTS.some((p) => p.path_with_namespace === `${fjRepo[1]}/${fjRepo[2]}`)) return send(res, 404, { message: "Not Found" });
+        return sendPage(req, res, url, rest === "/teams" ? [] : [{ id: 1, login: "uzi-bot" }, { id: 2, login: "reviewer" }], "limit", 50);
+      }
 
       // Issues list. Emits real issues AND every MR as a pull_request issue, so the
       // driver's R4 filter (pull_request != null) is exercised: an MR must never
@@ -1109,14 +1150,18 @@ const server = https.createServer(
       // Issue comments (CreateIssueNote). Recorded in the shared notes list so the
       // harness reads them back via /_e2e/state exactly like the GitLab lane.
       const fjNotes = rest.match(/^\/issues\/(\d+)\/comments$/);
+      if (method === "GET" && fjNotes) {
+        if (!PROJECTS.some((p) => p.path_with_namespace === `${fjRepo[1]}/${fjRepo[2]}`)) return send(res, 404, { message: "Not Found" });
+        return sendPage(req, res, url, issueComments(project, Number(fjNotes[1])), "limit", 50);
+      }
       if (method === "POST" && fjNotes) {
         const body = await readBody(req);
         const iid = Number(fjNotes[1]);
-        const note = { id: state.nextNoteId++, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString() };
+        const note = { id: state.nextNoteId++, project_id: project.id, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString(), author: { id: 1, username: "uzi-bot" } };
         state.notes.push(note);
         persist();
         log("fj note on issue", iid, JSON.stringify((body.body || "").slice(0, 72)));
-        return send(res, 201, { id: note.id, body: note.body });
+        return send(res, 201, toIssueComment(note));
       }
       // Issue timeline (ListIssueLabelEvents). Translate the shared labelEvents into
       // Forgejo timeline entries: type "label", body "1"=add / ""=remove, and a
@@ -1171,7 +1216,8 @@ const server = https.createServer(
       // RoleWrite, member=true (compliant, no finding).
       const fjPerm = rest.match(/^\/collaborators\/([^/]+)\/permission$/);
       if (method === "GET" && fjPerm) {
-        return send(res, 200, { permission: "write", role_name: "Write", user: { id: 1, login: "uzi-bot" } });
+        const user = fjPerm[1] === "reviewer" ? { id: 2, login: "reviewer" } : { id: 1, login: "uzi-bot" };
+        return send(res, 200, { permission: "write", role_name: "Write", user });
       }
 
       // Pull requests.
@@ -1288,6 +1334,12 @@ const server = https.createServer(
         res.writeHead(200, { "Content-Type": "application/json", "X-OAuth-Scopes": scopes });
         return res.end(JSON.stringify({ id: 1, login: "uzi-bot", site_admin: false }));
       }
+      if (method === "GET" && g === "/user/1") {
+        return send(res, 200, { id: 1, login: "uzi-bot" });
+      }
+      if (method === "GET" && g === "/user/2") {
+        return send(res, 200, { id: 2, login: "reviewer" });
+      }
       // UserExists (human_username verify). No human accounts are known, so 404 ->
       // the driver returns (false, nil) -> saved WITH a warning, never a hard reject
       // (the verified-or-warned path, mirroring the other tables' empty/absent user).
@@ -1334,6 +1386,16 @@ const server = https.createServer(
       if (ghRepo) {
         const project = resolveProject(`${ghRepo[1]}/${ghRepo[2]}`);
         const rest = ghRepo[3] || "";
+        if (method === "GET" && rest === "/collaborators") {
+          if (!PROJECTS.some((p) => p.path_with_namespace === `${ghRepo[1]}/${ghRepo[2]}`)) return send(res, 404, { message: "Not Found" });
+          return sendPage(req, res, url, [{
+            id: 1, login: "uzi-bot",
+            permissions: { pull: true, triage: false, push: true, maintain: false, admin: false },
+          }, {
+            id: 2, login: "reviewer",
+            permissions: { pull: true, triage: false, push: true, maintain: false, admin: false },
+          }], "per_page", 100);
+        }
 
         // Issues list. Emits real issues AND every MR as a pull_request issue, so the
         // driver's R4 filter (PullRequestLinks != nil) is exercised: an MR must never
@@ -1394,14 +1456,18 @@ const server = https.createServer(
         // Issue comments (CreateIssueNote). Recorded in the shared notes list so the
         // harness reads them back via /_e2e/state exactly like the other lanes.
         const ghComments = rest.match(/^\/issues\/(\d+)\/comments$/);
+        if (method === "GET" && ghComments) {
+          if (!PROJECTS.some((p) => p.path_with_namespace === `${ghRepo[1]}/${ghRepo[2]}`)) return send(res, 404, { message: "Not Found" });
+          return sendPage(req, res, url, issueComments(project, Number(ghComments[1])), "per_page", 100);
+        }
         if (method === "POST" && ghComments) {
           const body = await readBody(req);
           const iid = Number(ghComments[1]);
-          const note = { id: state.nextNoteId++, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString() };
+          const note = { id: state.nextNoteId++, project_id: project.id, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString(), author: { id: 1, username: "uzi-bot" } };
           state.notes.push(note);
           persist();
           log("gh note on issue", iid, JSON.stringify((body.body || "").slice(0, 72)));
-          return send(res, 201, { id: note.id, body: note.body });
+          return send(res, 201, toIssueComment(note));
         }
         // Issue events (ListIssueLabelEvents). Translate the shared labelEvents into
         // GitHub IssueEvent shape: event "labeled"/"unlabeled", actor.login, label.name.
@@ -1845,5 +1911,5 @@ const server = https.createServer(
 load();
 persist();
 server.listen(PORT, () =>
-  log(`listening on :${PORT} (base ${BASE}, projects ${PROJECTS.map((p) => p.path_with_namespace).join(", ")})`),
+  log(`listening on :${server.address().port} (base ${BASE}, projects ${PROJECTS.map((p) => p.path_with_namespace).join(", ")})`),
 );

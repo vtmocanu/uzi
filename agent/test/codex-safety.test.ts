@@ -1324,6 +1324,25 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
 });
 
 // Issue #1766 (M3a): the vault-locked reconcile deferral and the credential-free capture settle.
+describe("W8 account boundary safety", () => {
+  it("carries account deferral through the poisoned boundary with secret-free diagnostic", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(9));
+    const reconcile: ReconcileBeforeBoundary = async () => ({
+      kind: "blocked", deferral: "account_unavailable",
+      errors: [{ category: "authorization", message: "codex subscription boundary reconcile deferred: account unavailable" }],
+    });
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, reconcile);
+    await assert.rejects(safety.withBoundary(req("finalize"), async () => assert.fail("no action")), (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.equal(error.deferral, "account_unavailable");
+      assert.equal(error.stage, "reconcile");
+      assert.equal(error.diagnostic, "codex boundary failed at reconcile (finalize): codex subscription boundary reconcile deferred: account unavailable");
+      return true;
+    });
+    assert.equal(reg.state(), "poisoned");
+  });
+});
+
 describe("CodexExecutionSafety: vault_locked deferral (issue #1766)", () => {
   function inertSeams(events: string[]): BoundarySeams {
     return {

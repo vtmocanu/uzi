@@ -50,12 +50,10 @@ function tokenShares(totals: number[], factoryTotal: number): number[] {
 }
 
 // PRD #1429 M4b (D7) superseded PRD #40 Decision 8's "$0 renders '—'" heuristic: an
-// aggregate's cost_usd is the METERED SUBSET's real dollar sum (a subscription or
-// unreported run contributes $0 to that stored numeric by construction), so it is
-// shown here as a genuine dollar figure, never hidden behind a dash, and any
-// non-metered runs folded into the window are disclosed by count instead, via
-// `aggregateDisclosure` below. Showing the dollar figure ALONE, with no signal that
-// it excludes some runs, would be the aggregate shape of the same false-zero bug.
+// aggregate's cost_usd retains recorded API-equivalent costs, including partial
+// dollars from mixed unreported runs. Legacy subscription rows have no estimate.
+// `aggregateDisclosure` names both populations whose cost is incomplete while
+// retaining the recorded partial contributions in the displayed dollar total.
 
 // PRD #1293 D6: the failed-run rate as failed / finished, one decimal, "—" when the scope
 // has no finished runs (never a fabricated 0%). One helper for both cards' windows and the
@@ -186,7 +184,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
       <div>
         <div className="grid grid-cols-3 gap-x-4">
           <div className="min-w-0">
-            <h4 className="text-xs text-muted">Metered cost</h4>
+            <h4 className="text-xs text-muted">Cost (API-equivalent)</h4>
             <p className="mt-1 whitespace-nowrap font-mono text-[22px] font-semibold lg:text-[26px] tabular-nums tracking-tight text-brand">{summaryCost(selected.cost)}</p>
             {disclosure.incomplete && <p className="mt-1 truncate whitespace-nowrap text-[11px] leading-relaxed text-muted" title={disclosure.title}>{disclosure.text}</p>}
           </div>
@@ -357,7 +355,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                 // Rank and Share both use total tokens, including subscription runs.
                 // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
                 const pct = shares[i];
-                // PRD #1429 D7: this user's selected cost_usd is their metered subset —
+                // This user's selected cost_usd includes recorded partial costs —
                 // disclose their own subscription/unreported counts beside it rather than
                 // let the dollar figure read as their complete total.
                 const rowDisclosure = aggregateDisclosure(u.subscription, u.unreported);

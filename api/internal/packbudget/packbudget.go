@@ -57,6 +57,20 @@ func (e *BudgetError) Error() string {
 // Is makes a BudgetError match the ErrTooLarge sentinel.
 func (e *BudgetError) Is(target error) bool { return target == ErrTooLarge }
 
+// InvalidError is the error Scan returns for a malformed pack. It matches ErrInvalid under
+// errors.Is, and Check names which parse step failed (a fixed label, never pack content), so an
+// admin reading a refusal can tell a bad header from a bad delta.
+type InvalidError struct {
+	Check string
+}
+
+func (e *InvalidError) Error() string { return ErrInvalid.Error() + ": " + e.Check }
+
+// Is makes an InvalidError match the ErrInvalid sentinel.
+func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
+
+func invalid(check string) error { return &InvalidError{Check: check} }
+
 // Limits are the four bounds Scan enforces.
 type Limits struct {
 	// ObjectBytes caps ONE object's declared size (the target size for a delta).
@@ -84,7 +98,7 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 	scanner := packfile.NewScanner(bytes.NewReader(pack))
 	_, objects, err := scanner.Header()
 	if err != nil {
-		return ErrInvalid
+		return invalid("pack header")
 	}
 	if objects > lim.Objects {
 		return &BudgetError{BoundObjects, int64(lim.Objects)}
@@ -99,7 +113,7 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 			if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
 				return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 			}
-			return ErrInvalid
+			return invalid("object header")
 		}
 		if h.Length < 0 || h.Length > lim.ObjectBytes {
 			return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
@@ -117,15 +131,15 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 				if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
 					return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 				}
-				return ErrInvalid
+				return invalid("delta object")
 			}
 			b := buf.Bytes()
 			if _, b, err = ReadDeltaVarint(b); err != nil { // base size (discard)
-				return ErrInvalid
+				return invalid("delta base size")
 			}
 			var targetSz int64
 			if targetSz, _, err = ReadDeltaVarint(b); err != nil { // reconstructed size
-				return ErrInvalid
+				return invalid("delta target size")
 			}
 			if targetSz > lim.ObjectBytes {
 				return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
@@ -136,7 +150,7 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 				if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
 					return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 				}
-				return ErrInvalid
+				return invalid("object body")
 			}
 			contributed = h.Length
 		}

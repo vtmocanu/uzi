@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import type {
   Run,
   RunListItem,
+  RunSummaryItem,
   RunJob,
   Repo,
   AdminDockerAllowlistRepo,
@@ -57,6 +58,7 @@ import type {
   CodexAdminRateLimitRow,
   HealthDoc,
   BuildInfo,
+  ReleaseCheckStatus,
   Product,
   ProductOAuthClient,
   OAuthAuthorizeRequest,
@@ -76,10 +78,14 @@ import type {
 
 import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
 import buildInfoFull from "../../../fixtures/api-contract/build_info.full.json";
+import releaseCheckStatusZero from "../../../fixtures/api-contract/release_check_status.zero.json";
+import releaseCheckStatusFull from "../../../fixtures/api-contract/release_check_status.full.json";
 import runZero from "../../../fixtures/api-contract/run.zero.json";
 import runFull from "../../../fixtures/api-contract/run.full.json";
 import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.json";
 import runListItemFull from "../../../fixtures/api-contract/run_list_item.full.json";
+import runSummaryItemZero from "../../../fixtures/api-contract/run_summary_item.zero.json";
+import runSummaryItemFull from "../../../fixtures/api-contract/run_summary_item.full.json";
 import repoZero from "../../../fixtures/api-contract/repo.zero.json";
 import repoFull from "../../../fixtures/api-contract/repo.full.json";
 import dockerAllowlistRepoZero from "../../../fixtures/api-contract/admin_docker_allowlist_repo.zero.json";
@@ -277,6 +283,15 @@ void _buildInfoExtra;
 void _buildInfoZero;
 void _buildInfoFull;
 
+const _releaseCheckStatusMissing: never = null as unknown as Exclude<keyof ReleaseCheckStatus, keyof typeof releaseCheckStatusFull>;
+const _releaseCheckStatusExtra: never = null as unknown as Exclude<keyof typeof releaseCheckStatusFull, keyof ReleaseCheckStatus>;
+const _releaseCheckStatusZero: ZeroOf<ReleaseCheckStatus> = releaseCheckStatusZero;
+const _releaseCheckStatusFull: Widen<ReleaseCheckStatus> = releaseCheckStatusFull;
+void _releaseCheckStatusMissing;
+void _releaseCheckStatusExtra;
+void _releaseCheckStatusZero;
+void _releaseCheckStatusFull;
+
 // ── Run ─────────────────────────────────────────────────────────────────────
 // ZeroOf exemptions for Run (all normalized to [] by a mapper in runToDTO):
 // plan_changed_files (handler/workers.go:448), required_capabilities (:442),
@@ -355,6 +370,32 @@ void _buildInfoFull;
   void _runListItemExtra;
   void _runListItemZero;
   void _runListItemFull;
+}
+
+// ── RunSummaryItem ──────────────────────────────────────────────────────────
+// RunSummaryItem is RunListItem minus plan_md, repo_agents, issue_description and
+// preserved_patch (GET /api/runs?view=summary, Go RunSummaryItemDTO). The ZeroOf
+// exemptions are the same as RunListItem's.
+{
+  const _runSummaryItemMissing: never = null as unknown as Exclude<keyof RunSummaryItem, keyof typeof runSummaryItemFull>;
+  const _runSummaryItemExtra: never = null as unknown as Exclude<keyof typeof runSummaryItemFull, keyof RunSummaryItem>;
+  const _runSummaryItemZero: ZeroOf<
+    RunSummaryItem,
+    | "plan_changed_files"
+    | "required_capabilities"
+    | "required_tools"
+    | "completion_unmet"
+    | "completion_deferred"
+    | "completion_accepted"
+    | "credential_epochs"
+    // nonNilStrings in runs_dto.go normalizes the recorded nil slice to [].
+    | "auto_approve_blocked_reasons"
+  > = runSummaryItemZero;
+  const _runSummaryItemFull: Widen<RunSummaryItem> = runSummaryItemFull;
+  void _runSummaryItemMissing;
+  void _runSummaryItemExtra;
+  void _runSummaryItemZero;
+  void _runSummaryItemFull;
 }
 
 // ── Repo (M2) ───────────────────────────────────────────────────────────────
@@ -1191,6 +1232,25 @@ it("recorded nested checker metadata always has the nullable member", () => {
   void _recoveryCustodyHoldFull;
 }
 
+it("recovery publication receipt matches the Go contract and permits older servers", () => {
+  const full: RecoveryCustodyHold = recoveryCustodyHoldFull;
+  const older: RecoveryCustodyHold = recoveryCustodyHoldZero;
+  expect(full.completed_publication_reason).toBe("x");
+  expect(full.completed_publication_receipt).toEqual({
+    hold_id: "x", run_id: "x", owner_id: "x", worker_id: "x", generation: 1,
+    final_head: "x", repo_id: "x", connection_id: "x", project_id: 1,
+    forge_type: "x", base_url: "x", branch: "x", mr_iid: 1,
+    observed_branch_head: "x",
+  });
+  expect(older.completed_publication_receipt).toBeUndefined();
+  expect(older.completed_publication_reason).toBeUndefined();
+  const withoutMR: NonNullable<RecoveryCustodyHold["completed_publication_receipt"]> = {
+    ...full.completed_publication_receipt!, mr_iid: null,
+  };
+  // This assignment checks nullable MR compatibility at compile time.
+  void withoutMR;
+});
+
 // ── RecoveryCustodyAggregate (PRD #1349 M1) ──────────────────────────────────
 // All four fields are ints, so the zero.json carries no null (declared nullable:false).
 {
@@ -1435,6 +1495,7 @@ function hasNull(v: unknown): boolean {
 const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "run", nullable: true },
   { stem: "run_list_item", nullable: true },
+  { stem: "run_summary_item", nullable: true },
   // PRD #1908 D-D: inputs (nil slice), origin members and result are null in zero.json.
   { stem: "run_job", nullable: true },
   { stem: "repo", nullable: true },
@@ -1521,6 +1582,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // normalizes to []), so its zero.json carries nulls.
   { stem: "health_doc", nullable: true },
   { stem: "build_info", nullable: false },
+  { stem: "release_check_status", nullable: false },
   // PRD #1907 M1: every product/product-token DTO has a present-as-null pointer or a
   // nil-slice scopes in its zero.json, so all five are nullable:true.
   { stem: "product", nullable: true },
@@ -1626,4 +1688,9 @@ describe("issue-input history contract", () => {
     expect(cardFull.latest_run.auto_approve_blocked_reasons).toEqual(["x"]);
     expect(boardFull.cards[0].latest_run.auto_approve_blocked_reasons).toEqual(["x"]);
   });
+});
+
+it("release-check partial is omitted at zero and true when populated", () => {
+  expect(releaseCheckStatusZero).not.toHaveProperty("partial");
+  expect(releaseCheckStatusFull.partial).toBe(true);
 });

@@ -21,11 +21,14 @@ import os from "node:os";
 import path from "node:path";
 import { SdkExecutor } from "../src/sdk-executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
-import { nullLogger, recordingLogger } from "./helpers.js";
+import { CredentialSwitchSignal, type SteeringChannel } from "../src/steering.js";
+import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
 import {
   api,
   client,
   fakeGitlab,
+  fx,
+  git,
   gitlabClaim,
   homeDir,
   input,
@@ -221,30 +224,67 @@ describe("RunRunner — PRD #1247 M5b stop-on-stale_claim", () => {
     }
   });
 
-  it("MINOR-7: a credential_switch signal on a /state ACK triggers the switch (the secondary transport, not just /inputs)", async () => {
+  for (const stage of ["ack-empty", "ack-retained", "after-discovery"]) it(`MINOR-7: credential_switch triggers the handshake at ${stage}`, async () => {
+    const retained = stage !== "ack-empty";
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1247-ack-switch-"));
     try {
       const claim = gitlabClaim(1280, { claim_generation: 5 });
-      // Arm the switch signal ONLY on the /state ACK — /inputs (setInputs) is never called — so a
-      // trip PROVES the state-ack transport works on its own. Before MINOR-7 the ack's credential_switch
-      // was parsed but never forwarded, so ONLY a /inputs poll could trigger a switch; here the run
-      // would just complete normally.
-      api.armStateAckCredentialSwitch(claim.run_id, 5);
+      api.setOwnershipStatus(claim.run_id, "running", 5);
+      await client.register("w-ack-switch", undefined, 1, undefined, ["credential_switch_v1"]);
+      let clonePath: string | undefined;
+      let journal: string | undefined;
+      if (retained) {
+        const bare = await git.ensureClone(fx.originPath);
+        const clone = await git.createOrAttachRunnerClone(bare, 1280, noProofReseed, claim.run_id);
+        await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+        clonePath = clone.path;
+        fs.writeFileSync(path.join(clonePath, "retained.txt"), "only local work\n");
+        journal = fs.readFileSync(path.join(bare, "config"), "utf8");
+      }
+      const sessionPath = path.join(homeRoot, claim.run_id, "session.jsonl");
+      fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+      fs.writeFileSync(sessionPath, "predecessor session\n");
+      let models = 0, fetches = 0, releases = 0;
+      git.ensureClone = async () => { fetches++; throw new Error("must not fetch after switch"); };
+      client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+      // ACK cases exercise the secondary transport without /inputs. The late-switch
+      // case instead trips the same public steering entry after real discovery returns.
+      if (stage !== "after-discovery") api.armStateAckCredentialSwitch(claim.run_id, 5);
       const factory: ExecutorFactory = (runId) => ({
         homeDir: path.join(homeRoot, runId),
-        executor: new SdkExecutor(nullLogger(), path.join(homeRoot, runId), { queryFn: planThenDoneQuery() }),
+        executor: { run: async () => { models++; throw new Error("must not run after switch"); } },
       });
-      await runnerWith(factory, gitlab, undefined, nullLogger()).execute(claim);
+      const r = runnerWith(factory, gitlab, undefined, nullLogger());
+      let discoveries = 0;
+      if (stage === "after-discovery") {
+        const discover = git.discoverRetainedRecovery.bind(git);
+        git.discoverRetainedRecovery = async (...args) => {
+          const result = await discover(...args);
+          assert.ok(result, "actual discovery returned the retained source before switching");
+          discoveries++;
+          const active = (r as unknown as { activeRuns: Map<string, { steering: SteeringChannel }> }).activeRuns.get(claim.run_id);
+          assert.ok(active, "steering is registered before discovery completes");
+          // Inject after the initial discovery; the switch handler also reads the existing journal.
+          if (discoveries === 1) active.steering.tripCredentialSwitch(5);
+          assert.ok(active.steering.lifecycleSignal().reason instanceof CredentialSwitchSignal);
+          return result;
+        };
+      }
+      await r.execute(claim);
+      assert.equal(discoveries, stage === "after-discovery" ? 2 : 0);
 
       const s = api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body.status);
-      // The state-ack signal tripped the switch: the flight entered enterCredentialSwitch and
-      // reported the release (credential_switch) or the give-up (credential_switch_failed) — NOT a
-      // plain `completed`, which is what a run whose switch signal was ignored would report.
-      assert.ok(
-        s.includes("credential_switch") || s.includes("credential_switch_failed"),
-        `the state-ack credential_switch tripped the switch; reports were: ${s.join(", ")}`,
-      );
+      assert.deepEqual(s, ["running", "credential_switch_failed"], "discovery alone cannot authorize a release");
+      assert.equal(api.states.find(x => x.runId === claim.run_id && x.body.status === "credential_switch_failed")?.body.claim_generation, 5);
+      assert.equal(models, 0);
+      assert.equal(fetches, 0);
+      assert.equal(releases, 0);
+      assert.equal(fs.readFileSync(sessionPath, "utf8"), "predecessor session\n");
+      if (clonePath) {
+        assert.equal(fs.readFileSync(path.join(clonePath, "retained.txt"), "utf8"), "only local work\n");
+        assert.equal(fs.readFileSync(path.join(git.barePathFor(fx.originPath), "config"), "utf8"), journal);
+      }
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }

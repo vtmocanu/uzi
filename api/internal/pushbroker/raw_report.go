@@ -101,6 +101,11 @@ func (r *rawReport) feed(data []byte) {
 			return
 		}
 		if !r.sideband {
+			// Extra flushes after the complete report are not evidence of anything;
+			// native git's status reader stops at the first non-data packet.
+			if r.flushed && payload == nil {
+				return
+			}
 			r.reportPacket(payload)
 			return
 		}

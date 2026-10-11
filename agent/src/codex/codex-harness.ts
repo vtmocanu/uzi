@@ -56,6 +56,7 @@
 // thrown; a clean EOF with no terminal is Codex's own unexpected-EOF → a `protocol`
 // {@link CodexHarnessError} throw (Claude's clean-EOF `exhausted` is unaffected).
 
+import { randomUUID } from "node:crypto";
 import { renderCodexRun } from "./render.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
@@ -92,6 +93,7 @@ import type {
   BoundaryRequest,
   ChildQuiescence,
   HarnessContext,
+  HarnessAttribution,
   HarnessError,
   HarnessEvent,
   HarnessItem,
@@ -221,12 +223,9 @@ export interface CodexHarnessOptions {
   readonly appServerAuth?: CodexAppServerAuthSession;
   /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
-  /** PRD #1332 C4b / D5: the RUN's immutable credential auth mode, from the binding. It selects
-   *  the terminal cost semantics — a subscription run's per-model usage is `subscription` (no
-   *  per-token charge), an api_key run's is `metered` (versioned Standard price table) or
-   *  `unreported`. When ABSENT (a transitional/test construction that supplies no mode) the
-   *  terminal prices NOTHING — every entry stays `unreported` and the run cost `unreported` — the
-   *  conservative choice that retains tokens and never invents a subscription or a dollar figure. */
+  /** The RUN's immutable credential auth mode, from the binding. Either mode enables
+   *  API-equivalent estimates from the pinned Standard price table when usage fully reconciles.
+   *  When absent, entries and run cost stay unreported while token totals are retained. */
   readonly authMode?: CodexAppServerAuthMode;
   /** PRD #1332 C4a / CodeRabbit 4004800880: the executor-claim-leg token accountant, INJECTED so it
    *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
@@ -241,6 +240,8 @@ export interface CodexHarnessOptions {
    *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
    *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
   readonly emitClaimInit?: boolean;
+  /** Millisecond clock for root dispatch duration; defaults to Date.now. */
+  readonly nowMs?: () => number;
   /** Issue #1583: the redactor applied to every PROJECTED tool input/output string BEFORE it is
    *  bounded (the executor wires the run's runtime-released Codex tokens, which the batcher's
    *  claim-secret redactor never sees). Identity when absent; the batcher still redacts at persist. */
@@ -515,6 +516,11 @@ export class CodexHarness implements RunHarness {
     return this.threadId;
   }
   private currentModel?: string;
+  private readonly nowMs: () => number;
+  private dispatchStartedAt?: number;
+  // Usage lanes are independent of display bindings: normal child close retains the lane.
+  private readonly childUsageLanes = new Map<string, Readonly<HarnessAttribution>>();
+  private readonly pendingChildUsage = new Map<string, Extract<HarnessEvent, { kind: "usage_record" }>[]>();
   private closed = false;
 
   // PRD #1332 C4a: the executor-claim-leg token accountant. It holds the IMMUTABLE thread->model
@@ -582,6 +588,7 @@ export class CodexHarness implements RunHarness {
   private stopTurn?: () => void;
 
   constructor(opts: CodexHarnessOptions) {
+    this.nowMs = opts.nowMs ?? Date.now;
     this.registry = opts.registry;
     this.launchRootSeam = opts.launchRoot;
     this.broker = opts.broker;
@@ -654,6 +661,7 @@ export class CodexHarness implements RunHarness {
   unregisterChildSink(threadId: string): void {
     this.childSinks.delete(threadId);
     this.childBindings.delete(threadId);
+    this.pendingChildUsage.delete(threadId);
   }
 
   /**
@@ -702,6 +710,15 @@ export class CodexHarness implements RunHarness {
       };
       dispatch.child = binding;
       this.childBindings.set(childThreadId, binding);
+      const lane = Object.freeze({
+        agent: role,
+        agentInstance: dispatch.dispatchId,
+        ...(dispatch.label.length > 0 ? { agentLabel: dispatch.label } : {}),
+      });
+      this.childUsageLanes.set(childThreadId, lane);
+      for (const event of this.pendingChildUsage.get(childThreadId) ?? [])
+        this.emitProjected({ ...event, attribution: lane }, dispatch.ordinal);
+      this.pendingChildUsage.delete(childThreadId);
       this.emitProjected(
         this.leadFrame({
           kind: "tool",
@@ -929,6 +946,9 @@ export class CodexHarness implements RunHarness {
     this.activePolicyAdmission = admitPolicyTurn(request.phase);
     this.turnClosed = false;
     this.activeTurnId = undefined;
+    this.dispatchStartedAt = undefined;
+    this.childUsageLanes.clear();
+    this.pendingChildUsage.clear();
     this.stopRequested = false;
     this.stopTurn = undefined;
     this.pendingCodexError = undefined;
@@ -1220,16 +1240,38 @@ export class CodexHarness implements RunHarness {
           }
           const mapped = completed.event!;
           if (mapped.kind === "turn_finished") {
+            // The executor stops at its first terminal. Give already-admitted callbacks
+            // one event-loop turn to publish delayed bindings/usage before closing dispatches.
+            // Do not wait for child completion here: the executor cancels open children
+            // only after receiving the terminal. Each callback remains independently owned
+            // by the broker; a still-unproved lane is discarded at this boundary.
+            if (this.pendingToolCalls.size > 0) {
+              let flush: ReturnType<typeof setImmediate> | undefined;
+              try {
+                await Promise.race([
+                  Promise.allSettled(this.pendingToolCalls), abortPromise,
+                  new Promise<void>(resolve => { flush = setImmediate(resolve); }),
+                ]);
+              } finally {
+                if (flush !== undefined) clearImmediate(flush);
+              }
+            }
+            if (this.turnClosed || request.signal.aborted || this.stopRequested) {
+              this.endTurnOnStop();
+              this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
+              yield* this.drainOutbox();
+              return;
+            }
             this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
             yield* this.drainOutbox();
-          }
-          yield mapped;
-          if (mapped.kind === "turn_finished") {
+            this.pendingChildUsage.clear();
+            yield mapped;
             if (this.pendingToolCalls.size > 0)
               await Promise.race([Promise.allSettled(this.pendingToolCalls), abortPromise]);
             yield* this.drainOutbox();
             return;
           }
+          yield mapped;
           continue;
         }
         if (readReady === Infinity) {
@@ -1265,10 +1307,10 @@ export class CodexHarness implements RunHarness {
         // PRD #1332 C4a: reconcile every typed token-usage note into the per-model accountant
         // BEFORE the demux, so BOTH root and demuxed-child usage is captured off this single
         // consumer. An unknown/unregistered thread id is dropped inside record() (never
-        // attributed to root). The note still flows on to its normal handling below (a child's
-        // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
-        // Account snapshots have no thread identity; observe before child demux and
-        // project only liveness, keeping metadata out of the run feed.
+        // attributed to root). Adopted complete responses also queue accounting records before
+        // demux; the original note still routes to the child sink or root `activity` below.
+        // Rate-limit account snapshots have no thread identity. Observe before child demux;
+        // those snapshots remain pure liveness, without rate-limit metadata in the run feed.
         if (step.value.kind === "rate_limits_updated") this.rateLimits.observe(step.value.rateLimits);
         this.recordUsageNote(step.value);
         await this.deliverIncompleteNotice();
@@ -1345,6 +1387,8 @@ export class CodexHarness implements RunHarness {
       if (this.liveProjectionTurn === ordinal) {
         this.liveProjectionTurn = undefined;
         this.outbox = [];
+        this.childUsageLanes.clear();
+        this.pendingChildUsage.clear();
         this.wakeOutbox = undefined;
       }
       await this.deliverIncompleteNotice();
@@ -1504,6 +1548,7 @@ export class CodexHarness implements RunHarness {
     if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
+    this.dispatchStartedAt = this.nowMs();
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -2076,8 +2121,33 @@ export class CodexHarness implements RunHarness {
       // Late historical/duplicate replay is not new work.
       if (note.turnId !== this.activeTurnId) return;
     }
-    if (note.kind === "token_usage_updated")
-      this.accountant.record(note.threadId, note.usage);
+    if (note.kind !== "token_usage_updated") return;
+    const adopted = this.accountant.record(note.threadId, note.usage);
+    if (!adopted || !adopted.pricingEvidenceComplete) return;
+    const { last, model } = adopted;
+    if (last.cachedInputTokens + last.cacheWriteInputTokens > last.inputTokens) return;
+    const lane = root ? { agent: "lead" } : this.childUsageLanes.get(note.threadId);
+    const event: Extract<HarnessEvent, { kind: "usage_record" }> = {
+      kind: "usage_record",
+      attribution: lane ?? {},
+      responseId: randomUUID(),
+      model,
+      usage: Object.freeze({
+        input_tokens: Math.max(0, last.inputTokens - last.cachedInputTokens - last.cacheWriteInputTokens),
+        cache_read_input_tokens: last.cachedInputTokens,
+        cache_creation_input_tokens: last.cacheWriteInputTokens,
+        output_tokens: last.outputTokens,
+      }),
+      sessionId: this.threadId,
+    };
+    if (lane) this.emitProjected(event, this.turnOrdinal);
+    else if (this.childSinks.has(note.threadId)) {
+      // Only adopted responses of an active harness child await startup binding.
+      // A failed startup/unregister, terminal, abort or stream failure discards them.
+      const pending = this.pendingChildUsage.get(note.threadId) ?? [];
+      pending.push(event);
+      this.pendingChildUsage.set(note.threadId, pending);
+    }
   }
 
   /** Decode a `turn/completed` note into a neutral {@link HarnessTerminal}. Outcome is
@@ -2117,11 +2187,12 @@ export class CodexHarness implements RunHarness {
     const usage = this.accountant.usageIncomplete
       ? undefined
       : attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
-    // The RUN-level cost status: subscription/metered/unreported, folded with D5's unreported
+    // The RUN-level API-equivalent cost: metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
-    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage, this.authMode);
+    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
     const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
     const limitEvidence = usageLimit ? this.rateLimits.classify(this.authMode) : undefined;
+    const durationMs = Math.max(0, Math.floor(this.nowMs() - (this.dispatchStartedAt ?? this.nowMs())));
     return {
       outcome,
       subtype,
@@ -2129,7 +2200,7 @@ export class CodexHarness implements RunHarness {
       ...(limitEvidence ? { limitEvidence } : {}),
       ...(policyRefusal ? { policyRefusal } : {}),
       usage,
-      metrics: { cost },
+      metrics: { cost, durationMs, wire: { duration_ms: durationMs } },
       failure: {
         // Deferred, invoked only at the owner's classification point. The category now comes
         // from the CLOSED classification MAP (never invented from a raw provider status), and

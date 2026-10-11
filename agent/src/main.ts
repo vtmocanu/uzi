@@ -22,6 +22,7 @@ import { CrossCheckRunner } from "./cross-check-runner.js";
 import { stubClaudeCrossCheckQueryFn } from "./claude-cross-check.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
+import { defaultQueryFn } from "./sdk-messages.js";
 import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
@@ -578,6 +579,10 @@ async function main(): Promise<void> {
     // Under the stub executor the pass never runs: the e2e spends nothing on either harness (the
     // Codex advice path takes no queryFn, so a stub queryFn could not neutralize it).
     skipDeliverySummary: config.executor === "stub",
+    // PRD #2603: the model-written "Now" summary shares the advice passes' HOME root and the
+    // production Codex factory. Omitted under the stub executor (an e2e spends nothing); a missing
+    // value means off.
+    ...(config.executor === "stub" ? {} : { nowSummary: { homeRoot: sdkHomeRoot, queryFn: defaultQueryFn, codexAdviceHarnessFactory } }),
     diskLocks,
     queueTerminalRejectionReconciliation: (runId, generation) => terminalRejections.queueReconciliation(runId, generation),
     cachesDropped,

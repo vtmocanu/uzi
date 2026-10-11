@@ -15,8 +15,9 @@ to destroy recovery inventory.
 
 The claim-scoped custody and immutable archive model remains as described in
 [ADR-1296](1296-durable-run-recovery.md). This decision separates local inventory
-cleanup authority from report retirement authority, without adding a persisted
-local receipt or tombstone.
+cleanup authority from report retirement authority. The original archive path
+adds no persisted local receipt or tombstone; the 2026-10-09 amendment below
+adds completed-publication receipt authority inside existing recovery records.
 
 ## Decision
 
@@ -72,7 +73,8 @@ for closed or discarded holds.
 ### Terminal and finalize report retirement has separate authority
 
 `Runner.recoveryInventoryPending` in `agent/src/runner.ts` protects report
-retirement. A covering authenticated ACK clears the exact custody check. Worker-driven finalize
+retirement. A covering authenticated ACK or a persisted exact-generation
+completed-publication receipt clears the exact custody check. Worker-driven finalize
 retirement additionally requires either acceptance of the exact original record offered during
 registration, temporary authority for captured lower originals during accepted registration cleanup,
 or fresh runtime-validated terminal ownership (`completed`, `failed` or `cancelled`,
@@ -118,7 +120,7 @@ authority separately. Exact owner discard can authorize report retirement alone;
 permission to delete physical clones, recovery sources or guarded journals.
 Physical source retirement continues to require the existing quiescence and
 retention rules. Guarded local recovery journal deletion requires a covering
-FINAL ACK.
+FINAL ACK or the distinct persisted completed-publication authority below.
 
 ### Server archive retention does not follow local ACK cleanup
 
@@ -134,8 +136,9 @@ bundles and journals are gone. No server archive retention policy is changed.
 
 ## Consequences and boundaries
 
-Local storage can be reclaimed without keeping a second disposition record on
-disk, while partial cleanup retains authenticated retry authority. Conservative
+Archive-backed local storage can be reclaimed without keeping a second
+disposition record on disk, while partial cleanup retains authenticated retry
+authority. Completed-publication cleanup uses a receipt in an existing record. Conservative
 attribution and ownership checks can leave bytes or reports retained when a
 reader might otherwise infer that a closed hold or terminal status is enough.
 
@@ -145,8 +148,80 @@ retention are outside this change. This decision adds no upload or release
 exception during quarantine and does not close the existing quiescence gaps.
 
 The decisions in [specs/human.md](../specs/human.md) remain in force: exact owner
-discard warns about a possible only copy (line 839); a published checkpoint ref
-is removed after the last hold releases or is discarded (line 848); physical
-clone cleanup requires the existing confirmed-quiescence boundary, including
-its disclosed gaps (line 1060); quarantine retains evidence and permits no new
-upload or release exceptions (line 1066).
+discard warns about a possible only copy; a published checkpoint ref is
+removed after the last hold releases or is discarded; physical clone cleanup
+requires the existing confirmed-quiescence boundary, including its disclosed
+gaps; quarantine retains evidence. The existing completed custody release
+exception includes the guarded triad below, without narrowing legacy release.
+
+## Amendment 2026-10-09 — completed-publication receipt authority
+
+**Status**: Implemented in API and worker, per maintainer decision #2507.
+This records implemented behavior, not live or deployment acceptance.
+[ADR-1296](1296-durable-run-recovery.md#amendment-2026-10-09--2507-synchronous-completed-publication-release)
+defines the negotiated proof and exact completing-generation release.
+
+### Persisted completion receipt is distinct from archive coverage
+
+`RecoveryCoordinator.persistCompletionReceipt` writes the validated receipt
+only into an existing exact-generation guarded recovery record for
+`issue`, `mr_rework` or `self_improve`, then authenticates its readback.
+It neither creates a post-release journal nor introduces a standalone receipt
+or tombstone. A receipt authorizes completion cleanup separately from
+`finalAcknowledged` / `finalRequest` / `coverageDigest`; it does not claim
+archive ancestry or expand an archive's coverage.
+
+A successful receipt skips terminal inventory preparation even when an
+available, thin or needs-action capture already exists. Protected terminal and
+finalize retirement must preserve the fixed original completion until the
+receipt is persisted and read back. Failure to persist retains source and
+terminal evidence; server release alone does not substitute for the local
+record. Without a valid receipt, the original capture fallback remains.
+A lost ACK after release followed by capture refusal grants no destruction
+authority and cannot turn completion into failure or reopen it. Original
+completion replay recovers the exact stored receipt. Attempted-send guards
+also protect no-outbox and reserve-failure paths from false failure, without
+inventing durable storage on those paths.
+
+### Destruction requires a separate physical boundary
+
+`RecoveryCoordinator.forgetCompletedGeneration` reads the complete
+authenticated physical journal under the generation cycle and journal lock.
+It selects the exact receipt and bound completion source, validates consistent
+branch, kind, bare identity, source attribution and canonical bundle paths,
+and preflights refs before physical source retirement. The runner's
+`withCompletionSourceBoundary` reserves execution and checks quiescence and
+credential isolation. Execution/adoption exclusion and the bare lock remain
+held through destruction, with guards rechecked at destructive steps.
+
+`GitCache.retireRunnerClone` validates the exact canonical owned clone or
+recorded attempt, expected source SHA and attribution. Eligible dirty or
+untracked leftovers of that completing source may be discarded without
+requiring WIP capture or a clean worktree. This exception does not dispose of
+sibling generations, shared owed pins, metadata with consumers, foreign or
+unknown inventory, or quarantined residue. Unknown attribution and changed
+ownership retain evidence.
+
+Completion retirement finishes source metadata only after actual physical
+disposal. Metadata completion has one bounded EIO retry. An existing durable
+`retired` attempt-ledger entry can prove disposal and authorize clearing only
+the matching old recovery journal when the source is absent and no successor
+owns it. Permanently lost retirement proof retains remaining artifacts;
+absence alone is not authority and no new crash-discovery mechanism is added.
+
+Eligible recovery/coverage and unshared owed refs are deleted using expected
+SHAs under the bare lock. Bundles and other exact-generation journals follow;
+the receipt-bearing recovery record is removed last, preserving retry authority
+on partial failure. Empty-directory removal remains nonrecursive and
+best-effort. Server archives retain their existing policy.
+
+### Boundaries
+
+This authority applies only to guarded COMPLETED `issue`, `mr_rework` and
+`self_improve` completing generations with the negotiated receipt. Older or
+successor holds gain no authority, and unstamped older completions are not
+backfilled. Failed/cancelled/parked runs and other kinds keep their prior rules.
+Quarantine can permit the existing custody release exception but blocks
+physical destruction. Bad-MAC terminal cleanup remains its separate policy.
+No intent, endpoint, discovery, driver or E2E mechanism is added; #2544,
+#2545 and #2506 remain outside this change.

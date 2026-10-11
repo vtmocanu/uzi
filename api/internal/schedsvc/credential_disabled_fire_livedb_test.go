@@ -2,6 +2,7 @@ package schedsvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -128,9 +129,17 @@ func TestScheduleFireOnceCredentialDisabledHoldsLiveDB(t *testing.T) {
 	if n := countPromptRunsForSchedule(ctx, t, pool, scID); n != 0 {
 		t.Fatalf("runs created = %d, want 0 while the pin is disabled", n)
 	}
+	// The hold matched 1 candidate, so it is the one recent_fires entry (issue #2519).
+	if got := scheduleRecentFires(t, held); len(got) != 1 || len(got[0].Started) != 0 || len(got[0].Skips) != 1 || got[0].Skips[0].Reason != string(SkipCredentialDisabled) {
+		t.Fatalf("recent_fires after first held tick = %+v, want exactly the credential_disabled hold", got)
+	}
 	sched.Boot(ctx)
-	if again := assertOnceHeldLiveDB(ctx, t, q, scID, due); !again.UpdatedAt.Time.Equal(held.UpdatedAt.Time) {
+	again := assertOnceHeldLiveDB(ctx, t, q, scID, due)
+	if !again.UpdatedAt.Time.Equal(held.UpdatedAt.Time) {
 		t.Fatalf("a second held tick rewrote the row: updated_at %v -> %v, want unchanged", held.UpdatedAt.Time, again.UpdatedAt.Time)
+	}
+	if got := scheduleRecentFires(t, again); len(got) != 1 {
+		t.Fatalf("recent_fires after second held tick has %d entries, want 1 (no churn)", len(got))
 	}
 
 	if _, err := pool.Exec(ctx, `UPDATE user_secrets SET disabled_at = NULL, enablement_rev = enablement_rev + 1 WHERE id = $1`, pin); err != nil {
@@ -148,6 +157,29 @@ func TestScheduleFireOnceCredentialDisabledHoldsLiveDB(t *testing.T) {
 	if n := countPromptRunsForSchedule(ctx, t, pool, scID); n != 1 {
 		t.Fatalf("runs created after enable = %d, want 1", n)
 	}
+	// The dispatch is prepended ahead of the earlier hold.
+	if rf := scheduleRecentFires(t, got); len(rf) != 2 || len(rf[0].Started) != 1 || len(rf[1].Started) != 0 || len(rf[1].Skips) != 1 {
+		t.Fatalf("recent_fires after enable = %+v, want [dispatch, hold]", rf)
+	}
+}
+
+// scheduleRecentFireRec is the slice of a recent_fires entry the held-fire test inspects.
+type scheduleRecentFireRec struct {
+	Started []struct {
+		RunID string `json:"run_id"`
+	} `json:"started"`
+	Skips []struct {
+		Reason string `json:"reason"`
+	} `json:"skips"`
+}
+
+func scheduleRecentFires(t *testing.T, sc store.RunSchedule) []scheduleRecentFireRec {
+	t.Helper()
+	var out []scheduleRecentFireRec
+	if err := json.Unmarshal(sc.RecentFires, &out); err != nil {
+		t.Fatalf("unmarshal recent_fires: %v (%s)", err, sc.RecentFires)
+	}
+	return out
 }
 
 // TestScheduleFireOnceHarnessDisabledHoldsWithoutForgeLiveDB (PRD #1732 D2/D15): a due ONE-TIME

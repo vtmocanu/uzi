@@ -55,9 +55,10 @@ import {
   uniqueLiveMatchMilestoneId,
 } from "../lib/runBadge";
 import { activityAge, latestActivity } from "../lib/runActivity";
+import { RunProgressCard } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
-import { deriveRunUsage } from "../lib/runUsage";
+import { deriveRunUsage, hasSideUsage } from "../lib/runUsage";
 import { statusSinceIso } from "../lib/statusSince";
 import { firstStartIso } from "../lib/runDuration";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
@@ -1453,18 +1454,34 @@ function PoolWaitPanel({
 }) {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
+  const { id: viewedRunId } = useParams<{ id: string }>();
+  const ownership = useRef({ viewedRunId, runId: run.id });
+  ownership.current = { viewedRunId, runId: run.id };
+  const resumeAction = useRef<object | null>(null);
+  useEffect(() => {
+    setBusy(false);
+    setNote("");
+    return () => { resumeAction.current = null; };
+  }, [viewedRunId]);
 
   // Only for a run actually parked on the pool. Every other status (including
   // terminal) renders nothing — there is no future-pool opt-in to offer.
   if (run.status !== "pool_wait") return null;
 
   const resume = async () => {
+    if (run.id !== viewedRunId) return;
+    const action = {};
+    resumeAction.current = action;
+    const requestRunId = run.id;
+    const isCurrent = () => resumeAction.current === action &&
+      ownership.current.viewedRunId === requestRunId && ownership.current.runId === requestRunId;
     setNote("");
     setBusy(true);
     try {
-      await api.resumeRunNow(run.id);
-      await onResumed();
+      await api.resumeRunNow(requestRunId);
+      if (isCurrent()) await onResumed();
     } catch (e) {
+      if (!isCurrent()) return;
       // 409: the run is no longer at pool_wait — already resumed to `queued`, or a
       // token was pooled between render and click. Say so gently and re-sync rather
       // than surfacing it as a failure.
@@ -1475,7 +1492,10 @@ function PoolWaitPanel({
         setNote(errorMessage(e, "Could not resume the run."));
       }
     } finally {
-      setBusy(false);
+      if (isCurrent()) {
+        resumeAction.current = null;
+        setBusy(false);
+      }
     }
   };
 
@@ -1516,7 +1536,7 @@ function PoolWaitPanel({
           {/* Non-owner: no live control — inert text, never a greyed button that 404s
               (mirrors LimitWaitPanel's non-owner Stop branch). */}
           {canSteer ? (
-            <Button variant="secondary" size="sm" disabled={busy} onClick={resume}>
+            <Button variant="secondary" size="sm" disabled={busy || run.id !== viewedRunId} onClick={resume}>
               Resume now
             </Button>
           ) : (
@@ -2010,33 +2030,38 @@ export function RunView() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const exhaustionResumeAction = useRef<{ runId: string } | null>(null);
-  useEffect(() => () => {
-    // Retire this navigation's Resume, including a return to the same run ID.
-    if (exhaustionResumeAction.current) {
-      exhaustionResumeAction.current = null;
-      setBusy(false);
-      setActionErr("");
-    }
+  const currentAction = useRef<{ runId: string } | null>(null);
+  useEffect(() => {
+    setBusy(false);
+    setActionErr("");
+    return () => {
+      // Retire every action from this visit, including a return to the same run ID.
+      currentAction.current = null;
+    };
   }, [id]);
-  const resumeExhaustedRun = async () => {
-    if (!canSteer || !workerExhausted || run?.id !== id) return;
+  const startAction = () => {
     const action = { runId: id };
-    exhaustionResumeAction.current = action;
-    const isCurrent = () => currentRunIdRef.current === action.runId &&
-      exhaustionResumeAction.current === action;
+    currentAction.current = action;
     setActionErr("");
     setBusy(true);
+    return () => currentRunIdRef.current === action.runId && currentAction.current === action;
+  };
+  const finishAction = (isCurrent: () => boolean) => {
+    if (!isCurrent()) return;
+    currentAction.current = null;
+    setBusy(false);
+  };
+  const resumeExhaustedRun = async () => {
+    if (!canSteer || !workerExhausted || run?.id !== id) return;
+    const requestRunId = id;
+    const isCurrent = startAction();
     try {
-      await api.resumeRun(action.runId);
+      await api.resumeRun(requestRunId);
       if (isCurrent()) await refreshRun();
     } catch (e) {
       if (isCurrent()) setActionErr(errorMessage(e, "Action failed"));
     } finally {
-      if (isCurrent()) {
-        exhaustionResumeAction.current = null;
-        setBusy(false);
-      }
+      finishAction(isCurrent);
     }
   };
   // PRD #841: the owner's global MR-rework default, for the per-run checkbox's effective
@@ -2087,17 +2112,16 @@ export function RunView() {
   // Returns true when the action settled, false when it threw (the error is surfaced on the
   // page banner). Callers that must react to failure — the Extend chooser keeps itself open on a
   // false so the owner's pick is not lost — read this; the rest ignore it.
-  const act = async (fn: () => Promise<unknown>): Promise<boolean> => {
-    setActionErr("");
-    setBusy(true);
+  const act = async (fn: (isCurrent: () => boolean) => Promise<unknown>): Promise<boolean> => {
+    const isCurrent = startAction();
     try {
-      await fn();
+      await fn(isCurrent);
       return true;
     } catch (e) {
-      setActionErr(errorMessage(e, "Action failed"));
+      if (isCurrent()) setActionErr(errorMessage(e, "Action failed"));
       return false;
     } finally {
-      setBusy(false);
+      finishAction(isCurrent);
     }
   };
 
@@ -2112,24 +2136,25 @@ export function RunView() {
   // surfaces as before. Bound to the run that earned it, like the discard confirmation below.
   // Resolves true only when the verdict was accepted.
   const [gateMismatch, setGateMismatch] = useState<GateMismatchState | null>(null);
+  useEffect(() => { setGateMismatch(null); }, [id]);
   const gateAct = async (expected: number | undefined, fn: () => Promise<unknown>): Promise<boolean> => {
     let accepted = false;
-    await act(async () => {
+    await act(async (isCurrent) => {
       const requestRunId = id;
       setGateMismatch(null);
       try {
         await fn();
-        accepted = true;
+        if (isCurrent()) accepted = true;
       } catch (e) {
         const current = gateRevisionMismatchCurrent(e);
         if (current === null) throw e;
-        if (currentRunIdRef.current !== requestRunId) return;
+        if (!isCurrent()) return;
         const refusal: GateMismatchState = { runId: requestRunId, current, expected };
         setGateMismatch(refusal);
         await settleWithin(refreshRun(), GATE_REFETCH_WAIT_MS);
         // The refetch has landed (or the wait ran out): the notice now anchors to the run as
         // displayed, below. Only this refusal is marked; a newer one is left alone.
-        setGateMismatch((m) => (m === refusal ? { ...m, settled: true } : m));
+        if (isCurrent()) setGateMismatch((m) => (m === refusal ? { ...m, settled: true } : m));
       }
     });
     return accepted;
@@ -2184,13 +2209,12 @@ export function RunView() {
   const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
     if (workerExhausted && !canSteer) return false;
     const requestRunId = id;
-    setActionErr("");
+    const isCurrent = startAction();
     // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
     setDiscardOutcomeErr("");
-    setBusy(true);
     try {
       await submit("cancel", "", undefined, undefined, discardPendingOutcome);
-      if (currentRunIdRef.current === requestRunId) {
+      if (isCurrent()) {
         setDiscardConfirmationRunId(null);
       }
       return true;
@@ -2199,7 +2223,7 @@ export function RunView() {
         // A finished outcome is held on the worker — do not surface the raw 409; open the
         // modal that names the loss and offers the discarding retry, but only while this is
         // still the run whose cancel the server refused.
-        if (currentRunIdRef.current === requestRunId) {
+        if (isCurrent()) {
           setDiscardConfirmationRunId(requestRunId);
         }
         return false;
@@ -2208,7 +2232,7 @@ export function RunView() {
       // modal — the page-level <Alert> is hidden behind the overlay — and the modal stays open
       // so the owner can retry or back out. Any other cancel entry point surfaces on the page.
       // Ignore a late response from a route we no longer render.
-      if (currentRunIdRef.current === requestRunId) {
+      if (isCurrent()) {
         if (discardPendingOutcome) {
           setDiscardOutcomeErr(errorMessage(e, "Action failed"));
         } else {
@@ -2217,7 +2241,7 @@ export function RunView() {
       }
       return false;
     } finally {
-      setBusy(false);
+      finishAction(isCurrent);
     }
   };
 
@@ -2507,9 +2531,9 @@ export function RunView() {
                     size="sm"
                     disabled={busy}
                     onClick={() =>
-                      act(async () => {
+                      act(async (isCurrent) => {
                         await api.resumeRun(run.id);
-                        await refreshRun();
+                        if (isCurrent()) await refreshRun();
                       })
                     }
                   >
@@ -2713,6 +2737,15 @@ export function RunView() {
         }
       />
 
+      {/* PRD #2602 M2: the progress card under the header's budget facts — percent, the
+          segmented plan track, the active role's phase, or the state flag that replaces a
+          misleading number. Renders nothing without a server-derived progress (terminal
+          runs, older servers). The role line uses the now-line's activity (live frames),
+          falling back to the DTO's current_activity before the first frame arrives. The
+          card itself shows that role only while one is at work (percent, stalled): a
+          waiting, parked, queued or planning run has no active role. */}
+      <RunProgressCard run={run} activity={activity ?? run.current_activity ?? null} />
+
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
           parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
           because the panel below already carries the message for everyone else. The
@@ -2815,9 +2848,9 @@ export function RunView() {
         busy={busy}
         canSteer={canSteer}
         onResume={() =>
-          act(async () => {
+          act(async (isCurrent) => {
             await api.resumeRun(run.id);
-            await refreshRun();
+            if (isCurrent()) await refreshRun();
           })
         }
         onStop={() => cancelRun()}
@@ -3180,7 +3213,7 @@ export function RunView() {
         refreshRun={refreshRun}
       />
 
-      {(usage.hasLiveTokens || usage.hasConfirmed) && (
+      {(usage.hasLiveTokens || usage.hasConfirmed || hasSideUsage(usage)) && (
         <Card className="p-4">
           {/* PRD #1429 M4b (D7): the server-truthed per-run cost_status, distinct from
               the client-derived `usage` above — "" on a pre-M1 run reads defensively

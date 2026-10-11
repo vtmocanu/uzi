@@ -71,6 +71,18 @@ func (c *HTTPClient) AdminListRuns(ctx context.Context) ([]apitypes.RunListItemD
 	return env.Runs, nil
 }
 
+// AdminListRunSummaries is the compact admin run list (issue #2661):
+// GET /api/admin/runs?view=summary.
+func (c *HTTPClient) AdminListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error) {
+	var env struct {
+		Runs []apitypes.RunSummaryItemDTO `json:"runs"`
+	}
+	if err := c.get(ctx, "/api/admin/runs?view=summary", &env); err != nil {
+		return nil, err
+	}
+	return env.Runs, nil
+}
+
 // AdminHealth reads the admin health document (PRD #1484 M3): GET /api/admin/health,
 // in the RequireUser + RequireAdminRO group — so a uza_ (admin_ro) token reads it and a
 // masked uzc_/non-admin session is a 403 (exit 3). The reply is the HealthDocDTO directly

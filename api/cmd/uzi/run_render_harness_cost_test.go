@@ -36,17 +36,17 @@ func TestRenderRunDetailCostMetered(t *testing.T) {
 	}
 }
 
-// TestRenderRunDetailCostSubscription: a subscription-status run renders the word
-// "subscription" — never a dollar figure, never $0 — even at cost_usd == 0.
+// TestRenderRunDetailCostSubscription: a subscription-status run renders tokens with
+// "no estimate" — never a dollar figure, never $0 — even at cost_usd == 0.
 func TestRenderRunDetailCostSubscription(t *testing.T) {
 	out := renderDetail(t, apitypes.RunDTO{
 		ID: "run-1", Kind: "issue", Status: "completed",
-		Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 500},
+		Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 7.89, InputTokens: 500},
 	})
-	if !strings.Contains(out, "COST") || !strings.Contains(out, "subscription") {
-		t.Errorf("a subscription-status run should render COST subscription, got:\n%s", out)
+	if !strings.Contains(out, "COST") || !strings.Contains(out, "no estimate") {
+		t.Errorf("a subscription-status run should render COST no estimate, got:\n%s", out)
 	}
-	if strings.Contains(out, "$0") {
+	if strings.Contains(out, "$") {
 		t.Errorf("a subscription-status run must never render a dollar figure:\n%s", out)
 	}
 }
@@ -61,7 +61,7 @@ func TestRenderRunDetailCostUnreported(t *testing.T) {
 	for _, status := range []string{"unreported", "", "future-v2"} {
 		out := renderDetail(t, apitypes.RunDTO{
 			ID: "run-1", Kind: "issue", Status: "completed",
-			Usage: &apitypes.UsageDTO{CostStatus: status, CostUSD: 0, InputTokens: 500, OutputTokens: 300},
+			Usage: &apitypes.UsageDTO{CostStatus: status, CostUSD: 7.89, InputTokens: 500, OutputTokens: 300},
 		})
 		if !strings.Contains(out, "cost unavailable") {
 			t.Errorf("cost_status %q: expected 'cost unavailable', got:\n%s", status, out)

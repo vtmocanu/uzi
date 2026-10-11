@@ -197,7 +197,7 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     expect(meta.children[0].className).not.toMatch(/\b(relative|absolute)\b/);
     // A space precedes every hidden dot, so textContent and screen readers keep items apart.
     expect(meta.textContent).toContain(" ·worker A");
-    expect(meta.textContent).toContain("subscription");
+    expect(meta.textContent).toContain("cost n/a");
   });
 
   it("lets a long repo path truncate before the issue reference clips", () => {

@@ -8,6 +8,7 @@
 #   4. NO inspiration/ under /opt/uzi-src  (the large submodules are excluded)
 #   5. /opt/uzi-src is entirely ROOT-OWNED (Decision 5 — the non-root agent can't write it)
 #   6. read-only-to-agent: a write as the image's non-root user is DENIED
+#   7. NO .uzi/ under /opt/uzi-src (worker scratch content is excluded)
 # plus /opt/uzi-src/BUILD_INFO is present.
 # Invariants 5 + 6 are FULL-mode only (they need the real image's `uzi` user + USER
 # switch; the light busybox reproduction runs as root and would false-pass).
@@ -59,8 +60,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Seed harmless scratch content before any build so the .uzi exclusion is exercised
+# even in a clean checkout. Cleanup owns only mktemp dirs, never their parents.
+SCRATCH="$REPO_ROOT/.uzi/scratch"
+if ! mkdir -p "$SCRATCH"; then
+  echo "FAIL could not create scratch directory: $SCRATCH"
+  exit 1
+fi
+if ! SENTINEL_DIR="$(mktemp -d "$SCRATCH/image-content-sentinel.XXXXXX")"; then
+  echo "FAIL could not create scratch sentinel directory"
+  exit 1
+fi
+TMPS+=("$SENTINEL_DIR")
+if ! printf 'harmless image-content exclusion sentinel\n' > "$SENTINEL_DIR/sentinel"; then
+  echo "FAIL could not write scratch sentinel"
+  exit 1
+fi
+
 # have <regex> — grep the current $LISTING (a caller local; bash dynamic scoping).
-have() { printf '%s\n' "$LISTING" | grep -qE "$1"; }
+# Consume the whole listing to avoid SIGPIPE from an early match under pipefail.
+have() { printf '%s\n' "$LISTING" | grep -E "$1" >/dev/null; }
 
 # check_one <template> — returns 0 pass / 1 fail.
 check_one() {
@@ -78,18 +97,28 @@ check_one() {
   else
     echo "== light build: bake + real dockerignore on busybox ($TEMPLATE) =="
     local TMP
-    TMP="$(mktemp -d)"
+    if ! TMP="$(mktemp -d "$SCRATCH/image-content-dockerfile.XXXXXX")"; then
+      echo "FAIL could not create temporary Dockerfile directory for $TEMPLATE"
+      return 1
+    fi
     TMPS+=("$TMP")
-    cat > "$TMP/Dockerfile.check" <<'EOF'
+    if ! cat > "$TMP/Dockerfile.check" <<'EOF'
 # syntax=docker/dockerfile:1
 FROM busybox:latest
 ARG UZI_SRC_SHA=
 COPY . /opt/uzi-src
 RUN printf 'uzi source baked into the worker image (PRD #39 chat)\ncommit: %s\n' "${UZI_SRC_SHA:-unknown}" > /opt/uzi-src/BUILD_INFO
 EOF
+    then
+      echo "FAIL could not write temporary Dockerfile for $TEMPLATE"
+      return 1
+    fi
     # Faithfully apply the REAL per-Dockerfile ignore: BuildKit keys it to the
     # Dockerfile's name, so copy it beside the check Dockerfile under the matching name.
-    cp "$TDIR/Dockerfile.dockerignore" "$TMP/Dockerfile.check.dockerignore"
+    if ! cp "$TDIR/Dockerfile.dockerignore" "$TMP/Dockerfile.check.dockerignore"; then
+      echo "FAIL could not copy dockerignore for $TEMPLATE"
+      return 1
+    fi
     DOCKERFILE="$TMP/Dockerfile.check"
   fi
 
@@ -106,7 +135,10 @@ EOF
   # (/opt/uzi-src/…), and scoping the listing to /opt/uzi-src keeps the .env probe from
   # false-positiving on an OS/nix dotfile elsewhere in the real image.
   local LISTING
-  LISTING="$(docker run --rm --entrypoint sh "$IMAGE" -c 'find /opt/uzi-src' 2>/dev/null || true)"
+  if ! LISTING="$(docker run --rm --entrypoint sh "$IMAGE" -c 'find /opt/uzi-src' 2>/dev/null)"; then
+    echo "FAIL could not list baked source for $TEMPLATE"
+    return 1
+  fi
 
   local fail=0
   # find has no trailing slash on dirs, so match "<path>" or "<path>/…" via (/|$).
@@ -125,6 +157,7 @@ EOF
   fi
 
   if have '^/opt/uzi-src/inspiration(/|$)'; then echo "FAIL inspiration/ leaked into the baked source"; fail=1; else echo "ok   no inspiration/ under the baked source"; fi
+  if have '^/opt/uzi-src/\.uzi(/|$)'; then echo "FAIL .uzi/ leaked into the baked source"; fail=1; else echo "ok   no .uzi/ under the baked source"; fi
 
   # Ownership + read-only-to-agent (Decision 5) — FULL MODE ONLY, and per template. The
   # light check builds its OWN busybox Dockerfile.check with no USER switch (runs as

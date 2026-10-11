@@ -25,6 +25,7 @@ function fixture(options: {
   hang?: boolean; startupError?: boolean; disposalError?: boolean; text?: string;
   startup?: PrDescriptionEvalLaunchTestSeams["startup"];
   ignoreTerm?: boolean;
+  closeGate?: Promise<void>;
 } = {}) {
   const events: string[] = [];
   let root = "";
@@ -40,12 +41,29 @@ function fixture(options: {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   Object.assign(child, { stdin, stdout, stderr: new PassThrough(), pid: 42 });
+  // A real child closes once: later signals are still recorded, but never schedule a second exit/close.
+  let closing = false;
+  let closed = false;
+  let scheduled = 0;
+  let statted = 0;
+  const rootCheckWaiters: (() => void)[] = [];
+  const settleRootChecks = () => {
+    if (statted !== scheduled) return;
+    for (const resolve of rootCheckWaiters.splice(0)) resolve();
+  };
   child.kill = (signal) => {
     events.push(String(signal));
     if (options.ignoreTerm && signal === "SIGTERM") return true;
-    void fs.stat(root).then(() => {
+    if (closing || closed) return true;
+    closing = true;
+    scheduled += 1;
+    void fs.stat(root).then(async () => {
+      statted += 1;
+      settleRootChecks();
+      await options.closeGate;
       events.push("exit");
       stdout.end();
+      closed = true;
       child.emit("close", 0, signal);
     });
     return true;
@@ -112,7 +130,10 @@ function fixture(options: {
     },
   });
   return {
-    factory, controller, ready, running, events,
+    factory, controller, ready, running, events, child,
+    rootChecksSettled() {
+      return new Promise<void>((resolve) => { rootCheckWaiters.push(resolve); settleRootChecks(); });
+    },
     async inspect() {
       config = await fs.readFile(path.join(launchEnv.CODEX_HOME!, "config.toml"), "utf8");
       assert.equal(bin, CODEX_BIN);
@@ -213,6 +234,29 @@ test("active cancellation cleans up and escalates TERM to KILL", async () => {
   const kill = f.events.indexOf("SIGKILL");
   assert.ok(term >= 0 && kill >= 0 && term < kill);
   await f.removed();
+});
+
+test("TERM then KILL before the scheduled close emits exit and close exactly once", async () => {
+  let release!: () => void;
+  const closeGate = new Promise<void>((resolve) => { release = resolve; });
+  const f = await fixture({ hang: true, closeGate });
+  let closes = 0;
+  f.child.on("close", () => { closes += 1; });
+  const pass = f.factory.run(request(), policy);
+  const rejected = assert.rejects(pass);
+  await f.running;
+  f.controller.abort();
+  for (let i = 0; i < 200 && !f.events.includes("SIGKILL"); i++) {
+    await new Promise<void>((done) => setTimeout(done, 5));
+  }
+  assert.ok(f.events.indexOf("SIGTERM") >= 0 && f.events.indexOf("SIGTERM") < f.events.indexOf("SIGKILL"));
+  await f.rootChecksSettled();
+  release();
+  await rejected;
+  await f.removed();
+  await new Promise<void>((done) => setImmediate(done));
+  assert.equal(f.events.filter((event) => event === "exit").length, 1);
+  assert.equal(closes, 1);
 });
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {

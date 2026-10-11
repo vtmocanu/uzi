@@ -120,7 +120,7 @@ func SkewWarning(cliVersion, serverVersion, owner string) (string, bool) {
 	}
 	return fmt.Sprintf(
 		"uzi: CLI %s is behind server %s; some fields may be missing. Run: brew upgrade %s",
-		cliVersion, serverVersion, formula), true
+		cliVersion, serverVersion, "vtmocanu/tap/"+formula), true
 }
 
 // CompareServerVersion reports how the CLI version compares to the server version

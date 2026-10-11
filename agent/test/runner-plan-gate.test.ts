@@ -892,7 +892,9 @@ describe("RunRunner — plan gate + steering end to end", () => {
 
 describe("RunRunner — required plan cross-check fallback", () => {
   for (const codexLead of [false, true]) {
-    it(`parks a required ${codexLead ? "Codex" : "Claude"} autopilot plan and stops after human refusal`, async () => {
+    it(`parks a required ${codexLead ? "Codex" : "Claude"} autopilot plan and stops after human refusal`, {
+      skip: process.platform !== "linux" && "planning capture uses Linux proc-fd paths; non-Linux refuses before the checker",
+    }, async () => {
       client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1"];
       api.gateRevisions = true;
       api.checkedTransport = true;

@@ -6,6 +6,8 @@
 **Amends**: the write-once Codex run binding of [PRD #1147](../prds/done/1147-codex-credentials-foundation.md) (`FreezeRunCodexBinding` and `SetRunCodexFrozenIdentity`, `api/internal/store/queries/codex_binding.sql`). Both statements are unchanged and still refuse every change; this ADR adds one narrowly fenced statement beside them.
 **PRD**: [prds/1590-codex-quarantine-claim-hold.md](../prds/1590-codex-quarantine-claim-hold.md) (GitHub issue [vtmocanu/uzi#1590](https://github.com/vtmocanu/uzi/issues/1590)). The PRD carries the milestones, the verified anchors and the full Decision Log (D1-D7); this ADR carries D1, D4 and D5, the decisions a future change to Codex bindings, holds or custody must not undo.
 
+The in-flight boundary extension is recorded in [ADR-1766's #1595 amendment](1766-codex-vault-lock-park.md#account-unavailable-boundary-amendment-issue-1595-2026-10-10); this ADR's classifier and same-identity re-admission remain unchanged.
+
 ## Decision (summary)
 
 A Codex subscription run whose provider account is **quarantined**, or whose alias is

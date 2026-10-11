@@ -282,7 +282,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 
 	cmd.AddCommand(
-		newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunWaitCmd(env, gf),
+		newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunPlanCmd(env, gf), newRunWaitCmd(env, gf),
 		newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf),
 		newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf),
 		newRunExtendCmd(env, gf),
@@ -510,15 +510,8 @@ type answerBody struct {
 
 // questionPayload is the part of a `question` run-message the CLI reads.
 type questionPayload struct {
-	QuestionID string `json:"question_id"`
-	Questions  []struct {
-		Question string `json:"question"`
-		Header   string `json:"header"`
-		Options  []struct {
-			Label       string `json:"label"`
-			Description string `json:"description"`
-		} `json:"options"`
-	} `json:"questions"`
+	QuestionID string           `json:"question_id"`
+	Questions  []answerQuestion `json:"questions"`
 }
 
 // openQuestion reads the run's newest `question` message and returns its payload.
@@ -600,7 +593,8 @@ func nonEmpty(in []string) []string {
 // map[string]json.RawMessage makes its key set the source of truth (self-maintaining as
 // the DTO grows), gives `null → empty line` for free, and makes the non-scalar case a
 // one-byte test — a RawMessage whose first non-space byte is `[` or `{` (the four array
-// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress)
+// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress, plus
+// the progress object while a run is non-terminal; null on a terminal run prints an empty line)
 // has no meaningful one-line raw form and is a usage error. An unknown field is likewise
 // a usage error (exit 2), never a silent blank.
 //
