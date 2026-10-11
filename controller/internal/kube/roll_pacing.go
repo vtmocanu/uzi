@@ -42,20 +42,21 @@ type rollMarker struct {
 	Completed       bool         `json:"completed"`
 }
 type rollEntry struct {
-	w        protocol.DesiredWorker
-	o        reconcile.ObservedWorker
-	target   *appsv1.Deployment
-	dep      *appsv1.Deployment
-	marker   *rollMarker
-	pods     []corev1.Pod
-	sets     map[string]appsv1.ReplicaSet
-	coverage rollCoverage
-	ns       string
-	drift    bool
-	admitted bool
-	blocked  string
-	recovery bool
-	claim    *corev1.PersistentVolumeClaim
+	w          protocol.DesiredWorker
+	o          reconcile.ObservedWorker
+	target     *appsv1.Deployment
+	dep        *appsv1.Deployment
+	marker     *rollMarker
+	pods       []corev1.Pod
+	volumeRefs map[string]bool
+	sets       map[string]appsv1.ReplicaSet
+	coverage   rollCoverage
+	ns         string
+	drift      bool
+	admitted   bool
+	blocked    string
+	recovery   bool
+	claim      *corev1.PersistentVolumeClaim
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -224,6 +225,11 @@ func pacingText(s string) *string {
 	return &s
 }
 func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEntry) {
+	for _, e := range pool {
+		if e.blocked == "" && m.promoted(t, e) {
+			m.releaseRollHold(ctx, t, e)
+		}
+	}
 	sort.Slice(pool, func(i, j int) bool {
 		if pool[i].w.Busy != pool[j].w.Busy {
 			return !pool[i].w.Busy
@@ -496,7 +502,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			p.State = "completed"
 			m.releaseRollHold(ctx, t, e)
 			e.admitted = true
-			if e.dep == nil && canary == "" {
+			if e.dep == nil && canary == "" && !independentRebuild(e) {
 				canary = e.w.ID
 				id := canary
 				p.CanaryID = &id
@@ -616,13 +622,13 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 	return false
 }
 func (m *Materializer) releaseRollHold(ctx context.Context, t *rollTick, e *rollEntry) {
-	if !imageRollDrain(e.w) || (e.marker != nil && !e.drift) || e.admitted {
+	if !imageRollDrain(e.w) || e.blocked != "" {
 		return
 	}
 	copy := *e
 	copy.w.DrainingSince = nil
 	copy.w.DrainingReason = nil
-	if !m.oldUsable(t, &copy) {
+	if !m.promoted(t, e) && ((e.marker != nil && !e.drift) || e.admitted || !m.oldUsable(t, &copy)) {
 		return
 	}
 	if c, ok := m.cordoner.(rollCordoner); ok {
@@ -630,6 +636,8 @@ func (m *Materializer) releaseRollHold(ctx context.Context, t *rollTick, e *roll
 			e.blocked = "roll-owned release unconfirmed; re-poll required"
 			t.uncertain[coverageKey(e.coverage)] = true
 			t.outcomes[e.w.ID].BlockingReason = pacingText(e.blocked)
+		} else {
+			e.w.DrainingSince, e.w.DrainingReason = nil, nil
 		}
 	}
 }
@@ -638,6 +646,9 @@ func (m *Materializer) confirmAdmission(ctx context.Context, t *rollTick, e *rol
 		return nil
 	}
 	p := t.outcomes[e.w.ID]
+	if independentRebuild(e) && p.State == "completed" {
+		return nil // An unchanged independent recovery is not an image cohort.
+	}
 	r := &rollMarker{Version: 1, Hash: e.target.Spec.Template.Annotations[AnnotationSpecHash], Image: workerImage(e.target), TargetVersion: p.TargetVersion, Coverage: e.coverage, Canary: p.CanaryID != nil && *p.CanaryID == e.w.ID}
 	if proof := e.w.RollEvidence; proof != nil {
 		if proof.RegisterNonce != nil {
@@ -656,9 +667,14 @@ func (m *Materializer) confirmAdmission(ctx context.Context, t *rollTick, e *rol
 	return m.reserveRoll(ctx, e, r)
 }
 
+func independentRebuild(e *rollEntry) bool {
+	return e.dep == nil && e.marker == nil && e.w.RollEvidence != nil && e.w.RollEvidence.Registered &&
+		(maintenanceActive(e.w) || (e.w.DiskPressure && !imageRollDrain(e.w)))
+}
+
 // Independent maintenance creates no image-roll participant. Existing image-roll
 // reservations are retained by the caller through the retained data claim.
-func (m *Materializer) reserveMaintenanceRoll(ctx context.Context, e *rollEntry) error {
+func (m *Materializer) reserveMaintenanceRoll(e *rollEntry) error {
 	if e.marker == nil && e.drift && !m.drain.ForceRoll {
 		return fmt.Errorf("maintenance image admission unavailable; explicit recovery required")
 	}
@@ -686,7 +702,7 @@ func (m *Materializer) rollDrain(ctx context.Context, id string) error {
 	return c.RequestDrainWithReason(ctx, id, "image_roll")
 }
 func (m *Materializer) requestWorkerDrain(ctx context.Context, w protocol.DesiredWorker) error {
-	if rollFrom(ctx, w.ID) != nil && !w.Ephemeral {
+	if e := rollFrom(ctx, w.ID); e != nil && !w.Ephemeral && (e.drift || (e.marker != nil && !e.marker.Completed)) {
 		return m.rollDrain(ctx, w.ID)
 	}
 	return m.cordoner.RequestDrain(ctx, w.ID)
@@ -695,7 +711,7 @@ func (m *Materializer) rollDespiteBusy(ctx context.Context, w protocol.DesiredWo
 	if m.drain.ForceRoll {
 		return true
 	}
-	if e := rollFrom(ctx, w.ID); e != nil {
+	if e := rollFrom(ctx, w.ID); e != nil && (e.drift || (e.marker != nil && !e.marker.Completed) || imageRollDrain(w)) {
 		return e.admitted && e.marker != nil && imageRollDrain(w) && m.drain.Deadline > 0 && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline
 	}
 	// Independent pressure recycling retains its own drain policy.
@@ -1070,14 +1086,20 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		if e.dep != nil && e.marker != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 {
 			e.recovery = true
 		}
-		if e.w.RollEvidence != nil && maintenanceActive(e.w) && e.w.DindMaintenance.Phase != "requested" && e.w.DindMaintenance.Phase != "ready" && e.dep == nil && e.marker == nil {
+		if e.w.RollEvidence != nil && maintenanceActive(e.w) && e.w.DindMaintenance.Phase != "requested" && e.w.DindMaintenance.Phase != "ready" && e.dep == nil && e.marker == nil && imageRollDrain(e.w) {
 			e.blocked = "maintenance reservation missing; explicit recovery required"
 		}
 		e.sets = map[string]appsv1.ReplicaSet{}
 		if e.dep != nil && sets[e.dep.UID] != nil {
 			e.sets = sets[e.dep.UID]
 		}
+		e.volumeRefs = map[string]bool{}
 		for _, pod := range pods {
+			for _, volume := range pod.Spec.Volumes {
+				if volume.PersistentVolumeClaim != nil {
+					e.volumeRefs[volume.PersistentVolumeClaim.ClaimName] = true
+				}
+			}
 			if id, ours := IsOurs(pod.Labels); ours && id == e.w.ID {
 				e.pods = append(e.pods, pod)
 			}

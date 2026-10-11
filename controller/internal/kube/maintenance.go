@@ -140,7 +140,7 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 				return true, nil
 			}
 			if e := rollFrom(ctx, w.ID); e != nil && !m.drain.ForceRoll {
-				if err := m.reserveMaintenanceRoll(ctx, e); err != nil {
+				if err := m.reserveMaintenanceRoll(e); err != nil {
 					return true, err
 				}
 				// reservation advanced Deployment RV after the observation above.
@@ -219,6 +219,9 @@ func (m *Materializer) legacyRecycleDue(w protocol.DesiredWorker, o reconcile.Ob
 }
 
 func (m *Materializer) reconcileReplacement(ctx context.Context, w protocol.DesiredWorker, o reconcile.ObservedWorker) error {
+	if e := rollFrom(ctx, w.ID); e != nil && !e.admitted && !m.drain.ForceRoll {
+		return nil // Cleanup may progress; a replacement still needs its image turn.
+	}
 	// Disable only the legacy triggers in this local copy during fenced rebuilding.
 	w.DindMaintenance = nil
 	w.DiskPressure = false

@@ -265,6 +265,12 @@ func TestRollDinDMirrorRecovery(t *testing.T) {
 			cfg := dockerTestConfig()
 			w := evidence(desiredDocker("w1"), m5Now)
 			w.DindMaintenance = &protocol.DindMaintenance{Phase: "recycling", Fenced: true, DeploymentUID: "original-deployment", PVCUID: "old-dind"}
+			if scenario == "missing" {
+				// A visible roll-owned drain distinguishes an admitted image turn
+				// from independent maintenance with no image reservation at all.
+				at := m5Now.Add(-time.Hour)
+				w.DrainingSince, w.DrainingReason = &at, token("image_roll")
+			}
 			d := markedDeployment(t, cfg, w, true)
 			var objects []runtime.Object
 			var data *corev1.PersistentVolumeClaim

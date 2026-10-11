@@ -686,7 +686,7 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 		return nil
 	}
 
-	if w.Busy && rollFrom(ctx, w.ID) != nil && !m.drain.ForceRoll {
+	if e := rollFrom(ctx, w.ID); w.Busy && e != nil && (e.drift || (e.marker != nil && !e.marker.Completed)) && !m.drain.ForceRoll {
 		if err := m.rollDrain(ctx, w.ID); err != nil {
 			return fmt.Errorf("recycle cordon confirmation unconfirmed: %w", err)
 		}
@@ -714,7 +714,7 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// including a terminating one, must be absent before any PVC is deleted.
 	retained := false
 	if e := rollFrom(ctx, w.ID); e != nil {
-		if err := m.reserveMaintenanceRoll(ctx, e); err != nil {
+		if err := m.reserveMaintenanceRoll(e); err != nil {
 			return err
 		}
 	}
@@ -764,6 +764,18 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// proxy).
 	if vols.Data && obs.HasDataPVC && obs.DataPVCLive {
 		names = append(names, dataPVCName(w.ID))
+	}
+	// rollSnapshot scans every namespace pod, including terminating and unmanaged
+	// pods. Unknown snapshot evidence or any selected mount defers this tick.
+	if e := rollFrom(ctx, w.ID); e != nil {
+		if e.volumeRefs == nil {
+			return fmt.Errorf("recycle volume references unavailable")
+		}
+		for _, name := range names {
+			if e.volumeRefs[name] {
+				return nil
+			}
+		}
 	}
 	for _, name := range names {
 		if err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
