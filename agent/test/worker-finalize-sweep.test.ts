@@ -16,6 +16,7 @@ import { client as recoveryClient, git, TOKEN, fakeGitlab, installHarness, runne
 installHarness();
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { nullLogger } from "./helpers.js";
+import { reportProofTiming } from "../src/report-proof-timing.js";
 import { mkSweepOutbox, pollUntil, startSweepWorker, sweepClient } from "./worker-sweep-rig.js";
 
 const RUN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -569,16 +570,32 @@ it("queued lock rechecks admission/execution and terminal, abort cancels stale d
   }
 });
 
-it("five-second pass deadline bounds a queued deletion and prevents unlink after lock release", async () => {
-  const { outbox } = await rig();
-  await outbox.journalFinalize(RUN, 1);
-  const release = (outbox as unknown as { tryRunLock(id: string): (() => void) | null }).tryRunLock(RUN)!;
-  const w = worker(outbox, { recoveryInventoryPending: async () => false });
-  const start = Date.now();
-  try {
-    await w.sweepPendingFinalizes();
-    assert.ok(Date.now() - start < 6000, "pass stops awaiting lock");
-  } finally { release(); }
-  await new Promise<void>(resolve => setImmediate(resolve));
-  assert.deepEqual(outbox.listPendingFinalizeGenerations(), [entry()]);
-});
+/** One worker bound is made short and the other long, so only the bound under test can end the pass.
+ * The pass blocks on a held per-run lock; the abort reason seen by the deletion names the bound. */
+for (const bound of ["authority", "pass"] as const) {
+  it(`${bound} deadline alone bounds a queued deletion and prevents unlink after lock release`, async t => {
+    const { outbox } = await rig();
+    await outbox.journalFinalize(RUN, 1);
+    const release = (outbox as unknown as { tryRunLock(id: string): (() => void) | null }).tryRunLock(RUN)!;
+    t.mock.method(reportProofTiming, "finalizeAuthorityMs", () => bound === "authority" ? 150 : 60_000);
+    t.mock.method(reportProofTiming, "finalizePassMs", () => bound === "pass" ? 150 : 60_000);
+    const retire = outbox.retireFinalizeIfEligible.bind(outbox);
+    let seen: AbortSignal | undefined;
+    t.mock.method(outbox, "retireFinalizeIfEligible", (...args: Parameters<typeof retire>) => {
+      seen = args[3];
+      return retire(...args);
+    });
+    const w = worker(outbox, { recoveryInventoryPending: async () => false });
+    let guard: NodeJS.Timeout | undefined;
+    try {
+      // The guard only fires when the bound under test is missing; it is not a pass condition.
+      await Promise.race([w.sweepPendingFinalizes(), new Promise<never>((_, reject) => {
+        guard = setTimeout(() => reject(new Error(`${bound} timer did not end the pass`)), 10_000);
+      })]);
+    } finally { clearTimeout(guard); release(); }
+    assert.equal(seen?.aborted, true);
+    assert.equal((seen?.reason as Error | undefined)?.message, `finalize ${bound} deadline`);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(outbox.listPendingFinalizeGenerations(), [entry()]);
+  });
+}

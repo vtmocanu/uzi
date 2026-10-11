@@ -45,30 +45,31 @@ function injectStep(t: TestContext, f: Awaited<ReturnType<typeof reportRetiremen
 it("a proof crossing the default 1000 ms budget is retained, each attempt with a fresh deadline", linux, async t => {
   const f = await reportRetirementFixture(t);
   const clock = offsetClock(t);
-  const state = injectStep(t, f, () => clock.advance(1_001));
-  for (let n = 1; n <= 3; n++) {
-    await f.replay();
-    assert.equal(state.reached, n, "the injected step ran inside this attempt's proof");
-    assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, f.generation), true, "expired proof retains the report");
-  }
-  assert.equal(state.deadlines.length, 3);
-  assert.ok(state.deadlines[1]! > state.deadlines[0]! && state.deadlines[2]! > state.deadlines[1]!,
-    "every retry computes a fresh deadline");
-  clock.restore();
+  try {
+    const state = injectStep(t, f, () => clock.advance(1_001));
+    for (let n = 1; n <= 3; n++) {
+      await f.replay();
+      assert.equal(state.reached, n, "the injected step ran inside this attempt's proof");
+      assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, f.generation), true, "expired proof retains the report");
+    }
+    assert.equal(state.deadlines.length, 3);
+    assert.ok(state.deadlines[1]! > state.deadlines[0]! && state.deadlines[2]! > state.deadlines[1]!,
+      "every retry computes a fresh deadline");
+  } finally { clock.restore(); }
   await f.assertCustody();
 });
 
 it("the same proof retires under the positive-stage headroom", linux, async t => {
   const f = await reportRetirementFixture(t);
   const clock = offsetClock(t);
-  const state = injectStep(t, f, () => clock.advance(1_001));
   const restore = f.useHeadroom();
-  const attempts = await f.positiveStage("headroom proof", f.replay,
-    () => !f.outbox.hasPendingTerminal(f.claim.run_id, f.generation), f.assertPending);
-  restore();
-  assert.equal(attempts, 1);
-  assert.equal(state.reached, 1, "the clock was pushed past the default budget inside the proof");
-  clock.restore();
+  try {
+    const state = injectStep(t, f, () => clock.advance(1_001));
+    const attempts = await f.positiveStage("headroom proof", f.replay,
+      () => !f.outbox.hasPendingTerminal(f.claim.run_id, f.generation), f.assertPending);
+    assert.equal(attempts, 1);
+    assert.equal(state.reached, 1, "the clock was pushed past the default budget inside the proof");
+  } finally { clock.restore(); restore(); }
   await f.assertCustody();
 });
 
@@ -76,14 +77,14 @@ it("an earlier caller deadline still wins over headroom", linux, async t => {
   const f = await reportRetirementFixture(t);
   const captured = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
   const clock = offsetClock(t);
-  const state = injectStep(t, f, () => clock.advance(501));
   const restore = f.useHeadroom();
-  const callerDeadline = Date.now() + 500;
-  await f.r.retireRecoveryReport(f.claim.run_id, f.generation, { ...captured.context, deadline: callerDeadline });
-  restore();
-  assert.equal(state.reached, 1);
-  assert.deepEqual(state.deadlines, [callerDeadline], "proof budget is the caller deadline, not the headroom");
-  clock.restore();
+  try {
+    const state = injectStep(t, f, () => clock.advance(501));
+    const callerDeadline = Date.now() + 500;
+    await f.r.retireRecoveryReport(f.claim.run_id, f.generation, { ...captured.context, deadline: callerDeadline });
+    assert.equal(state.reached, 1);
+    assert.deepEqual(state.deadlines, [callerDeadline], "proof budget is the caller deadline, not the headroom");
+  } finally { clock.restore(); restore(); }
   await f.assertPending();
 });
 
@@ -91,11 +92,12 @@ it("cancellation still aborts under headroom", linux, async t => {
   const f = await reportRetirementFixture(t);
   const captured = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
   const cancel = new AbortController();
-  const state = injectStep(t, f, () => cancel.abort(new Error("test cancel")));
   const restore = f.useHeadroom();
-  await f.r.retireRecoveryReport(f.claim.run_id, f.generation, { ...captured.context, signal: cancel.signal });
-  restore();
-  assert.equal(state.reached, 1);
+  try {
+    const state = injectStep(t, f, () => cancel.abort(new Error("test cancel")));
+    await f.r.retireRecoveryReport(f.claim.run_id, f.generation, { ...captured.context, signal: cancel.signal });
+    assert.equal(state.reached, 1);
+  } finally { restore(); }
   await f.assertPending();
 });
 
@@ -106,11 +108,12 @@ it("without the helper the production proof budget is 1000 ms", linux, async t =
   assert.equal(reportProofTiming.finalizePassMs(), 5_000);
   const captured = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
   const clock = offsetClock(t, true);
-  const state = injectStep(t, f, () => clock.advance(1_001));
-  const before = Date.now();
-  await f.r.retireRecoveryReport(f.claim.run_id, f.generation, captured.context);
-  assert.equal(state.reached, 1);
-  assert.deepEqual(state.deadlines, [before + 1_000], "the proof's own deadline is exactly now + 1000 ms");
-  clock.restore();
+  try {
+    const state = injectStep(t, f, () => clock.advance(1_001));
+    const before = Date.now();
+    await f.r.retireRecoveryReport(f.claim.run_id, f.generation, captured.context);
+    assert.equal(state.reached, 1);
+    assert.deepEqual(state.deadlines, [before + 1_000], "the proof's own deadline is exactly now + 1000 ms");
+  } finally { clock.restore(); }
   await f.assertPending();
 });

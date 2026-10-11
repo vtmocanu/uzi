@@ -111,45 +111,60 @@ it("worker archive branch rotates past overflow and an unsettled slow sibling", 
   await f.assertCustody();
 });
 
-it("worker quarantine includes started archive unlink beyond deadline", {
-  skip: process.platform !== "linux" && "unlink barrier requires Linux procfs/no-follow report content proof",
-}, async t => {
-  const f = await reportRetirementFixture(t);
-  await f.replayPositive();
-  await f.outbox.journalFinalize(f.claim.run_id, 2);
-  const w = retirementWorker(f);
-  const entered = deferred(), release = deferred();
-  const unlink = fs.unlink.bind(fs);
-  let attempts = 0;
-  t.mock.method(fs, "unlink", async (...args: Parameters<typeof unlink>) => {
-    if (String(args[0]).endsWith("/finalize-2.json")) {
-      attempts++; entered.resolve(); await release.promise;
-    }
-    return unlink(...args);
+for (const bound of ["authority", "pass"] as const) {
+  it(`worker quarantine includes started archive unlink beyond the ${bound} deadline`, {
+    skip: process.platform !== "linux" && "unlink barrier requires Linux procfs/no-follow report content proof",
+  }, async t => {
+    const f = await reportRetirementFixture(t);
+    await f.replayPositive();
+    await f.outbox.journalFinalize(f.claim.run_id, 2);
+    const w = retirementWorker(f);
+    const entered = deferred(), release = deferred();
+    const unlink = fs.unlink.bind(fs);
+    let attempts = 0;
+    t.mock.method(fs, "unlink", async (...args: Parameters<typeof unlink>) => {
+      if (String(args[0]).endsWith("/finalize-2.json")) {
+        attempts++; entered.resolve(); await release.promise;
+      }
+      return unlink(...args);
+    });
+    // Every bound is long, so the proof reaches unlink on any runner speed. Only the exercised
+    // bound's production callback is then fired by hand; the other bound cannot fire first.
+    const restoreHeadroom = f.useHeadroom();
+    const timer = f.captureTimers(ms => ms === (bound === "authority" ? f.headroom.authorityMs : f.headroom.passMs));
+    let first: Promise<void> | undefined;
+    t.after(async () => { release.resolve(); await first; });
+    try {
+      first = w.sweepPendingFinalizes();
+      let settled = false;
+      void first.then(() => { settled = true; });
+      await entered.promise;
+      await new Promise<void>(r => setImmediate(r));
+      assert.equal(settled, false, "no bound has fired while unlink is held");
+      assert.equal(timer.count(), 1, `the ${bound} timer was registered by production code`);
+      timer.fire();
+      // The guard only fires when the fired callback did not end the pass; it is not a pass condition.
+      let guard: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([first, new Promise<never>((_, reject) => {
+          guard = setTimeout(() => reject(new Error(`${bound} callback did not end the pass`)), 10_000);
+        })]);
+      } finally { clearTimeout(guard); }
+    } finally { timer.restore(); restoreHeadroom(); }
+    assert.equal(f.r.isExecuting(f.claim.run_id), true);
+    assert.equal(attempts, 1);
+    await w.sweepPendingFinalizes();
+    assert.equal(attempts, 1, "no second candidate while started unlink remains unsettled");
+    release.resolve();
+    // Drain the actual O queue and then the runner's reservation completion.
+    await f.outbox.readTerminalJournal(f.claim.run_id, 2);
+    for (let i = 0; i < 20 && f.r.isExecuting(f.claim.run_id); i++)
+      await new Promise<void>(r => setImmediate(r));
+    assert.equal(f.r.isExecuting(f.claim.run_id), false);
+    assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined);
+    await f.assertCustody();
   });
-  // Headroom lets the proof reach unlink on a slow runner. The pass is then ended by its caller
-  // signal rather than by waiting out the (now long) authority deadline.
-  const restoreHeadroom = f.useHeadroom();
-  const pass = new AbortController();
-  const first = w.sweepPendingFinalizes(pass.signal);
-  t.after(async () => { release.resolve(); await first; });
-  await entered.promise;
-  pass.abort(new Error("test: end pass while unlink is held"));
-  await first;
-  restoreHeadroom();
-  assert.equal(f.r.isExecuting(f.claim.run_id), true);
-  assert.equal(attempts, 1);
-  await w.sweepPendingFinalizes();
-  assert.equal(attempts, 1, "no second candidate while started unlink remains unsettled");
-  release.resolve();
-  // Drain the actual O queue and then the runner's reservation completion.
-  await f.outbox.readTerminalJournal(f.claim.run_id, 2);
-  for (let i = 0; i < 20 && f.r.isExecuting(f.claim.run_id); i++)
-    await new Promise<void>(r => setImmediate(r));
-  assert.equal(f.r.isExecuting(f.claim.run_id), false);
-  assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined);
-  await f.assertCustody();
-});
+}
 
 
 for (const ownership of [
@@ -327,12 +342,17 @@ it("started unlink retains reservation beyond deadline until actual settlement",
   skip: process.platform !== "linux" && "unlink barrier requires Linux procfs/no-follow report content proof",
 }, async t => {
   const f = await reportRetirementFixture(t);
-  // Headroom lets the proof reach unlink on any runner speed; the deadline is then crossed by
-  // advancing an offset clock past it, with no real wait.
-  f.useHeadroom();
-  const realNow = Date.now.bind(Date);
-  let offset = 0;
-  const clock = t.mock.method(Date, "now", () => realNow() + offset);
+  // Headroom lets the proof reach unlink on any runner speed. Once unlink is entered, the
+  // production proof-deadline callbacks (the runner's and git's, whose delays are the remaining
+  // budget) are fired by hand: no real wait, and the abort is the production one.
+  const restoreHeadroom = f.useHeadroom();
+  const timer = f.captureTimers(ms => ms > f.headroom.proofMs - 5_000 && ms <= f.headroom.proofMs);
+  const signals: AbortSignal[] = [];
+  const proofBudget = git.withReportProofBudget.bind(git);
+  t.mock.method(git, "withReportProofBudget", <T>(budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>) => {
+    signals.push(budget.signal);
+    return proofBudget(budget, action);
+  });
   const unlink = fs.unlink.bind(fs);
   const entered = deferred(), release = deferred();
   let attempts = 0, settled = false;
@@ -346,21 +366,25 @@ it("started unlink retains reservation beyond deadline until actual settlement",
   });
   const replay = f.replay().then(() => { settled = true; });
   t.after(async () => { release.resolve(); await replay; });
-  await entered.promise;
-  offset += f.headroomMs + 1;
-  await new Promise<void>(resolve => setImmediate(resolve));
-  assert.equal(settled, false, "deadline cannot falsely complete started unlink");
-  assert.equal(f.r.isExecuting(f.claim.run_id), true);
-  assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), true);
-  let readSettled = false;
-  const read = f.outbox.readTerminalJournal(f.claim.run_id, 2).then(() => { readSettled = true; });
-  await new Promise<void>(resolve => setImmediate(resolve));
-  assert.equal(readSettled, false, "outbox lock remains owned by actual unlink");
-  assert.equal(attempts, 1);
-  await f.assertCustody();
-  release.resolve();
-  await Promise.all([replay, read]);
-  clock.mock.restore();
+  try {
+    await entered.promise;
+    assert.ok(timer.count() >= 1, "production registered its proof-deadline timer");
+    assert.ok(signals.length > 0 && signals.every(signal => !signal.aborted), "proof not yet aborted");
+    timer.fire();
+    assert.ok(signals.some(signal => signal.aborted), "the production deadline abort fired");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(settled, false, "deadline cannot falsely complete started unlink");
+    assert.equal(f.r.isExecuting(f.claim.run_id), true);
+    assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), true);
+    let readSettled = false;
+    const read = f.outbox.readTerminalJournal(f.claim.run_id, 2).then(() => { readSettled = true; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(readSettled, false, "outbox lock remains owned by actual unlink");
+    assert.equal(attempts, 1);
+    await f.assertCustody();
+    release.resolve();
+    await Promise.all([replay, read]);
+  } finally { timer.restore(); restoreHeadroom(); }
   assert.equal(f.r.isExecuting(f.claim.run_id), false);
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
   await f.assertCustody();
