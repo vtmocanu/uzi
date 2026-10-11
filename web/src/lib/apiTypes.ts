@@ -3260,6 +3260,8 @@ export interface Run {
    *  from forge_park_count. A preventive disk park (the worker stopped the run before its
    *  data volume filled) does not count. 0 for a run that has never taken a counted disk park. */
   disk_park_count?: number;
+  provider_park_count: number;
+  provider_park_streak_started_at: string | null;
   /** PRD #1809 M6 (D8): the worker's report, on the run's latest park, of whether the checkpoint
    *  that park published contains the run's latest committed work. false: it does not (the worker
    *  keeps the latest work under its custody hold). Absent when not reported. The server clears
@@ -3367,6 +3369,7 @@ export interface Run {
    *  a completed milestone and the finalize allowance unused). Both OPTIONAL for rollout skew. */
   worker_name?: string | null;
   can_stop_at_wall?: boolean;
+  can_stop_at_provider_hold: boolean;
   completion_phase?: "checking" | "reworking" | "blocked" | "";
   /** PRD #1227 M1: the owner-decision contract projection — contract-derived (no extra DB read),
    *  all OPTIONAL for api/web rollout skew exactly like the completion block above; the server
