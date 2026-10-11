@@ -168,6 +168,27 @@ describe("readRepoInstructionsAtCommit (PRD #2170)", () => {
     assert.deepEqual(await readRepoInstructionsAtCommit(fake, "/bare", "b".repeat(40)), { dropped: "too_large" });
   });
 
+  // A real commit tree never holds a `.git/` entry, so the tree-backed cases above would also fail
+  // as "broken link" without the guard; a stub tree that does answer the `.git` path isolates it.
+  for (const [name, target] of [["lowercase .git", ".git/config"], ["mixed-case nested .GIT", "sub/.GIT/x"]] as const) {
+    it(`a link into ${name} is dropped even when the tree answers that path with a blob`, async () => {
+      const linkOid = "1".repeat(40);
+      const blobOid = "2".repeat(40);
+      const entries: Record<string, string> = {
+        "CLAUDE.md": `120000 blob ${linkOid} ${target.length}\tCLAUDE.md\0`,
+        [target]: `100644 blob ${blobOid} 11\t${target}\0`,
+      };
+      const fake = {
+        async readBare(_bare: string, args: readonly string[]) {
+          if (args.includes("ls-tree")) return { text: entries[args[args.length - 1] as string] ?? "", truncated: false };
+          if (args.includes(linkOid)) return { text: target, truncated: false };
+          return { text: "git secrets", truncated: false };
+        },
+      };
+      assert.deepEqual(await readRepoInstructionsAtCommit(fake, "/bare", "b".repeat(40)), { dropped: "symlinked" });
+    });
+  }
+
   it("a failing git read is read_error and never throws", async () => {
     const fake = { async readBare(): Promise<never> { throw new Error("boom"); } };
     assert.deepEqual(await readRepoInstructionsAtCommit(fake, "/bare", "b".repeat(40)), { dropped: "read_error" });
