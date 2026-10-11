@@ -247,9 +247,12 @@ uzi's worker pushes with a GitHub PAT that **deliberately lacks the `workflow` s
 worker that could rewrite CI is a supply-chain risk, so this is by design, not a bug to
 "fix" by granting scope. A push creating a new ref that carries an authored workflow change
 is rejected **atomically** (`refusing to allow a Personal Access Token to create or update
-workflow … without workflow scope`), so nothing lands (#377, #456). How GitHub gates an
-update to an already-published ref is unverified (#1869). The worker checks before pushing:
-a run whose branch-only commits touch `.github/workflows/**` ends `failed` with
+workflow … without workflow scope`), so nothing lands (#377, #456). #1869's spike (branch
+refs only) found GitHub judges the pushed tip per workflow path: each blob must already be
+held at that path by some existing branch tip, and deletions pass; other ref namespaces
+were not probed. The worker checks before pushing: a run whose pushed tip carries a
+`.github/workflows/**` blob matching neither the fresh default's nor the target ref's
+current tip at that path ends `failed` with
 `workflow_scope_missing` ("branch changes .github/workflows … failing early"), with a
 `preserved_patch` only when its secret scan is trusted and clean. The work is usually
 recoverable from the durable sources or the worker's bare tracking ref, not guaranteed: a
@@ -257,9 +260,9 @@ Docker worker's clone is an `emptyDir` lost with its pod. See *Recovering a fail
 work from the worker PVC* below.
 
 - **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base
-  <branch>` run inherits the source branch's commits, so a maintainer workflow commit on a
-  PR branch can fail later runs on it while it stays branch-only by SHA, including after
-  equivalent content lands on main under another SHA (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
+  <branch>` run inherits the source branch's commits, so a maintainer workflow change on a
+  PR branch fails later runs on it until main or the target ref carries the same blob at
+  that path; equivalent content on main under another commit SHA passes (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
   rule, #1846).
 - **A branch merely behind main on workflow files is usually handled.** At finalize the
   worker tries to realign it to the current default (workflow-subtree overlay, else merge,
@@ -271,8 +274,9 @@ work from the worker PVC* below.
   precheck runs first, so an inherited workflow commit blocks this realign.
 - **Telling them apart on a recovered branch:** `git log --name-only origin/main..TIP --
   .github/workflows/` empty is evidence of base staleness only; a rebase onto main that
-  succeeds clears it, then gate and push as usual. A listed commit needs inspection: it may be a real workflow change (the
-  split below) or one whose content is already on main under another SHA (#1869).
+  succeeds clears it, then gate and push as usual. A listed commit needs inspection: `git diff origin/main TIP --
+  .github/workflows/` empty means its content is already on main and the precheck passes
+  (#1869); otherwise it is a real workflow change (the split below).
 
 **The split** (for a plan that genuinely *edits* a workflow file): uzi implements everything except `.github/workflows`; **you** add the
 workflow-file pieces locally, because your own token has `workflow` scope (confirm with
