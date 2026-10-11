@@ -70,6 +70,11 @@ export function Repos() {
   const [guidanceDraft, setGuidanceDraft] = useState("");
   const [checkerClaudemdDraft, setCheckerClaudemdDraft] = useState(false);
   const [crossCheckBusy, setCrossCheckBusy] = useState(false);
+  // The panel's current repo and the latest save, read after an await: a save that resolves
+  // after the owner opened another repo's panel must not write into that repo's draft.
+  const crossCheckRepoIdRef = useRef<string | null>(null);
+  crossCheckRepoIdRef.current = crossCheckRepoId;
+  const crossCheckSaveSeq = useRef(0);
   // Inline, inside the panel (like the Project-sync panel): a refusal belongs next
   // to the field it is about, not in the page Alert far above the table.
   const [crossCheckError, setCrossCheckError] = useState("");
@@ -189,6 +194,9 @@ export function Repos() {
     crossCheckTriggerRef.current = trigger;
     setCrossCheckError("");
     setCrossCheckSaved(false);
+    // Any save still in flight is superseded: it no longer owns the draft or the busy flag.
+    crossCheckSaveSeq.current++;
+    setCrossCheckBusy(false);
     if (crossCheckRepoId === repo.id) {
       setCrossCheckRepoId(null);
       return;
@@ -207,6 +215,9 @@ export function Repos() {
   // One PATCH for both inputs. A blank field clears the guidance (null), so an
   // empty or whitespace-only text never reaches the checker's brief.
   const saveCrossCheck = async (repo: Repo) => {
+    const seq = ++crossCheckSaveSeq.current;
+    // True only while this repo's panel is still the one open (and this is the latest save).
+    const current = () => crossCheckRepoIdRef.current === repo.id && crossCheckSaveSeq.current === seq;
     setCrossCheckError("");
     setCrossCheckSaved(false);
     setCrossCheckBusy(true);
@@ -215,14 +226,17 @@ export function Repos() {
         code_cross_check_guidance: guidanceDraft.trim() === "" ? null : guidanceDraft,
         cross_check_repo_instructions_enabled: checkerClaudemdDraft,
       });
+      // The saved row is the repo's own truth wherever the panel is.
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
-      setGuidanceDraft(updated.code_cross_check_guidance ?? "");
-      setCheckerClaudemdDraft(updated.cross_check_repo_instructions_enabled ?? false);
-      setCrossCheckSaved(true);
+      if (current()) {
+        setGuidanceDraft(updated.code_cross_check_guidance ?? "");
+        setCheckerClaudemdDraft(updated.cross_check_repo_instructions_enabled ?? false);
+        setCrossCheckSaved(true);
+      }
     } catch (err) {
-      setCrossCheckError(errorMessage(err, "Save failed"));
+      if (current()) setCrossCheckError(errorMessage(err, "Save failed"));
     } finally {
-      setCrossCheckBusy(false);
+      if (crossCheckSaveSeq.current === seq) setCrossCheckBusy(false);
     }
   };
 

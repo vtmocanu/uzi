@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Repos } from "./Repos";
 import { api, ApiError, type ForgeConnection, type Repo } from "../lib/api";
@@ -307,6 +307,32 @@ describe("Repos — Code cross-check panel (PRD #2170 M3)", () => {
     expect(await within(panel).findByRole("alert")).toBeTruthy();
     expect((within(panel).getByLabelText("Guidance") as HTMLTextAreaElement).value).toBe("Check migrations.");
   });
+
+  // Save of repo A is still in flight when repo B's panel opens: the late response must not
+  // reach B's draft (success) or B's alert (failure), whatever A's outcome.
+  for (const outcome of ["resolves", "rejects"] as const) {
+    it(`a deferred save for repo A that ${outcome} after repo B opened leaves B's draft and alert alone`, async () => {
+      let settleA: () => void = () => {};
+      const pending = new Promise<{ repo: Repo }>((resolve, reject) => {
+        settleA = () => (outcome === "resolves"
+          ? resolve({ repo: { ...REPOS[0], code_cross_check_guidance: "A saved guidance", cross_check_repo_instructions_enabled: true } })
+          : reject(new ApiError(403, "A refused")));
+      });
+      mockApi.setRepoCodeCrossCheckInputs.mockReturnValue(pending);
+      const panelA = await openCrossCheckPanel("vtmocanu/uzi");
+      fireEvent.change(within(panelA).getByLabelText("Guidance"), { target: { value: "A draft" } });
+      fireEvent.click(within(panelA).getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledTimes(1));
+      fireEvent.click(within(rowFor("vtmocanu/atlas")).getByRole("button", { name: /Code cross-check settings for/ }));
+      const panelB = screen.getByRole("group", { name: /Code cross-check for vtmocanu\/atlas/ });
+      const guidanceB = () => within(panelB).getByLabelText("Guidance") as HTMLTextAreaElement;
+      fireEvent.change(guidanceB(), { target: { value: "B draft" } });
+      await act(async () => { settleA(); await pending.catch(() => undefined); });
+      expect(guidanceB().value).toBe("B draft");
+      expect(within(panelB).queryByRole("alert")).toBeNull();
+      expect(within(panelB).queryByText(/^Saved\./)).toBeNull();
+    });
+  }
 
   it("Close returns focus to the cell trigger", async () => {
     const panel = await openCrossCheckPanel("vtmocanu/uzi");
