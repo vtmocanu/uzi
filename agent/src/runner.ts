@@ -1851,6 +1851,10 @@ interface RunFlight {
    *  clears it. In-memory only — NOT seeded from the claim: `claim.checkpoint_tip` is a
    *  server-confirmed anchor, and a resume self-heals via `lastCheckpointRefTip`. */
   lastAttemptedCheckpointRefTip: string | undefined;
+  /** issue #2733: the run's repo is on GitHub, the only forge with checkpoint workflow overlays and
+   *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
+   *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
+  checkpointChainForge?: boolean;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -8401,6 +8405,7 @@ export class RunRunner {
       // overlay on the ref), advanced on every confirmed publish.
       lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
       lastAttemptedCheckpointRefTip: undefined,
+      checkpointChainForge: claim.repo.forge_type === "github",
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -12862,7 +12867,13 @@ export class RunRunner {
           if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
             throw new SecretRemediationPendingError();
           }
-        });
+        },
+        // issue #2733: chain a raw publish over the prior overlay tip (same attempted ?? confirmed
+        // precedence as #1086's overlay base), so a lost-ack or confirmed overlay does not wedge
+        // later tick/iteration publishes with `not_descendant`. GitHub only, like the overlay.
+        flight.checkpointChainForge === true
+          ? flight.lastAttemptedCheckpointRefTip ?? flight.lastCheckpointRefTip
+          : undefined);
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
