@@ -252,6 +252,12 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	// This fixture tests migration 320's publication semantics with the current DAO.
+	// Later nullable worker evidence is unrelated to that migration; provide its
+	// default-null projection without applying or testing later migrations here.
+	if _, err := pool.Exec(ctx, "ALTER TABLE workers ADD COLUMN registered_pod_uid uuid, ADD COLUMN roll_heartbeat_at timestamptz, ADD COLUMN draining_reason text"); err != nil {
+		t.Fatal(err)
+	}
 	iid := int64(1)
 	e := interlockLiveDB{ctx: ctx, pool: pool, q: store.New(pool), userID: uuid.New(), repoID: uuid.New(), nextIID: &iid}
 	conn := uuid.New()

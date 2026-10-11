@@ -77,11 +77,16 @@ func TestRollEvidenceDrainWritersLiveDB(t *testing.T) {
 	if got := read(); !got.DrainingSince.Valid || !got.DrainingReason.Valid || got.DrainingReason.String != "image_roll" {
 		t.Fatalf("open custody hold lost image drain: %+v", got)
 	}
-	mustExec(ctx, t, pool, "UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,release_evidence='publication',released_at=now() WHERE id=$1", hold)
+	// Guarded custody requires a terminal generation and valid empty-inventory settlement.
+	mustExec(ctx, t, pool, "UPDATE runs SET status='failed',claim_generation=1 WHERE id=$1", run)
+	tag, err := pool.Exec(ctx, "UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,release_evidence='forge_no_output',final_disposition='settled',final_coverage_digest='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',released_at=now() WHERE id=$1", hold)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("valid custody settlement rejected: rows=%d err=%v", tag.RowsAffected(), err)
+	}
 	if _, err := q.UncordonHostedWorkerImageRoll(ctx, w.ID); err != nil {
 		t.Fatal(err)
 	}
-	if read().DrainingSince.Valid || read().DrainingReason.Valid {
+	if got := read(); got.DrainingSince.Valid || got.DrainingReason.Valid {
 		t.Fatal("image drain not released after fences ended")
 	}
 	maintenance("requested")
