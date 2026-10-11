@@ -265,14 +265,17 @@ signal off, from **Admin → Instance → Run health**:
 | Long tool call after | 1200s (20m) | `health_tool_call_seconds` — how long the oldest open tool call of a run's main agent may run, on a run that has also been silent for the **Stalled after** window (or for this threshold, if **Stalled after** is `0`), before it's flagged stalled. Calls to subagents are excluded. `0` turns this signal off. See [Long tool calls](./run-health.md#long-tool-calls). |
 | Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
 | Extension allowance per run (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the total extra wall-clock time an owner may grant a single run through [Extend](./run-health.md#giving-a-run-more-time), on top of its frozen budget. `0` turns extending off instance-wide. |
-| Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
+| Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. A Docker worker repo allowlist block is flagged as soon as it is detected instead; `0` still disables it. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
 
-**A repo-bearing run stuck past "Stuck queued after" can also be waiting on
-the Docker worker repo allowlist.** If every online worker is Docker-capable
-and the run's repo isn't on that allowlist, the owner's reason names it
-directly, distinct from "no worker online" or "all workers busy" — see
+**A repo-bearing run can also be waiting on the Docker worker repo
+allowlist.** If the owner's online workers are all Docker workers and the
+run's repo isn't on that allowlist, the run is flagged waiting for worker as
+soon as the block is detected, not after "Stuck queued after" (setting that to
+`0` still disables it). The reason names the allowlist directly, distinct from
+"no worker online" or "all workers busy", and tells a non-admin owner to ask
+an admin to add the repo — see
 [Run health](./run-health.md#what-the-flags-mean). That allowlist is keyed
 by **repo id**, not path, so a repo re-added to uzi (say, after moving it to
 a new forge) gets a new id and silently drops off — nothing re-adds it for

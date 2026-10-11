@@ -133,8 +133,9 @@ func TestHealthQueuedPriorityLookupCutoff(t *testing.T) {
 	}
 }
 
-// The lookup runs BEHIND the queued-threshold guard, so a freshly-queued run issues no
-// query at all — the affordability argument, same as verdictUndelivered's.
+// The lookup runs BEHIND the queued-threshold guard, so a freshly-queued run with no repo
+// (the early docker-allowlist probe needs one) issues no query at all — the
+// affordability argument, same as verdictUndelivered's.
 func TestHealthQueuedPriorityGuardShortCircuits(t *testing.T) {
 	r := runRow("queued")
 	r.StatusSince = ago(1 * time.Minute) // < 10m threshold

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -254,6 +255,56 @@ func TestHealthStaleRequeuePinDisabledCases(t *testing.T) {
 			fs.active = []store.ListActiveRunsForHealthRow{r}
 			if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 				t.Fatalf("changed = %d, want 0 (no flag); writes=%v", n, fs.writes)
+			}
+		})
+	}
+}
+
+// Issues #2705 and #2501 both surface a reason below the queued threshold. A repo run that
+// is pinned to its returning worker AND blocked by the Docker allowlist (one online worker,
+// none eligible) reports the pin reason and skips the Docker/owner probe; once the pin
+// lapses the same run reports the owner-role Docker reason.
+func TestHealthStaleRequeuePinBeatsEarlyDockerAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		owner  store.User
+		reason string
+	}{
+		{"member", store.User{}, reasonRepoNotDockerAllowedMember},
+		{"admin", store.User{IsAdmin: true}, reasonRepoNotDockerAllowedAdmin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blocked := func(pinned bool) (*healthFakeStore, store.ListActiveRunsForHealthRow) {
+				r := pinnedRun()
+				r.StaleRequeuePinnable = pinned
+				r.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+				return &healthFakeStore{
+					active:          []store.ListActiveRunsForHealthRow{r},
+					onlineWorkers:   1,
+					eligibleWorkers: 0,
+					owner:           tc.owner,
+				}, r
+			}
+
+			fs, r := blocked(true)
+			svc, _ := pinSvc(fs, defaultHealthSettings())
+			svc.SetDockerAllowlist(fakeAllowlistReader{})
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			if w.Health != healthWaitingWorker || !strings.Contains(w.HealthReason.String, "for its previous worker w1 to return") {
+				t.Fatalf("pinned: got %q/%q, want the stale-requeue pin reason", w.Health, w.HealthReason.String)
+			}
+			if len(fs.ownerCalls) != 0 {
+				t.Fatalf("pinned: issued %d owner lookups, want 0 (the Docker probe must not run)", len(fs.ownerCalls))
+			}
+
+			fs2, r2 := blocked(false)
+			svc2, _ := pinSvc(fs2, defaultHealthSettings())
+			svc2.SetDockerAllowlist(fakeAllowlistReader{})
+			svc2.detectRunHealth(context.Background(), t0)
+			w2 := lastWrite(t, fs2, r2.ID)
+			if w2.Health != healthWaitingWorker || w2.HealthReason.String != tc.reason {
+				t.Fatalf("unpinned: got %q/%q, want waiting_worker/%q", w2.Health, w2.HealthReason.String, tc.reason)
 			}
 		})
 	}

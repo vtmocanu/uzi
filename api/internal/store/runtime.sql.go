@@ -2196,7 +2196,8 @@ type CountOnlineEligibleWorkersForRepoParams struct {
 // with capability_aware mirroring the claim path's flag so this count and the claim gate can
 // never disagree on ELIGIBILITY. It is deliberately an ELIGIBILITY count, NOT an
 // availability one: it does NOT exclude draining workers (nor busy ones). That is on
-// purpose — its sole consumer is PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowed),
+// purpose — it serves only PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowedAdmin/Member)
+// and the early probe that surfaces that rung under the queued threshold,
 // whose job is to isolate the docker-allowlist fence as the blocker. Excluding draining here
 // would MISATTRIBUTE a transient all-draining fleet (during a worker roll — CountOnlineWorkersForUser
 // keeps draining workers online, so the run still reaches that rung) to the allowlist, printing
@@ -2208,8 +2209,9 @@ type CountOnlineEligibleWorkersForRepoParams struct {
 // Params cast EXACTLY as ClaimRun passes them so a green sqlc generate is not mistaken for a
 // query Postgres will accept. The fence-BLIND capability-gap discriminator ("does the fleet
 // HAVE these caps at all") is a separate concern handled upstream by
-// CountOnlineWorkersSatisfyingCaps. Its sole caller is the queued-reason resolver, only for a
-// run already past its health threshold, so it is off the hot path.
+// CountOnlineWorkersSatisfyingCaps. Its callers are the queued-reason resolver (past the
+// health threshold, or under it once the early probe has fired) and the early
+// docker-allowlist probe itself, after CountOnlineWorkersForUser found an online worker.
 func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineEligibleWorkersForRepo,
 		arg.UserID,
@@ -2420,8 +2422,10 @@ SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
 `
 
 // How many of a user's workers are online — the queued-run reason resolver uses it
-// to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
-// for a queued run already past its threshold, so it is off the hot path.
+// to say "no worker is online" vs "waiting for a worker" (Decision 8), for a queued run
+// past its threshold. Under the threshold the early docker-allowlist probe calls it once
+// per tick for each queued run that has a repo, no egress profile and a configured
+// allowlist reader (one cheap count; it gates the costlier reads).
 // draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): a draining
 // worker keeps status='online' and still counts as an online worker for "no worker is
 // online" purposes — do not add a draining predicate.
@@ -2458,13 +2462,14 @@ type CountOnlineWorkersSatisfyingCapsParams struct {
 // capability nothing in the fleet has, distinct from the generic wait. It is EXPLICITLY NOT
 // a claim-time count: it does not apply the docker allowlist fence, so a worker it counts
 // may still be barred from THIS repo. That fence is applied separately by the
-// reasonRepoNotDockerAllowed rung via CountOnlineEligibleWorkersForRepo, which is the true
+// reasonRepoNotDockerAllowedAdmin/Member rung via CountOnlineEligibleWorkersForRepo, which is the true
 // claim-time count. The effective-caps fold is the shared fn_effective_worker_caps
 // (single source since #512 M5, migration 00151) — capabilities plus `docker` when
 // docker_enabled — the SAME function fn_worker_can_claim applies at claim time.
 // draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a draining worker
 // claims nothing, so it cannot be the eligible worker. Only called for a queued run already
-// past its health threshold, so it is off the hot path.
+// past its health threshold (or one the early docker-allowlist probe found
+// online-but-ineligible), so it is off the hot path.
 //
 // AND NOT w.ephemeral (PRD #529 M2, Correction B): an ephemeral worker is bound to
 // ONE run (it can claim only its ephemeral_run_id), so it can never satisfy a
@@ -2540,7 +2545,8 @@ WHERE w.user_id = $1
 // (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
 // CountOnlineWorkersSatisfyingProtocol for the same reasons (a draining worker claims nothing; an
 // ephemeral worker is bound to one run and can never satisfy a different one). Only called for a
-// Codex-indicating queued run already past its health threshold, so it is off the hot path.
+// Codex-indicating queued run already past its health threshold (or one the early
+// docker-allowlist probe found online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCodexHarness, userID)
 	var count int64
@@ -2601,7 +2607,8 @@ WHERE w.user_id = $1
 // together), but the AND keeps this count exactly the set that could actually claim. Reads
 // workers.protocol_capabilities DIRECTLY, like its siblings; draining_since IS NULL and NOT
 // w.ephemeral for the same reasons. Only called for a custom-root queued run already past its
-// health threshold, so it is off the hot path.
+// health threshold (or one the early docker-allowlist probe found online-but-ineligible),
+// so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCustomCodex, userID)
 	var count int64
@@ -2669,7 +2676,8 @@ WHERE w.user_id = $1
 // kill-switch (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
 // CountOnlineWorkersSatisfyingCaps for the same reasons (a draining worker claims nothing; an
 // ephemeral worker is bound to one run and can never satisfy a different one). Only called for an
-// interlocked queued run already past its health threshold, so it is off the hot path.
+// interlocked queued run already past its health threshold (or one the early docker-allowlist
+// probe found online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProtocol, userID)
 	var count int64
@@ -2704,7 +2712,8 @@ WHERE w.user_id = $1
 // worker is treated as always having room. Active count uses the SAME run-lane
 // definition as ListWorkersByUser.active_runs (status claimed/running/
 // awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat'). Only called for a queued run
-// already past its health threshold, so it is off the hot path.
+// already past its health threshold (or one the early docker-allowlist probe found
+// online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersWithFreeSlotForUser, userID)
 	var count int64
@@ -16801,7 +16810,8 @@ type RunPriorityClassForRunParams struct {
 // already in hand), the health projection ListActiveRunsForHealth carries none of
 // kind/priority/created_at, so this reads them by id — a per-run lookup like
 // RunHasVerdictSinceGateOpened, affordable for the same reason: it runs only behind
-// healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick.
+// healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick (plus, under the
+// threshold, runs the early docker-allowlist probe found online-but-ineligible).
 // @background_grace_cutoff is the D4 fail-open cutoff (now() - RUN_BACKGROUND_GRACE),
 // built the SAME way service.go builds ClaimRun's cutoff: a demoted run created before
 // it reads as stale -> class `restored` (past grace) rather than `background`.
