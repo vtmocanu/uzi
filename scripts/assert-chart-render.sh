@@ -1016,15 +1016,17 @@ check_isolated_lane "$RENDER" || exit $?
 # offline copy with the `dependencies:` block stripped (the assert-drain-knobs-render.sh
 # approach), so no subchart fetch is needed.
 if ! command -v helm >/dev/null 2>&1; then
-  echo "SKIP: helm not on PATH -- chart-default and default-off checks did not run"
-  exit 0
+  echo "BROKEN: deploy/chart/templates/postgres-simple.yaml probes: helm not on PATH" >&2
+  exit 2
 fi
 
 CHART_DIR="$SCRIPT_DIR/../deploy/chart"
 [ -f "$CHART_DIR/Chart.yaml" ] || { echo "BROKEN: no Chart.yaml under $CHART_DIR" >&2; exit 2; }
 
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+REPO_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+mkdir -p "$REPO_DIR/.uzi/scratch"
+WORK=$(mktemp -d "$REPO_DIR/.uzi/scratch/assert-chart-render.XXXXXX")
+trap 'rm -rf "$WORK"' 0
 trap 'exit 2' INT TERM
 
 STRIPPED="$WORK/chart"
@@ -1040,6 +1042,137 @@ awk '
   skip { next }
   { print }
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
+
+# --- simple postgres: TCP readiness, socket liveness ---------------------------
+# Parse the focused render and Compose source, rather than accepting tokens from
+# another object/container or from an echo command.
+PG_SOURCE="deploy/chart/templates/postgres-simple.yaml"
+COMPOSE_SOURCE="docker-compose.yml"
+command -v yq >/dev/null 2>&1 || {
+  echo "BROKEN: $PG_SOURCE probes / $COMPOSE_SOURCE healthcheck: need mikefarah yq v4" >&2
+  exit 2
+}
+YQ_VERSION_RAW=$(yq --version 2>/dev/null) || {
+  echo "BROKEN: $PG_SOURCE probes / $COMPOSE_SOURCE healthcheck: yq --version failed" >&2
+  exit 2
+}
+case "$YQ_VERSION_RAW" in
+  *mikefarah*version\ v4.*|*mikefarah*version\ 4.*) ;;
+  *)
+    echo "BROKEN: $PG_SOURCE probes / $COMPOSE_SOURCE healthcheck: need mikefarah yq v4; got $YQ_VERSION_RAW" >&2
+    exit 2
+    ;;
+esac
+
+PG_RENDER="$WORK/postgres-simple.yaml"
+if ! helm template uzi "$STRIPPED" --set database.mode=simple \
+     --show-only templates/postgres-simple.yaml > "$PG_RENDER" 2> "$WORK/err"; then
+  echo "BROKEN: $PG_SOURCE readinessProbe/livenessProbe: helm render failed" >&2
+  cat "$WORK/err" >&2
+  exit 2
+fi
+# $item is a yq binding, not a shell variable.
+# shellcheck disable=SC2016
+if ! yq eval-all '. as $item ireduce ([]; . + [$item]) |
+     map(select(.kind == "StatefulSet" and .metadata.labels."app.kubernetes.io/component" == "postgres"))' \
+     "$PG_RENDER" > "$WORK/postgres-sets.yaml" 2> "$WORK/err"; then
+  echo "BROKEN: $PG_SOURCE readinessProbe/livenessProbe: YAML parse failed" >&2
+  cat "$WORK/err" >&2
+  exit 2
+fi
+if ! yq -e 'length == 1' "$WORK/postgres-sets.yaml" >/dev/null 2>&1; then
+  echo "BROKEN: $PG_SOURCE readinessProbe/livenessProbe: expected exactly one postgres StatefulSet" >&2
+  exit 2
+fi
+if ! yq -e '.[0].spec.template.spec.containers | tag == "!!seq"' \
+     "$WORK/postgres-sets.yaml" >/dev/null 2>&1 ||
+   ! yq '.[0].spec.template.spec.containers | map(select(.name == "postgres"))' \
+     "$WORK/postgres-sets.yaml" > "$WORK/postgres-containers.yaml" 2> "$WORK/err" ||
+   ! yq -e 'length == 1' "$WORK/postgres-containers.yaml" >/dev/null 2>&1; then
+  echo "BROKEN: $PG_SOURCE readinessProbe/livenessProbe: expected exactly one named postgres container" >&2
+  exit 2
+fi
+
+# Only the known option/value form is accepted. Arguments may be safe literal
+# words (optionally quoted), or Compose dollar-brace variables with safe defaults.
+# No command text is executed. This is deliberately not a general shell parser.
+check_pg_command() {
+  awk -v source="$1" -v probe="$2" -v tcp="$3" '
+    function fail(message) {
+      print "FAIL: " source " " probe ": " message
+      bad = 1
+    }
+    function usable(value,    quoted) {
+      quoted = substr(value, 1, 1)
+      if (quoted == "\"" || quoted == "\047") {
+        if (length(value) < 3 || substr(value, length(value), 1) != quoted) return 0
+        value = substr(value, 2, length(value) - 2)
+      }
+      if (value ~ /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/) return 1
+      # Single quotes would prevent variable expansion.
+      return source == "docker-compose.yml" && quoted != "\047" &&
+        value ~ /^\$\$?[{][A-Za-z_][A-Za-z0-9_]*(:-[A-Za-z0-9_][A-Za-z0-9_.-]*)?[}]$/
+    }
+    {
+      if (NR != 1 || $1 != "pg_isready" || NF < 5 || NF % 2 != 1) {
+        fail("expected a single simple pg_isready invocation"); next
+      }
+      for (i = 2; i <= NF; i += 2) {
+        option = $i
+        if (option != "-h" && option != "-U" && option != "-d") {
+          fail("only -h, -U and -d option/value pairs are allowed"); continue
+        }
+        seen[option]++
+        if (!usable($(i + 1))) fail("unusable argument or shell syntax after " option)
+        if (option == "-h" && $(i + 1) != "127.0.0.1") fail("host must be adjacent -h 127.0.0.1")
+      }
+    }
+    END {
+      if (NR != 1) fail("expected exactly one command line")
+      if (seen["-U"] != 1 || seen["-d"] != 1) fail("expected exactly one usable -U and -d argument")
+      if (tcp == 1 && seen["-h"] != 1) fail("readiness requires adjacent -h 127.0.0.1")
+      if (tcp == 0 && seen["-h"] != 0) fail("socket liveness must have no host option")
+      exit bad
+    }
+  ' "$4"
+}
+
+PG_BAD=0
+# Exactly two probes, no retries; a failure does not block the sibling probe or
+# Compose check, so both readiness failures are visible on the unchanged sources.
+for probe in readinessProbe livenessProbe; do
+  if ! yq -e ".[0].$probe.exec.command | select(tag == \"!!seq\") | select(length == 3) |
+       select(.[0] == \"sh\") | select(.[1] == \"-c\") | .[2] | tag == \"!!str\"" \
+       "$WORK/postgres-containers.yaml" >/dev/null 2>&1; then
+    echo "FAIL: $PG_SOURCE $probe: expected exact [sh, -c, command-string] wrapper" >&2
+    PG_BAD=1
+    continue
+  fi
+  if ! yq -r ".[0].$probe.exec.command[2]" "$WORK/postgres-containers.yaml" \
+       > "$WORK/probe-command" 2> "$WORK/err"; then
+    echo "BROKEN: $PG_SOURCE $probe: command extraction failed" >&2
+    PG_BAD=1
+    continue
+  fi
+  tcp=0
+  [ "$probe" != readinessProbe ] || tcp=1
+  check_pg_command "$PG_SOURCE" "$probe" "$tcp" "$WORK/probe-command" || PG_BAD=1
+done
+if ! yq -e '.services.db.healthcheck.test | select(tag == "!!seq") | select(length == 2) |
+     select(.[0] == "CMD-SHELL") | .[1] | tag == "!!str"' \
+     "$REPO_DIR/docker-compose.yml" > "$WORK/compose-wrapper" 2> "$WORK/err"; then
+  echo "BROKEN: $COMPOSE_SOURCE db.healthcheck: YAML parse failed or expected exact [CMD-SHELL, command-string] wrapper" >&2
+  cat "$WORK/err" >&2
+  PG_BAD=1
+elif ! yq -r '.services.db.healthcheck.test[1]' "$REPO_DIR/docker-compose.yml" \
+     > "$WORK/compose-command" 2> "$WORK/err"; then
+  echo "BROKEN: $COMPOSE_SOURCE db.healthcheck: command extraction failed" >&2
+  PG_BAD=1
+else
+  check_pg_command "$COMPOSE_SOURCE" db.healthcheck 1 "$WORK/compose-command" || PG_BAD=1
+fi
+[ "$PG_BAD" -eq 0 ] || exit 1
+echo "OK: $PG_SOURCE probes and $COMPOSE_SOURCE db.healthcheck use TCP readiness and socket liveness"
 
 # The existing api.config path carries the requeue budget as a quoted string and
 # injects it into the API through the SAME ConfigMap. Three independent offline

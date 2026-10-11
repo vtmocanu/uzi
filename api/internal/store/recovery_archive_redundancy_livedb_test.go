@@ -58,7 +58,7 @@ func TestRecoveryArchiveRedundancyMigrationRoundTripLiveDB(t *testing.T) {
 	if columns() != 3 || !strings.Contains(guard(), "redundancy") {
 		t.Fatalf("migrated shape: columns=%d", columns())
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 320); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 321); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
 	if n := columns(); n != 0 {

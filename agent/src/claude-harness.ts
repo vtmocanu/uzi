@@ -98,10 +98,14 @@ function signalNameOf(name: string | undefined): HarnessSignalName | undefined {
  * the timeout, so the caller simply attaches no `context` and the turn is
  * unaffected (Risk R1/R2, Success Criteria 5). Moved here from sdk-executor.ts as
  * part of the run-lane extraction; the 2000ms bound and swallow-to-undefined
- * contract are unchanged.
+ * contract are unchanged. Issue #1300: always asks for `detail: "summary"`, which
+ * answers from the last response's usage plus local estimates; the default "full"
+ * mode makes one token-count API call per category, and uzi reads only the totals.
  */
 async function readLeadContext(
-  queryInstance: { getContextUsage?(): Promise<ContextUsageReading> },
+  queryInstance: {
+    getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ContextUsageReading>;
+  },
   timeoutMs: number,
 ): Promise<HarnessContext | undefined> {
   const getContextUsage = queryInstance.getContextUsage;
@@ -109,7 +113,7 @@ async function readLeadContext(
   let timer: NodeJS.Timeout | undefined;
   try {
     const reading = await Promise.race([
-      getContextUsage.call(queryInstance),
+      getContextUsage.call(queryInstance, { detail: "summary" }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error("getContextUsage timed out")),
@@ -131,7 +135,7 @@ async function readLeadContext(
 }
 
 type SdkQueryInstance = AsyncIterable<SDKMessage> & {
-  getContextUsage?(): Promise<ContextUsageReading>;
+  getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ContextUsageReading>;
 };
 
 /**

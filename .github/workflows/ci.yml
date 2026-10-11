@@ -38,9 +38,18 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# A PR may skip component gates only after changes proves every changed file
+# is an added/modified input in the audited allowlist. Unknown paths, deletions,
+# renames and failed classification keep the full gates; main always runs them.
+# lint-repo stays unconditional, and job-level skips report required contexts.
 jobs:
   # ---------------------------------------------------------------- Go api ----
   validate-api:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -120,6 +129,11 @@ jobs:
           paths: ${{ steps.gocache.outputs.paths }}
 
   lint-api:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       # fetch-depth 0 + an explicit fetch of origin/main: the golangci ratchet
@@ -171,6 +185,11 @@ jobs:
           paths: ${{ steps.gocache.outputs.paths }}
 
   test-api:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -215,6 +234,11 @@ jobs:
   # set, so `go test` above prints a green `ok` while every one of them is skipped.
   # This job runs them against a real Postgres and asserts they actually ran.
   test-api-store-it:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -313,10 +337,15 @@ jobs:
           paths: ${{ steps.gocache.outputs.paths }}
 
   # The combined recovery proof crosses API, agent, fixtures and the DB harness.
-  # Run on every PR/main push like the other test gates, avoiding incomplete path
-  # filters. The Task target owns the serial LiveDB sweep and all three worker
+  # Run on every PR/main push except audited component-independent PRs. The Task
+  # target owns the serial LiveDB sweep and all three worker
   # variants; ubuntu-latest supplies Docker for its throwaway database.
   test-codex-refresh-lostreply-e2e:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -361,6 +390,11 @@ jobs:
 
   # --------------------------------------------------------- Go controller ----
   validate-controller:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -392,6 +426,11 @@ jobs:
           paths: ${{ steps.gocache.outputs.paths }}
 
   lint-controller:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -428,6 +467,11 @@ jobs:
           paths: ${{ steps.gocache.outputs.paths }}
 
   test-controller:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -459,6 +503,11 @@ jobs:
 
   # ---------------------------------------------------------- Vite/React web ----
   validate-web:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -486,6 +535,11 @@ jobs:
           task typecheck:web
 
   test-web:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -504,6 +558,11 @@ jobs:
   # Layout tests in real headless Chromium (vitest browser mode); jsdom in test-web cannot
   # see wrapping or overflow. The browser version is pinned by web's `playwright` devDependency.
   test-web-browser:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -524,6 +583,11 @@ jobs:
 
   # -------------------------------------------------------------- Node agent ----
   validate-agent:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -546,6 +610,11 @@ jobs:
           task typecheck:agent
 
   test-agent-shard:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
     name: test-agent-shard (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     strategy:
@@ -595,12 +664,13 @@ jobs:
     timeout-minutes: 30
     needs: [changes, validate-agent]
     # changes deliberately skips on main pushes. Override dependency skip propagation,
-    # but never run after failed validation or a failed PR path-filter job.
+    # but never run after failed validation. A failed/unknown filter runs this lane.
     if: >-
-      always() && needs.validate-agent.result == 'success' &&
-      (github.event_name == 'push' ||
-      (github.event_name == 'pull_request' && needs.changes.result == 'success' &&
-      needs.changes.outputs.worker_uid == 'true'))
+      !cancelled() && needs.validate-agent.result == 'success' &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1') &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.worker_uid != 'false')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -643,11 +713,17 @@ jobs:
 
   # The ruleset requires this EXACT check name. A failed, skipped or canceled
   # matrix leg must yield a FAILED check, not a skipped green dependency.
+  # Only a successful component-safe classification may skip the whole gate.
   test-agent:
     name: test-agent
     runs-on: ubuntu-latest
     needs: [test-agent-shard, changes, test-agent-worker-uid]
-    if: always()
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1' ||
+      needs.test-agent-shard.result != 'skipped' ||
+      needs.test-agent-worker-uid.result != 'skipped')
     steps:
       - name: Require shards and the applicable worker UID lane to succeed
         env:
@@ -902,12 +978,21 @@ jobs:
       agent: ${{ steps.filter.outputs.agent }}
       worker_uid: ${{ steps.filter.outputs.worker_uid }}
       web_nginx: ${{ steps.filter.outputs.web_nginx }}
+      skip_components: ${{ steps.safe.outputs.skip_components }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4
         id: filter
         with:
           filters: |
+            # Count ALL paths, including deletions and both sides of a rename.
+            all:
+              - '**'
+            # Audited component-independent inputs. gate:repo still tests these.
+            # Remove an entry if a component begins consuming files under it.
+            # Added/modified only: deletions and renames always keep full CI.
+            component_safe:
+              - added|modified: '.agents/skills/uzi-lander/**'
             api:
               - 'api/**'
             web:
@@ -933,6 +1018,23 @@ jobs:
               - 'Taskfile.yml'
               - 'scripts/assert-web-nginx.sh'
               - '.github/workflows/ci.yml'
+
+      - name: Classify component-independent changes
+        id: safe
+        env:
+          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
+          SAFE_COUNT: ${{ steps.filter.outputs.component_safe_count }}
+          EXPECTED_COUNT: ${{ github.event.pull_request.changed_files }}
+        run: |
+          # Only a nonempty, entirely allowlisted diff authorizes skipping.
+          # Numeric sentinel avoids Actions' case-insensitive string comparisons;
+          # missing/malformed outputs or a failed changes job keep the full run.
+          # The PR count also rejects a truncated API file list (limit: 3000).
+          if [[ "$ALL_COUNT" =~ ^[1-9][0-9]*$ && "$SAFE_COUNT" == "$ALL_COUNT" && "$EXPECTED_COUNT" == "$ALL_COUNT" ]]; then
+            echo 'skip_components=1' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip_components=0' >> "$GITHUB_OUTPUT"
+          fi
 
   # The three web nginx configs (compose, mock, and the chart's rendered web-configmap)
   # gzip and cache static assets and keep every security header (#2662, #2663). Real

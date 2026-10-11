@@ -28,6 +28,11 @@
     "react-router-dom": "^7.0.0",
     "remark-gfm": "^4.0.1"
   },
+  "overrides": {
+    "mermaid": {
+      "katex": "0.18.2"
+    }
+  },
   "devDependencies": {
     "@babel/parser": "^8.0.0",
     "@babel/types": "^8.0.0",

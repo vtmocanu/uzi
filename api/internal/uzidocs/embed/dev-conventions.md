@@ -19,7 +19,7 @@ enumerates them.
 Install the runner first:
 
 ```sh
-go install github.com/go-task/task/v3/cmd/task@v3.51.1
+go install github.com/go-task/task/v3/cmd/task@v3.54.0
 ```
 
 Pinned to the same version CI installs, verified through Go's checksum database,
@@ -365,11 +365,26 @@ jobs. All four of those jobs are in `*publish_needs`, so **the release-blocking
 property is inherited**: a CVE published on a Tuesday can redden a `v*` tag publish
 with nobody's diff in it. That is accepted rather than overlooked.
 
-**npm audit gates at `--audit-level=high`, not at zero**, because two moderate
-`react-router` advisories survive every available option — no patched 6.x exists,
-`--force` will not touch them, `overrides` has nothing to point at — so clearing
-them is a React Router 6 → 7 major through shipped SPA routing code. Filed as its
-own issue rather than left as an unexplained threshold.
+**npm audit gates at `--audit-level=high`, not at zero.** The threshold was set
+because two moderate `react-router` advisories had no fix on React Router 6: no
+patched 6.x existed, `--force` would not touch them, and `overrides` had nothing to
+point at, so clearing them meant a React Router 6 → 7 major. `web/package.json` has
+since moved to `react-router-dom` `^7.0.0`, which removed that reason. The threshold
+itself is unchanged and is still `--audit-level=high`.
+
+#### Temporary Mermaid KaTeX override (#2456)
+
+[Issue #2456](https://github.com/vtmocanu/uzi/issues/2456) pins Mermaid's KaTeX
+dependency to `0.18.2` via the scoped `mermaid` override in `web/package.json`
+to address [GHSA-238p-pmpm-9mq7](https://github.com/advisories/GHSA-238p-pmpm-9mq7).
+Mermaid is a dev-only parser for the PR diagram browser tests; Mermaid 11.17.2
+still requires KaTeX `^0.16.47`, so the override upgrades this transitive dependency
+without changing direct dependency declarations or other KaTeX consumers.
+
+Remove the override once a Mermaid release allows KaTeX `>= 0.18.2`. Before
+removal, verify the release's dependency range, regenerate and inspect the
+lockfile to confirm a patched KaTeX resolves without the override, and run the
+PR diagram browser tests and `task vulncheck:web`.
 
 ### 🔴 The rule this milestone earned: a gate script names the environment variables that can shrink its view, and refuses them
 

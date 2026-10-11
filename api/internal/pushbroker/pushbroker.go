@@ -107,7 +107,8 @@ var (
 	// "origin moved" outcome, not an error.
 	ErrNotDescendant = errors.New("pushbroker: declared tip does not descend origin tip")
 	// ErrTipMissing means the declared tip object is not present after applying the
-	// pack — the worker's pack did not actually contain the commit it named.
+	// pack — the worker's pack did not actually contain the commit it named. The caller maps it to a
+	// best-effort "tip_missing" skip.
 	ErrTipMissing = errors.New("pushbroker: declared tip not present after applying pack")
 	// ErrPackTooLarge means the worker's pack exceeds the budget along ANY of the axes
 	// scanPackBudget bounds: too many objects, an over-cap per-object inflated/declared
@@ -119,11 +120,12 @@ var (
 	// rather than OOMing the shared api (the reconstructed-size axis) OR pinning a core
 	// inflating instruction streams whose declared targets are tiny (the inflation-work
 	// axis — the variant a reconstructed-size-only budget waved through). The caller
-	// maps it to a best-effort "unsupported" skip.
+	// maps it to a best-effort "pack_too_large" skip; the returned error also wraps the
+	// packbudget.BudgetError naming the tripped bound, for the operator log.
 	ErrPackTooLarge = errors.New("pushbroker: pack exceeds inflation budget")
 	// ErrPackInvalid means the pack header or an object header could not be parsed —
 	// a genuinely malformed pack, distinct from an oversize one. The caller maps it to
-	// a best-effort "unsupported" skip (200), NOT a 5xx: worker input must not
+	// a best-effort "pack_invalid" skip (200), NOT a 5xx: worker input must not
 	// 500-storm the shared api.
 	ErrPackInvalid = errors.New("pushbroker: pack is malformed")
 	// ErrWorkflowScopeRejected means GitHub refused the checkpoint push because the
@@ -274,7 +276,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	if tipHash.IsZero() {
 		// A malformed tip should have been rejected at the handler, but never trust
 		// it here: a zero hash can never be a valid checkpoint tip.
-		return Result{}, ErrTipMissing
+		return Result{}, fmt.Errorf("%w: zero declared tip", ErrTipMissing)
 	}
 
 	// A publish always declares a tip, so it is never a ref delete, and even a zero-object
@@ -283,7 +285,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// send origin a create/update with no pack, which origin answers "eof before pack
 	// header" and surfaces as a 500; refuse it as malformed (a best-effort skip) instead.
 	if len(o.Pack) == 0 {
-		return Result{}, ErrPackInvalid
+		return Result{}, fmt.Errorf("%w: empty pack", ErrPackInvalid)
 	}
 
 	// Step 1: BEFORE resolving anything into the unbounded in-memory storer, walk the
@@ -364,7 +366,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	declaredCommit, err := object.GetCommit(repo.Storer, tipHash)
 	if err != nil {
 		if errors.Is(err, plumbing.ErrObjectNotFound) {
-			return Result{}, ErrTipMissing
+			return Result{}, fmt.Errorf("%w: declared tip not in applied pack", ErrTipMissing)
 		}
 		return Result{}, fmt.Errorf("pushbroker: read declared tip: %w", err)
 	}
@@ -1131,9 +1133,9 @@ func scanPackBudget(ctx context.Context, pack []byte) error {
 	})
 	switch {
 	case errors.Is(err, packbudget.ErrTooLarge):
-		return ErrPackTooLarge
+		return fmt.Errorf("%w: %w", ErrPackTooLarge, err)
 	case errors.Is(err, packbudget.ErrInvalid):
-		return ErrPackInvalid
+		return fmt.Errorf("%w: %w", ErrPackInvalid, err)
 	}
 	return err
 }

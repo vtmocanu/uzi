@@ -20,6 +20,12 @@ available if your admin has turned hosting on for this instance.
 2. Pick a **type** and a **size** (below), optionally tick **Docker-capable**
    (see [Docker inside a worker](./worker-docker.md) — needs an instance
    whose admin has turned the docker tier on), then **Provision**.
+
+   A Docker-capable worker claims repo-bearing runs only for repos on the Docker worker repo allowlist,
+   which only an admin edits at **Admin → Instance → Docker worker repo allowlist**. A run on any other
+   repo stays queued unless another eligible (for example non-Docker) worker can claim it; repo-less
+   judge runs are not affected. See [Run health](./run-health.md#what-the-flags-mean).
+
 3. The new worker appears under **Your workers** right away and comes online
    on its own, usually within a few seconds — nothing to run, nothing to copy.
 

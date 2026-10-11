@@ -1,4 +1,4 @@
-import { isAccountingStatus, isProgressNote } from "../lib/accountingStatus";
+import { isAccountingStatus, isProgressNote, isSummaryUsage } from "../lib/accountingStatus";
 import { PlanCrossCheckEvent } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
@@ -1062,7 +1062,7 @@ export const RunEventRow = memo(function RunEventRow({
   phaseUsage?: PhaseUsage;
   onFindingMutation?: () => void;
 }) {
-  if (isAccountingStatus(msg) || isProgressNote(msg)) return null;
+  if (isAccountingStatus(msg) || isProgressNote(msg) || isSummaryUsage(msg)) return null;
   const rec = asRecord(msg.payload);
   switch (msg.kind) {
     case "text": {

@@ -104,7 +104,7 @@ import {
   type RepoAgentHarness,
 } from "./repoagents.js";
 import { CandidateReservationRefusedError, MessageBatcher } from "./batcher.js";
-import type { Outbox } from "./outbox.js";
+import type { Outbox, ReportRetirementContext } from "./outbox.js";
 import {
   installTerminalWriteAhead,
   resolvePendingTerminal,
@@ -607,9 +607,20 @@ function isCodexBoundaryTimeout(err: unknown): boolean {
 
 /** issue #1597 M1: the closed set of server best-effort skip labels a checkpoint publish can
  *  carry onto the run feed — the `Skipped:` values api/internal/workersvc/service.go returns
- *  (PublishCheckpoint). Anything else the body carries is untrusted free text and is folded to
- *  `other`, so no server-/forge-shaped string reaches the feed verbatim. */
-const PUBLISH_SKIP_LABELS = ["unsupported", "no_ref", "not_descendant", "workflow_scope"] as const;
+ *  (`Publish` / `publishOutcome`): `unsupported` (run kind), `superseded`, and the broker refusals
+ *  `tip_missing` / `pack_too_large` / `pack_invalid`, besides the ref/scope skips. Anything
+ *  else the body carries is untrusted free text and is folded to `other`, so no server-/forge-
+ *  shaped string reaches the feed verbatim. */
+const PUBLISH_SKIP_LABELS = [
+  "unsupported",
+  "no_ref",
+  "not_descendant",
+  "workflow_scope",
+  "superseded",
+  "tip_missing",
+  "pack_too_large",
+  "pack_invalid",
+] as const;
 type PublishSkipLabel = (typeof PUBLISH_SKIP_LABELS)[number] | "other";
 
 function publishSkipLabel(raw: unknown): PublishSkipLabel {
@@ -969,6 +980,52 @@ class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
 
 class RetainedRecoveryMissingJournalError extends Error {
   constructor() { super("Retained recovery blocked: required journal is missing; local work and custody retained"); }
+}
+
+/** Per-claim retries of pre-clone retained discovery after a confirmed operational error. Shared by
+ *  both discoverRetained callers (pre-clone and the PendingRecoveryCaptureError branch). */
+const RETAINED_DISCOVERY_RETRIES = 2;
+
+/** Thrown inside discoverRetained when a retryable error has no allowance left; the catch maps it
+ *  to the "busy or unavailable after bounded retries" reason. Local, never escapes discoverRetained. */
+class RetainedDiscoveryExhaustedError extends Error {
+  constructor() { super("retained recovery discovery retries exhausted"); }
+}
+
+/** Message of the lock-wait abort in git.ts (GIT_LOCK_WAIT_ABORT_MESSAGE, not exported). */
+const RETAINED_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
+const RETAINED_DEADLINE_TEXT = "recovery deadline exhausted";
+const RETAINED_RETRYABLE_ERRNO = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]);
+const RETAINED_CORRUPTION_MARKERS = [
+  "invalid retained recovery clone journal", "invalid recovery", "unsafe recovery", "does not belong", "ledger",
+];
+
+/**
+ * Classifies a pre-clone retained-discovery failure. Typed and corruption rejections come first,
+ * before any deadline-text match, so a corrupt journal can never be retried as "busy". A deadline
+ * error is retryable only when the caller's absolute attempt deadline has elapsed AND the error
+ * carries positive deadline evidence; a bare AbortError is terminal.
+ */
+function classifyRetainedDiscoveryError(error: unknown, deadlineElapsed: boolean): "retryable" | "terminal" {
+  if (error instanceof RetainedRecoveryBlockedError || error instanceof RetainedRecoveryMissingJournalError ||
+      error instanceof ForeignRetainedRecoveryError || error instanceof RetainedRecoveryStop ||
+      error instanceof CredentialSwitchSignal || error instanceof SyntaxError) return "terminal";
+  const message = error instanceof Error ? error.message : "";
+  const errno = error as { code?: unknown; syscall?: unknown } | null;
+  if (error instanceof Error && typeof errno?.code === "string" && typeof errno.syscall === "string") {
+    // Node errno messages embed the failing path, so a marker such as "ledger" in a repo path
+    // must not reject them; the errno code alone decides.
+    return RETAINED_RETRYABLE_ERRNO.has(errno.code) ? "retryable" : "terminal";
+  }
+  if (RETAINED_CORRUPTION_MARKERS.some(marker => message.includes(marker))) return "terminal";
+  if (!deadlineElapsed) return "terminal";
+  if (error instanceof Error && error.name === "AbortError" && message === RETAINED_LOCK_WAIT_ABORT_MESSAGE) return "retryable";
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
+    if (current.message.includes(RETAINED_DEADLINE_TEXT)) return "retryable";
+    current = (current as { cause?: unknown }).cause;
+  }
+  return "terminal";
 }
 
 class CredentialSwitchRetainedStop extends Error {
@@ -1639,6 +1696,8 @@ interface RunFlight {
   retainedEpisodeCustody?: boolean;
   completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
+  /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
+  retainedDiscoveryRetries?: number;
   readonly runHome: string | undefined;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
@@ -4201,18 +4260,103 @@ export class RunRunner {
   // terminal-resolve keys its single-flight by outbox identity; all replay paths share this proxy.
   private readonly protectedTerminalOutboxes = new WeakMap<TerminalOutboxDeps["outbox"], TerminalOutboxDeps["outbox"]>();
 
+  /** Ended flights only. A queued execute changes the exact tail and refuses unlink;
+   * release never deletes that duplicate's replacement tail. */
+  private async withReportSourceReservation(runId: string,
+    action: (eligible: () => boolean) => Promise<void>): Promise<void> {
+    if (this.executionTails.has(runId) || this.activeRuns.has(runId) || this.snapshotRegistry?.has(runId)) return;
+    let release!: () => void;
+    const tail = new Promise<void>(resolve => { release = resolve; });
+    this.executionTails.set(runId, tail);
+    this.inventoryReservations.add(runId);
+    const eligible = () => this.executionTails.get(runId) === tail &&
+      !this.activeRuns.has(runId) && !this.snapshotRegistry?.has(runId) &&
+      residueQuarantine() === undefined;
+    try { await action(eligible); }
+    finally {
+      this.inventoryReservations.delete(runId);
+      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+      release();
+    }
+  }
+
+  /** Proof and unlink share C/S/J/B/O; no reusable archive proof escapes this call. */
+  async retireRecoveryReport(runId: string, generation: number, context: ReportRetirementContext,
+    kind: "terminal" | "finalize" = "terminal", outbox = this.outbox): Promise<boolean> {
+    if (!outbox || !context.expectedIdentity || context.signal?.aborted || context.eligible?.() === false) return false;
+    const deadline = Math.min(Date.now() + 1_000, context.deadline ?? Infinity);
+    if (deadline <= Date.now()) return false;
+    const abort = new AbortController();
+    const cancel = () => abort.abort(context.signal?.reason);
+    context.signal?.addEventListener("abort", cancel, { once: true });
+    const timer = setTimeout(() => abort.abort(new Error("report proof deadline")), Math.max(1, deadline - Date.now()));
+    const budget = { signal: abort.signal, deadline };
+    let retired = false;
+    try {
+      await this.recovery.retireArchivedReport(runId, generation, budget,
+        action => this.withReportSourceReservation(runId, action),
+        async (bare, covered, laterHead) => {
+          const first = await this.git.readInventoryCloneHeads(bare, runId, true);
+          if (first.kind !== "verified" || process.platform !== "linux") return false;
+          const identity = JSON.stringify(first);
+          for (const head of first.heads) if (!laterHead(head) && !await covered(head)) return false;
+          // Each complete content inspection is bracketed by process observations.
+          // Report observations refuse writers without killing them.
+          for (let pass = 0; pass < 2; pass++) {
+            for (const clone of first.clones) {
+              budget.signal.throwIfAborted();
+              if (this.liveAttempts.isLivePath(clone.clonePath)) return false;
+              if (!clone.head || !clone.identity) return false;
+              if (laterHead(clone.head)) continue;
+              const observe = () => this.quiesceImpl({
+                mode: "capture", attempt: undefined, cloneKey: cloneKeyOf(clone.clonePath).cloneKey,
+                targetPaths: [clone.clonePath], processes: true, dockerHost: undefined, registry: this.liveAttempts,
+                otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+                site: "report_retirement", reportBudget: budget,
+              });
+              const before = await observe();
+              if (before.process?.state !== "quiescent" || before.process.killed.length !== 0) return false;
+              if (await this.git.credentialFreeCancelCleanHead(clone.clonePath, bare, clone.head) !== clone.head) return false;
+              const after = await observe();
+              if (after.process?.state !== "quiescent" || after.process.killed.length !== 0) return false;
+            }
+            if (JSON.stringify(await this.git.readInventoryCloneHeads(bare, runId, true)) !== identity) return false;
+          }
+          return true;
+        },
+        async ownTailEligible => {
+          const eligible = () => ownTailEligible() && context.eligible?.() !== false &&
+            !outbox.hasUndrainedMessages(runId) && !outbox.isTerminalResolveHeld(runId, generation);
+          if (kind === "terminal") retired = await outbox.retireTerminalIfEligible(runId, generation,
+            { ...context, ...budget, eligible });
+          else retired = await outbox.retireFinalizeIfEligible(runId, generation, eligible, budget.signal, context.expectedIdentity!, true, budget);
+        });
+    } catch (err) {
+      this.log.debug("recovery: report retained", { run_id: runId, generation, error: errMessage(err) });
+    } finally {
+      clearTimeout(timer);
+      context.signal?.removeEventListener("abort", cancel);
+    }
+    return retired;
+  }
+
   protectRecoveryTerminalDeps(deps: TerminalOutboxDeps): TerminalOutboxDeps {
     const existing = this.protectedTerminalOutboxes.get(deps.outbox);
     if (existing) return { ...deps, outbox: existing };
     const outbox = new Proxy(deps.outbox, {
       get: (target, property) => {
-        if (property === "retireTerminal") return async (runId: string, generation: number) => {
+        if (property === "retireTerminal") return async (runId: string, generation: number, context?: ReportRetirementContext) => {
           const incarnation = this.client.capturePublicationCompletionRetirement?.();
           const receipt = this.completionReceipts.get(this.completionKey(runId, generation));
           const original = receipt && this.persistedReceiptProofs.has(receipt)
             ? await target.readTerminalJournal(runId, generation) : undefined;
-          if (await this.recoveryInventoryPending(runId, generation)) return false;
-          const retired = await target.retireTerminal(runId, generation);
+          let retired = false;
+          if (context?.expectedIdentity)
+            retired = await this.retireRecoveryReport(runId, generation, context, "terminal", target);
+          if (!retired) {
+            if (await this.recoveryInventoryPending(runId, generation)) return false;
+            retired = await target.retireTerminal(runId, generation);
+          }
           if (retired === true && incarnation && (!receipt ||
               (this.persistedReceiptProofs.has(receipt) && original?.body.status === "completed" &&
                 original.body.completion_final_head === receipt.final_head)))
@@ -7573,6 +7717,12 @@ export class RunRunner {
       pass: this.deliverySummaryRunner(),
       log: runLog,
       emit: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      // Issue #2686: the PR-description editor pass's spend, emitted while the batcher is open
+      // (publishing is awaited before it closes); a fenced (lost) claim emits nothing.
+      emitUsage: (u) => {
+        if (flight.steering.claimFence() !== undefined) return;
+        batcher.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "pr_description", model_usage: u } });
+      },
       forgeRetry,
       headLagRetryMs: this.prDescriptionHeadLagMs,
     });
@@ -8767,10 +8917,31 @@ export class RunRunner {
             }
           }
         };
-        if (typeof this.git.withRecoveryOperation === "function") {
-          await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs, discover);
-        } else {
-          await discover();
+        // The allowance is in-memory and separate from the persisted episode budget
+        // (reserveRecoveryIteration), which it never reads, resets or replaces. The extra time is
+        // scheduled time (attempt deadlines plus backoff), not a wall-clock guarantee.
+        for (;;) {
+          retainedJournal = undefined;
+          const attemptDeadline = Date.now() + this.codexBoundaryDeadlineMs;
+          try {
+            if (typeof this.git.withRecoveryOperation === "function") {
+              await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), attemptDeadline, discover);
+            } else {
+              await discover();
+            }
+            break;
+          } catch (attemptError) {
+            this.retainedLifecycleGuard(flight);
+            if (classifyRetainedDiscoveryError(attemptError, Date.now() >= attemptDeadline) !== "retryable") throw attemptError;
+            const retry = (flight.retainedDiscoveryRetries ?? 0) + 1;
+            if (retry > RETAINED_DISCOVERY_RETRIES) throw new RetainedDiscoveryExhaustedError();
+            flight.retainedDiscoveryRetries = retry;
+            flight.runLog.warn("retained recovery discovery failed; retrying within the bounded per-claim allowance", {
+              retry, error: sanitizeForLog(errMessage(attemptError)),
+            });
+            await this.waitRecoveryRetry(flight, true, this.recoveryRetryMs * 2 ** (retry - 1));
+            this.retainedLifecycleGuard(flight);
+          }
         }
         this.retainedLifecycleGuard(flight);
         if (required && !retainedJournal) throw new RetainedRecoveryMissingJournalError();
@@ -8795,7 +8966,9 @@ export class RunRunner {
           flight.keepGuardedInventoryOpen = true;
           flight.retainedLocalCustody = true;
           let reason = error instanceof RetainedRecoveryMissingJournalError ? error.message :
-            "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
+            error instanceof RetainedDiscoveryExhaustedError ?
+              "Retained recovery blocked: local recovery storage busy or unavailable after bounded retries; local work and custody retained" :
+              "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
           if (error instanceof RetainedRecoveryBlockedError) {
             flight.barePath = error.barePath;
             flight.worktreePath = error.journal.clonePath;
@@ -10029,6 +10202,8 @@ export class RunRunner {
         batcher.emit(m);
         nowSummary?.observeFrame(m);
       },
+      // Issue #2686: the same predicate the Now summary checks before a usage-only emit.
+      claimFenced: () => flight.steering.claimFence() !== undefined,
       // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
       usage: batcher.usage,
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.

@@ -259,7 +259,9 @@ export function HostedWorkers({
             Runs in the cluster, not on your machine: no join token, no container to start.
             It shows up under <strong>Your workers</strong> and you delete it there.{" "}
             <em>Docker-capable</em> gives it a Docker daemon for container builds and tests,
-            at extra CPU and storage.
+            at extra CPU and storage. A Docker-capable worker can pick up repo runs only when an
+            admin has added the repo to the Docker worker repo allowlist under Admin → Instance.
+            Runs on other repos need another eligible worker.
           </p>
         </>
       )}

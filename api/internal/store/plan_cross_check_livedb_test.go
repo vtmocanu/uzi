@@ -195,6 +195,10 @@ func TestPlanCrossCheckSecondParkLiveDB(t *testing.T) {
 		input, err := f.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
 			RunID: f.runID, Body: pgT("{}"), AgentSource: pgT("own"),
 			AgentExclusions: []byte("[]"), ExpectedGateRevision: pgtype.Int8{Int64: revision, Valid: true},
+			// Issue #2680: the interlocked run's freeze source is the parked `[]` list (the first
+			// approve freezes it, so the later approve still sees `[]`), which the contract-source
+			// predicate must be told it was built from.
+			ContractSource: []byte("[]"),
 		})
 		if err != nil {
 			t.Fatalf("approve revision %d: %v", revision, err)

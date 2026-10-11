@@ -81,13 +81,51 @@ batch and a full refold land on the same row, `GREATEST` makes the repeat a no-o
 The api rebuilds every `progress_note` payload on ingest from only `{text, milestone_id,
 model_usage}` (`normalizeProgressNotePayload`). In particular a note must never carry:
 
-- **`event: "result"`**: the usage tail and the web fold read that as the end of a leg, which
-  a note is not.
+- **`event: "result"`**: defense in depth. Every leg-end reader gates on the message kind
+  (`status` or `error`) before it looks at `event`: `collectUsageStamps` in `usage_tail.go`,
+  `foldUsageFrames` in `usage_fold.go` and the web `isResultFrame`. A `progress_note` is
+  neither, so none of them would read the key as a leg end today; ingest still drops it so
+  that does not depend on every future reader keeping the gate.
 - **a top-level `usage` key**: the web fold would count it a second time, beside the
   `model_usage` it already folds under the `progress_note:` key.
 
 Dropping every other key at ingest keeps both from reaching the stored row, whatever a worker
 sends.
+
+## Summary passes (issue #2686)
+
+The other SummaryRunner model passes (the intent and plan summaries on Claude, which use the
+resolved `summary_model` (default Haiku), and the PR-description summary on Claude or Codex,
+`CODEX_PR_DESCRIPTION_MODEL` on Codex) also run on the run's credential, and their spend used
+to never reach `run_usage`. They follow the same invariant, under their own key and carrier:
+
+```
+model         = "summary_pass:<model>"
+lineage_epoch = the summary_usage message's own seq
+usage_basis   = per_leg
+```
+
+The worker emits one `summary_usage` run message per pass that observed usage, with payload
+`{pass: intent|plan|pr_description, model_usage}`; a pass that finishes after the claim is fenced emits none. The api
+rebuilds the payload at ingest (`api/internal/workersvc/summary_usage.go`) and folds it
+(`foldSummaryUsage`, called from `usage_fold.go`). Each pass is its own row, so the rows sum.
+
+**Why a new kind and not an existing one.** `progress_note` is the Now line, so its readers
+would show a summary pass as a Now note. A status or error frame is read as a leg end. A new
+kind is neither. A batch holding only usage messages does not count as run activity.
+
+**Readers.**
+
+- The refold (`ListRunUsageFrames`) includes the kind.
+- The unpriced-Codex health check (`ListRecentUnpricedCodexModels`) strips the `summary_pass:`
+  prefix, as it does `progress_note:`.
+- The web usage fold counts it as a separate "Intent, plan & PR summaries" row that adds up to
+  the Run total. It never enters a phase or per-agent row, which matters because the per-agent
+  branch reads a top-level `usage` key without checking the kind.
+- The web transcript and activity feed, `uzi run logs`, and the TUI hide the kind; `--json`
+  still carries it. The run judge's input drops it.
+
+The `summary` fixture pair in `fixtures/run-usage/` pins the server and client folds.
 
 ## Alternative rejected
 
@@ -102,3 +140,4 @@ Usage accounting bullet now points here.
 - `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageNotesFoldMatchesAuthoredRollup`
   and its discriminating twin) with the `fixtures/run-usage/*-notes.json` pair.
 - `api/internal/store/codex_pricing_livedb_test.go` (`TestRecentUnpricedCodexModelsProgressNoteLiveDB`).
+- `api/internal/workersvc/run_usage_contract_test.go` (`TestRunUsageSummaryFoldMatchesAuthoredRollup`) and `web/src/lib/runUsageContract.test.ts` with the `fixtures/run-usage/*-summary.json` pair (issue #2686).

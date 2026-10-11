@@ -203,7 +203,7 @@ required PAT scope, and how a repo gets linked.
 
 | Setting | Default | Controls |
 |---|---|---|
-| `decisions_memo_enabled` | `false` | Experiment (#2083): lets a Claude run that publishes a PR save a private, owner-scoped decisions memo (up to 8 KiB), and lets a later [MR rework](./mr-review-watcher.md#decisions-memo-experiment) on the same PR receive it as untrusted, advisory context. Text `true` or `false`; set through `PUT /api/admin/settings`, with no Admin Settings control. Turning it off stops new writes and injection but keeps stored memos. Codex runs are unaffected. |
+| `decisions_memo_enabled` | `false` | Experiment (#2083): lets a Claude run that publishes a PR save a private, owner-scoped decisions memo (up to 8 KiB), and lets a later [MR rework](./mr-review-watcher.md#decisions-memo-experiment) on the same PR receive it as untrusted, advisory context. Text `true` or `false`; set through `PUT /api/admin/settings`, with no Admin → Instance control. Turning it off stops new writes and injection but keeps stored memos. Codex runs are unaffected. |
 
 ## Trusted review bots
 
@@ -265,18 +265,21 @@ signal off, from **Admin → Instance → Run health**:
 | Long tool call after | 1200s (20m) | `health_tool_call_seconds` — how long the oldest open tool call of a run's main agent may run, on a run that has also been silent for the **Stalled after** window (or for this threshold, if **Stalled after** is `0`), before it's flagged stalled. Calls to subagents are excluded. `0` turns this signal off. See [Long tool calls](./run-health.md#long-tool-calls). |
 | Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
 | Extension allowance per run (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the total extra wall-clock time an owner may grant a single run through [Extend](./run-health.md#giving-a-run-more-time), on top of its frozen budget. `0` turns extending off instance-wide. |
-| Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
+| Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. A Docker worker repo allowlist block is flagged as soon as it is detected instead; `0` still disables it. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
 
-**A repo-bearing run stuck past "Stuck queued after" can also be waiting on
-the Docker worker repo allowlist.** If every online worker is Docker-capable
-and the run's repo isn't on that allowlist, the owner's reason names it
-directly, distinct from "no worker online" or "all workers busy" — see
+**A repo-bearing run can also be waiting on the Docker worker repo
+allowlist.** If the owner's online workers are all Docker workers and the
+run's repo isn't on that allowlist, the run is flagged waiting for worker as
+soon as the block is detected, not after "Stuck queued after" (setting that to
+`0` still disables it). The reason names the allowlist directly, distinct from
+"no worker online" or "all workers busy", and tells a non-admin owner to ask
+an admin to add the repo — see
 [Run health](./run-health.md#what-the-flags-mean). That allowlist is keyed
 by **repo id**, not path, so a repo re-added to uzi (say, after moving it to
 a new forge) gets a new id and silently drops off — nothing re-adds it for
-you. The Repos page's **Setup** chip surfaces each repo's optional
+you. The Boards page's **Setup** chip surfaces each repo's optional
 capabilities (repo skills, repo instructions, tool profile, Docker workers)
 as on/off with where to set them, staying neutral while a repo sits on its
 safe defaults and escalating to an info tone only once a queued run is
@@ -326,12 +329,12 @@ This is not one of the instance-wide settings above: it is a **per-repo, per-dec
 exception, not a knob. An **instance admin only** can grant it — a member still cannot
 self-allow, not even for a repo they own. What a member *can* do is ask: when their own
 Enable attempt is refused for a **waivable** reason, a **Request admin approval** action
-appears on their own Repos page. It takes a required reason of their own and records the
+appears on their own Boards page. It takes a required reason of their own and records the
 request; only an instance admin can approve it. Allowing a repo, whether inline or via a
 request, requires a written reason, and the write is recorded with the admin's identity
 and a timestamp — there's no anonymous or unattributed override.
 
-Admins act on it in two places: **inline on the Repos page**, for any repo they
+Admins act on it in two places: **inline on the Boards page**, for any repo they
 can already see, with "Allow anyway" (blocked) or "Revoke" (already allowed); and
 from a cross-user **Admin → Blocked repos** page. That page is built from the
 **last stored privilege sweep**, not a live re-check, so a connection that was
@@ -351,7 +354,7 @@ member's own reason, the admin's identity, and a timestamp — it does **not** e
 the repo; the owner still has to retry Enable so the live guard runs again against
 the current forge state. The requester gets a one-time Slack DM with the
 decision when their Slack account is linked (see [Slack](./slack.md)); either
-way, the Repos page row for that repo also shows the decision.
+way, the Boards page row for that repo also shows the decision.
 
 **The override can never waive the case where uzi couldn't read the repo's
 protection at all.** A forge read error, timeout, or an unverifiable answer (see

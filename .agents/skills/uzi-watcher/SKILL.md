@@ -126,7 +126,8 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
    message naming the precise change (re-plans without ending the run; then watch for the
    gate again). Not sound → `uzi run reject` with a `-m` reason, then stop.
 5. **Hand off to `uzi-lander`.** Once approved, the run is landing work: load `uzi-lander`
-   and start at its snapshot (`takeover.sh RUN`). It polls the run blind to terminal, then
+   and start at its snapshot (`takeover.sh RUN`), carrying the approved plan's seq into its
+   step-1 poller. It polls the run blind to terminal, then
    drives the PR to merged and `main` green, one status line per state change. A `failed`
    or `cancelled` run comes back here (*When a run fails*, recovery below). First claim
    it so the board names its lander before a PR exists:

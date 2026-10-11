@@ -12,3 +12,9 @@ export function isAccountingStatus(message: RunMessage): boolean {
 export function isProgressNote(message: RunMessage): boolean {
   return message.kind === "progress_note";
 }
+
+/** A SummaryRunner pass's usage (issue #2686) is an accounting-only frame: the usage panel
+ *  folds it from the message list, and it has no transcript presentation. */
+export function isSummaryUsage(message: RunMessage): boolean {
+  return message.kind === "summary_usage";
+}

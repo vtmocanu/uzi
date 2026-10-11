@@ -212,3 +212,30 @@ cap does **not** bound Git-internal delta decompression memory. The deadline lim
 does not isolate this verifier from sibling runs. The resulting residual
 resource-exhaustion risk is deferred scope, as authorized by the human
 review on 2026-10-09 (#2512).
+
+## Amendment 2026-10-10 — #2613: pre-clone discovery error classification
+
+Pre-clone retained discovery used to fail the claim on any error that was not
+a foreign-retained rejection, so an operation deadline while waiting on the
+bare lock failed a run whose local work was intact. It now retries only
+confirmed operational errors: the operation deadline, identified by an elapsed
+absolute attempt deadline plus positive deadline evidence (the lock-wait
+abort message or a "recovery deadline exhausted" error in the cause chain), and the resource
+errnos EAGAIN, EMFILE, ENFILE and ENOMEM. A bare abort without that evidence
+is terminal. Typed errors and known corruption markers are rejected before
+any deadline-text match, and every other error is terminal unless positively
+identified as retryable; all of them except a foreign-retained rejection
+keep custody. Git spawn exhaustion is
+wrapped without a code, so it stays terminal.
+
+The allowance is at most 2 retries per claim, shared across both discovery
+callers (pre-clone and the pending-capture rediscovery), using the existing
+exponential recovery delay. It is in-memory and separate from the persisted
+episode budget, which it never reads, resets or replaces. It never parks and
+never mints a hold or generation. Exhaustion fails the claim with "local
+recovery storage busy or unavailable after bounded retries", keeping local
+work and custody like every other terminal discovery failure.
+
+The extra allowance is about 2 x codexBoundaryDeadlineMs plus 3 x
+recoveryRetryMs of scheduled time (about 63 s at defaults). It is not a
+wall-clock guarantee, since I/O settlement can add to it.

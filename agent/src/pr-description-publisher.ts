@@ -86,6 +86,7 @@ import type {
 import type { PrSummaryClaim } from "./signals.js";
 import { diagramEvent, type DiagramReason } from "./diagram-diagnostic.js";
 import { parseDeliveryDiagram, type DeliverySummary, type DeliverySummaryClaimView, type DeliverySummaryInput } from "./summary-runner.js";
+import type { AdviceUsageSnapshot } from "./harness.js";
 
 // ── Seams ──────────────────────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,9 @@ export interface PublisherDeps {
   log: Pick<Logger, "info" | "warn">;
   /** A run status message (the runner's batcher, kind "status"). Fixed wording only. */
   emit: (text: string) => void;
+  /** Issue #2686: receives each editor pass's observed model usage (at most once per pass; a
+   *  regeneration is a second pass and reports again). Absent under tests/stub executors. */
+  emitUsage?: (modelUsage: AdviceUsageSnapshot) => void;
   /** Wraps each forge call (the runner passes its bounded forge retry); default: one attempt.
    *  `signal` is the publication's budgeted signal: a retry must stop waiting once it aborts. */
   forgeRetry?: <T>(fn: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
@@ -708,7 +712,7 @@ export class PrDescriptionPublication {
     try {
       const previous = this.state?.published_version?.fields ?? null;
       const context = await this.spec.context(snapshot, this.deadline, previous);
-      return await pass.generateDeliverySummary({ claim: this.spec.claim, claimGeneration: this.spec.claimGeneration, context, deadlineMs: this.deadline });
+      return await pass.generateDeliverySummary({ claim: this.spec.claim, claimGeneration: this.spec.claimGeneration, context, deadlineMs: this.deadline, onUsage: this.deps.emitUsage });
     } catch {
       diagramEvent(log, this.spec.claim, "editor", "omitted", "pass_failed", { claim_generation: this.spec.claimGeneration }, [this.spec.pat]);
       log.warn("PR description: the editor pass failed", { run_id: this.spec.runId, reason: "pass_failed" });

@@ -139,8 +139,9 @@ const components: Components = {
   a({ href, children, node: _node, ...props }) {
     const url = href ?? "";
     if (url === "" || schemeIsDangerous(url)) {
-      // Neutralized by react-markdown or by our own check: inert text, no href.
-      return <a {...props}>{children}</a>;
+      // Neutralized by react-markdown or by our own check: plain text with no
+      // anchor at all, so no `a` selector can style it as a clickable link.
+      return <span>{children}</span>;
     }
     return (
       <a {...props} href={url} target="_blank" rel="noopener noreferrer">

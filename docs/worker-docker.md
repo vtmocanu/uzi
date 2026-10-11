@@ -67,6 +67,11 @@ an instance whose admin has turned the docker tier on. The cluster runs the
 daemon as a native sidecar in a dedicated, isolated namespace; there's
 nothing to configure yourself.
 
+A Docker-capable worker claims repo-bearing runs only for repos on the Docker worker repo allowlist,
+which only an admin edits at **Admin → Instance → Docker worker repo allowlist**. A run on any other
+repo stays queued unless another eligible (for example non-Docker) worker can claim it; repo-less
+judge runs are not affected. See [Run health](./run-health.md#what-the-flags-mean).
+
 For on-demand hosted workers, use **Ephemeral workers → Docker-capable** on
 the Workers page; it saves separately from auto-provision and adds Docker only
 for repositories your admin allows. See [auto-provisioning policy](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability).

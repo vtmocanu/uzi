@@ -825,3 +825,137 @@ func TestRunUsageStoredNotesFixtureMatchesNormalization(t *testing.T) {
 		t.Fatal("fixture broken: no progress_note frames")
 	}
 }
+
+// --- Issue #2686: the summary pair (summary_usage rows) ----------------------------------
+//
+// result-frames-summary.json / run-usage-summary.json: one Claude leg holding the lead's result
+// frame, a progress_note and four summary_usage frames (intent, plan, two pr_description
+// passes), all on claude-haiku-4-5-20251001. See the fixtures README, "The summary pair".
+
+// TestRunUsageSummaryFoldMatchesAuthoredRollup: the shipped fold, replayed over the summary
+// frames, must reproduce the authored per-(model, epoch) rows and their SUM as the run total.
+func TestRunUsageSummaryFoldMatchesAuthoredRollup(t *testing.T) {
+	var frames recordedFrames
+	readFixture(t, "result-frames-summary.json", &frames)
+	var rollup recordedLegRollup
+	readFixture(t, "run-usage-summary.json", &rollup)
+
+	got := foldRecordedNotesFrames(t, frames.Frames)
+	if len(got) != len(rollup.Rows) {
+		t.Fatalf("fold produced %d (model, epoch) rows, the rollup records %d -- a pass row was dropped, invented or collapsed", len(got), len(rollup.Rows))
+	}
+	summaryRows := 0
+	var sumIn, sumCR, sumCW, sumOut int64
+	var sumCost float64
+	for _, want := range rollup.Rows {
+		g, ok := got[legKey{model: want.Model, epoch: want.LineageEpoch}]
+		if !ok {
+			t.Fatalf("fold produced no row for (model %q, epoch %d), which the rollup holds", want.Model, want.LineageEpoch)
+		}
+		if strings.HasPrefix(want.Model, summaryPassModelPrefix) {
+			summaryRows++
+		}
+		if g.InputTokens != want.InputTokens || g.OutputTokens != want.OutputTokens ||
+			g.CacheReadTokens != want.CacheReadTokens || g.CacheCreationTokens != want.CacheCreationTokens {
+			t.Errorf("(model %s, epoch %d) tokens disagree:\n got in=%d out=%d cr=%d cw=%d\nwant in=%d out=%d cr=%d cw=%d",
+				want.Model, want.LineageEpoch, g.InputTokens, g.OutputTokens, g.CacheReadTokens, g.CacheCreationTokens,
+				want.InputTokens, want.OutputTokens, want.CacheReadTokens, want.CacheCreationTokens)
+		}
+		if d := math.Abs(costFloat(t, g.CostUsd) - want.CostUSD); d > 5e-7 {
+			t.Errorf("(model %s, epoch %d) cost disagrees: got %v, want %v", want.Model, want.LineageEpoch, costFloat(t, g.CostUsd), want.CostUSD)
+		}
+		if g.CostStatus != costStatusMetered || g.UsageBasis != usageBasisPerLeg || g.LineageIndex != 0 {
+			t.Errorf("(model %s, epoch %d) status/basis/lineage = %s/%s/%d, want metered/per_leg/0", want.Model, want.LineageEpoch, g.CostStatus, g.UsageBasis, g.LineageIndex)
+		}
+		sumIn += want.InputTokens
+		sumCR += want.CacheReadTokens
+		sumCW += want.CacheCreationTokens
+		sumOut += want.OutputTokens
+		sumCost += want.CostUSD
+	}
+	if summaryRows != 4 {
+		t.Fatalf("fixture broken: %d summary_pass rows, want 4 (intent, plan, two pr_description)", summaryRows)
+	}
+	if rollup.Totals.InputTokens != sumIn || rollup.Totals.CacheReadTokens != sumCR ||
+		rollup.Totals.CacheCreationTokens != sumCW || rollup.Totals.OutputTokens != sumOut ||
+		math.Abs(rollup.Totals.CostUSD-sumCost) > 5e-6 {
+		t.Fatalf("fixture broken: totals are not the SUM of the rows (rows in=%d cr=%d cw=%d out=%d cost=%v)", sumIn, sumCR, sumCW, sumOut, sumCost)
+	}
+}
+
+// TestRunUsageSummaryFixtureDiscriminates: collapsing the pass and note rows into the lead's
+// haiku group (no prefix, init-count epoch) must NOT reproduce the totals, so the pair can tell
+// the keys apart.
+func TestRunUsageSummaryFixtureDiscriminates(t *testing.T) {
+	var rollup recordedLegRollup
+	readFixture(t, "run-usage-summary.json", &rollup)
+	collapsed := map[legKey]recordedLegRow{}
+	for _, r := range rollup.Rows {
+		model := strings.TrimPrefix(strings.TrimPrefix(r.Model, progressNoteModelPrefix), summaryPassModelPrefix)
+		k := legKey{model: model, epoch: 1}
+		c := collapsed[k]
+		c.InputTokens = max64(c.InputTokens, r.InputTokens)
+		c.OutputTokens = max64(c.OutputTokens, r.OutputTokens)
+		collapsed[k] = c
+	}
+	var sumIn, sumOut int64
+	for _, c := range collapsed {
+		sumIn += c.InputTokens
+		sumOut += c.OutputTokens
+	}
+	if sumIn == rollup.Totals.InputTokens || sumOut == rollup.Totals.OutputTokens {
+		t.Fatalf("fixture broken: the collapsed (prefix-less, init-epoch) reading in=%d out=%d equals the true totals in=%d out=%d",
+			sumIn, sumOut, rollup.Totals.InputTokens, rollup.Totals.OutputTokens)
+	}
+	// Two passes of the same kind must stay two rows: keying by pass name alone would merge them.
+	var prRows int
+	for _, r := range rollup.Rows {
+		if strings.HasPrefix(r.Model, summaryPassModelPrefix) && (r.LineageEpoch == 11 || r.LineageEpoch == 14) {
+			prRows++
+		}
+	}
+	if prRows != 2 {
+		t.Fatalf("fixture broken: %d pr_description rows, want 2", prRows)
+	}
+}
+
+// TestRunUsageStoredSummaryFixtureMatchesNormalization: stored-frames-summary.json is
+// result-frames-summary.json with each progress_note and summary_usage payload as the server
+// stores it (the claude normalisation, carrying the resolved cost), and every other frame
+// unchanged.
+func TestRunUsageStoredSummaryFixtureMatchesNormalization(t *testing.T) {
+	var in, stored recordedFrames
+	readFixture(t, "result-frames-summary.json", &in)
+	readFixture(t, "stored-frames-summary.json", &stored)
+	if len(in.Frames) != len(stored.Frames) {
+		t.Fatalf("frame counts differ: %d input, %d stored", len(in.Frames), len(stored.Frames))
+	}
+	summaries := 0
+	for i, f := range in.Frames {
+		s := stored.Frames[i]
+		if f.Seq != s.Seq || f.Kind != s.Kind {
+			t.Fatalf("frame %d: seq/kind %d/%s vs stored %d/%s", i, f.Seq, f.Kind, s.Seq, s.Kind)
+		}
+		want := f.Payload
+		switch f.Kind {
+		case KindProgressNote:
+			want = normalizeProgressNotePayload(f.Payload, harnessClaude)
+		case KindSummaryUsage:
+			summaries++
+			want = normalizeSummaryUsagePayload(f.Payload, harnessClaude)
+		}
+		var a, b any
+		if err := json.Unmarshal(want, &a); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(s.Payload, &b); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(a, b) {
+			t.Errorf("frame seq %d: stored fixture payload drifted from the server's normalisation\n got %s\nwant %s", f.Seq, s.Payload, want)
+		}
+	}
+	if summaries != 4 {
+		t.Fatalf("fixture broken: %d summary_usage frames, want 4", summaries)
+	}
+}

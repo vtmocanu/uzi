@@ -189,3 +189,66 @@ func TestRecentUnpricedCodexModelsProgressNoteLiveDB(t *testing.T) {
 		}
 	}
 }
+
+// Issue #2686: a summary pass stores its usage under "summary_pass:<model>". The health query
+// must strip that prefix exactly as it strips "progress_note:", so a priced model's pass rows
+// are not reported as an unpriced model and an unpriced model's pass rows join its plain rows.
+func TestRecentUnpricedCodexModelsSummaryPassLiveDB(t *testing.T) {
+	e := setupHarnessEnv(t)
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error(err)
+		}
+	}()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(e.ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec("DELETE FROM run_usage")
+	q := store.New(tx)
+	cutoff := time.Date(2041, 2, 3, 4, 5, 6, 0, time.UTC)
+	use := func(model string) {
+		t.Helper()
+		id := uuid.New()
+		exec(`INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,status)
+   VALUES($1,$2,$3,1,'pricing fixture','fixture','completed')`, id, e.userID, e.repoID)
+		exec(`INSERT INTO run_usage(run_id,model,harness,session_id,lineage_epoch,updated_at)
+   VALUES($1,$2,'codex','s',0,$3)`, id, model, cutoff)
+	}
+	query := func(priced []string) []store.ListRecentUnpricedCodexModelsRow {
+		t.Helper()
+		rows, err := q.ListRecentUnpricedCodexModels(e.ctx, store.ListRecentUnpricedCodexModelsParams{Cutoff: pgconv.Time(cutoff), Priced: priced})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+
+	// A priced model's pass row is not reported (it would otherwise appear as the unpriced
+	// "summary_pass:gpt-6-luna").
+	use("summary_pass:gpt-6-luna")
+	use("gpt-6-luna")
+	if got := query([]string{"gpt-6-luna"}); len(got) != 0 {
+		t.Fatalf("priced model reported: %+v", got)
+	}
+
+	// An unpriced model's pass row, note row and plain row, in different runs, group into one
+	// entry; a look-alike that differs at the "_" (LIKE's wildcard) is untouched.
+	use("summary_pass:odd-model")
+	use("progress_note:odd-model")
+	use("odd-model")
+	use("summaryXpass:odd-model")
+	want := []store.ListRecentUnpricedCodexModelsRow{
+		{Model: "odd-model", Runs: 3},
+		{Model: "summaryXpass:odd-model", Runs: 1},
+	}
+	if got := query([]string{"gpt-6-luna"}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows=%+v want=%+v", got, want)
+	}
+}

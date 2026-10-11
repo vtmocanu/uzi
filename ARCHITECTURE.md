@@ -1098,8 +1098,14 @@ chain in the diagram above, with no intervening `running`.
   run stays pinned to its prior worker while that worker's row exists and it is
   either draining or heartbeating, bounded by `WORKER_AFFINITY_CEILING` (default
   2h of queue dwell after promotion). A deleted worker, a stale non-draining
-  worker, or an expired ceiling lets another eligible worker claim it.
+  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it.
   `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
+  A run the stale-worker sweeper requeued is additionally held for its previous
+  worker, while that worker's row exists, for `WORKER_STALE_REQUEUE_GRACE` (default
+  10m, `0` disables; issue #2705), so a restarted worker can resume from its own
+  local recovery source; the ceiling still releases it, ephemeral provisioning does
+  not count a held run as demand, and health explains the wait
+  ([ADR-628](adr/0628-cross-worker-resume-durability.md) D3a, issue #2705 amendment).
   uzi currently keeps SDK transcripts only on the owning worker, under its per-run
   HOME at `.claude/projects/<encoded-cwd>/<session-id>.jsonl`; Git checkpoints
   recover code but do not transfer the conversation. The worker preflights the
@@ -1123,7 +1129,7 @@ chain in the diagram above, with no intervening `running`.
   and two read-only surfaces reuse it: `RepoDTO.DockerAllowlisted`/`DockerBlocked`
   (`apitypes.RepoDTO`) are computed caller-scoped booleans feeding the Repos page's
   Setup chip, and the PRD #47 `queuedReason` resolver (`workersvc/health.go`) adds
-  `reasonRepoNotDockerAllowed` onto the `waiting_worker` health enum when every
+  `reasonRepoNotDockerAllowedAdmin`/`reasonRepoNotDockerAllowedMember` onto the `waiting_worker` health enum when every
   online worker is Docker-capable and none is eligible for the run's repo.
 - **Capability-aware eligibility, claim through plan gate (PRD #84).** A worker
   advertises a capability set (`workers.capabilities`, from the closed `{docker,

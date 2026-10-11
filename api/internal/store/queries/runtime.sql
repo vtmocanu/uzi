@@ -582,7 +582,8 @@ SELECT fn_run_priority_class(@run_kind::text, sqlc.narg('priority')::smallint, @
 -- already in hand), the health projection ListActiveRunsForHealth carries none of
 -- kind/priority/created_at, so this reads them by id — a per-run lookup like
 -- RunHasVerdictSinceGateOpened, affordable for the same reason: it runs only behind
--- healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick.
+-- healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick (plus, under the
+-- threshold, runs the early docker-allowlist probe found online-but-ineligible).
 -- @background_grace_cutoff is the D4 fail-open cutoff (now() - RUN_BACKGROUND_GRACE),
 -- built the SAME way service.go builds ClaimRun's cutoff: a demoted run created before
 -- it reads as stale -> class `restored` (past grace) rather than `background`.
@@ -861,8 +862,12 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
 -- for the worker's user, EXCLUDING chat runs (which the chat lane claims via
 -- ClaimChatRun). A re-queued run prefers its prior worker (own runs sort first, and
--- are the only claimant until the affinity grace lapses — @affinity_cutoff is now
--- minus WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
+-- are the only claimant while the owner row exists and can still resume the run: it is
+-- draining/fenced, heartbeat-fresh, or (a stale requeue, #2705) inside
+-- WORKER_STALE_REQUEUE_GRACE via @stale_requeue_cutoff; the @affinity_cutoff ceiling
+-- (now minus WORKER_AFFINITY_CEILING) bounds each queued episode (no global bound; see
+-- the in-arm comment); once the owner row is gone or the pin
+-- lapses any of the user's workers may claim it.
 -- FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 -- blocking. The kind<>'chat' predicate is what keeps
 -- the run lane and the concurrent chat lane from stealing each other's work.
@@ -957,7 +962,20 @@ WITH claimant AS MATERIALIZED (
                WHERE ow.id = r.worker_id
                  AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
-                          AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
+                          AND ow.last_heartbeat_at >= @heartbeat_cutoff)
+                      -- #2705 pin P: a run the stale sweeper requeued (stale_requeue_generation
+                      -- = claim_generation, set only by RequeueRunsOfStaleWorkers, cleared by
+                      -- every fresh claim) stays pinned to its stale owner for
+                      -- WORKER_STALE_REQUEUE_GRACE from status_since, so a returning worker
+                      -- (a roll, a network blip) resumes it. NULL cutoff (grace 0) never pins.
+                      -- Per-episode only: PromoteCodexAccountWaitRun resets status_since AND
+                      -- updated_at, so Codex account park/promote cycles renew both this grace
+                      -- and the ceiling below; there is NO global bound across cycles.
+                      -- stale_requeue_generation is deliberately kept through the park for
+                      -- #1390 readoption/refund provenance.
+                      OR (r.kind <> 'cross_check'
+                          AND r.stale_requeue_generation = r.claim_generation
+                          AND COALESCE(r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
            -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
            OR r.updated_at < @affinity_cutoff)
@@ -4749,8 +4767,8 @@ WHERE runs.id = @id AND runs.user_id = @user_id
 -- legacy caller (NULL) advances unconditionally, byte-identical to before.
 --
 -- PRD #2603: @quiet_activity true advances the high-water mark but LEAVES last_activity_at
--- untouched. appendMessages passes it for a batch made only of progress_note messages (the
--- worker's Now summary), so a summary note neither revives a stalled run nor hides its stall.
+-- untouched. appendMessages passes it for a batch made only of progress_note or summary_usage messages (the
+-- worker's Now summary and summary-pass accounting), so a summary note neither revives a stalled run nor hides its stall.
 -- The zero value (false) is the historical behaviour, so every other caller is unchanged.
 UPDATE runs SET last_seq = GREATEST(last_seq, @seq),
     last_activity_at = CASE WHEN @quiet_activity::boolean THEN last_activity_at ELSE now() END
@@ -6019,6 +6037,9 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     -- heartbeat re-adoption can refund the requeue only when the same generation is restored
     -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
     stale_requeue_generation = runs.claim_generation,
+    -- #2705 invariant: this column plus a fresh status_since (set above) is what pins the run
+    -- to its stale owner in ClaimRun for WORKER_STALE_REQUEUE_GRACE. Every fresh claim clears
+    -- it; park/promote paths keep it (per-episode pin, see ClaimRun's comment).
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
@@ -8032,16 +8053,17 @@ ORDER BY u.id;
 -- makes it converge: a post-migration run is born refolded and never selected here.
 
 -- name: ListRunUsageFrames :many
--- A run's full status/error/progress_note frame history in seq order — the exact frame shape
+-- A run's full status/error/progress_note/summary_usage frame history in seq order — the exact frame shape
 -- foldUsageFrames folds (never tool/text traffic). progress_note (PRD #2603) carries the usage of
--- a Now-summary call, so the refold MUST read it or it would drop spend the incremental fold
+-- a Now-summary call, and summary_usage (issue #2686) that of an intent/plan/PR-description
+-- summary pass, so the refold MUST read both or it would drop spend the incremental fold
 -- recorded. Column order matches
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
-WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note')
+WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note', 'summary_usage')
 ORDER BY seq ASC;
 
 -- name: ListRunsPendingUsageRefold :many
@@ -8385,6 +8407,24 @@ WITH selected AS (
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
+      -- Issue #2680: the completion_contract above is built IN GO from a snapshot read of the
+      -- milestone source, and this statement freezes the source as it is at WRITE time, so a
+      -- candidate republished between the two would freeze list B beside a contract built from
+      -- list A. @contract_source is the exact bytes the Go contract was built from (NULL = the
+      -- caller saw no source). The first three conjuncts are the completion_contract CASE
+      -- condition above, so the predicate binds only when this statement WOULD freeze the
+      -- contract: a legacy run (version NULL), an already-frozen contract (re-approve, re-gate
+      -- resume) and a run with no source are untouched. A mismatch writes NOTHING (no selection,
+      -- freeze, budget or input row: the INSERT selects FROM the CTE) and returns no row; the
+      -- caller (workersvc.submitApproval) re-reads and retries. jsonb compare (semantic, not
+      -- textual); every conjunct is IS [NOT] NULL / IS DISTINCT FROM, so NOT(...) is never NULL.
+      -- Runs-row columns only, no subquery in the qual (see CreateRunReviseInputIfUnderCap, #106).
+      -- Under READ COMMITTED an UPDATE that waited on the row lock re-evaluates this qual
+      -- against the new row version, so the comparison and the freeze read the same tuple.
+      AND NOT (runs.completion_contract_version IS NOT NULL AND runs.completion_contract IS NULL
+               AND COALESCE(runs.milestones_frozen, runs.milestones_candidate) IS NOT NULL
+               AND COALESCE(runs.milestones_frozen, runs.milestones_candidate)
+                   IS DISTINCT FROM sqlc.narg('contract_source')::jsonb)
     RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
 )
 -- PRD #1795 M2: INSERT ... SELECT FROM the update CTE (not VALUES), so the row is stamped with
@@ -9172,6 +9212,13 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- Issue #1994: terminal_pending_since is the first-seen time of the run's CURRENT-owner, CURRENT-
 -- generation, unexpired terminal-pending snapshot row (NULL otherwise), so the health ladder can
 -- flag an outcome journaled on its worker that has stayed undelivered across lease renewals.
+-- Issue #2705 M3: stale_requeue_pinnable and stale_requeue_worker_name project the NON-time half
+-- of ClaimRun's stale-requeue pin (a queued, non-cross_check run whose owner row still exists and
+-- whose stale_requeue_generation equals claim_generation); the time half (status_since + the
+-- grace, capped by updated_at + the affinity ceiling) is computed in Go (staleRequeuePin)
+-- from the status_since and updated_at already projected here. COALESCE keeps a NULL
+-- stale_requeue_generation false rather than NULL. The name is the owner worker's, an empty string when the
+-- owner row is gone (COALESCE keeps the scan target a plain string).
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
@@ -9179,6 +9226,11 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol,
+       COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
+                AND runs.worker_id IS NOT NULL
+                AND runs.stale_requeue_generation = runs.claim_generation
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
+       COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT a.terminal_pending_since FROM worker_active_runs a
          WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
@@ -9284,8 +9336,10 @@ WHERE id = @id AND status = @status;
 
 -- name: CountOnlineWorkersForUser :one
 -- How many of a user's workers are online — the queued-run reason resolver uses it
--- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
--- for a queued run already past its threshold, so it is off the hot path.
+-- to say "no worker is online" vs "waiting for a worker" (Decision 8), for a queued run
+-- past its threshold. Under the threshold the early docker-allowlist probe calls it once
+-- per tick for each queued run that has a repo, no egress profile and a configured
+-- allowlist reader (one cheap count; it gates the costlier reads).
 -- draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): a draining
 -- worker keeps status='online' and still counts as an online worker for "no worker is
 -- online" purposes — do not add a draining predicate.
@@ -9298,7 +9352,8 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 -- with capability_aware mirroring the claim path's flag so this count and the claim gate can
 -- never disagree on ELIGIBILITY. It is deliberately an ELIGIBILITY count, NOT an
 -- availability one: it does NOT exclude draining workers (nor busy ones). That is on
--- purpose — its sole consumer is PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowed),
+-- purpose — it serves only PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowedAdmin/Member)
+-- and the early probe that surfaces that rung under the queued threshold,
 -- whose job is to isolate the docker-allowlist fence as the blocker. Excluding draining here
 -- would MISATTRIBUTE a transient all-draining fleet (during a worker roll — CountOnlineWorkersForUser
 -- keeps draining workers online, so the run still reaches that rung) to the allowlist, printing
@@ -9310,8 +9365,9 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 -- Params cast EXACTLY as ClaimRun passes them so a green sqlc generate is not mistaken for a
 -- query Postgres will accept. The fence-BLIND capability-gap discriminator ("does the fleet
 -- HAVE these caps at all") is a separate concern handled upstream by
--- CountOnlineWorkersSatisfyingCaps. Its sole caller is the queued-reason resolver, only for a
--- run already past its health threshold, so it is off the hot path.
+-- CountOnlineWorkersSatisfyingCaps. Its callers are the queued-reason resolver (past the
+-- health threshold, or under it once the early probe has fired) and the early
+-- docker-allowlist probe itself, after CountOnlineWorkersForUser found an online worker.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -9372,7 +9428,11 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)))
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)
+                            -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
+                            OR (run.kind <> 'cross_check'
+                                AND run.stale_requeue_generation = run.claim_generation
+                                AND COALESCE(run.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))))
         OR run.updated_at < @affinity_cutoff) AS affinity
 FROM runs run
 JOIN users owner ON owner.id = run.user_id
@@ -9504,7 +9564,8 @@ WHERE fc.user_id = @user_id
 -- worker is treated as always having room. Active count uses the SAME run-lane
 -- definition as ListWorkersByUser.active_runs (status claimed/running/
 -- awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat'). Only called for a queued run
--- already past its health threshold, so it is off the hot path.
+-- already past its health threshold (or one the early docker-allowlist probe found
+-- online-but-ineligible), so it is off the hot path.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -9531,13 +9592,14 @@ WHERE w.user_id = @user_id
 -- capability nothing in the fleet has, distinct from the generic wait. It is EXPLICITLY NOT
 -- a claim-time count: it does not apply the docker allowlist fence, so a worker it counts
 -- may still be barred from THIS repo. That fence is applied separately by the
--- reasonRepoNotDockerAllowed rung via CountOnlineEligibleWorkersForRepo, which is the true
+-- reasonRepoNotDockerAllowedAdmin/Member rung via CountOnlineEligibleWorkersForRepo, which is the true
 -- claim-time count. The effective-caps fold is the shared fn_effective_worker_caps
 -- (single source since #512 M5, migration 00151) — capabilities plus `docker` when
 -- docker_enabled — the SAME function fn_worker_can_claim applies at claim time.
 -- draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a draining worker
 -- claims nothing, so it cannot be the eligible worker. Only called for a queued run already
--- past its health threshold, so it is off the hot path.
+-- past its health threshold (or one the early docker-allowlist probe found
+-- online-but-ineligible), so it is off the hot path.
 --
 -- AND NOT w.ephemeral (PRD #529 M2, Correction B): an ephemeral worker is bound to
 -- ONE run (it can claim only its ephemeral_run_id), so it can never satisfy a
@@ -9574,7 +9636,8 @@ WHERE w.user_id = @user_id
 -- kill-switch (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
 -- CountOnlineWorkersSatisfyingCaps for the same reasons (a draining worker claims nothing; an
 -- ephemeral worker is bound to one run and can never satisfy a different one). Only called for an
--- interlocked queued run already past its health threshold, so it is off the hot path.
+-- interlocked queued run already past its health threshold (or one the early docker-allowlist
+-- probe found online-but-ineligible), so it is off the hot path.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -9603,7 +9666,8 @@ WHERE w.user_id = @user_id
 -- (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
 -- CountOnlineWorkersSatisfyingProtocol for the same reasons (a draining worker claims nothing; an
 -- ephemeral worker is bound to one run and can never satisfy a different one). Only called for a
--- Codex-indicating queued run already past its health threshold, so it is off the hot path.
+-- Codex-indicating queued run already past its health threshold (or one the early
+-- docker-allowlist probe found online-but-ineligible), so it is off the hot path.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -9664,7 +9728,8 @@ WHERE w.user_id = @user_id
 -- together), but the AND keeps this count exactly the set that could actually claim. Reads
 -- workers.protocol_capabilities DIRECTLY, like its siblings; draining_since IS NULL and NOT
 -- w.ephemeral for the same reasons. Only called for a custom-root queued run already past its
--- health threshold, so it is off the hot path.
+-- health threshold (or one the early docker-allowlist probe found online-but-ineligible),
+-- so it is off the hot path.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -9750,6 +9815,25 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -9926,6 +10010,25 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
   AND now() - r.status_since > @saturation_delay::interval
   AND EXISTS (
       SELECT 1 FROM workers w
@@ -10580,7 +10683,9 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
--- queue.waiting by age instead. Expected plan cross-check waits are excluded:
+-- queue.waiting by age instead. Rows held for a returning worker (issue #2705, the
+-- 'waiting until ' stale-requeue pin reason) are excluded, see the predicate below.
+-- Expected plan cross-check waits are excluded:
 -- an owned check finishing is not a lead waiting for worker admission.
 SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
        (COALESCE(r.health_reason = @roll_reason::text, false))::boolean AS has_roll_reason
@@ -10588,6 +10693,14 @@ FROM runs r
 WHERE r.health = 'waiting_worker'
   AND r.kind <> 'cross_check'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+  -- Issue #2705: during the stale-requeue grace a run is explicitly held for its returning owner
+  -- (workersvc reasonStaleRequeuePinPrefix, 'waiting until ...'), so it is not a capacity failure
+  -- yet. The pin reason is flagged from the first detector tick after the requeue (below the queued
+  -- threshold), so without this the 5m danger threshold would fire inside the grace, clear at the
+  -- pin exit and fire again. Excluding the pin row keeps today's timing: the age runs from the first
+  -- non-pin flag, about max(grace, health_queued_seconds) after the requeue. A NULL health_reason
+  -- must stay included, hence the COALESCE.
+  AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -10604,6 +10717,12 @@ FROM runs
 WHERE health = 'waiting_worker'
   AND kind <> 'cross_check'
   AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+  -- Issue #2705 M3: a run held for its returning worker (workersvc reasonStaleRequeuePinPrefix,
+  -- 'waiting until ...') is expected waiting, not a queue.waiting age signal. Only a positively
+  -- identified pin row is excluded; waiting_worker rows with a NULL health_reason must stay
+  -- included: the LIKE is wrapped in COALESCE(..., false) under the NOT rather than written as a
+  -- bare NOT LIKE (which is NULL for a NULL reason).
+  AND NOT COALESCE(health_reason LIKE 'waiting until %', false)
 ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id;
 
 -- name: OldestUndispatchedTaskRun :one

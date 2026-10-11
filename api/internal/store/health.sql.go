@@ -191,7 +191,9 @@ const listRecentUnpricedCodexModels = `-- name: ListRecentUnpricedCodexModels :m
 SELECT base AS model, COUNT(DISTINCT run_id) AS runs
 FROM (
   SELECT run_id,
-         CASE WHEN model LIKE 'progress\_note:%' THEN substr(model, 15) ELSE model END::text AS base
+         CASE WHEN model LIKE 'progress\_note:%' THEN substr(model, 15)
+              WHEN model LIKE 'summary\_pass:%' THEN substr(model, 14)
+              ELSE model END::text AS base
   FROM run_usage
   WHERE harness = 'codex'
     AND updated_at >= $1
@@ -214,7 +216,8 @@ type ListRecentUnpricedCodexModelsRow struct {
 
 // A "progress_note:<model>" row (PRD #2603, the Now summary's own usage key) is the same model
 // as "<model>": strip the prefix first so a note-only model is named, and counted with its
-// plain rows, under its real id. The LIMIT applies after this grouping.
+// plain rows, under its real id. A "summary_pass:<model>" row (issue #2686, a summary pass's
+// usage key) is stripped the same way. The LIMIT applies after this grouping.
 func (q *Queries) ListRecentUnpricedCodexModels(ctx context.Context, arg ListRecentUnpricedCodexModelsParams) ([]ListRecentUnpricedCodexModelsRow, error) {
 	rows, err := q.db.Query(ctx, listRecentUnpricedCodexModels, arg.Cutoff, arg.Priced)
 	if err != nil {

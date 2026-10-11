@@ -1072,8 +1072,10 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Feature gate, mirroring WorkerHeartbeat's D7 rule EXACTLY: a disabled api 400s a claim that
-		// still carries the field (the same generic 400 that triggers the worker's strip-and-retry);
-		// when enabled, parse the snapshot defensively (a malformed body drops to nil).
+		// still carries the field. The worker's claim call has no strip-and-retry: the 400 fails
+		// that poll and the worker claims again on its next poll with a fresh snapshot (without
+		// the field once a rollback strip-and-retry on another wire has cleared the negotiated
+		// features). When enabled, parse the snapshot defensively (a malformed body drops to nil).
 		var snapshot *workersvc.ActiveSnapshot
 		if h.cfg.ActiveSnapshotDisabled {
 			if req.ActiveSnapshot != nil {
@@ -1092,7 +1094,8 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,
-			// no claim, no side effect. Same generic body the worker reads for its strip-and-retry.
+			// no claim, no side effect. The worker's claim call does not strip-and-retry: it claims
+			// again on its next poll with a fresh snapshot.
 			if errors.Is(err, workersvc.ErrActiveSnapshotInvalid) {
 				httpx.Error(w, http.StatusBadRequest, "invalid request body")
 				return
@@ -2221,17 +2224,28 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"published": res.Published, "ref": res.Ref}
 	if res.Skipped != "" {
 		// A benign non-publish outcome (origin moved / workflow-scope / unsupported /
-		// no-ref): a 200, not a fault. Log it at INFO with the mapped skip reason so the
-		// distribution of publish outcomes is observable by `reason` — the same label a
-		// checkpoint_publish_failures_total counter would carry — without adding a metrics
-		// dependency the api does not have (see the error arm above). INFO, not WARN:
-		// not_descendant is the common "origin advanced" case and must not read as an
-		// operator alert.
-		slog.Info("worker run publish skipped",
-			"run_id", runID.String(),
-			"worker_id", wkr.ID.String(),
-			"reason", res.Skipped,
-		)
+		// no-ref / tip_missing / pack_too_large / pack_invalid): a 200, not a fault. Log it
+		// with the mapped skip reason so the distribution of publish outcomes is observable by
+		// `reason` — the same label a checkpoint_publish_failures_total counter would carry —
+		// without adding a metrics dependency the api does not have (see the error arm above).
+		// A skip that carries a Detail (the broker refused the pack or tip) is an operator
+		// signal and logs at WARN with that content-free, scrubbed detail; the rest stay INFO
+		// (not_descendant is the common "origin advanced" case and must not read as an alert).
+		// Detail never goes on the wire: the response below stays the explicit map.
+		if res.Detail != "" {
+			slog.Warn("worker run publish refused",
+				"run_id", runID.String(),
+				"worker_id", wkr.ID.String(),
+				"reason", res.Skipped,
+				"detail", res.Detail,
+			)
+		} else {
+			slog.Info("worker run publish skipped",
+				"run_id", runID.String(),
+				"worker_id", wkr.ID.String(),
+				"reason", res.Skipped,
+			)
+		}
 		out["skipped"] = res.Skipped
 	}
 	httpx.JSON(w, http.StatusOK, out)

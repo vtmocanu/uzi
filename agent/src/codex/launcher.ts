@@ -36,7 +36,7 @@ import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "
 import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import type { Readable, Writable } from "node:stream";
+import { Transform, type Readable, type Writable } from "node:stream";
 
 import {
   CODEX_SESSION_GID,
@@ -1049,8 +1049,51 @@ async function createHandle(
     try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* primary failure already recorded */ }
   }
 
-  const lines = createInterface({ input: evidence });
+  let currentLineBytes = 0;
+  let oversizedTermination = false;
+  let guardReleased = false;
+  const guardedEvidence = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      for (const byte of chunk) {
+        if (byte === 0x0a || byte === 0x0d) currentLineBytes = 0;
+        else if (++currentLineBytes > MAX_EVIDENCE_LINE_BYTES) {
+          oversizedTermination = true;
+          fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`));
+          evidence.destroy();
+          lines.close();
+          releaseGuard();
+          // Teardown may occur during a write; still settle its callback exactly once.
+          callback();
+          return;
+        }
+      }
+      this.push(chunk);
+      callback();
+    },
+  });
+  const lines = createInterface({ input: guardedEvidence });
+  function releaseGuard(): void {
+    if (guardReleased) return;
+    guardReleased = true;
+    evidence.unpipe(guardedEvidence);
+    evidence.off("close", onEvidenceClose);
+    guardedEvidence.destroy();
+  }
+  function onEvidenceClose(): void {
+    // A close without end must not manufacture EOF for disposal proof.
+    lines.close();
+    releaseGuard();
+  }
+  function onEvidenceError(err: Error): void {
+    fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err }));
+    lines.close();
+    releaseGuard();
+  }
+  evidence.on("error", onEvidenceError);
+  evidence.on("close", onEvidenceClose);
+  guardedEvidence.on("error", onEvidenceError);
   lines.on("line", (line) => {
+    if (oversizedTermination) return;
     lineCount += 1;
     if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); lines.close(); return; }
     if (Buffer.byteLength(line) > MAX_EVIDENCE_LINE_BYTES) { fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`)); return; }
@@ -1060,6 +1103,7 @@ async function createHandle(
   });
   lines.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err })));
   lines.on("close", () => {
+    releaseGuard();
     resolveEvidenceEnd();
     if (failure || cleanDisposed || exited || abandoningStartup) return;
     if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
@@ -1280,6 +1324,9 @@ async function createHandle(
       disposeInFlight = false;
     }
   }
+
+  // All consumers and lifecycle handlers must be ready before prebuffered evidence flows.
+  evidence.pipe(guardedEvidence);
 
   // Await `started` (bounded). A pre-started failure/exit rejects the launch; we end
   // the control channel so the supervisor runs its own bounded abnormal cleanup — we

@@ -139,6 +139,9 @@ func TestPublishRejectsZeroBytePack(t *testing.T) {
 	if !errors.Is(err, pushbroker.ErrPackInvalid) {
 		t.Fatalf("err = %v, want ErrPackInvalid", err)
 	}
+	if !strings.Contains(err.Error(), "empty pack") {
+		t.Fatalf("err = %q, want it to say \"empty pack\"", err)
+	}
 	if got := f.originRef("refs/uzi-checkpoints/agent/issue-2"); got != "" {
 		t.Fatalf("origin checkpoint = %q, want absent", got)
 	}
