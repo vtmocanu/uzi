@@ -33,7 +33,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **A run re-planning after a revise no longer shows as waiting on you ([#2760](https://github.com/vtmocanu/uzi/issues/2760)).**
-  After a revise the run stays awaiting approval while the lead re-plans, and the progress badge, the run page status pill and activity feed, the TUI detail header, its PLAN GATE banner and approve keys, and `uzi run get` all still said it was waiting on you. They now show it as revising or planning until the new plan lands, then as waiting again. The run detail API (`GET /api/runs/{id}`) now carries `is_revising` as well as the run lists.
+  After a revise the run stays awaiting approval while the lead re-plans, and the progress badge, the run page status pill and activity feed, the TUI detail header, its PLAN GATE banner and approve keys, and `uzi run get` all still said it was waiting on you. The status now reads revising and the progress planning, and the TUI hides the PLAN GATE banner and approve keys, until the new plan lands; then the run waits on you again. The run detail API (`GET /api/runs/{id}`) now carries `is_revising` as well as the run lists.
 
 ## [0.86.0] - 2026-10-06
 
