@@ -36,6 +36,15 @@ Tick only items supported by direct execution evidence. Keep this PRD active unt
 
 9. **Retained API capacity:** roll evidence adds nullable liveness_valid_until from online status and an ordinary heartbeat whose expiry is strictly after the API's evaluated_at, using the claim path's staleness bound. This distinguishes legacy registered workers with no pod UID/proven heartbeat; pod readiness alone does not establish API connectivity. Ordinary liveness never refreshes nonce-proven heartbeat_at or valid_until. M2 uses this evidence to retain the owner's last API-online provider; planner enforcement remains pending.
 
+10. **Reconstruction durability:** legacy volume recycling keeps the Deployment at zero replicas until pods and selected volumes are safely stopped/recreated. DinD's existing fenced lifecycle requires deleting that Deployment and a different replacement UID (ADR-1759 D8–D9), so the same bounded reservation is temporarily mirrored on the retained /data PVC. This is necessary external evidence during that deletion, not another journal. Read it through bounded existing PVC lists; add only the namespaced PVC patch verb, and use UID/resourceVersion preconditions for handoff and cancellation. No PVC get or Secret read is added, and legacy /data self-heal is retained.
+11. **Exact release mapping:** ADR-1720 stamps published workers with <release>+g<commit>; a bare SemVer image tag does not identify that full version. Configure workers.rollTargetVersion from the pinned image's verified stamp (also for published bare release tags). Unknown mapping fails closed; never infer a target version from a replacement or discard build metadata.
+
+12. **Unabridged version proof:** ordinary registration retains its existing 64-byte display sanitization. If it alters a version, registration withholds the roll incarnation binding, so subsequent nonce-proven heartbeat cannot promote a different long build through the same truncated prefix. Supported exact roll versions must reach the API unchanged.
+
+13. **Overlapping pools:** coverage pools retain separate canaries and concurrency, but admission also preserves physical usable capacity across the owner's entire placement lane. Distinct capability pools cannot each remove the last generic lane provider in the same tick. No capacity is borrowed from a different owner or lane, or assembled from multiple workers' partial capability sets.
+14. **Completed history:** a completed canary first closes and cleans its original cohort. A later pin uses current registered coverage only after that cleanup; unrelated maintenance does not synthesize a second image-roll canary. Completed pacing metadata is omitted from authoritative fleet reports rather than turning ordinary maintenance into an active image hold.
+15. **Report authority:** one fleet report merges observed roll health and pacing, retaining actual stuck causes and adding podless pacing rows. Partial readiness reports explicitly identify themselves. Diagnostic publication failures never control claims or admission.
+
 ## Execution evidence
 
 M1 evidence (2026-10-11):
@@ -45,3 +54,11 @@ M1 evidence (2026-10-11):
 - A throwaway PostgreSQL run executed TestRollEvidenceDrainWritersLiveDB, TestRollEvidenceRegisterNamesAndPollLiveDB, TestRollEvidencePollOverflowLiveDB, TestRollEvidenceRegistrationHeartbeatLiveDB, TestRollEvidencePollEligibilityDrainLiveDB and TestRollEvidenceOfflineLadderLiveDB, all passing without skips. It exercised migration/query execution, handler registration/poll, actual heartbeat proof, coverage matrix and independent drain fences.
 - The observed fully offline mid-roll fallback is exactly: "no worker is online to pick up this run".
 - task check-docs:web passed. Full integration-gate and immutable-range review outcomes are recorded in the milestone checkpoint report; they are distinct from the focused evidence above.
+
+M2 focused evidence (2026-10-11; full milestone validation pending):
+
+- The controller kube package passed `go test -race -count=1 ./internal/kube`, including the three M1 behavior regressions, bounded concurrency and stuck-cause reporting, exact-incarnation/same-version proof, Deployment/PVC reconstruction, completed-marker cleanup and overlapping owner/lane capacity regressions.
+- Reconcile/apiclient reporting tests passed with `-race`: a single fleet POST preserves stuck/settled phases, includes podless pacing, and reports reconcile errors; readiness publication stamps its explicit partial-report kind.
+- Controller configuration tests passed for the default concurrency, a positive override and malformed limits. Chart assertions executed successfully for singleton/default/zero/disabled behavior, invalid concurrency, exact-version and force-roll rendering, Recreate strategy and the restricted/Docker/isolated ReplicaSet/PVC verbs.
+- A throwaway PostgreSQL run executed `TestRollEvidenceRegisterNamesAndPollLiveDB` without skips, including exact 64-byte registration versions and two different 65-byte versions with a shared truncated prefix. Altered/truncated versions supplied no pod binding or heartbeat promotion proof, while ordinary registration and user labels retained their existing behavior.
+- These are fake-client optimistic-conflict regressions and local PostgreSQL evidence, not real-apiserver or hosted-fleet verification. Maintainer verification remains open.

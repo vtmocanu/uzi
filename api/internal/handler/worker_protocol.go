@@ -301,7 +301,10 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var podUID uuid.UUID
-	if wkr.Kind == "hosted" && strings.HasPrefix(req.Name, "uzi-pod:") {
+	// UI sanitization must not turn a different (or truncated) build version into
+	// exact roll proof. Keep ordinary registration unchanged, but withhold the
+	// incarnation binding when the version cannot be preserved verbatim.
+	if wkr.Kind == "hosted" && version != "" && req.Version == version && strings.HasPrefix(req.Name, "uzi-pod:") {
 		candidate := strings.TrimPrefix(req.Name, "uzi-pod:")
 		if len(candidate) == 36 {
 			podUID, _ = uuid.Parse(candidate)

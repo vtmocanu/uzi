@@ -230,6 +230,14 @@ func boundedWorker(raw []byte) bool {
 		if json.Unmarshal(evidence, &e) != nil {
 			return false
 		}
+		// False is meaningful coverage evidence, not a default for absent/null
+		// fields. Reject incomplete versioned evidence before typed decoding.
+		for _, key := range []string{"registered", "ordinary_coverage", "checker_coverage"} {
+			value := string(bytes.TrimSpace(e[key]))
+			if value != "true" && value != "false" {
+				return false
+			}
+		}
 		for _, key := range []string{"scheduling_capabilities", "protocol_capabilities"} {
 			dec := json.NewDecoder(bytes.NewReader(e[key]))
 			token, err := dec.Token()

@@ -119,6 +119,7 @@ func (c *Client) Report(ctx context.Context, report protocol.StatusReport) error
 
 // ReportReadiness requires the status endpoint to actually accept publication.
 func (c *Client) ReportReadiness(ctx context.Context, report protocol.StatusReport) error {
+	report.Kind = "readiness"
 	return c.reportStatus(ctx, report, true)
 }
 

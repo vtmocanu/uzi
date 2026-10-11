@@ -1,5 +1,3 @@
-//go:build roll_pacing_regression
-
 package kube
 
 import (
@@ -16,8 +14,8 @@ import (
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
-// Kept behind a tag until M2. This fixture also compiles on the base revision:
-// new evidence is injected as JSON, which legacy DesiredWorker ignores.
+// M1 recorded these three failures on the base revision. Additive API liveness
+// and ordinary coverage make the fixture usable by M2 without changing its assertions.
 func TestRollPacingRegression(t *testing.T) {
 	for _, scenario := range []string{"idleN_must_roll_only1", "nonadmitted_busy_should_not_cordon", "stalled_canary_past_deadline_others_not_rolled"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -35,7 +33,8 @@ func TestRollPacingRegression(t *testing.T) {
 						"pod_uid": podID, "heartbeat_at": m5Now, "evaluated_at": m5Now,
 						"valid_until":             m5Now.Add(time.Minute),
 						"scheduling_capabilities": []string{}, "protocol_capabilities": []string{},
-						"ordinary_coverage": false, "checker_coverage": false,
+						"ordinary_coverage": true, "checker_coverage": false,
+						"liveness_valid_until": m5Now.Add(time.Minute),
 					},
 				})
 				if err != nil {
@@ -67,7 +66,7 @@ func TestRollPacingRegression(t *testing.T) {
 					ID: id, HasDeployment: true, SpecHash: hash, Roll: roll,
 					PodsKnown: true, WorkerPodCount: 1, ReadyPodUID: podID,
 				})
-				objects = append(objects, deployedWorker(id, 0, hash))
+				objects = append(objects, physicalOld(t, deployedWorker(id, 0, hash))...)
 			}
 			c := &fakeCordoner{}
 			m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Hour}, objects...)

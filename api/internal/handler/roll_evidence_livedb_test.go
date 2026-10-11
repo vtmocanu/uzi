@@ -29,17 +29,24 @@ func TestRollEvidenceRegisterNamesAndPollLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, old := uuid.New(), uuid.New()
-	for _, tc := range []struct{ name, kind, uid string }{
-		{"uzi-pod:" + current.String(), "hosted", current.String()},
-		{"uzi-pod:" + old.String(), "hosted", old.String()},
-		{"", "hosted", ""},
-		{"legacy name", "hosted", ""},
-		{"uzi-pod:invalid", "hosted", ""},
-		{"uzi-pod:" + uuid.Nil.String(), "hosted", ""},
-		{"uzi-pod:" + current.String() + "suffix", "hosted", ""},
-		{"uzi-pod:" + current.String(), "external", ""},
+	fullVersion := "1.2.3+" + strings.Repeat("a", maxSelfReportedBytes-len("1.2.3+"))
+	for _, tc := range []struct{ name, kind, uid, version string }{
+		{"uzi-pod:" + current.String(), "hosted", current.String(), "1.2.3"},
+		{"uzi-pod:" + old.String(), "hosted", old.String(), "1.2.3"},
+		{"", "hosted", "", "1.2.3"},
+		{"legacy name", "hosted", "", "1.2.3"},
+		{"uzi-pod:invalid", "hosted", "", "1.2.3"},
+		{"uzi-pod:" + uuid.Nil.String(), "hosted", "", "1.2.3"},
+		{"uzi-pod:" + current.String() + "suffix", "hosted", "", "1.2.3"},
+		{"uzi-pod:" + current.String(), "external", "", "1.2.3"},
+		{"uzi-pod:" + current.String(), "hosted", current.String(), fullVersion},
+		// These two builds share the same UI prefix. Neither may prove that prefix
+		// is the exact replacement version, even after a current-nonce heartbeat.
+		{"uzi-pod:" + current.String(), "hosted", "", fullVersion + "a"},
+		{"uzi-pod:" + current.String(), "hosted", "", fullVersion + "b"},
+		{"uzi-pod:" + current.String(), "hosted", "", "1.2.3\n"},
 	} {
-		t.Run(tc.kind+"/"+tc.name, func(t *testing.T) {
+		t.Run(tc.kind+"/"+tc.name+"/"+tc.version, func(t *testing.T) {
 			if _, err := pool.Exec(ctx, "UPDATE workers SET kind=$2,hosted_size=CASE WHEN $2='hosted' THEN 'm' ELSE NULL END WHERE id=$1", worker.ID, tc.kind); err != nil {
 				t.Fatal(err)
 			}
@@ -47,7 +54,7 @@ func TestRollEvidenceRegisterNamesAndPollLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			body, _ := json.Marshal(map[string]any{"name": tc.name, "version": "1.2.3", "template": "base", "capabilities": []string{"docker"}, "protocol_capabilities": []string{"cross_check_v1", "cross_check_lane_v1"}, "max_cross_check_slots": 2})
+			body, _ := json.Marshal(map[string]any{"name": tc.name, "version": tc.version, "template": "base", "capabilities": []string{"docker"}, "protocol_capabilities": []string{"cross_check_v1", "cross_check_lane_v1"}, "max_cross_check_slots": 2})
 			req := httptest.NewRequest(http.MethodPost, "/api/worker/register", strings.NewReader(string(body)))
 			req = req.WithContext(mw.ContextWithWorker(ctx, worker))
 			rec := httptest.NewRecorder()
@@ -59,7 +66,7 @@ func TestRollEvidenceRegisterNamesAndPollLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if worker.Name != "user chosen" || worker.RollHeartbeatAt.Valid {
+			if worker.Name != "user chosen" || worker.RollHeartbeatAt.Valid || worker.Version.String != sanitizeSelfReported(tc.version, maxSelfReportedBytes) {
 				t.Fatalf("register changed label or retained heartbeat: %+v", worker)
 			}
 			if tc.uid == "" {
@@ -95,7 +102,7 @@ func TestRollEvidenceRegisterNamesAndPollLiveDB(t *testing.T) {
 						found = true
 						e := desired.RollEvidence
 						if e == nil || e.Version != 1 || e.OwnerID != user.String() || !e.Registered || e.PodUID == nil || *e.PodUID != current.String() ||
-							e.RegisterNonce == nil || *e.RegisterNonce != worker.SnapshotRegisterNonce.String || e.RegisteredVersion == nil || *e.RegisteredVersion != "1.2.3" ||
+							e.RegisterNonce == nil || *e.RegisterNonce != worker.SnapshotRegisterNonce.String || e.RegisteredVersion == nil || *e.RegisteredVersion != tc.version ||
 							e.HeartbeatAt == nil || !e.HeartbeatAt.Equal(worker.RollHeartbeatAt.Time) || !e.ValidUntil.Equal(e.HeartbeatAt.Add(time.Minute)) ||
 							e.OrdinaryCoverage || !e.CheckerCoverage || len(e.SchedulingCapabilities) != 1 || len(e.ProtocolCapabilities) != 2 ||
 							desired.DrainingReason == nil || *desired.DrainingReason != "image_roll" || desired.DrainingSince == nil {
