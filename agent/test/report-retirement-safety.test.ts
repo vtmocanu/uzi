@@ -62,7 +62,7 @@ function retirementWorker(f: Awaited<ReturnType<typeof reportRetirementFixture>>
   return new Worker({} as Config, client, f.r, {} as ChatRunner, {} as JudgeRunner,
     {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }), f.outbox,
     new Map(), f.registry) as unknown as {
-      sweepPendingFinalizes(): Promise<void>;
+      sweepPendingFinalizes(signal?: AbortSignal): Promise<void>;
       admittedRunIds: Map<string, number>;
     };
 }
@@ -127,10 +127,16 @@ it("worker quarantine includes started archive unlink beyond deadline", {
     }
     return unlink(...args);
   });
-  const first = w.sweepPendingFinalizes();
+  // Headroom lets the proof reach unlink on a slow runner. The pass is then ended by its caller
+  // signal rather than by waiting out the (now long) authority deadline.
+  const restoreHeadroom = f.useHeadroom();
+  const pass = new AbortController();
+  const first = w.sweepPendingFinalizes(pass.signal);
   t.after(async () => { release.resolve(); await first; });
   await entered.promise;
+  pass.abort(new Error("test: end pass while unlink is held"));
   await first;
+  restoreHeadroom();
   assert.equal(f.r.isExecuting(f.claim.run_id), true);
   assert.equal(attempts, 1);
   await w.sweepPendingFinalizes();
@@ -175,6 +181,7 @@ it("writer killed only after positive source inspection retains report", {
   skip: process.platform !== "linux" && "requires Linux procfs/no-follow positive source inspection hook",
 }, async t => {
   const f = await reportRetirementFixture(t);
+  f.useHeadroom(); // the hook must be reached after a complete positive inspection on any runner speed
   const read = git.credentialFreeCancelCleanHead.bind(git);
   let reached = false;
   t.mock.method(git, "credentialFreeCancelCleanHead", async (...args: Parameters<typeof read>) => {
@@ -194,6 +201,7 @@ it("duplicate queued during ended-flight report reservation replaces its exact t
   skip: process.platform !== "linux" && "requires Linux procfs/no-follow report reservation proof hook",
 }, async t => {
   const f = await reportRetirementFixture(t);
+  f.useHeadroom(); // the hook must be reached after a complete positive inspection on any runner speed
   const read = git.credentialFreeCancelCleanHead.bind(git);
   let queued: Promise<void> | undefined;
   let reached = false;
@@ -299,6 +307,7 @@ it("unlink failure retains pending map and next replay succeeds", {
   skip: process.platform !== "linux" && "unlink hook requires Linux procfs/no-follow report content proof",
 }, async t => {
   const f = await reportRetirementFixture(t);
+  f.useHeadroom(); // the first replay must reach unlink on any runner speed
   const unlink = fs.unlink.bind(fs);
   let attempts = 0;
   t.mock.method(fs, "unlink", async (file: Parameters<typeof unlink>[0]) => {
@@ -318,6 +327,12 @@ it("started unlink retains reservation beyond deadline until actual settlement",
   skip: process.platform !== "linux" && "unlink barrier requires Linux procfs/no-follow report content proof",
 }, async t => {
   const f = await reportRetirementFixture(t);
+  // Headroom lets the proof reach unlink on any runner speed; the deadline is then crossed by
+  // advancing an offset clock past it, with no real wait.
+  f.useHeadroom();
+  const realNow = Date.now.bind(Date);
+  let offset = 0;
+  const clock = t.mock.method(Date, "now", () => realNow() + offset);
   const unlink = fs.unlink.bind(fs);
   const entered = deferred(), release = deferred();
   let attempts = 0, settled = false;
@@ -332,7 +347,8 @@ it("started unlink retains reservation beyond deadline until actual settlement",
   const replay = f.replay().then(() => { settled = true; });
   t.after(async () => { release.resolve(); await replay; });
   await entered.promise;
-  await new Promise(resolve => setTimeout(resolve, 1100));
+  offset += f.headroomMs + 1;
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(settled, false, "deadline cannot falsely complete started unlink");
   assert.equal(f.r.isExecuting(f.claim.run_id), true);
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), true);
@@ -344,6 +360,7 @@ it("started unlink retains reservation beyond deadline until actual settlement",
   await f.assertCustody();
   release.resolve();
   await Promise.all([replay, read]);
+  clock.mock.restore();
   assert.equal(f.r.isExecuting(f.claim.run_id), false);
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
   await f.assertCustody();

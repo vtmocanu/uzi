@@ -75,7 +75,7 @@ it("finalize retirement consumes the exact archived report while keeping source 
   assert.equal((await f.outbox.journalFinalize(f.claim.run_id, 2)).written, true);
   const identity = f.outbox.finalizeRecordIdentity(f.claim.run_id, 2)!;
   await f.positiveStage("finalize retirement", () => f.r.retireRecoveryReport(f.claim.run_id, 2, {
-    expectedIdentity: identity, signal: new AbortController().signal, deadline: Date.now() + 1_000,
+    expectedIdentity: identity, signal: new AbortController().signal, deadline: Date.now() + f.headroomMs,
   }, "finalize", f.outbox), () => !f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), f.assertFinalizePending);
   assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined);
   await f.assertCustody();

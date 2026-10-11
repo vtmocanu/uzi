@@ -8,6 +8,7 @@ import type { TestContext } from "node:test";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
+import { reportProofTiming } from "../src/report-proof-timing.js";
 import type { PositiveOwedCandidateContext } from "../src/git.js";
 import type { RecoveryUploadManifest } from "../src/protocol.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal } from "../src/terminal-resolve.js";
@@ -283,16 +284,38 @@ export async function reportRetirementFixture(t: TestContext, options: {
       e.claim_generation === generation && e.terminal_pending));
     await assertCustody();
   };
-  // Three fresh attempts retain the production budget and await actual settlement;
-  // the node-test timeout caps stalled settlement. Failed assertions stop retries.
+  // Positive stages lend the three production wall-clock bounds headroom so a slow runner cannot
+  // expire a proof that is otherwise valid. Expiry tests do not call this: they keep the 1 s/1 s/5 s
+  // defaults. Mocks are restored by the caller (positiveStage) or at test end.
+  const headroomMs = 60_000;
+  let headroomActive = false;
+  const useHeadroom = () => {
+    if (headroomActive) return () => {};
+    headroomActive = true;
+    const mocks = [
+      t.mock.method(reportProofTiming, "proofBudgetMs", () => headroomMs),
+      t.mock.method(reportProofTiming, "finalizeAuthorityMs", () => headroomMs),
+      t.mock.method(reportProofTiming, "finalizePassMs", () => headroomMs),
+    ];
+    return () => {
+      if (!headroomActive) return;
+      headroomActive = false;
+      for (const mock of mocks) mock.mock.restore();
+    };
+  };
+  // Three fresh attempts with headroom and actual settlement; the node-test timeout caps stalled
+  // settlement. Failed assertions stop retries.
   const positiveStage = async (label: string, attempt: () => Promise<unknown>,
     reached: () => boolean, retained: () => Promise<void>) => {
-    for (let n = 1; n <= 3; n++) {
-      await attempt();
-      await assertCustody();
-      if (reached()) return n;
-      await retained();
-    }
+    const restore = useHeadroom();
+    try {
+      for (let n = 1; n <= 3; n++) {
+        await attempt();
+        await assertCustody();
+        if (reached()) return n;
+        await retained();
+      }
+    } finally { restore(); }
     assert.fail(`${label}: persistent refusal after 3 fresh bounded attempts; sends=${calls.sends}, observations=${processObservation.calls}`);
   };
   const replayPositive = () => positiveStage("terminal retirement", replay,
@@ -316,6 +339,6 @@ export async function reportRetirementFixture(t: TestContext, options: {
     return observation;
   };
   const liveFlight = { flight, release: leave.resolve, executions: () => executions };
-  return { claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
+  return { headroomMs, useHeadroom, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }

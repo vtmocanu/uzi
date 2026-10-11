@@ -205,6 +205,7 @@ import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
 import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
+import { reportProofTiming } from "./report-proof-timing.js";
 import {
   clampUtf8Bytes,
   DECISIONS_MEMO_MAX_BYTES,
@@ -4284,7 +4285,7 @@ export class RunRunner {
   async retireRecoveryReport(runId: string, generation: number, context: ReportRetirementContext,
     kind: "terminal" | "finalize" = "terminal", outbox = this.outbox): Promise<boolean> {
     if (!outbox || !context.expectedIdentity || context.signal?.aborted || context.eligible?.() === false) return false;
-    const deadline = Math.min(Date.now() + 1_000, context.deadline ?? Infinity);
+    const deadline = Math.min(Date.now() + reportProofTiming.proofBudgetMs(), context.deadline ?? Infinity);
     if (deadline <= Date.now()) return false;
     const abort = new AbortController();
     const cancel = () => abort.abort(context.signal?.reason);
