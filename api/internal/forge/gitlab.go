@@ -540,7 +540,8 @@ func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 // resolve anchor. A note carrying a diff Position is inline (Path/Line/HeadSHA
 // populated); one without is a summary/top-level note. The discussions endpoint has
 // no sort option, so the driver sorts the flattened list by CreatedAt to guarantee
-// oldest-first (D8).
+// oldest-first (D8). Every note, inline or top-level, is in the single
+// CommentNSNote namespace (discussions only group notes).
 func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error) {
 	opt := &gitlab.ListMergeRequestDiscussionsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
 	wrap := func(e error) error { return g.wrapErr("list merge request comments", e) }
@@ -565,6 +566,7 @@ func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 				}
 				c := MRComment{
 					ID:                n.ID,
+					IDNamespace:       CommentNSNote,
 					AuthorForgeUserID: n.Author.ID,
 					AuthorUsername:    n.Author.Username,
 					Body:              n.Body,

@@ -560,13 +560,15 @@ type MrReviewAuthorVerdict struct {
 }
 
 type MrReworkLedger struct {
-	RepoID            uuid.UUID          `json:"repo_id"`
-	Ref               string             `json:"ref"`
-	AttemptCount      int32              `json:"attempt_count"`
-	HighWater         int64              `json:"high_water"`
-	HaltNotified      bool               `json:"halt_notified"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	PendingUnknownIds []int64            `json:"pending_unknown_ids"`
+	RepoID             uuid.UUID          `json:"repo_id"`
+	Ref                string             `json:"ref"`
+	AttemptCount       int32              `json:"attempt_count"`
+	HighWater          int64              `json:"high_water"`
+	HaltNotified       bool               `json:"halt_notified"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	PendingUnknownIds  []int64            `json:"pending_unknown_ids"`
+	CommentMarks       []byte             `json:"comment_marks"`
+	PendingUnknownKeys []string           `json:"pending_unknown_keys"`
 }
 
 type Notification struct {

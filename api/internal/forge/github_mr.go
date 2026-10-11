@@ -71,7 +71,9 @@ func githubMRState(pr *gh.PullRequest) string {
 // resolveReviewThread. GitHub's issue/PR-comment and review endpoints return no
 // forge system notes (those live on the separate events/timeline endpoints uzi
 // never calls), so no D2 filter is needed; the driver sorts the merged list by
-// CreatedAt for oldest-first (D8).
+// CreatedAt for oldest-first (D8). Each source is its own id namespace
+// (CommentNSIssueComment, CommentNSReviewComment, CommentNSReview): the REST ids
+// come from distinct sequences and may collide numerically.
 func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error) {
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
@@ -98,6 +100,7 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 			}
 			mc := MRComment{
 				ID:          c.GetID(), // REST databaseId of the issue comment
+				IDNamespace: CommentNSIssueComment,
 				Body:        c.GetBody(),
 				CreatedAt:   c.GetCreatedAt().Time,
 				ReviewState: ReviewCommentSummary,
@@ -136,6 +139,7 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 			}
 			mc := MRComment{
 				ID:          c.GetID(), // REST databaseId of the inline review comment
+				IDNamespace: CommentNSReviewComment,
 				Body:        c.GetBody(),
 				CreatedAt:   c.GetCreatedAt().Time,
 				HeadSHA:     c.GetCommitID(),
@@ -186,6 +190,7 @@ func (g *github) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 			}
 			mc := MRComment{
 				ID:          r.GetID(), // REST databaseId of the review summary
+				IDNamespace: CommentNSReview,
 				Body:        r.GetBody(),
 				CreatedAt:   r.GetSubmittedAt().Time,
 				HeadSHA:     r.GetCommitID(),

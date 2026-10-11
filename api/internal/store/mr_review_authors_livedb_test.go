@@ -435,6 +435,35 @@ func TestReviewAuthorStaleEvictionLiveDB(t *testing.T) {
 	}
 }
 
+// rns is the single comment namespace the ported pending-merge tests use; the id-only
+// assertions below read and write it through rkeys / rids / rmarks.
+const rns = "review_comment"
+
+func rkeys(ids ...int64) []string {
+	if ids == nil {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, fmt.Sprintf("%s:%d", rns, id))
+	}
+	return out
+}
+
+func rids(keys []string) []int64 {
+	out := make([]int64, 0, len(keys))
+	for _, k := range keys {
+		var id int64
+		if _, err := fmt.Sscanf(k, rns+":%d", &id); err != nil {
+			panic("unexpected pending key " + k)
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func rmarks(hw int64) []byte { return []byte(fmt.Sprintf(`{%q: %d}`, rns, hw)) }
+
 // TestMRReworkPendingUnknownIDsLiveDB pins the pending-set merge shared by UpsertMRReworkLedger
 // and the atomic on-demand create: only ids above the high-water mark the row had BEFORE the
 // update are added (so a stale writer cannot resurrect an id a faster one consumed), removals
@@ -451,11 +480,11 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return led.PendingUnknownIds
+		return rids(led.PendingUnknownKeys)
 	}
 	upsert := func(ref string, hw int64, add, remove []int64) {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: hw, PendingAdd: add, PendingRemove: remove}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: rkeys(remove...)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -472,7 +501,7 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 			t.Fatalf("after update = %v, want [9 12]", got)
 		}
 		// NULL arrays (a caller that sets neither list) leave the set alone.
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 13}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 13}); err != nil {
 			t.Fatal(err)
 		}
 		if got := pending(ref); !slices.Equal(got, []int64{9, 12}) {
@@ -548,7 +577,7 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 				Harness: "claude", UserID: user, RepoID: repo, IssueTitle: "t", IssueDescription: "d",
 				PipelineRef: pgtype.Text{String: ref, Valid: true}, MrIid: pgtype.Int8{Int64: 66, Valid: true},
 				TargetRunID: pgtype.UUID{Bytes: target, Valid: true}, ReviewComments: []byte(`{}`),
-				HighWater: hw, PendingAdd: add, PendingRemove: remove,
+				HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: rkeys(remove...),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -568,60 +597,60 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 	})
 }
 
-// TestRemoveMRReworkPendingIDsLiveDB pins the pending-only removal used when the snapshot caps
+// TestRemoveMRReworkPendingKeysLiveDB pins the pending-only removal used when the snapshot caps
 // evict an eligible pending id: array subtraction on the pending set, nothing else changes,
 // and a ref with no ledger row is left without one.
-func TestRemoveMRReworkPendingIDsLiveDB(t *testing.T) {
+func TestRemoveMRReworkPendingKeysLiveDB(t *testing.T) {
 	ctx, _, q, repo := reviewAuthorEnv(t)
 	ref := "agent/issue-pending-remove"
-	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 20, PendingAdd: []int64{5, 9, 12}}); err != nil {
+	if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 20, Marks: rmarks(20), PendingAdd: rkeys(5, 9, 12)}); err != nil {
 		t.Fatal(err)
 	}
 	before, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before.PendingUnknownIds, []int64{5, 9, 12}) {
-		t.Fatalf("seed pending = %v", before.PendingUnknownIds)
+	if !slices.Equal(rids(before.PendingUnknownKeys), []int64{5, 9, 12}) {
+		t.Fatalf("seed pending = %v", before.PendingUnknownKeys)
 	}
-	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: []int64{9, 5, 777}}); err != nil {
+	if err := q.RemoveMRReworkPendingKeys(ctx, store.RemoveMRReworkPendingKeysParams{RepoID: repo, Ref: ref, Keys: rkeys(9, 5, 777)}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(after.PendingUnknownIds, []int64{12}) {
-		t.Fatalf("pending after removal = %v, want [12]", after.PendingUnknownIds)
+	if !slices.Equal(rids(after.PendingUnknownKeys), []int64{12}) {
+		t.Fatalf("pending after removal = %v, want [12]", after.PendingUnknownKeys)
 	}
 	if after.AttemptCount != before.AttemptCount || after.HighWater != before.HighWater || after.HaltNotified != before.HaltNotified || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
 		t.Fatalf("a pending-only removal changed other columns: %+v -> %+v", before, after)
 	}
 	// A nil id list (pgx sends NULL) must be a no-op too, not empty the set.
-	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: nil}); err != nil {
+	if err := q.RemoveMRReworkPendingKeys(ctx, store.RemoveMRReworkPendingKeysParams{RepoID: repo, Ref: ref, Keys: nil}); err != nil {
 		t.Fatal(err)
 	}
-	if nilKept, _ := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref}); !slices.Equal(nilKept.PendingUnknownIds, []int64{12}) {
-		t.Fatalf("nil Ids changed the pending set: %v, want [12]", nilKept.PendingUnknownIds)
+	if nilKept, _ := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref}); !slices.Equal(rids(nilKept.PendingUnknownKeys), []int64{12}) {
+		t.Fatalf("nil Ids changed the pending set: %v, want [12]", nilKept.PendingUnknownKeys)
 	}
 	// An empty id list is a no-op, and an unknown ref creates no row.
-	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: ref, Ids: []int64{}}); err != nil {
+	if err := q.RemoveMRReworkPendingKeys(ctx, store.RemoveMRReworkPendingKeysParams{RepoID: repo, Ref: ref, Keys: []string{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repo, Ref: "agent/issue-none", Ids: []int64{1}}); err != nil {
+	if err := q.RemoveMRReworkPendingKeys(ctx, store.RemoveMRReworkPendingKeysParams{RepoID: repo, Ref: "agent/issue-none", Keys: rkeys(1)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: "agent/issue-none"}); err == nil {
 		t.Fatal("removal created a ledger row")
 	}
 	kept, _ := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
-	if !slices.Equal(kept.PendingUnknownIds, []int64{12}) {
-		t.Fatalf("empty removal changed the set: %v", kept.PendingUnknownIds)
+	if !slices.Equal(rids(kept.PendingUnknownKeys), []int64{12}) {
+		t.Fatalf("empty removal changed the set: %v", kept.PendingUnknownKeys)
 	}
 }
 
 // TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB pins the conditional supersession of
-// mr_rework_merge_pending: an author's older pending id is replaced by its newer representative
+// mr_rework_merge_pending_keys: an author's older pending id is replaced by its newer representative
 // only when the representative is retained in the same statement. A stale writer whose add the
 // high-water filter rejects, or whose replacement is removed or capped away, must not cost the
 // author its only pending id.
@@ -633,13 +662,13 @@ func TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return led.PendingUnknownIds
+		return rids(led.PendingUnknownKeys)
 	}
 	upsert := func(ref string, hw int64, add, remove, sup, supBy []int64) {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-			RepoID: repo, Ref: ref, HighWater: hw, PendingAdd: add, PendingRemove: remove,
-			PendingSuperseded: sup, PendingSupersededBy: supBy,
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+			RepoID: repo, Ref: ref, HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: rkeys(remove...),
+			PendingSuperseded: rkeys(sup...), PendingSupersededBy: rkeys(supBy...),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -709,8 +738,8 @@ func TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB(t *testing.T) {
 				Harness: "claude", UserID: user, RepoID: repo, IssueTitle: "t", IssueDescription: "d",
 				PipelineRef: pgtype.Text{String: ref, Valid: true}, MrIid: pgtype.Int8{Int64: 67, Valid: true},
 				TargetRunID: pgtype.UUID{Bytes: target, Valid: true}, ReviewComments: []byte(`{}`),
-				HighWater: hw, PendingAdd: add, PendingRemove: []int64{},
-				PendingSuperseded: sup, PendingSupersededBy: supBy,
+				HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: []string{},
+				PendingSuperseded: rkeys(sup...), PendingSupersededBy: rkeys(supBy...),
 			})
 			if err != nil {
 				t.Fatal(err)

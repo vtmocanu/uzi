@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -39,6 +40,10 @@ type startCounter struct {
 	inner    MRReworkRunStarter
 	attempts int // every create call, accepted or refused
 	starts   int // accepted creates only
+}
+
+func (c *startCounter) BootstrapReviewLedger(ctx context.Context, repoID uuid.UUID, ref string, pre store.GetMRReworkLedgerRow, comments []forge.MRComment) (workersvc.ReviewLedgerState, error) {
+	return c.inner.BootstrapReviewLedger(ctx, repoID, ref, pre, comments)
 }
 
 func (c *startCounter) CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error) {
@@ -94,7 +99,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			row := mrwRepoRow()
 			row.ID = repo
 			watch := NewMRReviewWatch(q, runs, poolQueue{pool}, nil, mrwSettings{enabled: true, capVal: 5}, 5, 0)
-			ledger := func(count int32, highwater int64) store.MrReworkLedger {
+			ledger := func(count int32, highwater int64) store.GetMRReworkLedgerRow {
 				t.Helper()
 				got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: mrwRef})
 				if err != nil {

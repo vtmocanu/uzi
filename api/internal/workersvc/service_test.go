@@ -41,7 +41,7 @@ func uziLabels(extra ...string) []byte {
 // path reaches them unexpectedly; the tests override only what they exercise.
 type fakeStore struct {
 	// pendingRemovals records the pending-only ledger removals (no run created).
-	pendingRemovals    []store.RemoveMRReworkPendingIDsParams
+	pendingRemovals    []store.RemoveMRReworkPendingKeysParams
 	pendingRemovalErr  error
 	promoteVaultLocked func(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
@@ -518,12 +518,14 @@ type fakeStore struct {
 	mrReworkRunParams *store.CreateAutoMRReworkRunParams
 	ledgerUpserts     []store.UpsertMRReworkLedgerParams
 	ledgerUpsertErr   error
+	// ledgerUpsertZeroRows models UpsertMRReworkLedger refusing a legacy row (0 rows written).
+	ledgerUpsertZeroRows bool
 	// On-demand mr_rework (PRD #1202). StartMRReworkForRun reads the ledger + token gate,
 	// then the manual create folds the run INSERT and the non-counting high-water advance
 	// into ONE atomic call (CreateManualMRReworkRunAndAdvance). mrReworkAndAdvanceParams
 	// captures that combined call's params (nil until it runs, proving the manual/atomic
 	// path was taken); the happy/error outcomes reuse mrReworkRunResult/mrReworkRunErr.
-	mrReworkLedger           store.MrReworkLedger
+	mrReworkLedger           store.GetMRReworkLedgerRow
 	mrReworkLedgerErr        error
 	hasAnthropicToken        bool
 	hasAnthropicTokenErr     error
@@ -1719,17 +1721,23 @@ func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAut
 	f.mrReworkRunParams = &arg
 	return f.mrReworkRunResult, f.mrReworkRunErr
 }
-func (f *fakeStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
+func (f *fakeStore) RemoveMRReworkPendingKeys(_ context.Context, arg store.RemoveMRReworkPendingKeysParams) error {
 	f.pendingRemovals = append(f.pendingRemovals, arg)
 	return f.pendingRemovalErr
 }
 
-func (f *fakeStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) error {
+func (f *fakeStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) (int64, error) {
 	f.ledgerUpserts = append(f.ledgerUpserts, arg)
-	return f.ledgerUpsertErr
+	if f.ledgerUpsertErr != nil {
+		return 0, f.ledgerUpsertErr
+	}
+	if f.ledgerUpsertZeroRows {
+		return 0, nil
+	}
+	return 1, nil
 }
 
-func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {
+func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error) {
 	return f.mrReworkLedger, f.mrReworkLedgerErr
 }
 func (f *fakeStore) CreateManualMRReworkRunAndAdvance(_ context.Context, arg store.CreateManualMRReworkRunAndAdvanceParams) (store.Run, error) {
