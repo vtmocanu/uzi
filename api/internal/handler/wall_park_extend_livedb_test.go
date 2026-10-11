@@ -149,13 +149,14 @@ func (e *wallParkExtendHTTPEnv) assertRefused409(rec *httptest.ResponseRecorder,
 	}
 }
 
-// TestWallParkExtendCapExhausted409LiveDB: cumulative cap exhausted (50000 + 10000 > 57600) used to
-// answer 202 resumed:true while the run stayed paused.
+// TestWallParkExtendCapExhausted409LiveDB: the cap is per request (#2735): a request above it (here
+// 57601 > 57600) answers 409 naming the per-extension maximum while the run stays paused (a refused
+// extend once answered 202 resumed:true with the run still paused).
 func TestWallParkExtendCapExhausted409LiveDB(t *testing.T) {
 	e := newWallParkExtendHTTPEnv(t, 57600)
 	id := e.wallPark(50000)
-	rec := e.postExtend(id, 10000)
-	e.assertRefused409(rec, id, "exceeds the remaining extension cap", "paused", 50000)
+	rec := e.postExtend(id, 57601)
+	e.assertRefused409(rec, id, "maximum per extension", "paused", 50000)
 }
 
 // TestWallParkExtendParkChanged409LiveDB drives workersvc.ErrWallParkChanged over HTTP: the owner

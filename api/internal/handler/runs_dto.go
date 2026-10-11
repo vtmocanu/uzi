@@ -199,7 +199,7 @@ func credentialSwitchState(r store.Run) *string {
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
 // reaches into it. globalTimeout is the instance RUN_TIMEOUT (h.cfg.RunTimeout),
 // passed in the same way, so RunDeadline can be computed here without config access
-// (PRD #1170). extensionCapSeconds is the effective admin extension cap (PRD #1189,
+// (PRD #1170). extensionCapSeconds is the effective admin per-request extension maximum (PRD #1189, #2735,
 // RunExtensionCapSeconds; 0 = extending disabled) and now is the wall-clock instant used
 // for budget_used_seconds — both passed in so this mapper stays pure.
 // forgeParkMax is the effective forge-unreachable park cap (PRD #1392 M1,
@@ -463,7 +463,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.BudgetWallSeconds = &v
 	}
 	// PRD #1189: the owner-granted extension (NOT NULL DEFAULT 0 → plain int) and the
-	// effective admin cap, so the Extend chooser and the CLI need no second settings call.
+	// effective admin per-request maximum, so the Extend chooser and the CLI need no second settings call.
 	// The cap is the same value RunExtensionCapSeconds returns (0 = extending disabled).
 	dto.BudgetExtensionSeconds = int(r.BudgetExtensionSeconds)
 	dto.BudgetExtensionCapSeconds = extensionCapSeconds
@@ -612,7 +612,7 @@ func landingStateOverlay(failOrigin *string, hasPreservedPatch, hasAvailableCapt
 	return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, hasAvailableCapture)
 }
 
-// runExtensionCapSeconds reads the per-run extension cap (PRD #1189) best-effort for the DTO:
+// runExtensionCapSeconds reads the per-request extension maximum (PRD #1189, #2735) best-effort for the DTO:
 // a nil settings cache or a read error reads as 0 (extending disabled / unknown), so a
 // momentarily-unreadable setting never fails a run read — the client falls back to plain
 // elapsed and the Extend button does not render (rollout-skew safe).

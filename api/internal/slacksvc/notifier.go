@@ -159,11 +159,16 @@ type Notifier struct {
 	// Zero until wired via WithRunTimeout; a zero value only affects the rare null-budget
 	// run's deadline line, never the extension logic.
 	runTimeout time.Duration
-	// extensionCap reads the per-run extension allowance (settings.RunExtensionCapSeconds)
-	// so the near-timeout DM offers the `uzi run extend` command only while the cap has
-	// room (PRD #1189 D9: never suggest a command that would 409). nil until wired via
-	// WithExtensionCap; nil or a read error is treated as 0 (command omitted).
-	extensionCap        func(context.Context) (int, error)
+	// extensionCap reads the PER-REQUEST extension maximum (settings.RunExtensionCapSeconds)
+	// so the near-timeout DM offers the `uzi run extend` command with a duration that fits
+	// it and the run's remaining total-time room (PRD #1189 D9: never suggest a command that
+	// would 409). nil until wired via WithExtensionCap; nil or a read error is treated as 0
+	// (command omitted).
+	extensionCap func(context.Context) (int, error)
+	// runWallCeiling is the instance RUN_WALL_CEILING; with runTimeout it sizes the room the
+	// extend bound reserves for a run's wall to scale up (workersvc.ExtensionRoomSeconds).
+	// Zero until wired via WithRunWallCeiling; zero falls back to runTimeout in the room math.
+	runWallCeiling      time.Duration
 	notificationUserCap int32
 }
 
@@ -187,9 +192,16 @@ func WithRunTimeout(d time.Duration) NotifierOption {
 	return func(n *Notifier) { n.runTimeout = d }
 }
 
-// WithExtensionCap sets the reader for the per-run extension allowance
+// WithRunWallCeiling sets the instance RUN_WALL_CEILING used, with the run timeout, to size
+// the remaining total-time room in the near-timeout DM's suggested extend duration.
+func WithRunWallCeiling(d time.Duration) NotifierOption {
+	return func(n *Notifier) { n.runWallCeiling = d }
+}
+
+// WithExtensionCap sets the reader for the per-request extension maximum
 // (settings.RunExtensionCapSeconds), so the near-timeout DM omits the extend command
-// once the cap is exhausted or extending is disabled.
+// when extending is disabled or the run has no total-time room left, and otherwise
+// suggests a duration within the maximum.
 func WithExtensionCap(fn func(context.Context) (int, error)) NotifierOption {
 	return func(n *Notifier) { n.extensionCap = fn }
 }

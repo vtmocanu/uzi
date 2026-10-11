@@ -318,7 +318,8 @@ type RunDTO struct {
 	BudgetWallSeconds   *int `json:"budget_wall_seconds"`
 	// BudgetExtensionSeconds is the owner-granted wall-clock extension (PRD #1189 M1) added ON
 	// TOP of the frozen budget; 0 for a run that was never extended. BudgetExtensionCapSeconds
-	// is the effective admin cap (run_extension_cap_seconds; 0 = extending disabled), served
+	// is the effective admin PER-REQUEST maximum (run_extension_cap_seconds; one Extend may add at
+	// most this; the cumulative extension is not capped by it; 0 = extending disabled), served
 	// here so the Extend chooser and the CLI need no separate settings call. Both are always
 	// present (a non-pointer int): 0 is a meaningful value, not "unknown".
 	BudgetExtensionSeconds    int `json:"budget_extension_seconds"`
@@ -1131,7 +1132,8 @@ type RunSummaryItemDTO struct {
 	BudgetWallSeconds   *int `json:"budget_wall_seconds"`
 	// BudgetExtensionSeconds is the owner-granted wall-clock extension (PRD #1189 M1) added ON
 	// TOP of the frozen budget; 0 for a run that was never extended. BudgetExtensionCapSeconds
-	// is the effective admin cap (run_extension_cap_seconds; 0 = extending disabled), served
+	// is the effective admin PER-REQUEST maximum (run_extension_cap_seconds; one Extend may add at
+	// most this; the cumulative extension is not capped by it; 0 = extending disabled), served
 	// here so the Extend chooser and the CLI need no separate settings call. Both are always
 	// present (a non-pointer int): 0 is a meaningful value, not "unknown".
 	BudgetExtensionSeconds    int `json:"budget_extension_seconds"`

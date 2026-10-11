@@ -654,9 +654,11 @@ func run() error {
 		slog.Default(),
 		// PRD #1189 M4: the near-timeout DM names the run's wall-clock deadline (needs the
 		// instance RUN_TIMEOUT for a run on the global default) and offers the `run extend`
-		// command unless the extension cap is exhausted or extending is disabled (cap 0).
+		// command with a duration within the per-request maximum and the run's remaining total-time room
+		// (nothing when extending is disabled, cap 0).
 		slacksvc.WithNotificationUserCap(notificationUserCap),
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
+		slacksvc.WithRunWallCeiling(cfg.RunWallCeiling),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
 	// Notifications write seam (PRD #46 M2): the one place that creates notification

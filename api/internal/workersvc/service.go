@@ -180,16 +180,20 @@ var (
 	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
 	// invalid mode fall through to the 500 default arm.
 	ErrInvalidPauseMode = errors.New("invalid pause mode")
-	// The four `extend` sentinels (PRD #1189 M1). ErrInvalidExtension rejects a body that is
+	// The `extend` sentinels (PRD #1189 M1, #2735). ErrInvalidExtension rejects a body that is
 	// not a whole number of seconds >= 60 → 400. ErrExtendDisabled is the admin off-switch
-	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the per-run cap gate,
-	// whose message names the remaining allowance → 409. ErrExtendNotTimed rejects a run of a
-	// kind that never times out (chat/judge/interactive) → 409. The last two are disambiguated
-	// from a 0-row CreateExtendInput by extendRefusalReason over the already-fetched run.
-	ErrInvalidExtension     = errors.New("invalid extension")
-	ErrExtendDisabled       = errors.New("extending runs is turned off")
-	ErrExtensionCapExceeded = errors.New("extension cap exceeded")
-	ErrExtendNotTimed       = errors.New("this run has no wall-clock timeout to extend")
+	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the PER-REQUEST gate: one
+	// request may not exceed run_extension_cap_seconds (the cumulative total is not capped by it),
+	// → 409. ErrExtensionLimitReached is the technical gate: the run's total wall time (budget +
+	// extensions + finalize allowance) must stay inside MaxRunWallSeconds, → 409. ErrExtendNotTimed
+	// rejects a run of a kind that never times out (chat/judge/interactive) → 409. The last three
+	// are disambiguated from a 0-row CreateExtendInput by extendRefusalReason over the
+	// already-fetched run.
+	ErrInvalidExtension      = errors.New("invalid extension")
+	ErrExtendDisabled        = errors.New("extending runs is turned off")
+	ErrExtensionCapExceeded  = errors.New("extension cap exceeded")
+	ErrExtensionLimitReached = errors.New("total run time limit reached")
+	ErrExtendNotTimed        = errors.New("this run has no wall-clock timeout to extend")
 	// ErrWallParkStopUnavailable (PRD #1497 M1, D9) rejects a `stop` on a budget_exhausted wall park
 	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
 	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
@@ -2202,6 +2206,17 @@ func (s *Service) notify(runID uuid.UUID, status string) {
 
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
+
+// MaxRunWallSeconds is the technical upper bound on a run's served wall total (frozen wall +
+// extensions + finalize allowance), in seconds. The worker arms its wall timer in milliseconds
+// with setTimeout, which clamps a delay above 2^31-1 ms to 1 ms (firing at once), so the total
+// must satisfy total*1000 <= math.MaxInt32 (about 24.8 days). Every extend path enforces it.
+const MaxRunWallSeconds = math.MaxInt32 / 1000
+
+// WallParkFinalizeSeconds is the one-time finalize allowance StopWallPark grants (SQL literal
+// budget_finalize_seconds = 1800). The extend bound reserves it so a later Stop cannot push the
+// served total past MaxRunWallSeconds; a LiveDB test pins it against the SQL.
+const WallParkFinalizeSeconds = 1800
 
 // defaultDispatchGrace is the undispatched-task-run reaper window (issue #1367): a
 // kind='task' (handoff) run may sit queued+undispatched this long before the sweep

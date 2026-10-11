@@ -118,9 +118,10 @@ const (
 	KeyHealthQueuedSeconds        = "health_queued_seconds"
 	KeyHealthApprovalSeconds      = "health_approval_seconds"
 	KeyHealthNudgeCooldownSeconds = "health_nudge_cooldown_seconds"
-	// KeyRunExtensionCapSeconds (PRD #1189) is the TOTAL extra wall-clock time, in seconds,
-	// an owner may grant a single run through Extend (budget_extension_seconds). It is a
-	// per-run total, not per-extension, so repeating Extend cannot exceed it. 0 disables
+	// KeyRunExtensionCapSeconds (PRD #1189, #2735) is the PER-REQUEST maximum of extra wall-clock
+	// time, in seconds, an owner may grant a run in one Extend. It does not cap the run's
+	// cumulative budget_extension_seconds: repeating Extend adds more, bounded only by the
+	// technical total-run-time limit (workersvc.MaxRunWallSeconds). 0 disables
 	// extending entirely; a non-zero value is [3600, 604800] (1h to 7d) — validated by
 	// validateExtensionCapSeconds, whose bounds differ from validateHealthSeconds.
 	KeyRunExtensionCapSeconds = "run_extension_cap_seconds"
@@ -373,8 +374,8 @@ const (
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
 	DefaultHealthNudgeCooldownSeconds = "1800" // 30m between Slack nudges per run
-	// PRD #1189: 16h of total extension per run by default (two full 8h ceilings) —
-	// generous for a human decision and still finite. 0 turns extending off.
+	// PRD #1189, #2735: at most 16h per extension request by default (two full 8h ceilings) —
+	// generous for a human decision; the run may be extended again. 0 turns extending off.
 	DefaultRunExtensionCapSeconds = "57600"
 	// PRD #58 Decision 8: two hosted workers per user by default. Hosting is itself
 	// off unless WORKER_HOSTING_ENABLED is set (the compose default), so this value
