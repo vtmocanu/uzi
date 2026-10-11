@@ -243,9 +243,7 @@ Ticks that don't count never move anyone ahead of *X*.
 > in [ADR-2347](../adr/2347-review-comment-author-trust.md).
 
 Smaller residuals: an outsider later promoted to collaborator is recognized
-within 6 hours (the cached verdict's lifetime); the cross-type comment-id
-limitation under [Known limitations](#known-limitations) also applies to
-remembered unknown ids; the ledger's 10,000-account cap is a documented residual (the pending set accumulates across fires, one entry per unverified author, and displacement needs it to exceed 10,000 entries); and a stale GitHub collaborator listing can cost a
+within 6 hours (the cached verdict's lifetime); the ledger's 10,000-account cap is a documented residual (the pending set accumulates across fires, one entry per unverified author, and displacement needs it to exceed 10,000 entries); and a stale GitHub collaborator listing can cost a
 queue position, which affects fairness only, never who is trusted.
 
 ## Enablement

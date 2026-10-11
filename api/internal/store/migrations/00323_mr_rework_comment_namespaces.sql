@@ -29,8 +29,10 @@ ALTER TABLE mr_rework_ledger
     ADD COLUMN pending_unknown_keys text[] NOT NULL DEFAULT '{}';
 
 -- Every pending key is '<namespace>:<id>': a lowercase/underscore namespace (possibly empty),
--- one colon, then a canonical non-negative decimal id (no leading zeros, at most 19 digits so it
--- is bounded to bigint width). A NULL element is rejected. Empty array is well formed.
+-- one colon, then a canonical non-negative decimal id (no leading zeros, at most 19 digits). The
+-- digit limit does not bound the value to bigint width (19 digits exceed 9223372036854775807);
+-- writers encode int64 ids and key extraction rejects larger values. A NULL element is rejected.
+-- Empty array is well formed.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_pending_keys_wellformed(keys text[]) RETURNS boolean
 LANGUAGE sql IMMUTABLE
