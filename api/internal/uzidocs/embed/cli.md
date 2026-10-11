@@ -1166,6 +1166,9 @@ source:
 uzi run discard <run-id> --hold <hold-id> --yes
 ```
 
+- **Source with no open hold.** When no hold is listed but a worker still retains the
+  source, `run discard` has nothing to target; use the worker-local inspect and discard
+  described in [retained sources with no open hold](run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard).
 - **Names one exact hold.** `--hold` is required; the discard settles only that hold and
   its non-ready captures. It never touches an *available* archive (delete that separately
   from the run view) and never a sibling hold or another generation.

@@ -753,6 +753,74 @@ it does not establish the cause of the historical refusal in
 lacked the deployed worker revision, classification request status, and
 underlying retirement error.
 
+### Retained sources with no open hold (worker-local inspect and discard)
+
+A retained source can outlive its server hold: the hold was released or discarded,
+but a worker-local record (attempt ledger, recovery journal, marker) still names the
+clone, so it keeps blocking reclaim or occupying disk. The server views above cannot
+show or discard it. The worker exposes a small operator channel for exactly this case:
+a read-only **inspect** and a guarded **discard**, run on the worker itself.
+
+- **Socket.** The worker listens on `<dataDir>/ops/retained-source.sock` (a
+  worker-owned `0700` directory holding a `0600` socket). There is no TCP listener. If
+  the channel cannot be set up the worker logs it and keeps running; the channel is
+  then unavailable, not the worker.
+- **Invocation.** Run the helper as the `worker` user, with a scrubbed environment and
+  the image-owned node binary. `env -i` plus that binary is why a planted `NODE_OPTIONS`,
+  `NODE_PATH` or tsx cache cannot influence it. Plain exec runs as root on compose and on
+  split-UID Kubernetes, which is why the user must be named:
+
+  ```sh
+  # Docker Compose
+  docker exec -u worker <agent container> \
+    env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
+
+  # Kubernetes
+  kubectl exec -c worker <pod> -- \
+    env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
+  ```
+
+**Inspect** is read-only and content-free. It reports the generation (or `none`), the
+attempt or `canonical`, the ledger, journal and marker state, a descriptor digest,
+whether the source is present, and its size in bytes. A size that hit the scan budget is
+reported as partial or unknown, never as `0`. Server hold state comes from the worker
+API (this worker's open holds); an empty list means the hold is absent or released,
+never something inferred from local files. It then names one disposition:
+
+| Disposition | Meaning and next step |
+|---|---|
+| `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still holds the source. Resolve it through its existing path; this command adds no new resolution. |
+| `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
+| `refused` | Named consumers still use the source. The output lists them. |
+
+**Discard** is the same invocation with `discard` in place of `inspect` and
+`--confirm <descriptor digest from inspect>` added; pass `--protected` as well for an
+episode or protected source. It closes new claims briefly, waits at most 5 s for
+in-flight claims, requires the worker to be idle, reserves the run, then deletes the
+exact source under one lock. Busy or timed out means refused. It never cancels a run or
+stops the worker, and the metadata is retired only after the files are verified gone.
+
+> **Discard destroys possibly unique work.** Inspect first, and export or back up
+> anything you may want before confirming (the `uzi-watcher` skill's `backup-runs.sh`
+> is the existing backup procedure).
+
+What the channel does not promise:
+
+- **Not a model boundary.** On single-UID workers (the default hosted Kubernetes
+  deployment, `uidSplit.enabled: false`) the model's shell runs as the worker's own uid
+  and can reach the socket and modify `/app`. The channel adds no capability beyond that
+  uid's existing write access to `/data/runner`. Under the uid split the runner uids
+  cannot connect.
+- **Durability follows the clone's storage.** A same-pod worker process restart keeps
+  the clone. Pod replacement loses an `emptyDir` clone (the Docker-tier `/data/runner`)
+  even though the bare-config ledger and marker survive; inspect reports such a source as
+  missing, never as empty work. PVC teardown loses both.
+- **Gitignored files are not covered.** No capture covers them; coverage is `HEAD` plus
+  tracked and untracked non-ignored bytes.
+
 ## What this is not: the threat model
 
 This is **server-side encryption at rest**, not end-to-end encryption. The
