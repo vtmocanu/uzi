@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { channel } from "node:diagnostics_channel";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
-import type { SpawnSyncOptions } from "node:child_process";
-import syncFs, { readFileSync } from "node:fs";
+import type { ChildProcess, SpawnSyncOptions } from "node:child_process";
+import syncFs, { readFileSync, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -833,7 +834,7 @@ describe("M1 controlled advice disposal ordering probe", () => {
   // Portable lifecycle probe, not a replacement for the real worker-UID security
   // inventory: privileged provisioning/parent metadata are scripted on this host.
   for (const ordering of ["exit_first", "evidence_first", "unclean"] as const) {
-    for (const leaf of ["single_uid", "owner_refusal"] as const) {
+    for (const leaf of ["single_uid", "owner_refusal", "runner_owner"] as const) {
       it(ordering + " through actual executor " + leaf, {
         skip: process.platform !== "linux" && "actual advice cleanup requires Linux descriptor-pinned tree removal",
       }, async (t) => {
@@ -842,6 +843,13 @@ describe("M1 controlled advice disposal ordering probe", () => {
         const { logger, lines } = recordingLogger();
         const diagnostic = new AdviceTeardownDiagnostic((line) => t.diagnostic(line));
         const originalOpen = fs.open.bind(fs);
+        const originalStat = fs.stat.bind(fs);
+        const realLstat = syncFs.lstatSync.bind(syncFs);
+        let replacement: Stats | undefined;
+        let numericOwnerReads = 0;
+        let bigintIdentityReads = 0;
+        let launcherRemovalRefusals = 0;
+        const helperResults: { command: string; code?: number | null; signal?: NodeJS.Signals | null; error?: string }[] = [];
         let owned = "";
         let shared = false;
         const parentMetadata = t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
@@ -852,12 +860,34 @@ describe("M1 controlled advice disposal ordering probe", () => {
           }
           return handle;
         });
+        // execFileAsync captured execFile at module load. Observe its real child
+        // dispatch/result rather than replacing that binding or the helper execution.
+        const helperChannel = channel("child_process");
+        const observeHelper = (message: unknown) => {
+          const child = (message as { process: ChildProcess }).process;
+          // The channel publishes at construction, before spawnargs exists.
+          // At close the dispatch operands and actual execFile result are available.
+          let failure: string | undefined;
+          child.once("error", (error: NodeJS.ErrnoException) => { failure = error.code ?? error.message; });
+          child.once("close", (code, signal) => {
+            if (!replacement || !child.spawnargs?.includes(path.dirname(owned)) ||
+              !child.spawnargs.includes(path.basename(owned)) ||
+              !child.spawnargs.includes(`${replacement.dev}:${replacement.ino}`)) return;
+            helperResults.push({ command: child.spawnfile, code, signal, error: failure });
+          });
+        };
+        helperChannel.subscribe(observeHelper);
         // Same spawnSync provisioning seam as the session seed test above. No
         // shell payload is executed: script categories select literal FS actions.
         const provision = t.mock.method(childProcess, "spawnSync", (command: string, args: readonly string[]) => {
           let stdout = "";
           if (command === "id") stdout = String(RUNNER_UID);
           else {
+            if (command === "/bin/rm" || args.includes("/bin/rm")) {
+              assert.equal(args.at(-1), owned, "launcher rm targets only the replacement");
+              launcherRemovalRefusals++;
+              return { status: 1, signal: null, pid: 0, output: [], stdout: "", stderr: "scripted launcher removal refusal" };
+            }
             assert.equal(command, "/bin/setpriv");
             const sh = args.indexOf("/bin/sh");
             assert.ok(sh >= 0, "only scripted provisioning shells are needed");
@@ -873,7 +903,16 @@ describe("M1 controlled advice disposal ordering probe", () => {
             } else if (script.includes("mkdir -m 700")) {
               owned = operands[0]!;
               assert.ok(owned.startsWith(base + "/codex-advice-data/"));
-              for (const dir of [owned, ...operands.slice(2)]) syncFs.mkdirSync(dir, { mode: 0o700 });
+              assert.equal(syncFs.statSync(path.dirname(owned)).mode & 0o2000, 0o2000,
+                "actual advice parent is setgid");
+              for (const dir of [owned, ...operands.slice(2)]) {
+                syncFs.mkdirSync(dir, { mode: 0o700 });
+                // mkdir inherits setgid; production explicitly clears it before
+                // applying the separate managed-session export posture later.
+                syncFs.chmodSync(dir, 0o700);
+                assert.equal(syncFs.statSync(dir).mode & 0o7777, 0o700,
+                  "private provisioning chmod clears inherited setgid");
+              }
             } else if (script.includes("chgrp")) {
               shared = true;
               syncFs.mkdirSync(owned + "/codex/sessions", { mode: 0o750 });
@@ -887,6 +926,15 @@ describe("M1 controlled advice disposal ordering probe", () => {
         });
         const spawn = t.mock.method(childProcess, "spawn", () => fake);
         syncBuiltinESMExports();
+        let ownerMetadata: { mock: { restore(): void } } | undefined;
+        const launcherOwner = t.mock.method(syncFs, "lstatSync", (...args: Parameters<typeof syncFs.lstatSync>) => {
+          const stat = realLstat(...args);
+          // Force the launcher to dispatch its deliberately refused rm before
+          // fallback, independent of the caller UID and its own owner guard.
+          if (String(args[0]) === owned && stat && typeof stat.uid === "number") stat.uid = RUNNER_UID;
+          return stat;
+        });
+        syncBuiltinESMExports();
         try {
           await diagnostic.run(async () => {
             const handle = await makeProductionLaunchAdviceRoot(base, "api_key", logger)({
@@ -897,6 +945,22 @@ describe("M1 controlled advice disposal ordering probe", () => {
             await fs.rename(owned, owned + ".retained");
             await fs.mkdir(owned);
             await fs.writeFile(owned + "/keep", "keep");
+            // Preserve the real inode and all Stats methods/types. Only the
+            // matching numeric pinned owner read is synthetic: this portable
+            // probe grants no privilege and does not replace worker UID inventory.
+            replacement = await originalStat(owned);
+            ownerMetadata = t.mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
+              const stat = await originalStat(...args);
+              if (/^\/proc\/self\/fd\/[0-9]+$/.test(String(args[0])) &&
+                String(stat.dev) === String(replacement!.dev) && String(stat.ino) === String(replacement!.ino)) {
+                if (typeof stat.uid === "bigint") bigintIdentityReads++;
+                else {
+                  numericOwnerReads++;
+                  stat.uid = leaf === "owner_refusal" ? WORKER_UID : leaf === "runner_owner" ? RUNNER_UID : replacement!.uid;
+                }
+              }
+              return stat;
+            });
             if (leaf === "single_uid") delete process.env.UZI_UID_SPLIT;
             await handle.dispose();
             await assertGone(handle.cwd);
@@ -913,6 +977,10 @@ describe("M1 controlled advice disposal ordering probe", () => {
               assert.equal(retained?.authority, "ECHILD+__WALL");
               assert.equal(retained?.cleanup_attempted, false);
               assert.equal(refused, false, "unclean disposal skips owner-refusal cleanup");
+              assert.equal(numericOwnerReads, 0, "unclean disposal skips pinned owner read");
+              assert.equal(bigintIdentityReads, 0);
+              assert.equal(helperResults.length, 0);
+              assert.equal(launcherRemovalRefusals, 0);
               const snapshot = await diagnostic.snapshot();
               assert.equal((snapshot.warnings as Record<string, unknown>[])[0]?.cleanup_attempted, false);
               const printed: string[] = [];
@@ -930,10 +998,34 @@ describe("M1 controlled advice disposal ordering probe", () => {
               assert.equal(printed[0]!.includes("private probe assertion"), false);
             } else {
               assert.equal(retained, undefined);
-              if (leaf === "single_uid") await assertGone(owned);
-              else {
+              assert.equal(launcherRemovalRefusals, 1, "launcher pre-fallback rm was deliberately refused");
+              assert.ok(numericOwnerReads > 0, "clean disposal reaches matching numeric pinned owner read");
+              if (leaf === "single_uid") {
+                await assertGone(owned);
+                assert.ok(bigintIdentityReads > 0, "single uid reaches actual bigint identity read");
+                assert.ok(helperResults.length > 0, "single uid dispatches real cleanup helper");
+                assert.ok(helperResults.every((result) => result.code !== undefined || result.error !== undefined),
+                  "single uid helper results observed");
+              } else if (leaf === "owner_refusal") {
                 assert.equal(await fs.readFile(owned + "/keep", "utf8"), "keep");
                 assert.equal(refused, true, "clean disposal reaches owner refusal");
+                assert.equal(bigintIdentityReads, 0, "owner refusal precedes identity read");
+                assert.equal(helperResults.length, 0, "owner refusal precedes helper dispatch");
+              } else {
+                assert.equal(refused, false, "matching runner owner bypasses owner refusal");
+                assert.ok(bigintIdentityReads > 0, "matching runner owner reaches actual bigint identity read");
+                assert.ok(helperResults.length > 0, "matching runner owner dispatches real cleanup helper");
+                assert.ok(helperResults.every((result) => result.code !== undefined || result.error !== undefined),
+                  "matching runner owner helper results observed");
+                const failure = lines.find((line) => (line as Record<string, unknown>).msg ===
+                  "Codex advice data cleanup failed") as Record<string, unknown> | undefined;
+                if (failure) {
+                  assert.match(String(failure.error), /agent-uid helper|rmTreePinned:/,
+                    "negative control records a specific downstream cleanup failure");
+                  assert.doesNotMatch(String(failure.error), /not owned/);
+                  assert.ok(helperResults.some((result) => result.error !== undefined || result.code !== 0),
+                    "downstream failure has an observed unsuccessful helper result");
+                } else await assertGone(owned);
               }
             }
             const snapshot = await diagnostic.snapshot();
@@ -944,10 +1036,14 @@ describe("M1 controlled advice disposal ordering probe", () => {
             assert.equal(exit < evidence, ordering === "exit_first");
             t.diagnostic(JSON.stringify({ ordering, leaf, result: ordering === "unclean" ? "legitimate_retention" : "clean",
               exit_ordinal: events[exit]?.ordinal, dispose_evidence_ordinal: events[evidence]?.ordinal,
+              numeric_owner_reads: numericOwnerReads, bigint_identity_reads: bigintIdentityReads,
+              launcher_removal_refusals: launcherRemovalRefusals, helper_results: helperResults,
               pipe_end_ordinals: events.filter((event) => event.event === "pipe_end").map((event) => event.ordinal) }));
           });
         } finally {
           process.env.UZI_UID_SPLIT = "1";
+          helperChannel.unsubscribe(observeHelper);
+          ownerMetadata?.mock.restore(); launcherOwner.mock.restore();
           spawn.mock.restore(); provision.mock.restore(); parentMetadata.mock.restore(); syncBuiltinESMExports();
           await fs.rm(base, { recursive: true, force: true });
         }
