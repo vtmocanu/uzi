@@ -27,6 +27,7 @@ type runProgressParityCase struct {
 	Status               string                `json:"status"`
 	Health               string                `json:"health"`
 	IsPlanning           bool                  `json:"is_planning"`
+	IsRevising           bool                  `json:"is_revising"`
 	Milestones           []apitypes.Milestone  `json:"milestones"`
 	MilestonesCompleted  []string              `json:"milestones_completed"`
 	MilestonesInProgress []string              `json:"milestones_in_progress"`
@@ -56,6 +57,7 @@ func TestRunProgressParityFixture(t *testing.T) {
 		{"awaiting input outranks stalled health", store.Run{Kind: "issue", Status: "awaiting_input", Health: "stalled", IterationCount: 1, MilestonesFrozen: []byte(frozen),
 			MilestonesCompleted: []byte(`["m1"]`)}},
 		{"plan gate waits", store.Run{Kind: "issue", Status: "awaiting_approval", Health: "ok", MilestonesCandidate: []byte(frozen)}},
+		{"plan gate re-planning after a revise is planning", store.Run{Kind: "issue", Status: "awaiting_approval", Health: "ok", MilestonesCandidate: []byte(frozen)}},
 		{"limit wait is parked", store.Run{Kind: "issue", Status: "limit_wait", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen)}},
 		{"claimed is queued", store.Run{Kind: "issue", Status: "claimed", Health: "ok"}},
 		{"looping health is stalled", store.Run{Kind: "issue", Status: "running", Health: "looping", IterationCount: 1, MilestonesFrozen: []byte(frozen),
@@ -64,12 +66,16 @@ func TestRunProgressParityFixture(t *testing.T) {
 		{"non-issue kind with a frozen list shows none", store.Run{Kind: "mr_rework", Status: "running", Health: "ok", IterationCount: 1, MilestonesFrozen: []byte(frozen)}},
 	}
 
+	// The cases whose derived plan-revise flag is set, stamped through applyRevising as
+	// GetRun and the lists do (issue #2760); runToDTO alone always leaves it false.
+	revising := map[string]bool{"plan gate re-planning after a revise is planning": true}
 	out := make([]runProgressParityCase, 0, len(cases))
 	for _, c := range cases {
 		c.run.ID = uuid.New()
 		dto := runToDTO(c.run, "normal", 0, 0, 0, dtoTestNow, 0)
+		applyRevising(&dto, revising[c.name])
 		out = append(out, runProgressParityCase{
-			Name: c.name, Kind: dto.Kind, Status: dto.Status, Health: dto.Health, IsPlanning: dto.IsPlanning,
+			Name: c.name, Kind: dto.Kind, Status: dto.Status, Health: dto.Health, IsPlanning: dto.IsPlanning, IsRevising: dto.IsRevising,
 			Milestones: dto.Milestones, MilestonesCompleted: dto.MilestonesCompleted,
 			MilestonesInProgress: dto.MilestonesInProgress, Progress: dto.Progress,
 		})

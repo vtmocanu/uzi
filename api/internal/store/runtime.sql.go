@@ -3064,7 +3064,10 @@ WITH extended AS (
       AND status NOT IN ('completed', 'failed', 'cancelled')
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
       AND interactive = false
-      AND budget_extension_seconds + $3::int <= $4::int
+      AND $3::int <= $4::int
+      AND GREATEST(COALESCE(budget_wall_seconds, 0), $5::int)::bigint
+          + budget_extension_seconds + $3::int
+          + GREATEST(budget_finalize_seconds, $6::int) <= $7::bigint
     RETURNING id, budget_extension_seconds
 ),
 consumed_wall AS (
@@ -3078,10 +3081,13 @@ RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS b
 `
 
 type CreateExtendInputParams struct {
-	ID   uuid.UUID   `json:"id"`
-	Body pgtype.Text `json:"body"`
-	Secs int32       `json:"secs"`
-	Cap  int32       `json:"cap"`
+	ID                       uuid.UUID   `json:"id"`
+	Body                     pgtype.Text `json:"body"`
+	Secs                     int32       `json:"secs"`
+	Cap                      int32       `json:"cap"`
+	BaseWallUpperSeconds     int32       `json:"base_wall_upper_seconds"`
+	FinalizeAllowanceSeconds int32       `json:"finalize_allowance_seconds"`
+	MaxWallSeconds           int64       `json:"max_wall_seconds"`
 }
 
 // PRD #1189 M1: grant a run more wall-clock time AND write the kind='extend' audit row in
@@ -3091,11 +3097,15 @@ type CreateExtendInputParams struct {
 // ONLY (excluded from ConsumeRunInputs, so the worker never drains or routes it — the extension
 // is served to the worker as runs.budget_extension_seconds on the ACK/claim instead).
 //
-// The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS the cap:
-// a completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
-// request that would push the total extension past @cap all match 0 rows. A 0-row result is
+// The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS two bounds:
+// @cap is a PER-REQUEST maximum (@secs <= @cap; the cumulative budget_extension_seconds is not
+// capped by it), and a TECHNICAL bound keeps the served wall total inside the worker timer's range
+// (GREATEST(budget_wall_seconds, @base_wall_upper_seconds) + extension + @secs + GREATEST(
+// budget_finalize_seconds, @finalize_allowance_seconds) <= @max_wall_seconds; bigint arithmetic).
+// A completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
+// request failing either bound all match 0 rows. A 0-row result is
 // disambiguated in Go by re-reading the already-fetched run (terminal -> ErrRunTerminal; untimed
-// kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded). On 0 rows the INSERT selects from
+// kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded / ErrExtensionLimitReached). On 0 rows the INSERT selects from
 // the empty CTE and writes NO audit row, so a refused extend leaves no trace.
 //
 // disposition = 'applied' at insert (the CHECK from 00162 admits it): an extension takes effect
@@ -3112,6 +3122,9 @@ func (q *Queries) CreateExtendInput(ctx context.Context, arg CreateExtendInputPa
 		arg.Body,
 		arg.Secs,
 		arg.Cap,
+		arg.BaseWallUpperSeconds,
+		arg.FinalizeAllowanceSeconds,
+		arg.MaxWallSeconds,
 	)
 	var budget_extension_seconds int32
 	err := row.Scan(&budget_extension_seconds)
@@ -4625,7 +4638,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $1 AND runs.user_id = $2
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
-      AND runs.budget_extension_seconds + $3::int <= $4::int
+      AND $3::int <= $4::int
+      AND GREATEST(COALESCE(runs.budget_wall_seconds, 0), $5::int)::bigint
+          + runs.budget_extension_seconds + $3::int
+          + GREATEST(runs.budget_finalize_seconds, $6::int) <= $7::bigint
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -4669,7 +4685,7 @@ WITH candidates AS MATERIALIZED (
         budget_extension_seconds = runs.budget_extension_seconds + $3::int,
         budget_paused_seconds = runs.budget_paused_seconds
             + GREATEST(0, (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds)
-                          - (COALESCE(runs.budget_wall_seconds, $5::int)
+                          - (COALESCE(runs.budget_wall_seconds, $8::int)
                              + runs.budget_extension_seconds + runs.budget_finalize_seconds))
             + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
         status = 'queued',
@@ -4683,7 +4699,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $1 AND runs.user_id = $2
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
-      AND runs.budget_extension_seconds + $3::int <= $4::int
+      AND $3::int <= $4::int
+      AND GREATEST(COALESCE(runs.budget_wall_seconds, 0), $5::int)::bigint
+          + runs.budget_extension_seconds + $3::int
+          + GREATEST(runs.budget_finalize_seconds, $6::int) <= $7::bigint
       AND runs.id IN (SELECT run_id FROM eligible_candidates)
       AND (runs.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM locked_checks cc
@@ -4697,7 +4716,8 @@ WITH candidates AS MATERIALIZED (
             AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
             AND lead.claim_generation = cc.lead_claim_generation
       ))
-    RETURNING runs.budget_extension_seconds
+    RETURNING runs.started_at, runs.budget_wall_seconds, runs.budget_extension_seconds,
+        runs.budget_finalize_seconds, runs.budget_paused_seconds
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
@@ -4708,32 +4728,45 @@ extend_audit AS (
     -- The audit rows use sqlc.arg('id') for run_id and ` + "`" + `FROM extended` + "`" + ` only for the row count (the
     -- CreateExtendInput shape), so no bare ` + "`" + `id` + "`" + ` collides with run_user_inputs.id in the INSERT scope.
     INSERT INTO run_user_inputs (run_id, kind, body, disposition)
-    SELECT $1, 'extend', $6, 'applied' FROM extended
+    SELECT $1, 'extend', $9, 'applied' FROM extended
 ),
 resume_audit AS (
     INSERT INTO run_user_inputs (run_id, kind, body)
     SELECT $1, 'resume', NULL::text FROM extended
 )
-SELECT COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budget_extension_seconds
+SELECT extended.started_at, extended.budget_wall_seconds, extended.budget_extension_seconds,
+    extended.budget_finalize_seconds, extended.budget_paused_seconds FROM extended
 `
 
 type ExtendAndResumeWallParkParams struct {
-	ID                   uuid.UUID   `json:"id"`
-	UserID               uuid.UUID   `json:"user_id"`
-	Secs                 int32       `json:"secs"`
-	Cap                  int32       `json:"cap"`
-	GlobalTimeoutSeconds int32       `json:"global_timeout_seconds"`
-	Body                 pgtype.Text `json:"body"`
+	ID                       uuid.UUID   `json:"id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	Secs                     int32       `json:"secs"`
+	Cap                      int32       `json:"cap"`
+	BaseWallUpperSeconds     int32       `json:"base_wall_upper_seconds"`
+	FinalizeAllowanceSeconds int32       `json:"finalize_allowance_seconds"`
+	MaxWallSeconds           int64       `json:"max_wall_seconds"`
+	GlobalTimeoutSeconds     int32       `json:"global_timeout_seconds"`
+	Body                     pgtype.Text `json:"body"`
+}
+
+type ExtendAndResumeWallParkRow struct {
+	StartedAt              pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
+	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
 }
 
 // PRD #1497 M1 (D7): the owner's Extend on a budget_exhausted wall park, in ONE statement — add the
 // extension AND resume, so an extension has one purpose and is one action. It:
-//  1. adds @secs to budget_extension_seconds under the SAME cap guard as CreateExtendInput (a
-//     request past @cap matches 0 rows -> ErrExtensionCapExceeded, worded for the park);
+//  1. adds @secs to budget_extension_seconds under the SAME per-request cap and technical
+//     wall bound as CreateExtendInput (a request past either matches 0 rows; the caller re-reads the run to word the refusal);
 //  2. BANKS THE OVERRUN into budget_paused_seconds so the extension buys exactly @secs of ACTIVE
 //     run-time however late the park landed (D7): overrun = active-at-park - total-before-extension,
 //     and the parked-wait interval is banked too (ResumePausedRun's rule), so the two banks leave the
-//     run resuming with precisely @secs of budget (proof: active_now = active_at_park - overrun =
+//     run resuming with precisely @secs of budget when the park landed at or past the deadline (every
+//     real wall park; otherwise @secs plus the unspent budget) (proof: active_now = active_at_park - overrun =
 //     total_before, remaining = (total_before + @secs) - total_before = @secs);
 //  3. does ResumePausedRun's transition — queued, codex cap/epoch, health reset, CLEAR
 //     hold_reason/hold_captured_head, and the D19 worker rule (a SERVER-parked row, claim_released_at
@@ -4744,20 +4777,30 @@ type ExtendAndResumeWallParkParams struct {
 // total_before and active-at-park read the OLD row (SET RHS is pre-update): budget_extension_seconds
 // in total_before is the pre-extension value, budget_finalize_seconds is included (a run may have been
 // Stopped then re-parked). Refuses (0 rows) a row that is not a budget_exhausted paused hold, or over
-// the cap. Returns the new total extension (CreateExtendInput's scalar shape); the handler re-reads
-// the run for the deadline + resumed:true response.
-func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (int32, error) {
+// the per-request cap or the technical wall bound, or a cross_check whose lead plan check is no longer pending and eligible. Returns the
+// POST-update budget row (started_at, budget_wall/extension/finalize/paused seconds) so the caller
+// computes the resumed deadline from the banked values; a refusal returns NO row (pgx.ErrNoRows), never a zero scalar.
+func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (ExtendAndResumeWallParkRow, error) {
 	row := q.db.QueryRow(ctx, extendAndResumeWallPark,
 		arg.ID,
 		arg.UserID,
 		arg.Secs,
 		arg.Cap,
+		arg.BaseWallUpperSeconds,
+		arg.FinalizeAllowanceSeconds,
+		arg.MaxWallSeconds,
 		arg.GlobalTimeoutSeconds,
 		arg.Body,
 	)
-	var budget_extension_seconds int32
-	err := row.Scan(&budget_extension_seconds)
-	return budget_extension_seconds, err
+	var i ExtendAndResumeWallParkRow
+	err := row.Scan(
+		&i.StartedAt,
+		&i.BudgetWallSeconds,
+		&i.BudgetExtensionSeconds,
+		&i.BudgetFinalizeSeconds,
+		&i.BudgetPausedSeconds,
+	)
+	return i, err
 }
 
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows
@@ -20180,7 +20223,8 @@ type StopWallParkParams struct {
 //  1. sets scope_ceiling = @scope_ceiling (the completed count, the CreateScopeCeilingInput shape),
 //     marking any prior unsettled scope rows superseded;
 //  2. grants budget_finalize_seconds = 1800 WHERE budget_finalize_seconds = 0 — the once-only marker
-//     AND the accounting: it lives OUTSIDE budget_extension_seconds so the owner cap never sees it,
+//     AND the accounting: it lives OUTSIDE budget_extension_seconds (the extend predicates count it separately as
+//     GREATEST(budget_finalize_seconds, @finalize_allowance_seconds)),
 //     and a second Stop matches 0 rows (allowance already used) -> the handler answers 409;
 //  3. banks the overrun + parked interval so the run resumes with exactly 1800s of finalize budget
 //     (the same two-bank rule as ExtendAndResumeWallPark; budget_finalize_seconds is OLD (=0) in the

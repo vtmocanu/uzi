@@ -128,6 +128,22 @@ describe("captureView", () => {
     expect(captureView("discarded")).toMatchObject({ label: "Discarded", tone: "neutral" });
   });
 
+  it("explains an early expiry only for the exact published_redundant reason", () => {
+    const early = captureView("expired", "published_redundant");
+    expect(early).toMatchObject({ label: "Expired", tone: "neutral", downloadable: false });
+    expect(early.description).toMatch(/already published on its branch/);
+    const plain = captureView("expired");
+    expect(plain.description).toBe("The download window has passed and the bytes were purged.");
+    // An unknown or near-miss reason keeps the default text and is never echoed.
+    for (const reason of ["something_else", "Published_Redundant", "published_redundant ", ""]) {
+      expect(captureView("expired", reason).description).toBe(plain.description);
+    }
+    // The reason only shapes the expired state.
+    expect(captureView("available", "published_redundant").description).toBe(
+      captureView("available").description,
+    );
+  });
+
   it("falls back to an honest label for an unknown state, never mis-rendered as available", () => {
     // A server that grew a new state before this client did must not read as downloadable.
     const unknown = captureView("quarantined");

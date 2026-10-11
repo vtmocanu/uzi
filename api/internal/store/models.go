@@ -766,6 +766,9 @@ type RecoveryCapture struct {
 	CoverageDigest         pgtype.Text        `json:"coverage_digest"`
 	LocalReplicaWorkerID   pgtype.UUID        `json:"local_replica_worker_id"`
 	ReadyRetentionSeconds  pgtype.Int8        `json:"ready_retention_seconds"`
+	RedundancyProof        []byte             `json:"redundancy_proof"`
+	RedundancyRefusedAt    pgtype.Timestamptz `json:"redundancy_refused_at"`
+	RedundancyRefusal      pgtype.Text        `json:"redundancy_refusal"`
 }
 
 type RecoveryCaptureChunk struct {

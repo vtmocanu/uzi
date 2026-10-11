@@ -774,7 +774,7 @@ type Config struct {
 	RecoveryReadyPayloadPerOwner   int64         // UZI_RECOVERY_READY_PAYLOAD_PER_OWNER_BYTES — ready payload quota per owner. Default 1 GiB.
 	RecoveryInstanceBytes          int64         // UZI_RECOVERY_INSTANCE_BYTES — instance-wide byte quota (scoped to the affected owner on breach, never a global stop). Default 4 GiB.
 	RecoveryMaxCapturesPerClaim    int           // UZI_RECOVERY_MAX_CAPTURES_PER_CLAIM — captures admitted under one hold. Default 16.
-	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded) captures per owner. Default 256.
+	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded, non-expired) captures per owner. Default 256.
 	RecoveryReadyRetention         time.Duration // UZI_RECOVERY_READY_RETENTION — ready-artifact TTL, begins at durable capture. Default 168h (7d).
 	RecoveryUploadRetryWindow      time.Duration // UZI_RECOVERY_UPLOAD_RETRY_WINDOW — governs the periodic stalled→needs_action sweep (workersvc ExpireStalledUploads), NOT an in-request loop: a capture stuck in a non-terminal upload state longer than this is surfaced as needs_action with the source retained. Default 24h; the sweep disables on a non-positive value.
 	RecoveryMaxConcurrentUploads   int           // UZI_RECOVERY_MAX_CONCURRENT_UPLOADS — concurrent uploads per API process. Default 2.

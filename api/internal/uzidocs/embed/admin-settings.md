@@ -264,7 +264,7 @@ signal off, from **Admin → Instance → Run health**:
 | Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
 | Long tool call after | 1200s (20m) | `health_tool_call_seconds` — how long the oldest open tool call of a run's main agent may run, on a run that has also been silent for the **Stalled after** window (or for this threshold, if **Stalled after** is `0`), before it's flagged stalled. Calls to subagents are excluded. `0` turns this signal off. See [Long tool calls](./run-health.md#long-tool-calls). |
 | Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
-| Extension allowance per run (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the total extra wall-clock time an owner may grant a single run through [Extend](./run-health.md#giving-a-run-more-time), on top of its frozen budget. `0` turns extending off instance-wide. |
+| Maximum per extension (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the most extra wall-clock time an owner may grant in one [Extend](./run-health.md#giving-a-run-more-time) request (web chooser, `uzi run extend --by`, or the API input). It is a per-request limit, not a lifetime total per run: an owner may extend a run again and again, and each extension is an explicit, audited action. Repeated grants therefore permit longer resource use, and nothing extends a run automatically. A run's total extension is bounded only by a [technical limit](./run-health.md#how-much-time-a-run-can-have-in-total). `0` turns extending off instance-wide. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. A Docker worker repo allowlist block is flagged as soon as it is detected instead; `0` still disables it. |
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
@@ -390,7 +390,7 @@ the same picture from a terminal instead of the web UI — see
   thresholds, `0` **disables that signal**. For the Slack nudge cooldown, `0`
   means something different: no rate limit, so a nudge fires on every
   ok→flagged transition instead of at most once per window.
-- The extension allowance is `0` (extending disabled instance-wide) or a
+- The maximum per extension is `0` (extending disabled instance-wide) or a
   whole number of seconds from 3600 to 604800 (1h to 7d); anything else —
   negative, non-integer, or a value in between the two ranges — is rejected.
 - An invalid save is rejected before anything is written. The same rules run

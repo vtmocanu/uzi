@@ -62,7 +62,7 @@ func (m tuiModel) renderLaneRail() string {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
 		if l, ok := d.selectedLane(); ok {
-			active := activeLaneKey(d.run.Status, d.frames)
+			active := activeLaneKey(d.run.Status, d.run.IsRevising, d.frames)
 			suffixes := laneSuffixes(d.lanes)
 			sb.WriteString(m.laneRow(l, true, m.laneCrewState(l, active, now), suffixes[l.Key], d.leadCtx, d.leadCtxOK && l.Key == laneLead))
 		}
@@ -167,7 +167,7 @@ func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewS
 		return crewIdle
 	}
 	d := &m.detail
-	return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+	return crewStateFor(d.run.Status, d.run.IsRevising, d.run.Health, l.Key, active, l.LastActivity, now)
 }
 
 // expandedRoster renders every crew lane row (the expanded rail's roster) into one joined string,
@@ -181,7 +181,7 @@ func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewS
 // a subagent lane and the synthetic ALL lane never get it.
 func (m tuiModel) expandedRoster(now time.Time) string {
 	d := &m.detail
-	active := activeLaneKey(d.run.Status, d.frames)
+	active := activeLaneKey(d.run.Status, d.run.IsRevising, d.frames)
 	suffixes := laneSuffixes(d.lanes)
 	fill, hasCtx := d.leadCtx, d.leadCtxOK
 	var sb strings.Builder

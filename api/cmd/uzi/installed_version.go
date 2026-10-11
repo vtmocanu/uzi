@@ -102,54 +102,61 @@ func installedProbeEnv() []string {
 	return append(out, "UZI_SKILL_AUTO_UPGRADE=0", "UZI_VERSION_CHECK=0", "UZI_URL=://")
 }
 
-func realInstalledVersion(formula string) (string, error) {
-	return probeInstalledVersion(runProcess, formula)
+// installedCLI is the formula-owned executable a probe verified and the version it
+// reported. Path is the symlink-resolved file inside the formula prefix: the version
+// probe ran it, and the post-upgrade relaunch execs the same file.
+type installedCLI struct {
+	Version string
+	Path    string
 }
 
-func probeInstalledVersion(run processRunner, formula string) (string, error) {
+func realInstalledCLI(formula string) (installedCLI, error) {
+	return probeInstalledCLI(runProcess, formula)
+}
+
+func probeInstalledCLI(run processRunner, formula string) (installedCLI, error) {
 	if !allowedFormula(formula) {
-		return "", errors.New("invalid installed formula")
+		return installedCLI{}, errors.New("invalid installed formula")
 	}
 	out, err := quietProcess(run, "brew", []string{"--prefix", formula}, nil)
 	if err != nil {
-		return "", fmt.Errorf("formula prefix: %w", err)
+		return installedCLI{}, fmt.Errorf("formula prefix: %w", err)
 	}
 	prefix := strings.TrimSpace(out)
 	if !filepath.IsAbs(prefix) {
-		return "", errors.New("formula prefix is not absolute")
+		return installedCLI{}, errors.New("formula prefix is not absolute")
 	}
 	prefix, err = filepath.EvalSymlinks(prefix)
 	if err != nil {
-		return "", fmt.Errorf("formula prefix: %w", err)
+		return installedCLI{}, fmt.Errorf("formula prefix: %w", err)
 	}
 	if !validFormulaPrefix(prefix, formula) {
-		return "", errors.New("foreign formula prefix")
+		return installedCLI{}, errors.New("foreign formula prefix")
 	}
-	path := filepath.Join(prefix, "bin", "uzi")
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := filepath.EvalSymlinks(filepath.Join(prefix, "bin", "uzi"))
 	if err != nil {
-		return "", fmt.Errorf("installed executable: %w", err)
+		return installedCLI{}, fmt.Errorf("installed executable: %w", err)
 	}
 	rel, err := filepath.Rel(prefix, resolved)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return "", errors.New("installed executable escapes formula prefix")
+		return installedCLI{}, errors.New("installed executable escapes formula prefix")
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		return "", fmt.Errorf("installed executable: %w", err)
+		return installedCLI{}, fmt.Errorf("installed executable: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-		return "", errors.New("installed executable is not executable")
+		return installedCLI{}, errors.New("installed executable is not executable")
 	}
-	out, err = quietProcess(run, path, []string{"version"}, installedProbeEnv())
+	out, err = quietProcess(run, resolved, []string{"version"}, installedProbeEnv())
 	if err != nil {
-		return "", fmt.Errorf("installed version: %w", err)
+		return installedCLI{}, fmt.Errorf("installed version: %w", err)
 	}
 	line, _, _ := strings.Cut(out, "\n")
 	if _, ok := validatedVersion(line); !ok {
-		return "", errors.New("invalid installed version")
+		return installedCLI{}, errors.New("invalid installed version")
 	}
-	return line, nil
+	return installedCLI{Version: line, Path: resolved}, nil
 }
 
 // Reject size before sanitizing; truncation must never turn invalid output into a

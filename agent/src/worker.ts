@@ -25,6 +25,7 @@ import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
+import { reportProofTiming } from "./report-proof-timing.js";
 
 /** PRD #1906 M4: the protocol capability proving this image runs the isolated research lane
  *  (the IsolatedRunner, the fetch tool and the fixed tool set). The api's dedicated claim
@@ -197,10 +198,11 @@ export class Worker {
         typeof this.runner.recoveryInventoryPending !== "function") return;
     this.sweepingFinalizes = true;
     const pass = new AbortController();
-    const deadline = Date.now() + 5_000;
+    const passMs = reportProofTiming.finalizePassMs();
+    const deadline = Date.now() + passMs;
     const abort = () => pass.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), 5_000);
+    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), passMs);
     try {
       const candidates = frozen ?? this.captureFinalizes();
       const entries = candidates.map(candidate => candidate.entry);
@@ -279,7 +281,8 @@ export class Worker {
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
+    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")),
+      reportProofTiming.finalizeAuthorityMs());
     try {
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
       const authority = Promise.resolve().then(async () => {

@@ -60,6 +60,11 @@ func TestInstalledProbeCommandConstruction(t *testing.T) {
 			if err := os.Symlink(prefix, opt); err != nil {
 				t.Fatal(err)
 			}
+			// The probe reports symlink-resolved paths; macOS temp dirs sit behind /var -> /private/var.
+			resolvedPrefix, err := filepath.EvalSymlinks(prefix)
+			if err != nil {
+				t.Fatal(err)
+			}
 			t.Setenv("HOMEBREW_PREFIX", "/fixture/homebrew")
 			t.Setenv("HOMEBREW_NO_AUTO_UPDATE", "1")
 			t.Setenv("UZI_URL", "https://configured.example")
@@ -76,7 +81,7 @@ func TestInstalledProbeCommandConstruction(t *testing.T) {
 					_, _ = io.WriteString(cmd.Stderr, "brew notice\n")
 					_, _ = io.WriteString(cmd.Stdout, opt+"\n")
 				} else {
-					if cmd.Path != filepath.Join(prefix, "bin", "uzi") || !reflect.DeepEqual(cmd.Args, []string{cmd.Path, "version"}) {
+					if cmd.Path != filepath.Join(resolvedPrefix, "bin", "uzi") || !reflect.DeepEqual(cmd.Args, []string{cmd.Path, "version"}) {
 						t.Fatalf("installed command: %q %v", cmd.Path, cmd.Args)
 					}
 					expected := map[string]string{"UZI_URL": "://", "UZI_VERSION_CHECK": "0", "UZI_SKILL_AUTO_UPGRADE": "0", "HOMEBREW_PREFIX": "/fixture/homebrew", "HOMEBREW_NO_AUTO_UPDATE": "1"}
@@ -100,8 +105,9 @@ func TestInstalledProbeCommandConstruction(t *testing.T) {
 				}
 				return nil
 			}
-			got, err := probeInstalledVersion(run, formula)
-			if err != nil || got != "v0.85.0" || calls != 2 {
+			cli, err := probeInstalledCLI(run, formula)
+			got := cli.Version
+			if err != nil || got != "v0.85.0" || cli.Path != filepath.Join(resolvedPrefix, "bin", "uzi") || calls != 2 {
 				t.Fatalf("probe = %q %v calls=%d", got, err, calls)
 			}
 		})
@@ -162,7 +168,8 @@ func TestInstalledProbeRejectsPathsAndOutput(t *testing.T) {
 				}
 				return nil
 			}
-			got, err := probeInstalledVersion(run, "uzi-cli")
+			cli, err := probeInstalledCLI(run, "uzi-cli")
+			got := cli.Version
 			if err == nil || got != "" {
 				t.Fatalf("accepted %s: %q %v", name, got, err)
 			}
@@ -177,7 +184,7 @@ func TestInstalledProbeRejectsPathsAndOutput(t *testing.T) {
 		})
 	}
 	calls := 0
-	if _, err := probeInstalledVersion(func(context.Context, *exec.Cmd) error { calls++; return nil }, "other/tap/uzi-cli"); err == nil || calls != 0 {
+	if _, err := probeInstalledCLI(func(context.Context, *exec.Cmd) error { calls++; return nil }, "other/tap/uzi-cli"); err == nil || calls != 0 {
 		t.Fatal("foreign formula reached runner")
 	}
 }
@@ -279,7 +286,8 @@ func TestInstalledProbeVersionCommandStaysOffline(t *testing.T) {
 		_, _ = io.WriteString(cmd.Stdout, out)
 		return nil
 	}
-	got, err := probeInstalledVersion(run, "uzi-cli")
+	cli, err := probeInstalledCLI(run, "uzi-cli")
+	got := cli.Version
 	if err != nil || got != "v0.85.0" || hits.Load() != 0 {
 		t.Fatalf("probe=%q %v HTTP hits=%d", got, err, hits.Load())
 	}

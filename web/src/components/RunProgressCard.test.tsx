@@ -200,6 +200,17 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
     expect(flag.className).toContain("text-warn");
   });
 
+  it("a revising run (awaiting_approval, is_revising, planning progress) does not wait on you", () => {
+    const { container } = renderCard({
+      status: "awaiting_approval",
+      is_revising: true,
+      status_since: STATUS_SINCE,
+      progress: progress({ state: "planning", pct: null }),
+    });
+    expect(container.textContent).not.toContain("waits on you");
+    expect(container.textContent).not.toContain("plan gate");
+  });
+
   it("parked on a usage limit: `⏸ limit wait · resumes HH:MM` when retry_not_before is ahead", () => {
     const at = "2026-10-09T21:00:00Z";
     renderCard({ status: "limit_wait", retry_not_before: at, progress: progress({ state: "parked", pct: null }) });

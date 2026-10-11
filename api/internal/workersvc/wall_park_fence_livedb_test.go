@@ -108,7 +108,7 @@ func TestWallParkFenceOldFlightRejectedLiveDB(t *testing.T) {
 
 	// The owner extends-and-resumes: paused -> queued, worker_id NULL (server-parked, D19).
 	if _, err := env.q.ExtendAndResumeWallPark(env.ctx, store.ExtendAndResumeWallParkParams{
-		ID: runID, UserID: userID, Secs: 3600, Cap: 57600, GlobalTimeoutSeconds: 7200,
+		ID: runID, UserID: userID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: 86400, FinalizeAllowanceSeconds: WallParkFinalizeSeconds, MaxWallSeconds: MaxRunWallSeconds, GlobalTimeoutSeconds: 7200,
 		Body: pgtype.Text{String: "extend+resume", Valid: true},
 	}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)

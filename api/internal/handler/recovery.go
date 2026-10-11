@@ -508,3 +508,39 @@ func (h *Handler) DiscardRecoveryHold(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.JSON(w, http.StatusOK, map[string]bool{"discarded": true})
 }
+
+// WorkerRecoveryArchiveRedundancy answers a worker's claim that a completed run's archive is
+// already redundant with the published branch (issue #2625). The body is decoded strictly under an
+// explicit cap; a malformed claim is a 400, a run or capture of another worker is a retained
+// answer, and every proof outcome is a 200 with outcome expired|retained and one bounded reason.
+func (h *Handler) WorkerRecoveryArchiveRedundancy(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	captureID, ok := httpx.PathUUID(w, r, "captureID", "capture")
+	if !ok {
+		return
+	}
+	var req apitypes.RecoveryArchiveRedundancyRequest
+	if err := httpx.DecodeJSONStrictBounded(r, &req, workersvc.RedundancyRequestMaxBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid redundancy request")
+		return
+	}
+	res, err := h.wsvc.ProveArchiveRedundancy(r.Context(), wkr, runID, captureID, req)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrInvalidRedundancyRequest) {
+			httpx.Error(w, http.StatusBadRequest, "invalid redundancy request")
+			return
+		}
+		slog.Error("recovery archive redundancy", "run", runID.String(), "capture", captureID.String(), "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}

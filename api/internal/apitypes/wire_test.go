@@ -88,6 +88,8 @@ var runDTOKeys = []string{
 	// issue #321: server-computed planning-phase display flag, always on the wire (bool,
 	// false for every non-planning and pre-feature run). Derived, not stored.
 	"is_planning",
+	// issues #750/#2760: server-derived plan-revise flag, always on the wire (bool).
+	"is_revising",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
 	"auto_approve", "plan_cross_check_required", "code_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
@@ -358,9 +360,8 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// PRD #1497 M1: worker_name is now on RunDTO too, so it is in runDTOKeys — RunListItemDTO's own
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
-	// is_revising (issue #750) is on RunListItemDTO only, deliberately NOT on RunDTO —
-	// so it is listed here, not in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count", "is_revising")
+	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
+	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"

@@ -94,11 +94,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		// issue #857: what/how/who started the run. A NOT NULL server enum (DEFAULT
 		// 'manual'), so it is always set and printed unconditionally like KIND above.
 		{"TRIGGER", r.TriggerSource},
-		// RunDTO carries no is_revising (issue #750): the detail page keeps its own
-		// derivePlanRevision panel, so revising is never surfaced through this helper here.
+		// RunDTO.IsRevising (issue #2760) is the server-derived "mid-revise replan" flag,
+		// so a re-planning run reads "revising" here instead of waiting on the owner.
 		// displayRunStatus (issue #1418) additionally reads "needs landing" for a failed run
 		// whose landing_state is needs_landing; every other status is unchanged.
-		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, false, r.LandingState)},
+		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},

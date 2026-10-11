@@ -1140,7 +1140,9 @@ chain in the diagram above, with no intervening `running`.
   Because the broker PAT lacks `workflow` scope, the worker checkpoints a
   `ckpt(overlay):` wrapper whose `.github/workflows` tree byte-matches the current
   default, so the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as a
-  fast-forward and adoption peels it back to the real tip. GitHub-only. See
+  fast-forward and adoption peels it back to the real tip. Tick and iteration
+  checkpoints chain over a prior overlay (when its history verifies as
+  bounded, wrapper-only) rather than being refused `not_descendant` (#2733). GitHub-only. See
   [ADR-1036](adr/1036-checkpoint-workflow-overlay.md).
 
 - **queued → claimed**: `POST /api/worker/runs/claim` atomically claims an eligible
@@ -1430,7 +1432,7 @@ chain in the diagram above, with no intervening `running`.
   run/forge checks. Missing, mismatched, unknown or drifting evidence retains.
   No capture, WIP, freeze or clean-source proof is needed for this receipt,
   even with existing available/thin/needs-action captures; archive retention
-  is unchanged. Healthy custody release needs no heartbeat prerequisite.
+  is unchanged by the receipt itself (but see #2625 below). Healthy custody release needs no heartbeat prerequisite.
   When its existing outbox can journal the terminal report, the worker persists
   the fixed original completion before preparation.
   A valid receipt skips preparation and is saved/read back in an existing
@@ -1450,6 +1452,10 @@ chain in the diagram above, with no intervening `running`.
   [ADR-2417](adr/2417-guarded-local-retention.md) for the dated amendments.
   Older/successor holds and unstamped older completions gain no authority;
   failed/cancelled/parked runs and other kinds keep their existing policy.
+  A completed run's guarded archive can expire early as `published_redundant`
+  when the API proves through the forge that the run's published branch already
+  contains everything it retains (#2625; worker claim, API proof, bytes and
+  count slot freed). See the [ADR-2417 amendment](adr/2417-guarded-local-retention.md#amendment-2026-10-11--published-redundancy-early-expiry-2625).
   Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature
   loss after guard latching retains custody with bounded retry. Credential-free
   boot cannot auto-capture dirty source. Unguarded APIs can retain local pins

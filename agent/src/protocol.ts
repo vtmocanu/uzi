@@ -2951,6 +2951,27 @@ export interface RecoveryReconcileResponse {
   reason?: string;
 }
 
+/** Claim that a completed run's guarded archive is redundant with its published branch (issue
+ *  #2625). Mirrors api/internal/apitypes/recovery_archive_redundancy.go; sent only when the server
+ *  advertises recovery_archive_redundancy_v1. Objects are standard padded base64 of raw commit bodies. */
+export interface RecoveryArchiveRedundancyRequest {
+  generation: number;
+  coverage_digest: string;
+  roots: string[];
+  current_sha: string;
+  tree: string;
+  aggregate_objects: string[];
+  current_object: string;
+  wip?: { witness_object: string };
+}
+
+/** The api's answer. reason is a bounded server token, or a local token when the reply was malformed. */
+export interface RecoveryArchiveRedundancyResponse {
+  capture_id: string;
+  outcome: "expired" | "retained";
+  reason?: string;
+}
+
 /** RecoveryReleaseResponse is the custody release ACK; holds_released counts settled holds. */
 export interface RecoveryReleaseResponse {
   run_id: string;

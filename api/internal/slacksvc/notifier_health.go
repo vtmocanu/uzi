@@ -72,16 +72,21 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 	// and, unless extending is exhausted/disabled, the exact `uzi run extend` command.
 	// RunDeadline is the same server-side helper the sweep and the run page share (D9), so
 	// the DM can never disagree with them; it returns nil for a run with no wall deadline,
-	// which healthNudgeBlocks treats as "omit the line". The extension cap comes from the
-	// admin setting (nil reader / read error → 0 → the command is omitted, the safe
-	// default). Both inputs are ignored for every flag other than `slow`.
+	// which healthNudgeBlocks treats as "omit the line". The extension maximum comes from the
+	// admin per-request setting (nil reader / read error → 0 → the command is omitted, the
+	// safe default), narrowed to the run's remaining total-time room. Both inputs are ignored for every flag other than `slow`.
 	deadline := workersvc.RunDeadline(rc.StartedAt, rc.BudgetWallSeconds, rc.BudgetPausedSeconds,
 		rc.Kind, rc.Interactive, rc.Status, n.runTimeout, rc.BudgetExtensionSeconds, rc.BudgetFinalizeSeconds)
 	extensionCap := 0
 	if n.extensionCap != nil {
 		extensionCap, _ = n.extensionCap(ctx)
 	}
-	hblocks, hfallback := healthNudgeBlocks(ev.health, ev.reason, base, rc, deadline, extensionCap, time.Now())
+	maxExtend := 0
+	if extensionCap > 0 {
+		maxExtend = min(extensionCap, workersvc.ExtensionRoomSeconds(rc.BudgetWallSeconds,
+			rc.BudgetExtensionSeconds, rc.BudgetFinalizeSeconds, n.runTimeout, n.runWallCeiling))
+	}
+	hblocks, hfallback := healthNudgeBlocks(ev.health, ev.reason, base, rc, deadline, maxExtend, time.Now())
 	if _, perr := n.poster.PostBlocks(ctx, channel, threadTS, hfallback, hblocks); perr != nil {
 		n.logf("post health nudge", perr)
 	}

@@ -37,6 +37,9 @@ export function deriveMockProgress(run: Run): RunProgress | null {
     active_milestone_id: active,
     phase: phaseOf(run.current_activity?.agent),
   };
+  // A revising run (awaiting_approval + is_revising) is the lead re-planning, not the owner
+  // being asked: mirrors runprogress.Derive, which checks it before the WAITING arm.
+  if (run.status === "awaiting_approval" && run.is_revising === true) return { ...base, state: "planning" };
   if (WAITING.has(run.status)) return { ...base, state: "waiting" };
   if (PARKED.has(run.status)) return { ...base, state: "parked" };
   if (QUEUED.has(run.status)) return { ...base, state: "queued" };

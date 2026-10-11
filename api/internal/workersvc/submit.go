@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -206,12 +207,14 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// below (the generic `extend` already admits a paused row; the milestone `stop` branch is
 	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
 	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
-	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged,
+	// because hasLivePoller reads every paused run as having no poller even while its kept worker
+	// heartbeats for other runs (issue #1969).
 	// PRD #1908 D-E: a job is never extended, on ANY extend path. Refuse it here, above the
 	// budget_exhausted wall-park branch (which routes to ExtendAndResumeWallPark with no kind
 	// filter) and the generic CTE (whose kind list admits a job).
 	if kind == "extend" && run.Kind == runkind.Job {
-		return SubmitInputResult{}, extendRefusalReason(run, 0, 0)
+		return SubmitInputResult{}, s.extendRefusal(run, 0, 0)
 	}
 	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 		switch kind {
@@ -227,10 +230,14 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			if capSeconds == 0 {
 				return SubmitInputResult{}, ErrExtendDisabled
 			}
-			// secs > capSeconds can never apply and would overflow the CTE's int4 addition — reported
-			// as a cap violation here, keeping secs in [60, capSeconds] for the int32 casts below.
+			// The cap is per request. secs > capSeconds can never apply; reporting it here keeps
+			// secs in [60, capSeconds] for the int32 casts below.
 			if secs > capSeconds {
-				return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+				return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
+			}
+			// secs beyond the room left under MaxRunWallSeconds can never apply either.
+			if secs > s.extensionRoom(run) {
+				return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
 			}
 			return s.extendAndResumeWallPark(ctx, userID, run, secs, capSeconds)
 		case "stop":
@@ -306,8 +313,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 
 	// An `extend` (PRD #1189 M1) is an owner-only request to add wall-clock time ON TOP of the
 	// frozen budget. It ADDS @secs to runs.budget_extension_seconds (never mutating the immutable
-	// budget_wall_seconds) and writes a kind='extend' audit row in ONE statement, capped by the
-	// admin setting run_extension_cap_seconds (0 = extending disabled). Like `scope` the control
+	// budget_wall_seconds) and writes a kind='extend' audit row in ONE statement. The admin setting
+	// run_extension_cap_seconds is the PER-REQUEST maximum (0 = extending disabled); the total is
+	// bounded only technically (MaxRunWallSeconds). Like `scope` the control
 	// is server-only — served to the worker as the column on the ACK/claim, excluded from
 	// ConsumeRunInputs — so it never routes through the worker's steering queue. A 0-row result
 	// is disambiguated into the 409 classes from the already-loaded run (extendRefusalReason).
@@ -325,12 +333,16 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if capSeconds == 0 {
 			return SubmitInputResult{}, ErrExtendDisabled
 		}
-		// secs is user input. A request larger than the whole cap can never be applied and,
-		// left unbounded, would overflow the CTE's int4 budget_extension_seconds + @secs
-		// addition — so it is reported as a cap violation here. After this, secs ∈ [60,
+		// secs is user input. The cap is per request: a request larger than it can never be
+		// applied, so it is reported as a cap violation here. After this, secs ∈ [60,
 		// capSeconds], keeping every int32 cast in submitExtend and the DB arithmetic in range.
 		if secs > capSeconds {
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
+		}
+		// A request beyond the room left under MaxRunWallSeconds can never apply either (the
+		// CTE enforces the same bound atomically; this names it without a write).
+		if secs > s.extensionRoom(run) {
+			return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
 		}
 		// The write is a helper taking secs/capSeconds as plain ints: crossing the function
 		// boundary is what keeps gosec G109 (strconv.Atoi result → int32) from firing at the
@@ -1114,7 +1126,8 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 // to int32) from firing, exactly as submitScopeCeiling does for its ceiling. The projected
 // total and deadline are computed from the already-fetched run BEFORE the CTE so the write
 // stays one statement and needs no read-back. A 0-row CTE (terminal / untimed kind / over the
-// cap) yields pgx.ErrNoRows, mapped to the specific 409 by extendRefusalReason over that row.
+// per-request cap / over the total-time limit) yields pgx.ErrNoRows, mapped to the specific 409
+// by extendRefusalReason over that row.
 func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
 	secs32, cap32 := int32(0), int32(0)
 	if secs >= 0 && secs <= math.MaxInt32 {
@@ -1128,16 +1141,19 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 	// CURRENT budget_extension_seconds atomically, so a total derived from run.BudgetExtensionSeconds
 	// can be stale under concurrent extends; the committed total (newTotal) is the only source of
 	// truth, and the running total is reconstructable from the run row plus these delta rows.
-	auditBody := fmt.Sprintf("extend +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
+	auditBody := fmt.Sprintf("extend +%s (max %s per extension)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
 	newTotal, err := s.q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-		ID:   run.ID,
-		Secs: secs32,
-		Cap:  cap32,
-		Body: pgconv.TextOrNull(auditBody),
+		ID:                       run.ID,
+		Secs:                     secs32,
+		Cap:                      cap32,
+		BaseWallUpperSeconds:     s.baseWallUpperSeconds(),
+		FinalizeAllowanceSeconds: WallParkFinalizeSeconds,
+		MaxWallSeconds:           MaxRunWallSeconds,
+		Body:                     pgconv.TextOrNull(auditBody),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
 		}
 		return SubmitInputResult{}, err
 	}
@@ -1150,11 +1166,13 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 
 // extendAndResumeWallPark applies the owner's Extend on a budget_exhausted wall park (PRD #1497 M1,
 // D7): add @secs of wall-clock time AND resume, in ONE statement (ExtendAndResumeWallPark). It banks
-// the overrun so the extension buys exactly @secs of active run-time, clears the hold, drops the
-// released worker (D19), and writes the extend + resume audit rows. Refusals mirror submitExtend's
-// (a 0-row CTE — over the cap — is mapped by extendRefusalReason). The projected deadline is
-// computed from the committed new total; Resumed is true so the CLI says the run resumed. Callers
-// have already validated secs ∈ [60, capSeconds].
+// the overrun so the extension buys @secs of active run-time (exactly @secs when the park landed at
+// or past the deadline), clears the hold, drops the released worker (D19), and writes the extend +
+// resume audit rows. A refused statement returns no row (pgx.ErrNoRows); wallParkExtendRefusal then
+// re-reads the run to name why, and nothing is published or notified. The projected deadline is
+// computed from the POST-update budget row the statement returns (it has banked the overrun and the
+// parked interval into budget_paused_seconds); Resumed is true so the CLI says the run resumed.
+// Callers have already validated secs in [60, capSeconds].
 func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
 	secs32, cap32 := int32(0), int32(0)
 	if secs >= 0 && secs <= math.MaxInt32 {
@@ -1163,20 +1181,21 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 	if capSeconds >= 0 && capSeconds <= math.MaxInt32 {
 		cap32 = int32(capSeconds)
 	}
-	auditBody := fmt.Sprintf("extend and resume +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
-	newTotal, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
-		ID:                   run.ID,
-		UserID:               userID,
-		Secs:                 secs32,
-		Cap:                  cap32,
-		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
-		Body:                 pgconv.TextOrNull(auditBody),
+	auditBody := fmt.Sprintf("extend and resume +%s (max %s per extension)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
+	row, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
+		ID:                       run.ID,
+		UserID:                   userID,
+		Secs:                     secs32,
+		Cap:                      cap32,
+		BaseWallUpperSeconds:     s.baseWallUpperSeconds(),
+		FinalizeAllowanceSeconds: WallParkFinalizeSeconds,
+		MaxWallSeconds:           MaxRunWallSeconds,
+		GlobalTimeoutSeconds:     int32(s.p.RunTimeout.Seconds()),
+		Body:                     pgconv.TextOrNull(auditBody),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The only refusal reachable here (the caller pre-validated the cap and the status is a
-			// budget_exhausted paused hold) is a raced cap violation; extendRefusalReason words it.
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.wallParkExtendRefusal(ctx, userID, run, secs, capSeconds)
 		}
 		return SubmitInputResult{}, err
 	}
@@ -1186,10 +1205,35 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 		s.bcast.PublishState(run.ID, "queued")
 	}
 	s.notify(run.ID, "queued")
-	// Deadline reflects the new total extension; the finalize term is unchanged by an extend.
-	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, newTotal, run.BudgetFinalizeSeconds)
-	nt := int(newTotal)
+	// Deadline comes from the post-update row: the statement banked the overrun and the parked
+	// interval into budget_paused_seconds, which the pre-update run snapshot does not carry.
+	deadline := RunDeadline(row.StartedAt, row.BudgetWallSeconds, row.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, row.BudgetExtensionSeconds, row.BudgetFinalizeSeconds)
+	nt := int(row.BudgetExtensionSeconds)
 	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: deadline, Resumed: true}, nil
+}
+
+// wallParkExtendRefusal names why ExtendAndResumeWallPark matched no row. The statement's guards
+// (status/hold, per-request cap, total-time limit, cross_check plan-check eligibility) all collapse
+// into "0 rows", and the run snapshot the caller holds can be stale, so it re-reads the run and
+// classifies from the fresh row: terminal, no longer a budget_exhausted park, over the total-time
+// room (or the per-request cap), a cross_check that can no longer resume, else a concurrent change. A re-read failure is returned as is.
+func (s *Service) wallParkExtendRefusal(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) error {
+	cur, err := s.GetRun(ctx, userID, run.ID)
+	if err != nil {
+		return err
+	}
+	switch {
+	case terminalStatuses[cur.Status]:
+		return ErrRunTerminal
+	case cur.Status != "paused" || !cur.HoldReason.Valid || cur.HoldReason.String != "budget_exhausted":
+		return ErrWallParkChanged
+	case secs > capSeconds || secs > s.extensionRoom(cur):
+		return s.extendRefusal(cur, secs, capSeconds)
+	case cur.Kind == runkind.CrossCheck:
+		return ErrWallParkCrossCheckIneligible
+	default:
+		return ErrWallParkChanged
+	}
 }
 
 // stopWallPark applies the owner's Stop on a budget_exhausted wall park of a milestone issue run
@@ -1267,15 +1311,56 @@ func (s *Service) runExtensionCap(ctx context.Context) (int, error) {
 	return s.healthSettings.RunExtensionCapSeconds(ctx)
 }
 
-// extendRefusalReason turns a 0-row CreateExtendInput into the specific 409 the owner sees
-// (PRD #1189 M1), decided from the already-loaded run row — the causes the CTE's predicate
+// baseWallUpperSeconds is the service-side upper bound on the wall a run can still be scaled to
+// (the immutable-column fallback and the scaling ceiling): max(RunTimeout, RunWallCeiling,
+// MaxRunWallCeiling), in seconds. The extend predicates take GREATEST of it and the persisted
+// budget_wall_seconds.
+func (s *Service) baseWallUpperSeconds() int32 {
+	return budgetDurationSeconds(max(s.p.RunTimeout, s.p.RunWallCeiling, MaxRunWallCeiling))
+}
+
+// extensionRoom is ExtensionRoomSeconds for a loaded run row under this service's config.
+func (s *Service) extensionRoom(run store.Run) int {
+	return ExtensionRoomSeconds(run.BudgetWallSeconds, run.BudgetExtensionSeconds, run.BudgetFinalizeSeconds, s.p.RunTimeout, s.p.RunWallCeiling)
+}
+
+// extendRefusal is extendRefusalReason under this service's config.
+func (s *Service) extendRefusal(run store.Run, secs, capSeconds int) error {
+	return extendRefusalReason(run, secs, capSeconds, s.p.RunTimeout, s.p.RunWallCeiling)
+}
+
+// ExtensionRoomSeconds is how many more seconds of extension a run can take before its served
+// wall total could exceed MaxRunWallSeconds (the worker's timer range). It mirrors the SQL
+// predicate in CreateExtendInput / ExtendAndResumeWallPark and is the same arithmetic:
+//
+//	room = MaxRunWallSeconds - wallUpper - finalizeUpper - extension, clamped at 0
+//
+// wallUpper is the largest wall the run may be served: max(persisted budget_wall_seconds when set,
+// runTimeout, wallCeiling, MaxRunWallCeiling) - a NULL-wall run can still be scaled up to the
+// ceiling at plan approval, and an operator may later raise RUN_WALL_CEILING (to at most
+// MaxRunWallCeiling), so the room reserves the larger of the frozen wall and that maximum for every
+// run, rather than the current setting. The only uncovered case is RUN_TIMEOUT raised above
+// MaxRunWallCeiling later for a run with no frozen wall. finalizeUpper is max(finalize,
+// WallParkFinalizeSeconds): the one-time Stop allowance is reserved before it is granted. Pure;
+// the SQL is authoritative.
+func ExtensionRoomSeconds(wall pgtype.Int4, ext, finalize int32, runTimeout, wallCeiling time.Duration) int {
+	wallUpper := int(budgetDurationSeconds(max(runTimeout, wallCeiling, MaxRunWallCeiling)))
+	if wall.Valid {
+		wallUpper = max(wallUpper, int(wall.Int32))
+	}
+	finalizeUpper := max(int(finalize), WallParkFinalizeSeconds)
+	return max(0, MaxRunWallSeconds-wallUpper-finalizeUpper-int(ext))
+}
+
+// extendRefusalReason turns a 0-row CreateExtendInput (or, via wallParkExtendRefusal, a 0-row
+// ExtendAndResumeWallPark) into the specific 409 the owner sees (PRD #1189 M1), decided from a
+// loaded run row (the caller's snapshot, or a fresh re-read) - the causes the CTE's predicate
 // collapses into "0 rows". Terminal first (the run is dead, the clock is already stopped),
-// then a kind that never times out (chat/judge, or an interactive task — the runWallClock
-// exclusion set), then the residual cause: budget_extension_seconds + secs would exceed the
-// per-run cap, so the message names the remaining allowance. Same accepted TOCTOU as
-// pauseRefusalReason: a run that changed between GetRun and the CTE is reported as the guard
-// the stale row suggests, which is harmless (the run is dead or untimed either way).
-func extendRefusalReason(run store.Run, secs, capSeconds int) error {
+// then a kind that never times out (chat/judge, or an interactive task - the runWallClock
+// exclusion set), then the per-request cap (secs > capSeconds), then the residual cause: the
+// total-time room under MaxRunWallSeconds. Same accepted TOCTOU as pauseRefusalReason: a run that
+// changed between GetRun and the CTE is reported as the guard the stale row suggests.
+func extendRefusalReason(run store.Run, secs, capSeconds int, runTimeout, wallCeiling time.Duration) error {
 	if terminalStatuses[run.Status] {
 		return ErrRunTerminal
 	}
@@ -1287,12 +1372,13 @@ func extendRefusalReason(run store.Run, secs, capSeconds int) error {
 	if run.Kind == runkind.Job {
 		return fmt.Errorf("%w (a job run's wall-clock limit is fixed at creation)", ErrExtendNotTimed)
 	}
-	remaining := capSeconds - int(run.BudgetExtensionSeconds)
-	if remaining < 0 {
-		remaining = 0
+	if secs > capSeconds {
+		return fmt.Errorf("%w: +%s is more than the %s maximum per extension", ErrExtensionCapExceeded,
+			extendDurationLabel(secs), extendDurationLabel(capSeconds))
 	}
-	return fmt.Errorf("%w: %s exceeds the remaining extension cap (%s left of %s)", ErrExtensionCapExceeded,
-		extendDurationLabel(secs), extendDurationLabel(remaining), extendDurationLabel(capSeconds))
+	room := ExtensionRoomSeconds(run.BudgetWallSeconds, run.BudgetExtensionSeconds, run.BudgetFinalizeSeconds, runTimeout, wallCeiling)
+	return fmt.Errorf("%w: +%s would take this run past the %s limit on total run time (%s left)", ErrExtensionLimitReached,
+		extendDurationLabel(secs), wallLimitLabel(MaxRunWallSeconds), wallLimitLabel(room))
 }
 
 // extendDurationLabel renders a whole-second extension duration tersely for an audit body or
@@ -1312,6 +1398,26 @@ func extendDurationLabel(secs int) string {
 	default:
 		return fmt.Sprintf("%dm", m)
 	}
+}
+
+// wallLimitLabel renders a total-time duration with every non-zero unit, seconds included
+// ("24d 20h 31m 23s"), for the MaxRunWallSeconds limit and the room left under it, which are
+// not whole minutes.
+func wallLimitLabel(secs int) string {
+	if secs <= 0 {
+		return "0s"
+	}
+	var parts []string
+	for _, u := range []struct {
+		n    int
+		unit string
+	}{{86400, "d"}, {3600, "h"}, {60, "m"}, {1, "s"}} {
+		if q := secs / u.n; q > 0 {
+			parts = append(parts, fmt.Sprintf("%d%s", q, u.unit))
+			secs -= q * u.n
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func stopKindFor(kind string) string {

@@ -91,7 +91,7 @@ type Limits struct {
 	ReadyPayloadPerOwner   int64         // ready payload byte quota per owner.
 	InstanceBytes          int64         // instance-wide byte quota (scoped to the affected owner on breach).
 	MaxCapturesPerClaim    int           // captures admitted under one hold.
-	MaxCapturesPerOwner    int           // retained (non-discarded) captures per owner.
+	MaxCapturesPerOwner    int           // retained (non-discarded, non-expired) captures per owner.
 	ReadyRetention         time.Duration // ready-artifact TTL, begins at durable capture.
 	MaxConcurrentUploads   int           // concurrent uploads per API process.
 	MaxConcurrentDownloads int           // concurrent downloads per API process.

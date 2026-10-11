@@ -1060,8 +1060,8 @@ func (f *autoStopSweepStore) RecordWallParkCapturedHead(context.Context, store.R
 func (f *autoStopSweepStore) CountOnlineWorkersClaimableForRun(context.Context, store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error) {
 	return store.CountOnlineWorkersClaimableForRunRow{}, nil
 }
-func (f *autoStopSweepStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (int32, error) {
-	return 0, pgx.ErrNoRows
+func (f *autoStopSweepStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (store.ExtendAndResumeWallParkRow, error) {
+	return store.ExtendAndResumeWallParkRow{}, pgx.ErrNoRows
 }
 func (f *autoStopSweepStore) StopWallPark(context.Context, store.StopWallParkParams) (uuid.UUID, error) {
 	return uuid.Nil, pgx.ErrNoRows
