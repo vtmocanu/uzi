@@ -147,7 +147,8 @@ export type HarnessSignalName =
   | "signal_done"
   | "ask_user"
   | "report_progress"
-  | "checkpoint";
+  | "checkpoint"
+  | "park_run";
 
 export type HarnessItem =
   | { kind: "text"; text: string }
@@ -319,6 +320,9 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  /** Worker-derived park admission; never supplied by the model. */
+  parkRunSupported?: boolean;
+  nonInteractiveIssue?: boolean;
   prompt: string;
   systemPrompt: string;
   resumeSessionId?: string;
@@ -535,6 +539,7 @@ export interface TurnSignals {
   rejectedMilestones?: Milestone[];
   progress?: MilestoneProgress;
   checkpoint?: boolean;
+  parkRun?: boolean;
   summary?: string;
   reportOnly?: boolean;
   proposal?: Proposal;

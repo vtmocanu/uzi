@@ -52,6 +52,7 @@
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
+import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
@@ -498,8 +499,8 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
   return `Your questions could not be put to a human on this run:\n\n${questions.map((q) => `- ${q.question}`).join("\n")}\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.`;
 }
 
-function answeredPrompt(questions: AskUserQuestion[], answers: string[]): string {
-  return `The human answered your questions:\n\n${questions.map((q, i) => `Q: ${q.question}\nA: ${answers[i]?.trim() || "(no answer given)"}`).join("\n\n")}\n\nContinue the work with these answers.`;
+function answeredPrompt(questions: AskUserQuestion[], answers: string[], continuation = "Continue the work with these answers."): string {
+  return `The human answered your questions:\n\n${questions.map((q, i) => `Q: ${q.question}\nA: ${answers[i]?.trim() || "(no answer given)"}`).join("\n\n")}\n\n${continuation}`;
 }
 
 
@@ -2569,7 +2570,8 @@ export class CodexExecutor implements Executor {
       const emitIgnoredQuestions = (result: ReducedTurnResult): void => {
         if (result.questions?.length) ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_IGNORED_NOTICE } });
       };
-      const clarify = async (questions: AskUserQuestion[]): Promise<string> => {
+      let clarificationPaused = false;
+      const clarify = async (questions: AskUserQuestion[], parkAt?: { completedCount: number; total?: number }): Promise<string> => {
         if (!ctx.askUser) {
           ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_UNWIRED_NOTICE } });
           return unansweredPrompt(questions);
@@ -2584,11 +2586,20 @@ export class CodexExecutor implements Executor {
           await ctx.askUser(questions);
           return unansweredPrompt(questions);
         }
-        const verdict = await ctx.askUser(questions);
-        if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        let verdict = await ctx.askUser(questions);
         questionBudget.asked++;
+        while (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && ctx.requestParkRun) {
+          if (questionBudget.asked > questionMax(ctx)) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+          const disposition = await ctx.requestParkRun(parkAt);
+          if (disposition.kind === "paused") { clarificationPaused = true; return ""; }
+          if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
+          questionBudget.asked++;
+          if (questionBudget.asked > questionMax(ctx)) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+          verdict = disposition;
+        }
+        if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
-        return answeredPrompt(questions, verdict.answers);
+        return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
       const drivePlan = async (initialPrompt: string) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
@@ -2609,6 +2620,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: a completed turn proves the home is live and holds newer session state.
           reapedSinceLastPersist = false;
           const result = turn.result;
+          if (result.parkRun) throw new TrustedExecutionRefusal("illicit park_run signal during planning");
           if (result.plan?.trim()) {
             emitIgnoredQuestions(result);
             return turn;
@@ -3038,6 +3050,23 @@ export class CodexExecutor implements Executor {
           if (!hasQuestions && result.prSummary !== undefined) {
             declaredPrSummary = await stampPrSummaryHead(result.prSummary, ctx.worktreePath);
           }
+          const parkAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
+          if (result.parkRun) {
+            if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new TrustedExecutionRefusal("illicit park_run signal");
+            if (clarificationRounds++ >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+            // Each failure question answer spends the shared clarification budget.
+            let disposition = await ctx.requestParkRun(parkAt);
+            while (disposition.kind === "answer") {
+              questionBudget.asked++;
+              if (questionBudget.asked > questionMax(ctx)) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+              if (!isParkAnswer(disposition)) break;
+              disposition = await ctx.requestParkRun(parkAt);
+            }
+            if (disposition.kind === "paused") { pausedAt = parkAt; return loopResult(); }
+            if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
+            nextPrompt = disposition.answers.join("\n") + "\n\n" + PARK_RUN_CONTINUATION;
+            continue;
+          }
           if (!result.questions?.length) break;
           if (result.checkpoint) {
             await epoch.persistSession();
@@ -3053,8 +3082,9 @@ export class CodexExecutor implements Executor {
           // With max_iterations=1, clarify inside this same iteration before its budget check.
           if (clarificationRounds >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
           clarificationRounds++;
-          const followUp = await clarify(result.questions);
-          const continuationBody = `${followUp}\n\nContinue the implementation.`;
+          const followUp = await clarify(result.questions, parkAt);
+          if (clarificationPaused) { pausedAt = parkAt; return loopResult(); }
+          const continuationBody = parkRunEnabled(ctx, "implement") ? followUp : `${followUp}\n\nContinue the implementation.`;
           nextPrompt = withMilestoneNote(continuationBody, milestoneNote());
           if (result.checkpoint) {
             clarificationPrompt = continuationBody;
@@ -4346,10 +4376,13 @@ export class CodexExecutor implements Executor {
     const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
+    if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     const request: RunTurnRequest = {
       prompt,
       systemPrompt,
       phase,
+      parkRunSupported: ctx.parkRunSupported,
+      nonInteractiveIssue: parkRunEligible(ctx, phase),
       agents,
       leadSkills,
       signal,

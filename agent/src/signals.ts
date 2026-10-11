@@ -34,6 +34,7 @@ const SIGNAL_DONE_TOOL = "signal_done";
 export const ASK_USER_TOOL = "ask_user";
 const REPORT_PROGRESS_TOOL = "report_progress";
 const CHECKPOINT_TOOL = "checkpoint";
+const PARK_RUN_TOOL = "park_run";
 
 /** issue #279: transport-hygiene cap on the `summary` captured from signal_done and
  *  forwarded as `report_md` on a report-only completion. HYGIENE ONLY — the api is the
@@ -46,6 +47,7 @@ const SIGNAL_DONE_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SIGNAL_DONE_TOOL}`;
 const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
 const REPORT_PROGRESS_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${REPORT_PROGRESS_TOOL}`;
 const CHECKPOINT_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${CHECKPOINT_TOOL}`;
+const PARK_RUN_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${PARK_RUN_TOOL}`;
 
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
@@ -134,6 +136,7 @@ export interface ScannedSignals {
    *  back, so a subagent frame — prompt-injected or buggy — must NEVER be able to force
    *  one. Absent unless the tool fired on the lead's own frame. */
   checkpoint?: boolean;
+  parkRun?: boolean;
 }
 
 /** PRD #1798 D4: one verification check the lead says it actually ran, with its outcome. */
@@ -205,6 +208,7 @@ export interface SignalServerOptions {
    *  the same discriminator as `progress` — a non-issue run has no milestone boundary to
    *  checkpoint at, so the tool is invisible to the model there rather than present. */
   checkpoint?: boolean;
+  parkRun?: boolean;
   /** issue #279: expose `report_only` on signal_done. Issue runs only — gated on the same
    *  isIssueRun discriminator as prdDonePath/milestones. A `ci_fix` run already has its own
    *  `not_code` no-MR terminal path and a `self_improve`/`prompt` run is never report-only,
@@ -570,6 +574,9 @@ export function buildSignalMcpServer(
       // acknowledges; the authoritative capture is the worker observing the tool_use in
       // scanSignals. Decision 6: this is a DURABILITY boundary, NOT a quality gate — the
       // description must not imply it verifies or tests anything.
+      ...(opts.parkRun ? [tool(PARK_RUN_TOOL,
+        "Request an owner pause when approved implementation cannot proceed until a dependency is ready. Stop and end your turn. The worker negotiates and publishes the pause.",
+        {}, async () => ({ content: [{ type: "text" as const, text: "Pause requested. Stop and end your turn." }] }))] : []),
       ...(opts.checkpoint
         ? [
             tool(
@@ -607,7 +614,8 @@ export function isSignalToolName(name: unknown): boolean {
     name === REPORT_PROGRESS_QUALIFIED ||
     // PRD #122 M6: checkpoint carries no payload and drives the fetch-back out of band,
     // so its raw tool_use is filtered from the persisted stream like the other signals.
-    name === CHECKPOINT_QUALIFIED
+    name === CHECKPOINT_QUALIFIED ||
+    name === PARK_RUN_QUALIFIED
   );
 }
 
@@ -1096,6 +1104,9 @@ export function scanSignals(message: unknown): ScannedSignals {
       // and fetches the branch back). The tool takes no arguments, so there is nothing to
       // parse: seeing the tool_use on a main-thread frame IS the signal.
       out.checkpoint = true;
+    } else if (name === PARK_RUN_QUALIFIED) {
+      const input = asRecord(block["input"]);
+      if (input && Object.keys(input).length === 0) out.parkRun = true;
     }
   }
   return out;

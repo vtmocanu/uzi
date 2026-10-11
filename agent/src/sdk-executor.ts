@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "./park-run.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "./checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
@@ -570,6 +571,7 @@ interface TurnResult {
    *  Latched (last-wins/latch within the turn, like `done`): once seen it stays set, and
    *  the loop reaps + fetches the committed milestone work back durably before continuing. */
   checkpoint?: boolean;
+  parkRun?: boolean;
   /** issue #279: the `summary` the lead passed to signal_done this turn, if any. Last-wins
    *  within the turn (like prdDonePath); persisted as report_md on a report-only completion. */
   summary?: string;
@@ -634,12 +636,13 @@ function questionMax(config: ClaimConfig | null): number {
 function answeredPrompt(
   questions: AskUserQuestion[],
   answers: string[],
+  continuation = "Continue the work with these answers.",
 ): string {
   const lines = questions.map((q, i) => {
     const a = answers[i]?.trim();
     return `Q: ${q.question}\nA: ${a && a.length > 0 ? a : "(no answer given)"}`;
   });
-  return `The human answered your question${questions.length > 1 ? "s" : ""}:\n\n${lines.join("\n\n")}\n\nContinue the work with these answers.`;
+  return `The human answered your question${questions.length > 1 ? "s" : ""}:\n\n${lines.join("\n\n")}\n\n${continuation}`;
 }
 
 /** Issue #281: normalize a turn's lead text for verbatim-repeat comparison — trim and
@@ -718,6 +721,7 @@ interface DriveState {
   subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
   preToolUse: (
     allowedSubagents: string[],
+    implementation?: boolean,
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
   isIssueRun: boolean;
   /** issue #1866 M2: the run-start environment facts (runEnvProbe), rendered into the plan
@@ -1379,6 +1383,7 @@ export class SdkExecutor implements Executor {
     const pathHook = buildPathGuardHook(ctx.worktreePath, this.log, this.secretPaths, { sdkHomeDir: this.homeDir });
     const preToolUse = (
       allowedSubagents: string[],
+      implementation = false,
     ): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
       { matcher: "Bash", hooks: [bashHook] },
       {
@@ -1394,6 +1399,13 @@ export class SdkExecutor implements Executor {
         matcher: SEND_MESSAGE_TOOL,
         hooks: [buildSendMessageAliasHook(allowedSubagents, this.log)],
       },
+      { matcher: "mcp__uzi__park_run", hooks: [async (input) => {
+        if (!parkRunEnabled(ctx, implementation ? "implement" : "plan")
+          || ("agent_id" in input && input.agent_id !== undefined)) {
+          return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: "park_run requires supported root issue implementation" } };
+        }
+        return {};
+      }] },
     ];
 
     // In-process MCP servers the LEAD (full toolset) reaches. The dep-free signal
@@ -2400,7 +2412,12 @@ export class SdkExecutor implements Executor {
           repoInstructions: repoInstructionsBlock,
           harness: "claude",
         }),
-        preToolUse: preToolUse(selectedNames),
+        preToolUse: preToolUse(selectedNames, true),
+        mcpServers: { ...baseConfig.mcpServers, [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
+          prdDonePath: isIssueRun, milestones: isIssueRun, progress: isIssueRun, checkpoint: isIssueRun,
+          reportOnly: isIssueRun, decisionsMemo: ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind)),
+          parkRun: parkRunEnabled(ctx, "implement"),
+        }) },
       };
       ctx.emit({
         kind: "status",
@@ -2543,6 +2560,7 @@ export class SdkExecutor implements Executor {
       // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
       // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
       let pausedAt: { completedCount: number; total?: number } | undefined;
+      let clarificationRounds = 0;
       // PRD #1247 M5b (data-integrity fix): latched TRUE when a held-state credential switch RELEASED
       // the claim IN PLACE (ctx.attemptCredentialSwitch → "released") from a live implement turn, an
       // ask_user question, or an interactive follow-up wait. Hoisted like pausedAt/scopeCapped so it
@@ -3024,6 +3042,84 @@ export class SdkExecutor implements Executor {
           latestProgress = turn.progress;
           for (const id of turn.progress.completed) seenCompletedIds.add(id);
         }
+        const parkAt = { completedCount: lastServedScope?.completedCount ?? latestProgress?.completed?.length ?? 0, total: (frozenMilestones ?? ctx.frozenMilestones)?.length };
+        if (turn.parkRun) {
+          if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
+          if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
+          const parkStep = await this.runThroughSwitch(ctx, state, async () => {
+            // A failure answer can itself request another pause. Each answer spends the
+            // existing question budget; no command answer is sent to the provider.
+            for (;;) {
+              const disposition = await ctx.requestParkRun!(parkAt);
+              if (disposition.kind !== "answer") return disposition;
+              budget.asked++;
+              if (budget.asked > questionMax(ctx.config ?? null)) throw new Error("clarification rounds exhausted during implementation");
+              if (!isParkAnswer(disposition)) return disposition;
+            }
+          });
+          if ("released" in parkStep) { switchReleased = true; break; }
+          const disposition = parkStep.value;
+          if (disposition.kind === "paused") { pausedAt = parkAt; break; }
+          if (disposition.kind === "cancel") throw new PlanRejectedError("run cancelled while awaiting clarification");
+          followUp = disposition.answers.join("\n") + "\n\n" + (parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : "");
+          iteration--;
+          resetStallState();
+          continue;
+        }
+        // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
+        // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
+        // human cannot trip REASON_IDLE. That property is free by construction here,
+        // not something the park has to defend.
+        //
+        // The answer is fed to the next turn as an ordinary user turn (via followUp)
+        // rather than returned as the tool's result — the lead was told to end its
+        // turn after asking, so there is no tool call still open to return into. The
+        // resumed session keeps full context, so nothing is replayed.
+        //
+        // `iteration` is deliberately NOT advanced for the answer round-trip: a
+        // clarification is not an implement/review iteration, and counting it would
+        // let a talkative lead burn the loop budget on questions. The `continue`
+        // re-enters the loop, which increments — so the decrement below keeps the
+        // clarification turn free.
+        const asked = turn.questions;
+        if (asked?.length) {
+          if (turn.checkpoint) await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
+          // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
+          // credential switch can trip while awaiting the answer (steering rejects the answer waiter
+          // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
+          // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
+          // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
+          // askUserOrContinue — keep waiting), never a terminal failure.
+          const askStep = await this.runThroughSwitch(ctx, state, () =>
+            this.askUserOrContinue(ctx, asked, budget.asked, parkAt),
+          );
+          if ("released" in askStep) {
+            switchReleased = true;
+            break;
+          }
+          const verdict = askStep.value;
+          if (verdict.runPaused) { pausedAt = parkAt; break; }
+          if (verdict.parked) {
+            budget.asked += verdict.questionsUsed ?? 1;
+            if (verdict.cancelled)
+              throw new PlanRejectedError(
+                "run cancelled while awaiting clarification",
+              );
+            followUp = verdict.followUp;
+            iteration--;
+            resetStallState(); // a clarification park is not a refusal turn → breaks the streak
+            continue;
+          }
+          // Not parked: the cap is spent, or no askUser is wired. Either way the run
+          // continues on the lead's judgment; the notice is already on the feed.
+          followUp = verdict.followUp;
+          iteration--;
+          resetStallState(); // a clarification turn is not a refusal → breaks the streak
+          continue;
+        }
+
+        clarificationRounds = 0;
         // PRD #122 M6 (Decision 10): the lead cooperatively checkpointed a completed
         // milestone. Reap + fetch-back durably, then continue — it ended its turn and will
         // be re-prompted for the next milestone. A turn that is BOTH done and checkpoint
@@ -3400,56 +3496,6 @@ export class SdkExecutor implements Executor {
         // `continue`d above). Fetch-back WITHOUT reaping — a backgrounded dev server the
         // lead means to reuse next iteration must survive (Decision 10b). Best-effort.
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
-
-        // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
-        // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
-        // human cannot trip REASON_IDLE. That property is free by construction here,
-        // not something the park has to defend.
-        //
-        // The answer is fed to the next turn as an ordinary user turn (via followUp)
-        // rather than returned as the tool's result — the lead was told to end its
-        // turn after asking, so there is no tool call still open to return into. The
-        // resumed session keeps full context, so nothing is replayed.
-        //
-        // `iteration` is deliberately NOT advanced for the answer round-trip: a
-        // clarification is not an implement/review iteration, and counting it would
-        // let a talkative lead burn the loop budget on questions. The `continue`
-        // re-enters the loop, which increments — so the decrement below keeps the
-        // clarification turn free.
-        const asked = turn.questions;
-        if (asked?.length) {
-          // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
-          // credential switch can trip while awaiting the answer (steering rejects the answer waiter
-          // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
-          // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
-          // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
-          // askUserOrContinue — keep waiting), never a terminal failure.
-          const askStep = await this.runThroughSwitch(ctx, state, () =>
-            this.askUserOrContinue(ctx, asked, budget.asked),
-          );
-          if ("released" in askStep) {
-            switchReleased = true;
-            break;
-          }
-          const verdict = askStep.value;
-          if (verdict.parked) {
-            budget.asked++;
-            if (verdict.cancelled)
-              throw new PlanRejectedError(
-                "run cancelled while awaiting clarification",
-              );
-            followUp = verdict.followUp;
-            iteration--;
-            resetStallState(); // a clarification park is not a refusal turn → breaks the streak
-            continue;
-          }
-          // Not parked: the cap is spent, or no askUser is wired. Either way the run
-          // continues on the lead's judgment; the notice is already on the feed.
-          followUp = verdict.followUp;
-          iteration--;
-          resetStallState(); // a clarification turn is not a refusal → breaks the streak
-          continue;
-        }
 
         // Issue #1800: the system text this turn carried is spent. Queued owner follow-ups are
         // pulled at the next loop top (FIFO, one per turn), immediately before the prompt that
@@ -3888,7 +3934,8 @@ export class SdkExecutor implements Executor {
     ctx: RunContext,
     questions: AskUserQuestion[],
     questionsAsked: number,
-  ): Promise<{ parked: boolean; cancelled?: boolean; followUp: string }> {
+    parkAt?: { completedCount: number; total?: number },
+  ): Promise<{ parked: boolean; runPaused?: boolean; cancelled?: boolean; questionsUsed?: number; followUp: string }> {
     const headers = questions.map((q) => q.header || q.question).join("; ");
     if (!ctx.askUser) {
       ctx.emit({
@@ -3909,7 +3956,19 @@ export class SdkExecutor implements Executor {
       });
       return { parked: false, followUp: unansweredPrompt(questions) };
     }
-    const verdict = await ctx.askUser(questions);
+    let verdict = await ctx.askUser(questions);
+    let questionsUsed = 1;
+    // Only a validated answer to an active implementation question is a command.
+    // Every failure question consumes this same bounded clarification budget.
+    for (let used = questionsAsked + 1; parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && ctx.requestParkRun; used++) {
+      if (used > cap) throw new Error("clarification rounds exhausted during implementation");
+      const disposition = await ctx.requestParkRun(parkAt);
+      if (disposition.kind === "paused") return { parked: true, runPaused: true, followUp: "" };
+      if (disposition.kind === "cancel") return { parked: true, cancelled: true, followUp: "" };
+      questionsUsed++;
+      if (questionsAsked + questionsUsed > cap) throw new Error("clarification rounds exhausted during implementation");
+      verdict = disposition;
+    }
     if (verdict.kind === "cancel")
       return { parked: true, cancelled: true, followUp: "" };
     ctx.emit({
@@ -3919,7 +3978,8 @@ export class SdkExecutor implements Executor {
     });
     return {
       parked: true,
-      followUp: answeredPrompt(questions, verdict.answers),
+      questionsUsed,
+      followUp: answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined),
     };
   }
 
@@ -4002,6 +4062,14 @@ export class SdkExecutor implements Executor {
       // the current-child sink; the adapter assembles the SdkOptions and finalizes
       // resume/abort/spawn per turn.
       this.harness.prepareTurn(turnConfig, state.currentChild);
+      if (parkRunEnabled(ctx, phase)) {
+        // buildImplementPrompt's later-turn opening must also allow dependency waiting.
+        prompt = prompt.replace(
+          /^Continue the implementation\. Address any remaining review findings, keep\niterating between your subagents until the review passes\./,
+          PARK_RUN_CONTINUATION,
+        );
+        if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
+      }
       const request: RunTurnRequest = {
         prompt,
         // The neutral fields below are carried as-is; the placeholders
@@ -4029,6 +4097,7 @@ export class SdkExecutor implements Executor {
           }
         }
         if (event.kind === "frame") {
+          if (event.signals?.parkRun && !parkRunEnabled(ctx, phase)) throw new Error("illicit park_run signal");
           for (const item of event.items) {
             if (item.kind !== "tool" || item.id === undefined) continue;
             if (item.phase === "started" && item.signal === undefined) {

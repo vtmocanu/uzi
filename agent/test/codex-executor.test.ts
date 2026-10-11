@@ -216,6 +216,7 @@ describe("M1 dependency wait characterization Codex", () => {
       } else {
         const response = leadScript.next({ continuation, advertisedTools });
         assert.ok("text" in response, "M1 baseline advertises no dependency-wait control");
+        assert.equal((advertisedTools as { name: string }[]).some((tool) => tool.name === "park_run"), false);
         c.transport.push(agentMessage(response.text));
       }
       c.transport.push(turnCompleted("completed", "th-1", tn));
@@ -15904,4 +15905,169 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
     assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
   });
+});
+
+describe("M3 dependency wait paired Codex", () => {
+  it("M3 dependency wait Codex preserves checkpoint and parks", async (t) => {
+    const leadScript = scriptedDependencyWait("identical", ({ continuation, advertisedTools }) => {
+      assert.match(continuation, /Continue if these answers give you actionable work/);
+      assert.doesNotMatch(continuation, /Continue the work with these answers\.|Continue the implementation\./);
+      assert.ok((advertisedTools as { name: string }[]).some((tool) => tool.name === "park_run"));
+      return { tool: "park_run", input: {} };
+    });
+    const parks: unknown[] = [];
+    const fixture = dependencyWaitCallbacks();
+    let advertisedTools: unknown;
+    const prompts: string[] = [];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        advertisedTools = rec(c.params).dynamicTools;
+        return { thread: { id: "th-1" } };
+      }
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount;
+      const tn = `tn-wait-${n}`;
+      const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+      prompts.push(continuation);
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        const response = leadScript.next({ continuation, advertisedTools });
+        assert.ok("tool" in response);
+        c.transport.push(toolCall(400 + n, response.tool, response.input, "th-1", tn, "park"));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeRig({ responder });
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true,
+      parkRunSupported: true, requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; } });
+    const observation = await observeDependencyWait(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+      () => ({ providerCalls: rig.transport.turnStartCount, iterations: fixture.iterations }),
+    );
+    t.diagnostic("M3_WAIT_OBSERVATION " + JSON.stringify({ harness: "codex", ...observation }));
+    expectDependencyWaitPaused(observation);
+    assert.equal(observation.providerCalls, 3);
+    assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+    assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+    assert.equal(leadScript.surfaces.length, 1);
+    assert.ok(Array.isArray(advertisedTools), "fixture sees the actual advertised dynamic tools");
+    fixture.assertPreserved();
+  });
+});
+
+describe("M3 dependency wait Codex", () => {
+  for (const direct of [false, true]) {
+    for (const supported of direct ? [false, true] : [true]) {
+      it(`parks ${direct ? "exact /park without provider" : "negotiated prose"} support=${supported} at max1`, async () => {
+        let advertisedTools: unknown;
+        const script = scriptedDependencyWait("identical", ({ continuation, advertisedTools: tools }) => {
+          assert.match(continuation, /actionable work/);
+          assert.ok((tools as { name: string }[]).some((tool) => tool.name === "park_run"));
+          return { tool: "park_run", input: {} };
+        });
+        const responder: Responder = (c) => {
+          if (c.method === "thread/start") { advertisedTools = rec(c.params).dynamicTools; return { thread: { id: "th-1" } }; }
+          if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          const n = c.turnStartCount, tn = `tn-park-${n}`;
+          if (n === 1) {
+            c.transport.push(toolCall(101, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+            c.transport.push(toolCall(102, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+          } else {
+            const continuation = (c.params as { input: { text: string }[] }).input[0]!.text;
+            const response = script.next({ continuation, advertisedTools });
+            assert.ok("tool" in response);
+            c.transport.push(toolCall(103, response.tool, response.input, "th-1", tn, "park"));
+            c.transport.push(toolCall(104, "signal_done", {}, "th-1", tn, "done"));
+          }
+          c.transport.push(turnCompleted("completed", "th-1", tn));
+          return { turn: { id: tn } };
+        };
+        const rig = makeRig({ responder });
+        const parks: unknown[] = [];
+        const { ctx } = makeCtx({ kind: "issue", parkRunSupported: supported, config: { max_iterations: 1 },
+          frozenMilestones: [{ id: "m1", title: "Independent" }, { id: "m2", title: "Dependency" }],
+          askUser: async () => ({ kind: "answer", answers: [direct ? "/park" : dependencyWaitAnswer] }),
+          requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; },
+          recordCompletionAttempt: async () => assert.fail("park precedes completion"), completionInterlock: true,
+        });
+        const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        assert.deepEqual(result.pausedAt, { completedCount: 1, total: 2 });
+        assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+        assert.equal(rig.transport.turnStartCount, direct ? 1 : 2);
+      });
+    }
+  }
+  for (const disposition of ["answer", "cancel"] as const) {
+    it(`handles park failure-question ${disposition} at max1`, async () => {
+      const prompts: string[] = [];
+      const rig = makeRig({ responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        prompts.push((c.params as { input: { text: string }[] }).input[0]!.text);
+        const tn = `tn-failure-${c.turnStartCount}`;
+        c.transport.push(toolCall(200 + c.turnStartCount, c.turnStartCount === 1 ? "park_run" : "signal_done", {}, "th-1", tn, "control"));
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      } });
+      const { ctx } = makeCtx({ parkRunSupported: true, config: { max_iterations: 1 },
+        requestParkRun: async () => disposition === "cancel" ? { kind: "cancel" } : { kind: "answer", answers: ["Implement the independent slice now"] },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (disposition === "cancel") await assert.rejects(run, /cancel/);
+      else {
+        assert.equal((await run).pausedAt, undefined);
+        assert.match(prompts[1]!, /Implement the independent slice now/);
+      }
+      assert.equal(rig.transport.turnStartCount, disposition === "cancel" ? 1 : 2);
+    });
+  }
+});
+
+describe("M3 Codex bounded park controls", () => {
+  it("bounds repeated failure-question /park answers without another provider turn", async () => {
+    let parks = 0;
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      c.transport.push(toolCall(401, "ask_user", { questions: [{ question: "Ready?" }] }, "th-1", "tn-1", "ask"));
+      c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
+      return { turn: { id: "tn-1" } };
+    } });
+    const { ctx } = makeCtx({ parkRunSupported: false, config: { max_iterations: 1, question_max: 2 },
+      askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+      requestParkRun: async () => { parks++; return { kind: "answer", answers: ["/park"] }; } });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /clarification rounds exhausted/);
+    assert.equal(parks, 2);
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } }]) {
+    it(`does not advertise or admit illicit park ${JSON.stringify(overrides)}`, async () => {
+      let parks = 0;
+      const rig = makeRig({ responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") {
+          const tools = rec(c.params).dynamicTools as { name: string }[];
+          if (tools) assert.equal(tools.some((tool) => tool.name === "park_run"), false);
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method !== "turn/start") return {};
+        c.transport.push(toolCall(501, "park_run", {}, "th-1", "tn-1", "park"));
+        c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      } });
+      const { ctx } = makeCtx({ parkRunSupported: true, config: { max_iterations: 1 },
+        requestParkRun: async () => { parks++; return { kind: "paused" }; }, ...overrides });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx));
+      assert.equal(parks, 0);
+      const response = rig.transport.responses.find((r) => r.requestId === 501);
+      assert.ok(response, "the illicit tool received a reply");
+      assert.equal(rec(rec(response.response).result).success, false);
+    });
+  }
 });

@@ -765,3 +765,18 @@ describe("renderCodexRun — diagnostic name sanitization", () => {
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "r", "Frobnicate-XYZ"), true);
   });
 });
+
+describe("M3 park_run advertisement", () => {
+  for (const phase of ["plan", "implement"] as const) {
+    for (const supported of [undefined, false, true]) {
+      for (const eligible of [false, true]) {
+        it(`phase=${phase} support=${supported} eligible=${eligible}`, () => {
+          const run = renderCodexRun(runRequest({ phase, parkRunSupported: supported, nonInteractiveIssue: eligible,
+            agents: { child: agent({ tools: allow(["mcp__uzi__park_run"]) }) } }));
+          assert.equal(run.leadGrants.allowedTools.has("park_run"), phase === "implement" && supported === true && eligible);
+          assert.equal(grantFor(run, "child").allowedTools.has("park_run"), false);
+        });
+      }
+    }
+  }
+});
