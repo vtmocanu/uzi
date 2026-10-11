@@ -97,6 +97,8 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 			http.Error(w, "read pack", http.StatusBadRequest)
 			return
 		}
+		// Simplified production mapping: ErrTipMissing, ErrPackTooLarge and ErrPackInvalid are 500 here
+		// but 200 skips in production; AlreadyCurrent ownership and the slot retry are not modelled.
 		_, err = pushbroker.Publish(r.Context(), pushbroker.Options{
 			CloneURL: f.cloneURL(), Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
 		})
@@ -140,10 +142,11 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, node, "--import", "tsx", "test/fixtures/checkpoint-chain-bridge.ts") //nolint:gosec // G204: node resolved by LookPath and a fixed repository fixture path; no shell, no external input.
+	cmd := exec.CommandContext(ctx, node, "--import", "tsx", "test/fixtures/checkpoint-chain-bridge.ts")
 	cmd.Dir = filepath.Join(root, "agent")
+	cmd.WaitDelay = 10 * time.Second
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "NODE_TEST_CONTEXT=") {
 			cmd.Env = append(cmd.Env, kv)
@@ -164,9 +167,15 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
 	}
 	var summary struct {
-		Overlay    string `json:"overlay"`
-		OverlayRef string `json:"overlayRef"`
-		RawTip     string `json:"rawTip"`
+		Overlay     string   `json:"overlay"`
+		OverlayRef  string   `json:"overlayRef"`
+		RawTip      string   `json:"rawTip"`
+		TickOutcome string   `json:"tickOutcome"`
+		Tips        []string `json:"tips"`
+		Results     []struct {
+			OK         bool `json:"ok"`
+			HTTPStatus int  `json:"httpStatus"`
+		} `json:"results"`
 	}
 	found := false
 	for _, line := range strings.Split(stdout.String(), "\n") {
@@ -190,12 +199,31 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		t.Fatalf("overlay subject = %q, want a ckpt(overlay): commit", subject)
 	}
 
+	if len(publishes) != 2 {
+		t.Fatalf("publishes = %d, want 2 (overlay, then the chained checkpoint)\n%s", len(publishes), describe())
+	}
+	if len(summary.Tips) != 2 || publishes[0].tip != summary.Tips[0] || publishes[1].tip != summary.Tips[1] {
+		t.Fatalf("Go-recorded tips %v != fixture-reported tips %v\n%s", []string{publishes[0].tip, publishes[1].tip}, summary.Tips, describe())
+	}
+	if boundary == "tick" && summary.TickOutcome != "published" {
+		t.Fatalf("tick outcome = %q, want published\n%s", summary.TickOutcome, describe())
+	}
+	if lostAck {
+		// The agent must actually have seen the overlay publish fail after it landed.
+		if len(summary.Results) < 1 || summary.Results[0].OK || summary.Results[0].HTTPStatus != http.StatusInternalServerError {
+			t.Fatalf("lost-ack: results[0] = %+v, want {ok:false httpStatus:500}\n%s", summary.Results, describe())
+		}
+	}
+
 	for _, p := range publishes {
 		if p.skipped != "" || p.err != "" {
 			t.Fatalf("a publish was not accepted (tip %s skipped=%q err=%q)\n%s", p.tip, p.skipped, p.err, describe())
 		}
 	}
 	final := f.originRef(ref)
+	if publishes[1].tip != final {
+		t.Fatalf("second publish tip %s != final ref %s\n%s", publishes[1].tip, final, describe())
+	}
 	if final == summary.Overlay {
 		t.Fatalf("the checkpoint ref never advanced past the overlay %s\n%s", summary.Overlay, describe())
 	}

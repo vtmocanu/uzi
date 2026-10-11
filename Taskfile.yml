@@ -2484,7 +2484,7 @@ tasks:
 
   # ----------------------------------------------------------- agent (npm) ----
   test:codex-refresh-lostreply-e2e:
-    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker)
+    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker), plus the checkpoint chain bridge
     preconditions:
       - sh: '[ "$(uname -s)" = Linux ]'
         msg: 'test:codex-refresh-lostreply-e2e is Linux-only; requires the Linux-only session-copy fixture'
@@ -2498,21 +2498,24 @@ tasks:
           (cd agent && npm ci --ignore-scripts)
           task deps-check:agent
         fi
-      - |
-        mkdir -p .uzi/scratch
-        UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
       # Issue #2733: the agent<->broker checkpoint chain bridge rides this target on purpose.
       # `test-codex-refresh-lostreply-e2e` is the only CI job that has Go, Node AND the agent's
       # installed dependencies, and `.github/workflows` is deliberately untouched (the worker PAT
-      # cannot push it), so calling it here is the wiring. The agent deps check above has
-      # already run, and the bridge needs no database.
+      # cannot push it), so calling it here is the wiring. It runs right after the deps check and
+      # before the Postgres-backed step: the bridge needs no database, so a Docker or Postgres
+      # flake cannot skip it.
       - task: test:checkpoint-chain-bridge
+      - |
+        mkdir -p .uzi/scratch
+        UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
 
   test:checkpoint-chain-bridge:
     desc: real agent RunRunner checkpoint chain through the real pushbroker.Publish (needs Node and agent deps)
     preconditions:
-      - sh: command -v node
-        msg: 'test:checkpoint-chain-bridge requires Node (the agent fixture runs under tsx)'
+      - sh: command -v node && node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+        msg: 'test:checkpoint-chain-bridge requires Node 24 or newer (the agent fixture runs under tsx)'
+      - sh: command -v go
+        msg: 'test:checkpoint-chain-bridge requires Go (the bridge is a Go test)'
     cmds:
       - |
         if ! task deps-check:agent; then

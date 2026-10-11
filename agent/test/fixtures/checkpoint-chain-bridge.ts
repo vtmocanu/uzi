@@ -78,11 +78,10 @@ const results: unknown[] = [];
 // Fake clock + tick timer, as control() in test/runner-midturn-checkpoint.test.ts.
 let fakeNow = 0;
 let tickCb: (() => void) | undefined;
-let outcomes: string[] = [];
 let outcomeWaiter: ((o: string) => void) | undefined;
 const hooks: NonNullable<RunnerOptions["checkpointTestHooks"]> = {
   tickKillGraceMs: 300,
-  onTickOutcome: (o) => { outcomes.push(o); outcomeWaiter?.(o); },
+  onTickOutcome: (o) => { outcomeWaiter?.(o); },
 };
 async function fireTick(): Promise<string> {
   assert.ok(tickCb, "the tick timer is armed");
