@@ -1312,10 +1312,11 @@ func (s *Service) runExtensionCap(ctx context.Context) (int, error) {
 }
 
 // baseWallUpperSeconds is the service-side upper bound on the wall a run can still be scaled to
-// (the immutable-column fallback and the scaling ceiling): max(RunTimeout, RunWallCeiling), in
-// seconds. The extend predicates take GREATEST of it and the persisted budget_wall_seconds.
+// (the immutable-column fallback and the scaling ceiling): max(RunTimeout, RunWallCeiling,
+// MaxRunWallCeiling), in seconds. The extend predicates take GREATEST of it and the persisted
+// budget_wall_seconds.
 func (s *Service) baseWallUpperSeconds() int32 {
-	return budgetDurationSeconds(max(s.p.RunTimeout, s.p.RunWallCeiling))
+	return budgetDurationSeconds(max(s.p.RunTimeout, s.p.RunWallCeiling, MaxRunWallCeiling))
 }
 
 // extensionRoom is ExtensionRoomSeconds for a loaded run row under this service's config.
@@ -1335,11 +1336,15 @@ func (s *Service) extendRefusal(run store.Run, secs, capSeconds int) error {
 //	room = MaxRunWallSeconds - wallUpper - finalizeUpper - extension, clamped at 0
 //
 // wallUpper is the largest wall the run may be served: max(persisted budget_wall_seconds when set,
-// runTimeout, wallCeiling) - a NULL-wall run can still be scaled up to the ceiling at plan approval,
-// and the room is reserved for that. finalizeUpper is max(finalize, WallParkFinalizeSeconds): the
-// one-time Stop allowance is reserved before it is granted. Pure; the SQL is authoritative.
+// runTimeout, wallCeiling, MaxRunWallCeiling) - a NULL-wall run can still be scaled up to the
+// ceiling at plan approval, and an operator may later raise RUN_WALL_CEILING (to at most
+// MaxRunWallCeiling), so the room reserves the larger of the frozen wall and that maximum for every
+// run, rather than the current setting. The only uncovered case is RUN_TIMEOUT raised above
+// MaxRunWallCeiling later for a run with no frozen wall. finalizeUpper is max(finalize,
+// WallParkFinalizeSeconds): the one-time Stop allowance is reserved before it is granted. Pure;
+// the SQL is authoritative.
 func ExtensionRoomSeconds(wall pgtype.Int4, ext, finalize int32, runTimeout, wallCeiling time.Duration) int {
-	wallUpper := int(budgetDurationSeconds(max(runTimeout, wallCeiling)))
+	wallUpper := int(budgetDurationSeconds(max(runTimeout, wallCeiling, MaxRunWallCeiling)))
 	if wall.Valid {
 		wallUpper = max(wallUpper, int(wall.Int32))
 	}

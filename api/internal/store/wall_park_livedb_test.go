@@ -447,7 +447,7 @@ func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 	})
 
 	t.Run("room fencepost: exactly filling the room applies, +60 is refused and writes nothing", func(t *testing.T) {
-		// 3600s of room left: 2059283 (fresh room for a small wall under the test params) - 3600 used.
+		// 3600s of room left: 1886483 (fresh room for a small wall under the test params) - 3600 used.
 		const used = extendTestFreshRoom - 3600
 		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600),
 			budgetExtension: used, startedAgo: 2 * time.Hour})

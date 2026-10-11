@@ -107,12 +107,13 @@ func TestExtendThenApproveScaledWallStaysInTimerRangeLiveDB(t *testing.T) {
 		'[{"id":"a","title":"A"},{"id":"b","title":"B"},{"id":"c","title":"C"},{"id":"d","title":"D"},{"id":"e","title":"E"},{"id":"f","title":"F"}]'::jsonb,1)`,
 		id, f.userID, f.repoID, f.worker)
 
-	// testParams: RunTimeout 2h, RunWallCeiling 8h. Room = 2147483 - 28800 - 1800 = 2116883 =
-	// 3 x 604800 + 302483. The first extend of the full cap leaves the run NULL-walled.
+	// testParams: RunTimeout 2h, RunWallCeiling 8h. The room reserves the 72h maximum ceiling:
+	// 2147483 - 259200 - 1800 = 1886483 = 3 x 604800 + 72083. The first extend of the full cap
+	// leaves the run NULL-walled.
 	f.mustExtend(t, id, "604800")
 	f.mustExtend(t, id, "604800")
 	f.mustExtend(t, id, "604800")
-	f.mustExtend(t, id, "302483")
+	f.mustExtend(t, id, "72083")
 	if _, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "60", nil); !errors.Is(err, ErrExtensionLimitReached) {
 		t.Fatalf("extend past the room err = %v, want ErrExtensionLimitReached", err)
 	}
@@ -129,7 +130,7 @@ func TestExtendThenApproveScaledWallStaysInTimerRangeLiveDB(t *testing.T) {
 	}
 	served := f.servedWallSeconds(t, id)
 	assertTimerInRange(t, served)
-	if want := 28800 + 2116883; served != want {
+	if want := 28800 + 1886483; served != want {
 		t.Fatalf("served = %d, want %d (scaled wall + extension)", served, want)
 	}
 }
@@ -139,9 +140,9 @@ func TestExtendThenApproveScaledWallStaysInTimerRangeLiveDB(t *testing.T) {
 func TestExtendFillThenWallParkStopStaysInTimerRangeLiveDB(t *testing.T) {
 	f := newWallParkExtendFixture(t, 604800)
 	f.sealClaimSecrets(t)
-	// Wall 3600 (fixture), RunTimeout 2h / ceiling 8h: room = 2116883. Seed 3 x 604800 already granted.
+	// Wall 3600 (fixture), RunTimeout 2h / ceiling 8h: room = 1886483. Seed 3 x 604800 already granted.
 	id := f.wallPark(t, 3*604800)
-	f.mustExtend(t, id, "302483") // exactly fills the room; resumes the run
+	f.mustExtend(t, id, "72083") // exactly fills the room; resumes the run
 	f.repark(t, id)
 	if _, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "60", nil); !errors.Is(err, ErrExtensionLimitReached) {
 		t.Fatalf("extend past the room err = %v, want ErrExtensionLimitReached", err)
@@ -149,7 +150,7 @@ func TestExtendFillThenWallParkStopStaysInTimerRangeLiveDB(t *testing.T) {
 
 	served := f.stopAndServe(t, id)
 	assertTimerInRange(t, served)
-	if want := 3600 + 2116883 + 1800; served != want {
+	if want := 3600 + 1886483 + 1800; served != want {
 		t.Fatalf("served = %d, want %d (wall + extension + finalize)", served, want)
 	}
 }
@@ -182,5 +183,70 @@ func TestPersistedWallAboveCeilingRoomAndStopLiveDB(t *testing.T) {
 	assertTimerInRange(t, served)
 	if want := 259200 + 1886483 + 1800; served != want || want != MaxRunWallSeconds {
 		t.Fatalf("served = %d, want %d == MaxRunWallSeconds %d", served, want, MaxRunWallSeconds)
+	}
+}
+
+// Issue #2735 review finding: a NULL-wall run is extended to fill its room under a 8h ceiling,
+// then the operator raises RUN_WALL_CEILING (to the 72h maximum) before the plan freezes its wall.
+// The room reserved MaxRunWallCeiling up front, so the larger scaled wall still fits the timer
+// whichever approval path freezes it: the owner's approve_plan input, or an autopilot run's own
+// self-contained running report.
+func TestExtendThenCeilingRaisedThenApproveStaysInTimerRangeLiveDB(t *testing.T) {
+	const sixMilestones = `[{"id":"a","title":"A"},{"id":"b","title":"B"},{"id":"c","title":"C"},{"id":"d","title":"D"},{"id":"e","title":"E"},{"id":"f","title":"F"}]`
+	for _, path := range []string{"approve_plan", "autopilot_running_report"} {
+		t.Run(path, func(t *testing.T) {
+			f := newWallParkExtendFixture(t, 604800)
+			f.sealClaimSecrets(t)
+			f.svc.SetTxBeginner(f.env.pool)
+			f.svc.SetBackground(func(func()) {})
+			id := uuid.New()
+			if path == "approve_plan" {
+				f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id,
+					milestones_candidate, claim_generation)
+					VALUES ($1,$2,$3,'issue',1,'t','d','awaiting_approval',$4,$5::jsonb,1)`, id, f.userID, f.repoID, f.worker, sixMilestones)
+			} else {
+				f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id,
+					auto_approve, plan_source, milestones_candidate, claim_generation, started_at)
+					VALUES ($1,$2,$3,'issue',1,'t','d','running',$4,true,'agent',$5::jsonb,1,now())`, id, f.userID, f.repoID, f.worker, sixMilestones)
+			}
+
+			// testParams: RunTimeout 2h, ceiling 8h; the reserved room is 1886483 s.
+			f.mustExtend(t, id, "604800")
+			f.mustExtend(t, id, "604800")
+			f.mustExtend(t, id, "604800")
+			f.mustExtend(t, id, "72083")
+			if _, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "60", nil); !errors.Is(err, ErrExtensionLimitReached) {
+				t.Fatalf("extend past the room err = %v, want ErrExtensionLimitReached", err)
+			}
+			if run := mustRun(t, f.env, id); run.BudgetWallSeconds.Valid {
+				t.Fatalf("wall = %v before the freeze, want NULL (the case under test)", run.BudgetWallSeconds)
+			}
+
+			// The operator raises only RUN_WALL_CEILING (72h is its validated maximum) and restarts.
+			f.svc.p.RunWallCeiling = 72 * time.Hour
+			if _, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "60", nil); !errors.Is(err, ErrExtensionLimitReached) {
+				t.Fatalf("extend after the ceiling raise err = %v, want ErrExtensionLimitReached (room already reserved 72h)", err)
+			}
+
+			if path == "approve_plan" {
+				if _, err := f.svc.SubmitInputWithOptions(f.env.ctx, f.userID, id, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}, SubmitInputOptions{}); err != nil {
+					t.Fatalf("approve_plan: %v", err)
+				}
+			} else {
+				gen := int64(1)
+				if _, applied, err := f.svc.SetState(f.env.ctx, store.Worker{ID: f.worker, UserID: f.userID}, id, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
+					t.Fatalf("running report applied=%v err=%v", applied, err)
+				}
+			}
+			run := mustRun(t, f.env, id)
+			if !run.BudgetWallSeconds.Valid || run.BudgetWallSeconds.Int32 != 43200 {
+				t.Fatalf("wall after the freeze = %v, want 43200 (2h x 6 milestones, under the raised 72h ceiling)", run.BudgetWallSeconds)
+			}
+			served := f.servedWallSeconds(t, id)
+			assertTimerInRange(t, served)
+			if want := 43200 + 1886483; served != want {
+				t.Fatalf("served = %d, want %d (scaled wall + extension)", served, want)
+			}
+		})
 	}
 }

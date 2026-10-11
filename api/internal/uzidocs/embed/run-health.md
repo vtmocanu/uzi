@@ -135,19 +135,21 @@ settings](admin-settings.md#run-health) for that setting.
 
 ### How much time a run can have in total
 
-A run's total wall-clock budget can never exceed 2147483 seconds (24d 20h
+A run's total wall-clock budget is held to 2147483 seconds (24d 20h
 31m 23s), the worker's timer limit. The room left for extensions is that
 limit, minus the larger of the run's frozen wall budget
-(`budget_wall_seconds`), `RUN_TIMEOUT` and `RUN_WALL_CEILING`, minus the
-30-minute finalize allowance that Stop grants (or the larger finalize
-allowance already granted), minus what is already extended. A request past
-that room is refused with a 409 naming the limit and the room left. With the
-shipped defaults (`RUN_TIMEOUT` 6h, derived `RUN_WALL_CEILING` 24h) that is
-about 23d 20h (2059283 s) of total extension; an instance configured with a
-72h `RUN_WALL_CEILING`, or a run frozen with a 72h wall, gets about 21d 20h
-(1886483 s). The room is computed from the current `RUN_TIMEOUT` and
-`RUN_WALL_CEILING`; an operator who raises `RUN_TIMEOUT` later is not covered
-for a run that has no frozen wall yet. Chat, judge and interactive-task runs
+(`budget_wall_seconds`), `RUN_TIMEOUT`, `RUN_WALL_CEILING` and 72h (the largest
+`RUN_WALL_CEILING` the configuration accepts), minus the 30-minute finalize
+allowance that Stop grants (or the larger finalize allowance already granted),
+minus what is already extended. A request past that room is refused with a 409
+naming the limit and the room left. Because the room reserves the larger of
+the run's frozen wall and 72h (the maximum `RUN_WALL_CEILING`) for every run,
+a run with no frozen wall included (plan approval can still scale it up to
+the ceiling), it is about 21d 20h (1886483 s) of total extension under any
+validated configuration (`RUN_TIMEOUT` of 72h or less), and a later change to
+`RUN_WALL_CEILING` cannot take a run past the limit. The one uncovered case is an
+operator raising `RUN_TIMEOUT` above 72h later for a run that has no frozen wall
+yet. Chat, judge and interactive-task runs
 never time out, so extending one is refused, and a job is never extended.
 
 ## Running out of time

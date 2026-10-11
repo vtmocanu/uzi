@@ -338,12 +338,12 @@ func TestNotifierSlowNudgeExtendFitsTotalRoom(t *testing.T) {
 		n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: healthSlow, reason: "", nudge: true})
 		return fp, rc.ID.String()
 	}
-	// Room = 2147483 - 28800 (8h wall/ceiling) - 1800 - ext; ext leaving 1800s of room -> 30m.
-	fp, id := room(2147483 - 28800 - 1800 - 1800)
+	// Room = 2147483 - 259200 (the 72h maximum ceiling) - 1800 - ext; ext leaving 1800s of room -> 30m.
+	fp, id := room(2147483 - 259200 - 1800 - 1800)
 	if len(fp.blocks) != 1 || !strings.Contains(fp.blocks[0].contextText, "uzi run extend "+id+" --by 30m") {
 		t.Fatalf("want a 30m fitted command, got %+v", fp.blocks)
 	}
-	fp, _ = room(2147483 - 28800 - 1800)
+	fp, _ = room(2147483 - 259200 - 1800)
 	if len(fp.blocks) != 1 || strings.Contains(fp.blocks[0].contextText, "uzi run extend") {
 		t.Fatalf("no room left: want no extend command, got %+v", fp.blocks)
 	}

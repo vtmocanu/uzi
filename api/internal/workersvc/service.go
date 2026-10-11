@@ -2213,6 +2213,13 @@ const defaultClaimGrace = 5 * time.Minute
 // must satisfy total*1000 <= math.MaxInt32 (about 24.8 days). Every extend path enforces it.
 const MaxRunWallSeconds = math.MaxInt32 / 1000
 
+// MaxRunWallCeiling is the largest RUN_WALL_CEILING the configuration can ever have: the
+// config.Load validator refuses an explicit value above it, and the derived default is capped at
+// it. The extend bound reserves max(frozen wall, it) for every run, because plan approval can
+// scale a NULL wall up to a ceiling raised after the extension was granted.
+// TestMaxRunWallCeilingMatchesConfigValidator keeps it equal to that validator's bound.
+const MaxRunWallCeiling = 72 * time.Hour
+
 // WallParkFinalizeSeconds is the one-time finalize allowance StopWallPark grants (SQL literal
 // budget_finalize_seconds = 1800). The extend bound reserves it so a later Stop cannot push the
 // served total past MaxRunWallSeconds; a LiveDB test pins it against the SQL.

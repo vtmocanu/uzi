@@ -147,12 +147,12 @@ func TestExtendBoundGoHelperAgreesWithSQLLiveDB(t *testing.T) {
 		ext, finalize int32
 		room          int32
 	}{
-		{"NULL wall", nil, 2054283, 0, 5000},
-		{"small persisted wall", i32(28800), 2054283, 0, 5000},
-		{"persisted wall above the config upper (72h)", i32(259200), 1881483, 0, 5000},
-		{"finalize allowance already granted (reserve equal)", i32(3600), 2054283, 1800, 5000},
-		{"finalize above the reserve", i32(3600), 2048883, 7200, 5000},
-		{"no room left", i32(3600), 2059283, 0, 0},
+		{"NULL wall", nil, 1881483, 0, 5000},
+		{"small persisted wall", i32(28800), 1881483, 0, 5000},
+		{"persisted wall at the 72h maximum ceiling", i32(259200), 1881483, 0, 5000},
+		{"finalize allowance already granted (reserve equal)", i32(3600), 1881483, 1800, 5000},
+		{"finalize above the reserve", i32(3600), 1876083, 7200, 5000},
+		{"no room left", i32(3600), 1886483, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wall := pgtype.Int4{}
@@ -196,7 +196,7 @@ func TestCreateExtendInputConcurrentNearBoundLiveDB(t *testing.T) {
 	fx := extendBoundFixture{ctx, pool, q, userID, repoID}
 	for round := 0; round < 5; round++ {
 		// 5000s of room; two requests of 3000s.
-		runID := seedBoundRun(t, fx, nil, 2054283, 0)
+		runID := seedBoundRun(t, fx, nil, 1881483, 0)
 		var wg sync.WaitGroup
 		start := make(chan struct{})
 		errs := make([]error, 2)
@@ -224,8 +224,8 @@ func TestCreateExtendInputConcurrentNearBoundLiveDB(t *testing.T) {
 		if applied != 1 || refused != 1 {
 			t.Fatalf("round %d: applied=%d refused=%d, want exactly one of each", round, applied, refused)
 		}
-		if got := extendColumn(ctx, t, pool, runID); got != 2054283+3000 {
-			t.Fatalf("round %d: column = %d, want %d", round, got, 2054283+3000)
+		if got := extendColumn(ctx, t, pool, runID); got != 1881483+3000 {
+			t.Fatalf("round %d: column = %d, want %d", round, got, 1881483+3000)
 		}
 		if n := len(extendAuditRows(ctx, t, pool, runID)); n != 1 {
 			t.Fatalf("round %d: audit rows = %d, want 1", round, n)

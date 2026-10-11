@@ -162,8 +162,8 @@ func TestWallParkExtendOverCapRequestRefusedLiveDB(t *testing.T) {
 // technical total-time bound is ErrExtensionLimitReached, and the run is still parked. The same
 // refusal comes from the statement (not only the pre-check) when the caller's snapshot is stale.
 func TestWallParkExtendOverRoomRefusedLiveDB(t *testing.T) {
-	// testParams: RunTimeout 2h, RunWallCeiling 8h -> wall upper 28800, room = 2147483 - 28800 - 1800 - ext.
-	const used = 2147483 - 28800 - 1800 - 3600 // 3600s of room left
+	// testParams: RunTimeout 2h, RunWallCeiling 8h -> wall upper 259200 (72h maximum ceiling), room = 2147483 - 259200 - 1800 - ext.
+	const used = 2147483 - 259200 - 1800 - 3600 // 3600s of room left
 	f := newWallParkExtendFixture(t, 604800)
 	id := f.wallPark(t, used)
 	before := mustRun(t, f.env, id)
