@@ -351,16 +351,17 @@ older `CLAUDE.md`, or none if the file did not exist then.
 The worker deletes its local snapshot ref once the checker has settled. After
 a restart, a boot sweep deletes a leftover ref only on positive server
 evidence that matches the lead run id, the lead's claim generation and the
-head. When the server has no check row for the lead, the sweep deletes the ref
-only if it was never read and the lead is finished or not held by that
-worker. On any doubt the ref is kept.
+head. For every candidate the lead must also be finished or not held by that
+worker, and a ref with an open local reader is kept. When the server has no
+check row for the lead, the sweep deletes the ref only if it was also never
+read. On any doubt the ref is kept.
 
 ### Rolling out Code cross-check
 
 Deploy the api and its migrations (00322 to 00325) before any worker that
 advertises `cross_check_code_v1`. A worker advertises it only with a
 cross-check lane (`WORKER_CROSS_CHECK_SLOTS` above zero) and the Codex
-harness. Each migration's Down is destructive for code evidence: 00322 deletes
+harness. The Downs of 00322, 00323 and 00325 delete data: 00322 deletes
 the code-stage checks and their checker runs and drops the new columns,
-00323 deletes your Code pins, and 00325 drops the per-repository guidance
-columns. Run a Down only with the new api stopped.
+00323 deletes your Code pins settings, and 00325 drops the per-repository guidance
+columns. The Down of 00324 deletes nothing (it only restores two functions). Run a Down only with the new api stopped.

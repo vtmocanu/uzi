@@ -2412,7 +2412,7 @@ uzi settings get
 uzi settings get --json
 ```
 
-The human table shows the two Plan cross-check cells: stage, harness,
+The human table shows the Plan and Code cross-check cells: stage, harness,
 active/inactive status, stored model and effort, worker default model,
 resolved model and effort, and each resolved field's source. Stored null
 fields show `Default`; explicit choices show `Pin · value`. Both
@@ -2481,7 +2481,9 @@ unavailable` / `Incomplete · outcome unavailable` when no summary is stored.
 The rows after it, all prefixed `CODE_CHECK_`, are `REASON` (the reason class
 with underscores shown as spaces), `CHECKED_SHA`, `CHECKER_ID`, `FAMILY`,
 `MODEL`, `EFFORT`, `COST` and, when owner guidance applied, `GUIDANCE`
-(`custom guidance applied (sha256 <12 hex>)`). `DISPOSITIONS` reads `Pending
+(`custom guidance applied (sha256 <12 hex>)`). `FINDINGS` reads `Findings
+unavailable` when the stored findings cannot be read (the dispositions then
+read `Dispositions unavailable`) or `No findings recorded` for an empty list. `DISPOSITIONS` reads `Pending
 report`, `Finalized` or `Dispositions unavailable`; once finalized on a
 completed check, `COUNTS` reads `N addressed, N declined, N not reported`.
 Each finding adds `_ID`, `_SEVERITY`, `_PATH`, `_TITLE` and `_DETAIL` rows
