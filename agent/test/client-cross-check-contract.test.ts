@@ -7,8 +7,9 @@ import { nullLogger, makeClaim } from "./helpers.js";
 it("cleanup metadata rejects ordinary ownership and nonexact identities", async (t) => {
   const lead = "11111111-1111-4111-8111-111111111111";
   const valid = { protocol: "code_snapshot_cleanup_v1", lead_run_id: lead,
-    head_commit: "a".repeat(40), outcome: "completed", lead_status: "running",
-    owned_by_worker: true, checker_run_id: "22222222-2222-4222-8222-222222222222",
+    lead_status: "running", owned_by_worker: true, row_present: true, lead_claim_generation: 3,
+    head_commit: "a".repeat(40), outcome: "completed", child_present: true,
+    checker_run_id: "22222222-2222-4222-8222-222222222222",
     checker_claim_generation: 1, checker_status: "completed" };
   t.mock.method(globalThis, "fetch", async (url: Parameters<typeof fetch>[0]) => {
     assert.match(String(url), /ownership\?purpose=code_snapshot/);
@@ -17,7 +18,9 @@ it("cleanup metadata rejects ordinary ownership and nonexact identities", async 
   assert.deepEqual(await client().getCodeSnapshotCleanup(lead), valid);
   for (const body of [{ status: "completed", claim_generation: 1 },
     { ...valid, extra: true }, { ...valid, head_commit: valid.head_commit + "\\n" },
-    { ...valid, checker_claim_generation: 0 }]) {
+    { ...valid, checker_claim_generation: -1 }, { ...valid, lead_claim_generation: 0 },
+    { ...valid, lead_claim_generation: undefined }, { ...valid, child_present: false },
+    { ...valid, row_present: false }]) {
     t.mock.method(globalThis, "fetch", async () => Response.json(body));
     await assert.rejects(client().getCodeSnapshotCleanup(lead), /invalid code snapshot cleanup/);
   }

@@ -1218,6 +1218,20 @@ function renderKindSectionLine(line: KindSectionLine): string {
   return renderFixedLine(line.fixed);
 }
 
+/** Fixed wording for every `reason_class` a failed code cross-check row can carry (the
+ *  cross_checks_reason_class_check allowlist for stage 'code'); anything else is escaped raw. */
+const CODE_CROSS_CHECK_REASON_PROSE: ReadonlyMap<string, string> = new Map([
+  ["worker_unsupported", "worker unsupported"],
+  ["snapshot_failed", "snapshot failed"],
+  ["malformed", "checker output malformed"],
+  ["model_error", "checker model error"],
+  ["model_timeout", "checker model timed out"],
+  ["checker_unavailable", "no local checker"],
+  ["confinement_failed", "checker confinement failed"],
+  ["timed_out", "timed out"],
+  ["superseded", "superseded by a later change"],
+]);
+
 /** Code data occupies escaped value slots only; the 4 KiB budget drops finding lines first. */
 function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").CodeCrossCheckSummary): string {
   const value = (s: string | null | undefined, cap = 256): string => {
@@ -1233,7 +1247,10 @@ function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").Code
   };
   if ("incomplete" in summary) return `Code cross-check incomplete: ${value(summary.incomplete)}`;
   if (summary.interrupted_at !== null || summary.reason_class === "interrupted") return "Code cross-check incomplete: interrupted";
-  if (summary.outcome !== "completed") return `Code cross-check incomplete: ${value(summary.reason_class ?? "not finished")}`;
+  if (summary.outcome !== "completed") {
+    const reason = summary.reason_class;
+    return `Code cross-check incomplete: ${reason === null ? "not finished" : CODE_CROSS_CHECK_REASON_PROSE.get(reason) ?? value(reason)}`;
+  }
   if (!summary.head_commit || !summary.base_commit) return "Code cross-check incomplete: snapshot failed";
   const dispositions = new Map((summary.dispositions ?? []).map(d => [d.finding_id, d]));
   let addressed = 0, declined = 0, missing = 0;
@@ -1245,10 +1262,17 @@ function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").Code
     else missing++;
     return `- ${codeSpan(f.id)} · ${value(f.severity)} · ${value(f.path)}:${f.line} · ${value(f.title)} — ${disposition === "not_reported" ? "not reported" : value(disposition)}${d?.reason ? `: ${value(d.reason, 1024)}` : ""}`;
   });
-  const identity = `Code cross-check (checked ${value(summary.head_commit.slice(0, 12))}, ${value(summary.checker_harness)} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
-  const counts = `${summary.findings.length} findings: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+  const family = summary.checker_harness === "codex" ? "Codex" : summary.checker_harness === "claude" ? "Claude" : value(summary.checker_harness);
+  const identity = `Code cross-check (checked ${codeSpan(summary.head_commit.slice(0, 7))}, ${family} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
+  const counts = summary.findings.length === 0
+    ? `${identity}: no findings`
+    : `${identity}\n${summary.findings.length} findings: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+  // The digest is the frozen guidance's sha256; only its first 12 hex characters are shown.
+  const guidance = summary.custom_guidance_applied
+    ? [`custom guidance applied${summary.guidance_digest ? ` (sha256 ${codeSpan(summary.guidance_digest.slice(0, 12))})` : ""}`]
+    : [];
   const footer = "**Changes after the check were not cross-checked.**";
-  const render = () => [identity, counts, ...findings, footer].join("\n");
+  const render = () => [counts, ...guidance, ...findings, footer].join("\n");
   while (findings.length && Buffer.byteLength(render()) > 4096) findings.pop();
   return render();
 }

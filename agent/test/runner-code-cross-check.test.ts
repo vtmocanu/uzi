@@ -200,8 +200,8 @@ for (const harness of ["claude", "codex"] as const) {
       assert.equal(submit.mock.callCount(), 1);
       if (safetyRig) assert.ok(safetyRig.reaps() > 0, "production safety facade reaped the registered provider root");
       assert.notEqual(original, repaired);
-      assert.ok(JSON.stringify(forge.calls).includes(`checked ${original.slice(0, 12)}`));
-      assert.ok(!JSON.stringify(forge.calls).includes(`checked ${repaired.slice(0, 12)}`));
+      assert.ok(JSON.stringify(forge.calls).includes(`checked \`${original.slice(0, 7)}\``));
+      assert.ok(!JSON.stringify(forge.calls).includes(`checked \`${repaired.slice(0, 7)}\``));
       assert.ok(JSON.stringify(forge.calls).includes("1 findings: 1 addressed, 0 declined"));
     });
   }
@@ -216,6 +216,7 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
       return "head_commit" in snapshot ? record(snapshot.head_commit, snapshot.base_commit) : record();
     });
     let base = "", originalH = "", movedTip = "", clone = "", branch = "", bare = "";
+    let publishesAtGate: [number, number] | undefined;
     const publishedBranch = "feature/code-snapshot";
     if (movement === "bridge") {
       execFileSync("git", ["-C", fx.originPath, "checkout", "-b", publishedBranch]);
@@ -226,7 +227,7 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
     }
     let moveOnPublish = false;
     let reaps = 0;
-    t.mock.method(client, "publishCheckpoint", async (...args: Parameters<WorkerClient["publishCheckpoint"]>) => {
+    const publish = t.mock.method(client, "publishCheckpoint", async (...args: Parameters<WorkerClient["publishCheckpoint"]>) => {
       const pack = args[2];
       for await (const _chunk of pack) { /* drain the real local Git pack */ }
       if (moveOnPublish && movement === "concurrent clone tip") {
@@ -254,7 +255,9 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
         moveOnPublish = true;
         await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
         if (movement === "bridge") movedTip = await git.trackingTip(bare, branch) ?? "";
+        const beforeGate = publish.mock.callCount();
         await ctx.codeCrossCheckGate!({ interlocked: true });
+        publishesAtGate = [beforeGate, publish.mock.callCount()];
         return { branch };
       },
     };
@@ -262,6 +265,9 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
     await runner(exec, forge.gitlab).execute(gitlabClaim(2175, { code_cross_check_required: true, claim_generation: 1,
       ...(movement === "bridge" ? { kind: "task", branch: publishedBranch, open_mr: false } : {}) }));
     assert.ok(reaps > 0, "checkpoint reaped the executor");
+    // The executor's own done_checkpoint publishes; the gate's step on the interlocked exit makes no publication of its own.
+    assert.ok(publishesAtGate && publishesAtGate[0] > 0, "the executor's checkpoint published before the gate");
+    assert.equal(publishesAtGate[1], publishesAtGate[0], "the interlocked gate step publishes nothing");
     assert.equal(status.mock.callCount(), movement === "bridge" ? 2 : 3, "publication refresh occurs only when this run publishes an MR");
     assert.equal(submit.mock.callCount(), 1);
     assert.deepEqual(snapshots, [{ head_commit: originalH, base_commit: base }]);

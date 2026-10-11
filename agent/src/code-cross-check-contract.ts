@@ -57,31 +57,53 @@ export type CodeCrossCheckInstructions =
 type CodeCrossCheckNoRow = { stage: "code"; result: "no_row"; repo_instructions_enabled: boolean };
 export type CodeCrossCheckStatus = CodeCrossCheckRecord | CodeCrossCheckNoRow;
 
+/**
+ * The server's answer for snapshot cleanup. `row_present: false` is a valid "no code row"
+ * answer and `child_present: false` on a present row a valid "no child" answer; both are
+ * explicit so a worker can tell them from a failed lookup (which never decodes).
+ * `lead_claim_generation` is cross_checks.lead_claim_generation: the lead claim generation
+ * the snapshot was pinned at (0 only when there is no row). `checker_claim_generation` is 0
+ * for a child that was never claimed.
+ */
 export interface CodeSnapshotCleanup {
   protocol: "code_snapshot_cleanup_v1";
   lead_run_id: string;
-  head_commit: string | null;
-  outcome: "pending" | "completed" | "failed";
   lead_status: string;
   owned_by_worker: boolean;
-  checker_run_id: string;
+  row_present: boolean;
+  lead_claim_generation: number;
+  head_commit: string | null;
+  outcome: "pending" | "completed" | "failed" | null;
+  child_present: boolean;
+  checker_run_id: string | null;
   checker_claim_generation: number;
-  checker_status: string;
+  checker_status: string | null;
 }
 
 export function decodeCodeSnapshotCleanup(v: unknown): CodeSnapshotCleanup {
+  const invalid = (): never => { throw new Error("invalid code snapshot cleanup metadata"); };
   const uuid = (s: unknown) => typeof s === "string" && s.length === 36 &&
     /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(s);
   const states = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input",
     "awaiting_followup", "limit_wait", "recovery_wait", "paused", "completed", "failed", "cancelled"];
+  const generation = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
   if (!record(v) || Object.keys(v).sort().join(",") !==
-    "checker_claim_generation,checker_run_id,checker_status,head_commit,lead_run_id,lead_status,outcome,owned_by_worker,protocol" ||
-    v.protocol !== "code_snapshot_cleanup_v1" || !uuid(v.lead_run_id) || !uuid(v.checker_run_id) ||
-    (v.head_commit !== null && (typeof v.head_commit !== "string" || v.head_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.head_commit))) ||
-    !["pending", "completed", "failed"].includes(v.outcome as string) ||
-    !states.includes(v.lead_status as string) || !states.includes(v.checker_status as string) ||
-    typeof v.owned_by_worker !== "boolean" || !Number.isSafeInteger(v.checker_claim_generation) ||
-    (v.checker_claim_generation as number) <= 0) throw new Error("invalid code snapshot cleanup metadata");
+    "checker_claim_generation,checker_run_id,checker_status,child_present,head_commit,lead_claim_generation,lead_run_id,lead_status,outcome,owned_by_worker,protocol,row_present" ||
+    v.protocol !== "code_snapshot_cleanup_v1" || !uuid(v.lead_run_id) || !states.includes(v.lead_status as string) ||
+    typeof v.owned_by_worker !== "boolean" || typeof v.row_present !== "boolean" || typeof v.child_present !== "boolean" ||
+    !generation(v.lead_claim_generation) || !generation(v.checker_claim_generation)) return invalid();
+  if (!v.row_present) {
+    // A valid no-row answer carries nothing else: no head, outcome, generation or child.
+    if (v.lead_claim_generation !== 0 || v.head_commit !== null || v.outcome !== null || v.child_present ||
+        v.checker_run_id !== null || v.checker_claim_generation !== 0 || v.checker_status !== null) return invalid();
+    return v as unknown as CodeSnapshotCleanup;
+  }
+  if ((v.lead_claim_generation as number) <= 0 ||
+      (v.head_commit !== null && (typeof v.head_commit !== "string" || !/^[a-f0-9]{40}$/.test(v.head_commit))) ||
+      !["pending", "completed", "failed"].includes(v.outcome as string)) return invalid();
+  if (!v.child_present) {
+    if (v.checker_run_id !== null || v.checker_claim_generation !== 0 || v.checker_status !== null) return invalid();
+  } else if (!uuid(v.checker_run_id) || !states.includes(v.checker_status as string)) return invalid();
   return v as unknown as CodeSnapshotCleanup;
 }
 

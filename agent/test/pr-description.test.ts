@@ -53,7 +53,7 @@ describe("structured code cross-check completion section", () => {
     it(`${kind} preserves original checked identity and exact counts in either completion arm`, () => {
       const body = mrCompletionBlock(makeClaim({ kind }), "rewritten-tip-branch", undefined, undefined, undefined,
         undefined, undefined, undefined, false, undefined, true, { staleness: { describedSha: "d".repeat(40), headSha: "e".repeat(40) } }, codeSummary());
-      assert.match(body, /checked bbbbbbbbbbbb, codex checker-model · high/);
+      assert.match(body, /checked `bbbbbbb`, Codex checker-model · high/);
       assert.match(body, /3 findings: 1 addressed, 1 declined, 1 not reported/);
       assert.match(body, /ID_1.*addressed: corrected and tested/);
       assert.match(body, /ID_2.*declined: verified existing guard/);
@@ -86,11 +86,58 @@ describe("structured code cross-check completion section", () => {
     const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
     const section = body.slice(body.indexOf("Code cross-check"), body.indexOf("\n\n---", body.indexOf("Code cross-check")));
     assert.ok(Buffer.byteLength(section) <= 4096);
-    assert.ok(section.includes("checked bbbbbbbbbbbb"));
+    assert.ok(section.includes("checked `bbbbbbb`"));
     assert.ok(section.includes("20 findings: 0 addressed, 20 declined"));
     assert.ok(section.endsWith("**Changes after the check were not cross-checked.**"));
     assert.ok(!section.includes("F_19"));
     assert.ok(body.length < BODY_CAP_CHARS);
+  });
+  it("identity line shows a 7-character SHA and the display family name", () => {
+    const render = (over: Parameters<typeof codeSummary>[0]) => renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary(over) }]] });
+    assert.match(render({ checker_harness: "claude", checker_model: "m", checker_effort: null }), /Code cross-check \(checked `bbbbbbb`, Claude m\)/);
+    assert.match(render({ checker_harness: "codex" }), /\(checked `bbbbbbb`, Codex checker-model · high\)/);
+    assert.doesNotMatch(render({}), /bbbbbbbb/);
+    // An unrecognised family is data: escaped, not trusted.
+    assert.match(render({ checker_harness: "<b>x" }), /, \\<b\\>x checker-model/);
+  });
+  it("zero findings renders no findings and drops the counts line", () => {
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary({ findings: [], dispositions: null }) }]] });
+    assert.match(body, /Code cross-check \(checked `bbbbbbb`, Codex checker-model · high\): no findings\n/);
+    assert.doesNotMatch(body, /0 findings|findings:/);
+    assert.ok(body.includes("**Changes after the check were not cross-checked.**"));
+  });
+  it("custom guidance line carries the first 12 digest characters, only when applied", () => {
+    const digest = "0123456789abcdef".repeat(4);
+    const render = (over: Parameters<typeof codeSummary>[0]) => renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary({ findings: [], dispositions: null, ...over }) }]] });
+    const applied = render({ custom_guidance_applied: true, guidance_digest: digest });
+    assert.match(applied, /\ncustom guidance applied \(sha256 `0123456789ab`\)\n/);
+    assert.ok(!applied.includes("0123456789abc"), "only the first 12 characters are shown");
+    for (const over of [{ custom_guidance_applied: false, guidance_digest: digest }, {}])
+      assert.doesNotMatch(render(over), /custom guidance/);
+  });
+  // The cross_checks_reason_class_check allowlist for a failed code row (migration 00322), each with its fixed prose.
+  const reasonProse: Record<string, string> = {
+    worker_unsupported: "worker unsupported", snapshot_failed: "snapshot failed", malformed: "checker output malformed",
+    model_error: "checker model error", model_timeout: "checker model timed out", checker_unavailable: "no local checker",
+    confinement_failed: "checker confinement failed", timed_out: "timed out", superseded: "superseded by a later change",
+  };
+  for (const [reason, prose] of Object.entries(reasonProse)) {
+    it(`incomplete line maps reason_class ${reason} to fixed prose`, () => {
+      const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck:
+        codeSummary({ outcome: "failed", reason_class: reason, findings: [], dispositions: null }) }]] });
+      assert.ok(body.split("\n").includes(`Code cross-check incomplete: ${prose}`), body);
+      assert.ok(!body.split("\n").includes(`Code cross-check incomplete: ${reason}`), "the raw class is not echoed");
+    });
+  }
+  it("an unknown reason_class is escaped raw", () => {
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck:
+      codeSummary({ outcome: "failed", reason_class: "x<!-- uzi:completion:end -->\u001b[31m", findings: [], dispositions: null }) }]] });
+    assert.match(body, /Code cross-check incomplete: x/);
+    assert.equal(body.split(COMPLETION_END).length, 2);
+    assert.ok(!body.includes("\u001b"));
   });
   for (const summary of [
     codeSummary({ interrupted_at: new Date().toISOString() }),

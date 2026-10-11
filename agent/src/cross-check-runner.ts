@@ -79,24 +79,49 @@ export class CrossCheckRunner {
     for (const candidate of frozen) {
       if (passSignal.aborted || Date.now() >= deadline) break;
       const { barePath, leadId, head, metadata } = candidate;
-      const child = metadata.latestChild;
-      if (!child || metadata.readers.length === 0 || metadata.readers.some(r => r.state !== "CLOSED")) continue;
+      // Missing proof keeps the ref: an open local reader, or anything below that fails to match.
+      if (metadata.readers.some(r => r.state !== "CLOSED")) continue;
       try {
         const server = decodeCodeSnapshotCleanup(await this.client.getCodeSnapshotCleanup(leadId,
           AbortSignal.any([passSignal, AbortSignal.timeout(Math.min(3000, deadline - Date.now()))])));
         if (passSignal.aborted || Date.now() >= deadline) break;
-        const terminal = server.checker_status;
         const leadTerminal = server.lead_status === "completed" || server.lead_status === "failed" || server.lead_status === "cancelled";
-        if (server.lead_run_id !== leadId || server.head_commit !== head ||
-            (server.outcome !== "completed" && server.outcome !== "failed") ||
-            server.checker_run_id !== child.childId || server.checker_claim_generation !== child.childGeneration ||
-            (terminal !== "completed" && terminal !== "failed" && terminal !== "cancelled") ||
-            (!leadTerminal && server.owned_by_worker !== false)) continue;
+        // An owned, live lead keeps its ref, and so does an answer about another lead.
+        if (server.lead_run_id !== leadId || (!leadTerminal && server.owned_by_worker !== false)) continue;
+        const leadDisposition = leadTerminal ? "terminal" as const : "foreign" as const;
+        if (!server.row_present) {
+          // The server validly has no code row for this lead: nothing can read the ref.
+          await this.git.deleteCodeSnapshot(barePath, leadId, head, {
+            sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId, outcome: "no_row" },
+            bootCandidate: candidate, leadDisposition,
+          });
+          continue;
+        }
+        // A decided row for exactly this snapshot: same head and the lead claim generation the
+        // snapshot was pinned at. A pending row has a checker that can still run.
+        if ((server.outcome !== "completed" && server.outcome !== "failed") || server.head_commit !== head ||
+            server.lead_claim_generation !== metadata.pinGeneration) continue;
+        const local = metadata.latestChild;
+        let child: { childId: string; childGeneration: number; terminalStatus: "completed" | "failed" | "cancelled" } | undefined;
+        if (server.child_present) {
+          const status = server.checker_status;
+          const terminal = status === "completed" || status === "failed" || status === "cancelled";
+          if (local) {
+            if (!terminal || server.checker_run_id !== local.childId ||
+                server.checker_claim_generation !== local.childGeneration) continue;
+            child = { childId: local.childId, childGeneration: local.childGeneration, terminalStatus: status };
+          } else if (!terminal && !(status === "queued" && server.checker_claim_generation === 0)) {
+            // No local reader, but the checker is claimed and live (or in limbo): it can still run.
+            continue;
+          }
+        } else if (local) {
+          continue; // A local reader ran, yet the server maps no child: inconclusive.
+        }
         await this.git.deleteCodeSnapshot(barePath, leadId, head, {
           sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId, head,
-            pinGeneration: metadata.pinGeneration, outcome: server.outcome },
-          child: { childId: child.childId, childGeneration: child.childGeneration, terminalStatus: terminal },
-          bootCandidate: candidate, leadDisposition: leadTerminal ? "terminal" : "foreign",
+            pinGeneration: server.lead_claim_generation, outcome: server.outcome },
+          ...(child ? { child } : {}),
+          bootCandidate: candidate, leadDisposition,
         });
       } catch {
         errors++;
@@ -268,8 +293,8 @@ export class CrossCheckRunner {
         try {
           const metadata = await this.client.getCodeSnapshotCleanup(code.lead_run_id, AbortSignal.timeout(3000));
           const terminal = metadata.checker_status;
-          if (metadata.lead_run_id === code.lead_run_id && metadata.head_commit === code.head_commit &&
-            metadata.checker_run_id === runId &&
+          if (metadata.lead_run_id === code.lead_run_id && metadata.row_present && metadata.head_commit === code.head_commit &&
+            metadata.child_present && metadata.checker_run_id === runId &&
             metadata.checker_claim_generation === generation &&
             (metadata.outcome === "completed" || metadata.outcome === "failed") &&
             (terminal === "completed" || terminal === "failed" || terminal === "cancelled")) {
@@ -280,7 +305,7 @@ export class CrossCheckRunner {
             const local = await this.git.codeSnapshotCandidate(bare, code.lead_run_id);
             if (local) await this.git.deleteCodeSnapshot(bare, code.lead_run_id, code.head_commit, {
               sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId: code.lead_run_id,
-                head: code.head_commit, pinGeneration: local.metadata.pinGeneration, outcome: metadata.outcome },
+                head: code.head_commit, pinGeneration: metadata.lead_claim_generation, outcome: metadata.outcome },
               child: { childId: runId, childGeneration: generation, terminalStatus: terminal },
             });
           }

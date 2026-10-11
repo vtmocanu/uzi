@@ -90,6 +90,9 @@ export interface CodeSnapshotBootCandidate {
   metadata: CodeSnapshotMetadata;
 }
 export interface CodeSnapshotRetirementProof {
+  /** Server evidence. `pinGeneration` is the lead claim generation the SERVER reports for the
+   *  code row and must equal the generation this snapshot was pinned at. `no_row` is the
+   *  server's valid "no code row" answer: boot-only, and it carries no head or generation. */
   sealedOutcome: {
     persisted: true;
     sealed: true;
@@ -98,6 +101,12 @@ export interface CodeSnapshotRetirementProof {
     head: string;
     pinGeneration: number;
     outcome: "completed" | "failed";
+  } | {
+    persisted: true;
+    sealed: true;
+    stage: "code";
+    leadId: string;
+    outcome: "no_row";
   };
   child?: { childId: string; childGeneration: number; terminalStatus: "completed" | "failed" | "cancelled" };
   freshNoReader?: { receipt: CodeSnapshotFreshReceipt; serverAtomicallyTerminalNoChild: true };
@@ -4261,20 +4270,29 @@ export class GitCache {
     await this.withLock(barePath, () => this.withCodeSnapshotFence(barePath, runId, async () => {
       const m = await this.readCodeSnapshotMetadata(barePath, runId);
       const outcome = evidence.sealedOutcome;
+      const noRow = outcome?.outcome === "no_row";
+      const decided = outcome && outcome.outcome !== "no_row" ? outcome : undefined;
       if (!m || m.head !== head || !outcome || outcome.persisted !== true || outcome.sealed !== true || outcome.stage !== "code" ||
-          outcome.leadId !== runId || outcome.head !== head || outcome.pinGeneration !== m.pinGeneration ||
-          !["completed", "failed"].includes(outcome.outcome) || m.readers.some(r => r.state !== "CLOSED"))
+          outcome.leadId !== runId || m.readers.some(r => r.state !== "CLOSED") ||
+          !(noRow ? !!evidence.bootCandidate && !evidence.child && !evidence.freshNoReader
+            : !!decided && decided.head === head && decided.pinGeneration === m.pinGeneration &&
+              ["completed", "failed"].includes(decided.outcome)))
         throw new Error("code snapshot retirement evidence incomplete");
       const token = this.codeSnapshotToken(m);
       const boot = evidence.bootCandidate;
       if (boot && (boot.barePath !== barePath || boot.leadId !== runId || boot.head !== head ||
           boot.metadataToken !== token || !["terminal", "foreign"].includes(evidence.leadDisposition ?? "")))
         throw new Error("code snapshot boot evidence changed");
-      if (m.latestChild) {
+      if (noRow) {
+        // The server has no code row for this lead, so there is no child to prove terminal.
+      } else if (m.latestChild) {
         const child = evidence.child;
         if (evidence.freshNoReader || !child || child.childId !== m.latestChild.childId ||
             child.childGeneration !== m.latestChild.childGeneration || !codeTerminal(child.terminalStatus))
           throw new Error("code snapshot latest child proof required");
+      } else if (boot && !evidence.child && !evidence.freshNoReader) {
+        // Boot observation of a ref no child ever read: the caller's server evidence names
+        // no claimed child that can still run, and the decided row/lead identity matched above.
       } else {
         const fresh = evidence.freshNoReader;
         const receipt = fresh?.receipt;

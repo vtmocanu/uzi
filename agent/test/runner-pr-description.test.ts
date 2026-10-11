@@ -30,8 +30,13 @@ function fakeGitlab(opts: Parameters<typeof rawFakeGitlab>[0] = {}) {
   return forge;
 }
 
+// Carried-over reconcile test (PRD #2170): reconcileCompletion rewrites the completion block (in place, or
+// the whole body when the markers are malformed) and must keep the code cross-check section through both
+// rewrites. "issue" renders the issue arm; "prompt" has a kindLine (RUN_KIND_PROFILES completionLine).
+for (const arm of ["issue", "prompt"] as const) {
+for (const body of ["in-place", "whole-body"] as const) {
 for (const interrupted of [false, true]) {
-  it(`code summary survives verified completion reconciliation; interrupted=${interrupted}`, async t => {
+  it(`code summary survives verified completion reconciliation; arm=${arm} rewrite=${body} interrupted=${interrupted}`, async t => {
     const summary: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
       stage: "code", round: 1, candidate_generation: 1, head_commit: "b".repeat(40), base_commit: "a".repeat(40),
       candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "test-checker",
@@ -49,23 +54,32 @@ for (const interrupted of [false, true]) {
       }
     }
     const iid = 2190;
-    const { gitlab, pr } = fakeGitlab({ head: H, existing: adoptedBody(iid, "Maintainer notes.") });
-    const claim = { ...interlockedClaim(iid), code_cross_check_required: true, claim_generation: 1 };
+    const existing = body === "in-place" ? adoptedBody(iid, "Maintainer notes.")
+      : `Maintainer notes.\n\n${SIZE_REGION}\n\n${COMPLETION_START}\nRelated to #${iid}.\n${COMPLETION_START}\n${COMPLETION_END}`;
+    const { gitlab, pr } = fakeGitlab({ head: H, existing });
+    const claim = { ...interlockedClaim(iid), ...(arm === "prompt" ? { kind: "prompt" as const } : {}),
+      code_cross_check_required: true, claim_generation: 1 };
     api.setCompletionPermitResponse(true);
     await runner(new SummaryExecutor(nullLogger()), gitlab).execute(claim);
     assert.ok(statuses(claim.run_id).includes("completed"));
-    assert.ok(pr.description.startsWith("Maintainer notes."));
-    assert.match(pr.description, /Closes #2190/);
+    if (body === "in-place") assert.ok(pr.description.startsWith("Maintainer notes."));
+    if (arm === "issue") assert.match(pr.description, /Closes #2190/);
+    else {
+      assert.match(pr.description, /Ad-hoc scheduled prompt run/, "the kind's own completion line is rendered");
+      assert.doesNotMatch(pr.description, /Closes #2190/);
+    }
     assert.ok(parseOwnedBlocks(pr.description).kind === "ok");
     if (interrupted) {
       assert.match(pr.description, /Code cross-check incomplete: interrupted/);
-      assert.doesNotMatch(pr.description, /checked bbbb|findings:|F1/);
+      assert.doesNotMatch(pr.description, /checked `bbbb|findings:|F1/);
     } else {
-      assert.match(pr.description, /checked bbbbbbbbbbbb, codex test-checker · high/);
+      assert.match(pr.description, /checked `bbbbbbb`, Codex test-checker · high/);
       assert.match(pr.description, /1 findings: 0 addressed, 1 declined/);
       assert.ok(pr.description.includes("**Changes after the check were not cross-checked.**"));
     }
   });
+}
+}
 }
 
 const H = "1111111111111111111111111111111111111111";

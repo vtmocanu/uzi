@@ -416,7 +416,7 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
     getInputs: async () => ({ inputs: [] }), postMessages: async () => {},
     reportCodeCrossCheckVerdict: async (_id: string, _gen: number, v: any) => { decisions.push(v); },
     getCodeSnapshotCleanup: async () => ({ lead_run_id: "lead", head_commit: "b".repeat(40),
-      checker_run_id: "child", checker_claim_generation: 7, checker_status: clean ? "completed" : "failed",
+      row_present: true, lead_claim_generation: 1, child_present: true, checker_run_id: "child", checker_claim_generation: 7, checker_status: clean ? "completed" : "failed",
       outcome: clean ? "completed" : "failed" }),
   } as unknown as WorkerClient;
   const git = {

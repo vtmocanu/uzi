@@ -36,18 +36,48 @@ func (h *Handler) workerCodeSnapshotCleanup(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if !row.Outcome.Valid {
-		httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+	body, err := codeSnapshotCleanupBody(row)
+	if err != nil {
+		slog.Error("worker code snapshot cleanup", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	var head *string
-	if row.HeadCommit.Valid {
-		head = &row.HeadCommit.String
-	}
-	httpx.JSON(w, http.StatusOK, apitypes.CodeSnapshotCleanup{
+	httpx.JSON(w, http.StatusOK, body)
+}
+
+// codeSnapshotCleanupBody maps the LEFT JOIN row to the wire shape. A lead with no code
+// row, or a row with no child, is a valid answer carried by explicit flags. A row whose
+// child mapping cannot be resolved is an error, never "no child": the worker must keep
+// the ref when it cannot prove the checker is gone.
+func codeSnapshotCleanupBody(row store.GetCodeSnapshotCleanupRow) (apitypes.CodeSnapshotCleanup, error) {
+	body := apitypes.CodeSnapshotCleanup{
 		Protocol: "code_snapshot_cleanup_v1", LeadRunID: row.LeadRunID.String(),
-		HeadCommit: head, Outcome: row.Outcome.String, LeadStatus: row.LeadStatus,
-		OwnedByWorker: row.OwnedByWorker, CheckerRunID: row.CheckerRunID.String(),
-		CheckerClaimGeneration: row.CheckerClaimGeneration, CheckerStatus: row.CheckerStatus,
-	})
+		LeadStatus: row.LeadStatus, OwnedByWorker: row.OwnedByWorker,
+		RowPresent: row.RowPresent, LeadClaimGeneration: row.LeadClaimGeneration,
+		ChildPresent: row.CheckerRunID.Valid, CheckerClaimGeneration: row.CheckerClaimGeneration,
+	}
+	if !row.RowPresent && (row.ChildMapped || row.CheckerRunID.Valid || row.Outcome.Valid) {
+		return body, errors.New("code snapshot cleanup: child or outcome without a code row")
+	}
+	if row.RowPresent && !row.Outcome.Valid {
+		return body, errors.New("code snapshot cleanup: code row without an outcome")
+	}
+	if row.ChildMapped != row.CheckerRunID.Valid {
+		return body, errors.New("code snapshot cleanup: checker mapping does not resolve to a child run")
+	}
+	if row.HeadCommit.Valid {
+		body.HeadCommit = &row.HeadCommit.String
+	}
+	if row.Outcome.Valid {
+		body.Outcome = &row.Outcome.String
+	}
+	if row.CheckerRunID.Valid {
+		id := uuid.UUID(row.CheckerRunID.Bytes).String()
+		body.CheckerRunID = &id
+		if !row.CheckerStatus.Valid {
+			return body, errors.New("code snapshot cleanup: child run without a status")
+		}
+		body.CheckerStatus = &row.CheckerStatus.String
+	}
+	return body, nil
 }

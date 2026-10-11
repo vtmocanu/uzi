@@ -25,7 +25,7 @@ async function fixture() {
   const head = runGit(fx.originPath, "rev-parse", "HEAD");
   const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const bare = await git.ensureClone(fx.originPath, "");
-  await git.pinCodeSnapshot(bare, "lead", head, base);
+  await git.pinCodeSnapshot(bare, "lead", head, base, true, 1);
   const claim: ClaimResponse = makeClaim({
     run_id: randomUUID(), kind: "cross_check", claim_generation: 1,
     repo: { id: "repo", url: "https://example.test/repo", clone_url: fx.originPath },
@@ -43,8 +43,9 @@ async function fixture() {
     postMessages: async () => {},
     getRunOwnership: async () => ({ status, claim_generation: 1 }),
     getCodeSnapshotCleanup: async () => ({ protocol: "code_snapshot_cleanup_v1", lead_run_id: claim.cross_check!.lead_run_id,
+      lead_status: "running", owned_by_worker: true, row_present: true, lead_claim_generation: 1,
       head_commit: claim.cross_check!.stage === "code" ? claim.cross_check!.head_commit : head,
-      outcome: status === "completed" ? "completed" : "failed", lead_status: "running", owned_by_worker: true,
+      outcome: status === "completed" ? "completed" : "failed", child_present: true,
       checker_run_id: claim.run_id, checker_claim_generation: claim.claim_generation, checker_status: status }),
     reportCodeCrossCheckVerdict: async (_id: string, _gen: number, body: unknown) => { verdicts.push(body); },
   } as unknown as WorkerClient;
@@ -139,13 +140,22 @@ it("code snapshot ref survives until child settlement and is deleted by exact na
   } finally { f.fx.cleanup(); }
 });
 
-for (const control of ["moved", "unknown-settlement", "cleanup-failed", "confinement-failed", "home-cleanup-failed", "cancelled-early-return", "malformed", "oversized-diff"] as const) {
+for (const control of ["moved", "unknown-settlement", "cleanup-failed", "confinement-failed", "home-cleanup-failed", "cancelled-early-return", "malformed", "oversized-diff", "server-lead-generation", "server-lead-id", "server-no-row"] as const) {
   it(`code snapshot lifetime control: ${control}`, async (t) => {
     const f = await fixture();
     let called = false;
     try {
       if (control === "moved") runGit(f.bare, "update-ref", "refs/uzi-cross-check/lead", f.base);
       if (control === "unknown-settlement") t.mock.method(f.client, "getCodeSnapshotCleanup", async () => { throw new Error("unknown ownership"); });
+      if (control === "server-lead-generation" || control === "server-lead-id" || control === "server-no-row") {
+        // Review note: the server's lead evidence must itself match the pinned snapshot.
+        const real = f.client.getCodeSnapshotCleanup.bind(f.client);
+        t.mock.method(f.client, "getCodeSnapshotCleanup", async (lead: string, signal?: AbortSignal) => {
+          const body = await real(lead, signal);
+          return control === "server-lead-generation" ? { ...body, lead_claim_generation: body.lead_claim_generation + 1 }
+            : control === "server-lead-id" ? { ...body, lead_run_id: "other-lead" } : { ...body, row_present: false };
+        });
+      }
       if (control === "cancelled-early-return") {
         let probes = 0;
         t.mock.method(f.client, "reportState", async () => ++probes === 1 ? { applied: true } : { staleClaim: true });
@@ -160,7 +170,7 @@ for (const control of ["moved", "unknown-settlement", "cleanup-failed", "confine
         // Import only from this fixture's local origin; the code runner itself cannot fetch.
         runGit(f.bare, "-c", "protocol.file.allow=always", "fetch", f.fx.originPath, "main");
         f.head = runGit(f.fx.originPath, "rev-parse", "HEAD");
-        await f.git.pinCodeSnapshot(f.bare, "large-lead", f.head, f.base);
+        await f.git.pinCodeSnapshot(f.bare, "large-lead", f.head, f.base, true, 1);
         if (f.claim.cross_check?.stage === "code") {
           f.claim.cross_check.head_commit = f.head;
           f.claim.cross_check.lead_run_id = "large-lead";
@@ -218,7 +228,7 @@ for (const extraByte of [0, 1] as const) {
       assert.ok(actualDiff.toString("utf8").length < actualDiff.length, "fixture counts UTF-8 bytes, not characters");
       runGit(f.bare, "-c", "protocol.file.allow=always", "fetch", f.fx.originPath, "main");
       f.head = runGit(f.fx.originPath, "rev-parse", "HEAD");
-      await f.git.pinCodeSnapshot(f.bare, "boundary-lead", f.head, f.base);
+      await f.git.pinCodeSnapshot(f.bare, "boundary-lead", f.head, f.base, true, 1);
       assert.equal(f.claim.cross_check?.stage, "code");
       if (f.claim.cross_check?.stage !== "code") assert.fail("code claim required");
       f.claim.cross_check.head_commit = f.head;
@@ -259,7 +269,7 @@ it("proof-free delete refuses a moved snapshot ref and pin refuses to replace it
 function retirement(f: Awaited<ReturnType<typeof fixture>>, childId: string, childGeneration: number): CodeSnapshotRetirementProof {
   return {
     sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId: "lead", head: f.head,
-      pinGeneration: 0, outcome: "completed" },
+      pinGeneration: 1, outcome: "completed" },
     child: { childId, childGeneration, terminalStatus: "completed" },
   };
 }
@@ -558,7 +568,7 @@ for (const proofKind of ["fresh", "latest-child"] as const) {
       const f = await fixture();
       try {
         const lead = proofKind === "fresh" ? "fresh" : "lead";
-        const generation = proofKind === "fresh" ? 7 : 0;
+        const generation = proofKind === "fresh" ? 7 : 1;
         const wrong = mismatch === "lead id" ? { leadId: "other" } : mismatch === "head" ? { head: f.base } : { pinGeneration: generation + 1 };
         let proof: CodeSnapshotRetirementProof;
         if (proofKind === "fresh") {
@@ -591,4 +601,44 @@ for (const field of ["leadId", "head", "pinGeneration"] as const) {
       assert.equal(await f.git.codeSnapshotTip(f.bare, "fresh"), f.head);
     } finally { f.fx.cleanup(); }
   });
+}
+
+// Boot retirement with no local reader (PRD #2170 U2): the server's "no row" answer and a decided row
+// with no child are both valid evidence, but only for a boot observation of this exact ref.
+for (const kind of ["no-row", "decided-no-child"] as const) {
+  for (const guard of ["valid", "not-boot", "stale-boot", "wrong-generation", "child-attached"] as const) {
+    if (kind === "no-row" && guard === "wrong-generation") continue;
+    it(`boot retirement of a never-read ref: ${kind} ${guard}`, async () => {
+      const f = await fixture();
+      try {
+        await f.git.pinCodeSnapshot(f.bare, "norow", f.head, f.base, true, 3);
+        const [candidate] = (await f.git.discoverCodeSnapshots()).filter(c => c.leadId === "norow");
+        assert.ok(candidate);
+        assert.equal(candidate.metadata.latestChild, null);
+        const sealedOutcome: CodeSnapshotRetirementProof["sealedOutcome"] = kind === "no-row"
+          ? { persisted: true, sealed: true, stage: "code", leadId: "norow", outcome: "no_row" }
+          : { persisted: true, sealed: true, stage: "code", leadId: "norow", head: f.head,
+            pinGeneration: guard === "wrong-generation" ? 4 : 3, outcome: "completed" };
+        const proof: CodeSnapshotRetirementProof = { sealedOutcome, leadDisposition: "terminal",
+          ...(guard === "not-boot" ? {} : { bootCandidate: candidate }) };
+        if (guard === "stale-boot") {
+          // A later reader changes the metadata: the earlier observation proves nothing.
+          const child = randomUUID();
+          const checkout = await f.git.runnerCloneAtCommit(f.bare, f.head, child, "norow", 1);
+          await f.git.removeRunnerClone(checkout);
+          await f.git.closeCodeSnapshotReader(f.bare, "norow", checkout,
+            { childId: child, childGeneration: 1, terminalStatus: "completed", cleanupConfirmed: true });
+        }
+        if (guard === "child-attached") proof.child = { childId: randomUUID(), childGeneration: 1, terminalStatus: "completed" };
+        if (guard === "valid") {
+          await f.git.deleteCodeSnapshot(f.bare, "norow", f.head, proof);
+          await assert.rejects(f.git.codeSnapshotTip(f.bare, "norow"));
+          assert.equal(fs.existsSync(metadataPath(f.bare, "norow")), false);
+        } else {
+          await assert.rejects(f.git.deleteCodeSnapshot(f.bare, "norow", f.head, proof));
+          assert.equal(await f.git.codeSnapshotTip(f.bare, "norow"), f.head, "the ref survives");
+        }
+      } finally { f.fx.cleanup(); }
+    });
+  }
 }

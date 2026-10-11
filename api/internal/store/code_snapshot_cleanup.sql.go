@@ -14,20 +14,22 @@ import (
 
 const getCodeSnapshotCleanup = `-- name: GetCodeSnapshotCleanup :one
 SELECT lead.id AS lead_run_id,
-       cc.head_commit,
-       cc.outcome,
        lead.status AS lead_status,
        COALESCE(lead.worker_id = $1::uuid AND lead.claim_released_at IS NULL, false)::boolean AS owned_by_worker,
+       (cc.lead_run_id IS NOT NULL)::boolean AS row_present,
+       COALESCE(cc.lead_claim_generation, 0)::bigint AS lead_claim_generation,
+       cc.head_commit,
+       cc.outcome,
+       (cc.checker_run_id IS NOT NULL)::boolean AS child_mapped,
        child.id AS checker_run_id,
-       child.claim_generation AS checker_claim_generation,
+       COALESCE(child.claim_generation, 0)::bigint AS checker_claim_generation,
        child.status AS checker_status
 FROM runs AS lead
-JOIN cross_checks AS cc ON cc.lead_run_id = lead.id AND cc.stage = 'code'
-JOIN runs AS child ON child.id = cc.checker_run_id
+LEFT JOIN cross_checks AS cc ON cc.lead_run_id = lead.id AND cc.stage = 'code'
+LEFT JOIN runs AS child ON child.id = cc.checker_run_id
     AND child.user_id = lead.user_id
     AND child.kind = 'cross_check'
     AND child.target_run_id = lead.id
-    AND child.worker_id = $1::uuid
 WHERE lead.id = $2::uuid
   AND lead.user_id = $3::uuid
 `
@@ -40,24 +42,36 @@ type GetCodeSnapshotCleanupParams struct {
 
 type GetCodeSnapshotCleanupRow struct {
 	LeadRunID              uuid.UUID   `json:"lead_run_id"`
-	HeadCommit             pgtype.Text `json:"head_commit"`
-	Outcome                pgtype.Text `json:"outcome"`
 	LeadStatus             string      `json:"lead_status"`
 	OwnedByWorker          bool        `json:"owned_by_worker"`
-	CheckerRunID           uuid.UUID   `json:"checker_run_id"`
+	RowPresent             bool        `json:"row_present"`
+	LeadClaimGeneration    int64       `json:"lead_claim_generation"`
+	HeadCommit             pgtype.Text `json:"head_commit"`
+	Outcome                pgtype.Text `json:"outcome"`
+	ChildMapped            bool        `json:"child_mapped"`
+	CheckerRunID           pgtype.UUID `json:"checker_run_id"`
 	CheckerClaimGeneration int64       `json:"checker_claim_generation"`
-	CheckerStatus          string      `json:"checker_status"`
+	CheckerStatus          pgtype.Text `json:"checker_status"`
 }
 
+// Answers for any lead the caller's user owns, whether or not a code cross-check row or
+// child exists, so a worker can tell a valid "no row" / "no child" answer from a failed
+// lookup. cc.lead_claim_generation is the lead claim generation that pinned the snapshot
+// (the worker pins with the same value), and is 0 when there is no row. The child is
+// joined without a worker condition: a child on another worker that can still run must
+// not read as "no child".
 func (q *Queries) GetCodeSnapshotCleanup(ctx context.Context, arg GetCodeSnapshotCleanupParams) (GetCodeSnapshotCleanupRow, error) {
 	row := q.db.QueryRow(ctx, getCodeSnapshotCleanup, arg.WorkerID, arg.LeadRunID, arg.UserID)
 	var i GetCodeSnapshotCleanupRow
 	err := row.Scan(
 		&i.LeadRunID,
-		&i.HeadCommit,
-		&i.Outcome,
 		&i.LeadStatus,
 		&i.OwnedByWorker,
+		&i.RowPresent,
+		&i.LeadClaimGeneration,
+		&i.HeadCommit,
+		&i.Outcome,
+		&i.ChildMapped,
 		&i.CheckerRunID,
 		&i.CheckerClaimGeneration,
 		&i.CheckerStatus,

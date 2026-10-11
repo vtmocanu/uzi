@@ -175,7 +175,7 @@ it("code child dispatch uses the dedicated pool through settlement, reader clean
   const head = execFileSync("git", ["-C", bare, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const leadIds: string[] = [randomUUID(), randomUUID()];
   const childIds = [randomUUID(), randomUUID()];
-  for (const lead of leadIds) await git.pinCodeSnapshot(bare, lead, head, head);
+  for (const lead of leadIds) await git.pinCodeSnapshot(bare, lead, head, head, true, 1);
   const releaseLead = deferred();
   const firstTurn = deferred();
   const cleanupStarted = deferred();
@@ -197,7 +197,8 @@ it("code child dispatch uses the dedicated pool through settlement, reader clean
       const status = states.get(childId);
       return { protocol: "code_snapshot_cleanup_v1", lead_run_id: lead, head_commit: head,
         outcome: status === "completed" ? "completed" : "failed", lead_status: "running",
-        owned_by_worker: true, checker_run_id: childId, checker_claim_generation: 2,
+        owned_by_worker: true, row_present: true, lead_claim_generation: 1, child_present: true,
+        checker_run_id: childId, checker_claim_generation: 2,
         checker_status: status };
     },
     reportCodeCrossCheckVerdict: async (id: string) => { verdicts.push(id); },
