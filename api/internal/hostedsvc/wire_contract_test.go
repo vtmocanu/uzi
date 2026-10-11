@@ -40,7 +40,7 @@ func samplePollResponse() PollResponse {
 			RollEvidence: &RollEvidence{
 				Version: 1, OwnerID: owner, Registered: true,
 				SchedulingCapabilities: []string{"docker"}, ProtocolCapabilities: []string{"cross_check_v1", "cross_check_lane_v1"},
-				OrdinaryCoverage: true, CheckerCoverage: true, RegisteredVersion: &version,
+				OrdinaryCoverage: false, CheckerCoverage: true, RegisteredVersion: &version,
 				RegisterNonce: &nonce, PodUID: &pod, HeartbeatAt: &at, EvaluatedAt: at, ValidUntil: at.Add(45 * time.Second),
 			},
 			ID:         "11111111-1111-1111-1111-111111111111",

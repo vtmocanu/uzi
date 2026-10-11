@@ -39,7 +39,7 @@ Tick only items supported by direct execution evidence. Keep this PRD active unt
 M1 evidence (2026-10-11):
 
 - On base revision 2c6b3393, the tagged TestRollPacingRegression fixture compiled and failed all three behavior assertions: three idle replacements, two premature busy cordons, and two sibling replacements despite a stuck canary and expired deadline. The tag intentionally excludes these pending M2 acceptance tests from the M1 default suite.
-- Focused controller apiclient/protocol checks passed, including actual gzip/chunked byte bounds, worker-count overflow, atomic rejection, token-safe errors and shared wire goldens. A 4,134,925-byte / 512-worker poll allocated 31,778,912 bytes in the near-limit allocation check.
+- Focused controller apiclient/protocol checks passed, including actual gzip/chunked byte bounds, worker-count overflow, atomic rejection, token-safe errors and shared wire goldens. A 4,134,925-byte / 512-worker poll allocated 31,900,920 bytes in the near-limit allocation check.
 - A throwaway PostgreSQL run executed TestRollEvidenceDrainWritersLiveDB, TestRollEvidenceRegisterNamesAndPollLiveDB, TestRollEvidencePollOverflowLiveDB, TestRollEvidenceRegistrationHeartbeatLiveDB, TestRollEvidencePollEligibilityDrainLiveDB and TestRollEvidenceOfflineLadderLiveDB, all passing without skips. It exercised migration/query execution, handler registration/poll, actual heartbeat proof, coverage matrix and independent drain fences.
 - The observed fully offline mid-roll fallback is exactly: "no worker is online to pick up this run".
-- task check-docs:web passed. Full integration gates and immutable-range review are recorded below after completion.
+- task check-docs:web passed. Full integration-gate and immutable-range review outcomes are recorded in the milestone checkpoint report; they are distinct from the focused evidence above.

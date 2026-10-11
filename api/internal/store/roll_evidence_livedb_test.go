@@ -22,7 +22,7 @@ func TestRollEvidenceDrainWritersLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(ctx)
+		defer func() { _ = tx.Rollback(ctx) }()
 		qt := store.New(tx)
 		if _, err := qt.GetWorkerForUpdate(ctx, w.ID); err != nil {
 			t.Fatal(err)
@@ -68,6 +68,16 @@ func TestRollEvidenceDrainWritersLiveDB(t *testing.T) {
 		}
 		mustExec(ctx, t, pool, "UPDATE workers SET "+column+"=0 WHERE id=$1", w.ID)
 	}
+	run, hold := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, "INSERT INTO runs(id,user_id,kind,issue_title,issue_description,status) VALUES($1,$2,'chat','t','d','running')", run, user)
+	mustExec(ctx, t, pool, "INSERT INTO recovery_custody_holds(id,user_id,run_id,generation,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded,state) VALUES($1,$2,$3,1,$4,$5,$4,$3,true,'open')", hold, user, run, w.ID, w.ID.String())
+	if _, err := q.UncordonHostedWorkerImageRoll(ctx, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); !got.DrainingSince.Valid || !got.DrainingReason.Valid || got.DrainingReason.String != "image_roll" {
+		t.Fatalf("open custody hold lost image drain: %+v", got)
+	}
+	mustExec(ctx, t, pool, "UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,release_evidence='publication',released_at=now() WHERE id=$1", hold)
 	if _, err := q.UncordonHostedWorkerImageRoll(ctx, w.ID); err != nil {
 		t.Fatal(err)
 	}

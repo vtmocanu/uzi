@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -22,6 +24,32 @@ func pollFixture(n int, token string) []byte {
 	}
 	b, _ := json.Marshal(map[string]any{"workers": workers})
 	return b
+}
+
+func TestDecodePollAcceptsSharedEvidenceGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "api", "internal", "hostedsvc", "testdata", "controller_poll_wire.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodePoll(&http.Response{Body: io.NopCloser(bytes.NewReader(raw)), Header: make(http.Header)})
+	if err != nil {
+		t.Fatalf("decodePoll rejected the API's evidence-bearing golden: %v", err)
+	}
+	if len(got.Workers) != 3 {
+		t.Fatalf("decoded %d workers, want 3", len(got.Workers))
+	}
+	evidence := got.Workers[0].RollEvidence
+	if evidence == nil || !evidence.Registered || evidence.OrdinaryCoverage || !evidence.CheckerCoverage {
+		t.Fatalf("decodePoll lost registered coverage evidence: %+v", evidence)
+	}
+	unregistered := got.Workers[1].RollEvidence
+	if unregistered == nil || unregistered.Registered ||
+		got.Workers[1].DrainingReason == nil || *got.Workers[1].DrainingReason != "image_roll" {
+		t.Fatalf("decodePoll lost unregistered evidence or drain reason: %+v", got.Workers[1])
+	}
+	if got.Workers[2].RollEvidence != nil {
+		t.Fatal("worker without roll evidence acquired evidence")
+	}
 }
 
 func TestBoundedPollRejectsWholeSnapshot(t *testing.T) {
@@ -118,6 +146,28 @@ func TestBoundedPollEvidenceSetsBeforeTypedAllocation(t *testing.T) {
 	}
 	if boundedWorker(body[len("{\"workers\":[") : len(body)-2]) {
 		t.Fatal("oversized evidence set passed pre-materialization bound")
+	}
+}
+
+func TestBoundedPollRejectsAmbiguousEvidenceBeforeTyping(t *testing.T) {
+	caps := make([]string, 65)
+	for i := range caps {
+		caps[i] = fmt.Sprintf("cap_%d", i)
+	}
+	oversized, err := json.Marshal(map[string]any{"scheduling_capabilities": caps, "protocol_capabilities": []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	small := `{"scheduling_capabilities":[],"protocol_capabilities":[]}`
+	for _, raw := range []string{
+		`{"ROLL_EVIDENCE":` + string(oversized) + `}`,
+		`{"roll_evidence":` + string(oversized) + `,"roll_evidence":` + small + `}`,
+		`{"roll_evidence":` + strings.Replace(string(oversized), "scheduling_capabilities", "SCHEDULING_CAPABILITIES", 1) + `}`,
+		`{"roll_evidence":` + strings.Replace(string(oversized), "scheduling_capabilities", "ſcheduling_capabilities", 1) + `}`,
+	} {
+		if boundedWorker([]byte(raw)) {
+			t.Fatal("ambiguous evidence bypassed the pre-materialization bound")
+		}
 	}
 }
 

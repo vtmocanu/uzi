@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
@@ -146,7 +147,16 @@ func scanPollWorkers(data []byte) ([]json.RawMessage, error) {
 
 func boundedWorker(raw []byte) bool {
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	// Token scanning holds one string at a time; the body cap bounds attempts.
+	// Reject duplicate object keys (including case aliases) before encoding/json
+	// can allocate an earlier overwritten value. Known evidence keys must use the
+	// canonical wire spelling: struct decoding is case-insensitive but map lookup
+	// below is not.
+	type frame struct {
+		object bool
+		key    bool
+		seen   map[string]bool
+	}
+	var stack []frame
 	for {
 		token, err := dec.Token()
 		if errors.Is(err, io.EOF) {
@@ -155,8 +165,46 @@ func boundedWorker(raw []byte) bool {
 		if err != nil {
 			return false
 		}
-		if s, ok := token.(string); ok && len(s) > 4096 {
-			return false
+		switch value := token.(type) {
+		case json.Delim:
+			switch value {
+			case '{':
+				stack = append(stack, frame{object: true, key: true, seen: map[string]bool{}})
+			case '[':
+				stack = append(stack, frame{})
+			case '}', ']':
+				if len(stack) == 0 {
+					return false
+				}
+				stack = stack[:len(stack)-1]
+				if len(stack) > 0 && stack[len(stack)-1].object {
+					stack[len(stack)-1].key = true
+				}
+			}
+		case string:
+			if len(value) > 4096 {
+				return false
+			}
+			if len(stack) > 0 && stack[len(stack)-1].object {
+				current := &stack[len(stack)-1]
+				if current.key {
+					folded := foldObjectKey(value)
+					if current.seen[folded] {
+						return false
+					}
+					current.seen[folded] = true
+					if (folded == "ROLL_EVIDENCE" && value != "roll_evidence") ||
+						(folded == "SCHEDULING_CAPABILITIES" && value != "scheduling_capabilities") ||
+						(folded == "PROTOCOL_CAPABILITIES" && value != "protocol_capabilities") {
+						return false
+					}
+				}
+				current.key = !current.key
+			}
+		default:
+			if len(stack) > 0 && stack[len(stack)-1].object {
+				stack[len(stack)-1].key = true
+			}
 		}
 	}
 	var fields map[string]json.RawMessage
@@ -188,6 +236,20 @@ func boundedWorker(raw []byte) bool {
 		}
 	}
 	return true
+}
+
+// Match encoding/json's Unicode simple-fold key equivalence, including aliases
+// such as long s. Using strings.ToLower would miss those struct-key aliases.
+func foldObjectKey(key string) string {
+	return strings.Map(func(r rune) rune {
+		smallest := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < smallest {
+				smallest = next
+			}
+		}
+		return smallest
+	}, key)
 }
 
 func validUUID(s string) bool {

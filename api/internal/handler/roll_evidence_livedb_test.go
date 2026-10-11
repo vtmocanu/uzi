@@ -116,7 +116,7 @@ func hostedWorkerParams(user uuid.UUID, name string) store.CreateHostedWorkerPar
 }
 
 func TestRollEvidencePollOverflowLiveDB(t *testing.T) {
-	h, pool, q, box, user := hostedLiveDB(t, "5")
+	h, pool, _, box, user := hostedLiveDB(t, "5")
 	ctx := context.Background()
 	// Isolate the complete-fleet boundary within a rolled-back transaction:
 	// do not alter earlier fixtures or leave 513 workers for later packages.
@@ -124,8 +124,8 @@ func TestRollEvidencePollOverflowLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx)
-	q = store.New(tx)
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
 	if _, err := tx.Exec(ctx, "UPDATE workers SET kind='external',hosted_size=NULL WHERE kind='hosted'"); err != nil {
 		t.Fatal(err)
 	}
