@@ -697,8 +697,9 @@ export function buildJudgePrompt(
 // captures the opening and the outcome either way.
 function sampleMessages(allMessages: WorkerRunMessage[]): string {
   // PRD #2603: a progress_note is a model-written Now line (or an empty usage-only/clear note),
-  // not evidence of what the run did; it never reaches the judge's input.
-  const messages = allMessages.filter((m) => m.kind !== "progress_note");
+  // not evidence of what the run did; it never reaches the judge's input. Issue #2686: a
+  // summary_usage message is accounting for a summary pass, likewise not run behaviour.
+  const messages = allMessages.filter((m) => m.kind !== "progress_note" && m.kind !== "summary_usage");
   const render = (m: WorkerRunMessage): string => {
     const who = m.agent ? `${m.kind}/${m.agent}` : m.kind;
     let body: string;

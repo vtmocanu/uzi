@@ -28,6 +28,10 @@ import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // t
 import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; // leaf value import (no runtime dep on codex-executor)
 import type { DeliveryContext } from "./pr-description-context.js";
 import type { PrDescriptionDiagram } from "./protocol.js";
+import type { AdviceUsageSnapshot } from "./harness.js";
+
+/** Which summary pass a usage report belongs to (the `summary_usage` message's `pass`). */
+export type SummaryPassName = "intent" | "plan" | "pr_description";
 import { isValidModel } from "./models.js";
 import { errMessage } from "./util.js";
 import { summaryModelTimeoutMs } from "./config.js";
@@ -89,6 +93,13 @@ export interface IntentSummaryInput {
   issueTitle: string;
   issueBody: string;
   prdText?: string | null;
+  /** Issue #2686: receives the pass's observed model usage AT MOST ONCE, only when the
+   *  harness observed usage evidence (success, error result, timeout and abort alike). A pass
+   *  that ended with no evidence logs `summary pass usage unavailable` and never calls this. */
+  onUsage?(modelUsage: AdviceUsageSnapshot): void;
+  /** Issue #2686: an external abort. Rejects the pass at once (the generation then returns
+   *  null) and still delivers any already-observed usage through `onUsage`. */
+  signal?: AbortSignal;
 }
 
 export interface PlanSummaryInput extends IntentSummaryInput {
@@ -131,6 +142,8 @@ export interface DeliverySummaryInput {
    *  one publication ({@link SummaryRunner.deliverySummaryDeadline}). A pass gets
    *  min(modelTimeoutMs, deadline - now). */
   deadlineMs: number;
+  /** Issue #2686: as {@link IntentSummaryInput.onUsage}, for the PR-description editor pass. */
+  onUsage?(modelUsage: AdviceUsageSnapshot): void;
 }
 
 export type DeliveryScopeKind = "added" | "changed" | "dropped" | "deferred";
@@ -278,6 +291,7 @@ export class SummaryRunner {
     }
     if (harness === null) return null;
     let text: string;
+    const reportUsage = this.usageReporter("pr_description", input.onUsage);
     try {
       text = await runReadOnlyModelPass({
         ...harness,
@@ -290,10 +304,13 @@ export class SummaryRunner {
         queryFn: this.queryFn,
         denyReason: "the summary runner is read-only and runs no tools",
         log: this.log,
+        onUsage: reportUsage.onUsage,
       });
     } catch (err) {
+      reportUsage.finish();
       return fail("the model pass failed", err);
     }
+    reportUsage.finish();
     let out: DeliverySummary | null;
     try {
       out = parseDeliverySummary(text, (raw) => {
@@ -336,7 +353,7 @@ export class SummaryRunner {
     const prompt = buildIntentPrompt(input);
     let text: string;
     try {
-      text = await this.runModel(input.token, input.model, prompt);
+      text = await this.runModel("intent", input, prompt);
     } catch (err) {
       this.log.warn("intent summary generation failed", { error: errMessage(err) });
       return null;
@@ -357,7 +374,7 @@ export class SummaryRunner {
     const prompt = buildPlanPrompt(input);
     let text: string;
     try {
-      text = await this.runModel(input.token, input.model, prompt);
+      text = await this.runModel("plan", input, prompt);
     } catch (err) {
       this.log.warn("plan summary generation failed", { error: errMessage(err) });
       return null;
@@ -397,20 +414,47 @@ export class SummaryRunner {
    *  that aborts the SDK query AND rejects the race, and best-effort cleanup that never
    *  throws into the caller. Returns the accumulated text; THROWS on timeout or an error
    *  result so the public methods can catch → null. */
-  private async runModel(token: string, model: string, prompt: string): Promise<string> {
-    return runReadOnlyModelPass({
-      token,
-      model,
-      systemPrompt: SUMMARY_SYSTEM_PROMPT,
-      prompt,
-      homeRoot: this.homeRoot,
-      homePrefix: "uzi-summary-",
-      label: "summary",
-      timeoutMs: this.modelTimeoutMs,
-      queryFn: this.queryFn,
-      denyReason: "the summary runner is read-only and runs no tools",
-      log: this.log,
-    });
+  private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
+    const reportUsage = this.usageReporter(pass, input.onUsage);
+    try {
+      return await runReadOnlyModelPass({
+        token: input.token,
+        model: input.model,
+        systemPrompt: SUMMARY_SYSTEM_PROMPT,
+        prompt,
+        homeRoot: this.homeRoot,
+        homePrefix: "uzi-summary-",
+        label: "summary",
+        timeoutMs: this.modelTimeoutMs,
+        queryFn: this.queryFn,
+        denyReason: "the summary runner is read-only and runs no tools",
+        log: this.log,
+        onUsage: reportUsage.onUsage,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+    } finally {
+      reportUsage.finish();
+    }
+  }
+
+  /** Wraps a caller's usage callback for one pass. The pass delivers usage in its own finally,
+   *  before it settles, so {@link finish} (called once the pass has settled) can tell a pass
+   *  that observed no usage evidence: that spend is unknown, so it is logged and never
+   *  reported as a zero row. */
+  private usageReporter(
+    pass: SummaryPassName,
+    onUsage: ((u: AdviceUsageSnapshot) => void) | undefined,
+  ): { onUsage: (u: AdviceUsageSnapshot) => void; finish: () => void } {
+    let reported = false;
+    return {
+      onUsage: (u) => {
+        reported = true;
+        onUsage?.(u);
+      },
+      finish: () => {
+        if (!reported) this.log.warn("summary pass usage unavailable", { pass });
+      },
+    };
   }
 }
 

@@ -425,3 +425,26 @@ func TestProgressNoteKindHidden(t *testing.T) {
 		t.Errorf("JSON mode must keep the note: %s", jout)
 	}
 }
+
+func TestAccountingSummaryUsageKindHidden(t *testing.T) {
+	payload := json.RawMessage(`{"pass":"plan","model_usage":{}}`)
+	if !isAccountingMessage("summary_usage", payload) {
+		t.Error("summary_usage must be hidden")
+	}
+	frames := []laneFrame{{Kind: "summary_usage", Payload: payload}, {Kind: "text", Payload: json.RawMessage(`{}`)}}
+	if got := presentationFrames(frames); len(got) != 1 || got[0].Kind != "text" {
+		t.Errorf("presentationFrames kept the summary_usage frame: %v", got)
+	}
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{"r1": {
+		{Seq: 1, Kind: "summary_usage", Payload: json.RawMessage(`{"pass":"hidden-pass-name","model_usage":{}}`)},
+		msgDTO(2, "text", "lead", "", "", "visible text", time.Now()),
+	}}}
+	out, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if strings.Contains(out, "hidden-pass-name") || strings.Contains(out, "summary_usage") || !strings.Contains(out, "visible text") {
+		t.Errorf("human logs: %s", out)
+	}
+	jout, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--json")
+	if !strings.Contains(jout, "hidden-pass-name") {
+		t.Errorf("JSON mode must keep summary_usage: %s", jout)
+	}
+}

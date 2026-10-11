@@ -7632,6 +7632,12 @@ export class RunRunner {
       pass: this.deliverySummaryRunner(),
       log: runLog,
       emit: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      // Issue #2686: the PR-description editor pass's spend, emitted while the batcher is open
+      // (publishing is awaited before it closes); a fenced (lost) claim emits nothing.
+      emitUsage: (u) => {
+        if (flight.steering.claimFence() !== undefined) return;
+        batcher.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "pr_description", model_usage: u } });
+      },
       forgeRetry,
       headLagRetryMs: this.prDescriptionHeadLagMs,
     });
@@ -10111,6 +10117,8 @@ export class RunRunner {
         batcher.emit(m);
         nowSummary?.observeFrame(m);
       },
+      // Issue #2686: the same predicate the Now summary checks before a usage-only emit.
+      claimFenced: () => flight.steering.claimFence() !== undefined,
       // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
       usage: batcher.usage,
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.

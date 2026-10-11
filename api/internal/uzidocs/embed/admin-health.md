@@ -466,7 +466,8 @@ descending then model ID, with an **and more** row when further models exist.
 Usage from the [Now summary](run-activity.md#now-summary) is stored under a
 `progress_note:<model>` key; this check strips that prefix, so a summary-only
 model is named and counted under its real ID together with the run's own usage
-of it.
+of it. Usage from the intent, plan and PR-description summary passes is stored
+under `summary_pass:<model>`, and the check strips that prefix the same way.
 
 Any finding is `warn`; this check has no `danger` band. With no findings it
 is `ok`, with the summary **"no recent Codex usage on unpriced models"**.

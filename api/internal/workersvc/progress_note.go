@@ -7,9 +7,10 @@ package workersvc
 //
 //  1. INGEST (normalizeProgressNotePayload): the stored payload is rebuilt from scratch with
 //     only {text, milestone_id, model_usage}, each usage entry carrying the server-resolved
-//     costStatus (and costUSD when metered). Any other key is dropped, in particular `event`
-//     (a payload that says event:"result" would be read by the usage tail and the web fold as
-//     the end of a leg) and `usage` (the web fold would count it a second time).
+//     costStatus (and costUSD when metered). Any other key is dropped, in particular `usage`
+//     (the web fold's per-agent branch reads it without checking the kind, so it would be
+//     counted a second time) and `event` (defense in depth: every leg-end reader gates on kind
+//     status/error first, so it is harmless today).
 //  2. USAGE FOLD (foldProgressNoteUsage): the note's model_usage is folded into run_usage under
 //     its OWN key so it can neither collapse into, nor be collapsed by, the run's own result
 //     frames. adr/2603-progress-note-usage-key.md records why the key is
@@ -107,43 +108,7 @@ func normalizeProgressNotePayload(raw json.RawMessage, harness string) json.RawM
 	}
 	var usage map[string]json.RawMessage
 	if json.Unmarshal(in["model_usage"], &usage) == nil {
-		// Walk the RAW keys in sorted order (map iteration order is random and a re-delivered
-		// batch must normalise to the same rows). Two raw keys can sanitise to the same name
-		// (" m" and "m"): the first valid entry in raw-key order wins, a later duplicate is
-		// ignored. The cap then keeps the first maxProgressNoteModels valid names in that walk;
-		// an invalid entry never consumes a slot. Raw-key order and sanitised-name order can
-		// differ (leading whitespace sorts first), so the kept set is "first valid by raw key".
-		rawKeys := make([]string, 0, len(usage))
-		for k := range usage {
-			rawKeys = append(rawKeys, k)
-		}
-		sort.Strings(rawKeys)
-		dropped := 0
-		for _, rawKey := range rawKeys {
-			model := truncateRunes(strings.TrimSpace(runactivity.Sanitize(rawKey)), maxUsageModelRunes-len(progressNoteModelPrefix))
-			if model == "" {
-				continue
-			}
-			if _, dup := out.ModelUsage[model]; dup {
-				continue
-			}
-			mu, ok := normalizeProgressNoteModelUsage(usage[rawKey], harness, model)
-			if !ok {
-				continue
-			}
-			if len(out.ModelUsage) >= maxProgressNoteModels {
-				dropped++
-				continue
-			}
-			if out.ModelUsage == nil {
-				out.ModelUsage = map[string]progressNoteModelUsage{}
-			}
-			out.ModelUsage[model] = mu
-		}
-		if dropped > 0 {
-			slog.Warn("progress_note model_usage entries dropped past the cap",
-				"kept", len(out.ModelUsage), "dropped", dropped, "cap", maxProgressNoteModels)
-		}
+		out.ModelUsage = normalizeModelUsageMap(usage, harness, progressNoteModelPrefix, KindProgressNote)
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
@@ -151,6 +116,51 @@ func normalizeProgressNotePayload(raw json.RawMessage, harness string) json.RawM
 		return json.RawMessage(`{"text":"","milestone_id":""}`)
 	}
 	return b
+}
+
+// normalizeModelUsageMap normalises a raw model_usage object for a kind whose run_usage key
+// is prefix+model (progress_note and summary_usage share it). It walks the RAW keys in sorted
+// order (map iteration order is random and a re-delivered batch must normalise to the same
+// rows). Two raw keys can sanitise to the same name (" m" and "m"): the first valid entry in
+// raw-key order wins, a later duplicate is ignored. The cap then keeps the first
+// maxProgressNoteModels valid names in that walk; an invalid entry never consumes a slot.
+// Raw-key order and sanitised-name order can differ (leading whitespace sorts first), so the
+// kept set is "first valid by raw key". The model name is capped so prefix+model still fits
+// maxUsageModelRunes. Returns nil when nothing is kept.
+func normalizeModelUsageMap(usage map[string]json.RawMessage, harness, prefix, kind string) map[string]progressNoteModelUsage {
+	var kept map[string]progressNoteModelUsage
+	rawKeys := make([]string, 0, len(usage))
+	for k := range usage {
+		rawKeys = append(rawKeys, k)
+	}
+	sort.Strings(rawKeys)
+	dropped := 0
+	for _, rawKey := range rawKeys {
+		model := truncateRunes(strings.TrimSpace(runactivity.Sanitize(rawKey)), maxUsageModelRunes-len(prefix))
+		if model == "" {
+			continue
+		}
+		if _, dup := kept[model]; dup {
+			continue
+		}
+		mu, ok := normalizeProgressNoteModelUsage(usage[rawKey], harness, model)
+		if !ok {
+			continue
+		}
+		if len(kept) >= maxProgressNoteModels {
+			dropped++
+			continue
+		}
+		if kept == nil {
+			kept = map[string]progressNoteModelUsage{}
+		}
+		kept[model] = mu
+	}
+	if dropped > 0 {
+		slog.Warn(kind+" model_usage entries dropped past the cap",
+			"kept", len(kept), "dropped", dropped, "cap", maxProgressNoteModels)
+	}
+	return kept
 }
 
 // normalizeProgressNoteModelUsage keeps the known fields of one model_usage entry, each
@@ -264,7 +274,14 @@ func foldProgressNoteUsage(ctx context.Context, q usageFoldQuerier, run store.Ru
 	if err := json.Unmarshal(m.Payload, &p); err != nil || len(p.ModelUsage) == 0 {
 		return nil // malformed or usage-free note: nothing to fold, never fail the append
 	}
-	for model, mu := range p.ModelUsage {
+	return foldPrefixedModelUsage(ctx, q, run, sessionID, m, progressNoteModelPrefix, p.ModelUsage, "progress note")
+}
+
+// foldPrefixedModelUsage upserts one run_usage row per model_usage entry under
+// model = prefix+model, lineage_epoch = the frame's seq, lineage_index 0, usage_basis per_leg.
+// progress_note and summary_usage share it, so the two keys cannot drift apart.
+func foldPrefixedModelUsage(ctx context.Context, q usageFoldQuerier, run store.Run, sessionID string, m IncomingMessage, prefix string, usage map[string]progressNoteModelUsage, what string) error {
+	for model, mu := range usage {
 		if model == "" {
 			continue
 		}
@@ -272,7 +289,7 @@ func foldProgressNoteUsage(ctx context.Context, q usageFoldQuerier, run store.Ru
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 			RunID:               run.ID,
 			SessionID:           sessionID,
-			Model:               truncateRunes(progressNoteModelPrefix+model, maxUsageModelRunes),
+			Model:               truncateRunes(prefix+model, maxUsageModelRunes),
 			LineageEpoch:        m.Seq,
 			InputTokens:         nonNegTokens(mu.InputTokens),
 			CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
@@ -285,7 +302,7 @@ func foldProgressNoteUsage(ctx context.Context, q usageFoldQuerier, run store.Ru
 			LineageIndex:        0,
 			ClaimGeneration:     pgconv.Int8Ptr(m.ClaimGeneration),
 		}); err != nil {
-			return fmt.Errorf("fold progress note usage (run %s, model %s): %w", run.ID, model, err)
+			return fmt.Errorf("fold %s usage (run %s, model %s): %w", what, run.ID, model, err)
 		}
 	}
 	return nil

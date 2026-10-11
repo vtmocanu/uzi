@@ -181,6 +181,9 @@ export interface RunUsage {
    *  "subscription" when every entry is subscription, "" (rendered as unavailable) for a
    *  mix, any unreported entry, or no entries at all. */
   noteTotal: { fresh: number; cached: number; out: number; costUsd: number; costStatus: CostStatus | "" };
+  /** Issue #2686: the SummaryRunner passes' (intent / plan / PR description) usage, shaped
+   *  and resolved exactly like `noteTotal`. Included in `total`; rendered as its own row. */
+  summaryTotal: { fresh: number; cached: number; out: number; costUsd: number; costStatus: CostStatus | "" };
   /** cached / (fresh + cached) in [0,1] — the UNROUNDED truth.
    *
    *  NOT what the strip renders: `Math.round(this * 100)` reads "100% from cache" at
@@ -353,8 +356,27 @@ interface ModelFigures {
   costUsd: number; // costUSD, quantized to microdollars (see quantizeCost)
 }
 
-/** `maxProgressNoteModels` (progress_note.go): model_usage entries kept per note. */
+/** `maxProgressNoteModels` (progress_note.go): model_usage entries kept per progress_note
+ *  and per summary_usage message (the server's normalizers share the cap). */
 const MAX_NOTE_MODELS = 4;
+
+interface SideAcc {
+  total: RunUsage["noteTotal"];
+  entries: number;
+  metered: number;
+  subscription: number;
+  seen: Set<number>;
+}
+
+function newSideAcc(): SideAcc {
+  return {
+    total: { fresh: 0, cached: 0, out: 0, costUsd: 0, costStatus: "" },
+    entries: 0,
+    metered: 0,
+    subscription: 0,
+    seen: new Set<number>(),
+  };
+}
 
 const ZERO_MODEL: ModelFigures = { input: 0, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 };
 
@@ -563,6 +585,18 @@ function primaryModel(counts: Record<string, number>): { model: string | null; o
   return { model: entries[0][0], otherModels: entries.length - 1 };
 }
 
+/** True when a side total (Now notes or intent/plan/PR summaries) recorded any spend: the
+ *  one predicate behind the panel's side rows and `hasSideUsage`, so they cannot drift. */
+export function hasSpend(t: RunUsage["noteTotal"]): boolean {
+  return t.fresh + t.cached + t.out > 0 || t.costUsd > 0;
+}
+
+/** True when a summary pass or a Now note recorded spend, whether or not a result frame did. `hasConfirmed` is left alone (it means a result frame landed), so a
+ *  lead that failed before any result frame still earns the usage panel through this. */
+export function hasSideUsage(usage: RunUsage): boolean {
+  return hasSpend(usage.noteTotal) || hasSpend(usage.summaryTotal);
+}
+
 /**
  * Reduce a run's message list into its usage surfaces. Pure: same messages (and
  * `opts`) → same result, so React just re-runs it as the stream grows (Decision 9
@@ -632,11 +666,59 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
   // PRD #2603: the Now-summary notes' usage. It joins the model sums and the billed total
   // below but never a phase row or a per-agent row. `seenNoteSeqs` makes a replayed note
   // (ws -> REST overlap) count once, as the server's per-seq row does.
-  const noteTotal: RunUsage["noteTotal"] = { fresh: 0, cached: 0, out: 0, costUsd: 0, costStatus: "" };
-  let noteEntries = 0;
-  let noteMetered = 0;
-  let noteSubscription = 0;
-  const seenNoteSeqs = new Set<number>();
+  const noteAcc = newSideAcc();
+  const summaryAcc = newSideAcc();
+  const noteTotal = noteAcc.total;
+  const summaryTotal = summaryAcc.total;
+  // Folds one accounting-only message (progress_note / summary_usage) into modelSums
+  // under `<prefix>:<model>` and into `acc`. A replayed seq counts once, as the server's
+  // per-seq row does.
+  function foldSideUsage(
+    acc: SideAcc,
+    prefix: string,
+    seq: number,
+    payload: Record<string, unknown> | null | undefined,
+  ): void {
+    if (acc.seen.has(seq)) return;
+    acc.seen.add(seq);
+    const nu = rec(payload?.["model_usage"]);
+    if (!nu) return;
+    // The stored payload is already normalised by the server; this re-cap to the first
+    // MAX_NOTE_MODELS in sorted name order is only defensive.
+    const names = Object.keys(nu).filter((k) => k !== "").sort().slice(0, MAX_NOTE_MODELS);
+    for (const raw of names) {
+      const e = rec(nu[raw]);
+      if (!e) continue;
+      const meteredCost =
+        e["costStatus"] === "metered" && typeof e["costUSD"] === "number" && Number.isFinite(e["costUSD"]);
+      const cur: ModelFigures = {
+        input: tokens(e["inputTokens"]),
+        cacheCreation: tokens(e["cacheCreationInputTokens"]),
+        cached: tokens(e["cacheReadInputTokens"]),
+        out: tokens(e["outputTokens"]),
+        // The server stores the cost it resolved as costStatus + costUSD, so only a
+        // "metered" entry carries a dollar figure; anything else adds tokens and no cost,
+        // and is shown unavailable.
+        costUsd: meteredCost ? quantizeCost(e["costUSD"]) : 0,
+      };
+      acc.entries++;
+      if (meteredCost) acc.metered++;
+      else if (e["costStatus"] === "subscription") acc.subscription++;
+      const key = capModelID(`${prefix}:${raw}`);
+      const sum = modelSums.get(key) ?? ZERO_MODEL;
+      modelSums.set(key, {
+        input: sum.input + cur.input,
+        cacheCreation: sum.cacheCreation + cur.cacheCreation,
+        cached: sum.cached + cur.cached,
+        out: sum.out + cur.out,
+        costUsd: sum.costUsd + cur.costUsd,
+      });
+      acc.total.fresh += cur.input + cur.cacheCreation;
+      acc.total.cached += cur.cached;
+      acc.total.out += cur.out;
+      acc.total.costUsd += cur.costUsd;
+    }
+  }
   // Whether ANY init frame has been seen yet: the run's FIRST init never opens a new
   // lineage (lineage 0 is the initial session whether or not its first init is flagged).
   let sawInit = false;
@@ -667,45 +749,14 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     // never max-merged with the run's own frame of the same model. It never reaches the
     // per-agent branch below.
     if (m.kind === "progress_note") {
-      if (seenNoteSeqs.has(m.seq)) continue;
-      seenNoteSeqs.add(m.seq);
-      const nu = rec(payload?.["model_usage"]);
-      if (!nu) continue;
-      // The stored payload is already normalised by the server (normalizeProgressNotePayload);
-      // this re-cap to the first MAX_NOTE_MODELS in sorted name order is only defensive.
-      const names = Object.keys(nu).filter((k) => k !== "").sort().slice(0, MAX_NOTE_MODELS);
-      for (const raw of names) {
-        const e = rec(nu[raw]);
-        if (!e) continue;
-        const noteMeteredCost =
-          e["costStatus"] === "metered" && typeof e["costUSD"] === "number" && Number.isFinite(e["costUSD"]);
-        const cur: ModelFigures = {
-          input: tokens(e["inputTokens"]),
-          cacheCreation: tokens(e["cacheCreationInputTokens"]),
-          cached: tokens(e["cacheReadInputTokens"]),
-          out: tokens(e["outputTokens"]),
-          // The server stores the cost it resolved (its standard table for an unpriced
-          // Claude note) as costStatus + costUSD, so only a "metered" entry carries a
-          // dollar figure; anything else adds tokens and no cost, and is shown unavailable.
-          costUsd: noteMeteredCost ? quantizeCost(e["costUSD"]) : 0,
-        };
-        noteEntries++;
-        if (noteMeteredCost) noteMetered++;
-        else if (e["costStatus"] === "subscription") noteSubscription++;
-        const key = capModelID(`progress_note:${raw}`);
-        const sum = modelSums.get(key) ?? ZERO_MODEL;
-        modelSums.set(key, {
-          input: sum.input + cur.input,
-          cacheCreation: sum.cacheCreation + cur.cacheCreation,
-          cached: sum.cached + cur.cached,
-          out: sum.out + cur.out,
-          costUsd: sum.costUsd + cur.costUsd,
-        });
-        noteTotal.fresh += cur.input + cur.cacheCreation;
-        noteTotal.cached += cur.cached;
-        noteTotal.out += cur.out;
-        noteTotal.costUsd += cur.costUsd;
-      }
+      foldSideUsage(noteAcc, "progress_note", m.seq, payload);
+      continue;
+    }
+    // Issue #2686: a SummaryRunner pass's usage folds the same way under
+    // `summary_pass:<model>` (lineage_epoch = the message's seq, so each pass is its own
+    // row and passes SUM). Never a phase row or a per-agent row.
+    if (m.kind === "summary_usage") {
+      foldSideUsage(summaryAcc, "summary_pass", m.seq, payload);
       continue;
     }
 
@@ -882,13 +933,14 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     { fresh: 0, cached: 0, out: 0, costUsd: 0, turns: 0, durationMs: 0, phaseCount: 0 },
   );
 
-  if (noteEntries > 0 && noteMetered === noteEntries) noteTotal.costStatus = "metered";
-  else if (noteEntries > 0 && noteSubscription === noteEntries) noteTotal.costStatus = "subscription";
-
-  total.fresh += noteTotal.fresh;
-  total.cached += noteTotal.cached;
-  total.out += noteTotal.out;
-  total.costUsd += noteTotal.costUsd;
+  for (const acc of [noteAcc, summaryAcc]) {
+    if (acc.entries > 0 && acc.metered === acc.entries) acc.total.costStatus = "metered";
+    else if (acc.entries > 0 && acc.subscription === acc.entries) acc.total.costStatus = "subscription";
+    total.fresh += acc.total.fresh;
+    total.cached += acc.total.cached;
+    total.out += acc.total.out;
+    total.costUsd += acc.total.costUsd;
+  }
 
   const inTotal = total.fresh + total.cached;
   const agents: AgentUsage[] = [...agentMap.values()].map((a) => ({ ...a, ...primaryModel(a.modelCounts) }));
@@ -921,6 +973,7 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     phases,
     total,
     noteTotal,
+    summaryTotal,
     modelTotals,
     cacheHitRatio: inTotal > 0 ? total.cached / inTotal : 0,
     model,
