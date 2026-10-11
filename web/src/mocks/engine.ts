@@ -461,6 +461,7 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
         // PRD #122: the re-gate still shows the milestones as PRE-APPROVAL candidates.
         patchRun(runId, {
           status: "awaiting_approval",
+          is_revising: false,
           plan_md: plan,
           gate_revision: (getRun(runId)?.gate_revision ?? 0) + 1,
           milestones_candidate: HEARTBEAT_MILESTONES,
@@ -640,6 +641,9 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       const round = countPlanFeedback(runId) + 1;
       appendMessage(runId, "plan_feedback", null, { feedback: body });
       appendMessage(runId, "plan_revising", "lead", { round });
+      // Mirrors the server's runToDTO: the latest plan-family message is plan_revising, so
+      // is_revising is true and progress derives to "planning" until the next plan lands.
+      patchRun(runId, { is_revising: true });
       schedule(runId, revisedPlanScript(runId, body));
       return null;
     }

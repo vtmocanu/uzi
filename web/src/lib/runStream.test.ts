@@ -84,6 +84,15 @@ describe("applyFrame", () => {
     expect(other.effects.refreshRun).toBe(false);
   });
 
+  it.each(["plan", "plan_revising"])(
+    "asks for a run refresh on a %s frame (flips the server-derived is_revising, issue #2760)",
+    (kind) => {
+      const s = ingestMany(emptyStream(), [msg(1)]).state;
+      const r = applyFrame(s, { type: "message", seq: 2, kind, payload: {} });
+      expect(r.effects).toEqual({ replay: false, refreshRun: true });
+    },
+  );
+
   it("asks for a run refresh on an empty-text progress_note (the clear note, PRD #2603 AC2)", () => {
     const s = ingestMany(emptyStream(), [msg(1)]).state;
     const clear = applyFrame(s, { type: "message", seq: 2, kind: "progress_note", payload: { text: "" } });

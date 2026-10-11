@@ -190,6 +190,18 @@ describe("mock engine: revise_plan no longer falls through (PRD #41, fixed with 
     expect(messagesOfKind("plan").length).toBeGreaterThan(0);
   });
 
+  it("flags the run revising (progress planning) until the next plan lands (issue #2760)", () => {
+    handleInput(RUN_ID, "revise_plan", "use the sweeper's window");
+    const revising = state.runs.get(RUN_ID)!;
+    expect(revising.status).toBe("awaiting_approval");
+    expect(revising.is_revising).toBe(true);
+    expect(revising.progress?.state).toBe("planning");
+    drain();
+    const regated = state.runs.get(RUN_ID)!;
+    expect(regated.is_revising).toBe(false);
+    expect(regated.progress?.state).toBe("waiting");
+  });
+
   it("does not consume human rounds for automatic feedback in a mixed feed", () => {
     appendMessage(RUN_ID, "plan_feedback", "lead", { feedback: "auto first", automatic: true, cross_check_round: 1 });
     appendMessage(RUN_ID, "plan_feedback", "lead", { feedback: "auto second", automatic: true, cross_check_round: 2 });
@@ -237,6 +249,13 @@ describe("the board card follows the run it names", () => {
     const open = latestQuestion()!;
     handleInput(RUN_ID, "answer", encodeAnswerBody(open.questionId, open.questions.map(() => "ok")));
     expect(cardFor(RUN_ID)!.latest_run!.status).toBe("running");
+  });
+
+  it("mirrors is_revising onto the card through a revise cycle (issue #2760)", () => {
+    handleInput(RUN_ID, "revise_plan", "tighten it");
+    expect(cardFor(RUN_ID)!.latest_run!.is_revising).toBe(true);
+    drain();
+    expect(cardFor(RUN_ID)!.latest_run!.is_revising).toBe(false);
   });
 
   it("carries the stop signal too, so a cancelled card reads 'stopped' not 'failed'", () => {

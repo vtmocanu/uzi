@@ -2841,6 +2841,12 @@ export interface Run {
    *  omits the key, and an absent value reads as not-planning (isPlanningRun requires
    *  `=== true`). RunListItem extends Run, so list rows inherit it. */
   is_planning?: boolean;
+  /** issue #750/#2760: server-computed plan-revise display flag — true while the run's
+   *  latest {plan, plan_revising} message is a plan_revising (a "revise" replan in
+   *  flight). Meaningful only with status awaiting_approval: isRevisingRun combines the
+   *  two. OPTIONAL for the SAME rollout skew as is_planning: a pre-feature api pod omits
+   *  the key, and an absent value reads as not-revising. */
+  is_revising?: boolean;
   /** PRD #2602: server-derived progress estimate; null for a terminal run. OPTIONAL for the
    *  same api/web rollout skew as is_planning: a pre-feature api omits the key, and absent
    *  renders no progress. */
@@ -3616,15 +3622,6 @@ export interface RunListItem extends Run {
    *  appends it only when > 0. */
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
-
-  /** issue #750: server-computed plan-revise display flag on the LIST row (it rides
-   *  RunListItemDTO, deliberately NOT RunDTO — the detail page keeps its own
-   *  derivePlanRevision panel). True while the run's latest {plan, plan_revising} message
-   *  is a plan_revising — a "revise" replan in flight. The server does NOT status-gate
-   *  it, so a client combines it with status (isRevisingRun requires status ===
-   *  "awaiting_approval" AND `=== true`). OPTIONAL for rollout skew: a pre-feature api
-   *  pod omits the key, and an absent value reads as not-revising. */
-  is_revising?: boolean;
 
   repo_path: string;
   worker_name: string | null;
