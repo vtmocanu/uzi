@@ -1138,6 +1138,30 @@ describe("rework: local custody, holds and stale markers", () => {
     assert.equal(fs.existsSync(plain.path), false);
   });
 
+  it("a malformed marker naming the path (or an overflowing run) makes retire, remove and detach refuse too", async () => {
+    const c = await seedCanonical("run-m", 2620);
+    fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
+    const planted = JSON.stringify({ version: 1, runId: c.runId, clonePath: c.path, extra: "key" });
+    gitIn(bare, ["config", "--local", "--add", `uzi-stopped.${c.runId}.entry`, planted]);
+    const before = configBytes();
+    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), RetainedStoppedSourceError);
+    await assert.rejects(git.removeRunnerClone(c.path, c.runId), RetainedStoppedSourceError);
+    await assert.rejects(git.detachTerminalRetained(bare, c.branch, c.key, JSON.parse(journalRaw(c.branch))), RetainedStoppedSourceError);
+    assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n", "the dirty clone stays");
+    assert.deepEqual(configBytes(), before);
+    gitIn(bare, ["config", "--local", "--unset-all", `uzi-stopped.${c.runId}.entry`]);
+    for (let i = 0; i < 65; i++) gitIn(bare, ["config", "--local", "--add", `uzi-stopped.${c.runId}.entry`, `{"n":${i}}`]);
+    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), RetainedStoppedSourceError);
+    await assert.rejects(git.removeRunnerClone(c.path, c.runId), RetainedStoppedSourceError);
+    assert.ok(fs.existsSync(c.path));
+  });
+
+  it("the marker comparison resolves the caller's path (a trailing slash does not bypass it)", async () => {
+    const c = await markedCanonical("run-c", 2600, 3);
+    await assert.rejects(git.removeRunnerClone(`${c.path}/`, c.runId), RetainedStoppedSourceError);
+    assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n");
+  });
+
   it("discarding one marked source never retires the marker of a source whose path it prefixes (issue-26 vs issue-260)", async () => {
     const short = await markedCanonical("run-m", 26, 1);
     const long = await markedCanonical("run-m", 260, 2);
@@ -1206,6 +1230,40 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     gitIn(a.path, ["update-index", "--skip-worktree", "work.txt"]);
     assert.equal(await verify(a, head), "not_covered", "skip-worktree");
   });
+
+  it("a clone config that moves the excludes file or the worktree root is not covered", async () => {
+    const { a, head } = await captured();
+    const ignores = path.join(a.path, "..", "evil-excludes");
+    fs.writeFileSync(ignores, "hidden.txt\n");
+    gitIn(a.path, ["config", "core.excludesFile", ignores]);
+    assert.equal(await verify(a, head), "covered");
+    fs.writeFileSync(path.join(a.path, "hidden.txt"), "unpreserved\n");
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "the clone's own config really hides it");
+    assert.equal(await verify(a, head), "not_covered", "core.excludesFile");
+    fs.rmSync(path.join(a.path, "hidden.txt"));
+    gitIn(a.path, ["config", "--unset", "core.excludesFile"]);
+    assert.equal(await verify(a, head), "covered");
+
+    const elsewhere = fs.mkdtempSync(path.join(path.dirname(a.path), "elsewhere-"));
+    gitIn(a.path, ["config", "core.worktree", elsewhere]);
+    fs.appendFileSync(path.join(a.path, "work.txt"), "unpreserved\n");
+    assert.equal(await verify(a, head), "not_covered", "core.worktree");
+  });
+
+  it("a clone with a filter driver configured or an info/attributes file is not covered", async () => {
+    const { a, head } = await captured();
+    gitIn(a.path, ["config", "filter.lfsish.clean", "cat"]);
+    assert.equal(await verify(a, head), "not_covered", "filter config");
+    gitIn(a.path, ["config", "--unset", "filter.lfsish.clean"]);
+    assert.equal(await verify(a, head), "covered");
+    fs.mkdirSync(path.join(a.path, ".git", "info"), { recursive: true });
+    fs.writeFileSync(path.join(a.path, ".git", "info", "attributes"), "* -diff\n");
+    assert.equal(await verify(a, head), "not_covered", "info/attributes");
+  });
+
+  // core.trustctime=false with a same-size edit and a restored mtime cannot be reproduced reliably
+  // here (the index stat data, including the ctime, changes with the edit and the filesystem's ctime
+  // granularity decides whether git re-reads the content), so that override has no test.
 });
 
 describe("rework: discard under the residue quarantine and a failed delete", () => {
@@ -1242,6 +1300,28 @@ describe("rework: discard under the residue quarantine and a failed delete", () 
     assert.equal(result.kind === "unknown" ? result.metadata : "", "kept");
     assert.ok(fs.existsSync(e.sourcePath) !== fs.existsSync(e.successorPath), "exactly one source remains");
     assert.equal(cfgAll(`uzi-recovery.${e.branch}.clone`).length, 1, "the journal is kept");
+  });
+
+  it("a latch landing after the skills sibling delete keeps the clone of the same source", async () => {
+    let calls = 0;
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      retentionDelete: {
+        split: true,
+        run: async (_command, args) => {
+          fs.rmSync(args.at(-1)!, { recursive: true, force: true });
+          if (++calls === 1) latchResidueQuarantine({ cause: "test", site: "test" });
+        },
+      },
+    }));
+    const planted = plantAttempt("agent/issue-3002", "issue-3002", attemptIdAt(5), "run-l1", "reclaimed");
+    const sel: RetainedSourceSelector = { runId: "run-l1", generation: 1, attempt: attemptIdAt(5) };
+    const ev = await inspectOne(sel);
+    const result = await git.discardStoppedSource(discardOpts(sel, ev.descriptor));
+    assert.equal(result.kind, "unknown", JSON.stringify(result));
+    assert.equal(calls, 1, "the clone delete never started");
+    assert.equal(fs.existsSync(planted.skills), false, "the skills sibling went first");
+    assert.ok(fs.existsSync(planted.dir), "the clone remains");
+    assert.equal(ledgerState("agent/issue-3002", attemptIdAt(5)), "reclaimed");
   });
 
   it("a delete that reports success while the path is still present keeps the metadata", async () => {

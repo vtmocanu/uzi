@@ -4620,7 +4620,7 @@ export class GitCache {
   async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
     expected = parseRecoveryJournal(JSON.stringify(expected));
     await this.withLock(barePath, async () => {
-      await this.refuseMarkedPaths(barePath, this.recoverySources(expected).map((x) => x.clonePath));
+      await this.refuseMarkedPaths(barePath, this.recoverySources(expected).map((x) => x.clonePath), expected.runId);
       const records = await this.protectedRecoveries(barePath);
       const prior = records.find(r => r.journal.runId === expected.runId);
       const value = JSON.stringify({ version: 1, branch, key, journal: expected });
@@ -5338,15 +5338,26 @@ export class GitCache {
     }
   }
 
-  /** Under the bare lock: refuse (throw, keep everything) when a VALID stopped marker names exactly
-   *  one of `paths`, so a marked canonical source is never retired, moved or detached out from under
+  /** Under the bare lock: refuse (throw, keep everything) when a stopped marker names one of `paths`
+   *  (compared resolved), or unattributable marker evidence does (malformed text naming a path, or an
+   *  overflowing `runId`), so a marked canonical source is never retired, moved or detached out from under
    *  its marker (which would leave a stale marker that could later rebind to other work). */
-  private async refuseMarkedPaths(barePath: string, paths: string[]): Promise<void> {
+  private async refuseMarkedPaths(barePath: string, paths: string[], runId?: string): Promise<void> {
     const markers = await this.readStoppedMarkers(barePath);
+    const wanted = paths.map((x) => path.resolve(x));
     for (const { marker } of markers.valid) {
-      if (paths.includes(marker.clonePath)) {
+      if (wanted.includes(path.resolve(marker.clonePath))) {
         throw new RetainedStoppedSourceError({ runId: marker.runId, generation: marker.generation, clonePath: marker.clonePath });
       }
+    }
+    // Fail closed on unattributable evidence, by the rule of assertNoStoppedMarker: a malformed
+    // marker whose text names a path, or an overflowing run whose marker text names one.
+    for (const m of markers.malformed) {
+      const hit = paths.find((x) => m.raw.includes(JSON.stringify(path.resolve(x)).slice(1, -1)));
+      if (hit !== undefined) throw new RetainedStoppedSourceError({ runId: m.runId, generation: "unknown", clonePath: hit });
+    }
+    if (runId !== undefined && markers.overflow.has(runId)) {
+      throw new RetainedStoppedSourceError({ runId, generation: "unknown", clonePath: paths[0] ?? "" });
     }
   }
 
@@ -5525,14 +5536,31 @@ export class GitCache {
 
   /**
    * Is the clone's tracked and untracked non-ignored state provably empty? The clone's own git
-   * config is runner-writable, so the proof does not trust it: command-line `-c` overrides turn
-   * every untracked file into a status entry and disable the untracked cache and the fsmonitor, and
-   * the index flags are read separately, because an assume-unchanged or skip-worktree entry hides a
-   * modified tracked file from `status`. Any such flag, any entry, or any failed read is `false`.
+   * config is runner-writable, so the proof does not take its settings on trust: command-line `-c`
+   * overrides pin the excludes file, the worktree root, the stat and ctime checks and the file-mode
+   * check, turn every untracked file into a status entry and disable the untracked cache and the
+   * fsmonitor, and the index flags are read separately, because an assume-unchanged or
+   * skip-worktree entry hides a modified tracked file from `status`. Clean and smudge filters
+   * cannot be blanket-disabled, so a clone with `.git/info/attributes` or any `filter.` config key
+   * is not provable (false). What IS still trusted: the ignore rules of the tree's `.gitignore`
+   * files and of `.git/info/exclude`, which define the scope the WIP capture's `git add -A`
+   * honours too, so an ignored file is outside both. Any such flag, any entry, or any failed read
+   * is `false`.
    */
   private async worktreeCleanHardened(cwd: string): Promise<boolean> {
-    const hardened = ["-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false"];
+    const hardened = [
+      "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
+      "-c", "core.checkStat=default", "-c", "core.fileMode=true",
+      "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
+    ];
     try {
+      const attributes = await fs.lstat(path.join(cwd, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      });
+      if (attributes) return false;
+      const config = await this.runGitAsRunner(cwd, ["config", "--local", "--null", "--list"]);
+      if (config.split("\0").some((e) => /^filter\./i.test(e))) return false;
       const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain"]);
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"]);
@@ -6201,8 +6229,13 @@ export class GitCache {
               try {
                 // The skills sibling first (see sweepRetainedArtifacts): a failed clone delete then
                 // orphans nothing.
-                if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills)) ||
-                    !(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base))) {
+                if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills))) {
+                  outcomes[i]!.outcome = "retained";
+                  continue;
+                }
+                // A latch that landed during the skills delete keeps the clone itself.
+                if (residueQuarantine() !== undefined) return stopped();
+                if (!(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base))) {
                   outcomes[i]!.outcome = "retained";
                   continue;
                 }
@@ -7662,7 +7695,7 @@ export class GitCache {
       if (path.dirname(parent) === path.resolve(this.runnerRoot)) {
         const bare = path.join(this.reposRoot, `${path.basename(parent)}.git`);
         if (await this.pathPresent(bare)) {
-          await this.withLock(bare, () => this.refuseMarkedPaths(bare, [path.resolve(clonePath)]));
+          await this.withLock(bare, () => this.refuseMarkedPaths(bare, [path.resolve(clonePath)], ownerRunId));
         }
       }
     }
@@ -7762,7 +7795,7 @@ export class GitCache {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
       }
       // issue #1786: a marked stopped canonical source is retired only by the operator discard.
-      await this.refuseMarkedPaths(barePath, [clonePath]);
+      await this.refuseMarkedPaths(barePath, [clonePath], ownerRunId);
       const verified = opts.verifiedSuccessor;
       let anchored: RecoveryJournalEntry | undefined;
       if (verified) {
