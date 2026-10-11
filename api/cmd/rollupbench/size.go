@@ -94,15 +94,19 @@ func footprint(ctx context.Context, pool *pgxpool.Pool) (int64, error) {
 	return n, err
 }
 
-// WALStat is the WAL a phase generated.
+// WALStat is the WAL a phase generated. LSNBytes (insert-LSN delta) is authoritative; the
+// pg_stat_wal counters are cross-checks and are read only after they stop moving.
 type WALStat struct {
 	LSNBytes      int64              `json:"lsn_bytes"`
 	WALBytes      int64              `json:"pg_stat_wal_bytes"`
 	WALFPI        int64              `json:"wal_fpi"`
 	WALRecords    int64              `json:"wal_records"`
+	StatsSettled  bool               `json:"pg_stat_wal_settled"`
+	StatsPolls    int                `json:"pg_stat_wal_polls"`
 	Checkpointer  map[string]float64 `json:"checkpointer_delta"`
 	DurationSec   float64            `json:"duration_s"`
 	WALBytesPerSc float64            `json:"wal_mb_per_s"`
+	endLSN        string
 }
 
 type walMark struct {
@@ -130,13 +134,20 @@ func checkpointerStats(ctx context.Context, pool *pgxpool.Pool) (map[string]floa
 	return out, nil
 }
 
-// markWAL resets pg_stat_wal and notes the current LSN and checkpointer counters.
+// statsSettleTimeout bounds how long endWAL waits for pg_stat_wal to stop moving.
+const statsSettleTimeout = 15 * time.Second
+
+// markWAL resets pg_stat_wal and notes the current insert LSN and checkpointer counters.
+// Backends report their pending statistics when their connection closes, so the pool is reset
+// first: counters a previous phase left unreported in an idle backend can then not land in the
+// new window after the reset.
 func markWAL(ctx context.Context, pool *pgxpool.Pool) (walMark, error) {
 	m := walMark{t: time.Now(), taken: true}
+	pool.Reset()
 	if _, err := pool.Exec(ctx, `SELECT pg_stat_reset_shared('wal')`); err != nil {
 		return m, err
 	}
-	if err := pool.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&m.lsn); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT pg_current_wal_insert_lsn()::text`).Scan(&m.lsn); err != nil {
 		return m, err
 	}
 	var err error
@@ -144,19 +155,37 @@ func markWAL(ctx context.Context, pool *pgxpool.Pool) (walMark, error) {
 	return m, err
 }
 
-// endWAL reads the counters since mark. pg_stat_wal is flushed lazily by the writing backends
-// (at most about once a second), so it waits that long first; the LSN delta is authoritative.
+// endWAL reads the counters since mark. The pool is reset so every backend that wrote reports
+// its statistics as its connection closes, then pg_stat_wal is polled until two reads 300 ms
+// apart agree (StatsSettled), or statsSettleTimeout passes (StatsSettled false: the
+// pg_stat_wal figures are then a lower bound). The LSN delta does not depend on any of that.
 func endWAL(ctx context.Context, pool *pgxpool.Pool, m walMark) (WALStat, error) {
 	var w WALStat
 	w.DurationSec = time.Since(m.t).Seconds()
-	if _, err := pool.Exec(ctx, `SELECT pg_sleep(1.2)`); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT pg_current_wal_insert_lsn()::text, pg_wal_lsn_diff(pg_current_wal_insert_lsn(), $1::pg_lsn)::bigint`, m.lsn).Scan(&w.endLSN, &w.LSNBytes); err != nil {
 		return w, err
 	}
-	if err := pool.QueryRow(ctx, `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::pg_lsn)::bigint`, m.lsn).Scan(&w.LSNBytes); err != nil {
-		return w, err
-	}
-	if err := pool.QueryRow(ctx, `SELECT wal_bytes::bigint, wal_fpi, wal_records FROM pg_stat_wal`).Scan(&w.WALBytes, &w.WALFPI, &w.WALRecords); err != nil {
-		return w, err
+	pool.Reset()
+	deadline := time.Now().Add(statsSettleTimeout)
+	prev := int64(-1)
+	for {
+		if err := pool.QueryRow(ctx, `SELECT wal_bytes::bigint, wal_fpi, wal_records FROM pg_stat_wal`).Scan(&w.WALBytes, &w.WALFPI, &w.WALRecords); err != nil {
+			return w, err
+		}
+		w.StatsPolls++
+		if w.WALBytes == prev {
+			w.StatsSettled = true
+			break
+		}
+		prev = w.WALBytes
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return w, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
 	}
 	after, err := checkpointerStats(ctx, pool)
 	if err != nil {
@@ -172,6 +201,13 @@ func endWAL(ctx context.Context, pool *pgxpool.Pool, m walMark) (WALStat, error)
 		w.WALBytesPerSc = float64(w.LSNBytes) / w.DurationSec / (1 << 20)
 	}
 	return w, nil
+}
+
+// lsnGap is the WAL between two insert LSNs.
+func lsnGap(ctx context.Context, pool *pgxpool.Pool, from, to string) (int64, error) {
+	var n int64
+	err := pool.QueryRow(ctx, `SELECT pg_wal_lsn_diff($2::pg_lsn, $1::pg_lsn)::bigint`, from, to).Scan(&n)
+	return n, err
 }
 
 // Fingerprint is the shape of the loaded corpus, so a later run on a real export can be compared.
@@ -191,6 +227,7 @@ type Fingerprint struct {
 	AvgRowWidth  float64                     `json:"avg_row_width_pg_stats"`
 	RunIDCorr    *float64                    `json:"run_id_correlation"`
 	LargestMsg   int64                       `json:"largest_message_payload_bytes"`
+	LargestTermM int64                       `json:"largest_terminal_run_message_payload_bytes"`
 	RunSizes     map[string]int64            `json:"run_message_count_percentiles"`
 }
 
@@ -236,6 +273,10 @@ func fingerprint(ctx context.Context, pool *pgxpool.Pool, label, note string, in
 		f.ToastShare = float64(f.ToastBytes) / float64(t)
 	}
 	if err := pool.QueryRow(ctx, `SELECT coalesce(sum(avg_width), 0)::float8 FROM pg_stats WHERE tablename = 'run_messages' AND schemaname = 'public'`).Scan(&f.AvgRowWidth); err != nil {
+		return f, err
+	}
+	if err := pool.QueryRow(ctx, `SELECT coalesce(max(octet_length(m.payload::text)), 0) FROM run_messages m JOIN runs r ON r.id = m.run_id
+		WHERE r.status IN ('completed','failed','cancelled')`).Scan(&f.LargestTermM); err != nil {
 		return f, err
 	}
 	var corr *float64

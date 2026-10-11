@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 var testSpecs = []CodecSpec{{codecFlate, 6}, {codecZstd, 3}}
@@ -190,6 +192,55 @@ func TestDecompressionBombRejectedWithoutAllocatingBeyondBound(t *testing.T) {
 			t.Fatalf("%s bomb allocated %d bytes for a %d byte bound", name, grew, maxRaw)
 		}
 	}
+}
+
+// A zstd frame written through the streaming encoder carries no frame content size, so the
+// decoder cannot refuse it up front: only the declared header length can stop it.
+func TestZstdFrameWithoutContentSizeBoundedByDeclaredLength(t *testing.T) {
+	const maxRaw = 1 << 20
+	e := newTestEngine(t, maxRaw)
+	const huge = 64 << 20
+	var zb bytes.Buffer
+	zw, err := zstd.NewWriter(&zb, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithWindowSize(zstdWindow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeros := make([]byte, 1<<20)
+	for i := 0; i < huge/len(zeros); i++ {
+		if _, err := zw.Write(zeros); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if zb.Len() > 1<<20 {
+		t.Fatalf("frame is not small (%d bytes)", zb.Len())
+	}
+	frame := zb.Bytes()
+	if hasContentSize(frame) {
+		t.Fatal("test frame unexpectedly declares a content size")
+	}
+	for _, declared := range []int{1000, maxRaw} {
+		data := append(hdrFor(CodecSpec{codecZstd, 3}, declared, 0), frame...)
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, _, err := e.Decode(data)
+		runtime.ReadMemStats(&after)
+		if !errors.Is(err, errChunkLength) {
+			t.Fatalf("declared %d: got %v, want errChunkLength", declared, err)
+		}
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > 8*maxRaw {
+			t.Fatalf("declared %d: allocated %d bytes for a %d byte bound", declared, grew, maxRaw)
+		}
+	}
+}
+
+// hasContentSize reports whether a frame header carries the content-size field.
+func hasContentSize(frame []byte) bool {
+	var h zstd.Header
+	return h.Decode(frame) == nil && h.HasFCS
 }
 
 func TestTruncatedAndBitFlippedRejected(t *testing.T) {

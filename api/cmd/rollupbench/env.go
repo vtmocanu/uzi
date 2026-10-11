@@ -126,6 +126,10 @@ type Env struct {
 	RunDigest   map[uuid.UUID]string
 	ChatDigest  string
 	Seqs        map[uuid.UUID][]int
+
+	// CompactTotal is pg_total_relation_size(run_messages) of a fresh corpus clone after VACUUM
+	// FULL (0 when it could not be taken): the real-bytes pre-rollup size of every run.
+	CompactTotal int64
 }
 
 // dsnFor swaps the database name in a DSN.
@@ -143,15 +147,16 @@ func (e *Env) dropDB(ctx context.Context, name string) error {
 	return err
 }
 
-// createDB drops and recreates name, optionally from a template. A template cannot be copied
-// while any session is connected to it, so a busy refusal is retried briefly.
+// createDB drops and recreates name, optionally from a template. A template is cloned with
+// STRATEGY FILE_COPY (a file-level copy, no per-block WAL for the clone). A template cannot be
+// copied while any session is connected to it, so a busy refusal is retried briefly.
 func (e *Env) createDB(ctx context.Context, name, template string) error {
 	if err := e.dropDB(ctx, name); err != nil {
 		return err
 	}
 	stmt := `CREATE DATABASE ` + pgx.Identifier{name}.Sanitize()
 	if template != "" {
-		stmt += ` TEMPLATE ` + pgx.Identifier{template}.Sanitize()
+		stmt += ` TEMPLATE ` + pgx.Identifier{template}.Sanitize() + ` STRATEGY FILE_COPY`
 	}
 	var err error
 	for i := 0; i < 20; i++ {
@@ -220,4 +225,22 @@ func loadInfos(ctx context.Context, pool *pgxpool.Pool) ([]*RunInfo, error) {
 		}
 	}
 	return out, rows.Err()
+}
+
+// compactBaseline records the VACUUM FULL size of the whole corpus on a clone (see Env.CompactTotal).
+func (e *Env) compactBaseline(ctx context.Context) (int64, error) {
+	const name = "m0_compact"
+	if err := e.createDB(ctx, name, "m0_corpus"); err != nil {
+		return 0, err
+	}
+	defer func() { _ = e.dropDB(context.WithoutCancel(ctx), name) }()
+	pool, _, err := e.openDB(ctx, name, 2, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `VACUUM FULL run_messages`); err != nil {
+		return 0, err
+	}
+	return relTotal(ctx, pool, "run_messages")
 }

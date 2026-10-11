@@ -21,6 +21,8 @@
 #     container is created, inspected or removed.
 #   * results.json carries no DSN, no run id and no payload content: run ids are ordinals and
 #     the harness scrubs uuid- and DSN-shaped text before writing.
+#   * The backfill pauses UZI_M0_BACKFILL_SLEEP (default 50ms) between runs, as a throttled
+#     production backfill would.
 #   * Postgres runs with its stock settings (the harness tunes nothing); SHOW ALL is recorded
 #     in settings.json.
 set -euo pipefail
@@ -31,6 +33,9 @@ PORT="$(( 20000 + (RANDOM % 20000) ))"
 PGPASS="$(openssl rand -hex 16)"
 PGIMAGE="${UZI_ROLLUP_M0_PG_IMAGE:-postgres:17}"
 PGWAIT="${UZI_ROLLUP_M0_PG_WAIT_SECS:-120}"
+# Pause between runs during the backfill. The live-reader bar (C5) is judged on a throttled
+# backfill, so the default is not zero; the value is recorded in results.json meta.
+SLEEP="${UZI_M0_BACKFILL_SLEEP:-50ms}"
 
 usage() {
   echo "usage: $0 [--scale tiny|full] [--corpus-ndjson DIR] OUT_DIR" >&2
@@ -95,7 +100,7 @@ fi
 
 DSN="postgres://uzi:$PGPASS@127.0.0.1:$PORT/uzi?sslmode=disable"
 
-ARGS=(--dsn "$DSN" --i-own-this-db --out "$OUT" --scale "$SCALE" --text-root "$ROOT")
+ARGS=(--dsn "$DSN" --i-own-this-db --out "$OUT" --scale "$SCALE" --backfill-sleep "$SLEEP" --text-root "$ROOT")
 if [ -n "$NDJSON" ]; then
   ARGS+=(--corpus-ndjson "$NDJSON")
 fi

@@ -74,7 +74,7 @@ func parseOptions(args []string) (Options, error) {
 	fs.StringVar(&readers, "readers", "1,8,32", "concurrent reader counts")
 	fs.StringVar(&sleep, "backfill-sleep", "0s", "pause between runs during the backfill (throttle)")
 	fs.IntVar(&o.VacuumEvery, "vacuum-every", 10, "run (ii): plain VACUUM after every K runs (0 skips run (ii))")
-	fs.IntVar(&o.MaxChunksPerTx, "max-chunks-per-tx", 0, "chunks per rollup transaction (default 8 full, 1 tiny)")
+	fs.IntVar(&o.MaxChunksPerTx, "max-chunks-per-tx", 0, "most chunks one rollup transaction publishes; a bigger run takes several (default 8 full, 1 tiny)")
 	fs.IntVar(&o.LargeMin, "large-min", 0, "messages for the large stratum (default 20000 full, 1500 tiny)")
 	fs.StringVar(&o.TextRoot, "text-root", ".", "git checkout whose tracked text files feed the synthetic tool results")
 	if err := fs.Parse(args); err != nil {
@@ -254,6 +254,7 @@ func run(ctx context.Context, opt Options) error {
 			"cache":             "no application cache on the archived path; warm database cache (untimed warm-up per cell)",
 			"chunk_table":       chunkTable + " (data bytea, ALTER COLUMN data SET STORAGE EXTERNAL, PRIMARY KEY (run_id, first_seq)), watermark table " + archiveTable,
 			"read_transaction":  "REPEATABLE READ READ ONLY for every archived read and for the tx-wrapped live baseline",
+			"database_clone":    "CREATE DATABASE ... TEMPLATE m0_corpus STRATEGY FILE_COPY; the cost clone and the concurrency-check clone are separate databases",
 			"num_cpu":           runtime.NumCPU(),
 			"go_version":        runtime.Version(),
 			"scale_parameters":  opt.synth,
@@ -364,12 +365,19 @@ func run(ctx context.Context, opt Options) error {
 
 	corpus.Close()
 
+	lg.f("VACUUM FULL baseline of the whole corpus (real pre-rollup size)")
+	if env.CompactTotal, err = env.compactBaseline(ctx); err != nil {
+		res.Notes = append(res.Notes, "real-bytes pre-rollup baseline failed, C1 falls back to the row-byte model: "+scrub(err.Error()))
+	}
+	res.Baseline["run_messages_total_after_vacuum_full_of_whole_corpus"] = env.CompactTotal
+	_ = res.write(opt.Out)
+
 	// ---- configs ----
 	seenCodec := map[CodecID]bool{}
 	for i, sel := range selected {
 		first := !seenCodec[sel.Config.Spec.ID]
 		seenCodec[sel.Config.Spec.ID] = true
-		cr, err := env.runConfig(ctx, i, sel, first, &attrib)
+		cr, err := env.runConfig(ctx, i, sel, &attrib)
 		if cr != nil {
 			if err != nil {
 				cr.Overall = "incomplete: " + scrub(err.Error())
@@ -381,13 +389,24 @@ func run(ctx context.Context, opt Options) error {
 			_ = res.write(opt.Out)
 			continue
 		}
+		if first {
+			rep, cerr := env.runCorrectness(ctx, i, sel)
+			if rep == nil {
+				rep = &ConcurrencyReport{}
+			}
+			if cerr != nil {
+				rep.Failure = scrub(cerr.Error())
+				res.Notes = append(res.Notes, fmt.Sprintf("config %s concurrency check did not complete: %s", cr.Name, rep.Failure))
+			}
+			cr.Concurrency = rep
+		}
 		if opt.VacuumEvery > 0 {
 			lg.f("config %s: backfill with vacuum every %d runs", cr.Name, opt.VacuumEvery)
 			if cr.VacuumRun, err = env.runVacuumEvery(ctx, i, sel.Config); err != nil {
 				res.Notes = append(res.Notes, fmt.Sprintf("config %s periodic-vacuum run failed: %s", cr.Name, scrub(err.Error())))
 			}
 		}
-		evaluate(cr, live, &attrib, opt.Readers, fp.LargestMsg)
+		evaluate(cr, live, &attrib, opt.Readers, fp.LargestMsg, fp.LargestTermM)
 		_ = res.write(opt.Out)
 	}
 	res.Verdicts = map[string]any{}

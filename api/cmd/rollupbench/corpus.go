@@ -260,7 +260,7 @@ type synthParams struct {
 	LargeMin  int
 	TargetMiB int
 	Window    int
-	TextRoot  string
+	TextRoot  string `json:"-"` // a filesystem path: never serialised into results
 	BigMiB    int
 }
 

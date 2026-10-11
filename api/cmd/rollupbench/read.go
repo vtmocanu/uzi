@@ -54,6 +54,7 @@ type Shape struct {
 	Args     func(run uuid.UUID, sp ReadSpec) []any
 	Spec     func(last int) ReadSpec
 	Heavy    int // iteration divisor: heavier shapes run fewer iterations (recorded in results)
+	MinIters int // floor on the iterations at the reader count the bars are evaluated at
 	RunsOnly string
 }
 
@@ -139,7 +140,7 @@ func readerShapes() []Shape {
 		{Name: "jobs_text_200", LiveSQL: sqlJobsText, Heavy: 1, Spec: func(int) ReadSpec {
 			return ReadSpec{Kinds: jobKinds, Limit: 200, Proj: projJobs}
 		}, Args: argsAfter},
-		{Name: "full_replay", LiveSQL: sqlAfter, Heavy: 100, RunsOnly: "largest", Spec: func(int) ReadSpec {
+		{Name: "full_replay", LiveSQL: sqlAfter, Heavy: 100, MinIters: 50, RunsOnly: "largest", Spec: func(int) ReadSpec {
 			return ReadSpec{After: 0}
 		}, Args: func(run uuid.UUID, sp ReadSpec) []any { return []any{run, sp.After} }},
 	}
@@ -159,6 +160,7 @@ var roTx = pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
 
 // scanProj reads rows of the given projection.
 func scanProj(rows pgx.Rows, proj Proj, out []Record) ([]Record, error) {
+	defer rows.Close() // also on a scan error, so the connection is never returned mid-result
 	for rows.Next() {
 		var r Record
 		var ts time.Time
@@ -449,7 +451,26 @@ func (p *pgArchStore) watermark(ctx context.Context) (int, error) {
 }
 
 func (p *pgArchStore) metas(ctx context.Context, sp ReadSpec, cursor int, haveCursor bool) ([]chunkMeta, error) {
-	args := []any{p.run}
+	sql, args := metasQuery(p.run, sp, cursor, haveCursor)
+	rows, err := p.q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []chunkMeta
+	for rows.Next() {
+		var m chunkMeta
+		if err := rows.Scan(&m.first, &m.last, &m.n); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// metasQuery is the candidate-chunk metadata query of one request, with its bind arguments.
+func metasQuery(run uuid.UUID, sp ReadSpec, cursor int, haveCursor bool) (string, []any) {
+	args := []any{run}
 	where := `run_id = $1`
 	add := func(cond string, v any) {
 		args = append(args, v)
@@ -475,25 +496,15 @@ func (p *pgArchStore) metas(ctx context.Context, sp ReadSpec, cursor int, haveCu
 	if sp.Desc {
 		order = `DESC`
 	}
-	rows, err := p.q.Query(ctx, `SELECT first_seq, last_seq, n_rows FROM `+chunkTable+` WHERE `+where+
-		fmt.Sprintf(` ORDER BY first_seq %s LIMIT %d`, order, metaPage), args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []chunkMeta
-	for rows.Next() {
-		var m chunkMeta
-		if err := rows.Scan(&m.first, &m.last, &m.n); err != nil {
-			return nil, err
-		}
-		out = append(out, m)
-	}
-	return out, rows.Err()
+	return `SELECT first_seq, last_seq, n_rows FROM ` + chunkTable + ` WHERE ` + where +
+		fmt.Sprintf(` ORDER BY first_seq %s LIMIT %d`, order, metaPage), args
 }
 
+// sqlChunkBodies fetches the bodies of the chunks chosen from the metadata.
+const sqlChunkBodies = `SELECT first_seq, data FROM ` + chunkTable + ` WHERE run_id = $1 AND first_seq = ANY($2)`
+
 func (p *pgArchStore) chunkData(ctx context.Context, firsts []int) (map[int][]byte, error) {
-	rows, err := p.q.Query(ctx, `SELECT first_seq, data FROM `+chunkTable+` WHERE run_id = $1 AND first_seq = ANY($2)`, p.run, firsts)
+	rows, err := p.q.Query(ctx, sqlChunkBodies, p.run, firsts)
 	if err != nil {
 		return nil, err
 	}

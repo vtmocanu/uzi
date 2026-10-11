@@ -26,10 +26,10 @@ type Attrib struct {
 	FreeSpaceBefore    int64   `json:"free_space_heap_plus_toast_before"`
 }
 
-func computeAttrib(ctx context.Context, pool *pgxpool.Pool, pre RelReport) (Attrib, error) {
-	a := Attrib{Model: "per run: sum(24 + 4 + pg_column_size of each column) over its rows + index_bytes * rows_run / rows_total"}
-	var archBytes, liveBytes int64
-	err := pool.QueryRow(ctx, `SELECT
+// modelRowBytes is the row-byte model of Attrib over the rows that are in run_messages now:
+// bytes and row counts of terminal runs' rows and of the other runs' rows.
+func modelRowBytes(ctx context.Context, pool *pgxpool.Pool) (archBytes, liveBytes, archRows, totalRows int64, err error) {
+	err = pool.QueryRow(ctx, `SELECT
 		coalesce(sum(b) FILTER (WHERE t), 0)::bigint, coalesce(sum(b) FILTER (WHERE NOT t), 0)::bigint,
 		coalesce(sum(n) FILTER (WHERE t), 0)::bigint, coalesce(sum(n), 0)::bigint FROM (
 		SELECT m.run_id, r.status IN ('completed','failed','cancelled') AS t, count(*) AS n,
@@ -37,10 +37,17 @@ func computeAttrib(ctx context.Context, pool *pgxpool.Pool, pre RelReport) (Attr
 		      + coalesce(pg_column_size(m.agent), 0) + pg_column_size(m.payload) + pg_column_size(m.created_at)
 		      + coalesce(pg_column_size(m.agent_instance), 0) + coalesce(pg_column_size(m.agent_label), 0)
 		      + coalesce(pg_column_size(m.claim_generation), 0)) AS b
-		FROM run_messages m JOIN runs r ON r.id = m.run_id GROUP BY m.run_id, r.status) s`).Scan(&archBytes, &liveBytes, &a.ArchivedRows, &a.TotalRows)
+		FROM run_messages m JOIN runs r ON r.id = m.run_id GROUP BY m.run_id, r.status) s`).Scan(&archBytes, &liveBytes, &archRows, &totalRows)
+	return archBytes, liveBytes, archRows, totalRows, err
+}
+
+func computeAttrib(ctx context.Context, pool *pgxpool.Pool, pre RelReport) (Attrib, error) {
+	a := Attrib{Model: "per run: sum(24 + 4 + pg_column_size of each column) over its rows + index_bytes * rows_run / rows_total"}
+	archBytes, liveBytes, archRows, totalRows, err := modelRowBytes(ctx, pool)
 	if err != nil {
 		return a, err
 	}
+	a.ArchivedRows, a.TotalRows = archRows, totalRows
 	a.IndexBytes = pre.IndexSize
 	a.RowBytes = archBytes + liveBytes
 	a.HeapPlusToast = pre.Heap.TableLen + pre.ToastSize
@@ -89,6 +96,25 @@ type DiskRun struct {
 	Backfill    BackfillReport `json:"backfill"`
 }
 
+// C1Basis is how the footprint bar was evaluated. The verdict never mixes a model on one side
+// with a measurement on the other: it is real bytes on both sides (the pre-rollup size of the
+// archived runs is a VACUUM FULL of a fresh corpus clone minus a VACUUM FULL of this config's
+// run_messages once only never-rolled runs are left in it) or, when that baseline is
+// unavailable, the row-byte model on both sides (chunk and watermark tables stay real bytes
+// there, because a chunk table has no row model).
+type C1Basis struct {
+	Basis                  string `json:"basis_of_the_verdict"`
+	Pre                    int64  `json:"pre_rollup_archived_runs_bytes"`
+	Post                   int64  `json:"post_rollup_archived_runs_bytes"`
+	ChunkTableBytes        int64  `json:"chunk_table_total_bytes"`
+	WatermarkBytes         int64  `json:"watermark_table_total_bytes"`
+	LeftoverRows           int64  `json:"archived_runs_rows_still_in_run_messages"`
+	RealPre                int64  `json:"real_bytes_pre_vacuum_full_baseline_minus_live_only,omitempty"`
+	ModelPre               int64  `json:"model_pre_bytes"`
+	ModelPostLeftoverBytes int64  `json:"model_bytes_of_leftover_archived_rows"`
+	Note                   string `json:"note,omitempty"`
+}
+
 // ConfigResult is everything measured for one materialised configuration.
 type ConfigResult struct {
 	Name         string             `json:"name"`
@@ -99,7 +125,8 @@ type ConfigResult struct {
 	Backfill     BackfillReport     `json:"backfill_worst_case_no_vacuum"`
 	VacuumPhase  WALStat            `json:"wal_explicit_vacuum_phase"`
 	VacuumSecs   float64            `json:"vacuum_phase_s"`
-	WALTotal     int64              `json:"wal_total_lsn_bytes_rollup_plus_vacuum"`
+	WALGap       int64              `json:"wal_lsn_bytes_between_backfill_end_and_vacuum_phase"`
+	WALTotal     int64              `json:"wal_total_lsn_bytes_rollup_gap_vacuum"`
 	VacuumRun    *DiskRun           `json:"backfill_with_periodic_vacuum,omitempty"`
 	Sizes        map[string]any     `json:"sizes"`
 	Latency      LatencyResults     `json:"latency"`
@@ -107,12 +134,13 @@ type ConfigResult struct {
 	RoundTrip    RoundTripReport    `json:"roundtrip"`
 	Concurrency  *ConcurrencyReport `json:"concurrency,omitempty"`
 	Rewrite      RewriteReport      `json:"rewrite_headroom"`
+	C1           C1Basis            `json:"c1_footprint_basis"`
+	Explain      map[string]string  `json:"explain_analyze_buffers_chunk_fetch"`
 	Criteria     []Criterion        `json:"criteria"`
 	Overall      string             `json:"overall"`
-	archivedPost int64
 }
 
-func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurrency bool, attrib *Attrib) (*ConfigResult, error) {
+func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, attrib *Attrib) (*ConfigResult, error) {
 	cfg := sel.Config
 	res := &ConfigResult{Name: cfg.Name(), Codec: cfg.Spec.Name(), ByteBoundKiB: cfg.Bounds.ByteBound >> 10, CountCeil: cfg.Bounds.CountCeiling, Why: sel.Why, Sizes: map[string]any{}}
 	dbName := fmt.Sprintf("m0_cfg%d", idx)
@@ -131,23 +159,11 @@ func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurr
 	}
 	arch := &ArchReader{Pool: pool, Eng: e.Eng}
 
-	bo := backfillOpts{cfg: cfg, sleep: e.Opt.BackfillSleep, withLoad: true}
-	var cc *concurrencyCheck
-	if withConcurrency {
-		cc = e.newConcurrencyCheck(pool, arch)
-		bo.hooks = cc.hooks()
-		bo.pause = 150 * time.Millisecond
-	}
+	// This clone carries no concurrency hooks: its backfill is the clean one the cost bars (C5)
+	// are read from. The reader and straggler checks run on their own clone (runCorrectness).
 	e.Lg.f("config %s: backfill (worst case, no vacuum)", res.Name)
-	if res.Backfill, err = e.backfill(ctx, pool, bo); err != nil {
+	if res.Backfill, err = e.backfill(ctx, pool, backfillOpts{cfg: cfg, sleep: e.Opt.BackfillSleep, withLoad: true}); err != nil {
 		return res, err
-	}
-	if cc != nil {
-		rep, err := cc.finish(ctx, cfg)
-		if err != nil {
-			return res, err
-		}
-		res.Concurrency = &rep
 	}
 	if _, err := pool.Exec(ctx, `ANALYZE run_messages`); err != nil {
 		return res, err
@@ -163,7 +179,7 @@ func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurr
 	}
 
 	e.Lg.f("config %s: verifying readers and round trip", res.Name)
-	res.Digests = e.checkDigests(ctx, arch, pool, withConcurrency)
+	res.Digests = e.checkDigests(ctx, arch, pool, false)
 	res.RoundTrip = e.roundTripAll(ctx, arch, cfg)
 
 	mo := MatrixOpts{Backend: "archived/" + res.Name, Readers: e.Opt.Readers, Iterations: e.Opt.Iterations, PeakAt: e.Opt.maxReaders(), Seed: e.Opt.Seed + uint64(idx)*101} //nolint:gosec // G115: small config index.
@@ -181,6 +197,11 @@ func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurr
 	if err != nil {
 		return res, err
 	}
+	// Everything between the end of the backfill window and this one (ANALYZE, the size and
+	// correctness reads, the latency runs, the checkpoint) is WAL the backfill window did not see.
+	if res.WALGap, err = lsnGap(ctx, pool, res.Backfill.WAL.endLSN, wm.lsn); err != nil {
+		return res, err
+	}
 	t0 := time.Now()
 	for _, t := range []string{"run_messages", chunkTable} {
 		if _, err := pool.Exec(ctx, `VACUUM (ANALYZE) `+t); err != nil {
@@ -191,7 +212,7 @@ func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurr
 	if res.VacuumPhase, err = endWAL(ctx, pool, wm); err != nil {
 		return res, err
 	}
-	res.WALTotal = res.Backfill.WAL.LSNBytes + res.VacuumPhase.LSNBytes
+	res.WALTotal = res.Backfill.WAL.LSNBytes + res.WALGap + res.VacuumPhase.LSNBytes
 	if res.Sizes["after_vacuum_run_messages"], err = measureRel(ctx, pool, "run_messages", "after plain VACUUM"); err != nil {
 		return res, err
 	}
@@ -208,6 +229,8 @@ func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurr
 		return res, err
 	}
 	res.Latency.Chat = append(res.Latency.Chat, e.measureChat(ctx, pool, "archived/"+res.Name+"/after_vacuum", true, true, critReaders(e.Opt.Readers), e.Opt.Iterations))
+
+	res.Explain = e.explainChunkFetch(ctx, pool)
 
 	e.Lg.f("config %s: VACUUM FULL (rewrite headroom)", res.Name)
 	if res.Rewrite.TotalBefore, err = relTotal(ctx, pool, "run_messages"); err != nil {
@@ -238,13 +261,48 @@ func (e *Env) runConfig(ctx context.Context, idx int, sel Selection, withConcurr
 	if res.Sizes["after_vacuum_full_chunks"], err = measureRel(ctx, pool, chunkTable, "chunk table at the end"); err != nil {
 		return res, err
 	}
-	chunksTotal, err := relTotal(ctx, pool, chunkTable)
-	if err != nil {
+	if res.C1, err = e.footprintBasis(ctx, pool, res.Rewrite.TotalAfter, attrib); err != nil {
 		return res, err
 	}
-	res.archivedPost = max(0, res.Rewrite.TotalAfter+chunksTotal-attrib.LivePre)
 	pool.Close()
 	return res, nil
+}
+
+// footprintBasis settles the C1 inputs after the VACUUM FULL of run_messages (see C1Basis).
+func (e *Env) footprintBasis(ctx context.Context, pool *pgxpool.Pool, liveOnlyTotal int64, attrib *Attrib) (C1Basis, error) {
+	var b C1Basis
+	var err error
+	if b.ChunkTableBytes, err = relTotal(ctx, pool, chunkTable); err != nil {
+		return b, err
+	}
+	if b.WatermarkBytes, err = relTotal(ctx, pool, archiveTable); err != nil {
+		return b, err
+	}
+	archBytes, _, archRows, totalRows, err := modelRowBytes(ctx, pool)
+	if err != nil {
+		return b, err
+	}
+	b.LeftoverRows = archRows
+	if totalRows > 0 {
+		var idx int64
+		if err := pool.QueryRow(ctx, `SELECT pg_indexes_size('run_messages')`).Scan(&idx); err != nil {
+			return b, err
+		}
+		b.ModelPostLeftoverBytes = archBytes + idx*archRows/totalRows
+	}
+	b.ModelPre = attrib.ArchivedPre
+	realPost := b.ChunkTableBytes + b.WatermarkBytes
+	switch {
+	case e.CompactTotal > 0 && liveOnlyTotal > 0 && archRows == 0:
+		b.Basis = "real_bytes"
+		b.RealPre = max(0, e.CompactTotal-liveOnlyTotal)
+		b.Pre, b.Post = b.RealPre, realPost
+	default:
+		b.Basis = "row_byte_model"
+		b.Pre, b.Post = b.ModelPre, realPost+b.ModelPostLeftoverBytes
+		b.Note = "real-bytes baseline unavailable or terminal rows were left in run_messages; the pre side is the row-byte model"
+	}
+	return b, nil
 }
 
 func relTotal(ctx context.Context, pool *pgxpool.Pool, rel string) (int64, error) {
@@ -295,4 +353,41 @@ func (e *Env) runVacuumEvery(ctx context.Context, idx int, cfg RollupConfig) (*D
 	}
 	rep, err := e.backfill(ctx, pool, backfillOpts{cfg: cfg, sleep: e.Opt.BackfillSleep, vacuumEvery: e.Opt.VacuumEvery})
 	return &DiskRun{VacuumEvery: e.Opt.VacuumEvery, Backfill: rep}, err
+}
+
+// runCorrectness is the reader and straggler check on its own clone, so its pauses, readers and
+// late writers cannot distort the cost numbers of the clean clone. It also repeats the
+// every-field round trip and the reader digests on the state the concurrent backfill left.
+func (e *Env) runCorrectness(ctx context.Context, idx int, sel Selection) (*ConcurrencyReport, error) {
+	cfg := sel.Config
+	dbName := fmt.Sprintf("m0_cfg%dc", idx)
+	e.Lg.f("config %s: concurrency check on its own clone", cfg.Name())
+	if err := e.createDB(ctx, dbName, "m0_corpus"); err != nil {
+		return nil, err
+	}
+	defer func() { _ = e.dropDB(context.WithoutCancel(ctx), dbName) }()
+	pool, _, err := e.openDB(ctx, dbName, e.Opt.maxReaders()+8, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer pool.Close()
+	if err := createChunkTables(ctx, pool); err != nil {
+		return nil, err
+	}
+	arch := &ArchReader{Pool: pool, Eng: e.Eng}
+	cc := e.newConcurrencyCheck(pool, arch)
+	bo := backfillOpts{cfg: cfg, sleep: e.Opt.BackfillSleep, hooks: cc.hooks(), pause: 150 * time.Millisecond, inflight: cc.fl}
+	bf, err := e.backfill(ctx, pool, bo)
+	cc.rep.BackfillRoundTripFail = bf.RoundTripFails
+	if err != nil {
+		return &cc.rep, err
+	}
+	rep, err := cc.finish(ctx, cfg)
+	if err != nil {
+		return &rep, err
+	}
+	rt := e.roundTripAll(ctx, arch, cfg)
+	dg := e.checkDigests(ctx, arch, pool, true)
+	rep.RoundTrip, rep.Digests = &rt, &dg
+	return &rep, nil
 }

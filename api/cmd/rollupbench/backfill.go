@@ -23,6 +23,7 @@ type FootprintReport struct {
 	PeakCombined int64       `json:"peak_combined_bytes"`
 	PeakExtra    int64       `json:"peak_extra_bytes"`
 	FinalChunks  int64       `json:"final_chunk_table_bytes"`
+	FinalArchive int64       `json:"final_watermark_table_bytes"`
 	FinalRM      int64       `json:"final_run_messages_bytes"`
 	Samples      int         `json:"samples"`
 	Series       []FootPoint `json:"series_downsampled"`
@@ -85,12 +86,14 @@ type backfillOpts struct {
 	pause       time.Duration // between txs of one run (correctness config only)
 	withLoad    bool          // idle/during live-reader comparison
 	hooks       *correctnessHooks
+	inflight    *inflight // marks runs whose rollup tx is open (correctness config only)
 }
 
 // correctnessHooks run alongside the backfill.
 type correctnessHooks struct {
-	start func(ctx context.Context)
-	stop  func()
+	start   func(ctx context.Context)
+	stop    func()
+	runDone func(id uuid.UUID, txs int) // a run's rollup finished after txs transactions
 }
 
 func (e *Env) terminalInfos() []*RunInfo {
@@ -129,10 +132,19 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 	if bo.withLoad {
 		rep.LiveLoad = e.idleLive(ctx, pool)
 	}
-	loadStop := e.startLiveLoad(ctx, pool, bo.withLoad)
-	probeStop := startProbe(ctx, pool, e.terminalInfos())
+	// Every background goroutine is stopped on every return path (the stops are idempotent), so
+	// an error mid-backfill cannot leave readers, probes or the straggler running into the next phase.
+	loadStop := sync.OnceValue(e.startLiveLoad(ctx, pool, bo.withLoad))
+	probeStop := sync.OnceValue(startProbe(ctx, pool, e.terminalInfos()))
+	stopHooks := func() {}
+	defer func() {
+		loadStop()
+		probeStop()
+		stopHooks()
+	}()
 	if bo.hooks != nil {
 		bo.hooks.start(ctx)
+		stopHooks = sync.OnceFunc(bo.hooks.stop)
 	}
 	wm, err := markWAL(ctx, pool)
 	if err != nil {
@@ -146,7 +158,7 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 			return rep, err
 		}
 		txs := 0
-		skipped, err := rollupRun(ctx, pool, e.Eng, bo.cfg, in.ID, bo.pause, func(st TxStat) {
+		skipped, err := rollupRun(ctx, pool, e.Eng, bo.cfg, in.ID, bo.pause, bo.inflight, func(st TxStat) {
 			txs++
 			rep.Txs++
 			rep.Rows += int64(st.Rows)
@@ -173,6 +185,9 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 		if txs > 1 {
 			rep.MultiTxRuns++
 		}
+		if bo.hooks != nil && bo.hooks.runDone != nil {
+			bo.hooks.runDone(in.ID, txs)
+		}
 		if bo.vacuumEvery > 0 && (i+1)%bo.vacuumEvery == 0 {
 			if _, err := pool.Exec(ctx, `VACUUM run_messages`); err != nil {
 				return rep, err
@@ -187,12 +202,10 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 		}
 	}
 	rep.DurationSec = time.Since(t0).Seconds()
-	if bo.hooks != nil {
-		bo.hooks.stop()
-	}
+	stopHooks()
 	rep.Probe = probeStop()
+	during := loadStop()
 	if bo.withLoad {
-		during := loadStop()
 		rep.LiveLoad.DuringN = len(during)
 		if len(during) > 0 {
 			rep.LiveLoad.DuringP95 = summarize(during).P95Ms
@@ -200,8 +213,6 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 		if rep.LiveLoad.IdleP95Ms > 0 {
 			rep.LiveLoad.Ratio = rep.LiveLoad.DuringP95 / rep.LiveLoad.IdleP95Ms
 		}
-	} else {
-		loadStop()
 	}
 	if rep.WAL, err = endWAL(ctx, pool, wm); err != nil {
 		return rep, err
@@ -216,7 +227,10 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 	rep.Footprint.PeakExtra = rep.Footprint.PeakCombined - pre
 	rep.Footprint.Samples = len(series)
 	rep.Footprint.Series = downsample(series, 200)
-	_ = pool.QueryRow(ctx, `SELECT pg_total_relation_size('`+chunkTable+`'), pg_total_relation_size('run_messages')`).Scan(&rep.Footprint.FinalChunks, &rep.Footprint.FinalRM)
+	if err := pool.QueryRow(ctx, `SELECT pg_total_relation_size('`+chunkTable+`'), pg_total_relation_size('`+archiveTable+`'), pg_total_relation_size('run_messages')`).
+		Scan(&rep.Footprint.FinalChunks, &rep.Footprint.FinalArchive, &rep.Footprint.FinalRM); err != nil {
+		return rep, err
+	}
 	return rep, nil
 }
 
@@ -347,29 +361,44 @@ func startProbe(ctx context.Context, pool *pgxpool.Pool, runs []*RunInfo) func()
 
 // ---- correctness under concurrency -----------------------------------------------------------
 
-// ConcurrencyReport is the outcome of the concurrent reader and straggler checks.
+// ConcurrencyReport is the outcome of the concurrent reader and straggler checks. They run on
+// their own database clone, never on the clone whose backfill cost is reported.
 type ConcurrencyReport struct {
+	Failure               string   `json:"failure,omitempty"`
 	Reads                 int64    `json:"reader_full_replays"`
 	Violations            int64    `json:"order_or_duplicate_violations"`
 	MissingSeqs           int64    `json:"missing_source_seqs"`
 	UnexpectedSeqs        int64    `json:"unexpected_seqs"`
 	ReadErrors            int64    `json:"read_errors"`
 	MixedStateObserved    int64    `json:"reads_that_saw_archived_and_live_source_rows"`
-	MixedOnMultiTxRun     int64    `json:"mixed_state_reads_of_multi_tx_runs"`
+	MultiTxRuns           int64    `json:"runs_whose_rollup_took_more_than_one_tx"`
+	MixedOnMultiTxRun     int64    `json:"mixed_state_reads_of_those_runs"`
 	StragglerInserts      int64    `json:"straggler_rows_inserted"`
 	StragglerInsertErrors int64    `json:"straggler_insert_errors"`
+	StragglerIssuedOpen   int64    `json:"straggler_inserts_issued_while_that_runs_rollup_tx_was_open"`
+	StragglerOverlapped   int64    `json:"straggler_inserts_blocked_by_an_open_rollup_tx"`
 	StragglerWaitP95Ms    float64  `json:"straggler_insert_wait_p95_ms"`
 	StragglerWaitMaxMs    float64  `json:"straggler_insert_wait_max_ms"`
 	StragglersArchived    int64    `json:"stragglers_ended_archived"`
 	StragglersLive        int64    `json:"stragglers_ended_live"`
 	StragglersLost        int64    `json:"stragglers_lost_or_duplicated"`
+	RerollRoundTripFails  int64    `json:"reroll_roundtrip_failures"`
+	BackfillRoundTripFail int      `json:"backfill_roundtrip_failures"`
 	Samples               []string `json:"first_problems,omitempty"`
+
+	RoundTrip *RoundTripReport `json:"roundtrip_after_the_concurrent_backfill,omitempty"`
+	Digests   *DigestCheck     `json:"reader_results_after_the_concurrent_backfill,omitempty"`
 }
+
+// blockedAfter is the insert wait that counts as "blocked by the rollup's row lock": an
+// unblocked insert on a local server takes well under a millisecond.
+const blockedAfter = 2 * time.Millisecond
 
 type concurrencyCheck struct {
 	e      *Env
 	pool   *pgxpool.Pool
 	arch   *ArchReader
+	fl     *inflight
 	rep    ConcurrencyReport
 	mu     sync.Mutex
 	intent map[uuid.UUID]map[int]bool
@@ -377,15 +406,20 @@ type concurrencyCheck struct {
 	waits  []time.Duration
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	multi  map[uuid.UUID]bool
+	// big is where the readers aim (runs large enough to need several txs); multiTx is what the
+	// rollup actually did, and mixed counts mixed-state reads per run, joined at the end.
+	big     map[uuid.UUID]bool
+	multiTx map[uuid.UUID]bool
+	mixed   map[uuid.UUID]int64
 }
 
 func (e *Env) newConcurrencyCheck(pool *pgxpool.Pool, arch *ArchReader) *concurrencyCheck {
-	c := &concurrencyCheck{e: e, pool: pool, arch: arch, intent: map[uuid.UUID]map[int]bool{}, next: map[uuid.UUID]int{}, multi: map[uuid.UUID]bool{}}
+	c := &concurrencyCheck{e: e, pool: pool, arch: arch, fl: newInflight(), intent: map[uuid.UUID]map[int]bool{}, next: map[uuid.UUID]int{},
+		big: map[uuid.UUID]bool{}, multiTx: map[uuid.UUID]bool{}, mixed: map[uuid.UUID]int64{}}
 	for _, in := range e.terminalInfos() {
 		c.next[in.ID] = in.MaxSeq + 1
 		if in.Count > 0 && in.Count >= e.Strata.LargeMin {
-			c.multi[in.ID] = true
+			c.big[in.ID] = true
 		}
 	}
 	return c
@@ -415,6 +449,13 @@ func (c *concurrencyCheck) hooks() *correctnessHooks {
 			c.cancel()
 			c.wg.Wait()
 		},
+		runDone: func(id uuid.UUID, txs int) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if txs > 1 {
+				c.multiTx[id] = true
+			}
+		},
 	}
 }
 
@@ -423,7 +464,7 @@ func (c *concurrencyCheck) readerLoop(ctx context.Context, w int) {
 	terminal := c.e.terminalInfos()
 	var large []*RunInfo
 	for _, in := range terminal {
-		if c.multi[in.ID] {
+		if c.big[in.ID] {
 			large = append(large, in)
 		}
 	}
@@ -487,43 +528,58 @@ func (c *concurrencyCheck) check(in *RunInfo, out []Record, st ReadStats) {
 	}
 	if st.ChunksFetched > 0 && st.LiveRows-extras > 0 {
 		c.rep.MixedStateObserved++
-		if c.multi[in.ID] {
-			c.rep.MixedOnMultiTxRun++
-		}
+		c.mixed[in.ID]++
 	}
 }
 
+// stragglerLoop inserts new seqs above the current max into terminal runs while their rollup
+// runs. It prefers a run whose rollup tx is open right now; the insert's FK check then queues
+// behind the rollup's FOR UPDATE on the runs row, which is the race being tested. The insert
+// runs on a context that survives the end of the check, so its outcome is always known: a row
+// is recorded as intended before the insert, and forgotten only when the insert reported an error.
 func (c *concurrencyCheck) stragglerLoop(ctx context.Context) {
 	defer c.wg.Done()
 	terminal := c.e.terminalInfos()
 	rng := newRNG(13, 13)
-	for ctx.Err() == nil {
+	for tick := 0; ctx.Err() == nil; tick++ {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(5 * time.Millisecond):
 		}
-		in := terminal[rng.IntN(len(terminal))]
+		id, open := c.fl.pick()
+		if !open || tick%5 == 0 {
+			id = terminal[rng.IntN(len(terminal))].ID
+		}
 		c.mu.Lock()
-		seq := c.next[in.ID]
-		c.next[in.ID]++
-		if c.intent[in.ID] == nil {
-			c.intent[in.ID] = map[int]bool{}
+		seq := c.next[id]
+		c.next[id]++
+		if c.intent[id] == nil {
+			c.intent[id] = map[int]bool{}
 		}
-		c.intent[in.ID][seq] = true // recorded before the insert, so a reader can never see an unexplained row
+		c.intent[id][seq] = true // recorded before the insert, so a reader can never see an unexplained row
 		c.mu.Unlock()
+		issuedOpen := c.fl.isOpen(id)
+		ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		t0 := time.Now()
-		_, err := c.pool.Exec(ctx, `INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, $2, 'text', '{"text":"late"}')`, in.ID, seq)
+		_, err := c.pool.Exec(ictx, `INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, $2, 'text', '{"text":"late"}')`, id, seq)
 		d := time.Since(t0)
+		cancel()
 		c.mu.Lock()
 		if err != nil {
-			if ctx.Err() == nil {
-				c.rep.StragglerInsertErrors++
-				delete(c.intent[in.ID], seq)
+			c.rep.StragglerInsertErrors++
+			delete(c.intent[id], seq)
+			c.mu.Unlock()
+			c.problem("straggler insert: " + err.Error())
+			continue
+		}
+		c.rep.StragglerInserts++
+		c.waits = append(c.waits, d)
+		if issuedOpen {
+			c.rep.StragglerIssuedOpen++
+			if d >= blockedAfter {
+				c.rep.StragglerOverlapped++
 			}
-		} else {
-			c.rep.StragglerInserts++
-			c.waits = append(c.waits, d)
 		}
 		c.mu.Unlock()
 	}
@@ -534,13 +590,22 @@ func (c *concurrencyCheck) stragglerLoop(ctx context.Context) {
 func (c *concurrencyCheck) finish(ctx context.Context, cfg RollupConfig) (ConcurrencyReport, error) {
 	s := summarize(c.waits)
 	c.rep.StragglerWaitP95Ms, c.rep.StragglerWaitMaxMs = s.P95Ms, s.MaxMs
+	c.rep.MultiTxRuns = int64(len(c.multiTx))
+	for id, n := range c.mixed {
+		if c.multiTx[id] {
+			c.rep.MixedOnMultiTxRun += n
+		}
+	}
 	var runs []uuid.UUID
 	for id := range c.intent {
 		runs = append(runs, id)
 	}
 	for _, id := range runs {
-		if _, err := rollupRun(ctx, c.pool, c.e.Eng, cfg, id, 0, nil); err != nil && !errors.Is(err, errRoundTrip) {
-			return c.rep, err
+		if _, err := rollupRun(ctx, c.pool, c.e.Eng, cfg, id, 0, nil, nil); err != nil {
+			if !errors.Is(err, errRoundTrip) {
+				return c.rep, err
+			}
+			c.rep.RerollRoundTripFails++
 		}
 	}
 	for _, id := range runs {

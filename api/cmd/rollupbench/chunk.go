@@ -103,17 +103,17 @@ func toU8(n int) uint8 {
 	return uint8(n)
 }
 
-// Engine encodes and decodes chunks. It owns the pooled compressors: one shared zstd decoder
-// (DecodeAll is safe for concurrent use and bounded by the decoder's concurrency), one shared
-// zstd encoder per requested level (EncodeAll likewise), and a sync.Pool of flate writers and
-// readers. Concurrency is recorded in Settings so the results state exactly what ran.
+// Engine encodes and decodes chunks. It owns the pooled compressors: one shared zstd encoder
+// per requested level (EncodeAll is safe for concurrent use), a sync.Pool of streaming
+// single-threaded zstd decoders, and sync.Pools of flate writers and readers. Concurrency is
+// recorded in PoolingNote so the results state exactly what ran.
 type Engine struct {
 	maxRaw      int
 	concurrency int
 
 	mu   sync.Mutex
 	zenc map[int]*zstd.Encoder
-	zdec *zstd.Decoder
+	zdec sync.Pool // *zstd.Decoder, streaming, concurrency 1
 
 	fwriters sync.Map // level -> *sync.Pool of *flate.Writer
 	freaders sync.Pool
@@ -125,20 +125,11 @@ func NewEngine(maxRaw, concurrency int) (*Engine, error) {
 	if maxRaw <= 0 || concurrency <= 0 {
 		return nil, errors.New("engine: maxRaw and concurrency must be positive")
 	}
-	dec, err := zstd.NewReader(nil,
-		zstd.WithDecoderConcurrency(concurrency),
-		zstd.WithDecoderMaxMemory(uint64(maxRaw)),
-		zstd.WithDecoderMaxWindow(zstdWindow),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("zstd decoder: %w", err)
-	}
-	return &Engine{maxRaw: maxRaw, concurrency: concurrency, zenc: map[int]*zstd.Encoder{}, zdec: dec}, nil
+	return &Engine{maxRaw: maxRaw, concurrency: concurrency, zenc: map[int]*zstd.Encoder{}}, nil
 }
 
-// Close releases the zstd goroutines.
+// Close releases the zstd encoder goroutines.
 func (e *Engine) Close() {
-	e.zdec.Close()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, enc := range e.zenc {
@@ -150,9 +141,9 @@ func (e *Engine) Close() {
 func (e *Engine) PoolingNote() map[string]any {
 	return map[string]any{
 		"zstd_encoder":             "one shared encoder per requested level, EncodeAll (concurrency-safe)",
-		"zstd_decoder":             "one shared decoder, DecodeAll (concurrency-safe)",
+		"zstd_decoder":             "sync.Pool of streaming decoders read through io.LimitReader(declared length + 1)",
 		"zstd_encoder_concurrency": e.concurrency,
-		"zstd_decoder_concurrency": e.concurrency,
+		"zstd_decoder_concurrency": 1,
 		"zstd_window_bytes":        zstdWindow,
 		"zstd_decoder_max_memory":  e.maxRaw,
 		"flate":                    "sync.Pool of writers per level and of readers (Resettable)",
@@ -478,12 +469,43 @@ func (e *Engine) inflate(comp []byte, rawLen int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// unzstd streams the frame through a limit one byte past the declared length, like inflate:
+// a frame that carries no content size (or lies about it) is stopped at the declared length
+// and rejected, so the output never grows beyond rawLen+1. WithDecoderMaxMemory bounds the
+// window of a streaming decode, not its output, which is why the limit reader is needed.
 func (e *Engine) unzstd(comp []byte, rawLen int) ([]byte, error) {
-	out, err := e.zdec.DecodeAll(comp, make([]byte, 0, rawLen))
-	if err != nil {
+	var dec *zstd.Decoder
+	if v := e.zdec.Get(); v != nil {
+		dec = v.(*zstd.Decoder)
+	} else {
+		var err error
+		dec, err = zstd.NewReader(nil,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(uint64(e.maxRaw)), //nolint:gosec // G115: maxRaw is validated positive in NewEngine.
+			zstd.WithDecoderMaxWindow(zstdWindow),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("zstd decoder: %w", err)
+		}
+	}
+	defer func() {
+		_ = dec.Reset(nil) // drop the reference to comp before the decoder waits in the pool
+		e.zdec.Put(dec)
+	}()
+	// bytes.Reader is not a bytes.Buffer, so the decoder streams instead of taking its
+	// in-memory shortcut.
+	if err := dec.Reset(bytes.NewReader(comp)); err != nil {
 		return nil, fmt.Errorf("%w: %v", errChunkCorrupt, err)
 	}
-	return out, nil
+	var buf bytes.Buffer
+	buf.Grow(rawLen + 1)
+	if _, err := buf.ReadFrom(io.LimitReader(dec, int64(rawLen)+1)); err != nil {
+		return nil, fmt.Errorf("%w: %v", errChunkCorrupt, err)
+	}
+	if buf.Len() > rawLen {
+		return nil, errChunkLength // produced more than declared
+	}
+	return buf.Bytes(), nil
 }
 
 // ChunkBounds is the greedy chunking rule: close a chunk before it would exceed ByteBound

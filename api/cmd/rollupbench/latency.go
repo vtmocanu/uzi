@@ -30,8 +30,12 @@ type Cell struct {
 	// Single-reader resource use (process-wide deltas, so only meaningful at 1 reader).
 	AllocBytesPerReq float64 `json:"alloc_bytes_per_request,omitempty"`
 	CPUMsPerReq      float64 `json:"go_cpu_ms_per_request,omitempty"`
-	// Peak heap, sampled at the highest reader count only.
-	PeakHeapInuse uint64 `json:"peak_heap_inuse_bytes,omitempty"`
+	// Peak heap, sampled at the highest reader count only: HeapInuse after a forced GC right
+	// before the cell is the baseline, the C6 input is the peak above it, and the absolute
+	// peak is kept as an extra.
+	PeakHeapInuse        uint64 `json:"peak_heap_inuse_bytes,omitempty"`
+	HeapBaseline         uint64 `json:"heap_inuse_baseline_bytes,omitempty"`
+	PeakHeapOverBaseline uint64 `json:"peak_heap_inuse_over_baseline_bytes,omitempty"`
 }
 
 // MatrixOpts controls one backend's matrix.
@@ -89,6 +93,8 @@ func (e *Env) measureCell(ctx context.Context, rd Reader, sh *Shape, stratum str
 	iters := max(readers*2, mo.Iterations/sh.Heavy)
 	if readers != critReaders(mo.Readers) {
 		iters = max(readers*2, iters/2) // the bars are evaluated at one reader count; the others are context
+	} else {
+		iters = max(iters, sh.MinIters) // a p95 needs enough samples at the evaluated reader count
 	}
 	c := Cell{Backend: mo.Backend, Shape: sh.Name, Stratum: stratum, Readers: readers}
 	// A fixed walk over the stratum's runs: every worker visits different runs at each step,
@@ -104,11 +110,11 @@ func (e *Env) measureCell(ctx context.Context, rd Reader, sh *Shape, stratum str
 	var rows, payload, fetched, matched, decoded atomic.Int64
 	var m0, m1 runtime.MemStats
 	var sampler *heapSampler
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
 	if readers == mo.PeakAt {
 		sampler = startHeapSampler()
 	}
-	runtime.GC()
-	runtime.ReadMemStats(&m0)
 	cpu0 := cpuSeconds()
 	durs, nerr, first := loopWorkers(ctx, readers, iters, func(w, i int) error {
 		run := pick(w, i)
@@ -126,7 +132,9 @@ func (e *Env) measureCell(ctx context.Context, rd Reader, sh *Shape, stratum str
 	cpu1 := cpuSeconds()
 	runtime.ReadMemStats(&m1)
 	if sampler != nil {
-		c.PeakHeapInuse = sampler.finish()
+		c.PeakHeapInuse = max(sampler.finish(), m0.HeapInuse)
+		c.HeapBaseline = m0.HeapInuse
+		c.PeakHeapOverBaseline = c.PeakHeapInuse - c.HeapBaseline
 	}
 	c.Iterations = len(durs)
 	c.Errors = nerr

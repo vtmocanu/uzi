@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,7 +52,7 @@ func createChunkTables(ctx context.Context, pool *pgxpool.Pool) error {
 type RollupConfig struct {
 	Spec           CodecSpec
 	Bounds         ChunkBounds
-	MaxChunksPerTx int
+	MaxChunksPerTx int // a rollup transaction publishes at most this many chunks; a bigger run takes several
 }
 
 // Name is the stable config label used in results.
@@ -88,12 +89,53 @@ func scanSourceRow(rows pgx.Rows) (Record, error) {
 	return r, nil
 }
 
+// inflight tracks which runs have a rollup transaction open (from just before its FOR UPDATE
+// until it commits or rolls back), so the straggler writer can target them and the report can
+// say how many late inserts really overlapped an open rollup transaction.
+type inflight struct {
+	mu   sync.Mutex
+	open map[uuid.UUID]int
+}
+
+func newInflight() *inflight { return &inflight{open: map[uuid.UUID]int{}} }
+
+func (f *inflight) set(id uuid.UUID, on bool) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if on {
+		f.open[id]++
+		return
+	}
+	if f.open[id]--; f.open[id] <= 0 {
+		delete(f.open, id)
+	}
+}
+
+func (f *inflight) isOpen(id uuid.UUID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.open[id] > 0
+}
+
+// pick returns some run with an open rollup transaction, or false.
+func (f *inflight) pick() (uuid.UUID, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := range f.open {
+		return id, true
+	}
+	return uuid.UUID{}, false
+}
+
 // rollupRun archives one terminal run, in one transaction or (for a big run) several, each
 // publishing a prefix. It returns a TxStat per committed tx and whether the run was skipped
 // because it was not terminal.
-func rollupRun(ctx context.Context, pool *pgxpool.Pool, eng *Engine, cfg RollupConfig, runID uuid.UUID, pause time.Duration, onTx func(TxStat)) (skipped bool, err error) {
+func rollupRun(ctx context.Context, pool *pgxpool.Pool, eng *Engine, cfg RollupConfig, runID uuid.UUID, pause time.Duration, fl *inflight, onTx func(TxStat)) (skipped bool, err error) {
 	for {
-		st, more, skip, err := rollupTx(ctx, pool, eng, cfg, runID)
+		st, more, skip, err := rollupTx(ctx, pool, eng, cfg, runID, fl)
 		if err != nil {
 			return false, err
 		}
@@ -112,8 +154,10 @@ func rollupRun(ctx context.Context, pool *pgxpool.Pool, eng *Engine, cfg RollupC
 	}
 }
 
-func rollupTx(ctx context.Context, pool *pgxpool.Pool, eng *Engine, cfg RollupConfig, runID uuid.UUID) (st TxStat, more bool, skipped bool, err error) {
+func rollupTx(ctx context.Context, pool *pgxpool.Pool, eng *Engine, cfg RollupConfig, runID uuid.UUID, fl *inflight) (st TxStat, more bool, skipped bool, err error) {
 	start := time.Now()
+	fl.set(runID, true)
+	defer fl.set(runID, false)
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return st, false, false, err
@@ -157,6 +201,17 @@ func rollupTx(ctx context.Context, pool *pgxpool.Pool, eng *Engine, cfg RollupCo
 	more = len(recs) == limit
 
 	chunks := SplitChunks(recs, cfg.Bounds)
+	if len(chunks) > cfg.MaxChunksPerTx {
+		// The byte bound made more, smaller chunks than the row read could hold: publish the first
+		// MaxChunksPerTx of them and leave the rest (re-read from the watermark) to the next tx.
+		chunks = chunks[:cfg.MaxChunksPerTx]
+		kept := 0
+		for _, c := range chunks {
+			kept += len(c)
+		}
+		recs = recs[:kept]
+		more = true
+	}
 	batch := &pgx.Batch{}
 	encoded := make([][]byte, len(chunks))
 	for i, c := range chunks {
