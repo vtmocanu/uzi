@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -120,5 +121,29 @@ func TestCreateAutoMRReworkRunAndAdvanceRecheckAndAdvance(t *testing.T) {
 	fs = &fakeStore{mrReworkLedger: store.GetMRReworkLedgerRow{CommentMarks: marksJSON("100")}, mrReworkRunResult: store.Run{ID: uuid.New()}, ledgerUpsertErr: errors.New("boom")}
 	if err := call(fs, res, 5); err == nil {
 		t.Fatal("an advance failure must fail the create")
+	}
+}
+
+// A stored ledger that does not decode is a hard error, not a retryable ErrReworkLedgerChanged:
+// a retry re-reads the same bytes.
+func TestRecheckReworkLedgerUndecodableRowIsNotRetryable(t *testing.T) {
+	cases := map[string]store.GetMRReworkLedgerRow{
+		"non-integer mark":   {Ref: "r", CommentMarks: []byte(`{"rc":"x"}`)},
+		"invalid marks JSON": {Ref: "r", CommentMarks: []byte(`{not json`)},
+		"bad pending key":    {Ref: "r", CommentMarks: []byte(`{}`), PendingUnknownKeys: []string{"review:007"}},
+	}
+	for name, row := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := recheckReworkLedger(row, &reworkRecheck{})
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if errors.Is(err, ErrReworkLedgerChanged) {
+				t.Fatalf("err = %v, must not be the retryable ErrReworkLedgerChanged", err)
+			}
+			if !strings.Contains(err.Error(), "decode") {
+				t.Fatalf("err = %v, want it to wrap the decode failure", err)
+			}
+		})
 	}
 }

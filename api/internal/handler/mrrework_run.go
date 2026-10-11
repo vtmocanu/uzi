@@ -194,7 +194,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case errors.As(err, &overflow):
 				slog.Warn("mr-rework: review ledger bootstrap overflow", "repo_id", repo.ID, "ref", run.Branch.String,
-					"legacy_ids", overflow.LegacyIDs, "expanded_keys", overflow.ExpandedKeys)
+					"legacy_pending", overflow.LegacyIDs, "expanded_keys", overflow.ExpandedKeys)
 				httpx.Error(w, http.StatusConflict, err.Error())
 			case errors.Is(err, workersvc.ErrReworkLedgerChanged):
 				httpx.Error(w, http.StatusConflict, err.Error())

@@ -81,7 +81,7 @@ func TestMRReworkMergePendingKeysLiveDB(t *testing.T) {
 		eq(t, got, []string{"ns:9", "ns:10"})
 	})
 
-	t.Run("tied positions are ordered numerically at the cap boundary", func(t *testing.T) {
+	t.Run("tied positions are ordered numerically", func(t *testing.T) {
 		got := merge([]string{"ns:20", "ns:3"}, []string{"ns:100"}, nil,
 			[]string{"ns:3", "ns:20"}, []string{"ns:20", "ns:100"}, `{"ns":1}`)
 		eq(t, got, []string{"ns:20", "ns:100"})

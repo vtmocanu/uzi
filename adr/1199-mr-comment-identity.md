@@ -83,7 +83,9 @@ the repository's id and `<branch>` the MR's source branch (`agent/issue-N`).
    WHERE repo_id = '<repo uuid>' AND ref = '<branch>' AND comment_marks IS NULL;
    ```
 
-   The next tick bootstraps with marks only. The previously pending comments
+   The next watcher tick that lists the comments (green head pipeline, MR
+   not halted at the cap), or the next on-demand rework, bootstraps with marks
+   only. The previously pending comments
    fall back to human review (the owner can run `uzi run rework` with
    guidance). The automatic cycle count is kept.
 
@@ -101,8 +103,12 @@ the repository's id and `<branch>` the MR's source branch (`agent/issue-N`).
 
 During a mixed-version rollout an old binary ignores the new columns and
 updates only the legacy columns (`high_water`, `pending_unknown_ids`,
-`attempt_count`). A comment it consumed on a non-legacy row may therefore
-replay once within the cap, and its legacy-column writes can leave the
+`attempt_count`, `halt_notified`). After bootstrap the legacy
+`pending_unknown_ids` column is frozen, and a rolled-back or mixed-version old
+binary still treats those frozen ids as pending, so it may replay a comment
+the new code already consumed, once within the cap (a bare id can also match a
+comment in another namespace). A comment it consumed on a non-legacy row may
+therefore replay once within the cap, and its legacy-column writes can leave the
 namespace marks and pending keys stale relative to the legacy state.
 
 A binary rollback without a database downgrade leaves `comment_marks` and

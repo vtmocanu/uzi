@@ -270,6 +270,14 @@ func mergePendingKeys(existing, added, removed, superseded, supersededBy []strin
 		if ks[i].slot != ks[j].slot {
 			return ks[i].slot < ks[j].slot
 		}
+		ni, ii := mrwKeyParts(ks[i].k)
+		nj, ij := mrwKeyParts(ks[j].k)
+		if ii != ij {
+			return ii < ij
+		}
+		if ni != nj {
+			return ni < nj
+		}
 		return ks[i].k < ks[j].k
 	})
 	if len(ks) > workersvc.ReviewPendingCap {
@@ -1235,5 +1243,17 @@ func TestMRReworkSummaryThenLowerIdInlineFires(t *testing.T) {
 	}
 	if len(st.upserts) != 1 || st.upserts[0].HighWater != 200 {
 		t.Fatalf("expected the fire to advance high_water to the actionable id 200 (not the summary 300), got %+v", st.upserts)
+	}
+}
+
+// Keys sharing a position (a tied supersession) are ordered numerically by (id, namespace), as
+// in the SQL, not lexically.
+func TestMergePendingKeysTiesOrderNumerically(t *testing.T) {
+	got := mergePendingKeys([]string{"review_comment:5"}, []string{"review_comment:10", "review_comment:9"}, nil,
+		[]string{"review_comment:5", "review_comment:5"}, []string{"review_comment:10", "review_comment:9"},
+		map[string]int64{"review_comment": 1})
+	want := []string{"review_comment:9", "review_comment:10"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

@@ -105,12 +105,14 @@ $$;
 -- superseded_by name (older key, newer key) pairs, a pair applies only when BOTH keys are in the
 -- base set, and an older key is dropped only when it is not itself the replacement of another
 -- applied pair.
--- ORDER is the stored admission order, NOT lexical and NOT numeric across namespaces (their ids
--- are not comparable): existing keys keep their array position; a kept replacement takes the
--- position of the earliest-positioned older key it replaces (the minimum with its own position
--- when it was already stored), so two keys can share a position; ties and keys not previously
--- stored (appended after every stored position) are ordered numerically by (id, namespace). The first 10000 in that order are kept, so
--- on overflow the oldest-admitted are kept, so a later flood cannot displace an earlier finding.
+-- ORDER: the stored admission order is the primary order. Existing keys keep their array
+-- position; a kept replacement takes the position of the earliest-positioned older key it
+-- replaces (the minimum with its own position when it was already stored), so two keys can share
+-- a position. Only keys that share a position (ties) and newly appended keys (placed after every
+-- stored position) are ordered by (id, namespace), numerically: a deterministic tiebreak, not an
+-- age claim across namespaces, whose ids are not comparable. The first 10000 in that order are
+-- kept, so on overflow the oldest-admitted are kept and a later flood cannot displace an earlier
+-- finding.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_merge_pending_keys(
     existing text[],

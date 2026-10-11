@@ -466,9 +466,10 @@ keys. The legacy `high_water` column is still advanced so it stays readable
 for a rollback, but it is not compared on an upgraded row.
 Design rationale and rejected alternatives: [ADR-1199](../adr/1199-mr-comment-identity.md).
 
-**Existing MRs upgrade automatically on their next check.** A ledger row
+**Existing MRs upgrade automatically, with no manual step.** A ledger row
 written before the upgrade is bootstrapped on the first successful comment
-listing, by the watcher or by an on-demand rework. Only a complete listing
+listing: the next watcher tick that lists the comments (green head pipeline,
+MR not halted at the cap) or the next on-demand rework. Only a complete listing
 counts; a failed listing leaves the row as it was and the tick does nothing,
 as before. Each namespace's mark becomes the highest id seen in that namespace
 at or below the old single mark, comments above the old mark keep their
@@ -485,7 +486,7 @@ If the old pending set would expand to more than 10,000 keys, nothing is
 written and the MR is not upgraded or reworked: the watcher logs one Warn per
 MR per tick with reason `bootstrap_overflow` and the counts, and an on-demand
 rework answers 409 "this merge request's review ledger is too large to upgrade
-automatically; an operator must reset it". An operator resets it with one of
+automatically; an operator must reset it (see docs/mr-review-watcher.md)". An operator resets it with one of
 these statements against the database (`<repo uuid>` is the repository id,
 `<branch>` the MR's source branch):
 
@@ -496,7 +497,9 @@ these statements against the database (`<repo uuid>` is the repository id,
    WHERE repo_id = '<repo uuid>' AND ref = '<branch>' AND comment_marks IS NULL;
    ```
 
-   The next tick upgrades the row with marks only. The comments that were
+   The next watcher tick that lists the comments (green head pipeline, MR not
+   halted at the cap), or the next on-demand rework, upgrades the row with
+   marks only. The comments that were
    pending fall back to human review (the owner can run `uzi run rework` with
    guidance). The automatic cycle count is kept.
 
@@ -514,8 +517,12 @@ these statements against the database (`<repo uuid>` is the repository id,
 
 During a mixed-version rollout an old binary ignores the new columns and
 updates only the legacy columns (`high_water`, `pending_unknown_ids`,
-`attempt_count`). A comment it consumed on an already-upgraded row may replay
-once within the cap, and its writes can leave the namespace marks and pending
+`attempt_count`, `halt_notified`). After the upgrade the legacy
+`pending_unknown_ids` column is frozen, and a rolled-back or mixed-version old
+binary still treats those frozen ids as pending, so it may replay a comment
+the new code already consumed, once within the cap (a bare id can also match a
+comment in another namespace). A comment it consumed on an already-upgraded
+row may replay once within the cap, and its writes can leave the namespace marks and pending
 keys stale relative to the legacy state.
 
 Rolling the binary back without a database downgrade leaves the marks and
