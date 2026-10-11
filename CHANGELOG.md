@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **A completed run's guarded recovery archive can expire early once the published branch provably contains it ([#2625](https://github.com/vtmocanu/uzi/issues/2625)).**
+  With worker and API support for `recovery_archive_redundancy_v1`, the worker asks the API from its receipt and covering-final-ACK cleanup, after releasing the journal lock, under one 30-second deadline that never gates cleanup. The API proves through the forge, against the live head of the published branch, that every root, the captured head (for parked WIP, a same-tree witness commit plus every parent of the captured head, using only the receipt's final head) and every recorded prerequisite are ancestors, bound to the exact released, completed, identity-stamped hold, generation, coverage digest and source commit. It then expires the capture as `published_redundant`, records the proof and deletes its payload, so ready-payload and instance byte quotas recover; the per-owner capture count still includes the expired capture and is not addressed here. Any missing, mismatched or inconclusive proof keeps the normal retention, and a forge-evidence refusal is not retried for an hour. Accepted risk: after early expiry, later deletion or force-rewrite of the published branch is not protected by uzi, the same post-publication risk #2598 accepts for custody release. Discard and failed-run handling are unchanged.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
