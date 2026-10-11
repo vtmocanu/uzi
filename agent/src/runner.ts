@@ -12868,9 +12868,11 @@ export class RunRunner {
             throw new SecretRemediationPendingError();
           }
         },
-        // issue #2733: chain a raw publish over the prior overlay tip (same attempted ?? confirmed
-        // precedence as #1086's overlay base), so a lost-ack or confirmed overlay does not wedge
-        // later tick/iteration publishes with `not_descendant`. GitHub only, like the overlay.
+        // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed
+        // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
+        // ordered [attempted, confirmed]: the first candidate that is not already contained in the
+        // raw tip and verifies as wrapper-only is used. (The reap overlay's own base still uses
+        // `attempted ?? confirmed`, unchanged #1086 behaviour.) GitHub only, like the overlay.
         flight.checkpointChainForge === true
           ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
           : undefined);

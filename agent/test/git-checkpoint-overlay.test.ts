@@ -676,8 +676,42 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
     const packed = await chainPack(sc, [n, sc.p]);
     assert.ok(packed);
     assert.deepStrictEqual(parentsOf(sc.bare, packed.tipOid), [sc.p, n2], "chained over the confirmed tip");
-    // An attempted tip that is NOT contained in the raw tip still wins.
-    assert.deepStrictEqual(parentsOf(sc.bare, (await chainPack(sc, [sc.p, sc.r]))!.tipOid), [sc.p, n2]);
+  });
+
+  it("when two candidates both qualify, the first (attempted) wins over the confirmed overlay", async () => {
+    const sc = await overlayScene();
+    const n1 = commit(sc.clone, "M2.txt");
+    await track(sc);
+    // C1 = [P, N1] is packed but never published: the attempted tip.
+    const c1 = (await chainPack(sc, sc.p))!.tipOid;
+    assert.deepStrictEqual(parentsOf(sc.bare, c1), [sc.p, n1]);
+    const n2 = commit(sc.clone, "M3.txt");
+    await track(sc);
+    // C1 is not an ancestor of N2 (only N1 is), and both C1 and P verify as wrapper-only over N2.
+    const packed = await chainPack(sc, [c1, sc.p]);
+    assert.ok(packed);
+    assert.deepStrictEqual(parentsOf(sc.bare, packed.tipOid), [c1, n2], "the first qualifying candidate wins");
+    const reversed = await chainPack(sc, [sc.p, c1]);
+    assert.ok(reversed);
+    assert.deepStrictEqual(parentsOf(sc.bare, reversed.tipOid), [sc.p, n2], "order decides");
+  });
+
+  it("an attempted tip the agent amended away falls through to the confirmed overlay", async () => {
+    const sc = await overlayScene();
+    const n1 = commit(sc.clone, "M2.txt");
+    await track(sc);
+    // C1 = [P, N1] is packed but never lands: attempted = C1.
+    const c1 = (await chainPack(sc, sc.p))!.tipOid;
+    assert.deepStrictEqual(parentsOf(sc.bare, c1), [sc.p, n1]);
+    // The agent amends N1 to N1' (reset to R, recommit different content).
+    gitIn(sc.clone, ["reset", "--hard", sc.r]);
+    const n1b = commit(sc.clone, "M2b.txt");
+    assert.notStrictEqual(n1b, n1);
+    await track(sc);
+    // C1 adds N1, which is real work not in N1', so it does not verify; P alone does.
+    const packed = await chainPack(sc, [c1, sc.p]);
+    assert.ok(packed);
+    assert.deepStrictEqual(parentsOf(sc.bare, packed.tipOid), [sc.p, n1b], "chained over the confirmed P, not raw");
   });
 
   it("no chain when P is an ancestor of N, absent from the bare, or equals N", async () => {

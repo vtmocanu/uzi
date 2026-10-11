@@ -6186,7 +6186,9 @@ export class GitCache {
   }
 
   /**
-   * issue #2733 — chain a RAW checkpoint tip over the prior checkpoint-ref tip `chainFrom` (P), or
+   * issue #2733 — chain a RAW checkpoint tip over a prior checkpoint-ref tip P, chosen from the ordered
+   * candidate list `chainFrom` (attempted, then confirmed: the first that is not already contained
+   * in realTip and verifies as wrapper-only), or
    * return null to ship `realTip` as today. Called only when no overlay wrapper was built.
    *
    * Why: after an overlay publish the remote checkpoint ref sits at P, a `ckpt(overlay):` wrapper
@@ -6198,7 +6200,8 @@ export class GitCache {
    * while the agent tree is alive.
    *
    * Guards, all fail-soft to null (a boundary abort propagates):
-   *  - P is 40-hex and resolves locally; P === realTip or P an ancestor of realTip needs no chain.
+   *  - A candidate is 40-hex and resolves locally; candidate === realTip or an ancestor of realTip
+   *    needs no chain and is skipped, as is a candidate that fails the wrapper-only check below.
    *  - GATE 3 (as in the overlay): the branch must not itself modify a workflow file.
    *  - {@link verifyWrapperOnlyHistory}(P, realTip): everything P adds beyond realTip is a verified
    *    workflow-only wrapper, so the pack carries no new non-workflow content beyond realTip's own
@@ -6219,23 +6222,25 @@ export class GitCache {
     if (!SHA40_RE.test(realTip)) return null;
     try {
       onStep?.("checkpoint_overlay");
-      // First candidate that is not already contained in realTip. A raw tip that shipped
-      // ambiguously (the attempted tip) becomes an ancestor of the next raw tip, and chaining
-      // from it would be a no-op the broker refuses `not_descendant` forever; the confirmed tip
-      // is the one that still needs the chain.
+      // GATE 3 is candidate-independent: the branch must not itself modify a workflow file.
+      const changed = await this.changedFiles(barePath, realTip);
+      if (changed === null) return null;
+      if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
+      // First candidate that is not already contained in realTip AND verifies as a wrapper-only
+      // history over it. A raw tip that shipped ambiguously (the attempted tip) becomes an ancestor
+      // of the next raw tip, and chaining from it would be a no-op the broker refuses
+      // `not_descendant` forever; an attempted tip the agent amended away is no longer a wrapper
+      // of realTip, so a failing candidate falls through to the next (the confirmed tip).
       let prev: string | undefined;
       for (const cand of chainFrom) {
         if (!cand || !SHA40_RE.test(cand) || cand === realTip) continue;
         if ((await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${cand}^{commit}`])) !== cand) continue;
         if (await this.isAncestor(barePath, cand, realTip)) continue;
+        if (!(await this.verifyWrapperOnlyHistory(barePath, cand, realTip))) continue;
         prev = cand;
         break;
       }
       if (prev === undefined) return null;
-      const changed = await this.changedFiles(barePath, realTip);
-      if (changed === null) return null;
-      if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
-      if (!(await this.verifyWrapperOnlyHistory(barePath, prev, realTip))) return null;
       const lastParent = (
         await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", prev])
       ).split(/\s+/).filter(Boolean).pop();
