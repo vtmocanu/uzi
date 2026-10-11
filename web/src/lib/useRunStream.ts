@@ -55,6 +55,11 @@ export function useRunStream(runId: string) {
   // would capture the new generation and be accepted.
   const genRef = useRef(0);
   const activeRunIdRef = useRef(runId);
+  // Same-run run reads can overlap (a state frame and a plan_revising frame each
+  // re-read it). Each read takes a ticket; a response older than the newest one
+  // already applied is dropped, so a slow read never restores stale state (issue #2760).
+  const runReadTicketRef = useRef(0);
+  const runReadAppliedRef = useRef(0);
 
   const commit = useCallback((s: StreamState) => {
     streamRef.current = s;
@@ -64,13 +69,17 @@ export function useRunStream(runId: string) {
   const refreshRun = useCallback(async () => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
+    const ticket = ++runReadTicketRef.current;
     try {
       const { run } = await api.getRun(runId);
       if (gen !== genRef.current) return;
+      if (ticket < runReadAppliedRef.current) return;
+      runReadAppliedRef.current = ticket;
       setRun(run);
       statusRef.current = run.status;
     } catch (e) {
       if (gen !== genRef.current) return;
+      if (ticket < runReadAppliedRef.current) return;
       if (e instanceof ApiError) setError(e.message);
     }
   }, [runId]);

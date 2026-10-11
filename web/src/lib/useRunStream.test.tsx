@@ -617,3 +617,56 @@ describe("useRunStream live revise cycle (issue #2760)", () => {
     await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(true));
   });
 });
+
+describe("useRunStream out-of-order run refresh (issue #2760)", () => {
+  beforeEach(() => {
+    LiveSocket.last = null;
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // A plan_revising / plan frame re-reads the run while an earlier re-read (here the
+  // state frame's) is still in flight. The older response resolving last must not
+  // overwrite the newer revising flag, in either direction.
+  for (const target of [true, false]) {
+    it(`keeps the newest is_revising=${target} when an older refresh resolves last`, async () => {
+      const gate = (revising: boolean): Run => ({ ...fakeRun(), status: "awaiting_approval", is_revising: revising });
+      const getRun = vi.spyOn(api, "getRun").mockResolvedValue({ run: gate(!target) });
+      vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+      vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+      const { result } = renderHook(() => useRunStream("run-1"));
+      await waitFor(() => expect(result.current.run?.is_revising).toBe(!target));
+
+      let resolveOld!: (value: { run: Run }) => void;
+      const old = new Promise<{ run: Run }>((resolve) => {
+        resolveOld = resolve;
+      });
+      getRun.mockImplementationOnce(() => old).mockResolvedValue({ run: gate(target) });
+      const before = getRun.mock.calls.length;
+      await act(async () => {
+        LiveSocket.last!.deliver({ type: "state" });
+      });
+      expect(getRun.mock.calls.length).toBeGreaterThan(before);
+      await act(async () => {
+        LiveSocket.last!.deliver({
+          type: "message",
+          seq: 1,
+          kind: target ? "plan_revising" : "plan",
+          agent: "lead",
+          payload: {},
+          created_at: "",
+        });
+      });
+      await waitFor(() => expect(result.current.run?.is_revising).toBe(target));
+
+      await act(async () => {
+        resolveOld({ run: gate(!target) });
+        await old;
+      });
+      expect(result.current.run?.is_revising).toBe(target);
+    });
+  }
+});
