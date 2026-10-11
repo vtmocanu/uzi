@@ -83,10 +83,10 @@ func TestStatusReportWireContract(t *testing.T) {
 	got = append(got, '\n')
 
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(statusContractFixture), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(statusContractFixture), 0o750); err != nil {
 			t.Fatalf("mkdir testdata: %v", err)
 		}
-		if err := os.WriteFile(statusContractFixture, got, 0o644); err != nil {
+		if err := os.WriteFile(statusContractFixture, got, 0o600); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}
 		t.Log("golden file updated")

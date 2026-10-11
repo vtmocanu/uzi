@@ -47,8 +47,9 @@ type Client struct {
 func New(baseURL, token string, timeout time.Duration, caPool *x509.CertPool, log *slog.Logger) *Client {
 	// Clone the default transport rather than building one: it carries the
 	// connection pooling, proxy handling and HTTP/2 support net/http has tuned, and
-	// only the TLS roots need changing.
+	// customize TLS roots and retain compression handling in the bounded poll decoder.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableCompression = true
 	if caPool != nil {
 		tr.TLSClientConfig = &tls.Config{
 			RootCAs:    caPool,
@@ -78,6 +79,7 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 		return protocol.PollResponse{}, fmt.Errorf("apiclient: build poll request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept-Encoding", "gzip")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

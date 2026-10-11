@@ -1,6 +1,7 @@
 package apiclient
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/hex"
@@ -18,24 +19,37 @@ import (
 const maxPollBytes = 4 << 20
 const maxPollWorkers = 512
 
-// decodePoll bounds actual decompressed bytes, independent of ContentLength.
+// decodePoll bounds compressed and decompressed bytes, independent of ContentLength.
+// Accept exactly one gzip member so empty members cannot evade the output budget.
 // Every rejected snapshot returns no workers and a payload-free error.
 func decodePoll(resp *http.Response) (protocol.PollResponse, error) {
 	reject := func() (protocol.PollResponse, error) {
 		return protocol.PollResponse{}, fmt.Errorf("apiclient: invalid or oversized poll response")
 	}
-	var reader io.Reader = resp.Body
+	if resp.Uncompressed {
+		return reject() // A custom transport hid the compressed input from our bound.
+	}
+	input := &io.LimitedReader{R: resp.Body, N: maxPollBytes + 1}
+	var reader io.Reader = input
+	var compressed *bufio.Reader
 	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(reader)
+		compressed = bufio.NewReader(input)
+		gz, err := gzip.NewReader(compressed)
 		if err != nil {
 			return reject()
 		}
 		defer func() { _ = gz.Close() }()
+		gz.Multistream(false)
 		reader = gz
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, maxPollBytes+1))
-	if err != nil || len(data) > maxPollBytes {
+	if err != nil || len(data) > maxPollBytes || input.N == 0 {
 		return reject()
+	}
+	if compressed != nil {
+		if _, err := compressed.ReadByte(); !errors.Is(err, io.EOF) {
+			return reject() // Reject trailing bytes, including a second gzip member.
+		}
 	}
 	raw, err := scanPollWorkers(data)
 	if err != nil {
@@ -270,7 +284,7 @@ func validSet(set []string) bool {
 			return false
 		}
 		for _, r := range s {
-			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
 				return false
 			}
 		}

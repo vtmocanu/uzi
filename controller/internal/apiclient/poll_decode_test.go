@@ -103,7 +103,7 @@ func TestBoundedPollDecompressionAndChunking(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Exercise explicit compressed responses and the HTTP transport's
-			// automatic decompression of a chunked response independently.
+			// chunked response handling independently.
 			resp := &http.Response{Body: io.NopCloser(bytes.NewReader(encoded.Bytes())), Header: http.Header{"Content-Encoding": {"gzip"}}, ContentLength: 1}
 			got, err := decodePoll(resp)
 			if oversized {
@@ -129,6 +129,35 @@ func TestBoundedPollDecompressionAndChunking(t *testing.T) {
 				t.Fatalf("chunked response: %v", err)
 			}
 		})
+	}
+}
+
+func TestBoundedPollRejectsConcatenatedGzipMembers(t *testing.T) {
+	var first, empty bytes.Buffer
+	for _, item := range []struct {
+		buf  *bytes.Buffer
+		body []byte
+	}{{&first, []byte(`{"workers":[]}`)}, {&empty, nil}} {
+		gz := gzip.NewWriter(item.buf)
+		if _, err := gz.Write(item.body); err != nil {
+			t.Fatal(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := append(first.Bytes(), bytes.Repeat(empty.Bytes(), 300000)...)
+	resp := &http.Response{Body: io.NopCloser(bytes.NewReader(body)), Header: http.Header{"Content-Encoding": {"gzip"}}}
+	if got, err := decodePoll(resp); err == nil || got.Workers != nil {
+		t.Fatal("concatenated gzip members bypassed input bounds")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	if got, err := New(srv.URL, "controller-fixture", time.Second, nil, testLogger()).Poll(context.Background()); err == nil || got.Workers != nil {
+		t.Fatal("transport decompression hid concatenated gzip members")
 	}
 }
 

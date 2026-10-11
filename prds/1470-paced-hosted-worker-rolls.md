@@ -32,7 +32,7 @@ Tick only items supported by direct execution evidence. Keep this PRD active unt
 5. **Holds:** any unresolved stalled participant blocks further admission, with remaining healthy old workers claiming. Drain deadlines apply only to admitted workers. Explicit workers.forceRoll bypasses pacing/hold/evidence with existing custody/maintenance protection; no automatic timeout override or rollback.
 6. **Cordon ownership:** a reason beside draining_since allows only roll-owned release. Preserve independent maintenance, pressure and custody fences, including delayed drain writes.
 7. **Skew:** deploy new API first, then the singleton controller, before changing the worker pin. Introducing pod UID environment itself causes a paced template roll. Old controllers retain legacy unpaced behavior.
-8. **Limits and verification:** decompressed polls are bounded before typed worker allocation and reject incomplete snapshots atomically. Existing KinD smoke is envelope coverage; maintainer hosted verification stays open.
+8. **Limits and verification:** compressed and decompressed polls have independent 4 MiB limits, accept one gzip member only, and are bounded before typed worker allocation; incomplete snapshots are rejected atomically. Existing KinD smoke is envelope coverage; maintainer hosted verification stays open.
 
 ## Execution evidence
 
