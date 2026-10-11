@@ -52,7 +52,7 @@ reaches a final status. Each retained capture is in one of these six states:
   storage limit was hit); the source stays retained. Retries depend on the
   recovery path's budget; terminal retained-source failure does not cycle
   automatically or offer Resume.
-- **Expired** — the ready download window passed and the bytes were purged.
+- **Expired** — uzi purged the bytes, for example when the ready download window passed. The record stays for audit and no longer counts toward the per-owner capture limit.
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
 
 When a run has **no** retained captures at all, the section reports one of
@@ -237,7 +237,7 @@ operator-configurable environment variable on the API:
 | Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. |
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
-| Retained captures per owner | 256 | Non-discarded captures on file, including expired metadata. |
+| Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
 | Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**

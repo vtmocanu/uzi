@@ -280,11 +280,14 @@ implementation.
 
 A new `Service.Reserve` refuses at `count >= ceiling` (unlike byte equality):
 per-claim counts captures under the exact hold, including tombstones;
-per-owner counts captures whose state is not `discarded`, including expired.
+per-owner counts captures whose state is neither `discarded` nor `expired`;
+any other state, including one added later, counts.
 An existing idempotency key bypasses these new-capture checks. Nonpositive
 ceilings disable them. Count refusal also returns 507 `quota`, potentially
 before any capture row is created; it is absent from `recovery.storage`
-unless a current persisted upload-refusal marker exists.
+unless a current persisted upload-refusal marker exists. Expired metadata rows
+are retained without a pruning window, so they accumulate as audit rows but no
+longer consume per-owner count slots.
 
 ```sql
 SELECT h.id AS hold_id, h.generation, count(c.id) AS per_claim_count,
@@ -299,7 +302,7 @@ SELECT count(*) AS per_owner_count,
        (:owner_capture_limit::int > 0 AND count(*) >= :owner_capture_limit::int)
          AS new_capture_count_refusal
 FROM recovery_captures
-WHERE user_id = :'owner_id'::uuid AND state <> 'discarded';
+WHERE user_id = :'owner_id'::uuid AND state NOT IN ('discarded', 'expired');
 
 SELECT id, run_id, hold_id, state, expires_at, local_replica_worker_id,
        (state = 'available' AND expires_at IS NOT NULL
