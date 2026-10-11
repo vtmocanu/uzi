@@ -82,10 +82,29 @@ it("finalize retirement consumes the exact archived report while keeping source 
   assert.equal(await f.r.recoveryInventoryPending(f.claim.run_id, 2), true);
 });
 
+// Without real waiting, the pre-proof path of the next retireRecoveryReport advances an offset
+// clock by `jumpMs`. Restores both mocks; call it in a finally before any later replay.
+function stallBeforeProof(t: Parameters<typeof reportRetirementFixture>[0],
+  f: Awaited<ReturnType<typeof reportRetirementFixture>>, jumpMs: number) {
+  let offset = 0;
+  const realNow = Date.now.bind(Date);
+  const clock = t.mock.method(Date, "now", () => realNow() + offset);
+  const reserve = f.r as unknown as { withReportSourceReservation: (id: string, action: () => Promise<void>) => Promise<void> };
+  const realReserve = reserve.withReportSourceReservation.bind(f.r);
+  const stall = t.mock.method(reserve, "withReportSourceReservation", (id: string, action: () => Promise<void>) => {
+    offset = jumpMs;
+    return realReserve(id, action);
+  });
+  return () => { offset = 0; stall.mock.restore(); clock.mock.restore(); };
+}
+
 it("fresh positive replay succeeds after a deterministic first proof budget expiry", async t => {
   const f = await reportRetirementFixture(t);
+  // A 1.5 s pre-boundary stall exceeds the production 1 s budget but not the headroom budget: the
+  // proof still reaches its boundary, and only the hand-fired production deadline expires it.
+  const unstall = stallBeforeProof(t, f, 1_500);
   const expiry = f.expireNextProof();
-  try { await f.replay(); } finally { expiry.restore(); }
+  try { await f.replay(); } finally { unstall(); expiry.restore(); }
   assert.equal(expiry.observation.reached, true, "the proof reached its first budgeted boundary");
   assert.ok(expiry.observation.timersCaptured >= 1, "production registered its proof-deadline timer");
   assert.equal(expiry.observation.abortedBefore, false, "the proof signal was live before the deadline callback fired");
@@ -105,27 +124,17 @@ it("fresh positive replay succeeds after a deterministic first proof budget expi
   await f.assertCustody();
 });
 
-it("a proof that lapses before the expiry boundary reports reached=false and cannot hijack the fresh replay", async t => {
+it("a proof that lapses before the expiry boundary reports reached=false", async t => {
   const f = await reportRetirementFixture(t);
-  // Stall before the hooked boundary without real waiting: the pre-proof path advances an offset
-  // clock past the (headroom) budget, so the proof refuses before it ever calls the hook.
-  let offset = 0;
-  const realNow = Date.now.bind(Date);
-  const clock = t.mock.method(Date, "now", () => realNow() + offset);
-  const reserve = (f.r as unknown as { withReportSourceReservation: (id: string, action: () => Promise<void>) => Promise<void> });
-  const realReserve = reserve.withReportSourceReservation.bind(f.r);
-  t.mock.method(reserve, "withReportSourceReservation", (id: string, action: () => Promise<void>) => {
-    offset = 120_000;
-    return realReserve(id, action);
-  });
+  // The jump exceeds even the headroom budget, so the proof refuses before it calls the hook.
+  const unstall = stallBeforeProof(t, f, 120_000);
   const expiry = f.expireNextProof();
-  try { await f.replay(); } finally { offset = 0; clock.mock.restore(); expiry.restore(); }
+  try { await f.replay(); } finally { unstall(); expiry.restore(); }
   assert.equal(expiry.observation.reached, false, "the missed boundary is reported, not silently passed");
   assert.equal(expiry.observation.aborted, false);
   assert.equal(f.calls.cancelledAcks, 1);
   await f.assertPending();
   if (process.platform !== "linux") return;
-  // The unreached hook was removed, so the fresh replay is not intercepted and retires.
   const attempts = await f.replayPositive();
   assert.equal(f.calls.cancelledAcks, 1 + attempts);
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
