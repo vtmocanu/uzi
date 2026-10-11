@@ -122,10 +122,10 @@ func (s *Service) CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, r
 // The non-counting ledger mark advance is now folded into the create as ONE atomic
 // statement (CreateManualMRReworkRunAndAdvance): the plan's MaxActionable marks (the max
 // actionable comment id per namespace, ADR-1199) are what StartMRReworkForRun computed, and
-// Postgres commits the run INSERT and the advance together or rolls both back. Previously the advance was a separate best-effort call whose failure
-// was only logged — a review finding, since a create that returned success with an
-// unadvanced ledger let the automatic watcher re-fire on the same comments (see
-// StartMRReworkForRun).
+// Postgres commits the run INSERT and the advance together or rolls both back. Previously
+// the advance was a separate best-effort call whose failure was only logged — a review
+// finding, since a create that returned success with an unadvanced ledger let the automatic
+// watcher re-fire on the same comments (see StartMRReworkForRun).
 //
 // plan carries the ledger's pending_unknown_keys delta (issue #2347) that rides the same atomic
 // statement as the advance. recheck, when non-nil, re-validates freshness under the create
@@ -353,9 +353,9 @@ func readReworkLedger(ctx context.Context, q Store, repoID uuid.UUID, ref string
 func recheckReworkLedger(cur store.GetMRReworkLedgerRow, rc *reworkRecheck) error {
 	state, err := LedgerStateFromRow(cur)
 	if err != nil {
-		// A legacy row never reaches here from a ledger-writing create (refused above); a
-		// read-only recheck on one has no namespaced state to judge freshness against.
-		return ErrReworkLedgerChanged
+		// A legacy row is refused earlier, under the lock; what reaches here is a stored
+		// ledger that does not decode, which a retry cannot fix.
+		return fmt.Errorf("decode mr rework ledger: %w", err)
 	}
 	if rc.enforceCap && int(cur.AttemptCount) >= rc.capLimit {
 		return ErrMRReworkCapReached

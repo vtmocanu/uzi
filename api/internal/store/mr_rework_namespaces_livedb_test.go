@@ -3,14 +3,12 @@ package store_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"slices"
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -31,14 +29,6 @@ func marksOf(t *testing.T, raw []byte) map[string]int64 {
 		t.Fatalf("comment_marks %q: %v", raw, err)
 	}
 	return m
-}
-
-func pgCode(err error) string {
-	var pe *pgconn.PgError
-	if errors.As(err, &pe) {
-		return pe.Code
-	}
-	return ""
 }
 
 func TestMRReworkMergePendingKeysLiveDB(t *testing.T) {
@@ -82,6 +72,19 @@ func TestMRReworkMergePendingKeysLiveDB(t *testing.T) {
 	t.Run("new keys are ordered numerically, not lexically", func(t *testing.T) {
 		got := merge(nil, []string{"review_comment:10", "review_comment:9"}, nil, nil, nil, `{}`)
 		eq(t, got, []string{"review_comment:9", "review_comment:10"})
+	})
+
+	t.Run("tied positions fall back to numeric id order, not lexical", func(t *testing.T) {
+		// ns:5 is replaced by the kept ns:10 and ns:9, which both inherit its position.
+		got := merge([]string{"ns:5"}, []string{"ns:10", "ns:9"}, nil,
+			[]string{"ns:5", "ns:5"}, []string{"ns:10", "ns:9"}, `{"ns":1}`)
+		eq(t, got, []string{"ns:9", "ns:10"})
+	})
+
+	t.Run("tied positions are ordered numerically at the cap boundary", func(t *testing.T) {
+		got := merge([]string{"ns:20", "ns:3"}, []string{"ns:100"}, nil,
+			[]string{"ns:3", "ns:20"}, []string{"ns:20", "ns:100"}, `{"ns":1}`)
+		eq(t, got, []string{"ns:20", "ns:100"})
 	})
 
 	t.Run("stored keys keep their position and precede new keys", func(t *testing.T) {

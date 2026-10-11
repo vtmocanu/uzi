@@ -139,3 +139,8 @@ legacy scalar (and the stays-skipped consequence below applies again).
 - Ambiguous legacy pending ids can replay one consumed comment once (above).
 - Mixed-version and rollback staleness is bounded by the cap and falls back to
   human review, never to a wrong automatic fix of an unverified author.
+- New code never advances a legacy row. The automatic advance is guarded twice
+  (the ledger read under the branch lock, and an upsert that writes nothing on a
+  legacy row); the on-demand create relies on the read under the branch lock
+  alone. Old binaries take the same lock, so a legacy row cannot appear inside
+  that window; this is an accepted boundary, not a second guard.

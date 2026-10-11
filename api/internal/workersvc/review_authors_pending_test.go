@@ -130,7 +130,7 @@ func TestPlanOutsiderFloodKeepsEligibleAuthorsComment(t *testing.T) {
 	}
 }
 
-func TestPlanKeepsOneNewestPendingIDPerAuthor(t *testing.T) {
+func TestPlanKeepsOneLastListedPendingKeyPerAuthor(t *testing.T) {
 	h := newHarness()
 	// X (unknown) has 100 pending, then 150 and 170 arrive; a member comment at 180 moves the mark.
 	res := h.snapshot(t, h.params(
@@ -141,7 +141,7 @@ func TestPlanKeepsOneNewestPendingIDPerAuthor(t *testing.T) {
 	))
 	plan := res.Plan(raState(120, 100))
 	if !slices.Equal(plan.PendingAdd, raKeys(170)) {
-		t.Fatalf("pending add = %v, want only the newest id of the author", plan.PendingAdd)
+		t.Fatalf("pending add = %v, want only the last listed key of the author", plan.PendingAdd)
 	}
 	if len(plan.PendingRemove) != 0 {
 		t.Fatalf("pending remove = %v, want supersession kept out of the unconditional removals", plan.PendingRemove)
@@ -292,5 +292,44 @@ func TestPlanCapWarningFiresWhenNewIDsExceedTheCap(t *testing.T) {
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("would exceed its cap")) {
 		t.Fatalf("no cap warning although a new id overflows the set; log: %q", buf.String())
+	}
+}
+
+// The representative is the author's LAST unknown actionable key in listing order, not the key
+// with the largest id: ids of different namespaces are not comparable (issue_comment ids run
+// far above review_comment ids).
+func TestPlanRepresentativeIsLastListedAcrossNamespaces(t *testing.T) {
+	h := newHarness()
+	ic := func(id, author int64, name, body string, at time.Time) forge.MRComment {
+		c := inline(id, author, name, body, at)
+		c.IDNamespace = forge.CommentNSIssueComment
+		return c
+	}
+	rc := func(id, author int64, name, body string, at time.Time) forge.MRComment {
+		c := inline(id, author, name, body, at)
+		c.IDNamespace = forge.CommentNSReviewComment
+		return c
+	}
+	const issueID, reviewID = int64(5_580_000_000), int64(3_960_000_001)
+	res := h.snapshot(t, h.params(
+		ic(issueID-1000, flakyID, "xavier", "older, already pending", raT0.Add(-time.Second)),
+		ic(issueID, flakyID, "xavier", "first", raT0),
+		rc(reviewID, flakyID, "xavier", "later", raT0.Add(time.Second)),
+		// Member comments move both namespaces' marks above X's ids.
+		ic(issueID+100, memberID, "carol", "m1", raT0.Add(2*time.Second)),
+		rc(reviewID+100, memberID, "carol", "m2", raT0.Add(3*time.Second)),
+	))
+	old := workersvc.CommentKey{Namespace: forge.CommentNSIssueComment, ID: issueID - 1000}
+	state := workersvc.ReviewLedgerState{
+		Marks:   map[string]int64{forge.CommentNSIssueComment: issueID - 500, forge.CommentNSReviewComment: reviewID - 500},
+		Pending: []workersvc.CommentKey{old},
+	}
+	plan := res.Plan(state)
+	want := workersvc.CommentKey{Namespace: forge.CommentNSReviewComment, ID: reviewID}
+	if !slices.Equal(plan.PendingAdd, []workersvc.CommentKey{want}) {
+		t.Fatalf("pending add = %v, want only the last listed key %v", plan.PendingAdd, want)
+	}
+	if !slices.Equal(plan.PendingSuperseded, []workersvc.CommentKey{old}) || !slices.Equal(plan.PendingSupersededBy, []workersvc.CommentKey{want}) {
+		t.Fatalf("superseded = %v by %v, want %v replaced by %v", plan.PendingSuperseded, plan.PendingSupersededBy, old, want)
 	}
 }

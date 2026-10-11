@@ -108,8 +108,8 @@ $$;
 -- ORDER is the stored admission order, NOT lexical and NOT numeric across namespaces (their ids
 -- are not comparable): existing keys keep their array position; a kept replacement takes the
 -- position of the earliest-positioned older key it replaces (the minimum with its own position
--- when it was already stored); keys not previously stored are appended after every stored
--- position, ordered numerically by (id, namespace). The first 10000 in that order are kept, so
+-- when it was already stored), so two keys can share a position; ties and keys not previously
+-- stored (appended after every stored position) are ordered numerically by (id, namespace). The first 10000 in that order are kept, so
 -- on overflow the oldest-admitted are kept, so a later flood cannot displace an earlier finding.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_merge_pending_keys(
@@ -168,8 +168,7 @@ AS $$
     SELECT sl.k,
            row_number() OVER (
              ORDER BY (sl.pos IS NULL), sl.pos,
-                      CASE WHEN sl.pos IS NULL THEN mr_rework_key_id(sl.k) END,
-                      CASE WHEN sl.pos IS NULL THEN mr_rework_key_ns(sl.k) END, sl.k
+                      mr_rework_key_id(sl.k), mr_rework_key_ns(sl.k), sl.k
            ) AS rn
     FROM slotted sl
   )
