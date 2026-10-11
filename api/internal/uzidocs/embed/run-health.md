@@ -112,7 +112,7 @@ next to the elapsed time — `3h 48m / 8h`, or `3h 48m / 8h+2h` once it's been
 extended. When it crosses **near timeout**, the run's owner gets an
 **Extend time…** button in the header and a panel explaining what will
 happen: a chooser offering +1h / +2h / +4h / +8h or a custom duration (`2h`,
-`90m`, `1h30m`), with the used time, the remaining allowance and the
+`90m`, `1h30m`), with the used time, the maximum per extension and the
 resulting deadline shown before you confirm. The extension adds to the
 run's existing budget — it never replaces it, and the underlying frozen
 budget described in [Milestone-scaled
@@ -124,11 +124,31 @@ formats and what a refusal looks like).
 Only the run's owner can extend it; everyone else sees inert text in the
 same spot. Extending a run clears its near-timeout flag on the next health
 sweep, though a long-enough run can cross 85% of the new, larger budget
-later and get flagged again — that's expected, not a bug. Total extra time
-per run is bounded by an admin-set allowance (default 16h); once a run has
-used up its allowance, or an admin has turned extending off entirely, the
-button and the CLI command both stop working — see [Admin
+later and get flagged again — that's expected, not a bug. An admin-set
+maximum per extension (default 16h) limits how much time one request can
+add; it is not a lifetime total, so the owner may extend the same run again
+and again. Each extension is an explicit, owner-authorized, audited action:
+repeated grants permit longer resource use, and nothing extends a run
+automatically. When an admin has turned extending off entirely, the button
+and the CLI command both stop working — see [Admin
 settings](admin-settings.md#run-health) for that setting.
+
+### How much time a run can have in total
+
+A run's total wall-clock budget can never exceed 2147483 seconds (24d 20h
+31m 23s), the worker's timer limit. The room left for extensions is that
+limit, minus the larger of the run's frozen wall budget
+(`budget_wall_seconds`), `RUN_TIMEOUT` and `RUN_WALL_CEILING`, minus the
+30-minute finalize allowance that Stop grants (or the larger finalize
+allowance already granted), minus what is already extended. A request past
+that room is refused with a 409 naming the limit and the room left. With the
+shipped defaults (`RUN_TIMEOUT` 6h, derived `RUN_WALL_CEILING` 24h) that is
+about 23d 20h (2059283 s) of total extension; an instance configured with a
+72h `RUN_WALL_CEILING`, or a run frozen with a 72h wall, gets about 21d 20h
+(1886483 s). The room is computed from the current `RUN_TIMEOUT` and
+`RUN_WALL_CEILING`; an operator who raises `RUN_TIMEOUT` later is not covered
+for a run that has no frozen wall yet. Chat, judge and interactive-task runs
+never time out, so extending one is refused, and a job is never extended.
 
 ## Running out of time
 

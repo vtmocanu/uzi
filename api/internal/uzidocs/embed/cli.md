@@ -338,12 +338,17 @@ A few worth knowing:
   of a kind the sweep can time out (issue, task, prompt, self-improve,
   mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
   interactive-task run never times out, so extending one is a 409 (exit 5).
-  Extending past the admin's per-run allowance, or while an admin has
-  turned extending off entirely, is also a 409, with the server's message
-  (naming the remaining allowance) printed verbatim. On success it prints
-  the new deadline and the running total against the allowance, e.g.
-  `Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this
-  run: 2h of 16h allowed.` Owner-only.
+  `--by` is limited per request by the admin's maximum per extension
+  (default 16h), not per run: you may extend the same run repeatedly, and
+  each extension is an audited action. A request above that maximum, a
+  request past the run's technical total limit (see [How much time a run
+  can have in total](./run-health.md#how-much-time-a-run-can-have-in-total)),
+  or an extend while an admin has turned extending off entirely, is a 409
+  (exit 5) with the server's message printed verbatim (for example `+20h is
+  more than the 16h maximum per extension`). On success it prints the new
+  deadline and the run's total extension, e.g. `Extended <id> by 2h. 3h05m
+  left, times out 17:20. Extensions on this run: 18h total (up to 16h per
+  extension).` Owner-only.
 - **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
