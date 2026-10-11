@@ -24,6 +24,7 @@ import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
+import { mkdtempForSocket } from "./short-sock-dir.js";
 
 // issue #1786 M0b — the operator retained-source channel, against a REAL GitCache, a REAL RunRunner
 // reservation, the REAL Worker claim loops and a REAL Unix socket. The destructive sequence is
@@ -153,7 +154,7 @@ interface Rig {
 }
 
 function shortDir(prefix = "rso-"): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = mkdtempForSocket(prefix);
   scratch.push(dir);
   return dir;
 }

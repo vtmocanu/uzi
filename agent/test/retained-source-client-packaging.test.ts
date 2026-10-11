@@ -2,7 +2,6 @@ import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import {
@@ -10,6 +9,7 @@ import {
   RETAINED_SOURCE_RESPONSE_MAX_BYTES,
   RETAINED_SOURCE_SOCKET_RELATIVE,
 } from "../src/ops/retained-source-server.js";
+import { mkdtempForSocket } from "./short-sock-dir.js";
 
 // issue #1786 M0b — the operator client is a self-contained `.mjs` that the image runs by path under
 // a scrubbed environment and the image-owned node binary. These tests run the EXACT documented
@@ -33,7 +33,7 @@ afterEach(async () => {
   for (const d of scratch.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 function shortDir(): string {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "rsc-"));
+  const d = mkdtempForSocket("rsc-");
   scratch.push(d);
   return d;
 }
