@@ -285,8 +285,10 @@ export async function reportRetirementFixture(t: TestContext, options: {
     await assertCustody();
   };
   // Positive stages lend the three production wall-clock bounds headroom so a slow runner cannot
-  // expire a proof that is otherwise valid. Expiry tests do not call this: they keep the 1 s/1 s/5 s
-  // defaults. Mocks are restored by the caller (positiveStage) or at test end.
+  // expire a proof that is otherwise valid. The deliberate-expiry test (expireNextProof) also uses
+  // headroom, to reach its first budgeted boundary on any runner speed, and then fires the captured
+  // production deadline callback by hand instead of waiting for the real 1 s budget. Mocks are
+  // restored by the caller (positiveStage, expireNextProof's restore) or at test end.
   // Distinct values let captureTimers tell the three production timers apart.
   const headroom = { proofMs: 61_001, authorityMs: 61_002, passMs: 61_003 };
   const headroomMs = headroom.proofMs;
@@ -353,15 +355,18 @@ export async function reportRetirementFixture(t: TestContext, options: {
     const restoreHeadroom = useHeadroom();
     const timer = captureTimers(ms => ms > headroom.proofMs - 5_000 && ms <= headroom.proofMs);
     const real = git.withReportProofBudget.bind(git);
-    const observation = { reached: false, timersCaptured: 0, aborted: false };
+    const observation = { reached: false, timersCaptured: 0, abortedBefore: undefined as boolean | undefined,
+      aborted: false, reason: undefined as string | undefined };
     const mock = t.mock.method(git, "withReportProofBudget", <T>(
       budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>,
     ): Promise<T> => {
       mock.mock.restore(); // Only this proof expires; the next attempt gets a fresh budget.
       observation.reached = true;
       observation.timersCaptured = timer.count();
+      observation.abortedBefore = budget.signal.aborted;
       timer.fire();
       observation.aborted = budget.signal.aborted;
+      observation.reason = budget.signal.reason instanceof Error ? budget.signal.reason.message : String(budget.signal.reason);
       return real(budget, action);
     });
     const restore = () => { mock.mock.restore(); timer.restore(); restoreHeadroom(); };
