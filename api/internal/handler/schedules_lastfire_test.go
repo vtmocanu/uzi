@@ -173,3 +173,74 @@ func TestRunNowResponseIneligibleMatched(t *testing.T) {
 		t.Errorf("nil IneligibleMatched must stay nil, got %d", *resp.IneligibleMatched)
 	}
 }
+
+// TestScheduleDTORecentFires pins the recent_fires mapping (issue #2519): always a
+// non-nil array on the wire, order preserved, a bad element dropped, a bad array empty.
+func TestScheduleDTORecentFires(t *testing.T) {
+	h := &Handler{}
+	base := store.RunSchedule{Target: "sweep", Timing: "recurring", Timezone: "UTC"}
+	recentJSON := func(t *testing.T, raw []byte) (apitypes.ScheduleDTO, string) {
+		t.Helper()
+		r := base
+		r.RecentFires = raw
+		dto := h.scheduleDTO(r, "")
+		b, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal dto: %v", err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("unmarshal dto: %v", err)
+		}
+		return dto, string(m["recent_fires"])
+	}
+
+	t.Run("empty array and nil bytes serialize as []", func(t *testing.T) {
+		for name, raw := range map[string][]byte{"empty": []byte(`[]`), "nil": nil, "zero-length": {}} {
+			dto, got := recentJSON(t, raw)
+			if got != `[]` || len(dto.RecentFires) != 0 {
+				t.Errorf("%s: recent_fires = %s, want []", name, got)
+			}
+		}
+	})
+
+	fire := func(day int, matched int) apitypes.LastFire {
+		return apitypes.LastFire{FiredAt: time.Date(2026, 8, day, 2, 0, 0, 0, time.UTC), Matched: matched}
+	}
+	marshalAll := func(t *testing.T, v any) []byte {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+
+	t.Run("order is kept", func(t *testing.T) {
+		dto, _ := recentJSON(t, marshalAll(t, []apitypes.LastFire{fire(3, 3), fire(2, 2), fire(1, 1)}))
+		if len(dto.RecentFires) != 3 {
+			t.Fatalf("len = %d, want 3", len(dto.RecentFires))
+		}
+		for i, want := range []int{3, 2, 1} {
+			if dto.RecentFires[i].Matched != want {
+				t.Errorf("[%d].Matched = %d, want %d", i, dto.RecentFires[i].Matched, want)
+			}
+		}
+	})
+
+	t.Run("malformed element is dropped", func(t *testing.T) {
+		good1, good2 := marshalAll(t, fire(2, 2)), marshalAll(t, fire(1, 1))
+		raw := []byte(`[` + string(good1) + `,{"fired_at":"not-a-time"},null,` + string(good2) + `]`)
+		dto, _ := recentJSON(t, raw)
+		if len(dto.RecentFires) != 2 || dto.RecentFires[0].Matched != 2 || dto.RecentFires[1].Matched != 1 {
+			t.Fatalf("recent_fires = %+v, want the two good entries in order", dto.RecentFires)
+		}
+	})
+
+	t.Run("malformed array is empty", func(t *testing.T) {
+		dto, got := recentJSON(t, []byte(`{"not":"an array"}`))
+		if got != `[]` || len(dto.RecentFires) != 0 {
+			t.Errorf("recent_fires = %s, want []", got)
+		}
+	})
+}

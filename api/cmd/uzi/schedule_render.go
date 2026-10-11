@@ -108,6 +108,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		return err
 	}
 	renderLastFire(p, s.LastFire)
+	renderRecentFires(p, s.RecentFires)
 	return nil
 }
 
@@ -227,6 +228,27 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 		p.Printf("  %s\n", lastFireCappedHint)
 	}
 	printIneligibleMatched(p, lf.IneligibleMatched)
+}
+
+// renderRecentFires prints the "Recent fires" history block (issue #2519), newest first:
+// one summary line per fire plus its started runs and skips, in the same style as the
+// "Last fire" block. It prints nothing when there is no history.
+func renderRecentFires(p *uzicli.Printer, fires []apitypes.LastFire) {
+	if len(fires) == 0 {
+		return
+	}
+	p.Printf("Recent fires:\n")
+	for _, f := range fires {
+		p.Printf("  %s · started %d · skipped %d\n",
+			f.FiredAt.UTC().Format(time.RFC3339), len(f.Started), len(f.Skips))
+		for _, st := range f.Started {
+			renderStartedScheduleRun(p, "    ", st)
+		}
+		for _, sk := range f.Skips {
+			// CellText folds newlines in the untrusted forge title so it cannot forge a line.
+			p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), uzicli.CellText(sk.Title))
+		}
+	}
 }
 
 // renderRunNow prints the human outcome of a `schedule run-now` fire (PRD #308 M5) from

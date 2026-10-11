@@ -9,6 +9,8 @@
 # Secrets — must NEVER enter the build context (`.env*` also catches `.envrc`).
 .env*
 **/.env*
+# Run-local scratch and recovery artifacts must not enter the baked source.
+.uzi/
 
 # VCS + submodule metadata + the large inspiration/ submodules.
 .git

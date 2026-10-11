@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -37,12 +38,17 @@ func runProgressDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 	return ctx, pool
 }
 
+// execer is what a scene writes through: the pool (committed) or a pgx.Tx (rolled back).
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // runProgressScene is one owner with one forge connection and repo, every id fresh so
 // scenes never collide on a shared database.
 type runProgressScene struct {
 	t      *testing.T
 	ctx    context.Context
-	pool   *pgxpool.Pool
+	db     execer
 	user   uuid.UUID
 	repo   uuid.UUID
 	conn   uuid.UUID
@@ -51,14 +57,14 @@ type runProgressScene struct {
 
 func (s *runProgressScene) exec(sql string, args ...any) {
 	s.t.Helper()
-	if _, err := s.pool.Exec(s.ctx, sql, args...); err != nil {
+	if _, err := s.db.Exec(s.ctx, sql, args...); err != nil {
 		s.t.Fatalf("exec %q: %v", sql, err)
 	}
 }
 
-func newRunProgressScene(t *testing.T, ctx context.Context, pool *pgxpool.Pool) *runProgressScene {
+func newRunProgressScene(t *testing.T, ctx context.Context, db execer) *runProgressScene {
 	t.Helper()
-	s := &runProgressScene{t: t, ctx: ctx, pool: pool, user: uuid.New(), conn: uuid.New(), nextID: 100}
+	s := &runProgressScene{t: t, ctx: ctx, db: db, user: uuid.New(), conn: uuid.New(), nextID: 100}
 	s.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, s.user, fmt.Sprintf("rp-%s@e2e", s.user))
 	s.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	        VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, s.conn, s.user, []byte{0x1})
@@ -307,10 +313,17 @@ func (r explainErrRow) Scan(...any) error { return r.err }
 // sequentially. It does not assert the full plan text.
 //
 // Filler rows give the planner a reason to prefer an index (on a near-empty table it would
-// rightly pick a seq scan), and ANALYZE refreshes the statistics.
+// rightly pick a seq scan), and ANALYZE refreshes the statistics. The scene, the filler,
+// the ANALYZE and every EXPLAIN run in one transaction that is rolled back, so no row is
+// committed to the shared database (issue #2643).
 func TestRunProgressIndexPlansLiveDB(t *testing.T) {
 	ctx, pool := runProgressDB(t)
-	s := newRunProgressScene(t, ctx, pool)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	s := newRunProgressScene(t, ctx, tx)
 
 	filler := s.newRepo()
 	s.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
@@ -327,12 +340,12 @@ func TestRunProgressIndexPlansLiveDB(t *testing.T) {
 
 	planOf := func(t *testing.T, run func(q *store.Queries)) string {
 		t.Helper()
-		tx, err := pool.Begin(ctx)
+		sp, err := tx.Begin(ctx) // a savepoint: a failed EXPLAIN cannot abort the outer tx
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		d := &explainDB{tx: tx}
+		defer func() { _ = sp.Rollback(ctx) }()
+		d := &explainDB{tx: sp}
 		run(store.New(d))
 		return d.plan.String()
 	}
@@ -365,4 +378,21 @@ func TestRunProgressIndexPlansLiveDB(t *testing.T) {
 			t.Errorf("plan seq-scans run_user_inputs:\n%s", plan)
 		}
 	})
+
+	// Nothing the test wrote survives the rollback.
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	for _, c := range []struct{ name, sql string }{
+		{"runs", `SELECT count(*) FROM runs WHERE user_id = $1`},
+		{"users", `SELECT count(*) FROM users WHERE id = $1`},
+	} {
+		var n int64
+		if err := pool.QueryRow(ctx, c.sql, s.user).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", c.name, err)
+		}
+		if n != 0 {
+			t.Errorf("%d %s rows of the plan-shape scene were committed to the shared database; want 0", n, c.name)
+		}
+	}
 }

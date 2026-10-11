@@ -527,9 +527,16 @@ A few worth knowing:
   ahead of them were skipped (it no longer suggests raising `--max-issues`:
   the fix is to clear those skips, and a higher cap also raises how many runs
   one fire can start). A label sweep also prints how many open issues
-  match its selector but aren't eligible (`ineligible_matched`), when known;
-  a never-fired schedule reads `Last fire: never fired`, and `--json` carries
-  the same detail under `.last_fire` (including `.last_fire.ineligible_matched`
+  match its selector but aren't eligible (`ineligible_matched`), when known.
+  After it, a **Recent fires** block lists the schedule's
+  last 10 scheduled fires that started or skipped something, newest first
+  (nothing is printed when there are none): each entry is a summary line
+  (`<RFC 3339 UTC stamp> · started N · skipped M`), then one line per started
+  issue (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
+  schedule), then one line per skipped issue with its human reason label and
+  title.
+  A never-fired schedule reads `Last fire: never fired`, and `--json` carries
+  the same detail under `.last_fire` and the list under `.recent_fires` (including `.last_fire.ineligible_matched`
   when present — absent means unknown, not zero). `run-now` prints the
   matching per-candidate breakdown inline — a `Started N run(s)` header with
   the created run id(s), a line per started run, then an `Examined N
@@ -900,7 +907,7 @@ A few worth knowing:
   bot's numeric forge user id) whose MR review comments the
   [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may ingest although
   they are not repo collaborators. It is **read-only by design**: edit the list
-  from Admin Settings in the web UI or through the cookie-only
+  from **Admin → Instance → Trusted review bots** in the web UI or through the cookie-only
   `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
   `STATUS` (`ok`, or `malformed` when the entry is not parseable as
   `<url>#<id>`; the CLI is lenient, so an entry the server skips can still show

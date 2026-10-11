@@ -911,6 +911,11 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 				"reason":                "gate_revision_mismatch",
 				"current_gate_revision": mismatch.Current,
 			})
+		case errors.Is(err, workersvc.ErrApprovalMilestonesMoved):
+			// Issue #2680: an unbound approve kept racing a republished milestone list (or the run
+			// left the plan gate while it retried). Nothing was written; distinct from
+			// gate_revision_mismatch, which names a revision the client sent.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "approval_milestones_moved")
 		case errors.Is(err, workersvc.ErrExpectedGateRevisionNotApplicable):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrRunNotFound):

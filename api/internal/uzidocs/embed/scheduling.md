@@ -419,7 +419,8 @@ Three surfaces read and drive the same state: the **Schedules** page (a
 "Pause all" control, an inline picker for the presets, and a paused banner
 while it's active), the **CLI** (`uzi schedule pause-all --until <when>` /
 `resume-all` / `pause-status` — see [the CLI
-reference](./cli.md#commands)), and a paused fire's **Last fire** record,
+reference](./cli.md#commands)), and a paused fire's **Last fire** record
+(and a **Recent fires** entry),
 which carries the `schedules_paused` skip reason.
 
 ## Fire outcomes
@@ -525,10 +526,12 @@ reaches lands in exactly one bucket, so the tally never silently drops one.
 
 The outcome surfaces everywhere a schedule's status does: the
 Schedules page's `Last run` cell (an outcome badge — started work vs.
-started nothing) with an expandable **Last fire** panel giving the
-per-issue breakdown; `uzi schedule get`'s **Last fire** block (and its
-`--json` `.last_fire`); and `uzi schedule run-now`'s per-candidate
-summary. In the web **Last fire** panel, each row's `#<iid>` links to
+started nothing) with an expandable panel giving the per-issue breakdown
+(labelled **Recent fires** once the schedule has recent fires, **Last fire**
+otherwise; see [Recent fires](#recent-fires)); `uzi schedule
+get`'s **Last fire** and **Recent fires** blocks (and their `--json`
+`.last_fire` and `.recent_fires`); and `uzi schedule run-now`'s
+per-candidate summary. In the web per-issue breakdown, each row's `#<iid>` links to
 the issue on the forge for the issues the fire actually fetched
 (started rows, and a sweep's post-fetch skip); a candidate skipped
 before it was fetched (e.g. `already_running`) shows a plain number
@@ -550,15 +553,18 @@ that started nothing (or fewer than expected) is being starved by
 [backfill](#sweep-cap) to walk past each one individually. It's shown in
 the Schedules list's **Last run** badge when the fire started nothing
 ("0 started · N not eligible", with the skip count between them when the
-fire also skipped candidates), the Schedules page's **Last fire** panel,
-`uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s
+fire also skipped candidates), and the Schedules page's panel, but only
+while the schedule has no recent fires or when an entry in `recent_fires`
+itself carries the count: the web shows `recent_fires[0]` whenever the list
+is non-empty, and a fire whose selector matched only ineligible issues has
+`matched` 0, so it is never added to that list. It is also in `uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s
 summary, and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
 `ineligible_matched`). It's **absent, not zero, on a fire from before this
 count existed and on an assigned-selector sweep** (an assigned candidate is
 eligible by construction, so the count doesn't apply) — read a missing key
 as unknown, never as "no ineligible matches."
 
-Only the **last** fire is kept, and only the last *scheduled* one:
+Two records are kept, and both hold only *scheduled* fires:
 `last_fire` is written on the same path that advances the schedule, so
 a **parked** schedule (bad repo or config) or a fire that hit a
 transient error (retried next tick, see `fetch_failed` above) leaves
@@ -570,6 +576,43 @@ without advancing, so it can show a `last_fire` while it is still due. A
 touching `last_fire` at all, since a manual fire must not disturb the
 cadence. A schedule that has never fired and was never held that way
 reads `last_fire: null`.
+
+### Recent fires
+
+Alongside `last_fire`, a schedule keeps `recent_fires`: the last 10
+scheduled fires that **did something**, newest first, each in the same
+shape as `last_fire`. "Did something" means `matched > 0`, so the fire
+started a run or recorded a skip. It is never appended for a
+capacity-blocked tick (the "waiting for room" tick, matched 0), a tick
+that examined 0 candidates, or a fire whose summary failed to serialize.
+`last_fire` is unchanged: it is still the latest persisted tick, so it can
+differ from `recent_fires[0]` (for example, when the latest tick was
+blocked on capacity, or matched 0 because nothing was eligible). The web
+shows only a blocked latest tick (the "Waiting for room at" line and a
+panel note), not an examined-0 one. The parked and transient paths write nothing to
+either field, and `run-now` records nothing in either. A one-time schedule
+held on a disabled credential appends its hold once, not once per tick,
+because the hold only writes when the stored summary differs.
+
+Skips count, so a schedule-wide skip also takes a slot: the `schedules_paused`
+skip recorded on every tick while all schedules are paused, or a persistent
+`already_running` skip, can push older dispatches out of the 10 over a
+long pause. Existing schedules were backfilled on upgrade with their
+current `last_fire` when it matched > 0.
+
+`GET` on a schedule returns `recent_fires` as an always-present array
+(`[]` when none); an older server lacks the field. On the Schedules page,
+a non-empty `recent_fires` makes the **Last run** cell show the newest
+recent fire's outcome badge and stamp instead of `last_fire`'s, and, when
+the latest tick was capacity-blocked, a warning-coloured
+"Waiting for room at `<stamp>`" line. The **Recent fires** panel lists entries newest
+first: the newest is expanded with the per-issue breakdown, older ones are
+collapsed headers (stamp, outcome badge, examined/started/skipped counts)
+that expand to the same breakdown, and a blocked latest tick adds a note
+first naming its time and its in-flight/limit/room numbers. With no
+recent fires, the panel is the plain **Last fire** panel. `uzi schedule
+get` prints a **Recent fires** block after **Last fire**
+([CLI reference](./cli.md#commands)).
 
 ## Default jobs
 

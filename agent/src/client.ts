@@ -2056,6 +2056,9 @@ export class WorkerClient {
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,
       body,
+      this.httpTimeoutMs,
+      undefined,
+      RECOVERY_RELEASE_RESPONSE_MAX_BYTES,
     )) as RecoveryReleaseResponse;
   }
 
@@ -3416,6 +3419,7 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; the cross-check methods and strict gate ACK opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
 

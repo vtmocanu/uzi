@@ -57,6 +57,16 @@ type EphemeralSettings interface {
 type EphemeralConfig struct {
 	// WorkerAffinityGrace must mirror the worker claim configuration.
 	WorkerAffinityGrace time.Duration
+	// WorkerStaleRequeueGrace must mirror the worker claim configuration
+	// (config.WorkerStaleRequeueGrace, #2705): a stale-requeued run ClaimRun holds for its
+	// returning worker inside this window is not provisioning demand. Zero (or negative)
+	// disables the exclusion, matching ClaimRun's NULL cutoff.
+	WorkerStaleRequeueGrace time.Duration
+	// WorkerAffinityCeiling must mirror the worker claim configuration
+	// (config.WorkerAffinityCeiling). Past it ClaimRun lets any worker claim the pinned run,
+	// so the run counts as demand again. The zero value puts the cutoff at the evaluation
+	// time, so no run is inside the ceiling and nothing is excluded: today's behaviour.
+	WorkerAffinityCeiling time.Duration
 	// BackgroundGrace restores background runs to normal priority after this age.
 	BackgroundGrace time.Duration
 	// DockerEnabled is the effective deployment Docker tier (config.WorkerDockerEnabled).
@@ -174,10 +184,15 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	evaluatedAt := p.now()
 	affinityCutoff := pgtype.Timestamptz{Time: evaluatedAt.Add(-p.cfg.WorkerAffinityGrace), Valid: true}
 	backgroundGraceCutoff := pgconv.Time(evaluatedAt.Add(-p.cfg.BackgroundGrace))
+	// #2705: the effective-pin cutoffs, computed on the same clock as ClaimRun's pin.
+	staleRequeueCutoff := workersvc.StaleRequeueCutoff(evaluatedAt, p.cfg.WorkerStaleRequeueGrace)
+	claimAffinityCutoff := pgconv.Time(evaluatedAt.Add(-p.cfg.WorkerAffinityCeiling))
 	gapRuns, err := p.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
 		BackgroundGraceCutoff:    backgroundGraceCutoff,
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: evaluatedAt, Valid: true},
 		CrossCheckAffinityCutoff: affinityCutoff,
+		StaleRequeueCutoff:       staleRequeueCutoff,
+		AffinityCutoff:           claimAffinityCutoff,
 		MaxRows:                  ephemeralProvisionBatch,
 		MaxPerUser:               int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease:           workersvc.LeaseInterval(p.cfg.Lease),
@@ -193,6 +208,8 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		BackgroundGraceCutoff:    backgroundGraceCutoff,
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: evaluatedAt, Valid: true},
 		CrossCheckAffinityCutoff: affinityCutoff,
+		StaleRequeueCutoff:       staleRequeueCutoff,
+		AffinityCutoff:           claimAffinityCutoff,
 		SaturationDelay:          durationToInterval(p.cfg.SaturationDelay),
 		MaxRows:                  ephemeralProvisionBatch,
 		MaxPerUser:               int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range

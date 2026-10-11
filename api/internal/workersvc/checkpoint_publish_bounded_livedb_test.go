@@ -193,7 +193,7 @@ func TestBoundedLiveReturnedPendingOutcomesLiveDB(t *testing.T) {
 				if outcome == "already current" && (err != nil || res.Skipped != "not_descendant") {
 					t.Fatalf("unowned noop: %+v %v", res, err)
 				}
-				if outcome == "sentinel" && (err != nil || res.Skipped != "unsupported") {
+				if outcome == "sentinel" && (err != nil || res.Skipped != "tip_missing") {
 					t.Fatalf("sentinel: %+v %v", res, err)
 				}
 				if outcome != "already current" && outcome != "sentinel" && err == nil {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -234,5 +235,56 @@ func TestCapabilityUnmetErrorCarriesNames(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error message %q must name %q", msg, want)
 		}
+	}
+}
+
+// Issue #2680: an unbound approve retried because the milestone list moved re-runs the capability
+// gate against the re-read run. The republished plan now requires docker on a worker without it:
+// the approve is blocked after exactly one write attempt, with no success row and no clear.
+func TestSubmitApproveRetryRerunsCapabilityGate(t *testing.T) {
+	fs, svc, user, runID := gatedRun(t)
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+	fs.runByID.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+	fs.approvalHook = func(f *fakeStore, _ int) error {
+		f.runByID.RequiredCapabilities = []string{"docker"}
+		return pgx.ErrNoRows
+	}
+
+	_, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", approveSel())
+	var unmet *CapabilityUnmetError
+	if !errors.As(err, &unmet) {
+		t.Fatalf("err = %v, want *CapabilityUnmetError", err)
+	}
+	if len(fs.approvals) != 1 {
+		t.Fatalf("write attempts = %d, want 1", len(fs.approvals))
+	}
+	if fs.clearedCaps != nil {
+		t.Fatal("a blocked approve must clear nothing")
+	}
+}
+
+// The owner override is not gated on the retry either: the second attempt succeeds and the
+// post-success clear runs scoped to the written row's revision.
+func TestSubmitApproveOverrideRetryIsNotGated(t *testing.T) {
+	fs, svc, user, runID := gatedRun(t)
+	svc.capabilitySettings = fakeCapabilitySettings{on: true}
+	fs.runByID.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+	fs.clearCapsRows = 1
+	fs.approvalHook = func(f *fakeStore, call int) error {
+		if call > 1 {
+			return nil
+		}
+		f.runByID.RequiredCapabilities = []string{"docker"}
+		return pgx.ErrNoRows
+	}
+
+	if _, err := svc.SubmitInputWithCapabilityOverride(context.Background(), user, runID, "approve_plan", "", approveSel()); err != nil {
+		t.Fatalf("override approve must succeed on the retry: %v", err)
+	}
+	if len(fs.approvals) != 2 {
+		t.Fatalf("write attempts = %d, want 2", len(fs.approvals))
+	}
+	if fs.clearedCaps == nil || fs.clearedCaps.GateRevision != 0 {
+		t.Fatalf("clearedCaps = %+v, want a clear scoped to the written row's revision (0)", fs.clearedCaps)
 	}
 }

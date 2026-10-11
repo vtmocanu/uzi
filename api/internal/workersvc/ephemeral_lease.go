@@ -46,6 +46,17 @@ func LeaseInterval(d time.Duration) pgtype.Interval {
 	return pgtype.Interval{Microseconds: d.Microseconds(), Valid: true}
 }
 
+// StaleRequeueCutoff is the @stale_requeue_cutoff the claim pin and its health/provisioning
+// mirrors take (#2705): now minus WORKER_STALE_REQUEUE_GRACE, or the invalid (NULL) timestamp
+// when the grace is zero or negative, which the SQL reads as "never pin". Exported so
+// hostedsvc shares this one conversion.
+func StaleRequeueCutoff(now time.Time, grace time.Duration) pgtype.Timestamptz {
+	if grace <= 0 {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: now.Add(-grace), Valid: true}
+}
+
 // enterEphemeralLeaseTx runs inside the transaction that wrote a run's terminal state, with the
 // worker row ALREADY locked (before the run's, the canonical order). EVERY statement it issues runs
 // inside one SAVEPOINT, the terminal-run read included, so a statement error rolls back to the

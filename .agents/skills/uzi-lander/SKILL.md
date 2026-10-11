@@ -175,8 +175,12 @@ changes it); trust it over a handover's claim.
 ## The loop
 
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
-   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_input,paused 60 MAX`,
-   with `MAX` polls covering the run's remaining budget (`budget_total_seconds` minus
+   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
+   with `SEQ` the seq of the plan that was approved, carried from the approval or the watcher's
+   handoff and kept across re-arms (`0` for a seeded run), so the stale gate is ignored but a NEW
+   plan stops it. Never recompute it as the latest plan seq: an unapproved re-plan would then
+   pass as the approved gate. Without the approved seq and with the run at `awaiting_approval`,
+   treat it as the re-plan case below. `MAX` polls cover the run's remaining budget (`budget_total_seconds` minus
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
    `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
@@ -188,8 +192,9 @@ changes it); trust it over a handover's claim.
    surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
    *Watching*; a completion question about a milestone
    the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
-   a plain answer cannot exempt it, then open the PR); `awaiting_approval` → the plan gate
-   is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
+   a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
+   (usually a lost worker resumed from the default branch): before steering the new gate with
+   `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (they resume on their own). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
@@ -332,6 +337,9 @@ changes it); trust it over a handover's claim.
    when unsure, decide with the buddy (*Buddy*). Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+   Prepare lazily: run `land-prep.sh` only on a PR that is next in the merge order, after
+   its blocker has merged. Defer base-only preparation of a held PR: its push would only be
+   redone after the blocker lands, at a full CI run per push.
    A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
    `mergeable` before waiting on checks.
    A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows

@@ -136,6 +136,10 @@ var (
 	// param) bypasses ONLY this guard, never the active-run gate.
 	ErrOpenMRExists = errors.New("issue already has an open MR")
 	ErrRunTerminal  = errors.New("run has already finished")
+	// ErrApprovalMilestonesMoved is the unbound approve's answer (issue #2680) when the plan's
+	// milestone list kept changing between the contract build and the freeze, or the run left the
+	// plan gate while the approve retried: nothing was written. → 409 approval_milestones_moved.
+	ErrApprovalMilestonesMoved = errors.New("the plan's milestones changed while approving; re-read the plan and approve again")
 	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
 	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
 	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
@@ -1415,6 +1419,10 @@ type Params struct {
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration
+	// WorkerStaleRequeueGrace (#2705): how long ClaimRun keeps a run the stale-worker sweeper
+	// requeued pinned to its previous worker (while that worker's row exists). Zero or negative
+	// disables the pin (NULL cutoff); the zero value keeps existing tests unaffected.
+	WorkerStaleRequeueGrace time.Duration
 	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
 	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
 	WorkerSpreadGrace time.Duration
@@ -3083,6 +3091,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
 		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		StaleRequeueCutoff:       StaleRequeueCutoff(claimNow, s.p.WorkerStaleRequeueGrace),
 		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
 		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:           isDocker,
@@ -5863,14 +5872,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
-// "superseded"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
 	Skipped   string
+	// Detail is a bounded, content-free reason behind Skipped (the broker's error text with
+	// secrets scrubbed), for the operator log only. It is never serialized to the worker.
+	Detail string
 }
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
@@ -5881,7 +5893,7 @@ type PublishResult struct {
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker
-// treats as "origin moved, nothing to do" — a diverged tip or an unsupported pack —
+// treats as "origin moved, nothing to do" — a diverged tip or an unusable pack —
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
@@ -6162,13 +6174,17 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
-	case errors.Is(err, pushbroker.ErrTipMissing),
-		errors.Is(err, pushbroker.ErrPackTooLarge),
-		errors.Is(err, pushbroker.ErrPackInvalid):
-		// A tip the pack never delivered, a pack over the reconstruction budget, or a
-		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
-		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
+	case errors.Is(err, pushbroker.ErrTipMissing):
+		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
+		// broker's content-free reason for the operator log (never serialized to the worker).
+		return PublishResult{Published: false, Ref: ref, Skipped: "tip_missing", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackTooLarge):
+		// A pack over the reconstruction budget: a best-effort skip. A worker pack may not
+		// OOM or 5xx-storm the shared api.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_too_large", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackInvalid):
+		// A malformed (or empty) pack: a best-effort skip, never a 5xx.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_invalid", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT

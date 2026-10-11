@@ -279,6 +279,10 @@ Web-only; no API/schema/agent changes. [user 2026-08-14]
 - Admin Factory status shows only other users' runs — the admin's own runs are not repeated there.
 - Alongside (same batch): the Schedules "Last fire" caret must render correctly.
 
+## Feature #2519 — Schedules keep recent fires
+
+- Schedules keep, alongside `last_fire`, the last 10 scheduled fires that started or skipped something (`recent_fires`, newest first); web and `uzi schedule get` list them. (AI-synced 2026-10-10, #2519)
+
 ## Feature #24 — MR closed without merging → card back to In Progress
 
 Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md`.
@@ -455,6 +459,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detectio
 - A lead tool call in flight past an admin-set threshold (default 20 minutes, 0 disables) on a quiet run is flagged stalled with a fixed reason (the outbox-queued reason during an api outage); an open delegation to a subagent is never aged. (AI-synced 2026-10-01, #2046)
 - A run's owner can extend its wall-clock budget from the web or CLI, up to an admin-set allowance; the frozen budget itself never changes. [user, #1189]
 - A run that runs out of time is parked and its owner is asked to extend or stop; it is never failed for the clock alone, the park never expires, and this is not configurable. [user, #1497]
+- A run requeued because its worker went heartbeat-stale stays pinned to that worker while its row exists for WORKER_STALE_REQUEUE_GRACE (default 10m, 0 disables), so a restarted worker resumes its own run; the affinity ceiling still releases it, a deleted worker row falls open at once, and chat runs and cross-check children are unaffected. The wait shows as waiting_worker with the return time and previous worker, sends no nudge, adds no ephemeral-provisioning demand and is excluded from queue.waiting and fleet.capacity; a Codex account park and promotion renews the grace and the ceiling, with no global bound. (AI-synced 2026-10-10, #2705)
 - Run defaults are 6h base wall time and 3 stale-worker requeues. RUN_WALL_CEILING defaults to min(max(24h, RUN_TIMEOUT), 72h), with empty/unset deriving the default so an existing larger base still boots. An explicit value must be at least 1s and the base timeout, and at most 72h; it caps scaled, non-interactive handoff and caller-requested job walls server-side. Explicit operator values win. Existing frozen budgets and the separate extension allowance stay unchanged. (AI-synced 2026-10-07, #2279)
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)

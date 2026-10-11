@@ -119,6 +119,8 @@ type runsStore struct {
 	clearedCapsArg  *store.ClearRunRequiredCapabilitiesParams
 	clearCapsRows   int64
 	createdApproval *store.CreateApprovePlanInputParams
+	// approvalErr programs a refusal of CreateApprovePlanInput (pgx.ErrNoRows = the 0-row CTE).
+	approvalErr error
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -198,7 +200,7 @@ func (s *runsStore) CreateGateVerdictInput(context.Context, store.CreateGateVerd
 }
 func (s *runsStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
 	s.createdApproval = &arg
-	return store.RunUserInput{}, nil
+	return store.RunUserInput{}, s.approvalErr
 }
 func (s *runsStore) GetRunMilestoneFreezeSnapshot(_ context.Context, id uuid.UUID) (store.GetRunMilestoneFreezeSnapshotRow, error) {
 	return store.GetRunMilestoneFreezeSnapshotRow{ID: id}, nil

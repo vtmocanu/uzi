@@ -1394,6 +1394,10 @@ describe("m2 accounting-only status", () => {
     const r = render(<RunEventRow msg={msg({ seq: 1, kind: "progress_note", payload: { text: "Running tests", milestone_id: "m1" } })} live />);
     expect(r.container.firstChild).toBeNull();
   });
+  it("renders no row for a summary_usage message (issue #2686)", () => {
+    const r = render(<RunEventRow msg={msg({ seq: 1, kind: "summary_usage", payload: { pass: "plan", model_usage: {} } })} live />);
+    expect(r.container.firstChild).toBeNull();
+  });
   it("keeps text carrying the same event name", () => {
     const r = render(<RunEventRow msg={msg({ seq: 1, kind: "text", payload: { event: "codex_response_usage", text: "visible prose" } })} live />);
     expect(r.getByText("visible prose")).toBeTruthy();

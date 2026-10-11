@@ -10,6 +10,7 @@ import {
   type UserSettingsPatch,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
   isAppearanceMode,
   isDarkTheme,
@@ -978,11 +979,9 @@ export const settingsApi = {
       if (key === "docker_repo_allowlist") {
         const ok = value
           .split(",")
-          .map((t) => t.trim())
+          .map(trimAllowlistToken)
           .filter((t) => t !== "")
-          .every((t) =>
-            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t),
-          );
+          .every((t) => uuidIdentity(t) !== null);
         if (!ok) {
           throw new ApiError(
             400,

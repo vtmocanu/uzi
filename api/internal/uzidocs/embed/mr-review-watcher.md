@@ -341,7 +341,7 @@ See [Admin settings](./admin-settings.md#trusted-review-bots).
 
 This is an experiment (issue #2083) to decide the next step of PRD #1214. It is **off by default**, and nothing here claims it makes reworks faster or cheaper: that measurement has not been done.
 
-An admin turns it on with the `decisions_memo_enabled` instance setting (text `true` or `false`, default `false`), set through `PUT /api/admin/settings` the same way as `mr_rework_enabled`. There is no Admin Settings control for it.
+An admin turns it on with the `decisions_memo_enabled` instance setting (text `true` or `false`, default `false`), set through `PUT /api/admin/settings` the same way as `mr_rework_enabled`. There is no Admin → Instance control for it.
 
 When it is on, a Claude run that produces a PR (issue, prompt, self-improvement or MR rework) can leave a private **decisions memo**, at most 8 KiB, as it finishes: decisions and rejected alternatives, relevant files, validation commands and results, and open risks.
 

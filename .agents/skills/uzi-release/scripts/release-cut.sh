@@ -7,8 +7,8 @@
 # the per-PR changelog check spared, scripts/lib/dependency-bump.sh), bump the chart, auto-bump
 # the worker tag, refresh links, commit, and verify with the coverage oracle. It does
 # NOT push. It tags only the promoted STABLE (locally, on a throwaway release branch);
-# the RC tag on main is applied by the lead after ci.yml is green. A tag push publishes
-# unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
+# the RC tag on main can follow its push immediately: publish gates enforce CI coverage.
+# A tag push publishes unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
 #
 #   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]
 #
@@ -46,7 +46,7 @@
 # Exit codes: 0 ready;  1 a step/verify failed (tree left recoverable);  3 usage /
 #             precondition failure, or a refusal that needs a verb.
 #
-# NEVER skip-ci a release commit (release.yml assumes ci.yml is green on it).
+# NEVER skip-ci a release commit: skip markers suppress tag publish workflows too.
 set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
@@ -244,6 +244,20 @@ git fetch --tags --quiet origin >/dev/null 2>&1 || true
 BEHIND="$(git rev-list --count HEAD..refs/remotes/origin/main 2>/dev/null || echo 0)"
 if [ "${BEHIND:-0}" -gt 0 ]; then
   echo "release-cut: local main is $BEHIND commit(s) behind origin/main. Fast-forward first: git merge --ff-only origin/main" >&2; exit 3
+fi
+
+# Require green main-push CI and smoke on the exact prospective parent. The
+# same coverage policy gates publication remotely; local failures are early feedback.
+# A release push cancels in-flight parent CI on main, destroying inheritance evidence.
+# Only the offline fixture harness may omit network evidence.
+if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" = "1" ]; then
+  fixture_origin="$(git remote get-url origin 2>/dev/null || true)"
+  if [ "${GH_REPO:-}" != "test/uzi" ] || [ "$(git config user.email)" != "t@example.com" ] ||
+     { [ -n "$fixture_origin" ] && [ "${fixture_origin#/}" = "$fixture_origin" ]; }; then
+    echo "release-cut: offline exemption requires the local test fixture" >&2; exit 3
+  fi
+elif [ "$VERB" != "--promote-only" ]; then
+  python3 -I "$ROOT/scripts/release-ci-coverage.py" tip HEAD --wait 0 || exit 3
 fi
 
 # --- discovery ----------------------------------------------------------------
@@ -615,6 +629,9 @@ EOF
 # --- promote (D5): tag a stable vIB from a throwaway release branch -----------
 promote_inflight() {
   local relbranch="release/$IB" tagB="v$IB" wt
+  if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" != "1" ]; then
+    python3 -I "$ROOT/scripts/release-ci-coverage.py" coverage "$INFLIGHT" --wait 0 || exit 3
+  fi
   if git rev-parse -q --verify "refs/heads/$relbranch" >/dev/null; then
     echo "release-cut: branch $relbranch already exists (aborted prior promotion?). Remove it deliberately and re-run." >&2; exit 3
   fi
@@ -841,12 +858,12 @@ if [ -n "$PROMOTED_TAG" ]; then
   echo "  # push order (D5): STABLE tag, then main, then the RC tag —"
   echo "  git push origin $PROMOTED_TAG"
   echo "  git push origin main               # triggers ci.yml"
-  echo "  .../watch-run-ci.sh --sha \"\$(git rev-parse HEAD)\" --branch main   # validate exact release HEAD, then wait for green"
+  echo "  # Tag immediately after the push; release.yml enforces CI coverage."
   echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 else
   echo "  git show HEAD                 # review"
   echo "  git push origin main         # triggers ci.yml"
-  echo "  .../watch-run-ci.sh --sha \"\$(git rev-parse HEAD)\" --branch main   # validate exact release HEAD, then wait for green"
+  echo "  # Tag immediately after the push; release.yml enforces CI coverage."
   echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 fi
 echo "  .../release-watch.sh $CHARTVER && .../release-verify.sh $CHARTVER"

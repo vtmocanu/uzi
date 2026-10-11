@@ -61,7 +61,8 @@ func newAdminReviewBotsCmd(env Env, gf *globalFlags) *cobra.Command {
 			"plus the bot's forge user id) whose merge-request review comments the mr_rework lane " +
 			"may ingest even though the bot is not a repo collaborator. Comments from any other " +
 			"non-collaborator are withheld. This command is read-only: edit the list in the web " +
-			"Admin Settings page or through the admin settings API (cookie-authenticated).",
+			"UI at Admin → Instance → Trusted review bots or through the admin settings API " +
+			"(cookie-authenticated).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)

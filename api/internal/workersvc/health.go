@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,7 @@ func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time,
 		RunID:                    runID,
 		HeartbeatCutoff:          pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		AffinityCutoff:           pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
+		StaleRequeueCutoff:       StaleRequeueCutoff(now, s.p.WorkerStaleRequeueGrace),
 		CrossCheckEvaluatedAt:    pgconv.Time(now),
 		CrossCheckAffinityCutoff: pgconv.Time(now.Add(-s.p.WorkerAffinityGrace)),
 		DockerRepoAllowlist:      allowlist,
@@ -121,6 +123,13 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
+	// reasonStaleRequeuePinPrefix (issue #2705) opens the queued reason for a run the stale-worker
+	// sweeper requeued and ClaimRun is still holding for its returning worker. Unlike its fixed
+	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
+	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
+	// the same literal in SQL (pinned in sync by a workersvc test,
+	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). No other reason starts with it.
+	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
 	// waiting for a SLOT to free — not for a worker to come online — and the
@@ -240,14 +249,17 @@ const (
 	// a deployment that did not enable the isolated research lane: the provisioner creates no
 	// lane worker there, so the run can never be claimed whatever the kill-switch says.
 	reasonIsolatedLaneNotEnabled = "this research run needs an isolated research-lane worker, but the isolated research lane is not enabled on this instance; an admin must enable it in the deployment"
-	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
-	// that no online worker is eligible to claim because every online worker is a Docker
-	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
-	// migration 00113). Same contract as its siblings — fixed, server-controlled, no
-	// tool name, no repo content, no live duration — and maps to the SAME
-	// healthWaitingWorker enum (no migration owed; runs.health_reason is free text).
-	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it.
-	reasonRepoNotDockerAllowed = "this repo isn't on the Docker worker allowlist, so no Docker worker can run it"
+	// reasonRepoNotDockerAllowedAdmin / reasonRepoNotDockerAllowedMember (PRD #361) are the
+	// queued reason for a repo-bearing run that no online worker is eligible to claim because
+	// every online worker is a Docker worker and the repo is not on the Docker-worker
+	// allowlist (fn_worker_can_claim, migration 00113). Same contract as its siblings — fixed,
+	// server-controlled, no tool name, no repo content, no live duration — and both map to the
+	// SAME healthWaitingWorker enum (no migration owed; runs.health_reason is free text).
+	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it. The
+	// variant is chosen by the run OWNER's is_admin (repoNotDockerAllowedReason), so an admin
+	// viewing someone else's run sees the owner's variant, not their own.
+	reasonRepoNotDockerAllowedAdmin  = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist"
+	reasonRepoNotDockerAllowedMember = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist"
 	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
 	// the custody-hold admission limit — they hold >= custodyHoldLimit admission-counted
 	// open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
@@ -408,7 +420,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// episode) DMs the owner, and only if the cooldown has elapsed since the last
 		// nudge. The sweeper is the single writer of health_notified_at, so it stamps
 		// it here — in the same SetRunHealth write — exactly when it emits a nudge.
-		nudge := target != healthOK && r.Health == healthOK &&
+		// Issue #2705: a run leaving the stale-requeue pin explanation for another flag starts a
+		// new episode, as if it came from ok: nudge-eligible again (cooldown still applies) and
+		// health_since restamped. Without it a run that stays stuck after the grace would never
+		// nudge (its flag was already waiting_worker) and would carry the grace in its "stuck for".
+		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
+		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -436,11 +454,21 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// Issue #2705: the pin reason is expected waiting for a worker that is likely coming back
+		// within the grace; a "waiting for a worker" nudge would be noise. Keyed off the reason
+		// prefix because the reason embeds the deadline and worker name.
+		if isStaleRequeuePinReason(reason) {
+			nudge = false
+		}
 		// A live plan cross-check is expected waiting. A worker-pickup nudge would
 		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
 		if reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
 			nudge = false
+		}
+		since := healthSince(now, target, r)
+		if leftPin {
+			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
@@ -449,7 +477,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		n, err := s.q.SetRunHealth(ctx, store.SetRunHealthParams{
 			Health:           target,
 			HealthReason:     pgconv.TextOrNull(reason),
-			HealthSince:      healthSince(now, target, r),
+			HealthSince:      since,
 			HealthNotifiedAt: notifiedAt, // NULL → COALESCE preserves the existing stamp
 			ID:               r.ID,
 			Status:           r.Status, // exit-race scope: no-ops if the run left this status
@@ -490,8 +518,22 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// here (Decision 8); 'queued' gains only a flag, timed from the last
 		// transition into queued (status_since — issue #190: updated_at conflated a
 		// real status change with an incidental row write and reset this clock).
-		if th.queued == 0 || !olderThan(now, r.StatusSince, th.queued) {
+		if th.queued == 0 {
 			return healthOK, ""
+		}
+		// Issue #2705: a run held for its returning worker is explained from the first tick of the
+		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
+		// docker-allowlist block is also surfaced early. Below the threshold ONLY those two bypass
+		// the age gate: any other reason queuedReason resolves (vault, custody, codex, egress)
+		// stays quiet until th.queued, exactly as for an unpinned run. th.queued == 0 above still
+		// switches every queued flag off.
+		if !olderThan(now, r.StatusSince, th.queued) {
+			if _, pinned := s.staleRequeuePin(now, r); pinned {
+				if reason := s.queuedReason(ctx, now, r); isStaleRequeuePinReason(reason) {
+					return healthWaitingWorker, reason
+				}
+			}
+			return s.earlyDockerAllowlistTarget(ctx, now, r)
 		}
 		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
 		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
@@ -931,7 +973,8 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 	return base
 }
 
-// queuedReason resolves the human reason a queued run past its threshold is not
+// queuedReason resolves the human reason a queued run past its threshold (or, via
+// earlyDockerAllowlistTarget, an online-but-ineligible one under it) is not
 // running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3, #320 D9,
 // #1226 M1 and #1296 M4): a locked owner vault (they unlock and it claims within a poll),
 // then (PRD #1296 M4) an owner at the custody-hold admission limit (another fleet-independent
@@ -977,7 +1020,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// admitted at/over the cap, so it never gets the custody reason; a run already holding
 	// custodyHoldLimit holds of its own is not exempt and gets it like new work. A non-positive limit DISABLES the gate on the claim
 	// side too, so this rung stays silent then. The per-run read sits behind the
-	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read error
+	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick except for a run held by
+	// the stale-requeue pin below that threshold (healthTargetFor computes queuedReason for it, once per
+	// tick until its grace ends) and the early docker-allowlist probe; a read error
 	// falls through to the generic reasons below rather than inventing a reason on a failed
 	// lookup (the conservative degrade the sibling per-run lookups use).
 	if custodyHoldLimit > 0 {
@@ -1001,6 +1046,12 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// of them excludes lane workers. Placed after the owner-account blocks, which still gate it.
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
+	}
+	// Issue #2705: ClaimRun is holding this stale-requeued run for its returning worker, so no
+	// fleet reason below is the cause. After every fundamental block above (none of which a
+	// returning worker clears) and before the cross_check and fleet rungs.
+	if until, pinned := s.staleRequeuePin(now, r); pinned {
+		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
 	}
 	// Read the capability-aware kill-switch ONCE and thread the same value into both the
 	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
@@ -1042,7 +1093,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// direction as the claim path in service.go): with the flag OFF the fleet claims
 	// best-effort, so there is no "eligible worker" concept to report and this stays silent.
 	// The per-run Count sits behind the queued-threshold guard in healthTargetFor, so it
-	// runs for ~0 runs/tick. A Count read error falls through to the generic reasons below
+	// runs for ~0 runs/tick (+ the early docker-allowlist probe). A Count read error falls through to the generic reasons below
 	// rather than inventing a reason on a failed lookup (the conservative degrade the sibling
 	// per-run lookups use).
 	if len(r.RequiredCapabilities) > 0 && capAware {
@@ -1065,7 +1116,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// switch — a run that IS interlocked is subject to the claim clause regardless of the flag
 	// (flipping the kill-switch off stamps no NEW run but leaves stamped runs interlocked). The
 	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs for
-	// ~0 runs/tick; a read error falls through to the generic reasons below rather than
+	// ~0 runs/tick (+ the early docker-allowlist probe); a read error falls through to the generic reasons below rather than
 	// inventing a reason on a failed lookup (the conservative degrade the sibling per-run
 	// lookups use).
 	if r.CompletionContractVersion.Valid {
@@ -1085,7 +1136,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// fail-closed all-three check (harness OR either M1 sentinel), so the pill and the claim can
 	// never disagree. In M5A only internal Codex rows exist, so this fires for them alone. The
 	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs for ~0
-	// runs/tick; a read error falls through to the generic reasons below rather than inventing a
+	// runs/tick (+ the early docker-allowlist probe); a read error falls through to the generic reasons below rather than inventing a
 	// reason on a failed lookup (the conservative degrade the sibling per-run lookups use).
 	if r.Harness == harnessCodex || r.CodexMaterialRevision.Valid || r.CodexSecretID.Valid {
 		c, cerr := s.q.CountOnlineWorkersSatisfyingCodexHarness(ctx, r.UserID)
@@ -1108,8 +1159,8 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// the claim gate can never disagree. Placed right after the plain Codex-harness rung and AHEAD of
 	// the priority-class re-label, for the same reason those rungs are: an actionable "provision a
 	// capable worker" block must not be hidden behind a yield/restored message. The per-run Count sits
-	// behind the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read error
-	// falls through to the generic reasons below rather than inventing a reason on a failed lookup.
+	// behind the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick (+ the early docker-allowlist probe); a read
+	// error falls through to the generic reasons below rather than inventing a reason on a failed lookup.
 	if r.CodexCustomRoot {
 		c, cerr := s.q.CountOnlineWorkersSatisfyingCustomCodex(ctx, r.UserID)
 		if cerr != nil {
@@ -1147,7 +1198,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		}
 	}
 	// The snapshot is absent from ListActiveRunsForHealth's projection. Read it only
-	// after the queued threshold, then inspect the owner's fleet for the protocol
+	// after the queued threshold (or the early docker-allowlist probe), then inspect the owner's fleet for the protocol
 	// capability ClaimRun requires. A failed read falls through.
 	if run, rerr := s.q.GetRunByID(ctx, r.ID); rerr != nil {
 		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
@@ -1214,7 +1265,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// generic wait. The class comes from the SAME SQL function ClaimRun's ORDER BY ranks by
 	// (fn_run_priority_class), so the reason and the claim order can never disagree. This
 	// per-run lookup is affordable for the same reason as the caps lookup above: it sits
-	// BEHIND the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick. On
+	// BEHIND the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick (+ the early docker-allowlist probe). On
 	// normal/expedited and on a read error we fall through to the generic reasons below.
 	switch s.queuedPriorityClass(ctx, now, r) {
 	case "background":
@@ -1234,9 +1285,11 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// HAS the required caps somewhere (that rung is fence-blind); elig==0 then isolates the
 	// docker allowlist fence as the remaining PERSISTENT blocker — every worker that could
 	// otherwise take it is a Docker worker and the repo is not allowlisted — which is exactly
-	// reasonRepoNotDockerAllowed, a condition that does not clear on its own the way a roll
+	// reasonRepoNotDockerAllowedAdmin/Member, a condition that does not clear on its own the way a roll
 	// does. A repo-less run (judge, repoID invalid) never trips this. On a nil reader or any
-	// read error we degrade to the generic free-slot logic below.
+	// read error we degrade to the generic free-slot logic below. earlyDockerAllowlistTarget
+	// reaches this rung under the queued threshold too, and the Admin/Member variant follows
+	// the run OWNER's is_admin (repoNotDockerAllowedReason).
 	if r.RepoID.Valid && s.dockerAllowlist != nil {
 		if al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx); aerr != nil {
 			slog.Error("health: docker allowlist for queued reason", "error", aerr)
@@ -1252,7 +1305,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			if eerr != nil {
 				slog.Error("health: count eligible workers for repo", "error", eerr)
 			} else if elig == 0 {
-				return reasonRepoNotDockerAllowed
+				return s.repoNotDockerAllowedReason(ctx, r.UserID)
 			}
 		}
 	}
@@ -1264,7 +1317,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// still names an online worker, name it so the owner knows the actionable fix. Placed after the
 	// capability/repo rungs so their more-specific reasons keep precedence; a read error falls through
 	// to the generic reasons below. The per-run counts sit behind the queued-threshold guard in
-	// healthTargetFor, so they run for ~0 runs/tick.
+	// healthTargetFor, so they run for ~0 runs/tick (+ the early docker-allowlist probe).
 	if r.ReleasedWorkerID.Valid {
 		allowlist := []uuid.UUID{}
 		if s.dockerAllowlist != nil {
@@ -1280,6 +1333,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			RunID:                    r.ID,
 			CodexCuratedModels:       codexCuratedModelsSlice(),
 			AffinityCutoff:           pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
+			StaleRequeueCutoff:       StaleRequeueCutoff(now, s.p.WorkerStaleRequeueGrace),
 			CrossCheckEvaluatedAt:    pgconv.Time(now),
 			CrossCheckAffinityCutoff: pgconv.Time(now.Add(-s.p.WorkerAffinityGrace)),
 			HeartbeatCutoff:          pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
@@ -1395,8 +1449,74 @@ func (s *Service) verdictUndelivered(ctx context.Context, r store.ListActiveRuns
 	return ok
 }
 
+// isRepoNotDockerAllowedReason reports whether reason is one of the two docker-allowlist
+// variants.
+func isRepoNotDockerAllowedReason(reason string) bool {
+	return reason == reasonRepoNotDockerAllowedAdmin || reason == reasonRepoNotDockerAllowedMember
+}
+
+// repoNotDockerAllowedReason picks the docker-allowlist reason variant by the run OWNER's
+// is_admin. A read error degrades to the Member variant (the one that names no action the
+// owner may be unable to take).
+func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.UUID) string {
+	u, err := s.q.GetUserByID(ctx, ownerID)
+	if err != nil {
+		slog.Error("health: read run owner for docker allowlist reason", "user_id", ownerID, "error", err)
+		return reasonRepoNotDockerAllowedMember
+	}
+	if u.IsAdmin {
+		return reasonRepoNotDockerAllowedAdmin
+	}
+	return reasonRepoNotDockerAllowedMember
+}
+
+// earlyDockerAllowlistTarget surfaces the docker-allowlist block for a queued run still
+// under the queued threshold. The block is persistent (it never clears on its own), so
+// waiting out the threshold only delays the owner's actionable message. It returns
+// (healthWaitingWorker, reason) only when the owner has an online worker, no online worker
+// is eligible for the repo, and queuedReason resolves to the docker-allowlist reason (so
+// every more-fundamental rung still wins); every other path, including any probe read error (an owner-lookup failure still shows the Member wording),
+// returns (healthOK, "").
+func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) (string, string) {
+	if !r.RepoID.Valid || r.EgressProfileID.Valid || s.dockerAllowlist == nil {
+		return healthOK, ""
+	}
+	online, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
+	if err != nil {
+		slog.Error("health: count online workers for early docker allowlist reason", "run_id", r.ID, "error", err)
+		return healthOK, ""
+	}
+	if online == 0 {
+		return healthOK, ""
+	}
+	al, err := s.dockerAllowlist.DockerRepoAllowlist(ctx)
+	if err != nil {
+		slog.Error("health: docker allowlist for early reason", "run_id", r.ID, "error", err)
+		return healthOK, ""
+	}
+	elig, err := s.q.CountOnlineEligibleWorkersForRepo(ctx, store.CountOnlineEligibleWorkersForRepoParams{
+		UserID:               r.UserID,
+		DockerRepoAllowlist:  al,
+		RepoID:               uuid.UUID(r.RepoID.Bytes),
+		Kind:                 r.Kind,
+		RequiredCapabilities: r.RequiredCapabilities,
+		CapabilityAware:      s.capabilityAwareOn(ctx),
+	})
+	if err != nil {
+		slog.Error("health: count eligible workers for early reason", "run_id", r.ID, "error", err)
+		return healthOK, ""
+	}
+	if elig != 0 {
+		return healthOK, ""
+	}
+	if reason := s.queuedReason(ctx, now, r); isRepoNotDockerAllowedReason(reason) {
+		return healthWaitingWorker, reason
+	}
+	return healthOK, ""
+}
+
 // queuedPriorityClass resolves the display priority class of a queued run past its
-// threshold (PRD #320 D9) from the ONE SQL function ClaimRun's ORDER BY ranks by, so a
+// threshold, or under it when earlyDockerAllowlistTarget probes it (PRD #320 D9) from the ONE SQL function ClaimRun's ORDER BY ranks by, so a
 // deprioritized/restored reason can never contradict the claim order. The cutoff is
 // built the SAME way service.go builds ClaimRun's — now minus WorkerBackgroundGrace —
 // so the D4 fail-open (a demoted run older than the grace collapses to `restored`)
@@ -1406,7 +1526,8 @@ func (s *Service) verdictUndelivered(ctx context.Context, r store.ListActiveRuns
 // generic queuedReason rather than failing the sweep. Same conservative shape as
 // verdictUndelivered's degrade-to-false and toolWindow's degrade-to-zero-value: a
 // missed pill is noise, never a lost health signal. Affordable behind the
-// queued-threshold guard for the same reason verdictUndelivered is behind its own.
+// queued-threshold guard for the same reason verdictUndelivered is behind its own;
+// earlyDockerAllowlistTarget also reaches it, under the threshold, for an online-but-ineligible run.
 func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
 	class, err := s.q.RunPriorityClassForRun(ctx, store.RunPriorityClassForRunParams{
 		RunID:                 r.ID,
@@ -1504,6 +1625,46 @@ func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, bu
 // olderThan reports whether ts is valid and at least d in the past relative to now.
 func olderThan(now time.Time, ts pgtype.Timestamptz, d time.Duration) bool {
 	return ts.Valid && now.Sub(ts.Time) >= d
+}
+
+// staleRequeuePin reports whether ClaimRun is holding this queued run for its returning worker
+// right now (issue #2705) and, if so, the instant the hold ends. It is the Go mirror of the
+// effective pin E the provisioning queries use: the non-time half (stale_requeue_pinnable) comes
+// from the projection, the time half is status_since + WorkerStaleRequeueGrace, capped by
+// updated_at + WorkerAffinityCeiling, which is where ClaimRun lets any worker take the run
+// regardless. A zero grace never pins. The grace bound is exclusive and the ceiling bound
+// inclusive, matching the SQL comparisons (status_since > cutoff, updated_at >= affinity cutoff).
+func (s *Service) staleRequeuePin(now time.Time, r store.ListActiveRunsForHealthRow) (time.Time, bool) {
+	if s.p.WorkerStaleRequeueGrace <= 0 || !r.StaleRequeuePinnable || !r.StatusSince.Valid || !r.UpdatedAt.Valid {
+		return time.Time{}, false
+	}
+	graceEnd := r.StatusSince.Time.Add(s.p.WorkerStaleRequeueGrace)
+	ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling)
+	if !now.Before(graceEnd) || now.After(ceilingEnd) {
+		return time.Time{}, false
+	}
+	if ceilingEnd.Before(graceEnd) {
+		return ceilingEnd, true
+	}
+	return graceEnd, true
+}
+
+// staleRequeuePinReason renders the waiting reason for a pinned run. The deadline leads so a
+// clamped render keeps it, and the text is a pure function of (until, name), so it is stable
+// across ticks for one episode and the detector does not rewrite it.
+func staleRequeuePinReason(until time.Time, workerName string) string {
+	who := "its previous worker"
+	if workerName != "" {
+		who += " " + workerName
+	}
+	return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for " + who +
+		" to return; another worker may take it after that"
+}
+
+// isStaleRequeuePinReason reports whether a stored health reason is the stale-requeue pin
+// explanation. Prefix-matched because the reason embeds the deadline and worker name.
+func isStaleRequeuePinReason(reason string) bool {
+	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix)
 }
 
 // healthSince decides the health_since to write. It stamps now when a flag is raised

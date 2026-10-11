@@ -385,7 +385,7 @@ export type SdkQueryFn = (params: {
   prompt: AsyncIterable<unknown>;
   options: SdkOptions;
 }) => AsyncIterable<SDKMessage> & {
-  getContextUsage?(): Promise<ContextUsageReading>;
+  getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ContextUsageReading>;
 };
 
 /** PRD #516 R1: how long to wait on the `getContextUsage()` control call before
@@ -395,6 +395,22 @@ export type SdkQueryFn = (params: {
  *  The read itself now lives in the Claude adapter (claude-harness.ts); this is
  *  the default bound the executor still threads to it. */
 const CONTEXT_USAGE_TIMEOUT_MS = 2000;
+
+/** Issue #2686: executor exit waits at most this long for an aborted intent-summary pass to
+ *  deliver its usage and settle (the pass's own bounded abort grace plus HOME teardown); a pass
+ *  still running then is abandoned and its late usage dropped. Mirrors NOW_STOP_BOUND_MS in
+ *  now-summary.ts; never the generation timeout. */
+const INTENT_SETTLE_BOUND_MS = 3_000;
+
+/** Issue #2686: the per-run record of the unawaited intent-summary pass. */
+interface IntentFlight {
+  ctrl: AbortController;
+  done: Promise<void>;
+  /** Set when the settle bound elapsed: a late usage report is dropped. */
+  abandoned: boolean;
+  /** Set once the pass's usage was emitted (at most one summary_usage per pass). */
+  delivered: boolean;
+}
 
 export interface SdkExecutorOptions {
   /** Override the SDK entrypoint (tests inject a fake transport here). */
@@ -448,6 +464,10 @@ export interface SdkExecutorOptions {
    *  clone). Injected in tests so the advisory hooks are drivable with a fake that
    *  records calls and can throw, proving failure isolation with no live SDK. */
   summaryRunner?: SummaryRunner;
+  /** Issue #2686: how long executor exit (and a credential-switch attempt) waits for an aborted
+   *  intent-summary pass to settle before abandoning it. Default {@link INTENT_SETTLE_BOUND_MS}.
+   *  Injectable so a test drives the abandon path in milliseconds. */
+  intentSettleBoundMs?: number;
   /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call.
    *  Default {@link CONTEXT_USAGE_TIMEOUT_MS} (2s); tests lower it so the hang case
    *  resolves fast. */
@@ -761,6 +781,10 @@ export class SdkExecutor implements Executor {
    *  shared provisioning HOME, a writable data-volume path — never the clone); tests
    *  inject a fake. Only used by the advisory summary hooks. */
   private readonly summaryRunner: SummaryRunner;
+  /** Issue #2686: the bound for {@link waitIntentSummary} and {@link settleIntentSummary}. */
+  private readonly intentSettleBoundMs: number;
+  /** Issue #2686: this run's in-flight intent-summary pass, undefined when none started. */
+  private intentFlight: IntentFlight | undefined;
   /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call. */
   private readonly contextUsageTimeoutMs: number;
   /** issue #1197 (D-RC2b): base in-process backoff between positively-empty turn
@@ -846,6 +870,7 @@ export class SdkExecutor implements Executor {
     // is where the judge/run put theirs — NOT the clone). Tests inject a fake.
     this.summaryRunner =
       opts.summaryRunner ?? new SummaryRunner(this.log, { homeRoot: this.provisionHomeDir });
+    this.intentSettleBoundMs = opts.intentSettleBoundMs ?? INTENT_SETTLE_BOUND_MS;
     this.contextUsageTimeoutMs =
       opts.contextUsageTimeoutMs ?? CONTEXT_USAGE_TIMEOUT_MS;
     // #1197: accept finite nonnegative overrides. Zero deliberately disables the
@@ -1037,6 +1062,10 @@ export class SdkExecutor implements Executor {
         issueBody: ctx.issueDescription,
         prdText: prd.prdText,
         planMd: approvedPlan,
+        onUsage: (u) => {
+          if (ctx.claimFenced?.()) return;
+          ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: u } });
+        },
       });
       if (r) {
         await this.client.postPlanSummary(ctx.runId, {
@@ -1079,12 +1108,16 @@ export class SdkExecutor implements Executor {
     // Issue #2014: each query() of this run records its per-message usage into the run's recorder.
     this.harness.setUsageSink(ctx.usage);
     this.latestPlanSummary = undefined;
+    this.intentFlight = undefined;
     const drive = await this.phaseSetup(ctx);
     try {
       const early = await this.phasePlanGate(ctx, drive);
       if (early !== undefined) return early;
       return await this.phaseRunLoop(ctx, drive);
     } finally {
+      // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
+      // open, so its observed usage is emitted rather than dropped by a closed batcher.
+      await this.settleIntentSummary();
       this.disarmWall(drive.state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
       // PRD #121 M2: no install may outlive the run. On every path that never reached
@@ -1794,7 +1827,14 @@ export class SdkExecutor implements Executor {
       // guarantees a late rejection can never surface as an unhandledRejection — the
       // run lives through planning+implement, so the promise has time to settle.
       if (summariesOn && !ctx.summaryIntentPresent) {
-        void (async () => {
+        const flight: IntentFlight = {
+          ctrl: new AbortController(),
+          done: Promise.resolve(),
+          abandoned: false,
+          delivered: false,
+        };
+        this.intentFlight = flight;
+        flight.done = (async () => {
           try {
             const prd = await prdInputP!;
             const summary = await this.summaryRunner.generateIntentSummary({
@@ -1803,6 +1843,12 @@ export class SdkExecutor implements Executor {
               issueTitle: ctx.issueTitle,
               issueBody: ctx.issueDescription,
               prdText: prd.prdText,
+              signal: flight.ctrl.signal,
+              onUsage: (u) => {
+                if (flight.delivered || flight.abandoned || ctx.claimFenced?.()) return;
+                flight.delivered = true;
+                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: u } });
+              },
             });
             if (summary) await this.client!.postIntentSummary(ctx.runId, summary);
           } catch (err) {
@@ -2828,7 +2874,7 @@ export class SdkExecutor implements Executor {
           //   - no hook wired (stub/test executor) → re-throw, byte-identical to the pre-fix behaviour
           //     (the runner's outer catch is then the safety net).
           if (err instanceof CredentialSwitchSignal) {
-            const outcome = await ctx.attemptCredentialSwitch?.();
+            const outcome = await this.attemptCredentialSwitch(ctx);
             if (outcome === "released") {
               switchReleased = true;
               break;
@@ -3628,6 +3674,57 @@ export class SdkExecutor implements Executor {
     return reportDepsInstall(ctx, this.log, result);
   }
 
+  /**
+   * Issue #2686: wait up to `intentSettleBoundMs` for the intent pass to finish on its own,
+   * WITHOUT aborting it. Resolves true when it settled (or none exists, or it was already
+   * abandoned: it was aborted and its late usage is dropped, so waiting again could only add a
+   * bound), false at the bound.
+   */
+  private async waitIntentSummary(): Promise<boolean> {
+    const flight = this.intentFlight;
+    if (flight === undefined || flight.abandoned) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), this.intentSettleBoundMs);
+    });
+    try {
+      return await Promise.race([flight.done.then(() => true as const, () => true as const), timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Issue #2686: abort the unawaited intent-summary pass and wait, bounded, for it to deliver
+   * its already-observed usage. Idempotent; never throws; never waits for the generation
+   * timeout. A pass still running at the bound is abandoned (its late usage is dropped).
+   */
+  private async settleIntentSummary(): Promise<void> {
+    const flight = this.intentFlight;
+    if (flight === undefined) return;
+    flight.ctrl.abort();
+    if (flight.abandoned) return;
+    if (!(await this.waitIntentSummary())) {
+      flight.abandoned = true;
+      this.log.warn("intent summary: the aborted pass did not settle within the bound; its late usage is dropped");
+    }
+  }
+
+  /**
+   * Issue #2686: a credential-switch attempt on a verified release closes the runner's batcher
+   * before the executor returns, so the intent pass must have reported its usage first. Wait for
+   * it to finish naturally (bounded) so a "gave_up" run, which continues in place on the old
+   * token, still posts its intent summary; only a pass still running at the bound is aborted and
+   * settled. Residual: such a pass is cancelled, so its summary is not posted on a later give-up
+   * (usage it reports before the settle bound is still emitted).
+   */
+  private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
+    if (!ctx.attemptCredentialSwitch) return undefined;
+    await this.waitIntentSummary();
+    await this.settleIntentSummary();
+    return ctx.attemptCredentialSwitch();
+  }
+
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
   /**
    * PRD #1247 M5b (data-integrity fix): run an idle held-state WAIT (the plan gate, an ask_user
@@ -3659,7 +3756,7 @@ export class SdkExecutor implements Executor {
         return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
-        const outcome = await ctx.attemptCredentialSwitch?.();
+        const outcome = await this.attemptCredentialSwitch(ctx);
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up") {
           state.tripReason = undefined;

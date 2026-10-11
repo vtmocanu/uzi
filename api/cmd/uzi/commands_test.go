@@ -201,6 +201,22 @@ func TestRunGetHealthReason(t *testing.T) {
 	}
 }
 
+// TestRunGetStaleRequeuePinReason pins issue #2705 at the CLI: the "waiting until <deadline> for
+// its previous worker" reason of a stale-requeued run rides the generic HEALTH rows, whole.
+func TestRunGetStaleRequeuePinReason(t *testing.T) {
+	reason := "waiting until 2026-07-12T12:19:00Z for its previous worker w1 to return; another worker may take it after that"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"r1": {ID: "r1", Status: "queued", Health: "waiting_worker", HealthReason: &reason},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "HEALTH_REASON") || !strings.Contains(out, reason) {
+		t.Errorf("run get did not render the stale-requeue pin reason:\n%s", out)
+	}
+}
+
 // TestRunGetLongToolCallHealth pins issue #2046 at the CLI: the long-tool-call flag is the
 // stalled enum with its fixed reason, rendered through the generic HEALTH rows.
 func TestRunGetLongToolCallHealth(t *testing.T) {

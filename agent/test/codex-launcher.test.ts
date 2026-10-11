@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { CODEX_SESSION_GID, COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
   CodexUnsupportedProfileError,
+  classifyCodexLaunchFailure,
   TMP_RETAINED_REASONS,
   launchCodexRoot,
   launchCodexEffectRoot,
@@ -98,6 +99,8 @@ class FakeSupervisor extends EventEmitter {
   private readonly exitBeforeEvidence: boolean;
   private readonly tmpCleanup: { value: unknown } | undefined;
   readonly disposeTimeouts: number[] = [];
+  autoSnapshots = true;
+  readonly snapshotIds: number[] = [];
 
   constructor(opts: FakeOpts = {}) {
     super();
@@ -135,6 +138,8 @@ class FakeSupervisor extends EventEmitter {
   private onControl(line: string): void {
     const cmd = JSON.parse(line) as { op: string; id: number; timeoutMs?: number };
     if (cmd.op === "snapshot") {
+      this.snapshotIds.push(cmd.id);
+      if (!this.autoSnapshots) return;
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
@@ -1191,6 +1196,22 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     assert.match(outcome.clean ? "" : outcome.reason, /missing required authority/);
   });
 
+  it("refuses oversized evidence without a delimiter at the crossing write", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.write(Buffer.alloc(65535, 0x78));
+    assert.equal(handle.failed, undefined, "below cap");
+    fake.evidence.write(Buffer.from("x"));
+    assert.equal(handle.failed, undefined, "exactly cap");
+    fake.evidence.write(Buffer.from("x"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const failure = handle.failed as Error | undefined;
+    assert.ok(failure instanceof TrustedExecutionRefusal, "crossing write must immediately refuse without a delimiter");
+    assert.equal(failure.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(classifyCodexLaunchFailure(failure), "protocol_evidence");
+    assert.equal(fake.evidence.destroyed, true);
+  });
+
   it("(f5) an oversized evidence line is a bounded rejection", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
@@ -1214,6 +1235,197 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
       launchCodexRoot(baseSpec(), baseDeps(fake, { deadlines: { started: 40, snapshot: 40, dispose: 40, exit: 40 } })),
       /started_deadline; cleanup unconfirmed/,
     );
+  });
+});
+
+describe("launchCodexRoot: raw evidence guard", () => {
+  const checkpoint = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+  function snapshotRecord(id: number, bytes?: number, text = "é"): Buffer {
+    const record = { event: "snapshot", id, processes: [], text };
+    const json = JSON.stringify(record);
+    return Buffer.from(bytes === undefined ? json : json + " ".repeat(bytes - Buffer.byteLength(json)));
+  }
+
+  for (const delimiter of ["\n", "\r", "\r\n"]) {
+    it(`dispatches multiple valid records in one chunk with ${JSON.stringify(delimiter)} delimiters`, async () => {
+      const fake = newFake();
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      fake.autoSnapshots = false;
+      const first = handle.snapshot(500);
+      const second = handle.snapshot(500);
+      fake.evidence.write(Buffer.concat(fake.snapshotIds.map((id) =>
+        Buffer.concat([snapshotRecord(id), Buffer.from(delimiter)]))));
+      assert.deepEqual((await Promise.all([first, second])).map((ev) => ev.id), fake.snapshotIds);
+      assert.equal(handle.failed, undefined);
+      assert.equal((await handle.dispose(500)).clean, true);
+    });
+  }
+
+  it("keeps split CRLF as one delimiter and split multibyte UTF8 verbatim", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const first = handle.snapshot(500);
+    const record = snapshotRecord(fake.snapshotIds[0]!);
+    const split = record.indexOf(Buffer.from("é")) + 1;
+    fake.evidence.write(record.subarray(0, split));
+    fake.evidence.write(Buffer.concat([record.subarray(split), Buffer.from("\r")]));
+    fake.evidence.write(Buffer.from("\n"));
+    const ev = await first;
+    assert.equal((ev as unknown as { text: string }).text, "é");
+    assert.equal(handle.failed, undefined, "split CRLF does not dispatch an empty line");
+    assert.equal((await handle.dispose(500)).clean, true);
+  });
+
+  it("dispatches exactly-cap and successive near-cap records with pending IDs", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const requests = [handle.snapshot(500), handle.snapshot(500), handle.snapshot(500)];
+    const sizes = [65536, 65535, 65535];
+    fake.evidence.write(Buffer.concat(fake.snapshotIds.map((id, index) =>
+      Buffer.concat([snapshotRecord(id, sizes[index]), Buffer.from("\n")]))));
+    assert.deepEqual((await Promise.all(requests)).map((ev) => ev.id), fake.snapshotIds);
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose(500)).clean, true);
+  });
+
+  it("refuses multibyte UTF8 by raw bytes before a delimiter", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const text = "é".repeat(32769);
+    assert.ok(text.length < 65536);
+    fake.evidence.write(Buffer.from(text));
+    await checkpoint();
+    assert.ok(handle.failed instanceof TrustedExecutionRefusal);
+    assert.equal(handle.failed.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(fake.evidence.destroyed, true);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("normal EOF releases the guard and settles terminal failure promptly", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.end();
+    await checkpoint();
+    assert.equal(fake.evidence.readableEnded, true);
+    assert.match(handle.failed?.message ?? "", /evidence stream closed before confirmed disposal/);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("source destruction without EOF releases the guard and settles terminal failure", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.destroy();
+    await checkpoint();
+    assert.equal(fake.evidence.readableEnded, false);
+    assert.match(handle.failed?.message ?? "", /evidence stream closed before confirmed disposal/);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("source error releases the guard and preserves the original stream refusal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.destroy(new Error("fd4 failed"));
+    await checkpoint();
+    const failure = handle.failed;
+    assert.equal(failure?.message, "evidence stream error: fd4 failed");
+    assert.equal(classifyCodexLaunchFailure(failure), "protocol_evidence");
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.equal(handle.failed, failure);
+  });
+
+  it("overflow teardown settles pending requests and preserves the first refusal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const pending = assert.rejects(handle.snapshot(500), /oversized evidence line/);
+    fake.evidence.write(Buffer.alloc(65537, 0x78));
+    await checkpoint();
+    await pending;
+    const failure = handle.failed;
+    assert.equal(failure?.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal(fake.evidence.destroyed, true);
+    fake.emit("exit", 2, null);
+    fake.emit("close", 2, null);
+    assert.equal((await handle.dispose(500)).clean, false);
+    assert.equal(handle.failed, failure);
+  });
+
+  it("line-count termination releases the guard during a forwarded chunk", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const requests = Array.from({ length: 256 }, () => handle.snapshot(500));
+    const settled = Promise.allSettled(requests);
+    fake.evidence.write(Buffer.concat(fake.snapshotIds.map((id) =>
+      Buffer.concat([snapshotRecord(id), Buffer.from("\n")]))));
+    await checkpoint();
+    const results = await settled;
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 255);
+    assert.equal(results[255]?.status, "rejected");
+    assert.equal(handle.failed?.message, "evidence line budget exceeded (> 256)");
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("source close without EOF cannot confirm an in-flight disposal", async () => {
+    const fake = newFake();
+    fake.exitWith = (code) => {
+      fake.emit("exit", code, null);
+      fake.stdout.end();
+      fake.stderr.end();
+      fake.evidence.destroy();
+      setImmediate(() => fake.emit("close", code, null));
+    };
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.match(outcome.clean ? "" : outcome.reason, /final disposal evidence unconfirmed/);
+    assert.equal(fake.evidence.readableEnded, false);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+  });
+
+  it("overflow after an unrelated failure retains the original refusal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitChildExit(17);
+    const failure = handle.failed;
+    fake.evidence.write(Buffer.alloc(65537, 0x78));
+    await checkpoint();
+    assert.equal(handle.failed, failure);
+    assert.equal(fake.evidence.destroyed, true);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("startup abandonment detaches the guard without synthesizing EOF", async () => {
+    const fake = newFake({ autoStarted: false });
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake, {
+      deadlines: { started: 20, snapshot: 50, dispose: 50, exit: 50 },
+    })), /started_deadline; cleanup unconfirmed/);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal(fake.evidence.readableEnded, false);
+  });
+
+  it("retains later abnormal tmpCleanup after unrelated child_exit failure", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitChildExit(17);
+    const failure = handle.failed;
+    assert.match(failure?.message ?? "", /provider child exited unexpectedly/);
+    fake.writeEvidence({ event: "abnormal", reason: "control EOF",
+      cleanup: { state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [] },
+      tmpCleanup: { state: "retained", reason: "owner" } });
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.deepEqual(outcome.clean ? undefined : outcome.tmpCleanup, { state: "retained", reason: "owner" });
+    assert.equal(handle.failed, failure);
   });
 });
 

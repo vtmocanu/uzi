@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=29
+FLOOR=34
 cases=0
 passed=0
 
@@ -68,6 +68,24 @@ expect 1 "shipping change, no entry"
 
 fresh with-entry; echo '// y' >> "$W/api/x.go"; unrel '- y (#1)'; commit "fix(api): y"
 expect 0 "shipping change with an [Unreleased] line"
+
+# Worker runtime assets need entries; excluded agent tests still do not.
+for runtime in templates codex; do
+  fresh "agent-$runtime-missing"
+  mkdir -p "$W/agent/$runtime"
+  echo 'runtime asset' > "$W/agent/$runtime/runtime.txt"
+  commit "fix(agent): update $runtime"
+  expect 1 "agent/$runtime change without an entry"
+  unrel "- Update $runtime (#1466)"
+  commit "docs: record $runtime change"
+  expect 0 "agent/$runtime change with an added entry"
+done
+fresh agent-test-only
+mkdir -p "$W/agent/test" "$W/agent/src"
+echo 'test fixture' > "$W/agent/test/runtime.ts"
+echo 'test fixture' > "$W/agent/src/foo.test.ts"
+commit "test(agent): runtime coverage"
+expect 0 "excluded agent tests need no entry"
 
 # A PATH-first shim models BusyBox unified headers. Its added record corresponds to
 # the real new line in the fixture; the headers alone must never count as an entry.

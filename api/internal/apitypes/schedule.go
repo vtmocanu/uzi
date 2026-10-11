@@ -335,10 +335,15 @@ type ScheduleDTO struct {
 	// LastFire is the structured summary of this schedule's most recent persisted fire
 	// (PRD #308 M3), unmarshalled straight from the run_schedules.last_fire jsonb column
 	// (its json tags mirror schedsvc's package-internal persisted wire shape exactly). A
-	// nil value means the schedule has never fired — or, since only the success/benign
-	// advance path persists, that a parked-or-transient fire left the prior summary (or
-	// none) in place rather than overwriting it.
+	// nil value means the schedule has never persisted a fire. Only the success/benign
+	// advance path and the credential-disabled hold persist it; a parked-or-transient
+	// fire leaves the prior summary (or none) in place rather than overwriting it.
 	LastFire *LastFire `json:"last_fire"`
+	// RecentFires (issue #2519) is up to 10 scheduled fires that did something (matched >
+	// 0), newest first, unmarshalled from the run_schedules.recent_fires jsonb column. It is
+	// always emitted: an empty array when there are none. LastFire is the latest persisted
+	// tick and may differ from RecentFires[0].
+	RecentFires []LastFire `json:"recent_fires"`
 	// CredentialOverride is the schedule's per-run credential override (PRD #1247 M1,
 	// D5): null = inherit (the fired run follows the worker binding), else {mode, label}.
 	// The twin of RunDTO.CredentialOverride — a fired run inherits this choice (M6). Null

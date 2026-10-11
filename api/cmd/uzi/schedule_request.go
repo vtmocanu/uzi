@@ -272,7 +272,7 @@ func parseAt(s string) (time.Time, error) {
 // A typed rebuild from the DTO's config fields (rather than re-posting the raw DTO) is
 // deliberate: the PATCH endpoint decodes with DisallowUnknownFields, so the DTO's
 // response-only fields (id, status, created_at, updated_at, next_fire_at, last_fired_at,
-// next_fires, repo_id, repo_path) would be rejected as unknown → 400. It also compensates
+// next_fires, recent_fires, repo_id, repo_path) would be rejected as unknown → 400. It also compensates
 // for mergeSchedule, which is keep-on-empty for most fields but takes max_issues,
 // guidance, model and override_subagent_model STRAIGHT from the request (nil clears them)
 // — so those MUST be re-sent from the fetched row, or a --cron-only edit would silently

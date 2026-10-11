@@ -50,6 +50,41 @@ it("resolves stored UUID aliases when retaining disabled repositories", async ()
   expect((await mockApi.adminListDockerAllowlistRepos()).repos.some((r) => r.id === id)).toBe(false);
 });
 
+const savedId = "b2222222-2222-4222-8222-222222222222";
+const compactId = "b2222222222242228222222222222222";
+
+it.each([
+  ["compact lowercase hex", compactId],
+  ["compact uppercase hex", compactId.toUpperCase()],
+  ["mixed-case URN prefix", "UrN:UuId:" + savedId],
+  ["arbitrary ASCII wrappers", "x" + savedId.toUpperCase() + "y"],
+  ["NEL padding", "\u0085" + savedId + "\u0085"],
+  ["mixed comma list and empty tokens", " , " + compactId + ",,UrN:UuId:" + savedId.toUpperCase() + ", x" + savedId + "y,\u0085" + savedId + "\u0085, "],
+  ["empty input", ""],
+  ["only commas", ",,,"],
+  ["only commas and Go whitespace", ",\u0085, "],
+])("saves %s and preserves the exact raw input", async (_name, value) => {
+  const { mockApi } = await import("./mockApi");
+  const response = await mockApi.updateSettings({ docker_repo_allowlist: value });
+  expect(response.settings.docker_repo_allowlist).toBe(value);
+  expect((await mockApi.getSettings()).settings.docker_repo_allowlist).toBe(value);
+});
+
+it.each([
+  ["non-ASCII wrappers", "é" + savedId + "é"],
+  ["invalid URN prefix", "urn:uuidx:" + savedId],
+  ["trailing extra character", savedId + "x"],
+  ["BOM padding", "\ufeff" + savedId + "\ufeff"],
+])("rejects %s without changing the saved value", async (_name, value) => {
+  const { mockApi } = await import("./mockApi");
+  await mockApi.updateSettings({ docker_repo_allowlist: savedId });
+  await expect(mockApi.updateSettings({ docker_repo_allowlist: value })).rejects.toMatchObject({
+    status: 400,
+    message: "docker_repo_allowlist: must be a comma-separated list of repo ids (UUIDs)",
+  });
+  expect((await mockApi.getSettings()).settings.docker_repo_allowlist).toBe(savedId);
+});
+
 it("requires an administrator session", async () => {
   const { mockApi } = await import("./mockApi");
   const { state } = await import("./store");

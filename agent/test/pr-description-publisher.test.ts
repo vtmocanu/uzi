@@ -29,7 +29,9 @@ import {
 } from "../src/pr-description.js";
 import { PR_DESC_ACK_OUTCOMES, type PrDescriptionSize, type PrDescriptionState } from "../src/protocol.js";
 import type { PrSummaryClaim } from "../src/signals.js";
-import type { DeliverySummary, DeliverySummaryInput } from "../src/summary-runner.js";
+import { SummaryRunner, type DeliverySummary, type DeliverySummaryInput } from "../src/summary-runner.js";
+import type { AdviceUsageSnapshot } from "../src/harness.js";
+import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { FakePrDescApi, clientFor } from "./fake-pr-desc-api.js";
 import { nullLogger } from "./helpers.js";
 
@@ -1511,5 +1513,76 @@ describe("publisher helpers", () => {
   it("every ack any test sent is one of the six api outcomes", () => {
     assert.ok(everyAck.length > 0);
     for (const a of everyAck) assert.ok((PR_DESC_ACK_OUTCOMES as readonly string[]).includes(a), a);
+  });
+});
+
+// ── Issue #2686: the editor pass's spend leaves the publisher as one usage report per pass ──────
+
+describe("publisher: editor-pass usage (issue #2686)", () => {
+  const usageOf = (n: number): AdviceUsageSnapshot => ({
+    "claude-haiku-4-5-20251001": { inputTokens: n, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+  });
+
+  /** A pass that, like SummaryRunner, reports one distinct usage snapshot per call. */
+  class UsagePass extends FakePass {
+    n = 0;
+    override async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
+      const out = await super.generateDeliverySummary(input);
+      input.onUsage?.(usageOf(++this.n));
+      return out;
+    }
+  }
+
+  function usageRig(pass: DeliveryPass | null) {
+    const forge = new FakeForge();
+    const usage: AdviceUsageSnapshot[] = [];
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: client,
+      pass,
+      log: nullLogger(),
+      emit: () => {},
+      emitUsage: (u) => void usage.push(u),
+      sleep: async () => {},
+      headLagRetryMs: 0,
+    });
+    return { forge, usage, publisher };
+  }
+
+  it("one editor pass reports its usage once", async () => {
+    const r = usageRig(new UsagePass(SUMMARY));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.deepEqual(r.usage, [usageOf(1)]);
+  });
+
+  it("a regeneration is a second pass: two independently counted reports", async () => {
+    const r = usageRig(new UsagePass(SUMMARY));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    r.forge.pr.head = H2; // read 1 sees another head: the one regeneration
+    await pub.publish(MR);
+    assert.deepEqual(r.usage, [usageOf(1), usageOf(2)]);
+  });
+
+  it("a call whose deadline is spent makes no model call and reports no usage", async () => {
+    let modelCalls = 0;
+    const queryFn = (async function* () {
+      modelCalls++;
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const runner = new SummaryRunner(nullLogger(), { queryFn });
+    const spent: DeliveryPass = {
+      deliverySummaryDeadline: () => Date.now() - 1,
+      generateDeliverySummary: (input) => runner.generateDeliverySummary(input),
+    };
+    const r = usageRig(spent);
+    const claim = { run_id: RUN, summary_model: "haiku", secrets: { anthropic_oauth_token: "tok" } };
+    const pub = await r.publisher.prepare(makeSpec({ claim }), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.equal(modelCalls, 0);
+    assert.deepEqual(r.usage, []);
   });
 });

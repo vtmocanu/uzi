@@ -1155,6 +1155,317 @@ it("corrupt owned journal fails with custody while preserving the exact corrupt 
   assert.ok(fs.existsSync(clone.path));
 });
 
+// issue #2613: pre-clone retained discovery retries only confirmed operational errors, within a
+// bounded in-memory per-claim allowance, and otherwise keeps the terminal custody-retaining failure.
+const LOCK_WAIT_ABORT = "permit-held git lock wait aborted: boundary deadline exceeded";
+const STORAGE_BUSY = "local recovery storage busy or unavailable after bounded retries";
+function errnoError(code: string, errno: number, syscall = "lstat"): Error {
+  return Object.assign(new Error(`${code}: fixture errno, ${syscall}`), { code, syscall, errno });
+}
+function namedError(name: string, message: string, cause?: unknown): Error {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.name = name;
+  return error;
+}
+const sleepMs = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+/** Deadline-shaped failures must be thrown after the attempt deadline (50ms) has elapsed. */
+const NARROW_DEADLINE_MS = 50;
+const WIDE_DEADLINE_MS = 30_000;
+
+/** Fails the first discovery attempt of a deadline-shaped variant without running real git under
+ *  the narrow clock: waits until the attempt deadline passed to withRecoveryOperation has elapsed,
+ *  widens the runner's deadline for the real second attempt, then throws. Returns the throw count. */
+function failFirstOperationAfterDeadline(r: unknown, fail: () => Error): { thrown: () => number } {
+  const operation = git.withRecoveryOperation.bind(git);
+  let entries = 0, thrown = 0;
+  git.withRecoveryOperation = (async (signal: AbortSignal, deadline: number, action: any) => {
+    if (++entries !== 1) return operation(signal, deadline, action);
+    await sleepMs(Math.max(0, deadline - Date.now()) + 5);
+    (r as any).codexBoundaryDeadlineMs = WIDE_DEADLINE_MS;
+    thrown++;
+    throw fail();
+  }) as typeof git.withRecoveryOperation;
+  return { thrown: () => thrown };
+}
+
+const retryableDiscoveryFailures: { name: string; deadline: boolean; fail: () => Error }[] = [
+  { name: "lock-wait AbortError", deadline: true, fail: () => namedError("AbortError", LOCK_WAIT_ABORT) },
+  { name: "AbortError with deadline cause", deadline: true,
+    fail: () => namedError("AbortError", "permit-held git operation aborted", new Error("recovery deadline exhausted")) },
+  { name: "wrapped git deadline", deadline: true,
+    fail: () => new Error("git config --local --null --list failed: recovery deadline exhausted") },
+  { name: "raw deadline", deadline: true, fail: () => new Error("recovery deadline exhausted") },
+  { name: "EMFILE", deadline: false, fail: () => errnoError("EMFILE", -24) },
+  { name: "ENOMEM", deadline: false, fail: () => errnoError("ENOMEM", -12) },
+];
+
+for (const variant of retryableDiscoveryFailures) {
+  it(`pre-clone discovery retries a first ${variant.name} failure and proceeds`, async () => {
+    const { claim, bare, clone } = await seed();
+    const discover = git.discoverRetainedRecovery.bind(git);
+    let calls = 0, models = 0;
+    const { gitlab } = fakeGitlab();
+    const r = runnerWith(factory(async () => {
+      models++;
+      assert.equal(readJournal(bare, clone.branch).recovery.attempts, 1);
+      throw new Error("fixture stops after admission");
+    }), gitlab, undefined, nullLogger(), {
+      recoveryRetryMs: 1, codexBoundaryDeadlineMs: variant.deadline ? NARROW_DEADLINE_MS : WIDE_DEADLINE_MS,
+    });
+    const first = variant.deadline ? failFirstOperationAfterDeadline(r, variant.fail) : undefined;
+    git.discoverRetainedRecovery = async (...args) => {
+      if (++calls === 1 && !variant.deadline) throw variant.fail();
+      return discover(...args);
+    };
+    await r.execute(claim);
+    if (variant.deadline) assert.equal(first!.thrown(), 1, "the first attempt failed with the deadline elapsed");
+    assert.equal(calls, variant.deadline ? 1 : 2, "the second discovery is the real one");
+    assert.equal(models, 1);
+    assert.equal(api.states.some(s => s.body.status === "failed" && /Retained recovery blocked/.test(s.body.failure_reason ?? "")), false);
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+    assert.equal(readJournal(bare, clone.branch).recovery?.attempts, 1);
+  });
+}
+
+it("an operation deadline already elapsed on entry is retried", async () => {
+  const { claim, bare, clone } = await seed();
+  const discover = git.discoverRetainedRecovery.bind(git);
+  const operation = git.withRecoveryOperation.bind(git);
+  let discoveries = 0, entries = 0, models = 0;
+  const { gitlab } = fakeGitlab();
+  const r = runnerWith(factory(async () => { models++; throw new Error("fixture stops after admission"); }),
+    gitlab, undefined, nullLogger(), { recoveryRetryMs: 1, codexBoundaryDeadlineMs: NARROW_DEADLINE_MS });
+  git.withRecoveryOperation = (async (signal: AbortSignal, deadline: number, action: any) => {
+    if (++entries === 1) {
+      await sleepMs(NARROW_DEADLINE_MS + 40);
+      (r as any).codexBoundaryDeadlineMs = WIDE_DEADLINE_MS;
+    }
+    return operation(signal, deadline, action);
+  }) as typeof git.withRecoveryOperation;
+  git.discoverRetainedRecovery = async (...args) => { discoveries++; return discover(...args); };
+  await r.execute(claim);
+  assert.equal(models, 1);
+  assert.equal(discoveries, 1, "the first attempt failed before reaching discovery");
+  assert.equal(api.states.some(s => s.body.status === "failed" && /Retained recovery blocked/.test(s.body.failure_reason ?? "")), false);
+  assert.equal(readJournal(bare, clone.branch).recovery?.attempts, 1);
+});
+
+const terminalDiscoveryFailures: { name: string; deadline: boolean; fail: () => Error }[] = [
+  { name: "bare AbortError after the deadline", deadline: true, fail: () => namedError("AbortError", "This operation was aborted") },
+  { name: "deadline text before the deadline elapsed", deadline: false, fail: () => new Error("recovery deadline exhausted") },
+  { name: "deadline text on a corruption error", deadline: true,
+    fail: () => new Error("invalid retained recovery clone journal: recovery deadline exhausted") },
+  { name: "SyntaxError", deadline: false, fail: () => new SyntaxError("Unexpected token in JSON") },
+  { name: "EACCES", deadline: false, fail: () => errnoError("EACCES", -13) },
+  { name: "EIO", deadline: false, fail: () => errnoError("EIO", -5) },
+  { name: "plain Error", deadline: false, fail: () => new Error("discovery storage read unavailable") },
+];
+
+for (const variant of terminalDiscoveryFailures) {
+  it(`pre-clone discovery stays terminal on ${variant.name}`, async () => {
+    const { claim, bare, clone } = await seed();
+    const before = readJournal(bare, clone.branch);
+    let calls = 0, models = 0;
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, nullLogger(), {
+        recoveryRetryMs: 1, codexBoundaryDeadlineMs: variant.deadline ? NARROW_DEADLINE_MS : WIDE_DEADLINE_MS,
+      });
+    const first = variant.deadline ? failFirstOperationAfterDeadline(r, variant.fail) : undefined;
+    git.discoverRetainedRecovery = async () => {
+      calls++;
+      throw variant.fail();
+    };
+    await r.execute(claim);
+    if (variant.deadline) assert.equal(first!.thrown(), 1, "the failure was classified with the deadline elapsed");
+    assert.equal(calls, variant.deadline ? 0 : 1);
+    assert.equal(models, 0);
+    const terminals = api.states.filter(s => s.body.status === "failed");
+    assert.equal(terminals.length, 1);
+    assert.ok(terminals[0]!.body.failure_reason?.includes("corrupt journal or unsafe local recovery storage"));
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+    assert.deepEqual(readJournal(bare, clone.branch), before);
+    assert.ok(fs.existsSync(clone.path));
+  });
+}
+
+it("pre-clone discovery stays terminal on an invalid recovery progress in the real journal", async () => {
+  const { claim, bare, clone } = await seed();
+  const journal = readJournal(bare, clone.branch);
+  command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify({ ...journal, recovery: { attempts: 7 } }));
+  const before = command(bare, "config", `uzi-recovery.${clone.branch}.clone`);
+  const discover = git.discoverRetainedRecovery.bind(git);
+  let calls = 0, models = 0;
+  git.discoverRetainedRecovery = async (...args) => { calls++; return discover(...args); };
+  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  assert.equal(calls, 1);
+  assert.equal(models, 0);
+  assert.equal(command(bare, "config", `uzi-recovery.${clone.branch}.clone`), before);
+  assert.equal(api.states.filter(s => s.body.status === "failed").length, 1);
+  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  assert.ok(fs.existsSync(clone.path));
+});
+
+it("pre-clone discovery exhausts its bounded allowance on persistent EMFILE and retains custody", async () => {
+  const { claim, bare, clone } = await seed();
+  const before = command(bare, "config", `uzi-recovery.${clone.branch}.clone`);
+  const tip = command(clone.path, "rev-parse", "HEAD");
+  const pin = `refs/uzi-recovery-episode/${claim.run_id}/${tip}`;
+  command(bare, "update-ref", pin, tip);
+  let calls = 0, models = 0;
+  git.discoverRetainedRecovery = async () => { calls++; throw errnoError("EMFILE", -24); };
+  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  assert.equal(calls, 3);
+  assert.equal(models, 0);
+  const terminals = api.states.filter(s => s.body.status === "failed");
+  assert.equal(terminals.length, 1);
+  assert.ok(terminals[0]!.body.failure_reason?.includes(STORAGE_BUSY));
+  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  assert.equal(command(bare, "config", `uzi-recovery.${clone.branch}.clone`), before);
+  assert.equal(command(bare, "rev-parse", pin), tip);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+});
+
+it("pre-clone discovery retries an EMFILE whose path contains a corruption marker", async () => {
+  const { claim } = await seed();
+  const discover = git.discoverRetainedRecovery.bind(git);
+  let calls = 0, models = 0;
+  git.discoverRetainedRecovery = async (...args) => {
+    if (++calls === 1) {
+      throw Object.assign(new Error("EMFILE: too many open files, lstat '/data/acme/ledger.git/config'"),
+        { code: "EMFILE", syscall: "lstat", errno: -24 });
+    }
+    return discover(...args);
+  };
+  await runnerWith(factory(async () => { models++; throw new Error("fixture stops after admission"); }),
+    fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  assert.equal(calls, 2);
+  assert.equal(models, 1);
+  assert.equal(api.states.some(s => s.body.status === "failed" && /Retained recovery blocked/.test(s.body.failure_reason ?? "")), false);
+});
+
+it("the discovery allowance is shared per claim across the pre-clone and pending-rediscovery callers", async () => {
+  const { claim, bare, clone } = await seed();
+  const tip = command(clone.path, "rev-parse", "HEAD");
+  const pin = `refs/uzi-recovery-episode/${claim.run_id}/${tip}`;
+  command(bare, "update-ref", pin, tip);
+  const discover = git.discoverRetainedRecovery.bind(git);
+  let calls = 0, models = 0;
+  git.createOrAttachRunnerClone = async () => { throw new PendingRecoveryCaptureError(clone.path, clone.branch); };
+  git.discoverRetainedRecovery = async (...args) => {
+    calls++;
+    if (calls === 1 || calls === 3 || calls === 4) throw errnoError("EMFILE", -24);
+    if (calls === 2) return undefined;
+    return discover(...args);
+  };
+  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+    fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  assert.equal(calls, 4);
+  assert.equal(models, 0);
+  const terminals = api.states.filter(s => s.body.status === "failed");
+  assert.equal(terminals.length, 1);
+  assert.ok(terminals[0]!.body.failure_reason?.includes(STORAGE_BUSY));
+  assert.equal(command(bare, "rev-parse", pin), tip);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+});
+
+for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
+  it(`pre-clone discovery gives ${outcome} precedence over a retryable EMFILE`, async () => {
+    const { claim, clone } = await seed();
+    client.protocolFeatures = ["claim_generation_fence"];
+    let calls = 0, models = 0;
+    const log = recordingLogger();
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
+    git.discoverRetainedRecovery = async () => {
+      calls++;
+      const active = (r as any).activeRuns.get(claim.run_id);
+      active.steering.cancelled = true;
+      if (outcome === "shutdown") active.shuttingDown = true;
+      if (outcome === "fence") active.steering.claimFence = () => ({ kind: "superseded" });
+      active.cancel.abort(new Error("discovery interrupted"));
+      throw errnoError("EMFILE", -24);
+    };
+    await r.execute(claim);
+    assert.equal(calls, 1);
+    assert.equal(models, 0);
+    assert.equal(log.lines.some(line => (line as { msg: string }).msg ===
+      "retained recovery discovery failed; retrying within the bounded per-claim allowance"), false,
+      "the lifecycle guard runs before the retry decision");
+    const terminals = api.states.filter(s => s.body.status === "failed");
+    if (outcome === "owner cancel") {
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0]!.body.failure_reason, "run cancelled");
+    } else assert.equal(terminals.length, 0);
+    assert.ok(fs.existsSync(clone.path));
+  });
+}
+
+for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
+  it(`retained discovery backoff: ${outcome} after the backoff began stops before a second discovery`, async () => {
+    const { claim, bare, clone } = await seed();
+    client.protocolFeatures = ["claim_generation_fence"];
+    const before = readJournal(bare, clone.branch);
+    const discover = git.discoverRetainedRecovery.bind(git);
+    const operation = git.withRecoveryOperation.bind(git);
+    let discoveries = 0, operations = 0, models = 0;
+    git.discoverRetainedRecovery = async (...args) => {
+      if (++discoveries === 1) throw errnoError("EMFILE", -24);
+      return discover(...args);
+    };
+    git.withRecoveryOperation = (async (...args: Parameters<typeof operation>) => {
+      operations++;
+      return operation(...args);
+    }) as typeof git.withRecoveryOperation;
+    const log = recordingLogger();
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: outcome === "fence" ? 200 : 5000 });
+    const waits: { cancelStopsWait: unknown }[] = [];
+    const snapshot: { discoveries?: number; operations?: number; at?: number } = {};
+    const wait = (r as any).waitRecoveryRetry.bind(r);
+    (r as any).waitRecoveryRetry = (flight: any, cancelStopsWait?: boolean, waitMs?: number) => {
+      waits.push({ cancelStopsWait });
+      // The original has started its first sleep slice, so the trigger lands after the backoff began.
+      const pending = wait(flight, cancelStopsWait, waitMs);
+      snapshot.discoveries = discoveries;
+      snapshot.operations = operations;
+      snapshot.at = Date.now();
+      setImmediate(() => {
+        if (outcome === "owner cancel") flight.steering.route("cancel", undefined, 1, false, undefined);
+        else if (outcome === "shutdown") r.shutdown();
+        else (flight.steering as any).endFencedFlight("stale");
+      });
+      return pending;
+    };
+    await r.execute(claim);
+    const elapsed = Date.now() - snapshot.at!;
+    assert.equal(waits.length, 1, "the backoff ran once");
+    assert.equal(waits[0]!.cancelStopsWait, true);
+    assert.equal(log.lines.filter(line => (line as { msg: string }).msg ===
+      "retained recovery discovery failed; retrying within the bounded per-claim allowance").length, 1);
+    // Holds because flight.barePath stays unset after the failed first attempt, so the teardown
+    // recovery operation after the lifecycle stop is skipped.
+    assert.equal(discoveries, 1, "no second discovery");
+    assert.equal(discoveries, snapshot.discoveries);
+    assert.equal(snapshot.operations, 1, "the first recovery operation was entered");
+    assert.equal(operations, snapshot.operations, "no second recovery operation was entered");
+    assert.equal(models, 0);
+    if (outcome === "owner cancel") {
+      const terminals = api.states.filter(s => s.body.status === "failed");
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0]!.body.failure_reason, "run cancelled");
+      assert.equal(api.states.some(s => /Retained recovery blocked/.test(s.body.failure_reason ?? "")
+        || (s.body.failure_reason ?? "").includes(STORAGE_BUSY)), false);
+      assert.deepEqual(readJournal(bare, clone.branch), before);
+    } else {
+      assert.equal(api.states.some(s => ["failed", "cancelled", "completed", "recovery_wait"].includes(s.body.status)), false);
+    }
+    if (outcome !== "fence") assert.ok(elapsed < 2500, `the stop did not sleep out the backoff (${elapsed}ms)`);
+    assert.ok(fs.existsSync(clone.path));
+  });
+}
+
 it("missing-source blocker persistence failure still reports retained terminal failure", async () => {
   const { claim, bare, clone } = await seed();
   const before = readJournal(bare, clone.branch);

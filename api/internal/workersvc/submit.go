@@ -148,7 +148,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			row store.RunUserInput
 		)
 		if sel != nil {
-			res, row, err = s.submitApproval(ctx, run, *sel, opts.ExpectedGateRevision)
+			res, row, err = s.submitApproval(ctx, userID, run, *sel, opts.ExpectedGateRevision, opts.OverrideCapabilities)
 		} else {
 			res, row, err = s.enqueueGateApproval(ctx, run, body, opts.ExpectedGateRevision)
 		}
@@ -717,6 +717,10 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 	return SubmitInputResult{ServerSide: true}, nil
 }
 
+// approveMilestoneAttempts bounds submitApproval's write attempts when an unbound approve keeps
+// losing the race with a republished milestone list (issue #2680).
+const approveMilestoneAttempts = 3
+
 // submitApproval enqueues an approve_plan carrying an agent selection (PRD #37):
 // validate against the run's real roster, then write the run's agent_source /
 // agent_exclusions and the worker-bound input body in one statement, so the row can
@@ -726,18 +730,7 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 // client's text: the worker parses it back with parseAgentSelection, and a raw
 // pass-through would hand an unvalidated string to the process that builds the
 // agent map.
-func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSelection, expected *int64) (SubmitInputResult, store.RunUserInput, error) {
-	roster, err := s.rosterFor(ctx, run, sel.Source, nil)
-	if err != nil {
-		return SubmitInputResult{}, store.RunUserInput{}, err
-	}
-	if err := validateSelection(sel, roster); err != nil {
-		return SubmitInputResult{}, store.RunUserInput{}, err
-	}
-	// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
-	// every approve_plan — both the selection-bearing path that reaches here and the
-	// nil-selection plain-enqueue path — so a plan can never be approved onto a worker that
-	// cannot run it, whichever path the client used.
+func (s *Service) submitApproval(ctx context.Context, userID uuid.UUID, run store.Run, sel AgentSelection, expected *int64, overrideCaps bool) (SubmitInputResult, store.RunUserInput, error) {
 	exclusions, err := encodeJSONArray(sel.Exclusions)
 	if err != nil {
 		return SubmitInputResult{}, store.RunUserInput{}, fmt.Errorf("encode agent exclusions: %w", err)
@@ -746,92 +739,156 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	if err != nil {
 		return SubmitInputResult{}, store.RunUserInput{}, fmt.Errorf("encode agent selection: %w", err)
 	}
-	// Issue #260 instrumentation: capture the live milestone freeze state on both sides of
-	// the approve-time freeze so a future human-gated dev-cluster run reveals what
-	// CreateApprovePlanInput saw. Best-effort: a snapshot read error is logged at Warn and
-	// NEVER aborts the approve.
-	before, beforeErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
-	if beforeErr != nil {
-		slog.Warn("workersvc: approve-freeze pre-read failed", "run_id", run.ID, "error", beforeErr)
-	}
-	// PRD #1226 M1 (D1): build the structural completion contract to freeze at the SAME
-	// approve freeze, ONLY for an interlocked run (completion_contract_version stamped at
-	// CreateRun). Build it from the SAME milestone source the query freezes —
-	// COALESCE(milestones_frozen, milestones_candidate) — preferring the fresh `before`
-	// snapshot read just above (so it matches what the freeze reads a line later), falling
-	// back to the run snapshot if that read failed. The query still guards the assignment
-	// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
-	// non-interlocked run passes NULL and stays legacy. A build error is best-effort:
-	// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
-	var completionContract []byte
-	if run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0 {
-		frozenSrc := run.MilestonesFrozen
-		candidateSrc := run.MilestonesCandidate
-		if beforeErr == nil {
-			frozenSrc = before.MilestonesFrozen
-			candidateSrc = before.MilestonesCandidate
+	// Issue #2680: the contract below is built in Go from a snapshot read of the milestone
+	// source, but CreateApprovePlanInput freezes the source as it is at WRITE time. The query
+	// therefore refuses (pgx.ErrNoRows, nothing written) when the source it would freeze is not
+	// the ContractSource this attempt built from, and an UNBOUND approve re-reads and tries again
+	// against the refreshed run, at most approveMilestoneAttempts times. A bound approve is not
+	// retried: its refusal is answered as a gate-revision mismatch (verdictNotWritten) and the
+	// client refetches.
+	for attempt := 1; ; attempt++ {
+		roster, err := s.rosterFor(ctx, run, sel.Source, nil)
+		if err != nil {
+			return SubmitInputResult{}, store.RunUserInput{}, err
 		}
-		src := frozenSrc
-		if len(src) == 0 {
-			src = candidateSrc
+		if err := validateSelection(sel, roster); err != nil {
+			return SubmitInputResult{}, store.RunUserInput{}, err
 		}
-		contract, cerr := buildCompletionContract(src)
-		if cerr != nil {
-			slog.Warn("workersvc: build completion contract at approve failed", "run_id", run.ID, "error", cerr)
+		// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
+		// every approve_plan — both the selection-bearing path that reaches here and the
+		// nil-selection plain-enqueue path — so a plan can never be approved onto a worker that
+		// cannot run it, whichever path the client used. A retry re-runs it below (#2680).
+		// Issue #260 instrumentation: capture the live milestone freeze state on both sides of
+		// the approve-time freeze so a future human-gated dev-cluster run reveals what
+		// CreateApprovePlanInput saw. Best-effort: a snapshot read error is logged at Warn and
+		// NEVER aborts the approve.
+		before, beforeErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
+		if beforeErr != nil {
+			slog.Warn("workersvc: approve-freeze pre-read failed", "run_id", run.ID, "error", beforeErr)
+		}
+		// PRD #1226 M1 (D1): build the structural completion contract to freeze at the SAME
+		// approve freeze, ONLY for an interlocked run (completion_contract_version stamped at
+		// CreateRun). Build it from the SAME milestone source the query freezes —
+		// COALESCE(milestones_frozen, milestones_candidate) — preferring the fresh `before`
+		// snapshot read just above (so it matches what the freeze reads a line later), falling
+		// back to the run snapshot if that read failed. The query still guards the assignment
+		// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
+		// non-interlocked run passes NULL and stays legacy. A build error is best-effort:
+		// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
+		//
+		// Issue #2680: a refusable attempt (the same interlocked, not-yet-frozen condition) also
+		// passes the exact source bytes the contract was built from as ContractSource, NIL
+		// included (nil = "I saw no source", so a candidate published meanwhile is refused and
+		// retried rather than frozen beside an empty-criteria contract), and keeps passing it when
+		// the build fails so that best-effort NULL-contract path never loops.
+		var (
+			completionContract []byte
+			contractSource     []byte
+		)
+		refusable := run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0
+		if refusable {
+			frozenSrc := run.MilestonesFrozen
+			candidateSrc := run.MilestonesCandidate
+			if beforeErr == nil {
+				frozenSrc = before.MilestonesFrozen
+				candidateSrc = before.MilestonesCandidate
+			}
+			src := frozenSrc
+			if len(src) == 0 {
+				src = candidateSrc
+			}
+			if len(src) > 0 {
+				contractSource = src
+			}
+			contract, cerr := buildCompletionContract(src)
+			if cerr != nil {
+				slog.Warn("workersvc: build completion contract at approve failed", "run_id", run.ID, "error", cerr)
+			} else {
+				completionContract = contract
+			}
+		}
+		// PRD #1795 M2: the row is stamped with the gate binding of the row the UPDATE locked, and
+		// an expected revision joins the UPDATE predicate: a mismatch returns pgx.ErrNoRows having
+		// written no selection, no milestone/contract/budget freeze and no input.
+		row, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
+			RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
+			CompletionContract:   completionContract,
+			ContractSource:       contractSource,
+			ExpectedGateRevision: pgconv.Int8Ptr(expected),
+			// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
+			// this run's effective budget from its frozen milestone count, atomically with the
+			// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
+			// same config and never changes a budget frozen once.
+			RunMaxIterations:         int32(s.p.RunMaxIterations), //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
+			RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
+			MilestoneBudgetCap:       milestoneBudgetCap,
+			SizeBudgetFactorL:        sizeBudgetFactorL,
+			BudgetWallCeilingSeconds: budgetDurationSeconds(s.p.RunWallCeiling),
+		})
+		if err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) || expected != nil || !refusable {
+				return SubmitInputResult{}, store.RunUserInput{}, err
+			}
+			// An unbound refusal on a refusable attempt is the #2680 source predicate (the
+			// unbound path has no other refusal besides a vanished run, which the re-read below
+			// tells apart). The re-read runs on every refusal, the last included, so a run that
+			// vanished or finished is classified as such rather than as source contention.
+			refreshed, gerr := s.GetRun(ctx, userID, run.ID)
+			if gerr != nil {
+				return SubmitInputResult{}, store.RunUserInput{}, gerr // ErrRunNotFound stays a 404
+			}
+			if terminalStatuses[refreshed.Status] {
+				return SubmitInputResult{}, store.RunUserInput{}, ErrRunTerminal
+			}
+			// Out of attempts: the milestone list keeps moving.
+			if attempt >= approveMilestoneAttempts {
+				return SubmitInputResult{}, store.RunUserInput{}, ErrApprovalMilestonesMoved
+			}
+			if refreshed.Status != "awaiting_approval" {
+				// The run left the gate mid-approve: the caller must re-read and decide again.
+				return SubmitInputResult{}, store.RunUserInput{}, ErrApprovalMilestonesMoved
+			}
+			// The republished plan may carry new required_capabilities; the upstream gate ran
+			// against the old row, so re-run it (the owner override bypasses it, as upstream).
+			if !overrideCaps {
+				if cerr := s.capabilityGate(ctx, refreshed); cerr != nil {
+					return SubmitInputResult{}, store.RunUserInput{}, cerr
+				}
+			}
+			run = refreshed
+			continue
+		}
+		after, afterErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
+		if afterErr != nil {
+			slog.Warn("workersvc: approve-freeze post-read failed", "run_id", run.ID, "error", afterErr)
+		}
+		// Issue #260: emit ONE structured log capturing what the approve-time freeze saw at the
+		// live instant. Approves are human-gated and rare, so this logs unconditionally. The
+		// pathological signature is the #260 bug SHAPE specifically — a candidate WAS present at
+		// the pre-read yet frozen came out NULL after the freeze — raised to Warn with a stable
+		// signature field for alerting. A 0-milestone LEGACY run correctly freezes NULL from a NULL
+		// candidate (see CreateApprovePlanInput's own comment), so it must NOT trip the signature,
+		// or every no-milestone approve would drown the real signal; hence the before-candidate
+		// guard, not a bare after-frozen-empty test. (Issue #1626: a 0-milestone INTERLOCKED run's
+		// candidate is the explicit `[]` (planMilestonesParam), which freezes `[]`: non-empty bytes
+		// on both sides, so it does not trip the signature either.)
+		logArgs := []any{
+			"run_id", run.ID,
+			"before_frozen", string(before.MilestonesFrozen),
+			"before_candidate", string(before.MilestonesCandidate),
+			"before_updated_at", before.UpdatedAt.Time,
+			"after_frozen", string(after.MilestonesFrozen),
+			"after_updated_at", after.UpdatedAt.Time,
+		}
+		if afterErr == nil && beforeErr == nil && len(before.MilestonesCandidate) > 0 && len(after.MilestonesFrozen) == 0 {
+			slog.Warn("workersvc: approve-time milestone freeze", append(logArgs, "signature", "approve_froze_null")...)
 		} else {
-			completionContract = contract
+			slog.Info("workersvc: approve-time milestone freeze", logArgs...)
 		}
+		// Populated AFTER validateSelection accepted the selection: only a valid, accepted
+		// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
+		return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, row, nil
 	}
-	// PRD #1795 M2: the row is stamped with the gate binding of the row the UPDATE locked, and
-	// an expected revision joins the UPDATE predicate: a mismatch returns pgx.ErrNoRows having
-	// written no selection, no milestone/contract/budget freeze and no input.
-	row, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
-		RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
-		CompletionContract:   completionContract,
-		ExpectedGateRevision: pgconv.Int8Ptr(expected),
-		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
-		// this run's effective budget from its frozen milestone count, atomically with the
-		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
-		// same config and never changes a budget frozen once.
-		RunMaxIterations:         int32(s.p.RunMaxIterations), //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
-		RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
-		MilestoneBudgetCap:       milestoneBudgetCap,
-		SizeBudgetFactorL:        sizeBudgetFactorL,
-		BudgetWallCeilingSeconds: budgetDurationSeconds(s.p.RunWallCeiling),
-	})
-	if err != nil {
-		return SubmitInputResult{}, store.RunUserInput{}, err
-	}
-	after, afterErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
-	if afterErr != nil {
-		slog.Warn("workersvc: approve-freeze post-read failed", "run_id", run.ID, "error", afterErr)
-	}
-	// Issue #260: emit ONE structured log capturing what the approve-time freeze saw at the
-	// live instant. Approves are human-gated and rare, so this logs unconditionally. The
-	// pathological signature is the #260 bug SHAPE specifically — a candidate WAS present at
-	// the pre-read yet frozen came out NULL after the freeze — raised to Warn with a stable
-	// signature field for alerting. A 0-milestone LEGACY run correctly freezes NULL from a NULL
-	// candidate (see CreateApprovePlanInput's own comment), so it must NOT trip the signature,
-	// or every no-milestone approve would drown the real signal; hence the before-candidate
-	// guard, not a bare after-frozen-empty test. (Issue #1626: a 0-milestone INTERLOCKED run's
-	// candidate is the explicit `[]` (planMilestonesParam), which freezes `[]`: non-empty bytes
-	// on both sides, so it does not trip the signature either.)
-	logArgs := []any{
-		"run_id", run.ID,
-		"before_frozen", string(before.MilestonesFrozen),
-		"before_candidate", string(before.MilestonesCandidate),
-		"before_updated_at", before.UpdatedAt.Time,
-		"after_frozen", string(after.MilestonesFrozen),
-		"after_updated_at", after.UpdatedAt.Time,
-	}
-	if afterErr == nil && beforeErr == nil && len(before.MilestonesCandidate) > 0 && len(after.MilestonesFrozen) == 0 {
-		slog.Warn("workersvc: approve-time milestone freeze", append(logArgs, "signature", "approve_froze_null")...)
-	} else {
-		slog.Info("workersvc: approve-time milestone freeze", logArgs...)
-	}
-	// Populated AFTER validateSelection accepted the selection: only a valid, accepted
-	// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
-	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, row, nil
 }
 
 // capabilityGate is the AUTHORITATIVE, server-side PRD #84 M4 4c approval gate. A run at

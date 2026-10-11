@@ -259,7 +259,9 @@ describe("existing callers are unchanged", () => {
   it("none of the four callers names a new option", () => {
     for (const f of ["judge-runner.ts", "review-runner.ts", "summary-runner.ts", "pr-description-eval-cli.ts"]) {
       const src = readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
-      for (const needle of ["maxOutputTokens", "onUsage", "usageObserver", "thinking:"]) {
+      // Issue #2686: the summary runner now forwards onUsage (and signal) for its spend.
+      const needles = f === "summary-runner.ts" ? ["maxOutputTokens", "usageObserver", "thinking:"] : ["maxOutputTokens", "onUsage", "usageObserver", "thinking:"];
+      for (const needle of needles) {
         assert.ok(!src.includes(needle), `${f} must not pass ${needle}`);
       }
     }
@@ -277,5 +279,19 @@ describe("existing callers are unchanged", () => {
     const prompt = buildJudgePrompt(trace, null);
     assert.ok(prompt.includes("real work"));
     assert.ok(!prompt.includes("SUMMARY-LINE-XYZ"));
+  });
+
+  it("the judge's trace sample skips summary_usage messages", () => {
+    const trace = {
+      target: { id: "r1", kind: "issue", status: "completed" },
+      inputs: [],
+      messages: [
+        { seq: 1, kind: "text", agent: "lead", payload: { text: "real work" } },
+        { seq: 2, kind: "summary_usage", agent: "worker", payload: { pass: "SUMMARY-PASS-XYZ", model_usage: {} } },
+      ],
+    } as unknown as Parameters<typeof buildJudgePrompt>[0];
+    const prompt = buildJudgePrompt(trace, null);
+    assert.ok(prompt.includes("real work"));
+    assert.ok(!prompt.includes("SUMMARY-PASS-XYZ"));
   });
 });

@@ -170,6 +170,78 @@ describe("recovery archive client wire (PRD #1296 M3 ↔ M2 handler)", () => {
     });
   }
 
+  for (const contentLength of [undefined, "1"]) {
+    it(`release bounds streamed bytes with ${contentLength === undefined ? "absent" : "lying"} Content-Length`, async (t) => {
+      const receipt = { run_id: RUN_ID, generation: 7, released: true, holds_released: 1, retained: false };
+      const text = JSON.stringify({ ...receipt, reason: "界".repeat(10_000) });
+      const bytes = Buffer.from(text);
+      assert.ok(text.length < 16 * 1024);
+      assert.ok(bytes.length > 16 * 1024);
+      let delivered = 0;
+      let cancelled = false;
+      let ended = false;
+      const headers = contentLength === undefined ? {} : { "Content-Length": contentLength };
+      let response = new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (delivered === bytes.length) {
+            ended = true;
+            controller.close();
+            return;
+          }
+          const chunk = bytes.subarray(delivered, delivered + 4096);
+          delivered += chunk.length;
+          controller.enqueue(chunk);
+        },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 }), { headers });
+      // A bounded ACK must read the stream rather than materialize Response.text().
+      t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
+      const calls: Array<{ url: string; init?: RequestInit }> = [];
+      const client = new WorkerClient(baseUrl, TOKEN, "test", nullLogger(), {
+        fetch: async (input, init) => {
+          calls.push({ url: String(input), init });
+          return response;
+        },
+      });
+      await assert.rejects(client.releaseRecoveryCustody(RUN_ID, 7), {
+        name: "ResponseBodyOverflowError",
+        message: "response body exceeds 16384 bytes",
+      });
+      assert.equal(cancelled, true);
+      assert.equal(ended, false);
+      assert.equal(delivered, 20 * 1024, "stops at first overflowing chunk");
+      assert.ok(delivered < bytes.length, "overflow stops before EOF");
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0]!.url, `${baseUrl}/api/worker/runs/${RUN_ID}/archives/release`);
+      assert.equal(calls[0]!.init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), { generation: 7 });
+
+      for (const size of [undefined, 16 * 1024]) {
+        const healthy = Buffer.from(size === undefined ? JSON.stringify(receipt) :
+          JSON.stringify(receipt).padEnd(size, " "));
+        let offset = 0;
+        let healthyEnded = false;
+        response = new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset === healthy.length) {
+              healthyEnded = true;
+              controller.close();
+              return;
+            }
+            const chunk = healthy.subarray(offset, offset + 4096);
+            offset += chunk.length;
+            controller.enqueue(chunk);
+          },
+        }, { highWaterMark: 0 }), { headers });
+        t.mock.method(response, "text", async () => { throw new Error("Response.text prohibited for release ACK"); });
+        assert.deepEqual(await client.releaseRecoveryCustody(RUN_ID, 7), receipt);
+        assert.equal(offset, healthy.length);
+        assert.equal(healthyEnded, true);
+      }
+      assert.equal(calls.length, 3);
+    });
+  }
+
   it("status → GET /api/worker/runs/{id}/archives/{captureID}", async () => {
     respond = () => ({
       status: 200,
