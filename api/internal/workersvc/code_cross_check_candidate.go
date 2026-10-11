@@ -23,7 +23,8 @@ func codeCandidateDigest(cc store.CrossCheck) ([]byte, error) {
 		len(cc.PlanMd.String) > 256*1024 || !utf8.ValidString(cc.PlanMd.String) ||
 		len(cc.Milestones) > 256*1024 || len(cc.RequiredCapabilities) > 64 ||
 		len(cc.RequiredTools) > 64 || len(cc.GuidanceSnapshot.String) > 8192 ||
-		!utf8.ValidString(cc.GuidanceSnapshot.String) {
+		!utf8.ValidString(cc.GuidanceSnapshot.String) || len(cc.RepoInstructionsText.String) > 65536 ||
+		!utf8.ValidString(cc.RepoInstructionsText.String) || (!cc.RepoInstructionsEnabled && cc.RepoInstructionsText.String != "") {
 		return nil, ErrCrossCheckRefused
 	}
 	var milestones []json.RawMessage
@@ -45,12 +46,22 @@ func codeCandidateDigest(cc store.CrossCheck) ([]byte, error) {
 	if len(cc.Milestones) > 0 && json.Unmarshal(cc.Milestones, &normalizedMilestones) != nil {
 		return nil, ErrCrossCheckRefused
 	}
-	raw, err := json.Marshal(map[string]any{
+	binding := map[string]any{
 		"base_commit": cc.BaseCommit.String, "head_commit": cc.HeadCommit.String,
 		"context": context, "plan_md": cc.PlanMd.String, "milestones": normalizedMilestones,
 		"required_capabilities": cc.RequiredCapabilities, "required_tools": cc.RequiredTools,
 		"size_class": cc.SizeClass.String, "guidance": cc.GuidanceSnapshot.String,
-	})
+	}
+	// Legacy empty/off candidates retain their exact canonical bytes.
+	if cc.GuidanceSnapshot.String != "" || cc.RepoInstructionsEnabled {
+		binding["repo_instructions_enabled"] = cc.RepoInstructionsEnabled
+		binding["repo_instructions_text"] = cc.RepoInstructionsText.String
+		guidanceDigest := sha256.Sum256([]byte(cc.GuidanceSnapshot.String))
+		instructionsDigest := sha256.Sum256([]byte(cc.RepoInstructionsText.String))
+		binding["guidance_digest"] = guidanceDigest[:]
+		binding["repo_instructions_digest"] = instructionsDigest[:]
+	}
+	raw, err := json.Marshal(binding)
 	if err != nil {
 		return nil, ErrCrossCheckRefused
 	}

@@ -820,21 +820,23 @@ type RecoveryCustodyHoldFact struct {
 }
 
 type Repo struct {
-	ID                      uuid.UUID          `json:"id"`
-	ConnectionID            uuid.UUID          `json:"connection_id"`
-	ForgeProjectID          int64              `json:"forge_project_id"`
-	PathWithNamespace       string             `json:"path_with_namespace"`
-	WebUrl                  string             `json:"web_url"`
-	DefaultBranch           pgtype.Text        `json:"default_branch"`
-	Enabled                 bool               `json:"enabled"`
-	RepoSkillsEnabled       bool               `json:"repo_skills_enabled"`
-	RepoDevboxOptIn         bool               `json:"repo_devbox_opt_in"`
-	RepoClaudemdEnabled     bool               `json:"repo_claudemd_enabled"`
-	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
-	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
-	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
-	RequiredCapabilities    []string           `json:"required_capabilities"`
-	FoldImproveUziBacklog   bool               `json:"fold_improve_uzi_backlog"`
+	ID                                uuid.UUID          `json:"id"`
+	ConnectionID                      uuid.UUID          `json:"connection_id"`
+	ForgeProjectID                    int64              `json:"forge_project_id"`
+	PathWithNamespace                 string             `json:"path_with_namespace"`
+	WebUrl                            string             `json:"web_url"`
+	DefaultBranch                     pgtype.Text        `json:"default_branch"`
+	Enabled                           bool               `json:"enabled"`
+	RepoSkillsEnabled                 bool               `json:"repo_skills_enabled"`
+	RepoDevboxOptIn                   bool               `json:"repo_devbox_opt_in"`
+	RepoClaudemdEnabled               bool               `json:"repo_claudemd_enabled"`
+	GuardrailOverrideReason           pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy               pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt               pgtype.Timestamptz `json:"guardrail_override_at"`
+	RequiredCapabilities              []string           `json:"required_capabilities"`
+	FoldImproveUziBacklog             bool               `json:"fold_improve_uzi_backlog"`
+	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
+	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 }
 
 type RepoToolProfile struct {

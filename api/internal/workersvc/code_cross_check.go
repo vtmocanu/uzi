@@ -2,11 +2,13 @@ package workersvc
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -30,7 +32,11 @@ func codeCrossCheckCustodyStatus(lead store.Run) bool {
 
 // SubmitCodeCrossCheck atomically freezes one local snapshot and creates its child.
 // A lost ACK returns the exact attempt before resolving credentials again.
-func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, base, head string) (store.CrossCheck, error) {
+func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, base, head string, inputs ...CodeCrossCheckInstructions) (store.CrossCheck, error) {
+	input, inputErr := codeCrossCheckInstructions(inputs)
+	if inputErr != nil {
+		return store.CrossCheck{}, inputErr
+	}
 	if !validCodeSHA(base) || !validCodeSHA(head) || s.txBeginner == nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
@@ -71,7 +77,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 	prior, e := retryQ.GetCodeCrossCheck(ctx, leadID)
 	if e == nil {
 		_ = tx.Rollback(ctx)
-		if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid || prior.BaseCommit.String != base || prior.HeadCommit.String != head {
+		if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid || prior.BaseCommit.String != base || prior.HeadCommit.String != head || !input.matches(prior) {
 			return result, ErrCrossCheckInterrupted
 		}
 		return prior, nil
@@ -96,13 +102,17 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		prior, e := txq.GetCodeCrossCheck(ctx, leadID)
 		if e == nil {
-			if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid || prior.BaseCommit.String != base || prior.HeadCommit.String != head {
+			if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid || prior.BaseCommit.String != base || prior.HeadCommit.String != head || !input.matches(prior) {
 				return store.Run{}, ErrCrossCheckInterrupted
 			}
 			result = prior
 			return store.Run{}, retry
 		}
 		if !errors.Is(e, pgx.ErrNoRows) {
+			return store.Run{}, e
+		}
+		frozen, e := freezeCodeCrossCheckInputs(ctx, txq, locked, input)
+		if e != nil {
 			return store.Run{}, e
 		}
 		if !slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodeV1) ||
@@ -117,7 +127,9 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		if e != nil {
 			return store.Run{}, e
 		}
-		digest, e := codeCandidateDigest(store.CrossCheck{BaseCommit: pgtype.Text{String: base, Valid: true}, HeadCommit: pgtype.Text{String: head, Valid: true}, CodeContext: contextBytes, PlanMd: locked.PlanMd, Milestones: locked.MilestonesFrozen, RequiredCapabilities: locked.RequiredCapabilities, RequiredTools: locked.RequiredTools, SizeClass: pgtype.Text{String: locked.SizeClass, Valid: true}, GuidanceSnapshot: pgtype.Text{Valid: true}})
+		frozen.BaseCommit, frozen.HeadCommit = pgtype.Text{String: base, Valid: true}, pgtype.Text{String: head, Valid: true}
+		frozen.CodeContext = contextBytes
+		digest, e := codeCandidateDigest(frozen)
 		if e != nil {
 			return store.Run{}, e
 		}
@@ -128,14 +140,14 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 			}
 			return store.Run{}, e
 		}
-		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
+		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, GuidanceText: frozen.GuidanceText.String, RepoInstructionsEnabled: frozen.RepoInstructionsEnabled, RepoInstructionsText: frozen.RepoInstructionsText.String, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
 		return child, e
 	})
 	if errors.Is(err, retry) {
 		return result, nil
 	}
 	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) || errors.Is(err, ErrCrossCheckUnavailable) {
-		return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable")
+		return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
 	}
 	if err != nil {
 		return result, err
@@ -216,4 +228,88 @@ func (s *Service) DecideCodeCrossCheck(ctx context.Context, worker store.Worker,
 		return cc, err
 	}
 	return cc, nil
+}
+
+// CodeCrossCheckInstructions is worker-provided text plus the consent observed
+// before reading it. An absent expected consent means off for legacy callers.
+type CodeCrossCheckInstructions struct {
+	RepoInstructionsEnabled *bool
+	RepoInstructionsText    string
+}
+
+func codeCrossCheckInstructions(inputs []CodeCrossCheckInstructions) (CodeCrossCheckInstructions, error) {
+	var input CodeCrossCheckInstructions
+	if len(inputs) > 1 {
+		return input, ErrCrossCheckRefused
+	}
+	if len(inputs) == 1 {
+		input = inputs[0]
+	}
+	if len(input.RepoInstructionsText) > 65536 || !utf8.ValidString(input.RepoInstructionsText) ||
+		(!input.enabled() && input.RepoInstructionsText != "") {
+		return input, ErrCrossCheckRefused
+	}
+	return input, nil
+}
+func (input CodeCrossCheckInstructions) enabled() bool {
+	return input.RepoInstructionsEnabled != nil && *input.RepoInstructionsEnabled
+}
+func (input CodeCrossCheckInstructions) matches(cc store.CrossCheck) bool {
+	return input.enabled() == cc.RepoInstructionsEnabled && input.RepoInstructionsText == cc.RepoInstructionsText.String
+}
+func freezeCodeCrossCheckInputs(ctx context.Context, q *store.Queries, lead store.Run, input CodeCrossCheckInstructions) (store.CrossCheck, error) {
+	var cc store.CrossCheck
+	settings, err := q.GetCodeCrossCheckRepoInputsForUpdate(ctx, store.GetCodeCrossCheckRepoInputsForUpdateParams{RepoID: uuid.UUID(lead.RepoID.Bytes), UserID: lead.UserID})
+	if err != nil {
+		return cc, ErrCrossCheckRefused
+	}
+	if settings.CrossCheckRepoInstructionsEnabled != input.enabled() {
+		return cc, ErrCrossCheckRefused
+	}
+	guidance := settings.CodeCrossCheckGuidance.String
+	if len(guidance) > 8192 || !utf8.ValidString(guidance) {
+		return cc, ErrCrossCheckRefused
+	}
+	cc.GuidanceSnapshot = pgtype.Text{String: guidance, Valid: true}
+	cc.GuidanceText = cc.GuidanceSnapshot
+	guidanceDigest := sha256.Sum256([]byte(guidance))
+	cc.GuidanceDigest = guidanceDigest[:]
+	cc.RepoInstructionsEnabled = input.enabled()
+	cc.RepoInstructionsText = pgtype.Text{String: input.RepoInstructionsText, Valid: true}
+	instructionsDigest := sha256.Sum256([]byte(input.RepoInstructionsText))
+	cc.RepoInstructionsDigest = instructionsDigest[:]
+	cc.PlanMd, cc.Milestones = lead.PlanMd, lead.MilestonesFrozen
+	cc.RequiredCapabilities, cc.RequiredTools = lead.RequiredCapabilities, lead.RequiredTools
+	cc.SizeClass = pgtype.Text{String: lead.SizeClass, Valid: true}
+	return cc, nil
+}
+
+// CodeCrossCheckRepoInstructionsEnabled authorizes a fresh snapshot read using
+// the same live worker ownership, custody and generation guard as code status.
+func (s *Service) CodeCrossCheckRepoInstructionsEnabled(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64) (bool, error) {
+	if s.txBeginner == nil {
+		return false, ErrCrossCheckRefused
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	lead, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
+	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid || !codeCrossCheckCustodyStatus(lead) || !lead.CodeCrossCheckRequired || !runkind.CodeCrossCheckable(lead.Kind) || lead.ReportOnly || lead.FixVerdict.String == "not_code" {
+		return false, ErrCrossCheckRefused
+	}
+	// A pending or terminal attempt cannot grant fresh file-read authority.
+	if _, err = q.GetCodeCrossCheck(ctx, leadID); !errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrCrossCheckRefused
+	}
+	settings, err := q.GetCodeCrossCheckRepoInputsForUpdate(ctx, store.GetCodeCrossCheckRepoInputsForUpdateParams{RepoID: uuid.UUID(lead.RepoID.Bytes), UserID: lead.UserID})
+	if err != nil {
+		return false, ErrCrossCheckRefused
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return settings.CrossCheckRepoInstructionsEnabled, nil
 }

@@ -689,6 +689,31 @@ func (q *Queries) GetCodeCrossCheckForOwner(ctx context.Context, arg GetCodeCros
 	return i, err
 }
 
+const getCodeCrossCheckRepoInputsForUpdate = `-- name: GetCodeCrossCheckRepoInputsForUpdate :one
+SELECT repo.code_cross_check_guidance, repo.cross_check_repo_instructions_enabled
+FROM repos repo JOIN forge_connections c ON c.id = repo.connection_id
+WHERE repo.id = $1 AND c.user_id = $2
+FOR UPDATE OF repo
+`
+
+type GetCodeCrossCheckRepoInputsForUpdateParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetCodeCrossCheckRepoInputsForUpdateRow struct {
+	CodeCrossCheckGuidance            pgtype.Text `json:"code_cross_check_guidance"`
+	CrossCheckRepoInstructionsEnabled bool        `json:"cross_check_repo_instructions_enabled"`
+}
+
+// Called only after locking and validating the current owned lead generation.
+func (q *Queries) GetCodeCrossCheckRepoInputsForUpdate(ctx context.Context, arg GetCodeCrossCheckRepoInputsForUpdateParams) (GetCodeCrossCheckRepoInputsForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getCodeCrossCheckRepoInputsForUpdate, arg.RepoID, arg.UserID)
+	var i GetCodeCrossCheckRepoInputsForUpdateRow
+	err := row.Scan(&i.CodeCrossCheckGuidance, &i.CrossCheckRepoInstructionsEnabled)
+	return i, err
+}
+
 const getCrossCheckByChild = `-- name: GetCrossCheckByChild :one
 SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at FROM cross_checks WHERE checker_run_id = $1
 `
@@ -749,11 +774,12 @@ INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, head
  repo_instructions_enabled, repo_instructions_text, repo_instructions_digest)
 SELECT lead.id, 'code', 1, lead.claim_generation, $1::text, $2::text,
  $3::bytea, child.id, child.harness, $4::timestamptz, 'failed',
- 'pending', $5::jsonb, '', lead.plan_md, lead.milestones_frozen,
+ 'pending', $5::jsonb, $6::text, lead.plan_md, lead.milestones_frozen,
  lead.required_capabilities, lead.required_tools, lead.size_class,
- '', sha256(convert_to('', 'UTF8')), false, '', sha256(convert_to('', 'UTF8'))
-FROM runs lead JOIN runs child ON child.id = $6
-WHERE lead.id = $7 AND child.target_run_id = lead.id AND child.kind = 'cross_check'
+ $6::text, sha256(convert_to($6::text, 'UTF8')),
+ $7::boolean, $8::text, sha256(convert_to($8::text, 'UTF8'))
+FROM runs lead JOIN runs child ON child.id = $9
+WHERE lead.id = $10 AND child.target_run_id = lead.id AND child.kind = 'cross_check'
  AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
  AND child.harness <> lead.harness
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
@@ -762,13 +788,16 @@ RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milesto
 `
 
 type InsertCodeCrossCheckParams struct {
-	HeadCommit      string             `json:"head_commit"`
-	BaseCommit      string             `json:"base_commit"`
-	CandidateDigest []byte             `json:"candidate_digest"`
-	DeadlineAt      pgtype.Timestamptz `json:"deadline_at"`
-	CodeContext     []byte             `json:"code_context"`
-	CheckerRunID    uuid.UUID          `json:"checker_run_id"`
-	LeadRunID       uuid.UUID          `json:"lead_run_id"`
+	HeadCommit              string             `json:"head_commit"`
+	BaseCommit              string             `json:"base_commit"`
+	CandidateDigest         []byte             `json:"candidate_digest"`
+	DeadlineAt              pgtype.Timestamptz `json:"deadline_at"`
+	CodeContext             []byte             `json:"code_context"`
+	GuidanceText            string             `json:"guidance_text"`
+	RepoInstructionsEnabled bool               `json:"repo_instructions_enabled"`
+	RepoInstructionsText    string             `json:"repo_instructions_text"`
+	CheckerRunID            uuid.UUID          `json:"checker_run_id"`
+	LeadRunID               uuid.UUID          `json:"lead_run_id"`
 }
 
 func (q *Queries) InsertCodeCrossCheck(ctx context.Context, arg InsertCodeCrossCheckParams) (CrossCheck, error) {
@@ -778,6 +807,9 @@ func (q *Queries) InsertCodeCrossCheck(ctx context.Context, arg InsertCodeCrossC
 		arg.CandidateDigest,
 		arg.DeadlineAt,
 		arg.CodeContext,
+		arg.GuidanceText,
+		arg.RepoInstructionsEnabled,
+		arg.RepoInstructionsText,
 		arg.CheckerRunID,
 		arg.LeadRunID,
 	)
@@ -831,20 +863,20 @@ const insertFailedCodeCrossCheck = `-- name: InsertFailedCodeCrossCheck :one
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
  base_commit, head_commit, candidate_digest, verdict, outcome, reason_class,
  code_context, guidance_snapshot, guidance_text, guidance_digest,
- repo_instructions_text, repo_instructions_digest, deadline_at, decided_at,
+ repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, deadline_at, decided_at,
  wait_credited, plan_md, milestones, required_capabilities, required_tools, size_class)
 SELECT lead.id, 'code', 1, lead.claim_generation,
  $1::text, $2::text,
  $3::bytea, 'failed', 'failed', $4::text,
- $5::jsonb, '', '', sha256(convert_to('', 'UTF8')),
- '', sha256(convert_to('', 'UTF8')), now(), now(), true,
+ $5::jsonb, $6::text, $6::text, sha256(convert_to($6::text, 'UTF8')),
+ $7::boolean, $8::text, sha256(convert_to($8::text, 'UTF8')), now(), now(), true,
  CASE WHEN $2::text IS NOT NULL THEN lead.plan_md END,
  CASE WHEN $2::text IS NOT NULL THEN lead.milestones_frozen END,
  CASE WHEN $2::text IS NOT NULL THEN lead.required_capabilities ELSE '{}' END,
  CASE WHEN $2::text IS NOT NULL THEN lead.required_tools ELSE '{}' END,
  CASE WHEN $2::text IS NOT NULL THEN lead.size_class END
-FROM runs lead WHERE lead.id = $6 AND lead.worker_id = $7
- AND lead.user_id = $8 AND lead.claim_generation = $9
+FROM runs lead WHERE lead.id = $9 AND lead.worker_id = $10
+ AND lead.user_id = $11 AND lead.claim_generation = $12
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.code_cross_check_required AND NOT lead.report_only
  AND lead.fix_verdict IS DISTINCT FROM 'not_code'
@@ -853,15 +885,18 @@ RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milesto
 `
 
 type InsertFailedCodeCrossCheckParams struct {
-	BaseCommit      pgtype.Text `json:"base_commit"`
-	HeadCommit      pgtype.Text `json:"head_commit"`
-	CandidateDigest []byte      `json:"candidate_digest"`
-	ReasonClass     string      `json:"reason_class"`
-	CodeContext     []byte      `json:"code_context"`
-	LeadRunID       uuid.UUID   `json:"lead_run_id"`
-	WorkerID        pgtype.UUID `json:"worker_id"`
-	UserID          uuid.UUID   `json:"user_id"`
-	ClaimGeneration int64       `json:"claim_generation"`
+	BaseCommit              pgtype.Text `json:"base_commit"`
+	HeadCommit              pgtype.Text `json:"head_commit"`
+	CandidateDigest         []byte      `json:"candidate_digest"`
+	ReasonClass             string      `json:"reason_class"`
+	CodeContext             []byte      `json:"code_context"`
+	GuidanceText            string      `json:"guidance_text"`
+	RepoInstructionsEnabled bool        `json:"repo_instructions_enabled"`
+	RepoInstructionsText    string      `json:"repo_instructions_text"`
+	LeadRunID               uuid.UUID   `json:"lead_run_id"`
+	WorkerID                pgtype.UUID `json:"worker_id"`
+	UserID                  uuid.UUID   `json:"user_id"`
+	ClaimGeneration         int64       `json:"claim_generation"`
 }
 
 func (q *Queries) InsertFailedCodeCrossCheck(ctx context.Context, arg InsertFailedCodeCrossCheckParams) (CrossCheck, error) {
@@ -871,6 +906,9 @@ func (q *Queries) InsertFailedCodeCrossCheck(ctx context.Context, arg InsertFail
 		arg.CandidateDigest,
 		arg.ReasonClass,
 		arg.CodeContext,
+		arg.GuidanceText,
+		arg.RepoInstructionsEnabled,
+		arg.RepoInstructionsText,
 		arg.LeadRunID,
 		arg.WorkerID,
 		arg.UserID,

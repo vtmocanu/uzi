@@ -37,7 +37,7 @@ func codeCrossCheckResponse(cc store.CrossCheck) apitypes.CodeCrossCheck {
 		id := uuid.UUID(cc.CheckerRunID.Bytes).String()
 		child = &id
 	}
-	return apitypes.CodeCrossCheck{Stage: "code", Round: cc.Round, CandidateGeneration: cc.LeadClaimGeneration,
+	return apitypes.CodeCrossCheck{CustomGuidanceApplied: cc.GuidanceText.String != "", GuidanceDigest: hex.EncodeToString(cc.GuidanceDigest), RepoInstructionsEnabled: cc.RepoInstructionsEnabled, RepoInstructionsDigest: hex.EncodeToString(cc.RepoInstructionsDigest), Stage: "code", Round: cc.Round, CandidateGeneration: cc.LeadClaimGeneration,
 		BaseCommit: text(cc.BaseCommit), HeadCommit: text(cc.HeadCommit), CandidateDigest: hex.EncodeToString(cc.CandidateDigest),
 		CheckerRunID: child, CheckerHarness: text(cc.CheckerHarness), CheckerModel: text(cc.CheckerModel), CheckerEffort: text(cc.CheckerEffort),
 		Outcome: cc.Outcome.String, ReasonClass: text(cc.ReasonClass), Findings: cc.Findings, Dispositions: cc.Dispositions, InterruptedAt: timestamp(cc.InterruptedAt),
@@ -104,7 +104,12 @@ func (h *Handler) WorkerCodeCrossCheckStatus(w http.ResponseWriter, r *http.Requ
 	}
 	cc, err := h.wsvc.CodeCrossCheckStatus(r.Context(), worker, id, generation)
 	if errors.Is(err, workersvc.ErrCrossCheckNoRow) {
-		httpx.JSON(w, http.StatusOK, map[string]any{"stage": "code", "result": "no_row"})
+		enabled, settingsErr := h.wsvc.CodeCrossCheckRepoInstructionsEnabled(r.Context(), worker, id, generation)
+		if settingsErr != nil {
+			crossCheckError(w, settingsErr)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"stage": "code", "result": "no_row", "repo_instructions_enabled": enabled})
 		return
 	}
 	if err != nil {

@@ -15,10 +15,14 @@ import (
 
 // RecordCodeCrossCheckFailure retains a verified pair, or records an allowlisted
 // pre-snapshot failure with neither SHA. Retries cannot replace a frozen attempt.
-func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, base, head, reason string) (store.CrossCheck, error) {
+func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, base, head, reason string, inputs ...CodeCrossCheckInstructions) (store.CrossCheck, error) {
 	var result store.CrossCheck
+	input, inputErr := codeCrossCheckInstructions(inputs)
+	if inputErr != nil {
+		return result, inputErr
+	}
 	noSnapshot := base == "" && head == ""
-	if s.txBeginner == nil || (noSnapshot && reason != "snapshot_failed" && reason != "worker_unsupported") ||
+	if (noSnapshot && len(inputs) != 0) || s.txBeginner == nil || (noSnapshot && reason != "snapshot_failed" && reason != "worker_unsupported") ||
 		(!noSnapshot && (!validCodeSHA(base) || !validCodeSHA(head) || reason != "checker_unavailable")) {
 		return result, ErrCrossCheckRefused
 	}
@@ -39,7 +43,7 @@ func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.
 	if err == nil {
 		if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid ||
 			prior.BaseCommit.String != base || prior.HeadCommit.String != head ||
-			(noSnapshot && prior.ReasonClass.String != reason) {
+			(noSnapshot && prior.ReasonClass.String != reason) || !input.matches(prior) {
 			return result, ErrCrossCheckInterrupted
 		}
 		return prior, nil
@@ -52,17 +56,21 @@ func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.
 		ClaimGeneration: generation, ReasonClass: reason, CodeContext: []byte("{}"),
 	}
 	if !noSnapshot {
+		frozen, freezeErr := freezeCodeCrossCheckInputs(ctx, q, lead, input)
+		if freezeErr != nil {
+			return result, freezeErr
+		}
+		params.GuidanceText = frozen.GuidanceText.String
+		params.RepoInstructionsEnabled = frozen.RepoInstructionsEnabled
+		params.RepoInstructionsText = frozen.RepoInstructionsText.String
 		params.BaseCommit = pgtype.Text{String: base, Valid: true}
 		params.HeadCommit = pgtype.Text{String: head, Valid: true}
 		params.CodeContext, err = json.Marshal(map[string]any{"issue_title": lead.IssueTitle, "issue_description": lead.IssueDescription})
 		if err != nil {
 			return result, err
 		}
-		params.CandidateDigest, err = codeCandidateDigest(store.CrossCheck{
-			BaseCommit: params.BaseCommit, HeadCommit: params.HeadCommit, CodeContext: params.CodeContext,
-			PlanMd: lead.PlanMd, Milestones: lead.MilestonesFrozen, RequiredCapabilities: lead.RequiredCapabilities,
-			RequiredTools: lead.RequiredTools, SizeClass: pgtype.Text{String: lead.SizeClass, Valid: true}, GuidanceSnapshot: pgtype.Text{Valid: true},
-		})
+		frozen.BaseCommit, frozen.HeadCommit, frozen.CodeContext = params.BaseCommit, params.HeadCommit, params.CodeContext
+		params.CandidateDigest, err = codeCandidateDigest(frozen)
 		if err != nil {
 			return result, err
 		}

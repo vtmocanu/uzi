@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -20,12 +21,50 @@ import (
 )
 
 type planCrossCheckRequest struct {
-	HeadCommit      string `json:"head_commit"`
-	ReasonClass     string `json:"reason_class"`
-	Round           *int32 `json:"round"`
-	Stage           string `json:"stage"`
-	ClaimGeneration *int64 `json:"claim_generation"`
+	instructionFields       bool
+	planFields              bool
+	RepoInstructionsEnabled *bool  `json:"repo_instructions_enabled,omitempty"`
+	RepoInstructionsText    string `json:"repo_instructions_text,omitempty"`
+	HeadCommit              string `json:"head_commit"`
+	ReasonClass             string `json:"reason_class"`
+	Round                   *int32 `json:"round"`
+	Stage                   string `json:"stage"`
+	ClaimGeneration         *int64 `json:"claim_generation"`
 	workersvc.PlanCrossCheckCandidate
+}
+
+// Presence, including false/empty/null, distinguishes code-only inputs from
+// plan payloads. UTF-8 is checked before encoding/json can replace bad bytes.
+func (req *planCrossCheckRequest) UnmarshalJSON(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return workersvc.ErrCrossCheckRefused
+	}
+	type wire planCrossCheckRequest
+	var decoded wire
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*req = planCrossCheckRequest(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{"repo_instructions_enabled", "repo_instructions_text"} {
+		if value, present := fields[key]; present {
+			req.instructionFields = true
+			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return workersvc.ErrCrossCheckRefused
+			}
+		}
+	}
+	for _, key := range []string{"plan_md", "milestones", "planning_diff", "required_capabilities", "required_tools", "size_class"} {
+		if _, present := fields[key]; present {
+			req.planFields = true
+		}
+	}
+	return nil
 }
 
 type crossCheckVerdictRequest struct {
@@ -109,7 +148,7 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if req.Stage == "code" && req.ClaimGeneration != nil {
-		if (req.Round != nil && *req.Round != 1) || req.PlanMd != "" || req.SizeClass != "" ||
+		if req.planFields || (req.Round != nil && *req.Round != 1) || req.PlanMd != "" || req.SizeClass != "" ||
 			len(req.Milestones) != 0 || req.PlanningDiff != "" || len(req.RequiredCapabilities) != 0 || len(req.RequiredTools) != 0 {
 			httpx.ErrorReason(w, http.StatusBadRequest, "invalid code cross-check request", "candidate_invalid")
 			return
@@ -117,13 +156,13 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		var cc store.CrossCheck
 		var err error
 		if req.ReasonClass != "" {
-			if req.BaseCommit != "" || req.HeadCommit != "" || (req.ReasonClass != "snapshot_failed" && req.ReasonClass != "worker_unsupported") {
+			if req.instructionFields || req.BaseCommit != "" || req.HeadCommit != "" || (req.ReasonClass != "snapshot_failed" && req.ReasonClass != "worker_unsupported") {
 				httpx.Error(w, http.StatusBadRequest, "invalid pre-snapshot failure")
 				return
 			}
 			cc, err = h.wsvc.RecordCodeCrossCheckFailure(r.Context(), worker, id, *req.ClaimGeneration, "", "", req.ReasonClass)
 		} else {
-			cc, err = h.wsvc.SubmitCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.BaseCommit, req.HeadCommit)
+			cc, err = h.wsvc.SubmitCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.BaseCommit, req.HeadCommit, workersvc.CodeCrossCheckInstructions{RepoInstructionsEnabled: req.RepoInstructionsEnabled, RepoInstructionsText: req.RepoInstructionsText})
 		}
 		if err != nil {
 			crossCheckError(w, err)
@@ -132,7 +171,7 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		httpx.JSON(w, http.StatusOK, codeCrossCheckResponse(cc))
 		return
 	}
-	if req.Stage != "plan" || req.ClaimGeneration == nil || req.HeadCommit != "" || req.ReasonClass != "" {
+	if req.instructionFields || req.Stage != "plan" || req.ClaimGeneration == nil || req.HeadCommit != "" || req.ReasonClass != "" {
 		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check request", "candidate_invalid")
 		return
 	}

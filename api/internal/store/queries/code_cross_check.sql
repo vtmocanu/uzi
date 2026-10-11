@@ -36,9 +36,10 @@ INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, head
  repo_instructions_enabled, repo_instructions_text, repo_instructions_digest)
 SELECT lead.id, 'code', 1, lead.claim_generation, @head_commit::text, @base_commit::text,
  @candidate_digest::bytea, child.id, child.harness, @deadline_at::timestamptz, 'failed',
- 'pending', @code_context::jsonb, '', lead.plan_md, lead.milestones_frozen,
+ 'pending', @code_context::jsonb, @guidance_text::text, lead.plan_md, lead.milestones_frozen,
  lead.required_capabilities, lead.required_tools, lead.size_class,
- '', sha256(convert_to('', 'UTF8')), false, '', sha256(convert_to('', 'UTF8'))
+ @guidance_text::text, sha256(convert_to(@guidance_text::text, 'UTF8')),
+ @repo_instructions_enabled::boolean, @repo_instructions_text::text, sha256(convert_to(@repo_instructions_text::text, 'UTF8'))
 FROM runs lead JOIN runs child ON child.id = @checker_run_id
 WHERE lead.id = @lead_run_id AND child.target_run_id = lead.id AND child.kind = 'cross_check'
  AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
@@ -122,13 +123,13 @@ FROM credited cc WHERE lead.id = cc.lead_run_id;
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
  base_commit, head_commit, candidate_digest, verdict, outcome, reason_class,
  code_context, guidance_snapshot, guidance_text, guidance_digest,
- repo_instructions_text, repo_instructions_digest, deadline_at, decided_at,
+ repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, deadline_at, decided_at,
  wait_credited, plan_md, milestones, required_capabilities, required_tools, size_class)
 SELECT lead.id, 'code', 1, lead.claim_generation,
  sqlc.narg('base_commit')::text, sqlc.narg('head_commit')::text,
  sqlc.narg('candidate_digest')::bytea, 'failed', 'failed', @reason_class::text,
- @code_context::jsonb, '', '', sha256(convert_to('', 'UTF8')),
- '', sha256(convert_to('', 'UTF8')), now(), now(), true,
+ @code_context::jsonb, @guidance_text::text, @guidance_text::text, sha256(convert_to(@guidance_text::text, 'UTF8')),
+ @repo_instructions_enabled::boolean, @repo_instructions_text::text, sha256(convert_to(@repo_instructions_text::text, 'UTF8')), now(), now(), true,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.plan_md END,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.milestones_frozen END,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.required_capabilities ELSE '{}' END,
@@ -174,3 +175,10 @@ WHERE cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND lead.claim_generation = cc.lead_claim_generation
  AND (cc.deadline_at <= now() OR child.status IN ('completed','failed','cancelled'))
 ORDER BY cc.deadline_at LIMIT 100;
+
+-- name: GetCodeCrossCheckRepoInputsForUpdate :one
+-- Called only after locking and validating the current owned lead generation.
+SELECT repo.code_cross_check_guidance, repo.cross_check_repo_instructions_enabled
+FROM repos repo JOIN forge_connections c ON c.id = repo.connection_id
+WHERE repo.id = @repo_id AND c.user_id = @user_id
+FOR UPDATE OF repo;

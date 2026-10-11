@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,16 +20,21 @@ import (
 // ClaimPlanCrossCheck carries the stored candidate only. Credentials stay in the
 // existing child claim's worker-owned secret envelope, never in this model input.
 type ClaimPlanCrossCheck struct {
-	HeadCommit       string          `json:"head_commit,omitempty"`
-	CodeContext      json.RawMessage `json:"code_context,omitempty"`
-	GuidanceSnapshot string          `json:"guidance_snapshot,omitempty"`
-	ModelSource      *string         `json:"model_source,omitempty"`
-	EffortSource     *string         `json:"effort_source,omitempty"`
-	Stage            string          `json:"stage"`
-	LeadRunID        string          `json:"lead_run_id"`
-	Round            int32           `json:"round"`
-	CandidateDigest  string          `json:"candidate_digest"`
-	DeadlineAt       time.Time       `json:"deadline_at"`
+	GuidanceDigest          string          `json:"guidance_digest,omitempty"`
+	RepoInstructionsEnabled *bool           `json:"repo_instructions_enabled,omitempty"`
+	RepoInstructionsText    string          `json:"repo_instructions_text,omitempty"`
+	RepoInstructionsDigest  string          `json:"repo_instructions_digest,omitempty"`
+	CustomGuidanceApplied   *bool           `json:"custom_guidance_applied,omitempty"`
+	HeadCommit              string          `json:"head_commit,omitempty"`
+	CodeContext             json.RawMessage `json:"code_context,omitempty"`
+	GuidanceSnapshot        string          `json:"guidance_snapshot,omitempty"`
+	ModelSource             *string         `json:"model_source,omitempty"`
+	EffortSource            *string         `json:"effort_source,omitempty"`
+	Stage                   string          `json:"stage"`
+	LeadRunID               string          `json:"lead_run_id"`
+	Round                   int32           `json:"round"`
+	CandidateDigest         string          `json:"candidate_digest"`
+	DeadlineAt              time.Time       `json:"deadline_at"`
 	PlanCrossCheckCandidate
 }
 
@@ -49,12 +55,22 @@ func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error)
 			!json.Valid(cc.CodeContext) || !cc.GuidanceSnapshot.Valid {
 			return nil, ErrCrossCheckRefused
 		}
+		guidanceHash := sha256.Sum256([]byte(cc.GuidanceSnapshot.String))
+		instructionsHash := sha256.Sum256([]byte(cc.RepoInstructionsText.String))
+		if cc.GuidanceText.Valid && cc.GuidanceText.String != cc.GuidanceSnapshot.String ||
+			(len(cc.GuidanceDigest) != 0 && !bytes.Equal(guidanceHash[:], cc.GuidanceDigest)) ||
+			(len(cc.RepoInstructionsDigest) != 0 && !bytes.Equal(instructionsHash[:], cc.RepoInstructionsDigest)) {
+			return nil, ErrCrossCheckRefused
+		}
+		custom := cc.GuidanceSnapshot.String != ""
 		digest, err := codeCandidateDigest(cc)
 		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
 			return nil, ErrCrossCheckRefused
 		}
 		return &ClaimPlanCrossCheck{Stage: "code", LeadRunID: cc.LeadRunID.String(), Round: 1,
 			CandidateDigest: hex.EncodeToString(cc.CandidateDigest), DeadlineAt: cc.DeadlineAt.Time,
+			GuidanceDigest: hex.EncodeToString(guidanceHash[:]), RepoInstructionsEnabled: &cc.RepoInstructionsEnabled,
+			RepoInstructionsText: cc.RepoInstructionsText.String, RepoInstructionsDigest: hex.EncodeToString(instructionsHash[:]), CustomGuidanceApplied: &custom,
 			HeadCommit: cc.HeadCommit.String, CodeContext: cc.CodeContext, GuidanceSnapshot: cc.GuidanceSnapshot.String,
 			PlanCrossCheckCandidate: PlanCrossCheckCandidate{BaseCommit: cc.BaseCommit.String, PlanMd: cc.PlanMd.String,
 				Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String},

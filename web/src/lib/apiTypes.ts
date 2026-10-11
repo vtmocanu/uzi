@@ -510,6 +510,9 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  /** Separate checker consent; absent on older APIs means off. */
+  cross_check_repo_instructions_enabled?: boolean;
+  code_cross_check_guidance?: string | null;
   id: string;
   connection_id: string;
   forge_project_id: number;
@@ -3498,6 +3501,10 @@ export interface PlanCrossCheckFinding {
 }
 
 export interface CodeCrossCheckSummary {
+  custom_guidance_applied?: boolean;
+  guidance_digest?: string;
+  repo_instructions_enabled?: boolean;
+  repo_instructions_digest?: string;
   usage?: RunUsage | null;
   stage: string;
   round: number;
