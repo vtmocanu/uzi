@@ -39,6 +39,9 @@ func (req *planCrossCheckRequest) UnmarshalJSON(raw []byte) error {
 	if !utf8.Valid(raw) {
 		return workersvc.ErrCrossCheckRefused
 	}
+	if err := requireExactTopLevelKeys(raw, planCrossCheckKeys.get()); err != nil {
+		return err
+	}
 	type wire planCrossCheckRequest
 	var decoded wire
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -85,6 +88,9 @@ type crossCheckVerdictRequest struct {
 }
 
 func (req *crossCheckVerdictRequest) UnmarshalJSON(raw []byte) error {
+	if err := requireExactTopLevelKeys(raw, crossCheckVerdictKeys.get()); err != nil {
+		return err
+	}
 	type wire crossCheckVerdictRequest
 	var decoded wire
 	decoder := json.NewDecoder(bytes.NewReader(raw))
