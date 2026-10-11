@@ -184,8 +184,15 @@ func TestSubmitInputExtendOverRoomRefusedBeforeCTE(t *testing.T) {
 	}
 	// Exactly the room left applies (the pre-check allows it).
 	fs.extendReturn = 2147483 - 259200 - 1800
-	if _, err := svc.SubmitInput(context.Background(), user, runID, "extend", "3600", nil); err != nil {
+	res, err := svc.SubmitInput(context.Background(), user, runID, "extend", "3600", nil)
+	if err != nil {
 		t.Fatalf("a request exactly filling the room must reach the CTE and apply: %v", err)
+	}
+	if fs.createdExtend == nil || fs.createdExtend.Secs != 3600 {
+		t.Fatalf("the exact-room request must be written via CreateExtendInput with secs=3600, got %+v", fs.createdExtend)
+	}
+	if res.ExtensionSeconds == nil || *res.ExtensionSeconds != int(fs.extendReturn) {
+		t.Fatalf("result ExtensionSeconds = %v, want the CTE total %d", res.ExtensionSeconds, fs.extendReturn)
 	}
 }
 

@@ -108,9 +108,13 @@ func TestCreateExtendInputRequestOverCapLiveDB(t *testing.T) {
 	if extendColumn(ctx, t, pool, runID) != 0 || len(extendAuditRows(ctx, t, pool, runID)) != 0 {
 		t.Fatal("a refused over-cap request changed the column or wrote an audit row")
 	}
-	// secs == cap applies.
-	if _, err := q.CreateExtendInput(ctx, extendParams(runID, 57600, 57600, "ok")); err != nil {
+	// secs == cap applies, and the time is actually granted.
+	total, err := q.CreateExtendInput(ctx, extendParams(runID, 57600, 57600, "ok"))
+	if err != nil {
 		t.Fatalf("secs == cap: %v", err)
+	}
+	if total != 57600 || extendColumn(ctx, t, pool, runID) != 57600 {
+		t.Fatalf("secs == cap returned total %d, stored %d; want 57600 both", total, extendColumn(ctx, t, pool, runID))
 	}
 }
 
