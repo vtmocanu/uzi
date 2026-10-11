@@ -1015,6 +1015,9 @@ export class CodexCallbackBroker {
         ],
       },
     });
+    if (scanned.signalDiagnostic !== undefined) {
+      return deny("invalid_signal", scanned.signalDiagnostic);
+    }
     if (Object.keys(scanned).length === 0) {
       return deny("invalid_signal", `signal "${safeId(canonical)}" carried no valid payload`);
     }

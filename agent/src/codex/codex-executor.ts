@@ -2813,6 +2813,7 @@ export class CodexExecutor implements Executor {
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
+      let declaredNonClosing: { reason: string } | undefined;
       // Latched at a fresh ACK boundary or the legacy done exit when milestones remain.
       // Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
@@ -2849,6 +2850,7 @@ export class CodexExecutor implements Executor {
         // PRD #1798 M2: the lead's PR claims, NOT gated on run kind (as in sdk-executor); OMITTED
         // when none was declared. The runner reads it only where it renders a PR description.
         ...(declaredPrSummary !== undefined ? { prSummary: declaredPrSummary } : {}),
+        ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
       });
       // Clarification checkpoints return through the normal boundary guards without spending
       // another implementation iteration. The round bound spans all such provider epochs.
@@ -3029,6 +3031,9 @@ export class CodexExecutor implements Executor {
             for (const id of result.progress.completed) seenCompletedIds.add(id);
           }
           const hasQuestions = !!result.questions?.length;
+          if (isIssueRun && !hasQuestions && result.nonClosing !== undefined) {
+            declaredNonClosing = result.nonClosing;
+          }
           if (!hasQuestions && result.milestonesCompleted !== undefined) {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);

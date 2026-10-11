@@ -542,6 +542,8 @@ export interface TurnSignals {
   prSummary?: PrSummaryClaim;
   /** Issue #2083: see ScannedSignals.decisionsMemo (last-wins; never logged). */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
 }
 
 export interface ReducedTurnResult extends TurnSignals {

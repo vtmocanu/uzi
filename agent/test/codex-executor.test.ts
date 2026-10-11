@@ -10725,6 +10725,96 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     assert.deepEqual(transitions(emitted), ["milestone m1 started — Alpha"]);
   });
 
+
+
+
+  it("m1 non-closing Codex keeps nonissue completion semantics", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(91, th, tn, { non_closing: { reason: "issue only" } })]])]);
+    const { ctx } = makeCtx({ kind: "self_improve" });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m1 nonissue");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.ok(!("nonClosing" in result));
+  });
+
+  it("m1 non-closing Codex questions take precedence over a concurrent declaration", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [
+      (th, tn) => [
+        done(81, th, tn, { non_closing: { reason: "must not latch" } }),
+        toolCall(82, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "ask-82"),
+      ],
+      (th, tn) => [done(83, th, tn)],
+    ])]);
+    let asked = 0;
+    const { ctx } = makeCtx({
+      config: { max_iterations: 3 },
+      askUser: async () => { asked++; return { kind: "answer", answers: ["server"] }; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m1 questions");
+    assert.equal(asked, 1);
+    assert.equal(turnTexts(rig.epochs[0]!.transport).length, 2);
+    assert.equal((result as unknown as { nonClosing?: unknown }).nonClosing, undefined, "question turn must not latch completion intent");
+  });
+
+  it("m1 non-closing Codex questions preserve a prior accepted reason through rework", async () => {
+    const rig = makeMultiEpochRig([
+      script("th-1", [(th, tn) => [done(84, th, tn, { non_closing: { reason: "first" }, milestones_completed: ["m1"] })]]),
+      script("th-1", [
+        (th, tn) => [
+          done(85, th, tn, { non_closing: { reason: "must not replace" }, milestones_completed: ["m1", "m2"] }),
+          toolCall(86, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "ask-86"),
+        ],
+        (th, tn) => [done(87, th, tn, { milestones_completed: ["m1", "m2"] })],
+      ]),
+    ]);
+    let attempts = 0;
+    let asked = 0;
+    const { ctx } = makeCtx({
+      completionInterlock: true, config: { max_iterations: 5 },
+      frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+      checkpoint: async () => {},
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+      askUser: async () => { asked++; return { kind: "answer", answers: ["server"] }; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m1 prior reason questions");
+    assert.equal(attempts, 2);
+    assert.equal(asked, 1);
+    assert.deepEqual((result as unknown as { nonClosing: unknown }).nonClosing, { reason: "first" }, "question turn must preserve the prior accepted reason");
+  });
+
+  it("m1 non-closing actual Codex callbacks reject invalid done and propagate corrected reason", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [
+      (th, tn) => [done(61, th, tn, { non_closing: null, summary: "LEAK" })],
+      (th, tn) => [done(62, th, tn, { non_closing: { reason: " corrected " } })],
+    ])]);
+    const { ctx } = makeCtx({ config: { max_iterations: 3 } });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m1 callbacks");
+    assert.equal(turnTexts(rig.epochs[0]!.transport).length, 2, "invalid done must not end implementation");
+    const reply = rec(rec(rig.epochs[0]!.transport.responses.find(r => r.requestId === 61)?.response).result);
+    assert.equal(reply.success, false, "invalid done callback is model-visible failure");
+    assert.match(JSON.stringify(reply), /Invalid non_closing/);
+    assert.ok(!JSON.stringify(reply).includes("LEAK"));
+    assert.deepEqual((result as unknown as { nonClosing: unknown }).nonClosing, { reason: "corrected" });
+  });
+
+  for (const later of [{}, { non_closing: { reason: " latest " } }]) {
+    it("m1 non-closing Codex rework keeps or replaces reason " + JSON.stringify(later), async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(71, th, tn, { non_closing: { reason: " first " }, milestones_completed: ["m1"] })]]),
+        script("th-1", [(th, tn) => [done(72, th, tn, { ...later, milestones_completed: ["m1", "m2"] })]]),
+      ]);
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        completionInterlock: true, config: { max_iterations: 5 },
+        frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m1 rework");
+      assert.equal(attempts, 2);
+      assert.deepEqual((result as unknown as { nonClosing: unknown }).nonClosing, { reason: "non_closing" in later ? "latest" : "first" });
+    });
+  }
+
   it("carries signal_done milestones_completed into the terminal result on issue runs only", async () => {
     for (const [kind, args, expected] of [
       ["issue", { milestones_completed: ["m1"] }, ["m1"]],

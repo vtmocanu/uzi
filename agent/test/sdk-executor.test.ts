@@ -5957,6 +5957,45 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
   });
 });
 
+
+describe("m1 non-closing SDK propagation", () => {
+  it("does not change nonissue completion semantics", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", { non_closing: { reason: "issue only" } }), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], kind: "self_improve" });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.ok(!("nonClosing" in result));
+  });
+  it("raw Claude frames reject invalid done and carry the corrected reason", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", { non_closing: null, summary: "LEAK" }), resultSuccess()],
+      [signalDone("sess-1", { non_closing: { reason: " corrected " } }), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(turns.length, 3, "invalid done must not end implementation");
+    assert.deepEqual((result as unknown as { nonClosing: unknown }).nonClosing, { reason: "corrected" });
+    assert.equal(result.summary, undefined);
+  });
+  for (const later of [{}, { non_closing: { reason: " latest " } }]) {
+    it("keeps or replaces reason across in-process rework " + JSON.stringify(later), async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone("sess-1", { non_closing: { reason: " first " } }), resultSuccess()],
+        [signalDone("sess-1", later), resultSuccess()],
+      ]);
+      const outcomes = [{ kind: "followup" as const, id: 101, body: "more" }, { kind: "ended" as const, reason: "idle" as const }];
+      const { ctx } = makeCtx({ agents: [lead, coder], interactive: true, checkpoint: async () => {}, awaitFollowUp: async () => outcomes.shift()! });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.deepEqual((result as unknown as { nonClosing: unknown }).nonClosing, { reason: "non_closing" in later ? "latest" : "first" });
+    });
+  }
+});
+
 describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
   async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
     const { queryFn } = fakeTurns([
