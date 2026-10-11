@@ -1446,24 +1446,32 @@ const CODE_CROSS_CHECK_PARAGRAPH_RE = /^Code cross-check (?:\(checked |incomplet
  * paragraph, the closing-reference text included, is returned byte-for-byte.
  */
 export function swapCodeCrossCheckSection(oldCompletion: string, freshCompletion: string, headSha: string): string {
-  const paras = oldCompletion.split("\n\n");
-  const fresh = freshCompletion.split("\n\n").find((p) => CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
-  const at = paras.findIndex((p) => CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  // Paragraphs are separated by a blank line in any of CommonMark's line endings; the separators
+  // are kept (odd indexes) so every untouched byte, its own line endings included, is preserved.
+  // A CR directly before an LF is half of one CRLF, never a line ending of its own.
+  const BLANK = /((?:\r\n|\r(?!\n)|\n)(?:\r\n|\r|\n))/u;
+  const parts = oldCompletion.split(BLANK);
+  const eol = /\r\n|\r|\n/u.exec(oldCompletion)?.[0] ?? "\n";
+  const fresh = freshCompletion.split(BLANK).find((p, k) => k % 2 === 0 && CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  const at = parts.findIndex((p, k) => k % 2 === 0 && CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
   if (fresh === undefined) {
     if (at < 0) return oldCompletion;
-    const checked = /^Code cross-check \(checked `([0-9a-f]{7})`/u.exec(paras[at]!)?.[1];
+    const checked = /^Code cross-check \(checked `([0-9a-f]{7})`/u.exec(parts[at]!)?.[1];
     if (checked !== undefined && headSha.startsWith(checked)) return oldCompletion;
-    paras.splice(at, 1);
-    return paras.join("\n\n");
+    // The footer always follows the section, so drop the paragraph with the separator after it.
+    parts.splice(at, 2);
+    return parts.join("");
   }
+  // The fresh block is LF-rendered: write its paragraph in the old body's line ending.
+  const written = fresh.replace(/\r\n|\r|\n/gu, eol);
   if (at >= 0) {
-    paras[at] = fresh;
-    return paras.join("\n\n");
+    parts[at] = written;
+    return parts.join("");
   }
-  const anchor = paras.findIndex((p) => p === BRIDGE_SENTENCE || p.includes(STALENESS_START) || p.startsWith("---\n"));
+  const anchor = parts.findIndex((p, k) => k % 2 === 0 && (p === BRIDGE_SENTENCE || p.includes(STALENESS_START) || /^---(?:\r\n|\r|\n)/u.test(p)));
   if (anchor < 0) return oldCompletion;
-  paras.splice(anchor, 0, fresh);
-  return paras.join("\n\n");
+  parts.splice(anchor, 0, written, parts[1] ?? eol + eol);
+  return parts.join("");
 }
 
 // ── Parsing and composing a body (D10, D15) ─────────────────────────────────────────────────

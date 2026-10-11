@@ -1062,6 +1062,46 @@ describe("publisher: refresh runs replace only the code cross-check section", ()
     }
   }
 
+  for (const [label, eol] of [["CRLF", "\r\n"], ["lone CR", "\r"]] as const) {
+    for (const [name, oldSection, fresh, expected] of [
+      ["replaces", OLD_SECTION, FRESH_SECTION, FRESH_SECTION],
+      ["inserts", undefined, FRESH_SECTION, FRESH_SECTION],
+      ["removes", OLD_SECTION, undefined, undefined],
+    ] as const) {
+      it(`${label} body: ${name} the section and keeps every other line ending`, async () => {
+        const r = rig();
+        api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+        const withEol = (t: string) => t.replace(/\n/gu, eol);
+        r.forge.pr.head = H2;
+        r.forge.pr.description = `${OLD_REGION}\n\n${withEol(block("Automated MR rework.", oldSection))}`;
+        const spec = makeSpec({ mode: "refresh", completion: (d) => block("Automated MR rework.", fresh, d) });
+        const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+        await pub.publish(MR);
+        const parsed = parseOwnedBlocks(r.forge.pr.description);
+        assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+        assert.equal(parsed.completion, withEol(block("Automated MR rework.", expected)));
+      });
+    }
+  }
+
+  it("a fresh run without a section keeps an old one that names the current head", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const current = `Code cross-check (checked \`${H2.slice(0, 7)}\`, Codex m): no findings`;
+    const oldBlock = renderCompletionBlock({
+      branch: "agent/issue-7", closes: false, kindLine: "Automated MR rework.",
+      kindSections: [[{ fixed: current }]],
+    });
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${OLD_REGION}\n\n${oldBlock}`;
+    const spec = makeSpec({ mode: "refresh", completion: (d) => block("Automated MR rework.", undefined, d) });
+    const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+    assert.equal(parsed.completion, oldBlock);
+  });
+
   it("a closing-reference completion keeps its Closes text while the section is swapped", async () => {
     const r = rig();
     api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
