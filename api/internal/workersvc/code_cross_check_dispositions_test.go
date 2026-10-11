@@ -152,3 +152,44 @@ func TestCodeCrossCheckDispositionsRejectUnsafeIDsBeforeDB(t *testing.T) {
 		})
 	}
 }
+
+// A secret-bearing disposition reason is scrubbed before persistence, and an
+// identical retry (same raw secret) still matches the stored scrubbed value.
+func TestCodeCrossCheckDispositionsScrubReasonAndRetryIdentical(t *testing.T) {
+	secret := "sk-ant-" + "api03-FIXTUREFIXTUREFIXTURE1234"
+	batch := []CodeCrossCheckDisposition{{ID: "F-1", Disposition: "declined", Reason: "token " + secret + " leaked"}}
+	worker := store.Worker{ID: uuid.New(), UserID: uuid.New()}
+	lead := store.Run{ID: uuid.New(), UserID: worker.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: 1, Status: "running"}
+	cc := store.CrossCheck{LeadRunID: lead.ID, LeadClaimGeneration: 1, Outcome: pgconv.Text("completed"), DecidedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, Findings: []byte(`[{"id":"F-1"}]`)}
+	writes := 0
+	tx := &crossCheckBoundaryTx{t: t}
+	tx.query = func(sql string, args []any) pgx.Row {
+		switch {
+		case strings.HasPrefix(sql, "-- name: GetRunOwnedByWorkerForUpdate"):
+			return crossCheckBoundaryRow{value: lead}
+		case strings.HasPrefix(sql, "-- name: GetCodeCrossCheck"):
+			return crossCheckBoundaryRow{value: cc}
+		case strings.HasPrefix(sql, "-- name: FinalizeCodeCrossCheckDispositions"):
+			writes++
+			cc.Dispositions = args[0].([]byte)
+			cc.FinalizedAt = cc.DecidedAt
+			return crossCheckBoundaryRow{value: cc}
+		}
+		t.Fatalf("unexpected query: %s", sql)
+		return crossCheckBoundaryRow{err: pgx.ErrNoRows}
+	}
+	svc := New(nil, nil, Params{})
+	svc.SetTxBeginner(tx)
+	for attempt := 0; attempt < 2; attempt++ {
+		got, err := svc.FinalizeCodeCrossCheckDispositions(t.Context(), worker, lead.ID, 1, batch)
+		if err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+		if strings.Contains(string(got.Dispositions), secret) || strings.Contains(string(got.Dispositions), "FIXTUREFIXTURE") {
+			t.Fatalf("secret persisted: %s", got.Dispositions)
+		}
+	}
+	if writes != 1 {
+		t.Fatalf("writes=%d, identical retry must not rewrite", writes)
+	}
+}

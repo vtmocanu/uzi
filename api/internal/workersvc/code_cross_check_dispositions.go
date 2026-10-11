@@ -37,6 +37,9 @@ func (s *Service) FinalizeCodeCrossCheckDispositions(ctx context.Context, worker
 		if _, duplicate := supplied[d.ID]; duplicate {
 			return store.CrossCheck{}, ErrCrossCheckRefused
 		}
+		// The reason reaches the public MR description: scrub it as findings are, and
+		// persist and compare the scrubbed value so an identical retry stays identical.
+		d.Reason = scrubThenBound(d.Reason, 1024)
 		supplied[d.ID] = d
 	}
 	tx, err := s.txBeginner.Begin(ctx)
