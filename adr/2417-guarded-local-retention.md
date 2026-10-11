@@ -131,7 +131,8 @@ still in the future. The trigger raises before an expiry update can remove the
 selected archive, rolling back the statement's chunk deletion too.
 
 Physical worker deletion is the operation that renews the selected capture's
-configured ready-retention window and clears `local_replica_worker_id`. Local
+configured ready-retention window and clears `local_replica_worker_id` (a
+published-redundancy early expiry, #2625, also clears it). Local
 ACK cleanup leaves that marker and expiry unchanged, even after its local
 bundles and journals are gone. No server archive retention policy is changed by this decision; #2625 later
 adds one narrow early-expiry path ([Amendment 2026-10-11](#amendment-2026-10-11--published-redundancy-early-expiry-2625)).
@@ -275,9 +276,11 @@ step, and submits them after the lock is released, sequentially under one
 guarded, non-empty, non-settled records claim.
 
 The WIP witness exists on the receipt path only and is exactly the receipt's
-delivered `final_head`. It is attached only if its tree equals the archive tree
-and every parent of the captured head is its ancestor; otherwise no claim is
-sent (fail-closed, with no broader search). The ACK path sends no witness.
+delivered `final_head`. When `final_head` already contains the captured head, the claim is sent with
+no witness. Only when it does not (divergent) is the witness attached, and
+only if its tree equals the archive tree and every parent of the captured head
+is its ancestor; if those checks fail or ancestry is unknown, no claim is sent
+(fail-closed, with no broader search). The ACK path sends no witness.
 Cleanup usually removes the local source in the same pass, so each archive
 effectively gets one attempt; a missed or failed claim leaves the normal TTL.
 

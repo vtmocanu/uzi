@@ -416,11 +416,12 @@ pending is not safe terminal release or permission to reclaim the source.
 The **selected final archive** is protected from automatic expiry while its
 local worker row exists. Physical worker deletion renews its configured
 normal ready-retention window (7 days by default) and clears the server's
-local-replica marker; protection is not perpetual. Local acknowledgment
+local-replica marker (a published-redundancy early expiry also clears it);
+protection is not perpetual. Local acknowledgment
 cleanup leaves that marker and the archive's expiry unchanged. Earlier
 non-final and legacy ready captures keep their existing TTL, including thin
 captures. Custody itself does not expire when a download expires. Size limits,
-quotas, owner-only access and explicit discard behavior are unchanged. The one exception to the retention
+quotas, owner-only access and explicit discard behavior are unchanged. The exception to the retention
 rules above is the proven early expiry of a completed run's archive, described
 below.
 
@@ -462,8 +463,9 @@ expire the run's guarded archive early. The API does not trust the worker: it
 checks through the forge, against the current head of the run's published
 branch, that every root, the archive's captured head and every prerequisite
 the server recorded for it is already an ancestor of that head. For an archive
-of parked uncommitted work, the run's delivered final commit must have the same
-tree as the archive and contain every parent of the captured head. The claim is
+of parked uncommitted work, the published branch must carry a commit with the
+same tree as the archive plus every parent of the captured head; the worker
+only offers the run's delivered final commit as that commit. The claim is
 bound to the exact hold, generation, coverage digest and source commit, and
 needs a released, completed hold stamped with the completion identity and MR.
 
@@ -471,11 +473,12 @@ When the proof succeeds the archive becomes **Expired** with reason
 `published_redundant` and its bytes are deleted at once, instead of at the end
 of the 7-day window. When any part is missing, mismatched or inconclusive (the
 branch is gone, its head differs, the forge cannot answer), the archive simply
-keeps its normal retention. A refusal caused by forge evidence is not retried
-for an hour. The worker sends these claims from its completion cleanup, once
+keeps its normal retention. A refusal caused by forge answers, including timeouts and inconclusive
+answers, is not retried for an hour. The worker sends these claims from its
+completion cleanup and its covering final-acknowledgement cleanup, once
 per archive in practice, and a missed or failed claim never blocks cleanup; it
-only leaves the normal window in place. Failed, cancelled and parked runs, and
-archives without a complete proof, are unchanged, and an explicit discard
+only leaves the normal window in place. Failed, cancelled and parked runs (the API refuses a run that did not
+complete as `not_completed`), and archives without a complete proof, are unchanged, and an explicit discard
 behaves as before.
 
 **Durability risk you accept.** The proof is made against the published branch
