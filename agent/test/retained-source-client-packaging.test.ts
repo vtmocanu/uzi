@@ -21,7 +21,10 @@ const REPO_DIR = path.resolve(AGENT_DIR, "..");
 const CLIENT = path.join(AGENT_DIR, "src", "ops", "retained-source.mjs");
 
 /** The documented invocation prefix; the runbook (docs/run-recovery.md) carries the same text. */
-const DOCUMENTED_PREFIX = "env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs";
+const DOCUMENTED_PREFIX = "/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs";
+
+/** The documented form names /usr/bin/env by absolute path; a host without it cannot run the form. */
+const ENV_SKIP = fs.existsSync("/usr/bin/env") ? false : "/usr/bin/env is absent on this host";
 
 const scratch: string[] = [];
 const servers: net.Server[] = [];
@@ -81,14 +84,38 @@ function documented(clientArgs: string[]): { command: string; args: string[] } {
 const RUN_ID = "11111111-2222-3333-4444-555555555555";
 const ATTEMPT = "20261008T171401Z-g1-0123456789abcdef";
 
-describe("the documented invocation", () => {
+describe("the documented invocation", { skip: ENV_SKIP }, () => {
   it("starts with the scrubbed-environment form and the image-owned node", () => {
-    assert.ok(DOCUMENTED_PREFIX.startsWith("env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node "), DOCUMENTED_PREFIX);
+    assert.ok(DOCUMENTED_PREFIX.startsWith("/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node "), DOCUMENTED_PREFIX);
   });
 
   it("is the text the runbook carries", () => {
     const runbook = fs.readFileSync(path.join(REPO_DIR, "docs", "run-recovery.md"), "utf8");
-    assert.ok(runbook.includes(DOCUMENTED_PREFIX), "docs/run-recovery.md documents the exact env -i form");
+    assert.ok(runbook.includes(DOCUMENTED_PREFIX), "docs/run-recovery.md documents the exact /usr/bin/env -i form");
+  });
+
+  it("names every binary in the runbook's Invocation commands by absolute path", () => {
+    const runbook = fs.readFileSync(path.join(REPO_DIR, "docs", "run-recovery.md"), "utf8");
+    const start = runbook.indexOf("- **Invocation.**");
+    assert.ok(start !== -1, "the Invocation bullet exists");
+    const fence = runbook.indexOf("```sh", start);
+    const end = runbook.indexOf("```", fence + 5);
+    assert.ok(fence !== -1 && end !== -1, "the Invocation code block exists");
+    // Join backslash continuations, drop comments and blanks: one logical command per line.
+    const lines = runbook.slice(fence + 5, end).replace(/\\\n\s*/g, " ").split("\n")
+      .map((l) => l.trim().replace(/\s+/g, " ")).filter((l) => l.length > 0 && !l.startsWith("#"));
+    const clientLines = lines.filter((l) => l.includes("retained-source.mjs"));
+    assert.equal(clientLines.length, 3, "compose, single-UID and split-UID forms");
+    for (const l of clientLines) {
+      assert.match(l, /\/usr\/bin\/env -i PATH=\/usr\/local\/bin:\/usr\/bin:\/bin \/usr\/local\/bin\/node \/app\/src\/ops\/retained-source\.mjs /, l);
+      assert.doesNotMatch(l, /(^|[\s;|&])env -i/, `bare env: ${l}`);
+      assert.doesNotMatch(l, /(^|[\s;|&])setpriv /, `bare setpriv: ${l}`);
+    }
+    const split = clientLines.find((l) => l.includes("setpriv"));
+    assert.ok(split, "the split-UID line exists");
+    assert.match(split, /-- \/bin\/setpriv --reuid=10001 --regid=10001 /, split);
+    assert.ok(split.includes("--no-new-privs"), split);
+    assert.ok(!lines.some((l) => /(^|[\s;|&])setpriv /.test(l)), "no bare setpriv anywhere in the block");
   });
 
   it("sends one NDJSON request, prints the response and exits 0 on ok", async () => {

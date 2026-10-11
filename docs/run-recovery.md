@@ -766,7 +766,7 @@ a read-only **inspect** and a guarded **discard**, run on the worker itself.
   the channel cannot be set up the worker logs it and keeps running; the channel is
   then unavailable, not the worker.
 - **Invocation.** Run the helper as the `worker` user, with a scrubbed environment and
-  the image-owned node binary. `env -i` plus that binary is why a planted `NODE_OPTIONS`,
+  the image-owned node binary. `/usr/bin/env -i` plus that binary is why a planted `NODE_OPTIONS`,
   `NODE_PATH` or tsx cache cannot influence it. **Never run the client as root:** the
   client file is owned by the worker uid (the image runs `chown -R worker:worker /app`),
   so running it as root would execute a worker-writable script with root privileges.
@@ -777,24 +777,30 @@ a read-only **inspect** and a guarded **discard**, run on the worker itself.
   ```sh
   # Docker Compose
   docker exec -u worker <agent container> \
-    env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
     inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
 
   # Kubernetes, single-UID workers (the default, workers.uidSplit.enabled: false):
   # the container already runs as the worker uid
   kubectl exec -c worker <pod> -- \
-    env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
     inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
 
   # Kubernetes, split-UID workers: drop to the worker uid (10001) first;
-  # setpriv is the util-linux binary at /bin/setpriv in the image
+  # /bin/setpriv is the util-linux binary in the image
   kubectl exec -c worker <pod> -- \
-    setpriv --reuid=10001 --regid=10001 --init-groups \
-    env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    /bin/setpriv --reuid=10001 --regid=10001 --init-groups \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
     inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
   ```
 
-  Under `env -i` the client cannot read `UZI_DATA_DIR` and defaults to `/data`; for a
+  Every binary in these commands is named by an absolute, root-owned path because the
+  image `PATH` includes runner-writable directories (`/opt/uzi-toolchain/bin` and the nix
+  profile `bin`) ahead of `/bin`; a bare `env` or `setpriv` could run a runner-planted
+  program as root or as the worker uid.
+
+  Under `/usr/bin/env -i` the client cannot read `UZI_DATA_DIR` and defaults to `/data`; for a
   non-default data directory pass `--socket <path>` naming the socket. As defense in
   depth, the run's Bash guardrail denies commands that name the installed client or the
   socket path from inside a run; the uid split, not that guardrail, is the real boundary.

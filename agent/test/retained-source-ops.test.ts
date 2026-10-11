@@ -1273,6 +1273,21 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered");
   });
 
+  it("a clone claiming core.ignorecase in any form git reads as true is not covered even when clean", async () => {
+    // A clean tree: only the refusal (not the status override) can turn these away.
+    const { a, head } = await captured();
+    assert.equal(await verify(a, head), "covered");
+    for (const value of ["true", "yes", "on", "1", "2", "0x1", "1k"]) {
+      gitIn(a.path, ["config", "core.ignorecase", value]);
+      assert.equal(await verify(a, head), "not_covered", `core.ignorecase=${value}`);
+    }
+    fs.appendFileSync(path.join(a.path, ".git", "config"), "[core]\n\tignorecase\n");
+    assert.equal(await verify(a, head), "not_covered", "bare key");
+    gitIn(a.path, ["config", "--unset-all", "core.ignorecase"]);
+    gitIn(a.path, ["config", "core.ignorecase", "false"]);
+    assert.equal(await verify(a, head), "covered", "false is not a claim");
+  });
+
   it("a clone with a filter driver configured or an info/attributes file is not covered", async () => {
     const { a, head } = await captured();
     gitIn(a.path, ["config", "filter.lfsish.clean", "cat"]);
