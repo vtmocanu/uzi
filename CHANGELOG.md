@@ -26,6 +26,8 @@ through `[0.52.0]`.)
 
 - **Cancelling a paused run now cancels it ([#1969](https://github.com/vtmocanu/uzi/issues/1969)).**
   A paused run (owner pause, credential disabled, wall-clock budget exhausted, or completion hold) whose worker was still online for other runs had its cancel queued for a worker that was not running it, so the run stayed paused and kept blocking new runs on its branch. The cancel now applies immediately (a run holding an unreported finished outcome still asks you to confirm discarding it first). A plan reject sent to a paused run, and an MR-close cancel of a paused MR rework run, now also apply immediately instead of being stranded.
+- **An owner's Extend on a time-budget park no longer reports a resume that never happened, and returns the right deadline ([#2734](https://github.com/vtmocanu/uzi/issues/2734)).**
+  When the extend was refused (the per-run extension cap would be exceeded across earlier extends, the run was no longer parked at its time budget, or a plan cross-check could no longer resume), the API still answered success with `resumed: true` and notified, while the run stayed paused; it now answers 409 naming the reason and changes nothing. A successful extend also now computes its returned deadline from the budget the extend just banked instead of the pre-extend run, so it no longer lands in the past.
 
 ## [0.86.0] - 2026-10-06
 

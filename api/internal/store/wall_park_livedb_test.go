@@ -351,7 +351,7 @@ func p32(n int32) *int32 { return &n }
 func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
 	wkr := fx.worker("w", wpWorker{})
-	extend := func(id uuid.UUID, secs, capv int32) (int32, error) {
+	extend := func(id uuid.UUID, secs, capv int32) (store.ExtendAndResumeWallParkRow, error) {
 		return fx.q.ExtendAndResumeWallPark(fx.ctx, store.ExtendAndResumeWallParkParams{
 			ID: id, UserID: fx.userID, Secs: secs, Cap: capv, GlobalTimeoutSeconds: 7200,
 			Body: pgtype.Text{String: "extend+resume", Valid: true}})
@@ -375,8 +375,8 @@ func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 			// overrun + the parked wait are banked, leaving exactly 3600s of active budget after Extend.
 			id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted",
 				budgetWall: p32(3600), startedAgo: 5 * time.Hour, sinceAgo: lateness})
-			if newExt, err := extend(id, 3600, 57600); err != nil || newExt == 0 {
-				t.Fatalf("extend (lateness %s) = (%d,%v), want (>0,nil)", lateness, newExt, err)
+			if row, err := extend(id, 3600, 57600); err != nil || row.BudgetExtensionSeconds == 0 {
+				t.Fatalf("extend (lateness %s) = (%d,%v), want (>0,nil)", lateness, row.BudgetExtensionSeconds, err)
 			}
 			if d := deadlineFromNow(id); d < 3590 || d > 3610 {
 				t.Fatalf("lateness %s: deadline is %.0fs from now, want ~3600 (the overrun must be banked)", lateness, d)
@@ -389,16 +389,52 @@ func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 
 	t.Run("honours the cap (refuses when ext + secs > cap)", func(t *testing.T) {
 		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600), budgetExtension: 50000})
-		newExt, err := extend(id, 10000, 57600) // 50000 + 10000 > 57600
-		if err != nil {
-			t.Fatalf("cap-exceeded extend err = %v, want nil (0-row scalar)", err)
-		}
-		if newExt != 0 {
-			t.Fatalf("cap-exceeded extend returned %d, want 0 (refused)", newExt)
+		_, err := extend(id, 10000, 57600) // 50000 + 10000 > 57600
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("cap-exceeded extend err = %v, want pgx.ErrNoRows (no row extended)", err)
 		}
 		if fx.status(id) != "paused" {
 			t.Fatal("a cap-refused extend must leave the run paused")
 		}
+	})
+
+	// refusedLeavesNothing pins the whole refusal contract: no row (pgx.ErrNoRows, never a zero
+	// scalar a caller could read as success), no extend/resume audit rows, the budget untouched and
+	// the wall 'pause' input still unsettled (applied_at NULL) so the park can still be extended.
+	refusedLeavesNothing := func(t *testing.T, id uuid.UUID, secs, capv int32, wantStatus string, wantExt int32) {
+		t.Helper()
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1,'pause','wall')`, id)
+		if _, err := extend(id, secs, capv); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("refused extend err = %v, want pgx.ErrNoRows", err)
+		}
+		var audits int
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('extend','resume')`, id).Scan(&audits); err != nil {
+			t.Fatal(err)
+		}
+		if audits != 0 {
+			t.Fatalf("refused extend wrote %d extend/resume audit rows, want 0", audits)
+		}
+		var applied pgtype.Timestamptz
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT applied_at FROM run_user_inputs WHERE run_id=$1 AND kind='pause' AND body='wall'`, id).Scan(&applied); err != nil {
+			t.Fatal(err)
+		}
+		if applied.Valid {
+			t.Fatal("refused extend settled the wall pause input (applied_at set)")
+		}
+		r := fx.mustRun(id)
+		if r.Status != wantStatus || r.BudgetExtensionSeconds != wantExt {
+			t.Fatalf("refused extend changed the run: status=%s ext=%d, want %s/%d", r.Status, r.BudgetExtensionSeconds, wantStatus, wantExt)
+		}
+	}
+
+	t.Run("cap refusal returns no row and writes nothing", func(t *testing.T) {
+		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600), budgetExtension: 50000})
+		refusedLeavesNothing(t, id, 10000, 57600, "paused", 50000)
+	})
+
+	t.Run("status-changed refusal (owner-paused, no budget_exhausted hold) returns no row and writes nothing", func(t *testing.T) {
+		id := fx.run(wpRun{worker: &wkr, status: "paused", budgetWall: p32(3600)})
+		refusedLeavesNothing(t, id, 3600, 57600, "paused", 0)
 	})
 
 	t.Run("server-parked row resumes worker_id NULL, released pair preserved", func(t *testing.T) {

@@ -194,6 +194,14 @@ var (
 	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
 	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
 	ErrWallParkStopUnavailable = errors.New("this parked run has nothing to finalize; extend it to keep working, or cancel it")
+	// ErrWallParkChanged rejects an `extend` on a budget_exhausted wall park whose run changed
+	// between the owner's read and the extend statement (resumed, paused by its owner, finished,
+	// or otherwise no longer held at its time budget). Nothing was extended or resumed. → 409.
+	ErrWallParkChanged = errors.New("this run is no longer parked at its time budget; nothing was extended")
+	// ErrWallParkCrossCheckIneligible rejects an `extend` on a wall-parked plan cross-check whose
+	// lead's plan check is no longer pending (decided, expired, or its lead moved on), so the
+	// checker cannot resume. Nothing was extended or resumed. → 409.
+	ErrWallParkCrossCheckIneligible = errors.New("this plan cross-check can no longer resume: its lead's plan check is no longer pending; nothing was extended")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -1027,9 +1035,10 @@ type Store interface {
 	CountOnlineWorkersClaimableForRun(ctx context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error)
 	// ExtendAndResumeWallPark / StopWallPark (PRD #1497 M1, D7/D9) are the owner's Extend and Stop on
 	// a budget_exhausted wall park, each in one statement: bank the overrun, resume, and (Stop) cap
-	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the new total
-	// extension; StopWallPark returns the run id (0 rows / ErrNoRows on refusal).
-	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (int32, error)
+	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the
+	// post-update budget row (pgx.ErrNoRows on refusal); StopWallPark returns the run id (0 rows /
+	// ErrNoRows on refusal).
+	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (store.ExtendAndResumeWallParkRow, error)
 	StopWallPark(ctx context.Context, arg store.StopWallParkParams) (uuid.UUID, error)
 	// StampCompletionBudgetExhausted (PRD #1226 M4, D3) arms the server-side served
 	// `budget_exhausted` steer on EXACTLY the post-attempt live-worker interlocked rows
