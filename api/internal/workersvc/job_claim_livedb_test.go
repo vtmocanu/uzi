@@ -771,7 +771,7 @@ func TestJobParkGuardsLiveDB(t *testing.T) {
 	})
 	t.Run("CreateExtendInput", func(t *testing.T) {
 		mk := func(id uuid.UUID) store.CreateExtendInputParams {
-			return store.CreateExtendInputParams{ID: id, Body: pgtype.Text{String: "extend", Valid: true}, Secs: 600, Cap: 28800}
+			return store.CreateExtendInputParams{ID: id, Body: pgtype.Text{String: "extend", Valid: true}, Secs: 600, Cap: 28800, BaseWallUpperSeconds: 86400, FinalizeAllowanceSeconds: WallParkFinalizeSeconds, MaxWallSeconds: MaxRunWallSeconds}
 		}
 		if _, err := e.q.CreateExtendInput(e.ctx, mk(job)); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("job err = %v; want no rows", err)

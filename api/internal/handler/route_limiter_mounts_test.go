@@ -859,6 +859,12 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/reconcile", noLimiter},
+	// Issue #2625: the archive redundancy claim. Worker-authenticated; a claim that passes the
+	// local checks spends the OWNER's forge quota (a summary, a branch head and one compare per
+	// distinct commit), so it rides proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback
+	// mount), which this per-USER probe reads as noLimiter, like /settle below. A refused claim is
+	// also memoized for an hour, so a looping worker is answered without any forge call.
+	{"POST", "/api/worker/runs/{id}/archives/{captureID}/redundancy", noLimiter},
 	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated; a call that
 	// reaches the proof spends the OWNER's forge quota (one branch-head read plus up to three
 	// compares, up to six on Forgejo, which compares both directions per candidate), so it

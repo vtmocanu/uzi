@@ -8735,11 +8735,15 @@ RETURNING *;
 -- ONLY (excluded from ConsumeRunInputs, so the worker never drains or routes it — the extension
 -- is served to the worker as runs.budget_extension_seconds on the ACK/claim instead).
 --
--- The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS the cap:
--- a completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
--- request that would push the total extension past @cap all match 0 rows. A 0-row result is
+-- The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS two bounds:
+-- @cap is a PER-REQUEST maximum (@secs <= @cap; the cumulative budget_extension_seconds is not
+-- capped by it), and a TECHNICAL bound keeps the served wall total inside the worker timer's range
+-- (GREATEST(budget_wall_seconds, @base_wall_upper_seconds) + extension + @secs + GREATEST(
+-- budget_finalize_seconds, @finalize_allowance_seconds) <= @max_wall_seconds; bigint arithmetic).
+-- A completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
+-- request failing either bound all match 0 rows. A 0-row result is
 -- disambiguated in Go by re-reading the already-fetched run (terminal -> ErrRunTerminal; untimed
--- kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded). On 0 rows the INSERT selects from
+-- kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded / ErrExtensionLimitReached). On 0 rows the INSERT selects from
 -- the empty CTE and writes NO audit row, so a refused extend leaves no trace.
 --
 -- disposition = 'applied' at insert (the CHECK from 00162 admits it): an extension takes effect
@@ -8762,7 +8766,10 @@ WITH extended AS (
       AND status NOT IN ('completed', 'failed', 'cancelled')
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
       AND interactive = false
-      AND budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+      AND sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+      AND GREATEST(COALESCE(budget_wall_seconds, 0), sqlc.arg('base_wall_upper_seconds')::int)::bigint
+          + budget_extension_seconds + sqlc.arg('secs')::int
+          + GREATEST(budget_finalize_seconds, sqlc.arg('finalize_allowance_seconds')::int) <= sqlc.arg('max_wall_seconds')::bigint
     RETURNING id, budget_extension_seconds
 ),
 -- PRD #1497 M1 (D18): settle the voided wall request's input too, so ConsumeRunInputs never hands
@@ -8780,8 +8787,8 @@ RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS b
 -- name: ExtendAndResumeWallPark :one
 -- PRD #1497 M1 (D7): the owner's Extend on a budget_exhausted wall park, in ONE statement — add the
 -- extension AND resume, so an extension has one purpose and is one action. It:
---   1. adds @secs to budget_extension_seconds under the SAME cap guard as CreateExtendInput (a
---      request past @cap matches 0 rows; the caller re-reads the run to word the refusal);
+--   1. adds @secs to budget_extension_seconds under the SAME per-request cap and technical
+--      wall bound as CreateExtendInput (a request past either matches 0 rows; the caller re-reads the run to word the refusal);
 --   2. BANKS THE OVERRUN into budget_paused_seconds so the extension buys exactly @secs of ACTIVE
 --      run-time however late the park landed (D7): overrun = active-at-park - total-before-extension,
 --      and the parked-wait interval is banked too (ResumePausedRun's rule), so the two banks leave the
@@ -8796,7 +8803,7 @@ RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS b
 -- total_before and active-at-park read the OLD row (SET RHS is pre-update): budget_extension_seconds
 -- in total_before is the pre-extension value, budget_finalize_seconds is included (a run may have been
 -- Stopped then re-parked). Refuses (0 rows) a row that is not a budget_exhausted paused hold, or over
--- the cap, or a cross_check whose lead plan check is no longer pending and eligible. Returns the
+-- the per-request cap or the technical wall bound, or a cross_check whose lead plan check is no longer pending and eligible. Returns the
 -- POST-update budget row (started_at, budget_wall/extension/finalize/paused seconds) so the caller
 -- computes the resumed deadline from the banked values; a refusal returns NO row (pgx.ErrNoRows), never a zero scalar.
 WITH candidates AS MATERIALIZED (
@@ -8804,7 +8811,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = sqlc.arg('id') AND runs.user_id = sqlc.arg('user_id')
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
-      AND runs.budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+      AND sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+      AND GREATEST(COALESCE(runs.budget_wall_seconds, 0), sqlc.arg('base_wall_upper_seconds')::int)::bigint
+          + runs.budget_extension_seconds + sqlc.arg('secs')::int
+          + GREATEST(runs.budget_finalize_seconds, sqlc.arg('finalize_allowance_seconds')::int) <= sqlc.arg('max_wall_seconds')::bigint
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -8862,7 +8872,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = sqlc.arg('id') AND runs.user_id = sqlc.arg('user_id')
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
-      AND runs.budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+      AND sqlc.arg('secs')::int <= sqlc.arg('cap')::int
+      AND GREATEST(COALESCE(runs.budget_wall_seconds, 0), sqlc.arg('base_wall_upper_seconds')::int)::bigint
+          + runs.budget_extension_seconds + sqlc.arg('secs')::int
+          + GREATEST(runs.budget_finalize_seconds, sqlc.arg('finalize_allowance_seconds')::int) <= sqlc.arg('max_wall_seconds')::bigint
       AND runs.id IN (SELECT run_id FROM eligible_candidates)
       AND (runs.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM locked_checks cc
@@ -8905,7 +8918,8 @@ SELECT extended.started_at, extended.budget_wall_seconds, extended.budget_extens
 --   1. sets scope_ceiling = @scope_ceiling (the completed count, the CreateScopeCeilingInput shape),
 --      marking any prior unsettled scope rows superseded;
 --   2. grants budget_finalize_seconds = 1800 WHERE budget_finalize_seconds = 0 — the once-only marker
---      AND the accounting: it lives OUTSIDE budget_extension_seconds so the owner cap never sees it,
+--      AND the accounting: it lives OUTSIDE budget_extension_seconds (the extend predicates count it separately as
+--      GREATEST(budget_finalize_seconds, @finalize_allowance_seconds)),
 --      and a second Stop matches 0 rows (allowance already used) -> the handler answers 409;
 --   3. banks the overrun + parked interval so the run resumes with exactly 1800s of finalize budget
 --      (the same two-bank rule as ExtendAndResumeWallPark; budget_finalize_seconds is OLD (=0) in the

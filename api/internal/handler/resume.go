@@ -43,9 +43,13 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	switch run.Status {
 	case "recovery_wait":
 		if run.RecoveryWaitCause.Valid && run.RecoveryWaitCause.String == "provider_outage" {
-			// PRD #1733: a typed provider park retries on its own backoff; past the bound it
-			// becomes a paused hold the owner resumes. Name that instead of a bare status.
-			httpx.Error(w, http.StatusConflict, "run is waiting out a provider outage and retries automatically; once the outage streak passes its limit it pauses for you to resume")
+			// PRD #1733: a typed provider park retries on its own backoff. Only an enabled
+			// RunProviderParkMaxDuration turns the streak into an owner-resumed hold.
+			hint := "run is waiting out a provider outage and retries automatically"
+			if h.cfg.RunProviderParkMaxDuration > 0 {
+				hint += "; once the outage streak passes its limit it pauses for you to resume"
+			}
+			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
 		if !run.RecoveryWaitCause.Valid || run.RecoveryWaitCause.String != "worker_requeue_exhausted" {

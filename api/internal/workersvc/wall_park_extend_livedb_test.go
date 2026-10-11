@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -113,22 +114,84 @@ func (f *wallParkExtendFixture) assertRefusedUntouched(t *testing.T, id uuid.UUI
 	}
 }
 
-// TestWallParkExtendCumulativeCapRefusedLiveDB: 50000s already extended, cap 57600, extend 10000
-// passes the per-request check (10000 <= 57600) but the cumulative guard matches no row. The owner
-// must get the cap refusal, not Resumed:true.
-func TestWallParkExtendCumulativeCapRefusedLiveDB(t *testing.T) {
+// TestWallParkExtendPastOldCumulativeCapResumesLiveDB: the cap is a PER-REQUEST maximum (#2735).
+// 50000s already extended with cap 57600 used to refuse an extend of 10000 (the cumulative rule); it
+// now applies, resumes the run, and returns the new total.
+func TestWallParkExtendPastOldCumulativeCapResumesLiveDB(t *testing.T) {
 	f := newWallParkExtendFixture(t, 57600)
 	id := f.wallPark(t, 50000)
-	before := mustRun(t, f.env, id)
 
 	res, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "10000", nil)
-	if !errors.Is(err, ErrExtensionCapExceeded) {
-		t.Fatalf("SubmitInput extend err = %v (res %+v), want ErrExtensionCapExceeded", err, res)
+	if err != nil {
+		t.Fatalf("SubmitInput extend past the old cumulative cap: %v", err)
+	}
+	if !res.Resumed || res.ExtensionSeconds == nil || *res.ExtensionSeconds != 60000 {
+		t.Fatalf("result = %+v (ext %v), want Resumed with a 60000s total", res, res.ExtensionSeconds)
+	}
+	after := mustRun(t, f.env, id)
+	if after.Status != "queued" || after.HoldReason.Valid || after.BudgetExtensionSeconds != 60000 {
+		t.Fatalf("run after extend = %s hold=%v ext=%d, want queued / no hold / 60000", after.Status, after.HoldReason, after.BudgetExtensionSeconds)
+	}
+	var audit string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT body FROM run_user_inputs WHERE run_id=$1 AND kind='extend'`, id).Scan(&audit); err != nil {
+		t.Fatal(err)
+	}
+	if audit != "extend and resume +2h46m (max 16h per extension)" {
+		t.Fatalf("extend audit body = %q", audit)
+	}
+}
+
+// TestWallParkExtendOverCapRequestRefusedLiveDB: a request above the per-request cap is refused as
+// ErrExtensionCapExceeded naming the maximum, and the run stays parked and untouched.
+func TestWallParkExtendOverCapRequestRefusedLiveDB(t *testing.T) {
+	f := newWallParkExtendFixture(t, 57600)
+	id := f.wallPark(t, 0)
+	before := mustRun(t, f.env, id)
+
+	res, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "57660", nil)
+	if !errors.Is(err, ErrExtensionCapExceeded) || !strings.Contains(err.Error(), "+16h1m is more than the 16h maximum per extension") {
+		t.Fatalf("err = %v (res %+v), want ErrExtensionCapExceeded naming the per-extension maximum", err, res)
 	}
 	if res.Resumed {
 		t.Fatal("a refused extend reported Resumed:true")
 	}
 	f.assertRefusedUntouched(t, id, before)
+}
+
+// TestWallParkExtendOverRoomRefusedLiveDB: a request within the cap but beyond the room under the
+// technical total-time bound is ErrExtensionLimitReached, and the run is still parked. The same
+// refusal comes from the statement (not only the pre-check) when the caller's snapshot is stale.
+func TestWallParkExtendOverRoomRefusedLiveDB(t *testing.T) {
+	// testParams: RunTimeout 2h, RunWallCeiling 8h -> wall upper 259200 (72h maximum ceiling), room = 2147483 - 259200 - 1800 - ext.
+	const used = 2147483 - 259200 - 1800 - 3600 // 3600s of room left
+	f := newWallParkExtendFixture(t, 604800)
+	id := f.wallPark(t, used)
+	before := mustRun(t, f.env, id)
+
+	res, err := f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "3660", nil)
+	if !errors.Is(err, ErrExtensionLimitReached) {
+		t.Fatalf("err = %v (res %+v), want ErrExtensionLimitReached", err, res)
+	}
+	if res.Resumed {
+		t.Fatal("a refused extend reported Resumed:true")
+	}
+	f.assertRefusedUntouched(t, id, before)
+
+	// Stale snapshot: the caller read the run with room to spare, then another extend consumed it;
+	// the statement refuses and the re-read names the limit.
+	stale := before
+	stale.BudgetExtensionSeconds = 0
+	res, err = f.svc.extendAndResumeWallPark(f.env.ctx, f.userID, stale, 3660, 604800)
+	if !errors.Is(err, ErrExtensionLimitReached) || res.Resumed {
+		t.Fatalf("stale-snapshot err = %v (res %+v), want ErrExtensionLimitReached", err, res)
+	}
+	f.assertRefusedUntouched(t, id, before)
+
+	// Exactly the room applies.
+	res, err = f.svc.SubmitInput(f.env.ctx, f.userID, id, "extend", "3600", nil)
+	if err != nil || !res.Resumed {
+		t.Fatalf("exact-room extend = (%+v, %v), want applied and resumed", res, err)
+	}
 }
 
 // TestWallParkExtendStateChangedLiveDB: the caller's snapshot says "budget_exhausted wall park" but
@@ -141,10 +204,10 @@ func TestWallParkExtendStateChangedLiveDB(t *testing.T) {
 	}{
 		{"owner-paused (hold cleared)", `UPDATE runs SET hold_reason=NULL WHERE id=$1`},
 		{"already resumed (queued)", `UPDATE runs SET status='queued', hold_reason=NULL WHERE id=$1`},
-		// Over the cap AND no longer a budget_exhausted park: the state-change refusal must win over
-		// the cap wording, since the cap arithmetic on a run that is not parked is meaningless.
-		{"owner-paused and over the cap", `UPDATE runs SET hold_reason=NULL, budget_extension_seconds=57000 WHERE id=$1`},
-		{"queued and over the cap", `UPDATE runs SET status='queued', hold_reason=NULL, budget_extension_seconds=57000 WHERE id=$1`},
+		// Out of room AND no longer a budget_exhausted park: the state-change refusal must win over
+		// the limit wording, since the room arithmetic on a run that is not parked is meaningless.
+		{"owner-paused and out of room", `UPDATE runs SET hold_reason=NULL, budget_extension_seconds=2116000 WHERE id=$1`},
+		{"queued and out of room", `UPDATE runs SET status='queued', hold_reason=NULL, budget_extension_seconds=2116000 WHERE id=$1`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newWallParkExtendFixture(t, 57600)
@@ -154,7 +217,7 @@ func TestWallParkExtendStateChangedLiveDB(t *testing.T) {
 			before := mustRun(t, f.env, id)
 
 			res, err := f.svc.extendAndResumeWallPark(f.env.ctx, f.userID, stale, 3600, 57600)
-			if !errors.Is(err, ErrWallParkChanged) || errors.Is(err, ErrExtensionCapExceeded) {
+			if !errors.Is(err, ErrWallParkChanged) || errors.Is(err, ErrExtensionCapExceeded) || errors.Is(err, ErrExtensionLimitReached) {
 				t.Fatalf("extendAndResumeWallPark err = %v (res %+v), want ErrWallParkChanged", err, res)
 			}
 			if res.Resumed {
@@ -170,6 +233,12 @@ func TestWallParkExtendStateChangedLiveDB(t *testing.T) {
 // has already expired cannot resume (the statement's eligibility guard), so the extend is refused
 // with the cross-check sentinel.
 func TestWallParkExtendCrossCheckIneligibleLiveDB(t *testing.T) {
+	for _, ext := range []int{0, 60000} { // 60000 is above the old cumulative cap (57600)
+		t.Run(fmt.Sprintf("extension_%d", ext), func(t *testing.T) { crossCheckIneligible(t, ext) })
+	}
+}
+
+func crossCheckIneligible(t *testing.T, ext int) {
 	f := newWallParkExtendFixture(t, 57600)
 	leadID := uuid.New()
 	f.env.exec(`INSERT INTO runs (id, user_id, repo_id, worker_id, kind, issue_iid, issue_title, issue_description,
@@ -177,10 +246,10 @@ func TestWallParkExtendCrossCheckIneligibleLiveDB(t *testing.T) {
 		VALUES ($1,$2,$3,$4,'issue',1,'t','d','running','claude',true,1)`, leadID, f.userID, f.repoID, f.worker)
 	checkerID := uuid.New()
 	f.env.exec(`INSERT INTO runs (id, user_id, repo_id, worker_id, kind, target_run_id, harness, report_only,
-		budget_wall_seconds, status, hold_reason, claim_generation, issue_title, issue_description,
+		budget_wall_seconds, budget_extension_seconds, status, hold_reason, claim_generation, issue_title, issue_description,
 		started_at, status_since)
-		VALUES ($1,$2,$3,$4,'cross_check',$5,'codex',true,1800,'paused','budget_exhausted',1,'check','check',
-		now()-interval '5 hours',now()-interval '30 minutes')`, checkerID, f.userID, f.repoID, f.worker, leadID)
+		VALUES ($1,$2,$3,$4,'cross_check',$5,'codex',true,1800,$6,'paused','budget_exhausted',1,'check','check',
+		now()-interval '5 hours',now()-interval '30 minutes')`, checkerID, f.userID, f.repoID, f.worker, leadID, ext)
 	f.env.exec(`INSERT INTO cross_checks (lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,
 		required_capabilities,required_tools,size_class,base_commit,planning_diff,candidate_digest,
 		checker_run_id,checker_harness,created_at,deadline_at)

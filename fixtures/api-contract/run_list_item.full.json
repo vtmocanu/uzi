@@ -29,6 +29,7 @@
   "requeue_count": 1,
   "iteration_count": 1,
   "is_planning": true,
+  "is_revising": true,
   "progress": {
     "state": "x",
     "pct": 1,
@@ -436,6 +437,5 @@
   "worker_name": "x",
   "owner_email": "x",
   "judge_verdict": "x",
-  "judge_todo_count": 1,
-  "is_revising": true
+  "judge_todo_count": 1
 }

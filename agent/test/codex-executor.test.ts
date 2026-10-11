@@ -14254,6 +14254,70 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 // escalates as TransientRecoveryError (the runner parks it in recovery_wait) instead of failing the
 // run as agent_failure. Cancel, pause and a spent wall budget always win over the retry and over the
 // escalation; a non-transient classification is never retried.
+describe("CodexExecutor planning settlement (#1733)", () => {
+  it("notifies for a successful Codex plan before approval and for implementation after approval", async () => {
+    const lifecycle: string[] = [];
+    const rig = makeMultiEpochRig([
+      epochResponder("th-plan", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "# Productive plan" }, th, tn, "c-plan"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-impl", "tn-impl", (t, th, tn) => {
+        t.push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      onModelTurnSettled: async count => { assert.ok(count > 0); lifecycle.push("settled"); },
+      gatePlan: async plan => {
+        assert.equal(plan, "# Productive plan");
+        lifecycle.push("approval");
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "productive Codex plan");
+    assert.equal(result.branch, ctx.branch);
+    assert.deepEqual(lifecycle, ["settled", "approval", "settled"], "the planning turn counts independently of the implementation turn");
+  });
+
+  for (const info of ["serverOverloaded", "unauthorized"]) {
+    it(`planning settlement excludes a failed Codex plan turn (${info})`, async () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-plan"))
+            .push(agentMessage("drafting the plan", "th-plan"))
+            .push(toolCall(1, "submit_plan", { plan_md: "# Failed draft" }, "th-plan", "tn-plan", "c-plan"))
+            .push({
+              kind: "turn_completed", method: "turn/completed", threadId: "th-plan", turnId: "tn-plan", status: "failed",
+              params: { threadId: "th-plan", turn: { id: "tn-plan", status: "failed", error: { codexErrorInfo: info } } },
+            });
+          return { turn: { id: "tn-plan" } };
+        }
+        return {};
+      } });
+      rig.deps = { ...rig.deps, transientRetryMax: 0 };
+      let settled = 0;
+      let gated = 0;
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        onModelTurnSettled: async () => { settled++; },
+        gatePlan: async () => { gated++; throw new Error("failed plan reached approval"); },
+      });
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "failed Codex plan"), (err: Error) => {
+        assert.equal(err instanceof TransientRecoveryError, info === "serverOverloaded");
+        assert.match(err.message, new RegExp(info));
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1, "the failed planning turn actually ran");
+      assert.equal(gated, 0, "a draft submitted on a failed turn never reaches approval");
+      assert.equal(settled, 0, "planning output and submit_plan do not make a failed turn productive");
+    });
+  }
+});
+
 describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   /** A failed `turn/completed` carrying a terminal `turn.error.codexErrorInfo`. */
   function turnCompletedWithError(codexErrorInfo: unknown, threadId = "th-1", turnId = "tn-1"): CodexNotification {

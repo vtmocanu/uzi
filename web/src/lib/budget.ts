@@ -40,8 +40,8 @@ export type BudgetView = {
   extSec: number;
   // The effective admin cap (0 = extending disabled).
   capSec: number;
-  // How much extension an owner may still grant: cap − extension, clamped ≥ 0.
-  allowanceLeftSec: number;
+  // The most one Extend may add: the per-request cap (not reduced by earlier extensions).
+  perExtensionMaxSec: number;
   // Time left before the run is stopped (running) / would be stopped after resume (paused).
   remainingSec: number;
   // The wall-clock deadline as an ISO string for a running run; null while paused (it moves).
@@ -103,7 +103,8 @@ export function parseDurationToSeconds(input: string): number | null {
 export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | null {
   const ext = run.budget_extension_seconds ?? 0;
   const cap = run.budget_extension_cap_seconds ?? 0;
-  const allowanceLeft = Math.max(0, cap - ext);
+  // The cap is a per-request maximum (#2735): earlier extensions do not shrink it.
+  const perExtensionMax = Math.max(0, cap);
 
   if (run.status === "running") {
     const total = run.budget_total_seconds;
@@ -125,7 +126,7 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
       wallSec: Math.max(0, wall),
       extSec: ext,
       capSec: cap,
-      allowanceLeftSec: allowanceLeft,
+      perExtensionMaxSec: perExtensionMax,
       remainingSec: remaining,
       deadlineIso: run.deadline_at ?? null,
       running: true,
@@ -150,7 +151,7 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
       wallSec: wall,
       extSec: ext,
       capSec: cap,
-      allowanceLeftSec: allowanceLeft,
+      perExtensionMaxSec: perExtensionMax,
       remainingSec: remaining,
       deadlineIso: null,
       running: false,

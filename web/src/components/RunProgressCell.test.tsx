@@ -70,6 +70,17 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(container.textContent).toBe(`waits on you${reason} since ${formatLocalTime(STATUS_SINCE)}`);
   });
 
+  it("a revising run (awaiting_approval, is_revising, planning progress) does not wait on you", () => {
+    const { container } = renderCell({
+      status: "awaiting_approval",
+      is_revising: true,
+      status_since: STATUS_SINCE,
+      progress: progress({ state: "planning" }),
+    });
+    expect(screen.queryByText("waits on you")).toBeNull();
+    expect(container.textContent).not.toContain("plan gate");
+  });
+
   it("waiting without status_since keeps just the reason", () => {
     const { container } = renderCell({ status: "awaiting_approval", progress: progress({ state: "waiting" }) });
     expect(screen.getByText("waits on you")).toBeTruthy();

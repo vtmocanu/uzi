@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"image/color"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -511,10 +513,11 @@ func (m tuiModel) updateChoiceRow(c updateChoice, selected, ascii bool, width in
 }
 
 // runPendingUpgrade runs the selected formula upgrade in the FOREGROUND after the TUI has exited
-// (PRD #1251 M1 D1), so the from-source compile progress and any failure are visible and the
-// stale running process is replaced by a rerun. It is extracted from RunE so a test can
-// assert it calls the seam with foreground=true and an allowlisted tap-qualified argv WITHOUT
-// running brew. A nil seam is reported cleanly rather than panicking.
+// (PRD #1251 M1 D1), so the from-source compile progress and any failure are visible, then
+// verifies the formula-owned binary reached the offered version and execs that same verified
+// file with the original arguments, restarting the TUI on the new version (D12). It is
+// extracted from RunE so a test can assert the seams' arguments WITHOUT running brew or
+// replacing the test process. A nil seam is reported cleanly rather than panicking.
 func runPendingUpgrade(env Env, argv []string, offered string) error {
 	formula := ""
 	if len(argv) == 2 && argv[0] == "upgrade" {
@@ -542,14 +545,14 @@ func runPendingUpgrade(env Env, argv []string, offered string) error {
 		_, _ = fmt.Fprintf(env.Stderr, "update failed: %s\n", diagnostic)
 		return uzicli.Exitf(uzicli.ExitGeneric, "brew upgrade %s: %s", argv[1], diagnostic)
 	}
-	if env.InstalledVersion == nil {
+	if env.InstalledCLI == nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: no installed version probe is available")
 	}
-	raw, err := env.InstalledVersion(formula)
+	cli, err := env.InstalledCLI(formula)
 	if err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: %s", cellText(err.Error()))
 	}
-	installed, ok := validatedVersion(raw)
+	installed, ok := validatedVersion(cli.Version)
 	if !ok {
 		return uzicli.Exitf(uzicli.ExitGeneric, "update verification failed: invalid installed version")
 	}
@@ -562,6 +565,15 @@ func runPendingUpgrade(env Env, argv []string, offered string) error {
 		_, _ = fmt.Fprintln(env.Stderr, line)
 		return uzicli.Exitf(uzicli.ExitGeneric, "%s", line)
 	}
-	_, _ = fmt.Fprintln(env.Stdout, "Update complete. Start the TUI again to use the new version.")
-	return nil
+	_, _ = fmt.Fprintln(env.Stdout, "Update complete. Restarting the TUI...")
+	// Exec only returns on failure. The upgrade itself succeeded, but the requested
+	// upgrade-and-restart did not, so report it nonzero with the manual way forward.
+	err = errors.New("no exec is available")
+	if env.Exec != nil {
+		err = env.Exec(cli.Path, append([]string{cli.Path}, env.Args...), os.Environ())
+	}
+	if err != nil {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update succeeded, but restarting the TUI failed: %s; run `uzi tui` to start it", cellText(err.Error()))
+	}
+	return nil // only an injected Exec returns nil; syscall.Exec does not return on success
 }

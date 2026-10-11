@@ -16,7 +16,7 @@ func TestM2RejectUnqualifiedUpgrade(t *testing.T) {
 }
 func TestM2ZeroExitNoopNotSuccess(t *testing.T) {
 	var out strings.Builder
-	env := Env{Stdout: &out, Stderr: io.Discard, Brew: func(bool, ...string) (string, error) { return "", nil }, InstalledVersion: func(string) (string, error) { return "v0.84.0", nil }}
+	env := Env{Stdout: &out, Stderr: io.Discard, Brew: func(bool, ...string) (string, error) { return "", nil }, InstalledCLI: func(string) (installedCLI, error) { return installedCLI{Version: "v0.84.0"}, nil }}
 	err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0")
 	if err == nil || strings.Contains(out.String(), "Update complete") {
 		t.Fatalf("zero-exit no-op reported success: %v %q", err, out.String())

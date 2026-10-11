@@ -86,6 +86,8 @@ import {
   type RecoveryUploadManifest,
   type JobFileUploadMeta,
   type JobFileUploadResponse,
+  type RecoveryArchiveRedundancyRequest,
+  type RecoveryArchiveRedundancyResponse,
   type RecoveryCaptureStatusResponse,
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
@@ -1998,6 +2000,31 @@ export class WorkerClient {
       // 16 KiB leaves ample protocol headroom while bounding actual response bytes.
       16 * 1024,
     ) as RecoveryReconcileResponse;
+  }
+
+  /** Issue #2625: claim a completed run's archive is already covered by its published branch. The
+   *  api decides; a malformed reply (unknown outcome, wrong capture id) is reported as retained with
+   *  reason "invalid_response" so a caller can never act on an unverified expiry. Throws RequestError
+   *  on 4xx/5xx and on abort/timeout. */
+  async proveRecoveryArchiveRedundancy(
+    runId: string,
+    captureId: string,
+    req: RecoveryArchiveRedundancyRequest,
+    signal?: AbortSignal,
+  ): Promise<RecoveryArchiveRedundancyResponse> {
+    const raw = await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/redundancy`,
+      req,
+      this.httpTimeoutMs,
+      signal,
+      16 * 1024,
+    );
+    const r = (raw ?? {}) as { capture_id?: unknown; outcome?: unknown; reason?: unknown };
+    const reason = typeof r.reason === "string" && r.reason.length <= 64 ? r.reason : undefined;
+    if (r.capture_id !== captureId || (r.outcome !== "expired" && r.outcome !== "retained")) {
+      return { capture_id: captureId, outcome: "retained", reason: "invalid_response" };
+    }
+    return { capture_id: captureId, outcome: r.outcome, ...(reason === undefined ? {} : { reason }) };
   }
 
   /** By-id status poll of a capture (handles lost ACKs; on restart tells whether the byte

@@ -587,12 +587,12 @@ uzi version
   wall-clock time so the sweep does not kill it at its current deadline (PRD #1189). `--by`
   takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit (`1d` = 24h); it
   must be positive (`0`, negative or unparseable is a usage error, exit 2). The added time
-  stacks on the frozen budget rather than replacing it, up to an admin-set per-run allowance.
+  stacks on the frozen budget rather than replacing it. `--by` is capped per request by an admin-set maximum per extension (default 16h), not per run: a run may be extended repeatedly, up to a technical total limit.
   Owner-only, and valid on any non-terminal run of a kind the sweep can time out (issue, task,
   prompt, self-improve, mr-rework, ci-fix), including a queued or parked one. A chat, judge or
   interactive-task run never times out, an over-cap request, or extending while the admin has
   turned extensions off, is a 409 (exit 5) with the server's message printed verbatim. Prints
-  the new deadline and the run's remaining extension allowance; `uzi run get` then shows the
+  the new deadline and the run's total extension (with the per-extension maximum); `uzi run get` then shows the
   extension on its `DEADLINE` row (`· +2h extended`).
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.

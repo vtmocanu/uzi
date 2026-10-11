@@ -1469,6 +1469,17 @@ export interface RecoveryCoverage {
   originalShas: string[];
   currentSha: string;
 }
+/** Issue #2625: the objects an archive-redundancy claim carries, read back from a bare repo.
+ *  Bodies are standard padded base64 of raw `git cat-file commit` bytes. */
+export interface RecoveryCoverageClaim {
+  coverageDigest: string;
+  roots: string[];
+  currentSha: string;
+  tree: string;
+  aggregateObjects: string[];
+  currentObject: string;
+  witnessObject?: string;
+}
 type TrackingReceipt = {
   version: 1; branch: string; runId: string; generation: number | null; context: string;
   trackingSha: string; phase: "pending" | "committed";
@@ -10404,6 +10415,104 @@ export class GitCache {
       if (await this.checkedRefSha(barePath, coverageRef) !== sha) throw new Error("recovery coverage pin mismatch");
       return { sha, coverageRef, fingerprint, originalShas: roots, currentSha };
     });
+  }
+
+  /**
+   * Issue #2625: read, never write, the claim that a coverage aggregate built by
+   * {@link buildRecoveryCoverage} is redundant with a published branch. Returns undefined (no claim)
+   * for anything that does not verify locally, so a caller can only ever send a claim the api's
+   * strict checks are expected to accept. Walks from `sourceSha` through commits whose message is
+   * exactly the coverage message for `fingerprint`; every other commit reached is a leaf and the
+   * leaves must be exactly roots + currentSha. When `witnessHead` is given and does not already
+   * contain `currentSha`, it is attached as the WIP witness only if its tree equals the current tree
+   * and every parent of `currentSha` is its ancestor.
+   */
+  async readRecoveryCoverageClaim(barePath: string, opts: {
+    sourceSha: string; fingerprint: string; roots: string[]; currentSha: string; witnessHead?: string;
+  }): Promise<RecoveryCoverageClaim | undefined> {
+    const { sourceSha, fingerprint, roots, currentSha, witnessHead } = opts;
+    const MAX_HEADS = 64, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
+    const strictlySorted = roots.every((r, i) => i === 0 || roots[i - 1]! < r);
+    const heads = [...new Set([...roots, currentSha])].sort();
+    if (!OWED_OID.test(sourceSha) || !OWED_OID.test(currentSha) || !/^[0-9a-f]{64}$/.test(fingerprint) ||
+        !roots.length || !roots.every(r => OWED_OID.test(r)) || !strictlySorted ||
+        (witnessHead !== undefined && !OWED_OID.test(witnessHead)) || heads.length > MAX_HEADS) return undefined;
+    const coverageMessage = new RegExp(`^uzi recovery coverage ${fingerprint} round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\\n$`);
+    const gitObjectId = (body: Buffer): string =>
+      createHash("sha1").update(Buffer.concat([Buffer.from(`commit ${body.length}\0`), body])).digest("hex");
+    try {
+      return await this.withLock(barePath, async () => {
+        // `git cat-file` output is decoded as UTF-8 by the exec plumbing; a body that does not survive
+        // the round trip back to its own object id is refused rather than sent corrupted.
+        const readCommit = async (sha: string): Promise<{ body: Buffer; tree: string; parents: string[]; message: string } | undefined> => {
+          const body = Buffer.from(await this.runGit(barePath, ["--no-replace-objects", "cat-file", "commit", sha]), "utf8");
+          if (body.length > MAX_OBJECT_BYTES || gitObjectId(body) !== sha) return undefined;
+          const text = body.toString("utf8");
+          const split = text.indexOf("\n\n");
+          if (split < 0) return undefined;
+          const header = text.slice(0, split).split("\n");
+          const tree = /^tree ([0-9a-f]{40})$/.exec(header[0] ?? "")?.[1];
+          if (!tree) return undefined;
+          const parents: string[] = [];
+          for (let i = 1; i < header.length; i++) {
+            const parent = /^parent ([0-9a-f]{40})$/.exec(header[i]!)?.[1];
+            if (!parent) break;
+            parents.push(parent);
+          }
+          return { body, tree, parents, message: text.slice(split + 2) };
+        };
+        const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
+        if (!OWED_OID.test(tree) ||
+            createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex") !== fingerprint) return undefined;
+        const aggregates: Array<{ round: number; batch: number; body: Buffer }> = [];
+        const leaves = new Set<string>();
+        const seen = new Set<string>();
+        const queue = [sourceSha];
+        while (queue.length) {
+          const sha = queue.shift()!;
+          if (seen.has(sha)) continue;
+          seen.add(sha);
+          if (seen.size > MAX_AGGREGATES + MAX_HEADS) return undefined;
+          const commit = await readCommit(sha);
+          if (!commit) return undefined;
+          const m = coverageMessage.exec(commit.message);
+          if (!m) {
+            if (sha === sourceSha) return undefined;
+            leaves.add(sha);
+            continue;
+          }
+          if (commit.tree !== tree) return undefined;
+          aggregates.push({ round: Number(m[1]), batch: Number(m[2]), body: commit.body });
+          if (aggregates.length > MAX_AGGREGATES) return undefined;
+          queue.push(...commit.parents);
+        }
+        if (!aggregates.length || [...leaves].sort().join(",") !== heads.join(",")) return undefined;
+        const current = await readCommit(currentSha);
+        if (!current || current.tree !== tree) return undefined;
+        let witnessObject: string | undefined;
+        if (witnessHead !== undefined) {
+          const containment = await this.ancestry(barePath, currentSha, witnessHead);
+          if (containment === "unknown") return undefined;
+          if (containment === "divergent") {
+            const witness = await readCommit(witnessHead);
+            if (!witness || witness.tree !== tree) return undefined;
+            for (const parent of current.parents) {
+              if (await this.ancestry(barePath, parent, witnessHead) !== "ancestor") return undefined;
+            }
+            witnessObject = witness.body.toString("base64");
+          }
+        }
+        aggregates.sort((a, b) => a.round - b.round || a.batch - b.batch);
+        return {
+          coverageDigest: fingerprint, roots: [...roots], currentSha, tree,
+          aggregateObjects: aggregates.map(a => a.body.toString("base64")),
+          currentObject: current.body.toString("base64"),
+          ...(witnessObject === undefined ? {} : { witnessObject }),
+        };
+      });
+    } catch {
+      return undefined;
+    }
   }
 
   private async tryGitStdout(cwd: string | undefined, args: string[]): Promise<string> {

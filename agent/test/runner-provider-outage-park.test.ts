@@ -6,9 +6,10 @@ import path from "node:path";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { ExecutorFactory, RunRunner } from "../src/runner.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
-import { TransientRecoveryError } from "../src/sdk-executor.js";
+import { SdkExecutor, TransientRecoveryError } from "../src/sdk-executor.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, gitlabClaim, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
+import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 import {
   FakeCodexExecutor,
   codexRig,
@@ -202,6 +203,61 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
       });
     });
   }
+
+  it("provider-hold continuation at the owner's scope ceiling still requests a permit and publishes a non-closing partial", async () => {
+    await withHome(async homeRoot => {
+      client.protocolFeatures = FEATURES;
+      const claim = gitlabClaim(3310, {
+        claim_generation: 3,
+        plan_source: "seeded",
+        plan_approved: true,
+        plan_md: "# Approved work",
+        milestones: [{ id: "m1", title: "Delivered" }, { id: "m2", title: "Deferred" }],
+        config: { completion_contract_version: 1, contract_revision: 1 },
+      });
+      const parked = rigFor("claude", { turns: 1 }, homeRoot);
+      api.ackTypedParkAs(claim.run_id, "paused", HOLD);
+      await parked.runner.execute(claim);
+      assert.equal(parks(claim.run_id).length, 1);
+      assert.equal(api.completionPermitRequests.length, 0, "a provider hold does not finalize work");
+      assert.equal(fs.existsSync(worktreeDirFor(3310)), true);
+
+      // Model the server's next claim after Stop caps scope and Resume re-queues the same run.
+      // The real HTTP Stop/Resume transitions are covered in provider_hold_stop_livedb_test.go.
+      const resumed = { ...claim, claim_generation: 4, resume_phase: "implementing" };
+      api.setOwnershipStatus(claim.run_id, "running", 4);
+      api.setStateAckScope(claim.run_id, { scope_ceiling: 1, milestones_completed: ["m1"] });
+      api.setCompletionPermitResponse(true);
+      const forge = fakeGitlab();
+      const pushedHead = followSuccessfulPush(git, forge.pr);
+      let modelQueries = 0;
+      const continuation = runnerWith(() => ({
+        homeDir: parked.homePath(),
+        executor: new SdkExecutor(nullLogger(), parked.homePath(), {
+          queryFn: () => { modelQueries++; throw new Error("scope ceiling must stop before querying the provider"); },
+        }),
+      }), forge.gitlab);
+      await continuation.execute(resumed);
+      assert.equal(modelQueries, 0, "the completed scope ceiling is honored before further model work");
+      assert.equal(api.completionPermitRequests.length, 1, "continuation keeps the completion interlock");
+      const permit = api.completionPermitRequests[0]!.body;
+      assert.equal(permit.claim_generation, 4);
+      assert.equal(permit.scope_capped, true);
+      assert.equal(permit.head, pushedHead());
+      const terminal = api.states.filter(s => s.runId === claim.run_id && s.body.status === "completed").at(-1)?.body;
+      assert.ok(terminal, "the resumed partial completed after permit and head verification");
+      assert.equal(terminal.scope_capped, true);
+      assert.equal(terminal.head, pushedHead());
+      const post = forge.calls.find(c => c.method === "POST");
+      assert.ok(post, "the retained committed work was published");
+      const body = JSON.parse(post.body ?? "{}") as { title: string; description: string };
+      assert.match(body.title, /^\[partial\] /);
+      assert.doesNotMatch(body.description, /Closes #3310/);
+      assert.doesNotMatch(forge.pr.description, /Closes #3310/, "head verification keeps the final description non-closing");
+      assert.equal(api.completionHoldRequests.length, 0);
+      assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "failed"), false);
+    });
+  });
 
   it("a paused ack without the provider hold reason is NOT an accepted park", async () => {
     await withHome(async (homeRoot) => {

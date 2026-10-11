@@ -29,6 +29,7 @@
   "requeue_count": 1,
   "iteration_count": 1,
   "is_planning": true,
+  "is_revising": true,
   "progress": {
     "state": "x",
     "pct": 1,

@@ -81,10 +81,11 @@ type Settings interface {
 	// HealthNudgeCooldownSeconds bounds how often a single run may DM its owner
 	// (PRD #47 M4). 0 means no cooldown (nudge on every ok→flagged transition).
 	HealthNudgeCooldownSeconds(ctx context.Context) (int, error)
-	// RunExtensionCapSeconds is the TOTAL extra wall-clock time an owner may grant a run
-	// through Extend (PRD #1189 M1); 0 disables extending. It rides this run-health-card
+	// RunExtensionCapSeconds is the PER-REQUEST maximum of extra wall-clock time an owner may
+	// grant a run in one Extend (PRD #1189 M1, #2735; the total is bounded only by
+	// MaxRunWallSeconds); 0 disables extending. It rides this run-health-card
 	// reader (the setting lives in that admin card and is served by the same *settings.Cache)
-	// so the `extend` SubmitInput branch can enforce the cap; the health detector itself does
+	// so the `extend` SubmitInput branch can enforce the maximum; the health detector itself does
 	// not read it.
 	RunExtensionCapSeconds(ctx context.Context) (int, error)
 }

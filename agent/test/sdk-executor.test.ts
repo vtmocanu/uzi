@@ -5858,10 +5858,38 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
       [assistantText("impl"), signalDone(), resultSuccess()], // implement turn
     ]);
     let settled = 0;
-    const probe = makeCtx({ agents: [lead, coder, reviewer], onModelTurnSettled: async () => { settled++; } });
+    const probe = makeCtx({ agents: [lead, coder, reviewer], onModelTurnSettled: async count => {
+      assert.ok(count > 0);
+      settled++;
+    } });
+    const approvePlan = probe.ctx.gatePlan!;
+    probe.ctx.gatePlan = async (...args) => {
+      assert.strictEqual(settled, 1, "the successful planning retry settles before approval; its failed attempt did not count");
+      return approvePlan(...args);
+    };
     await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.deepStrictEqual(probe.gated, ["# The Plan"]);
     assert.strictEqual(settled, 2, "plan + implement; the 529 attempt is excluded");
   });
+
+  for (const status of [529, 401]) {
+    it(`planning settlement excludes a failed SDK plan turn (${status})`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [assistantText("drafting the plan"), submitPlan("# Failed draft"), resultApiError(status, `API Error: ${status}`)],
+      ]);
+      let settled = 0;
+      const probe = makeCtx({
+        agents: [lead, coder, reviewer],
+        onModelTurnSettled: async () => { settled++; },
+      });
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(probe.ctx));
+      assert.ok(err instanceof Error);
+      assert.equal(err instanceof TransientRecoveryError, status === 529);
+      assert.strictEqual(turns.length, 1, "the failed planning query actually ran");
+      assert.deepStrictEqual(probe.gated, [], "a submitted draft on a failed query never reaches approval");
+      assert.strictEqual(settled, 0, "planning output and submit_plan do not make a failed turn productive");
+    });
+  }
 
   it("does NOT over-park a permanent 401 — it fails, labelled with 401 and never 'success'", async () => {
     const { queryFn, turns } = fakeTurns([[resultApiError(401, "API Error: 401 Unauthorized")]]);

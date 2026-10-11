@@ -157,7 +157,7 @@ func TestAccountingModelPresentation(t *testing.T) {
 				}
 				m.detail.laneIdx = 0
 				lanes := append([]agentLane(nil), m.detail.lanes...)
-				active := activeLaneKey(m.detail.run.Status, m.detail.frames)
+				active := activeLaneKey(m.detail.run.Status, m.detail.run.IsRevising, m.detail.frames)
 				activity := railActivity(m.detail.frames)
 				m = step(m, streamEventsMsg{runID: "r1", gen: m.detail.gen, events: []apitypes.RunEventDTO{
 					accountingEvent(accountingMsg(12, "lead", "", now.Add(time.Minute))),
@@ -178,7 +178,7 @@ func TestAccountingModelPresentation(t *testing.T) {
 				if !reflect.DeepEqual(lanes, m.detail.lanes) {
 					t.Error("lane counts/frames/LastActivity changed")
 				}
-				if activeLaneKey(m.detail.run.Status, m.detail.frames) != active {
+				if activeLaneKey(m.detail.run.Status, m.detail.run.IsRevising, m.detail.frames) != active {
 					t.Error("active lane changed")
 				}
 				if !reflect.DeepEqual(railActivity(m.detail.frames), activity) {

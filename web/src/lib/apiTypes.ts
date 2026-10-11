@@ -1044,8 +1044,8 @@ export interface AppSettings {
   health_queued_seconds: string;
   health_approval_seconds: string;
   health_nudge_cooldown_seconds: string;
-  // Per-run wall-clock extension allowance (PRD #1189): the total extra time an owner may
-  // grant one run through Extend, integer seconds as a string. 0 turns extending off
+  // Per-request wall-clock extension cap (PRD #1189, #2735): the most extra time an owner may
+  // add to a run in one Extend (the cumulative total is not capped), integer seconds as a string. 0 turns extending off
   // instance-wide. Its bounds differ from the health-seconds keys ({0} ∪ [3600, 604800]),
   // so it carries its OWN client validator in HealthSettingsCard, not validateHealthSeconds.
   run_extension_cap_seconds: string;
@@ -2841,6 +2841,12 @@ export interface Run {
    *  omits the key, and an absent value reads as not-planning (isPlanningRun requires
    *  `=== true`). RunListItem extends Run, so list rows inherit it. */
   is_planning?: boolean;
+  /** issue #750/#2760: server-computed plan-revise display flag — true while the run's
+   *  latest {plan, plan_revising} message is a plan_revising (a "revise" replan in
+   *  flight). Meaningful only with status awaiting_approval: isRevisingRun combines the
+   *  two. OPTIONAL for the SAME rollout skew as is_planning: a pre-feature api pod omits
+   *  the key, and an absent value reads as not-revising. */
+  is_revising?: boolean;
   /** PRD #2602: server-derived progress estimate; null for a terminal run. OPTIONAL for the
    *  same api/web rollout skew as is_planning: a pre-feature api omits the key, and absent
    *  renders no progress. */
@@ -3092,7 +3098,7 @@ export interface Run {
    *
    *  `budget_extension_seconds` is the owner-granted extension added ON TOP of the frozen
    *  budget (0 when never extended). `budget_extension_cap_seconds` is the effective admin
-   *  cap (run_extension_cap_seconds; 0 = disabled), served here so the Extend chooser needs
+   *  PER-REQUEST maximum (run_extension_cap_seconds; each Extend must be <= it; 0 = disabled), served here so the Extend chooser needs
    *  no separate admin-settings read.
    *
    *  `budget_total_seconds` is COALESCE(budget_wall_seconds, RUN_TIMEOUT) + extension, so a
@@ -3107,7 +3113,7 @@ export interface Run {
   budget_extension_cap_seconds?: number;
   /** PRD #1497 M1: the one-time finalize allowance the Stop action grants a wall-parked milestone
    *  issue run (0, or 1800 once granted). It lives OUTSIDE budget_extension_seconds (the owner
-   *  extension cap never sees it) and is the THIRD term of budget_total_seconds. Optional for
+   *  extension never includes it) and is the THIRD term of budget_total_seconds. Optional for
    *  rollout skew: a pre-feature api pod omits the key. */
   budget_finalize_seconds?: number;
   budget_total_seconds?: number | null;
@@ -3616,15 +3622,6 @@ export interface RunListItem extends Run {
    *  appends it only when > 0. */
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
-
-  /** issue #750: server-computed plan-revise display flag on the LIST row (it rides
-   *  RunListItemDTO, deliberately NOT RunDTO — the detail page keeps its own
-   *  derivePlanRevision panel). True while the run's latest {plan, plan_revising} message
-   *  is a plan_revising — a "revise" replan in flight. The server does NOT status-gate
-   *  it, so a client combines it with status (isRevisingRun requires status ===
-   *  "awaiting_approval" AND `=== true`). OPTIONAL for rollout skew: a pre-feature api
-   *  pod omits the key, and an absent value reads as not-revising. */
-  is_revising?: boolean;
 
   repo_path: string;
   worker_name: string | null;

@@ -495,7 +495,7 @@ export const mockRuns: Run[] = [
     budget_max_iterations: 12,
     budget_wall_seconds: 7200,
     // PRD #1189: the budget wire contract. This healthy running run shows `1m / 2h` in the
-    // header elapsed (used aged off deadline_at); no extension yet, a 16h allowance.
+    // header elapsed (used aged off deadline_at); no extension yet, a 16h per-extension cap.
     budget_extension_seconds: 0,
     budget_extension_cap_seconds: 57600,
     budget_total_seconds: 7200,

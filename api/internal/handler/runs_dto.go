@@ -199,7 +199,7 @@ func credentialSwitchState(r store.Run) *string {
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
 // reaches into it. globalTimeout is the instance RUN_TIMEOUT (h.cfg.RunTimeout),
 // passed in the same way, so RunDeadline can be computed here without config access
-// (PRD #1170). extensionCapSeconds is the effective admin extension cap (PRD #1189,
+// (PRD #1170). extensionCapSeconds is the effective admin per-request extension maximum (PRD #1189, #2735,
 // RunExtensionCapSeconds; 0 = extending disabled) and now is the wall-clock instant used
 // for budget_used_seconds — both passed in so this mapper stays pure.
 // forgeParkMax is the effective forge-unreachable park cap (PRD #1392 M1,
@@ -442,14 +442,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	}
 	// PRD #2602: the progress estimate, from the row-only inputs decoded above. Phase is
 	// filled by the callers that also set CurrentActivity.
-	frozenIDs := make([]string, 0, len(dto.Milestones))
-	for _, m := range dto.Milestones {
-		frozenIDs = append(frozenIDs, m.ID)
-	}
-	dto.Progress = runprogress.Derive(runprogress.Input{
-		Kind: r.Kind, Status: r.Status, Health: r.Health, IsPlanning: dto.IsPlanning,
-		FrozenIDs: frozenIDs, Completed: dto.MilestonesCompleted, InProgress: dto.MilestonesInProgress,
-	})
+	deriveProgress(&dto)
 	// PRD #1224: the validated per-milestone agent attribution. Degrades to nil on a decode
 	// error (the stored value is the already-validated subset), same as the id arrays above.
 	if agents, err := workersvc.DecodeMilestoneAgents(r.MilestonesAgents); err != nil {
@@ -466,7 +459,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.BudgetWallSeconds = &v
 	}
 	// PRD #1189: the owner-granted extension (NOT NULL DEFAULT 0 → plain int) and the
-	// effective admin cap, so the Extend chooser and the CLI need no second settings call.
+	// effective admin per-request maximum, so the Extend chooser and the CLI need no second settings call.
 	// The cap is the same value RunExtensionCapSeconds returns (0 = extending disabled).
 	dto.BudgetExtensionSeconds = int(r.BudgetExtensionSeconds)
 	dto.BudgetExtensionCapSeconds = extensionCapSeconds
@@ -620,7 +613,7 @@ func landingStateOverlay(failOrigin *string, hasPreservedPatch, hasAvailableCapt
 	return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, hasAvailableCapture)
 }
 
-// runExtensionCapSeconds reads the per-run extension cap (PRD #1189) best-effort for the DTO:
+// runExtensionCapSeconds reads the per-request extension maximum (PRD #1189, #2735) best-effort for the DTO:
 // a nil settings cache or a read error reads as 0 (extending disabled / unknown), so a
 // momentarily-unreadable setting never fails a run read — the client falls back to plain
 // elapsed and the Extend button does not render (rollout-skew safe).
@@ -784,4 +777,27 @@ func setProgressPhase(dto *apitypes.RunDTO) {
 	if dto.Progress != nil && dto.CurrentActivity != nil {
 		dto.Progress.Phase = runprogress.Phase(dto.CurrentActivity.Agent)
 	}
+}
+
+// deriveProgress (re)builds dto.Progress from the DTO's own fields (PRD #2602), so
+// applyRevising can re-run it once IsRevising is known. Phase is left empty.
+func deriveProgress(dto *apitypes.RunDTO) {
+	frozenIDs := make([]string, 0, len(dto.Milestones))
+	for _, m := range dto.Milestones {
+		frozenIDs = append(frozenIDs, m.ID)
+	}
+	dto.Progress = runprogress.Derive(runprogress.Input{
+		Kind: dto.Kind, Status: dto.Status, Health: dto.Health,
+		IsPlanning: dto.IsPlanning, IsRevising: dto.IsRevising,
+		FrozenIDs: frozenIDs, Completed: dto.MilestonesCompleted, InProgress: dto.MilestonesInProgress,
+	})
+}
+
+// applyRevising stamps the derived is_revising flag (issues #750, #2760) and re-derives
+// Progress, since a revising awaiting_approval run is planning, not waiting. It rebuilds
+// Progress from scratch, so it must run before setProgressPhase, MaybeBlockedByRunID and
+// overlayNowNote, which refine the Progress it replaces.
+func applyRevising(dto *apitypes.RunDTO, revising bool) {
+	dto.IsRevising = revising
+	deriveProgress(dto)
 }
