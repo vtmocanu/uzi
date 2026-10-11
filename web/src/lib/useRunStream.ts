@@ -75,7 +75,9 @@ export function useRunStream(runId: string) {
     }
   }, [runId]);
 
-  const replay = useCallback(async () => {
+  // refreshOnKinds is set only by the debounced catch-up: the mount and onopen paths
+  // already re-read the run themselves, so they skip it rather than fetch it twice.
+  const replay = useCallback(async (refreshOnKinds = false) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     try {
@@ -85,7 +87,7 @@ export function useRunStream(runId: string) {
       // A replayed plan/plan_revising/progress_note never arrived as a live frame, so
       // nothing else re-reads the run for it (a revise changes no status, hence no state
       // frame follows): apply the same refresh a live frame of that kind would (issue #2760).
-      if (hasRefreshKind(batch)) void refreshRun();
+      if (refreshOnKinds && hasRefreshKind(batch)) void refreshRun();
     } catch {
       // Transient; the next frame or reconnect retries. The log is durable, so a
       // failed catch-up only delays rendering, never loses a message.
@@ -153,7 +155,7 @@ export function useRunStream(runId: string) {
       if (catchup != null) return;
       catchup = window.setTimeout(() => {
         catchup = null;
-        void replay();
+        void replay(true);
       }, CATCHUP_DEBOUNCE_MS);
     };
 
