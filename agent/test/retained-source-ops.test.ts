@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { attemptGeneration, formatAttemptId } from "../src/attempt-path.js";
@@ -542,6 +543,34 @@ describe("verifyStoppedSourceCovered", () => {
     const { a, head } = await captured();
     commitOffBranch(a, head, "refs/remotes/origin/x", "planted.txt");
     assert.equal(await verify(a, head), "not_covered", "a remote-tracking ref is no exemption");
+  });
+
+  it("is not covered when a linked worktree holds a clone-only commit that status and for-each-ref cannot see", async () => {
+    const { a, head } = await captured();
+    const wtDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-linked-wt-"));
+    try {
+      fs.rmSync(wtDir, { recursive: true, force: true });
+      gitIn(a.path, ["worktree", "add", "--detach", wtDir, head]);
+      gitIn(wtDir, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "linked-only"]);
+      assert.notEqual(gitIn(wtDir, ["rev-parse", "HEAD"]), head);
+      assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "the clone itself looks clean");
+      assert.equal(await verify(a, head), "not_covered", "a linked worktree HEAD is worker-only source");
+    } finally {
+      fs.rmSync(wtDir, { recursive: true, force: true });
+    }
+  });
+
+  it("is not covered when a clone ref names a blob the bare holds only unreachably", async () => {
+    const { a, head } = await captured();
+    const blobFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-blob-")), "blob.txt");
+    fs.writeFileSync(blobFile, "unreachable blob\n");
+    const blob = gitIn(a.path, ["hash-object", "-w", blobFile]);
+    assert.equal(gitIn(bare, ["hash-object", "-w", blobFile]), blob);
+    fs.rmSync(path.dirname(blobFile), { recursive: true, force: true });
+    assert.equal(gitIn(bare, ["cat-file", "-t", blob]), "blob");
+    gitIn(a.path, ["update-ref", "refs/tags/blobref", blob]);
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "");
+    assert.equal(await verify(a, head), "not_covered", "an object only present, not reachable, in the bare is not held");
   });
 
   it("is not covered when a clone replace ref would hide a staged change from status", async () => {

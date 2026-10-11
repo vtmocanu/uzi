@@ -5557,9 +5557,25 @@ export class GitCache {
    * means "not covered" and any error, a clone-local commit missing from the bare included, also
    * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
    * from the bare. Any failed read is `false`.
+   *
+   * `--objects` makes a ref naming a blob, tree or tag object count as held only when the bare
+   * reaches that object from one of its refs, not when it merely has it as unreachable loose data.
+   *
+   * Residual: coverage is decided atomically under the bare lock and retirement deletes no bare
+   * refs, but after the lock a justifying bare ref (another run's tracking ref, a settled pin, a
+   * pruned `refs/remotes/`) can move and its objects be garbage-collected. Side refs accept ANY
+   * bare ref (the forge or other flows keep their own copy), whereas the head anchor in
+   * {@link verifyStoppedSourceCovered} must be owned by this run and generation, or be an owed pin.
    */
   private async localRefsReachableFrom(barePath: string, cwd: string, head: string): Promise<boolean> {
     try {
+      // Per-worktree HEADs and refs of a linked worktree are invisible to for-each-ref and status,
+      // so any `.git/worktrees/` entry (or an unreadable directory) makes coverage unprovable.
+      const wt = await fs.readdir(path.join(cwd, ".git", "worktrees")).then((n) => n, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return [] as string[];
+        throw err;
+      });
+      if (wt.length > 0) return false;
       const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: NO_REPLACE_ENV });
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
@@ -5574,7 +5590,7 @@ export class GitCache {
       const all = [...shas];
       for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
         const chunk = all.slice(i, i + LOCAL_REF_REVLIST_CHUNK);
-        const extra = await this.runGitWithEnv(barePath, ["rev-list", "-n", "1", ...chunk, "--not", head, "--all"], NO_REPLACE_ENV);
+        const extra = await this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", head, "--all"], NO_REPLACE_ENV);
         if (extra.trim() !== "") return false;
       }
       return true;
@@ -10803,6 +10819,9 @@ export class GitCache {
    * write). Single-uid (#58): `runnerCommand` is a passthrough, so this is a plain git.
    * issue #1783: carries the worker spawn mark only for {@link runnerGitCarriesWorkerMark}'s
    * subcommands; every other runner git runs unmarked (its plants stay reapable).
+   * `opts.env` is merged AFTER gitEnv()'s pins, so it can override them: callers must pass only
+   * benign keys (e.g. GIT_NO_REPLACE_OBJECTS) and never GIT_CONFIG_* or any other
+   * security-relevant key.
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
     const base = { ...gitEnv(), ...opts.env };
