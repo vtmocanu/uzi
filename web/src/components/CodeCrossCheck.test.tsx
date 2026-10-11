@@ -109,13 +109,13 @@ it.each([undefined, null])("does not turn legacy dispositions %s into not report
   expect(screen.queryByText(/not reported/)).toBeNull();
 });
 it.each([
-  ["unknown", persistedFindings, [{ finding_id: "unknown", disposition: "addressed", reason: "hidden reason" }]],
+  ["unknown", [persistedFindings[0]], [{ finding_id: "unknown", disposition: "addressed", reason: "hidden reason" }]],
   ["duplicate dispositions", persistedFindings, [...persistedDispositions, persistedDispositions[0]]],
   ["duplicate findings", [persistedFindings[0], persistedFindings[0]], [persistedDispositions[1]]],
   ["forged identity", [{ id: "KEEP_id-1\n" }], [persistedDispositions[1]]],
   ["bad status", persistedFindings, [{ finding_id: "f2", disposition: "accepted", reason: "hidden reason" }]],
   ["missing reason", persistedFindings, [{ finding_id: "f2", disposition: "addressed" }]],
-  ["reason bytes", persistedFindings, [{ finding_id: "f2", disposition: "addressed", reason: "界".repeat(342) }]],
+  ["reason bytes", [persistedFindings[1]], [{ finding_id: "f2", disposition: "addressed", reason: "界".repeat(341) + "ab" }]],
   ["reason length", persistedFindings, [{ finding_id: "f2", disposition: "addressed", reason: "x".repeat(1025) }]],
   ["invalid UTF16", persistedFindings, [{ finding_id: "f2", disposition: "addressed", reason: "\ud800" }]],
   ["incomplete finalized", persistedFindings, []],

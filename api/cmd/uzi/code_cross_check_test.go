@@ -155,6 +155,22 @@ func TestRunGetCodeCrossCheckDispositions(t *testing.T) {
 			t.Fatalf("missing %q: %s", want, out)
 		}
 	}
+	rowValues := make(map[string]string)
+	for _, row := range codeCrossCheckRows(apitypes.RunDTO{CodeCrossCheckSummary: s}) {
+		rowValues[row[0]] = row[1]
+	}
+	for key, want := range map[string]string{
+		"CODE_CHECK_1_DISPOSITION":        "addressed",
+		"CODE_CHECK_1_DISPOSITION_REASON": "fixed first",
+		"CODE_CHECK_2_DISPOSITION":        "declined",
+		"CODE_CHECK_2_DISPOSITION_REASON": "verified second",
+		"CODE_CHECK_3_DISPOSITION":        "not_reported",
+		"CODE_CHECK_3_DISPOSITION_REASON": "",
+	} {
+		if got, ok := rowValues[key]; !ok || got != want {
+			t.Errorf("%s: present=%t, got %q, want %q", key, ok, got, want)
+		}
+	}
 	s.InterruptedAt = &now
 	out = codeCheckCommand(t, s)
 	if strings.Contains(out, "_COUNTS") || !strings.Contains(out, "EARLIER_CODE_CHECK_1_DISPOSITION") || !strings.Contains(out, "fixed first") {
