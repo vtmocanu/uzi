@@ -87,6 +87,9 @@ CREATE INDEX idx_run_held_publications_live_run ON run_held_publications (live_r
     WHERE live_run_id IS NOT NULL;
 
 ALTER TABLE recovery_custody_holds ADD COLUMN final_publication_id uuid;
+-- A hold's held receipt never dangles: the publication it names cannot be deleted while it does.
+ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_final_publication_id_fkey
+    FOREIGN KEY (final_publication_id) REFERENCES run_held_publications(id) ON DELETE RESTRICT;
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_evidence_check;
 ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_release_evidence_check
     CHECK (release_evidence IS NULL OR release_evidence IN ('publication', 'archive', 'forge_no_output',

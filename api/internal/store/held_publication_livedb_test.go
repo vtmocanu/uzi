@@ -11,7 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #2545 M1: migration 00321's held-publication schema. Every test stands its own
+// Issue #2545 M1: migration 00324's held-publication schema. Every test stands its own
 // database, so the CHECKs, the two triggers and the rebuilt recovery_inventory_hold_guard are
 // executed by real UPDATEs. A refused guard update is a silent zero-row UPDATE (RETURN NULL),
 // a failed CHECK is a 23514, and the tests tell the two apart.
@@ -604,7 +604,7 @@ func TestHeldPublicationRollbackLiveDB(t *testing.T) {
 	}
 	mustExec(ctx, t, pool, `UPDATE run_held_publications SET state='acknowledged',acknowledged_at=now(),
 		expires_at=now()+interval '1 day' WHERE id=$1`, f.pub)
-	if err := store.MigrateDownTo(ctx, dsn, 320); err == nil {
+	if err := store.MigrateDownTo(ctx, dsn, 323); err == nil {
 		t.Fatal("Down accepted a live acknowledged publication")
 	}
 	var applied bool
@@ -612,7 +612,7 @@ func TestHeldPublicationRollbackLiveDB(t *testing.T) {
 		t.Fatalf("refused Down changed the schema: %v %v", applied, err)
 	}
 	mustExec(ctx, t, pool, `UPDATE run_held_publications SET state='deleted',live_run_id=NULL,deleted_at=now() WHERE id=$1`, f.pub)
-	if err := store.MigrateDownTo(ctx, dsn, 320); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 323); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
 	var column, table, guards int
