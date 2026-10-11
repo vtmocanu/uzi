@@ -1,0 +1,380 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { DataVolumeFullError } from "../src/disk-full.js";
+import { PlanRejectedError } from "../src/executor.js";
+import { CodexBoundaryError } from "../src/codex/safety.js";
+import type { StateAck, StateRequest } from "../src/protocol.js";
+import type { RecoveryJournalEntry } from "../src/git.js";
+import { nullLogger } from "./helpers.js";
+import { api, client, fakeGitlab, fx, git, installHarness, runnerWith } from "./runner-harness.js";
+import {
+  trustedCaptureCases,
+} from "./fixtures/trusted-execution-refusals.js";
+import {
+  ROOMY,
+  FULL,
+  QUIESCENT,
+  readGit,
+  fixture,
+  parks,
+  supervisedSafety,
+  LINUX_CAPTURE,
+} from "./runner-terminal-disk-deferral-fixture.js";
+
+installHarness();
+
+describe("terminal execution disk deferral", () => {
+  for (const deferral of ["vault_locked", "refresh_unknown"] as const) {
+    for (const location of ["boundary", "post-WIP proof"] as const) {
+      it(`full-volume opaque rejection redispatches ${location} ${deferral} into credential-free recovery`, async () => {
+        let deferred = false;
+        let settles = 0;
+        let unverified = 0;
+        const boundaries: string[] = [];
+        const interruption = new CodexBoundaryError("reconcile", [], undefined, deferral);
+        const safety = supervisedSafety("empty");
+        const boundary = safety.withBoundary.bind(safety);
+        safety.withBoundary = async (request, action) => {
+          assert.equal(deferred, false, "no credentialed boundary after the deferral");
+          boundaries.push(request.boundary);
+          if (location === "boundary" && request.boundary === "shutdown") {
+            deferred = true;
+            throw interruption;
+          }
+          return boundary(request, action);
+        };
+        const f = fixture({ safety,
+          features: ["recovery_cause_data_volume_full", "claim_generation_fence", "recovery_cause_vault_locked"],
+          settleForCredentialFreeCapture: async () => {
+            assert.equal(deferred, true);
+            settles++;
+            return { kind: "observed_empty" };
+          },
+          runner: { quiesceRun: async (req) => {
+            if (!deferred && location === "post-WIP proof" && req.site === "recovery_capture:after_runner_git") {
+              deferred = true;
+              throw interruption;
+            }
+            return QUIESCENT;
+          } },
+        });
+        let custodySettles = 0;
+        const custody = f.runner as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+        for (const name of ["reapThenSettleRecoveryGeneration", "settleRecoveryGeneration"]) {
+          const original = custody[name]!.bind(f.runner);
+          custody[name] = async (...args) => { custodySettles++; return original(...args); };
+        }
+        const verify = git.verifyRunnerTrackingCovers.bind(git);
+        git.verifyRunnerTrackingCovers = async (...args) => {
+          if (deferred && unverified++ < 4) {
+            assert.equal(settles, 1, "credential-free settlement precedes recapture");
+            assert.equal(fs.existsSync(f.clone()), true);
+            assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+            assert.equal(custodySettles, 0);
+            return false;
+          }
+          return verify(...args);
+        };
+        await f.runner.execute(f.claim);
+        assert.equal(deferred, true);
+        assert.equal(f.calls(), 1, "the executor was never replayed");
+        assert.equal(f.reclaims(), 1, "canonical redispatch never re-enters disk admission");
+        assert.equal(settles, 1);
+        assert.equal(unverified, 5, "credential deferrals outlive the three-attempt disk capture budget");
+        assert.deepEqual(boundaries, ["shutdown"]);
+        assert.equal(custodySettles, 0, "custody is retained");
+        assert.equal(parks().length, 1);
+        assert.equal(parks()[0]!.body.recovery_cause, deferral === "vault_locked" ? "vault_locked" : undefined);
+        assert.equal(parks()[0]!.body.claim_generation, 4);
+        assert.equal(api.states.some((state) => state.body.status === "failed" || state.body.status === "completed"), false);
+        assert.equal(f.forge.calls.length, 0);
+        assert.equal(api.completionPermitRequests.length, 0);
+        assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+        const bare = git.barePathFor(fx.originPath);
+        assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:COMMITTED.txt"), "committed sentinel");
+        assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:DIRTY.txt"), "dirty sentinel");
+        const feed = api.messages(f.claim.run_id).filter((message) => message.kind === "status")
+          .map((message) => String((message.payload as { text?: unknown }).text));
+        assert.equal(feed.filter((text) => text === "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.").length, 1);
+        assert.ok(feed.includes(deferral === "vault_locked"
+          ? "Paused: the run owner's vault is locked. The recovery checkpoint is saved only on this worker; this run resumes automatically at its next retry once the vault is unlocked."
+          : "Paused for credential recovery. The recovery checkpoint is saved only on this worker; this run can resume at its next retry."));
+        if (deferral === "refresh_unknown") assert.ok(feed.every((text) => !/vault/i.test(text)));
+      });
+    }
+  }
+
+  it("alternating safety blocks permits at most fifteen captures and five separate final proofs", { skip: LINUX_CAPTURE }, async () => {
+    let captures = 0;
+    let finals = 0;
+    let markers = 0;
+    git.commitWipMarker = async () => { markers++; return false; };
+    const blocked = { ...QUIESCENT, process: { state: "unverified" as const, processes: [], killed: [], detail: "unknown" } };
+    const f = fixture({ runner: { quiesceRun: async (req) => {
+      if (req.site !== "terminal_disk:after_runner_git") return QUIESCENT;
+      if (markers === 3) { finals++; return blocked; }
+      captures++;
+      return captures % 5 === 0 ? QUIESCENT : blocked;
+    } } });
+    await f.runner.execute(f.claim);
+    assert.equal(captures, 15);
+    assert.equal(markers, 3);
+    assert.equal(finals, 5);
+    assert.equal(parks().length, 0);
+    assert.equal(api.states.find((s) => s.body.status === "failed")?.body.fail_origin, "worker_residue_blocked");
+  });
+
+  for (const verified of [false, true]) {
+    it(`lost and statusless ACKs keep the original capture budget, verified=${verified}`, { skip: LINUX_CAPTURE }, async () => {
+      let markers = 0;
+      const marker = git.commitWipMarker.bind(git);
+      git.commitWipMarker = async (...args) => { markers++; return verified ? marker(...args) : false; };
+      const f = fixture();
+      const report = client.reportState.bind(client);
+      let sends = 0;
+      const latest: unknown[] = [];
+      client.reportState = async (id, body, signal) => {
+        if (body.status === "recovery_wait") {
+          sends++;
+          latest.push(body.checkpoint_contains_latest);
+          assert.equal(body.recovery_cause, "data_volume_full");
+          if (sends === 1) throw new Error("lost reply");
+          if (sends === 2) return { applied: false };
+          api.overrideStateStatus(id, "failed");
+        }
+        return report(id, body, signal);
+      };
+      try {
+        await f.runner.execute(f.claim);
+        assert.equal(sends, 3);
+        assert.equal(markers, verified ? 1 : 3);
+        assert.equal(f.calls(), 1);
+        assert.equal(f.reclaims(), 1);
+        assert.deepEqual(latest, [undefined, undefined, undefined], "no publish ACK means no latest-checkpoint claim");
+        assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "cap ACK causes no extra failure report");
+        assert.equal(fs.existsSync(f.clone()), false, "server-terminal cap uses normal cleanup");
+      } finally { client.reportState = report; }
+    });
+  }
+
+  for (const [name, sample, error] of [
+    ["opaque bytes", FULL, new Error("the agent exited without detail")],
+    ["opaque inodes with roomy bytes", { ...ROOMY, ffree: 1 }, "opaque value"],
+    ["undefined rejection", FULL, undefined],
+    ["NaN rejection", FULL, NaN],
+  ] as const) {
+    it(name, { skip: LINUX_CAPTURE }, async () => {
+      const f = fixture({ sample, error });
+      await f.runner.execute(f.claim);
+      assert.equal(f.calls(), 1);
+      assert.equal(f.reclaims(), 1);
+      assert.equal(parks().length, 1);
+      assert.equal(parks()[0]!.body.recovery_cause, "data_volume_full");
+      assert.equal(parks()[0]!.body.claim_generation, 4);
+      assert.notEqual(parks()[0]!.body.disk_park_preventive, true);
+      assert.equal(api.states.some((s) => s.body.status === "failed" || s.body.status === "completed"), false);
+      assert.equal(f.forge.calls.length, 0, "no finalize/MR");
+      assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+      const bare = git.barePathFor(fx.originPath);
+      assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:COMMITTED.txt"), "committed sentinel");
+      assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:DIRTY.txt"), "dirty sentinel");
+    });
+  }
+  it("fresh generations exhaust the counted disk cap without replay or a second failure", { skip: LINUX_CAPTURE }, async () => {
+    const options = { generation: 4 };
+    const f = fixture(options);
+    const report = client.reportState.bind(client);
+    let counted = 0;
+    const records: { body: StateRequest; ack: StateAck }[] = [];
+    client.reportState = async (id, body, signal) => {
+      if (body.status !== "recovery_wait") return report(id, body, signal);
+      assert.equal(body.claim_generation, options.generation);
+      assert.equal(body.recovery_cause, "data_volume_full");
+      assert.notEqual(body.disk_park_preventive, true);
+      if (body.recovery_cause === "data_volume_full" && body.disk_park_preventive !== true) counted++;
+      const status = counted > 3 ? "failed" : "recovery_wait";
+      api.overrideStateStatus(id, status);
+      const ack = await report(id, body, signal);
+      api.setOwnershipStatus(id, status, options.generation);
+      records.push({ body, ack });
+      return ack;
+    };
+    try {
+      // Four explicit fresh claims are the only admission to another executor turn.
+      // Each generation starts roomy; the executor makes the volume full before rejecting.
+      for (let leg = 0; leg < 4; leg++) {
+        options.generation = 4 + leg;
+        f.claim.claim_generation = options.generation;
+        f.setRoomy();
+        api.setOwnershipStatus(f.claim.run_id, "claimed", options.generation);
+        await f.runner.execute(f.claim);
+        assert.equal(f.calls(), leg + 1);
+        assert.equal(f.reclaims(), leg + 1);
+        assert.equal(counted, leg + 1);
+        assert.equal(records.length, leg + 1);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(f.calls(), leg + 1, "park/terminal ACK cannot replay the executor");
+        if (leg < 3) assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+      }
+      assert.deepEqual(records.map((r) => r.ack.status), ["recovery_wait", "recovery_wait", "recovery_wait", "failed"]);
+      assert.deepEqual(records.map((r) => r.body.claim_generation), [4, 5, 6, 7]);
+      // Server origin stamping is proved by TestDiskParkCapFailsRunLiveDB, not this ACK model.
+      assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "no second generic failure report");
+      assert.equal(f.forge.calls.length, 0, "no finalize/MR");
+      assert.equal(fs.existsSync(f.clone()), false, "terminal cap ACK cleans up the clone");
+      assert.equal(fs.existsSync(f.home), false, "terminal cap ACK cleans up the session");
+    } finally { client.reportState = report; }
+  });
+
+  it("reclaim relief does not restart execution or withdraw the counted park", { skip: LINUX_CAPTURE }, async () => {
+    const f = fixture({ reclaim: async () => f.setRoomy() });
+    await f.runner.execute(f.claim);
+    assert.equal(f.calls(), 1);
+    assert.equal(f.reclaims(), 1);
+    assert.equal(parks().length, 1);
+  });
+
+  for (const entry of trustedCaptureCases) {
+    for (const site of ["source", "fetch"] as const) {
+      it(`trusted capture ${site}: ${entry.reason} [${entry.representation}]`, { skip: LINUX_CAPTURE }, async () => {
+        let captures = 0;
+        const reject = async () => { captures++; throw entry.error(); };
+        if (site === "source") git.commitWipMarker = reject;
+        else git.fetchAgentBranch = reject;
+        const f = fixture();
+        await f.runner.execute(f.claim);
+        assert.equal(f.calls(), 1, "one executor call");
+        assert.equal(f.forge.calls.length, 0, "no finalize/MR");
+        assert.equal(captures, 1, "propagate once, without capture retry");
+        assert.equal(f.reclaims(), 1, "only original opaque rejection reclaims");
+        assert.equal(parks().length, 0, "capture refusal cannot park");
+        const failures = api.states.filter((s) => s.body.status === "failed");
+        assert.equal(failures.length, 1, "one terminal failure");
+        assert.equal(failures[0]!.body.failure_reason, entry.display);
+      });
+    }
+  }
+
+  class UnknownError extends Error {}
+  class NativeNamedError extends Error { constructor() { super("opaque"); this.name = "Error"; } }
+  for (const error of [
+    new UnknownError("opaque"), new NativeNamedError(), new TypeError("opaque"),
+    Object.assign(new Error("opaque"), { name: "UnknownError" }),
+    new Error("wrapped", { cause: new UnknownError("opaque") }),
+    new Error("wrapped", { cause: new PlanRejectedError("not approved") }),
+    new Error("wrapped", { cause: new DataVolumeFullError("typed write", new Error("full")) }),
+    new Error("wrapped", { cause: new Error("denied by guardrail: other trusted policy") }),
+    new Error("wrapped", { cause: new Error("run cancelled") }),
+    new Error("run cancelled"), new Error("codex plan revision budget exhausted"),
+    new Error("Codex claim block is missing a valid capability"),
+    new Error("command cwd escapes the worktree sandbox"),
+    new Error("denied by guardrail: reading the process environment is not permitted"),
+    new Error("plan-gate input delivery failed: refused"),
+  ]) {
+    it(`preserves typed/control/security failure: ${error.name}: ${error.message}`, async () => {
+      const f = fixture({ error });
+      await f.runner.execute(f.claim);
+      assert.equal(f.reclaims(), 0);
+      assert.equal(parks().length, 0);
+      assert.equal(api.states.some((s) => s.body.status === "failed"), true);
+    });
+  }
+
+  for (const [name, error] of [
+    ["plain object", { message: "command cwd escapes the worktree sandbox" }],
+    ["string", "denied by guardrail: reading the process environment is not permitted"],
+    ["string cause", new Error("wrapped", { cause: "denied by guardrail: reading the process environment is not permitted" })],
+  ] as const) {
+    it(`protects security rejection represented as ${name}`, async () => {
+      const f = fixture({ error });
+      await f.runner.execute(f.claim);
+      assert.equal(f.reclaims(), 0);
+      assert.equal(parks().length, 0);
+      assert.equal(api.states.filter((s) => s.body.status === "failed").length, 1);
+    });
+  }
+
+  for (const error of [
+    new Error("wrapped", { cause: new PlanRejectedError("capture policy rejected") }),
+    new Error("denied by guardrail: other trusted policy"),
+    { message: "command cwd escapes the worktree sandbox" },
+    new Error("wrapped", { cause: "denied by guardrail: other trusted policy" }),
+  ]) {
+    it(`propagates protected capture failure: ${String(error)}`, { skip: LINUX_CAPTURE }, async () => {
+      let markers = 0;
+      git.commitWipMarker = async () => { markers++; throw error; };
+      const f = fixture();
+      await f.runner.execute(f.claim);
+      assert.equal(markers, 1, "protected failures cannot become repeated capture attempts");
+      assert.equal(f.reclaims(), 1);
+      assert.equal(parks().length, 0);
+      assert.equal(api.states.filter((s) => s.body.status === "failed").length, 1);
+    });
+  }
+
+  for (const failure of ["wip", "fetch"] as const) {
+    it(`bounds persistent real-Git ${failure} failure and retains both sentinels plus session/journal`, { skip: LINUX_CAPTURE }, async () => {
+      const marker = git.commitWipMarker.bind(git);
+      const fetch = git.fetchAgentBranch.bind(git);
+      let attempts = 0;
+      if (failure === "wip") git.commitWipMarker = async () => { attempts++; return false; };
+      else git.fetchAgentBranch = async () => { attempts++; throw new Error("persistent fetch failure"); };
+      const f = fixture({ runner: { dockerHost: "unix:///fixture-no-daemon" } });
+      await f.runner.execute(f.claim);
+      assert.equal(attempts, 3);
+      assert.equal(f.calls(), 1);
+      assert.equal(f.reclaims(), 1);
+      assert.equal(parks().length, 1);
+      assert.equal(fs.readFileSync(path.join(f.clone(), "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+      assert.equal(fs.readFileSync(path.join(f.clone(), "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+      assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
+      assert.equal(parks()[0]!.body.checkpoint_contains_latest, undefined);
+      const journal = JSON.parse(readGit(git.barePathFor(fx.originPath), "config", "--local", "--get", "uzi-recovery.agent/issue-2201.clone")) as { clonePath: string; runId: string; attemptId: string };
+      assert.equal(journal.clonePath, f.clone());
+      assert.equal(journal.runId, f.claim.run_id);
+      assert.ok(journal.attemptId);
+      assert.equal(fs.existsSync(journal.clonePath), true);
+      git.commitWipMarker = marker;
+      git.fetchAgentBranch = fetch;
+      f.setRoomy();
+      // The fenced successor captures the predecessor and reads both sentinels in this claim.
+      const { gitlab } = fakeGitlab();
+      let resumedCalls = 0;
+      let modelPath = "";
+      let admittedJournal: RecoveryJournalEntry | undefined;
+      const resumed = runnerWith(() => ({ homeDir: f.home, executor: { run: async (ctx) => {
+        resumedCalls++;
+        modelPath = ctx.worktreePath;
+        admittedJournal = JSON.parse(readGit(git.barePathFor(fx.originPath), "config", "--local", "--get", "uzi-recovery.agent/issue-2201.clone")) as RecoveryJournalEntry;
+        assert.notEqual(ctx.worktreePath, journal.clonePath, "successor executes in a fresh attempt path");
+        assert.match(ctx.worktreePath, /\.attempt-/);
+        assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
+        assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+        assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+        throw new PlanRejectedError("stop after durability proof");
+      } } }), gitlab, undefined, nullLogger(), { quiesceRun: async () => QUIESCENT, dockerHost: "unix:///fixture-no-daemon" });
+      const next = { ...f.claim, claim_generation: 5 };
+      api.onState(next.run_id, body => api.setOwnershipStatus(next.run_id, body.status, next.claim_generation));
+      api.setOwnershipStatus(next.run_id, "running", 5);
+      await resumed.execute(next);
+      assert.equal(resumedCalls, 1, "the first fenced successor starts the model");
+      assert.notEqual(modelPath, journal.clonePath);
+      assert.match(modelPath, /\.attempt-.*-g5-/);
+      assert.equal(fs.readFileSync(path.join(modelPath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+      assert.equal(fs.readFileSync(path.join(modelPath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+      assert.equal(fs.readFileSync(path.join(journal.clonePath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+      assert.equal(fs.readFileSync(path.join(journal.clonePath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+      assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
+      assert.equal(parks().length, 1, "local recovery adds no automatic recovery_wait");
+      assert.equal(admittedJournal?.clonePath, modelPath);
+      assert.equal(admittedJournal?.recovery?.stage, "ready-for-model");
+      assert.equal(admittedJournal?.recovery?.attempts, 1, "the model sees the charged recovery episode");
+      assert.ok(admittedJournal?.retainedSources?.some(source => source.clonePath === journal.clonePath && source.attemptId === journal.attemptId));
+      const retained = JSON.parse(readGit(git.barePathFor(fx.originPath), "config", "--local", "--get", "uzi-recovery.agent/issue-2201.clone")) as RecoveryJournalEntry;
+      assert.equal(retained.recovery?.attempts, 1, "fixture interruption preserves the episode budget");
+      assert.ok(readGit(git.barePathFor(fx.originPath), "for-each-ref", "--format=%(refname)", `refs/uzi-recovery-episode/${next.run_id}/`), "episode pins retain custody");
+    });
+  }
+});
