@@ -4,7 +4,7 @@ import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
+import { basename as pathBasename, dirname as pathDirname, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost } from "./client.js";
 import { RecoveryClosureLimitError } from "./recovery-closure.js";
@@ -2742,6 +2742,62 @@ export class RunRunner {
     } finally {
       this.inventoryReservations.delete(ctx.runId);
       if (this.executionTails.get(ctx.runId) === tail) this.executionTails.delete(ctx.runId);
+      release();
+    }
+  }
+
+  /** issue #1786: whether `clonePath` is a live execution attempt of this runner (the operator
+   *  retained-source channel's read-only liveness probe). */
+  isLiveAttemptPath(clonePath: string): boolean {
+    return this.liveAttempts.isLivePath(clonePath);
+  }
+
+  /**
+   * issue #1786: reserve `runId` for the operator retained-source channel, like
+   * {@link withCompletionSourceBoundary}: refuse (never wait) while this runner holds an execution
+   * tail for the run, otherwise install the tail plus the inventory reservation so a successor claim
+   * or background recovery for the run sees the run as executing until `action` settles. `open()` is
+   * true while the tail is still ours, no residue latch is set and none of `clonePaths` is a live
+   * attempt. `quiesce` is a capture-mode scoped quiescence over the paths GitCache is about to
+   * delete; it is true only when every path is proven quiescent.
+   */
+  async withRetainedSourceBoundary<T>(
+    runId: string,
+    clonePaths: readonly string[],
+    action: (ctx: {
+      open: () => boolean;
+      quiesce: (paths: string[]) => Promise<boolean>;
+      isLivePath: (clonePath: string) => boolean;
+    }) => Promise<T>,
+  ): Promise<{ entered: false } | { entered: true; value: T }> {
+    if (this.executionTails.has(runId)) return { entered: false };
+    let release!: () => void;
+    const tail = new Promise<void>(resolve => { release = resolve; });
+    this.executionTails.set(runId, tail);
+    this.inventoryReservations.add(runId);
+    const open = (): boolean => this.executionTails.get(runId) === tail && residueQuarantine() === undefined &&
+      !clonePaths.some(p => this.liveAttempts.isLivePath(p));
+    const quiesce = async (paths: string[]): Promise<boolean> => {
+      if (process.platform !== "linux" || !open()) return false;
+      for (const p of paths) {
+        const base = pathBasename(p);
+        const owner = base.startsWith(".uzi-skills-") ? join(pathDirname(p), base.slice(".uzi-skills-".length)) : p;
+        const outcome = await this.quiesceImpl({
+          mode: "capture" as const, attempt: undefined, cloneKey: cloneKeyOf(owner).cloneKey, targetPaths: [p],
+          processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
+          otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+          site: "retained_ops",
+        });
+        if (outcome.process?.state !== "quiescent" || !open()) return false;
+      }
+      return true;
+    };
+    try {
+      if (!open()) return { entered: false };
+      return { entered: true, value: await action({ open, quiesce, isLivePath: (p) => this.liveAttempts.isLivePath(p) }) };
+    } finally {
+      this.inventoryReservations.delete(runId);
+      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
     }
   }

@@ -14,7 +14,7 @@ import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
 import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
-import type { DindPruneController } from "./dind-prune.js";
+import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
 import type { DindMaintenanceController } from "./dind-maintenance.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
@@ -139,6 +139,14 @@ export class Worker {
     private readonly dindMaintenance?: DindMaintenanceController,
     private readonly terminalRejections?: TerminalRejectionCoordinator,
     private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute">,
+    // issue #1786: the shared claim gate, injected unconditionally (main.ts builds it for every
+    // worker). All three claim lanes use it even when no DinD controller exists, so the operator
+    // retained-source channel can close them. Falls back to a controller's gate only when none
+    // is injected (older callers and tests).
+    private readonly claimGate?: DindPruneGate,
+    // issue #1786: the operator retained-source channel (a local 0600 Unix socket). `serve` is
+    // started alongside the claim loops and settles after the signal aborts and the socket is closed.
+    private readonly retainedSource?: { serve(signal: AbortSignal): Promise<void> },
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -408,7 +416,12 @@ export class Worker {
     const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
     // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
     const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
-    await Promise.all([heartbeat, rejections, settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal)]);
+    // issue #1786: the operator retained-source socket. serve() never rejects: any setup failure
+    // is logged and the worker runs without the channel.
+    const retainedSource = this.retainedSource?.serve(signal).catch((err) => {
+      this.log.warn("retained-source channel stopped", { error: errMessage(err) });
+    }) ?? Promise.resolve();
+    await Promise.all([heartbeat, rejections, settlement, dindPrune, dindMaintenance, diskReclaim, retainedSource, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -1082,7 +1095,7 @@ export class Worker {
     const cap = crossCheckLane ? this.config.crossCheckSlots : this.config.maxConcurrentRuns;
     const active = crossCheckLane ? this.crossCheckActive : this.runActive;
     const lane = crossCheckLane ? "cross-check" : "run";
-    const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
+    const gate = this.claimGate ?? this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedAtCapacity = false;
     let loggedQuarantined = false;
     while (!signal.aborted) {
@@ -1305,7 +1318,7 @@ export class Worker {
    */
   private async chatClaimLoop(signal: AbortSignal): Promise<void> {
     const active = this.chatActive;
-    const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
+    const gate = this.claimGate ?? this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedQuarantined = false;
     while (!signal.aborted) {
       // issue #2213: the same quarantine gate as the run lane (see claimLoop).

@@ -188,6 +188,10 @@ export const execDocker: DockerExec = (argv, opts) =>
     });
   });
 
+/** Who may hold the claim gate closed; `open(owner)` removes only that owner's key. `retained_ops`
+ *  is the operator retained-source channel (issue #1786). */
+export type GateOwner = "cache" | "maintenance" | "retained_ops";
+
 /**
  * The claim gate the two claim loops and the prune share. A claim loop calls
  * {@link tryEnterClaim} before its HTTP claim and {@link exitClaim} once the claimed
@@ -196,7 +200,7 @@ export const execDocker: DockerExec = (argv, opts) =>
  * slip a run in between the idle check and the prune.
  */
 export class DindPruneGate {
-  private readonly blockers = new Set<"cache" | "maintenance">();
+  private readonly blockers = new Set<GateOwner>();
   private inFlight = 0;
 
   /** False while the prune holds the gate; otherwise counts one in-flight claim. */
@@ -216,15 +220,15 @@ export class DindPruneGate {
     return this.blockers.size > 0;
   }
 
-  close(owner: "cache" | "maintenance" = "cache"): void {
+  close(owner: GateOwner = "cache"): void {
     this.blockers.add(owner);
   }
 
-  open(owner: "cache" | "maintenance" = "cache"): void {
+  open(owner: GateOwner = "cache"): void {
     this.blockers.delete(owner);
   }
 
-  heldBy(owner: "cache" | "maintenance"): boolean {
+  heldBy(owner: GateOwner): boolean {
     return this.blockers.has(owner);
   }
 
