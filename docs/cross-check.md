@@ -358,10 +358,10 @@ deletes the ref only if it was also never read. On any doubt the ref is kept.
 
 ### Rolling out Code cross-check
 
-Deploy the api and its migrations (00322 to 00325) before any worker that
+Deploy the api and its migrations (00324 to 00327) before any worker that
 advertises `cross_check_code_v1`. A worker advertises it only with a
 cross-check lane (`WORKER_CROSS_CHECK_SLOTS` above zero) and the Codex
-harness. The Downs of 00322, 00323 and 00325 delete data: 00322 deletes
+harness. The Downs of 00324, 00325 and 00327 delete data: 00324 deletes
 the code-stage checks and their checker runs and drops the new columns,
-00323 deletes your Code pins, and 00325 drops the per-repository guidance
-columns. The Down of 00324 deletes nothing (it only restores two functions). Run a Down only with the new api stopped.
+00325 deletes your Code pins, and 00327 drops the per-repository guidance
+columns. The Down of 00326 deletes nothing (it only restores two functions). Run a Down only with the new api stopped.

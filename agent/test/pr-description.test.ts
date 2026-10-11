@@ -125,7 +125,7 @@ describe("structured code cross-check completion section", () => {
     for (const over of [{ custom_guidance_applied: false, guidance_digest: digest }, {}])
       assert.doesNotMatch(render(over), /custom guidance/);
   });
-  // The cross_checks_reason_class_check allowlist for a failed code row (migration 00322), each with its fixed prose.
+  // The cross_checks_reason_class_check allowlist for a failed code row (migration 00324), each with its fixed prose.
   const reasonProse: Record<string, string> = {
     worker_unsupported: "worker unsupported", snapshot_failed: "snapshot failed", malformed: "checker output malformed",
     model_error: "checker model error", model_timeout: "checker model timed out", checker_unavailable: "no local checker",

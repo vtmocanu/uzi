@@ -253,7 +253,7 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 	}
 	t.Cleanup(pool.Close)
 	// The sqlc queries these paths drive track head, but this private database sits
-	// below the code cross-check migrations (00322 and 00325), so add the columns
+	// below the code cross-check migrations (00324 and 00327), so add the columns
 	// those queries select as inert shims: plain columns with the migrations' types
 	// and defaults, no constraints or triggers. Down/Up of 00320 never touches them.
 	for _, ddl := range []string{
