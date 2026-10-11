@@ -800,8 +800,7 @@ type Forge interface {
 	// third-party review bot (CodeRabbit) stays readable. Bodies are untrusted free
 	// text. GitHub stitches three REST sources with a GraphQL reviewThreads read to
 	// supply both anchors (Resolved facts). Every comment carries its IDNamespace
-	// (CommentNS*): ids are ordered only within one namespace. No caller until PRD
-	// #700's plumbing.
+	// (CommentNS*): ids are ordered only within one namespace.
 	ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error)
 	// ReplyMergeRequestComment posts a reply in the thread keyed on replyID (an
 	// MRComment.ReplyID: the GitLab discussion id, the GitHub REST databaseId, or
