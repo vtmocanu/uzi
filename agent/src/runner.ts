@@ -10909,7 +10909,7 @@ export class RunRunner {
         this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone)),
       ...(claim.code_cross_check_required === true
         && isCodePublishingKind(claim.kind ?? "issue") ? {
-        codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
+        codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
           if (completion.reportOnly || completion.notCode || completion.confirmedEmptyPrompt) return { action: "proceed" as const };
           const decision = await this.runGatedSink(flight, async () => {
             codeGate ??= new CodeCrossCheckGate({
@@ -10946,7 +10946,7 @@ export class RunRunner {
               return { reason_class: "snapshot_failed" as const };
             },
             });
-            return codeGate.done();
+            return codeGate.done({ repairAvailable: completion.repairAvailable !== false });
           });
           const summary = codeGate?.observed();
           const record = summary && !("incomplete" in summary) ? summary : undefined;

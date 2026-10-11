@@ -271,3 +271,32 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
     assert.deepStrictEqual(checkpoints, []);
   });
 });
+
+describe("SdkExecutor code cross-check on the last allowed iteration", () => {
+  for (const interlocked of [false, true]) {
+    it(`${interlocked ? "interlocked" : "legacy"}: findings with no iteration left publish without a repair turn or a hold`, async () => {
+      const { queryFn, prompts } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const holds: string[] = [];
+      const availability: Array<boolean | undefined> = [];
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        kind: "issue", config: { max_iterations: 1 }, completionInterlock: interlocked,
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+        // Models the real gate: findings lead to a repair only while an iteration remains.
+        codeCrossCheckGate: async (completion) => {
+          availability.push(completion.repairAvailable);
+          return completion.repairAvailable === false || availability.length > 1 ? { action: "proceed" } : { action: "repair", followUp: "REPAIR-MARKER" };
+        },
+      }));
+      assert.deepEqual(holds, []);
+      assert.deepEqual(availability, [false]);
+      assert.equal(prompts.length, 2, "plan + implement only; no repair turn");
+      assert.equal(result.branch, "agent/issue-5");
+      assert.equal(result.completionHeld, undefined);
+    });
+  }
+});

@@ -3279,7 +3279,7 @@ export class SdkExecutor implements Executor {
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
             if (unmet.length === 0) {
-              const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly });
+              const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
               if (codeDecision?.action === "repair") {
                 followUp = codeDecision.followUp;
                 turn.done = false;
@@ -3382,7 +3382,7 @@ export class SdkExecutor implements Executor {
             turn.done = false;
             continue;
           }
-          const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: false, reportOnly: declaredReportOnly });
+          const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: false, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
           if (codeDecision?.action === "repair") {
             followUp = codeDecision.followUp;
             turn.done = false;

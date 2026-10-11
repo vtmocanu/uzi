@@ -189,3 +189,13 @@ for (const overrides of [{ findings: [] }, { outcome: "failed" as const, finding
     assert.equal(await r.gate.repair(), undefined);
   });
 }
+
+it("no repair iteration left: done proceeds, never activates repair, and records findings as not_reported", async () => {
+  const r = rig();
+  assert.deepEqual(await r.gate.done({ repairAvailable: false }), { action: "proceed" });
+  assert.deepEqual(r.batches, [[]]);
+  assert.equal(r.gate.repairActive(), false);
+  assert.equal(await r.gate.repair(), undefined);
+  const dispositions = (r.row() as { dispositions: { disposition: string }[] }).dispositions;
+  assert.deepEqual(dispositions.map(d => d.disposition), ["not_reported"]);
+});

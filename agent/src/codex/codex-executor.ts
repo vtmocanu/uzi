@@ -3114,7 +3114,7 @@ export class CodexExecutor implements Executor {
               await epoch.persistSession();
               reapedSinceLastPersist = true;
               epochNeedsRecreate = true;
-              const codeDecision = await ctx.codeCrossCheckGate({ interlocked: false, reportOnly: declaredReportOnly });
+              const codeDecision = await ctx.codeCrossCheckGate({ interlocked: false, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
               if (codeDecision.action === "repair") {
                 epochNeedsRecreate = true;
                 completionFollowUp = codeDecision.followUp;
@@ -3152,7 +3152,7 @@ export class CodexExecutor implements Executor {
           });
           completionAttempted = true;
           if (unmet.length === 0) {
-            const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly });
+            const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
             if (codeDecision?.action === "repair") {
               epochNeedsRecreate = true;
               completionFollowUp = codeDecision.followUp;

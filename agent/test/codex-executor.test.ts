@@ -13635,6 +13635,30 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
   });
 
   for (const interlocked of [false, true]) {
+    it(`code findings on the last allowed iteration publish without a repair turn: ${interlocked ? "interlocked" : "legacy"}`, async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(11, th, tn)]]),
+        script("th-1", [(th, tn) => [done(21, th, tn)]]),
+      ]);
+      const availability: Array<boolean | undefined> = [];
+      const { ctx } = makeCtx({
+        kind: "issue", config: { max_iterations: 1 }, completionInterlock: interlocked,
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        // Models the real gate: findings lead to a repair only while an iteration remains.
+        codeCrossCheckGate: async (completion) => {
+          availability.push(completion.repairAvailable);
+          return completion.repairAvailable === false || availability.length > 1
+            ? { action: "proceed" } : { action: "repair", followUp: "REPAIR-MARKER" };
+        },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "last iteration code gate");
+      assert.deepEqual(availability, [false]);
+      assert.equal(rig.epochs.flatMap((epoch) => turnTexts(epoch.transport)).length, 1, "no repair turn beyond the budget");
+      assert.equal(result.completionHeld, undefined);
+    });
+  }
+
+  for (const interlocked of [false, true]) {
     const label = interlocked ? "interlocked" : "non-interlocked";
 
     it(`${label}: remediate re-prompts the same live epoch, then proceed completes`, async () => {

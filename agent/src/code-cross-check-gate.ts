@@ -105,7 +105,7 @@ export class CodeCrossCheckGate {
     return this.summary;
   }
 
-  async done(): Promise<CodeCrossCheckDecision> {
+  async done(opts: { repairAvailable?: boolean } = {}): Promise<CodeCrossCheckDecision> {
     const first = !this.called;
     this.called = true;
     // Closing authority precedes final done. Later calls only read; they never snapshot or submit.
@@ -113,7 +113,9 @@ export class CodeCrossCheckGate {
     this.active = undefined;
     const row = first ? this.remember(await checkCode(this.options)) : await this.read();
     if (!this.current(row)) return { action: "proceed" };
-    if (first && row.findings.length > 0 && row.finalized_at == null) {
+    // With no implementation iteration left the findings are advisory only: skip the repair and fall
+    // through to the empty finalizer, which records every finding as not_reported.
+    if (first && row.findings.length > 0 && row.finalized_at == null && opts.repairAvailable !== false) {
       this.repairSignal = new AbortController();
       this.active = row;
       return { action: "repair", followUp: buildAutomaticRevisionPrompt("code", { findings: row.findings }) };
