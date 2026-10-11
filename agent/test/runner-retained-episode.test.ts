@@ -301,7 +301,8 @@ for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
     client.releaseRecoveryCustody = async () => { releases++; throw new Error("must not release"); };
     (r as any).recovery.forgetGeneration = async () => { forgets++; };
     git.deleteRecoveryPin = async () => { deletes++; };
-    client.getRunOwnership = async (_run, signal) => {
+    client.getRunOwnership = async (_run, options) => {
+      const signal = options instanceof AbortSignal ? options : options?.signal;
       reads++;
       const active = (r as any).activeRuns.get(claim.run_id);
       active.steering.cancelled = true;
@@ -513,9 +514,11 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
       if (options.deadline) {
         assert.ok(args[1], "verification passes its independent bounded signal");
         return new Promise<Awaited<ReturnType<typeof owner>>>((_resolve, reject) => {
-          const aborted = () => reject(args[1]!.reason);
-          if (args[1]!.aborted) aborted();
-          else args[1]!.addEventListener("abort", aborted, { once: true });
+          const signal = args[1] instanceof AbortSignal ? args[1] : args[1]?.signal;
+          assert.ok(signal);
+          const aborted = () => reject(signal.reason);
+          if (signal.aborted) aborted();
+          else signal.addEventListener("abort", aborted, { once: true });
         });
       }
       if (options.proofTerminal === "shutdown") (r as any).shuttingDownGlobal = true;
@@ -1540,7 +1543,8 @@ for (const setupDelay of [0, 5_000]) {
       }
       return report(...args);
     };
-    client.getRunOwnership = async (_run, signal) => {
+    client.getRunOwnership = async (_run, options) => {
+      const signal = options instanceof AbortSignal ? options : options?.signal;
       if (Date.now() >= old.recovery.deadline) lateReads++;
       if (++reads !== 1) {
         await new Promise(resolve => setTimeout(resolve, 600));

@@ -210,7 +210,7 @@ export interface RecoveryArchiveClient {
   hasFeature?(feature: string): boolean;
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
-  getRecoveryCaptureStatus(runId: string, captureId: string): Promise<RecoveryCaptureStatusResponse>;
+  getRecoveryCaptureStatus(runId: string, captureId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RecoveryCaptureStatusResponse>;
   uploadRecoveryBundle(
     runId: string,
     captureId: string,
@@ -228,7 +228,7 @@ export interface RecoveryArchiveClient {
     releaseEvidence?: string,
     finalDisposition?: RecoveryFinalDisposition,
   ): Promise<RecoveryReleaseResponse>;
-  getRunOwnership?(runId: string): Promise<RunOwnershipResponse>;
+  getRunOwnership?(runId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   /** The worker's own open custody holds on a run — the post-clone generation-exact inventory
    *  (PRD #1349 M1/M2, D3). */
   listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
@@ -236,6 +236,10 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
+  withReportProofBudget?: GitCache["withReportProofBudget"];
+  withBareLock?: GitCache["withBareLock"];
+  readInventoryCloneHeadsUnderLock?: GitCache["readInventoryCloneHeadsUnderLock"];
+  enumerateOwedUnderLock?: GitCache["enumerateOwedUnderLock"];
   cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
   readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
@@ -1089,6 +1093,102 @@ export class RecoveryCoordinator {
       return { state: retained.state, captureId: retained.captureId, reason: retained.reason };
     }
     return outcome;
+  }
+
+  /** C -> S -> J -> B -> O. This operation consumes archive observations only;
+   * the callback performs the conditional exact unlink before any boundary releases.
+   * At most 256 journals and their captures are considered; a bad candidate retains
+   * its report, without granting FINAL, capture or cleanup authority. */
+  async retireArchivedReport(
+    runId: string, generation: number,
+    budget: { signal: AbortSignal; deadline: number },
+    reserve: (action: (ownTailEligible: () => boolean) => Promise<void>) => Promise<void>,
+    inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
+      laterHead: (head: string) => boolean) => Promise<boolean>,
+    remove: (ownTailEligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
+        !this.git.withBareLock || !this.git.withReportProofBudget ||
+        !this.git.enumerateOwedUnderLock || !this.git.readInventoryCloneHeads ||
+        !this.git.ancestry || !this.client.getRunOwnership) return;
+    const check = () => {
+      budget.signal.throwIfAborted();
+      if (Date.now() >= budget.deadline || residueQuarantine() !== undefined) throw new Error("report proof unavailable");
+    };
+    await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
+      () => reserve(ownTailEligible => this.withJournalLock(runId, async () => {
+        check();
+        const sources = await this.checkedRecords(runId, budget);
+        const records = sources.filter(r => r.generation === generation && r.inventoryGuarded === true &&
+          r.state === "uploaded" && r.serverCaptureId && r.coverageDigest && r.coverageContext &&
+          r.originalSourceSha && r.inventoryCurrentSha && Array.isArray(r.originalRoots) &&
+          /^[0-9a-f]{40}$/.test(r.sourceSha) && /^[0-9a-f]{64}$/.test(r.checksum ?? "") &&
+          Number.isSafeInteger(r.byteSize) && r.byteSize! > 0 &&
+          r.reason !== "inventory_snapshot_changed" && r.reason !== "inventory_quiescence_breach");
+        if (records.length !== 1) return;
+        for (const record of records) {
+          check();
+          const bare = record.bareDir && await this.git.withReportProofBudget!(budget,
+            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined));
+          if (!bare || bare !== record.coverageContext!.barePath) continue;
+          const removed = await this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
+            check();
+            const ownership = await this.client.getRunOwnership!(runId, budget);
+            if (!ownership || !["completed", "failed", "cancelled"].includes(ownership.status) ||
+                !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
+                (ownership.inventory_guarded !== undefined && typeof ownership.inventory_guarded !== "boolean")) return false;
+            const status = await this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget);
+            if (!healthyInventoryStatus(status, record, this.now())) return false;
+            check();
+            const owed = await this.git.enumerateOwedUnderLock!(bare, runId);
+            const settledEarlier = await this.settledEarlierGenerations(sources, generation);
+            const laterContext = (c: OwedCandidate["contexts"][number]) =>
+              Number.isSafeInteger(c.generation) && c.generation! > generation;
+            const laterHead = (sha: string) => {
+              const journals = sources.filter(r => !r.coverageDigest && r.sourceSha === sha);
+              const producers = owed.filter(c => c.sha === sha).flatMap(c => c.contexts);
+              return journals.length + producers.length > 0 &&
+                journals.every(r => Number.isSafeInteger(r.generation) && r.generation! > generation) &&
+                producers.every(laterContext);
+            };
+            const covered = async (head: string) => {
+              check();
+              return /^[0-9a-f]{40}$/.test(head) &&
+                await this.git.ancestry!(bare, head, record.sourceSha) === "ancestor";
+            };
+            for (const source of sources) {
+              if (source.captureId === record.captureId ||
+                  (Number.isSafeInteger(source.generation) &&
+                    (source.generation! > generation || settledEarlier.has(source.generation!)))) continue;
+              if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha ||
+                  !Array.isArray(source.originalRoots))) return false;
+              const heads = source.coverageDigest
+                ? [source.originalSourceSha!, source.inventoryCurrentSha!, ...source.originalRoots!.map(r => r.sha)]
+                : [source.sourceSha];
+              for (const head of heads) if (!await covered(head)) return false;
+            }
+            for (const root of owed) {
+              const contexts = root.contexts.filter(c => !laterContext(c) &&
+                !(Number.isSafeInteger(c.generation) && settledEarlier.has(c.generation!)));
+              if (!contexts.length) continue;
+              if (!record.originalRoots!.some(frozen => root.sha === frozen.sha &&
+                  contexts.every(c => frozen.contexts.some(p => canonicalJson(p) === canonicalJson(c)))) ||
+                  !await covered(root.sha)) return false;
+            }
+            // Frozen original/current heads remain requirements even if their pins disappeared.
+            for (const head of [record.originalSourceSha!, record.inventoryCurrentSha!,
+                ...record.originalRoots!.map(r => r.sha)]) if (!await covered(head)) return false;
+            if (!await inspectSources(bare, covered, laterHead)) return false;
+            check();
+            if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
+                canonicalJson(await this.git.enumerateOwedUnderLock!(bare, runId)) !== canonicalJson(owed)) return false;
+            if (!ownTailEligible()) return false;
+            await remove(ownTailEligible);
+            return true;
+          }));
+          if (removed) return;
+        }
+      }, budget.signal)));
   }
 
   private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>, reconcile: boolean): Promise<RecoveryOutcome | void> {
@@ -2566,7 +2666,7 @@ export class RecoveryCoordinator {
 
   /** One bounded pass over physical JSON files; any failed read blocks authority.
    * Paths must resolve inside this coordinator's root, with no symlink file reads. */
-  private async checkedRecords(runId: string): Promise<RecoveryRecord[]> {
+  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }): Promise<RecoveryRecord[]> {
     if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("unsafe recovery run id");
     const root = path.resolve(this.recoveryRoot);
     const dir = this.runDir(runId);
@@ -2588,15 +2688,32 @@ export class RecoveryCoordinator {
       throw new Error("symlink recovery directory");
     }
     // Disappearance after a positive directory check is unknown, not empty proof.
-    names = await fs.readdir(dir);
+    const before = await fs.lstat(dir);
+    if (budget) {
+      names = [];
+      const directory = await fs.opendir(dir);
+      try {
+        for (;;) {
+          budget.signal.throwIfAborted();
+          if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+          const entry = await directory.read();
+          if (!entry) break;
+          if (names.length >= 256) throw new Error("report journal entry budget");
+          names.push(entry.name);
+        }
+      } finally { await directory.close(); }
+    } else names = await fs.readdir(dir);
     const records: RecoveryRecord[] = [];
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
-      const result = await this.readRecordResult(path.join(dir, name), true);
+      const result = await this.readRecordResult(path.join(dir, name), true, budget);
       if (result.kind !== "ok" || result.record.runId !== runId ||
           name !== result.record.captureId + ".json") throw new Error("unverified recovery journal");
       records.push(result.record);
     }
+    const after = await fs.lstat(dir);
+    if (budget && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
+        before.ctimeMs !== after.ctimeMs)) throw new Error("report journal directory changed");
     return records;
   }
 
@@ -2632,8 +2749,8 @@ export class RecoveryCoordinator {
       .some(r => r.generation === record.generation && r.inventoryGuarded === true);
   }
 
-  private withJournalLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn);
+  private withJournalLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn, signal);
   }
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
@@ -2663,6 +2780,7 @@ export class RecoveryCoordinator {
   private async readRecordResult(
     filePath: string,
     noFollow = false,
+    budget?: { signal: AbortSignal; deadline: number },
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
     if (!this.key) return { kind: "unreadable" };
     let raw: string;
@@ -2670,8 +2788,27 @@ export class RecoveryCoordinator {
       if (noFollow) {
         const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         try {
-          if (!(await file.stat()).isFile()) return { kind: "unreadable" };
-          raw = await file.readFile("utf8");
+          const before = await file.stat({ bigint: true });
+          if (!before.isFile()) return { kind: "unreadable" };
+          if (budget) {
+            if (before.size > BigInt(1024 * 1024)) return { kind: "unreadable" };
+            const bytes = Buffer.alloc(1024 * 1024 + 1);
+            let length = 0;
+            while (length < bytes.length) {
+              budget.signal.throwIfAborted();
+              if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+              const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
+              if (!bytesRead) break;
+              length += bytesRead;
+            }
+            if (length > 1024 * 1024) return { kind: "unreadable" };
+            const after = await file.stat({ bigint: true });
+            const named = await fs.lstat(filePath, { bigint: true });
+            if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
+                before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+                before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) return { kind: "unreadable" };
+            raw = bytes.subarray(0, length).toString("utf8");
+          } else raw = await file.readFile("utf8");
         } finally { await file.close(); }
       } else {
         raw = await fs.readFile(filePath, "utf8");

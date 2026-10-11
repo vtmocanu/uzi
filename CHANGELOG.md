@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Cancelled runs stop counting as active once their exact generation's archive covers retained source ([#2652](https://github.com/vtmocanu/uzi/issues/2652)).**
+  After execution ends, workers can retire an authenticated terminal or finalize report when fresh terminal ownership and a verified archive cover the same generation and its current clean source. Uncertain, changed or dirty sources retain the report; retirement keeps custody holds, source pins and clone cleanup protections intact.
+
 - **Worker images exclude run-local artifacts from their baked source ([#2523](https://github.com/vtmocanu/uzi/issues/2523)).**
   Both worker templates exclude `.uzi/`, keeping scratch and recovery artifacts out of `/opt/uzi-src` and preventing scratch updates from invalidating the source-copy cache.
 

@@ -358,9 +358,28 @@ inventory can still retry when execution and quarantine guards permit it.
 Boot discovery does not recreate journals for closed or discarded holds.
 
 Retiring a queued completion or finalization report is a separate decision.
-Without a covering acknowledgment or a persisted exact-generation
-completed-publication receipt, the worker needs fresh proof of terminal
-ownership and a complete, nonempty custody decision for that exact generation,
+An authenticated report for generation G can retire after real execution ends
+when fresh ownership is terminal (`completed`, `failed` or `cancelled`) at
+exactly G, and an authenticated exact-G reservation/upload journal identifies
+a fresh, healthy **Available** server archive with a matching bound manifest.
+The worker must also prove complete current source coverage and strictly clean
+actual clone contents; archive byte verification alone does not establish
+source completeness. Dirty, untracked or reset-soft WIP retains the report;
+a clean, covered WIP commit can qualify. A thin capture can support this
+**report-only** decision, without authorizing FINAL, custody release, source
+or pin deletion, or clone cleanup. Busy execution, queued duplicates, changed
+report identity, missing old-contract evidence, uncertain reads, input overflow
+or an expired proof budget retain the report. Proof is bounded to one second
+and any shorter caller budget; restart requires fresh proof. Once live execution
+has ended and the report retires, the next accepted heartbeat omits its
+terminal-pending active-run row. See
+[ADR-2652](../adr/2652-report-only-retirement.md) for the protected boundary,
+cancellation and rollout limits.
+
+Outside that archive-backed exception, without a covering acknowledgment or a persisted
+exact-generation completed-publication receipt,
+the worker needs fresh proof of terminal ownership and a complete, nonempty
+custody decision for that exact generation,
 with no open sibling holds on that worker. Pending guarded inventory requires
 every exact hold to be **discarded**; a mixture of released and discarded
 holds is insufficient. With absent recovery journals, released or discarded
