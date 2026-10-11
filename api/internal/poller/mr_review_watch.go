@@ -26,8 +26,8 @@ import (
 // ciAutofixStore.
 type mrReviewWatchStore interface {
 	ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRReworkCandidatesRow, error)
-	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error)
+	RemoveMRReworkPendingKeys(ctx context.Context, arg store.RemoveMRReworkPendingKeysParams) error
 	SetMRReworkHaltNotified(ctx context.Context, arg store.SetMRReworkHaltNotifiedParams) error
 	DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUID) (int64, error)
 	// The review-comment author verdict cache and queue reads (issue #2347).
@@ -41,8 +41,13 @@ type mrReviewWatchStore interface {
 // the run go through the SAME guards — the one-active-mr_rework-per-MR index and the
 // create-time cross-kind branch guard — so the detector receives ErrActiveMRReworkExists /
 // ErrBranchInUse to swallow on a race, and likewise swallows the under-lock refusals
-// ErrMRReworkCapReached, ErrReworkNothingNew and ErrReworkPermissionUnknown.
+// ErrMRReworkCapReached, ErrReworkNothingNew, ErrReworkLedgerChanged and ErrReworkPermissionUnknown.
+//
+// BootstrapReviewLedger turns the ledger row the detector read (before listing comments) into
+// the namespaced state the assessor plans against, upgrading a legacy row once from the
+// complete listing (ADR-1199).
 type MRReworkRunStarter interface {
+	BootstrapReviewLedger(ctx context.Context, repoID uuid.UUID, ref string, pre store.GetMRReworkLedgerRow, comments []forge.MRComment) (workersvc.ReviewLedgerState, error)
 	CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error)
 }
 
@@ -231,16 +236,16 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		slog.Warn("poller: mr-rework review author queue read", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		return
 	}
-	// The ledger row. No row means this MR was never reworked: the generated :one
-	// returns a zero-value struct alongside pgx.ErrNoRows (attempt_count=0,
-	// high_water=0, halt_notified=false, no pending ids), so every gate below keys on those
-	// values, NEVER on row-existence. Read BEFORE the comment listing (and so before the
-	// assessment): every pending id in it existed before the list was fetched, so a pending id
-	// absent from the list is gone, whatever the forge's comment-id order (GitHub and Forgejo
-	// number comment types from separate sequences, so no id comparison can stand in for this).
-	// Planning against this older row is safe: the ledger merge tolerates it (GREATEST high-water,
-	// the prior_high_water filter, conditional supersession pairs). Which comments are NEW (above
-	// the mark, or pending) decides which authors are worth a lookup.
+	// The ledger row. No row means this MR was never reworked: the generated :one returns a
+	// zero-value struct alongside pgx.ErrNoRows (attempt_count=0, not legacy, no marks, no
+	// pending keys), so every gate below keys on those values, NEVER on row-existence. A row
+	// written before ADR-1199 reads as legacy (Legacy true) until BootstrapReviewLedger upgrades
+	// it. Read BEFORE the comment listing (and so before the assessment): every pending key in
+	// it existed before the list was fetched, so a pending key absent from the list is gone,
+	// whatever the forge's comment-id order. Planning against this older row is safe: the ledger
+	// merge tolerates it (per-namespace GREATEST marks, conditional supersession pairs) and the
+	// bootstrap and the create both compare against it under the branch lock. Which comments are
+	// NEW (above their namespace's mark, or pending) decides which authors are worth a lookup.
 	led, err := d.q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: r.ID, Ref: ref})
 	switch {
 	case err == nil, errors.Is(err, pgx.ErrNoRows):
@@ -265,6 +270,32 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return
 	}
 
+	// Namespaced ledger state. A legacy row is upgraded here, once, from this complete listing
+	// (a failed listing returned above and leaves the row legacy). The overflow refusal logs
+	// once per MR per tick with counts only; a concurrent change returns silently and the next
+	// tick retries from a fresh read.
+	state, err := d.runs.BootstrapReviewLedger(ctx, r.ID, ref, led, comments)
+	switch {
+	case err == nil:
+	case errors.Is(err, workersvc.ErrReviewLedgerBootstrapOverflow):
+		var ov *workersvc.ReviewLedgerBootstrapOverflowError
+		if errors.As(err, &ov) {
+			slog.Warn("poller: mr-rework withheld: review ledger bootstrap overflow",
+				"repo", r.PathWithNamespace, "ref", ref, "reason", "bootstrap_overflow",
+				"legacy_pending", ov.LegacyIDs, "expanded_keys", ov.ExpandedKeys)
+		} else {
+			slog.Warn("poller: mr-rework withheld: review ledger bootstrap overflow",
+				"repo", r.PathWithNamespace, "ref", ref, "reason", "bootstrap_overflow")
+		}
+		return
+	case errors.Is(err, workersvc.ErrReworkLedgerChanged):
+		slog.Debug("poller: mr-rework ledger changed during bootstrap (retry next tick)", "repo", r.PathWithNamespace, "ref", ref)
+		return
+	default:
+		slog.Warn("poller: mr-rework review ledger bootstrap", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		return
+	}
+
 	as, err := assessor.Begin(ctx, workersvc.ReviewAssessParams{
 		RepoID:         r.ID,
 		Ref:            ref,
@@ -274,8 +305,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		Lookup:         f,
 		Trusted:        trusted,
 		Comments:       comments,
-		HighWater:      led.HighWater,
-		Pending:        led.PendingUnknownIds,
+		Ledger:         state,
 		QueueBound:     queueBound,
 	})
 	if err != nil {
@@ -319,13 +349,17 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 	plan := res.PlanAssessed()
 
-	// A pending id the snapshot caps evicted falls back to human review: drop it from the
+	// A pending key the snapshot caps evicted falls back to human review: drop it from the
 	// pending set now, even when no run is created below. Left pending it would keep HasTrigger
 	// (which ignores the caps) true while plan.HasNew stays false, so every tick would repeat
 	// the full assessment. Best effort: a failed write is retried by the next tick.
 	if len(plan.PendingEvicted) > 0 {
-		if err := d.q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: r.ID, Ref: ref, Ids: plan.PendingEvicted}); err != nil {
-			slog.Warn("poller: mr-rework drop evicted pending ids", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		keys := make([]string, 0, len(plan.PendingEvicted))
+		for _, k := range plan.PendingEvicted {
+			keys = append(keys, k.String())
+		}
+		if err := d.q.RemoveMRReworkPendingKeys(ctx, store.RemoveMRReworkPendingKeysParams{RepoID: r.ID, Ref: ref, Keys: keys}); err != nil {
+			slog.Warn("poller: mr-rework drop evicted pending keys", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		}
 	}
 
@@ -341,22 +375,18 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return // comment written against a superseded head SHA
 	}
 
-	// GATE 3 — NEW ACTIONABLE COMMENT PAST THE HIGH-WATER (Decision 2 / SC3, issue
-	// #1142). Fire only when an eligible ACTIONABLE kept comment has id STRICTLY ABOVE the
-	// consumed high-water, or is pending (an earlier permission-unknown comment whose author
-	// has since resolved eligible, issue #2347). A comment at/below the mark is never
-	// re-acted; a non-actionable note (a bot walkthrough/summary) never counts, and a
-	// summary-only tick does not advance the high-water — leaving the mark unmoved is what
-	// lets a later actionable comment with a lower forge id still fire (it also avoids
-	// widening the scalar-high-water skip below rather than narrowing it).
-	//
-	// 🔴 KNOWN LIMITATION (documented decision, mirrored from the 00168 migration
-	// comment, NOT an oversight): GitHub/Forgejo source comment ids from DISTINCT
-	// sequences, so this SCALAR high-water can skip a genuinely-new comment whose id is
-	// below a previously-consumed comment from another sequence. It is FAIL-SAFE (a
-	// skipped comment falls back to human review, never a wrong write) and bounded by
-	// the capLimit. A per-sequence high-water is the robust follow-up; the scalar mark is
-	// what Decision 2 + SC3 specify.
+	// GATE 3 — NEW ACTIONABLE COMMENT PAST ITS NAMESPACE'S MARK (Decision 2 / SC3, issue #1142,
+	// ADR-1199). A comment's identity is its namespace plus its id: a forge draws ids from
+	// distinct sequences (forge.CommentNS*), so ids are ordered only within one namespace. The
+	// ledger keeps one advance-only consumed mark per namespace and its pending keys are
+	// source-qualified, and a legacy row (one scalar high-water) is bootstrapped once from the
+	// first complete listing. Fire only when an eligible ACTIONABLE kept comment has an id
+	// STRICTLY ABOVE its own namespace's mark, or is pending (an earlier permission-unknown
+	// comment whose author has since resolved eligible, issue #2347). A comment at/below its
+	// mark is never re-acted, and a high id in one namespace never hides a new comment in
+	// another. A non-actionable note (a bot walkthrough/summary) never counts, and a
+	// summary-only tick does not advance any mark, so a later actionable comment with a lower
+	// id still fires.
 	if !plan.HasNew {
 		return
 	}
@@ -414,7 +444,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	case err == nil:
 	case errors.Is(err, workersvc.ErrBranchInUse), errors.Is(err, workersvc.ErrActiveMRReworkExists),
 		errors.Is(err, workersvc.ErrMRReworkCapReached), errors.Is(err, workersvc.ErrReworkNothingNew),
-		errors.Is(err, workersvc.ErrReworkPermissionUnknown):
+		errors.Is(err, workersvc.ErrReworkLedgerChanged), errors.Is(err, workersvc.ErrReworkPermissionUnknown):
 		// A race with a ci_fix on the branch, a concurrent rework on this MR, or a concurrent
 		// cycle that consumed these comments or spent the cap: swallow, nothing was written,
 		// retry next tick.
