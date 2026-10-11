@@ -5380,6 +5380,70 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
   });
 });
 
+// Issue #2760: a run re-planning after a revise stays awaiting_approval, but the server
+// derives is_revising + progress.state "planning", so the header pill and the progress card
+// must not say the run waits on the owner.
+describe("RunView — a revising run does not read as waiting on the owner (issue #2760)", () => {
+  const PROGRESS_BASE = {
+    pct: null,
+    milestone_done: 0,
+    milestone_total: 0,
+    active_milestone_id: "",
+    phase: "",
+  } as const;
+  const extra = mockApi as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows no 'awaiting approval' pill and no 'waits on you' while revising", async () => {
+    renderPage({
+      status: "awaiting_approval",
+      is_revising: true,
+      progress: { ...PROGRESS_BASE, state: "planning" },
+    });
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText(/awaiting approval/i)).toBeNull();
+    expect(screen.queryByText(/waits on you/i)).toBeNull();
+    expect(screen.getAllByText(/revising/i).length).toBeGreaterThan(0);
+  });
+
+  it("still reads waiting on the owner for a plan gate that is not revising", async () => {
+    renderPage({
+      status: "awaiting_approval",
+      is_revising: false,
+      progress: { ...PROGRESS_BASE, state: "waiting" },
+    });
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByText(/awaiting approval/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/waits on you/i)).toBeTruthy();
+  });
+});
+
 // Issue #1197 (a11y): recovery_wait is a self-resuming park with NO ActivityFeed message
 // backup (unlike limit_wait, whose run message the feed's polite region narrates) and
 // RecoveryWaitPanel mounts in the same tick as its content — so, exactly like pool_wait,
@@ -7041,5 +7105,55 @@ describe("usage-limit provider regression #2360", () => {
   it.each([true, false])("keeps the shared setting neutral for read-only state %s", (wait_on_limit) => {
     render(<LimitWaitPanel run={run({ status: "running", harness: "codex", wait_on_limit })} canSteer={false} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />);
     expect(screen.getByText(`${wait_on_limit ? "Waiting" : "Not waiting"} out future usage limits on this run — only its owner can change this.`)).toBeTruthy();
+  });
+});
+
+describe("RunView side-only usage panel", () => {
+  const entry = (over: Record<string, unknown> = {}) => ({
+    "claude-haiku-4-5": { inputTokens: 400, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered", ...over },
+  });
+  const msg = (kind: string, payload: unknown): RunMessage => ({
+    seq: 1, kind, agent: "lead", agent_instance: null, agent_label: null, payload, created_at: "2026-07-12T00:00:00Z",
+  });
+  const usageOf = (cost_status: "metered" | "unreported") => ({
+    input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0, cost_status,
+  });
+  function showWith(messages: RunMessage[], cost_status: "metered" | "unreported" = "metered") {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "failed", usage: usageOf(cost_status) }), messages, connected: true, error: "", submit: vi.fn(),
+      refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+  }
+  const rowsOf = (table: HTMLElement) =>
+    Array.from(table.querySelectorAll("tbody tr")).map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""));
+
+  it("renders the summary rows and Run total for a summary-only run", async () => {
+    showWith([msg("summary_usage", { pass: "plan", model_usage: entry() })]);
+    const table = await screen.findByRole("table", { name: "Summary usage" });
+    expect(rowsOf(table)).toEqual([
+      ["Intent, plan & PR summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+    expect(screen.queryByRole("table", { name: "Per-phase usage" })).toBeNull();
+  });
+
+  it("renders Now summaries and Run total for a Now-note-only run", async () => {
+    showWith([msg("progress_note", { text: "Reading the code", model_usage: entry() })]);
+    const table = await screen.findByRole("table", { name: "Summary usage" });
+    expect(rowsOf(table)).toEqual([
+      ["Now summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+  });
+
+  it("shows unpriced side spend as n/a, not $0, under a metered run status", async () => {
+    showWith([msg("summary_usage", { pass: "plan", model_usage: entry({ costUSD: 0, costStatus: "unreported" }) })], "metered");
+    const table = await screen.findByRole("table", { name: "Summary usage" });
+    const rows = rowsOf(table);
+    expect(rows[0]?.[5]).toBe("n/a");
+    expect(rows[1]?.[5]).toBe("n/a");
+    expect(rows.flat().join(" ")).not.toMatch(/\$0/);
   });
 });

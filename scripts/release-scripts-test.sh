@@ -25,6 +25,7 @@
 #     reading the `[0.2.0]` body
 #
 # M2a/M2b extend this file to drive release-cut.sh through its verbs.
+# --shipping-paths-only runs the #1466 regressions without the full release suite.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -302,6 +303,7 @@ oracle_prev() {
 # oracle_run <ref> <version> — run with derived PREV; echoes rc into $? via caller
 oracle_run() { ( cd "$REPO" && bash "$ORACLE" "$1" "" "$2" >/dev/null 2>&1 ); }
 
+if [ "${1:-}" != "--shipping-paths-only" ]; then
 echo "=== building fixture in $REPO ==="
 build_fixture
 
@@ -401,6 +403,8 @@ assert_contains "stable body accumulates rc.2 (Y)" "Feature Y" "$b_stable"
 b_rc3="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.3 2>&1 )"
 assert_contains "re-spin rc.3 with no new bullets says so" "No changelog changes since v0.4.0-rc.2" "$b_rc3"
 
+fi
+
 # =============================================================================
 # M2: release-cut.sh state machine (D1) + lockstep promote (D5)
 # =============================================================================
@@ -425,7 +429,7 @@ seed_repo() {
   for s in worker-tag-autobump changelog-links assert-changelog-covers-release changelog-section assert-worker-tag-decoupled; do
     [ -f "$SCRIPTS_DIR/$s.sh" ] && { cp "$SCRIPTS_DIR/$s.sh" "$d/scripts/$s.sh"; chmod +x "$d/scripts/$s.sh"; }
   done
-  # The shared shipping-path lib the oracle and release-cut both source.
+  # The shared shipping-path lib used by the oracle, release-cut and autobump.
   cp "$SCRIPTS_DIR/lib/shipping-paths.sh" "$d/scripts/lib/shipping-paths.sh"
   cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
@@ -470,7 +474,7 @@ put_changelog() { # put_changelog <dir> ; stdin -> CHANGELOG.md, committed
 }
 run_rc() { # run_rc <dir> <args...>  -> sets RC_RC / RC_OUT
   local d="$1"; shift
-  RC_OUT="$( cd "$d" && UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
+  RC_OUT="$( cd "$d" && UZI_RELEASE_OFFLINE_FIXTURE=1 UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
 }
 chart_ver()   { awk '/^version:/{print $2; exit}' "$1/deploy/chart/Chart.yaml"; }
 pin_tag()     { awk '/^workers:/{w=1} w&&/^    tag:/{gsub(/"/,"",$2);print $2;exit}' "$1/deploy/chart/values.yaml"; }
@@ -489,6 +493,130 @@ add_origin() {
   git -C "$d" push -q origin main --tags
 }
 push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
+
+# #1466: public release seams, with independent fixtures for each runtime surface.
+shipping_path_regressions() {
+  # shellcheck source=scripts/lib/shipping-paths.sh
+  . "$SCRIPTS_DIR/lib/shipping-paths.sh"
+  local expected="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex"
+  assert_eq "shared runtime set stays exact" "$expected" "$AGENT_PATHS"
+  local p d out status subject
+  for p in $expected; do
+    if is_shipping "$p"; then pass "runtime entry $p ships"; else fail "runtime entry $p ships"; fi
+    if is_shipping "$p/nested/runtime.txt"; then pass "runtime descendant $p ships"; else fail "runtime descendant $p ships"; fi
+    if is_shipping "${p}-near/runtime.txt"; then fail "runtime boundary $p excludes near miss"; else pass "runtime boundary $p excludes near miss"; fi
+  done
+  for p in api/x.go controller/x.go web/src/x.ts deploy/chart/values.yaml docs/cli.md; do
+    if is_shipping "$p"; then pass "existing shipping $p"; else fail "existing shipping $p"; fi
+  done
+  for p in api/x_test.go agent/src/foo.test.ts web/src/foo.test.tsx api/testdata/x agent/test/x.ts agent/templates/test/x agent/codex/x_test.go e2e/x fixtures/x .agents/skills/x prds/x.md agent/README.md; do
+    if is_shipping "$p"; then fail "excluded $p"; else pass "excluded $p"; fi
+  done
+
+  # Finite two-case loop: each failure is tallied and the sibling fixture still runs.
+  for p in agent/templates/base/runtime.txt agent/codex/runtime.txt; do
+    d="$(mktemp -d)"; seed_repo "$d"
+    mkdir -p "$d/$(dirname "$p")"; echo 'runtime change' > "$d/$p"
+    git -C "$d" add "$p"
+    subject="Update $p (#1466)"
+    gcommit "$d" "$subject"  # one-parent squash merge, no CHANGELOG in this commit
+    put_changelog "$d" <<'MD'
+# Changelog
+
+## [Unreleased]
+
+## [0.2.0] - 2026-10-01
+### Fixed
+- Unrelated fix (#999)
+
+## [0.1.0] - 2026-09-01
+### Added
+- Initial (#100)
+MD
+    status=0
+    out="$(cd "$d" && bash scripts/assert-changelog-covers-release.sh HEAD v0.1.0 0.2.0-rc.1 2>&1)" || status=$?
+    assert_eq "uncited $p squash merge rejected" "1" "$status"
+    assert_contains "oracle names $p subject" "$subject" "$out"
+    assert_contains "oracle names $p path" "changed $p" "$out"
+    sed 's/Unrelated fix (#999)/Runtime fix (#1466)/' "$d/CHANGELOG.md" > "$d/CHANGELOG.tmp"
+    mv "$d/CHANGELOG.tmp" "$d/CHANGELOG.md"
+    git -C "$d" add CHANGELOG.md; gcommit "$d" "docs: cite runtime fix"
+    status=0
+    out="$(cd "$d" && bash scripts/assert-changelog-covers-release.sh HEAD v0.1.0 0.2.0-rc.1 2>&1)" || status=$?
+    assert_eq "cited $p squash merge accepted" "0" "$status"
+    rm -rf "$d"
+  done
+
+  d="$(mktemp -d)"; seed_repo "$d"; add_origin "$d"; add_feature "$d" 201
+  put_changelog "$d" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- Feature 201 (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- Initial (#100)
+MD
+  run_rc "$d" 0.2.0
+  assert_eq "templates promote fixture first RC succeeds" "0" "$RC_RC"
+  git -C "$d" tag v0.2.0-rc.1; push_tag_to_origin "$d" v0.2.0-rc.1
+  mkdir -p "$d/agent/templates/base"; echo 'runtime change' > "$d/agent/templates/base/runtime.txt"
+  git -C "$d" add agent/templates/base/runtime.txt; gcommit "$d" "Update worker template (#1466)"
+  run_rc "$d" 0.3.0 --promote
+  assert_eq "templates-only empty Unreleased refuses next RC" "3" "$RC_RC"
+  assert_contains "templates-only reaches main-half empty refusal" "[Unreleased] is empty and no --changelog-file given" "$RC_OUT"
+  if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "templates-only empty refusal rolls stable tag back"
+  else
+    pass "templates-only empty refusal rolls stable tag back"
+  fi
+  assert_eq "templates-only empty refusal leaves chart at prior RC" "0.2.0-rc.1" "$(chart_ver "$d")"
+  awk '{print} /^## \[Unreleased\]/ {print "### Fixed"; print "- Runtime template (#1466)"}' "$d/CHANGELOG.md" > "$d/CHANGELOG.tmp"
+  mv "$d/CHANGELOG.tmp" "$d/CHANGELOG.md"
+  git -C "$d" add CHANGELOG.md; gcommit "$d" "docs: cite runtime template"
+  run_rc "$d" 0.3.0 --promote
+  assert_eq "cited templates-only promote succeeds" "0" "$RC_RC"
+  assert_eq "cited templates-only cuts next RC" "0.3.0-rc.1" "$(chart_ver "$d")"
+  if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "cited templates-only creates stable"; else fail "cited templates-only creates stable"; fi
+  rm -rf "$d" "$d.origin.git"
+
+  if grep -qE '^[[:space:]]*AGENT_PATHS=' "$SCRIPTS_DIR/worker-tag-autobump.sh"; then
+    fail "autobump has no private AGENT_PATHS assignment"
+  else
+    pass "autobump has no private AGENT_PATHS assignment"
+  fi
+  assert_contains "autobump sources shipping library" '/lib/shipping-paths.sh"' "$(cat "$SCRIPTS_DIR/worker-tag-autobump.sh")"
+  # Override only the fixture-local library. A non-agent sentinel proves both actual
+  # Git diff selection and changed-path reporting consume that library's pathspecs.
+  d="$(mktemp -d)"; seed_repo "$d"
+  printf '\nAGENT_PATHS="runtime-sentinel"\n' >> "$d/scripts/lib/shipping-paths.sh"
+  mkdir -p "$d/agent/src"; echo 'raw runtime test' > "$d/agent/src/foo.test.ts"
+  git -C "$d" add scripts/lib/shipping-paths.sh agent/src/foo.test.ts
+  gcommit "$d" "test: fixture-local pathspec selection"
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+  assert_eq "autobump ignores paths outside sentinel set" "0" "$status"
+  echo 'runtime change' > "$d/runtime-sentinel"
+  git -C "$d" add runtime-sentinel; gcommit "$d" "test: selected sentinel"
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+  assert_eq "autobump check selects fixture sentinel" "1" "$status"
+  assert_contains "autobump changed-path diff reports sentinel" "runtime-sentinel" "$out"
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh 0.2.0 2>&1)" || status=$?
+  assert_eq "autobump edit selects fixture sentinel" "0" "$status"
+  assert_eq "sentinel change bumps worker pin" "0.2.0" "$(pin_tag "$d")"
+  rm -rf "$d"
+}
+
+shipping_path_regressions
+if [ "${1:-}" = "--shipping-paths-only" ]; then
+  echo "=== shipping-path regressions: $PASSES passed, $FAILS failed ==="
+  [ "$FAILS" -eq 0 ]
+  exit $?
+fi
 
 echo "=== M2: release-cut first RC ==="
 S1="$(mktemp -d)"; seed_repo "$S1"; add_feature "$S1" 201

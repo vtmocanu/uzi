@@ -157,7 +157,7 @@ func TestAccountingModelPresentation(t *testing.T) {
 				}
 				m.detail.laneIdx = 0
 				lanes := append([]agentLane(nil), m.detail.lanes...)
-				active := activeLaneKey(m.detail.run.Status, m.detail.frames)
+				active := activeLaneKey(m.detail.run.Status, m.detail.run.IsRevising, m.detail.frames)
 				activity := railActivity(m.detail.frames)
 				m = step(m, streamEventsMsg{runID: "r1", gen: m.detail.gen, events: []apitypes.RunEventDTO{
 					accountingEvent(accountingMsg(12, "lead", "", now.Add(time.Minute))),
@@ -178,7 +178,7 @@ func TestAccountingModelPresentation(t *testing.T) {
 				if !reflect.DeepEqual(lanes, m.detail.lanes) {
 					t.Error("lane counts/frames/LastActivity changed")
 				}
-				if activeLaneKey(m.detail.run.Status, m.detail.frames) != active {
+				if activeLaneKey(m.detail.run.Status, m.detail.run.IsRevising, m.detail.frames) != active {
 					t.Error("active lane changed")
 				}
 				if !reflect.DeepEqual(railActivity(m.detail.frames), activity) {
@@ -423,5 +423,28 @@ func TestProgressNoteKindHidden(t *testing.T) {
 	jout, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--json")
 	if !strings.Contains(jout, "hidden-note-text") {
 		t.Errorf("JSON mode must keep the note: %s", jout)
+	}
+}
+
+func TestAccountingSummaryUsageKindHidden(t *testing.T) {
+	payload := json.RawMessage(`{"pass":"plan","model_usage":{}}`)
+	if !isAccountingMessage("summary_usage", payload) {
+		t.Error("summary_usage must be hidden")
+	}
+	frames := []laneFrame{{Kind: "summary_usage", Payload: payload}, {Kind: "text", Payload: json.RawMessage(`{}`)}}
+	if got := presentationFrames(frames); len(got) != 1 || got[0].Kind != "text" {
+		t.Errorf("presentationFrames kept the summary_usage frame: %v", got)
+	}
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{"r1": {
+		{Seq: 1, Kind: "summary_usage", Payload: json.RawMessage(`{"pass":"hidden-pass-name","model_usage":{}}`)},
+		msgDTO(2, "text", "lead", "", "", "visible text", time.Now()),
+	}}}
+	out, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if strings.Contains(out, "hidden-pass-name") || strings.Contains(out, "summary_usage") || !strings.Contains(out, "visible text") {
+		t.Errorf("human logs: %s", out)
+	}
+	jout, _, _ := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--json")
+	if !strings.Contains(jout, "hidden-pass-name") {
+		t.Errorf("JSON mode must keep summary_usage: %s", jout)
 	}
 }

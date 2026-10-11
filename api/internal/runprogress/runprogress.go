@@ -35,6 +35,10 @@ type Input struct {
 	Status     string
 	Health     string
 	IsPlanning bool
+	// IsRevising is the server-derived plan-revise flag (issues #750, #2760). It only
+	// matters while status is awaiting_approval, where a revise re-plan leaves the status
+	// parked at the gate; on any other status it changes nothing.
+	IsRevising bool
 	// FrozenIDs are the frozen milestone ids in frozen order.
 	FrozenIDs  []string
 	Completed  []string
@@ -54,6 +58,9 @@ func Derive(in Input) *apitypes.RunProgress {
 		ActiveMilestoneID: active,
 	}
 	switch {
+	case in.Status == "awaiting_approval" && in.IsRevising:
+		// The lead is re-planning after a revise: the run is not waiting on the human.
+		p.State = StatePlanning
 	case in.Status == "awaiting_approval" || in.Status == "awaiting_input" || in.Status == "awaiting_followup":
 		p.State = StateWaiting
 	case in.Status == "limit_wait" || in.Status == "pool_wait" || in.Status == "recovery_wait" || in.Status == "paused":

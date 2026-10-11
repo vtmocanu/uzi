@@ -41,7 +41,7 @@ func uziLabels(extra ...string) []byte {
 // path reaches them unexpectedly; the tests override only what they exercise.
 type fakeStore struct {
 	// pendingRemovals records the pending-only ledger removals (no run created).
-	pendingRemovals    []store.RemoveMRReworkPendingIDsParams
+	pendingRemovals    []store.RemoveMRReworkPendingKeysParams
 	pendingRemovalErr  error
 	promoteVaultLocked func(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
@@ -518,12 +518,14 @@ type fakeStore struct {
 	mrReworkRunParams *store.CreateAutoMRReworkRunParams
 	ledgerUpserts     []store.UpsertMRReworkLedgerParams
 	ledgerUpsertErr   error
+	// ledgerUpsertZeroRows models UpsertMRReworkLedger refusing a legacy row (0 rows written).
+	ledgerUpsertZeroRows bool
 	// On-demand mr_rework (PRD #1202). StartMRReworkForRun reads the ledger + token gate,
 	// then the manual create folds the run INSERT and the non-counting high-water advance
 	// into ONE atomic call (CreateManualMRReworkRunAndAdvance). mrReworkAndAdvanceParams
 	// captures that combined call's params (nil until it runs, proving the manual/atomic
 	// path was taken); the happy/error outcomes reuse mrReworkRunResult/mrReworkRunErr.
-	mrReworkLedger           store.MrReworkLedger
+	mrReworkLedger           store.GetMRReworkLedgerRow
 	mrReworkLedgerErr        error
 	hasAnthropicToken        bool
 	hasAnthropicTokenErr     error
@@ -1428,8 +1430,8 @@ func (f *fakeStore) RecordWallParkCapturedHead(context.Context, store.RecordWall
 func (f *fakeStore) CountOnlineWorkersClaimableForRun(context.Context, store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error) {
 	return store.CountOnlineWorkersClaimableForRunRow{}, nil
 }
-func (f *fakeStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (int32, error) {
-	return 0, pgx.ErrNoRows
+func (f *fakeStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (store.ExtendAndResumeWallParkRow, error) {
+	return store.ExtendAndResumeWallParkRow{}, pgx.ErrNoRows
 }
 func (f *fakeStore) StopWallPark(context.Context, store.StopWallParkParams) (uuid.UUID, error) {
 	return uuid.Nil, pgx.ErrNoRows
@@ -1719,17 +1721,23 @@ func (f *fakeStore) CreateAutoMRReworkRun(_ context.Context, arg store.CreateAut
 	f.mrReworkRunParams = &arg
 	return f.mrReworkRunResult, f.mrReworkRunErr
 }
-func (f *fakeStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
+func (f *fakeStore) RemoveMRReworkPendingKeys(_ context.Context, arg store.RemoveMRReworkPendingKeysParams) error {
 	f.pendingRemovals = append(f.pendingRemovals, arg)
 	return f.pendingRemovalErr
 }
 
-func (f *fakeStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) error {
+func (f *fakeStore) UpsertMRReworkLedger(_ context.Context, arg store.UpsertMRReworkLedgerParams) (int64, error) {
 	f.ledgerUpserts = append(f.ledgerUpserts, arg)
-	return f.ledgerUpsertErr
+	if f.ledgerUpsertErr != nil {
+		return 0, f.ledgerUpsertErr
+	}
+	if f.ledgerUpsertZeroRows {
+		return 0, nil
+	}
+	return 1, nil
 }
 
-func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {
+func (f *fakeStore) GetMRReworkLedger(_ context.Context, _ store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error) {
 	return f.mrReworkLedger, f.mrReworkLedgerErr
 }
 func (f *fakeStore) CreateManualMRReworkRunAndAdvance(_ context.Context, arg store.CreateManualMRReworkRunAndAdvanceParams) (store.Run, error) {
@@ -2845,6 +2853,42 @@ func TestClaimPassesAffinityCeiling(t *testing.T) {
 	want := fixed.Add(-25 * time.Minute)
 	if !fs.claimParams.AffinityCutoff.Time.Equal(want) {
 		t.Fatalf("affinity cutoff = %v, want now-ceiling %v", fs.claimParams.AffinityCutoff.Time, want)
+	}
+}
+
+// #2705: the run-lane claim passes @stale_requeue_cutoff = now - WorkerStaleRequeueGrace, and
+// a zero grace passes the invalid (NULL) timestamp so the SQL never pins.
+func TestClaimPassesStaleRequeueCutoff(t *testing.T) {
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		grace     time.Duration
+		wantValid bool
+		want      time.Time
+	}{
+		{"grace set", 7 * time.Minute, true, fixed.Add(-7 * time.Minute)},
+		{"zero grace is NULL", 0, false, time.Time{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{claimErr: pgx.ErrNoRows}
+			p := testParams()
+			p.WorkerStaleRequeueGrace = tc.grace
+			svc := New(fs, newBox(t), p)
+			svc.now = func() time.Time { return fixed }
+			if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if fs.claimParams == nil {
+				t.Fatal("ClaimRun not called")
+			}
+			got := fs.claimParams.StaleRequeueCutoff
+			if got.Valid != tc.wantValid {
+				t.Fatalf("StaleRequeueCutoff.Valid = %v, want %v", got.Valid, tc.wantValid)
+			}
+			if tc.wantValid && !got.Time.Equal(tc.want) {
+				t.Fatalf("StaleRequeueCutoff = %v, want now-grace %v", got.Time, tc.want)
+			}
+		})
 	}
 }
 

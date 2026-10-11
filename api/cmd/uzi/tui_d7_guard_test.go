@@ -232,6 +232,9 @@ var d7UntrustedFields = []string{
 	"outboxBlockedText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
 	"runWorkerName",
+	// Issue #2705: the run's health_reason on the crew rail's waiting line (railWaitingLine),
+	// drawn through renderer.Plain; the hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.
+	"runHealthReason",
 	// PRD #2602 run progress strings (tui_detail_progress.go renderProgress): the active milestone id,
 	// the phase and the blocked-by run id derive from untrusted repo/agent/question text and are
 	// drawn only through renderer.Plain. The hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.

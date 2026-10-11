@@ -337,6 +337,7 @@ func run() error {
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
+		WorkerStaleRequeueGrace:     cfg.WorkerStaleRequeueGrace,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
 		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
@@ -655,9 +656,11 @@ func run() error {
 		slog.Default(),
 		// PRD #1189 M4: the near-timeout DM names the run's wall-clock deadline (needs the
 		// instance RUN_TIMEOUT for a run on the global default) and offers the `run extend`
-		// command unless the extension cap is exhausted or extending is disabled (cap 0).
+		// command with a duration within the per-request maximum and the run's remaining total-time room
+		// (nothing when extending is disabled, cap 0).
 		slacksvc.WithNotificationUserCap(notificationUserCap),
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
+		slacksvc.WithRunWallCeiling(cfg.RunWallCeiling),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
 	// Notifications write seam (PRD #46 M2): the one place that creates notification
@@ -769,7 +772,9 @@ func run() error {
 	// store, box and settings cache already in scope, plus the ephemeral cap + default
 	// size knobs.
 	ephemeralProv := hostedsvc.NewEphemeralProvisioner(pool, q, box, settingsCache, hostedsvc.EphemeralConfig{
-		WorkerAffinityGrace: cfg.WorkerAffinityGrace,
+		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
+		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
+		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,

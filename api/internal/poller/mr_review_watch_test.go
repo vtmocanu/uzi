@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -44,12 +45,12 @@ type mrwStore struct {
 	candidates []store.ListMRReworkCandidatesRow
 	candErr    error
 
-	ledgers map[string]store.MrReworkLedger
+	ledgers map[string]store.GetMRReworkLedgerRow
 	getErr  error
 
 	upserts []store.UpsertMRReworkLedgerParams
 	// pendingRemovals records the pending-only removals (no run created).
-	pendingRemovals []store.RemoveMRReworkPendingIDsParams
+	pendingRemovals []store.RemoveMRReworkPendingKeysParams
 	haltSets        []store.SetMRReworkHaltNotifiedParams
 	evicts          []uuid.UUID
 	haltErr         error
@@ -94,26 +95,63 @@ func (s *mrwStore) ListMRReworkCandidates(context.Context, uuid.UUID) ([]store.L
 	return s.candidates, s.candErr
 }
 
-func (s *mrwStore) GetMRReworkLedger(_ context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error) {
+func (s *mrwStore) GetMRReworkLedger(_ context.Context, arg store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error) {
 	if s.getErr != nil {
-		return store.MrReworkLedger{}, s.getErr
+		return store.GetMRReworkLedgerRow{}, s.getErr
 	}
 	if l, ok := s.ledgers[arg.Ref]; ok {
 		return l, nil
 	}
-	// Mirror the generated :one — a zero-value row alongside ErrNoRows.
-	return store.MrReworkLedger{}, pgx.ErrNoRows
+	// Mirror the generated :one: a zero-value (non-legacy) row alongside ErrNoRows.
+	return store.GetMRReworkLedgerRow{}, pgx.ErrNoRows
 }
 
-// applyUpsert mirrors UpsertMRReworkLedger. The detector no longer writes the ledger itself
+// mrwRow is a non-legacy ledger row whose only consumed mark is highWater in the namespace
+// mrwComment uses (review_comment), the shape a row has after one automatic cycle.
+func mrwRow(ref string, attempts int32, highWater int64, opts ...func(*store.GetMRReworkLedgerRow)) store.GetMRReworkLedgerRow {
+	r := store.GetMRReworkLedgerRow{RepoID: mrwRepoID, Ref: ref, AttemptCount: attempts, HighWater: highWater}
+	mrwWithMarks(map[string]int64{forge.CommentNSReviewComment: highWater})(&r)
+	for _, o := range opts {
+		o(&r)
+	}
+	return r
+}
+
+func mrwHalted(r *store.GetMRReworkLedgerRow) { r.HaltNotified = true }
+
+func mrwWithMarks(m map[string]int64) func(*store.GetMRReworkLedgerRow) {
+	return func(r *store.GetMRReworkLedgerRow) { r.CommentMarks, _ = json.Marshal(m) }
+}
+
+func mrwWithKeys(keys ...string) func(*store.GetMRReworkLedgerRow) {
+	return func(r *store.GetMRReworkLedgerRow) { r.PendingUnknownKeys = keys }
+}
+
+// marks decodes comment_marks.
+func mrwMarks(t *testing.T, r store.GetMRReworkLedgerRow) map[string]int64 {
+	t.Helper()
+	m := map[string]int64{}
+	if len(r.CommentMarks) > 0 {
+		if err := json.Unmarshal(r.CommentMarks, &m); err != nil {
+			t.Fatalf("comment_marks %q: %v", r.CommentMarks, err)
+		}
+	}
+	return m
+}
+
+// applyUpsert mirrors UpsertMRReworkLedger for a non-legacy row (the mrwRuns fake refuses a
+// legacy one first, as the real create does). The detector no longer writes the ledger itself
 // (the create does, in its own transaction), so only the mrwRuns fake reaches it.
 func (s *mrwStore) applyUpsert(arg store.UpsertMRReworkLedgerParams) {
 	s.upserts = append(s.upserts, arg)
 	if s.ledgers == nil {
-		s.ledgers = map[string]store.MrReworkLedger{}
+		s.ledgers = map[string]store.GetMRReworkLedgerRow{}
 	}
 	cur := s.ledgers[arg.Ref]
-	priorHighWater := cur.HighWater
+	prior := map[string]int64{}
+	if len(cur.CommentMarks) > 0 {
+		_ = json.Unmarshal(cur.CommentMarks, &prior)
+	}
 	cur.RepoID = arg.RepoID
 	cur.Ref = arg.Ref
 	cur.AttemptCount++ // INSERT count=1 or increment
@@ -121,31 +159,68 @@ func (s *mrwStore) applyUpsert(arg store.UpsertMRReworkLedgerParams) {
 		cur.HighWater = arg.HighWater // GREATEST(existing, new): advance-only
 	}
 	cur.HaltNotified = false // a proceed resets the latch
-	cur.PendingUnknownIds = mergePending(cur.PendingUnknownIds, arg.PendingAdd, arg.PendingRemove, arg.PendingSuperseded, arg.PendingSupersededBy, priorHighWater)
+	merged := map[string]int64{}
+	for ns, id := range prior {
+		merged[ns] = id
+	}
+	var incoming map[string]int64
+	_ = json.Unmarshal(arg.Marks, &incoming)
+	for ns, id := range incoming {
+		merged[ns] = max(merged[ns], id)
+	}
+	cur.CommentMarks, _ = json.Marshal(merged)
+	cur.PendingUnknownKeys = mergePendingKeys(cur.PendingUnknownKeys, arg.PendingAdd, arg.PendingRemove, arg.PendingSuperseded, arg.PendingSupersededBy, prior)
 	s.ledgers[arg.Ref] = cur
 }
 
-// mergePending mirrors mr_rework_merge_pending: (existing UNION added ids above the prior
-// high-water mark) minus removed ids; each (superseded, superseded-by) pair applies only when
-// both ids are in that set, dropping the older id unless it is itself a replacement; then the
-// OLDEST ReviewPendingCap slots are kept, a replacement taking the slot of the smallest id it
-// replaces. Ascending.
-func mergePending(existing, added, removed, superseded, supersededBy []int64, priorHighWater int64) []int64 {
-	base := map[int64]bool{}
-	for _, id := range existing {
-		base[id] = true
+func mrwKeyStrings(keys []workersvc.CommentKey) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k.String())
 	}
-	for _, id := range added {
-		if id > priorHighWater {
-			base[id] = true
+	return out
+}
+
+// mrwKeyParts splits a stored key at its last colon.
+func mrwKeyParts(k string) (string, int64) {
+	ck, err := workersvc.ParseCommentKey(k)
+	if err != nil {
+		panic(err)
+	}
+	return ck.Namespace, ck.ID
+}
+
+// mergePendingKeys mirrors mr_rework_merge_pending_keys: (existing UNION added keys whose id is
+// above the prior mark of their namespace) minus removed keys; each (superseded, superseded-by)
+// pair applies only when both keys are in that set, dropping the older key unless it is itself a
+// replacement; a kept replacement takes the earliest position of the older keys it replaces;
+// keys not previously stored are appended in (id, namespace) order; the first ReviewPendingCap
+// are kept.
+func mergePendingKeys(existing, added, removed, superseded, supersededBy []string, prior map[string]int64) []string {
+	pos := map[string]int{}
+	for i, k := range existing {
+		if _, ok := pos[k]; !ok {
+			pos[k] = i
 		}
 	}
-	for _, id := range removed {
-		delete(base, id)
+	base := map[string]bool{}
+	for k := range pos {
+		base[k] = true
 	}
-	dropped := map[int64]bool{}
-	replacement := map[int64]bool{}
-	slot := map[int64]int64{}
+	var fresh []string
+	for _, k := range added {
+		ns, id := mrwKeyParts(k)
+		if id > prior[ns] && !base[k] {
+			base[k] = true
+			fresh = append(fresh, k)
+		}
+	}
+	for _, k := range removed {
+		delete(base, k)
+	}
+	dropped := map[string]bool{}
+	replacement := map[string]bool{}
+	slot := map[string]int{}
 	for i, o := range superseded {
 		if i >= len(supersededBy) {
 			break
@@ -156,61 +231,84 @@ func mergePending(existing, added, removed, superseded, supersededBy []int64, pr
 		}
 		dropped[o] = true
 		replacement[n] = true
-		if cur, ok := slot[n]; !ok || o < cur {
-			slot[n] = o
+		if po, ok := pos[o]; ok {
+			if cur, ok := slot[n]; !ok || po < cur {
+				slot[n] = po
+			}
 		}
 	}
 	for n := range replacement {
 		delete(dropped, n)
 	}
-	type kept struct{ x, slot int64 }
+	sort.Slice(fresh, func(i, j int) bool {
+		ni, ii := mrwKeyParts(fresh[i])
+		nj, ij := mrwKeyParts(fresh[j])
+		if ii != ij {
+			return ii < ij
+		}
+		return ni < nj
+	})
+	for i, k := range fresh {
+		pos[k] = len(existing) + i
+	}
+	type kept struct {
+		k    string
+		slot int
+	}
 	var ks []kept
-	for x := range base {
-		if dropped[x] {
+	for k := range base {
+		if dropped[k] {
 			continue
 		}
-		sl := x
-		if s, ok := slot[x]; ok {
-			sl = min(s, x)
+		sl := pos[k]
+		if s, ok := slot[k]; ok {
+			sl = min(sl, s)
 		}
-		ks = append(ks, kept{x, sl})
+		ks = append(ks, kept{k, sl})
 	}
 	sort.Slice(ks, func(i, j int) bool {
 		if ks[i].slot != ks[j].slot {
 			return ks[i].slot < ks[j].slot
 		}
-		return ks[i].x < ks[j].x
+		ni, ii := mrwKeyParts(ks[i].k)
+		nj, ij := mrwKeyParts(ks[j].k)
+		if ii != ij {
+			return ii < ij
+		}
+		if ni != nj {
+			return ni < nj
+		}
+		return ks[i].k < ks[j].k
 	})
 	if len(ks) > workersvc.ReviewPendingCap {
 		ks = ks[:workersvc.ReviewPendingCap]
 	}
-	out := make([]int64, 0, len(ks))
+	out := make([]string, 0, len(ks))
 	for _, k := range ks {
-		out = append(out, k.x)
+		out = append(out, k.k)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 
-// RemoveMRReworkPendingIDs mirrors the SQL: array subtraction on the pending set of an
+// RemoveMRReworkPendingKeys mirrors the SQL: array subtraction on the pending keys of an
 // existing row, leaving every other column alone.
-func (s *mrwStore) RemoveMRReworkPendingIDs(_ context.Context, arg store.RemoveMRReworkPendingIDsParams) error {
+func (s *mrwStore) RemoveMRReworkPendingKeys(_ context.Context, arg store.RemoveMRReworkPendingKeysParams) error {
 	cur, ok := s.ledgers[arg.Ref]
 	if !ok {
 		return nil
 	}
 	s.pendingRemovals = append(s.pendingRemovals, arg)
-	drop := map[int64]bool{}
-	for _, id := range arg.Ids {
-		drop[id] = true
+	drop := map[string]bool{}
+	for _, k := range arg.Keys {
+		drop[k] = true
 	}
-	kept := []int64{}
-	for _, id := range cur.PendingUnknownIds {
-		if !drop[id] {
-			kept = append(kept, id)
+	kept := []string{}
+	for _, k := range cur.PendingUnknownKeys {
+		if !drop[k] {
+			kept = append(kept, k)
 		}
 	}
-	cur.PendingUnknownIds = kept
+	cur.PendingUnknownKeys = kept
 	s.ledgers[arg.Ref] = cur
 	return nil
 }
@@ -221,7 +319,7 @@ func (s *mrwStore) SetMRReworkHaltNotified(_ context.Context, arg store.SetMRRew
 	}
 	s.haltSets = append(s.haltSets, arg)
 	if s.ledgers == nil {
-		s.ledgers = map[string]store.MrReworkLedger{}
+		s.ledgers = map[string]store.GetMRReworkLedgerRow{}
 	}
 	cur := s.ledgers[arg.Ref]
 	cur.RepoID = arg.RepoID
@@ -257,6 +355,29 @@ type mrwRuns struct {
 	// st is the ledger the fake create re-validates and advances, standing in for
 	// workersvc's in-transaction recheck and upsert; newMRW binds it.
 	st *mrwStore
+
+	// bootstraps records each BootstrapReviewLedger call. bootstrapErr, when set, is returned for
+	// a LEGACY row (the real bootstrap's overflow and changed-under-us refusals). Without it a
+	// legacy row is an error: the bootstrap rule itself is tested in workersvc and against a real
+	// database in the LiveDB watcher tests, so this fake only models routing.
+	bootstraps   []mrwBootstrapCall
+	bootstrapErr error
+}
+
+type mrwBootstrapCall struct {
+	pre      store.GetMRReworkLedgerRow
+	comments int
+}
+
+func (r *mrwRuns) BootstrapReviewLedger(_ context.Context, _ uuid.UUID, _ string, pre store.GetMRReworkLedgerRow, comments []forge.MRComment) (workersvc.ReviewLedgerState, error) {
+	r.bootstraps = append(r.bootstraps, mrwBootstrapCall{pre, len(comments)})
+	if !pre.Legacy {
+		return workersvc.LedgerStateFromRow(pre)
+	}
+	if r.bootstrapErr != nil {
+		return workersvc.ReviewLedgerState{}, r.bootstrapErr
+	}
+	return workersvc.ReviewLedgerState{}, errors.New("mrwRuns: legacy ledger row without a scripted bootstrap result")
 }
 
 func (r *mrwRuns) CreateAutoMRReworkRunAndAdvance(_ context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, desc string, res *workersvc.ReviewSnapshotResult, capLimit int) (store.Run, error) {
@@ -271,20 +392,29 @@ func (r *mrwRuns) CreateAutoMRReworkRunAndAdvance(_ context.Context, userID, rep
 	if r.st != nil {
 		// The same re-validation the real create runs under the branch lock.
 		cur := r.st.ledgers[ref]
+		if cur.Legacy {
+			return store.Run{}, workersvc.ErrReworkLedgerChanged
+		}
 		if int(cur.AttemptCount) >= capLimit {
 			return store.Run{}, workersvc.ErrMRReworkCapReached
 		}
-		if !res.HasNewAgainst(cur.HighWater, cur.PendingUnknownIds) {
+		state, err := workersvc.LedgerStateFromRow(cur)
+		if err != nil {
+			return store.Run{}, err
+		}
+		if !res.HasNewAgainst(state) {
 			return store.Run{}, workersvc.ErrReworkNothingNew
 		}
+		marks, _ := json.Marshal(plan.MaxActionable)
 		r.st.applyUpsert(store.UpsertMRReworkLedgerParams{
 			RepoID:              repoID,
 			Ref:                 ref,
 			HighWater:           plan.MaxActionableID,
-			PendingAdd:          plan.PendingAdd,
-			PendingRemove:       plan.PendingRemove,
-			PendingSuperseded:   plan.PendingSuperseded,
-			PendingSupersededBy: plan.PendingSupersededBy,
+			Marks:               marks,
+			PendingAdd:          mrwKeyStrings(plan.PendingAdd),
+			PendingRemove:       mrwKeyStrings(plan.PendingRemove),
+			PendingSuperseded:   mrwKeyStrings(plan.PendingSuperseded),
+			PendingSupersededBy: mrwKeyStrings(plan.PendingSupersededBy),
 		})
 	}
 	if r.runID == (uuid.UUID{}) {
@@ -413,6 +543,7 @@ func mrwComment(id int64, created time.Time, headSHA string) forge.MRComment {
 		CreatedAt:         created,
 		HeadSHA:           headSHA,
 		ReviewState:       forge.ReviewCommentInline,
+		IDNamespace:       forge.CommentNSReviewComment,
 	}
 }
 
@@ -529,7 +660,7 @@ func TestMRReworkCommentAtOrBelowHighWaterNoFire(t *testing.T) {
 	// not re-acted.
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 1, HighWater: 120}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 1, 120)},
 	}
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(100, landed(), mrwHeadSHA), mrwComment(120, landed(), mrwHeadSHA))
@@ -554,12 +685,12 @@ func TestMRReworkPostManualLedgerStateNoRefire(t *testing.T) {
 	// Post-manual ledger: high_water = the max actionable id the manual cycle consumed (200),
 	// attempt_count still at the cap (the manual cycle did NOT spend an automatic one), latch
 	// reset.
-	postManual := store.MrReworkLedger{Ref: mrwRef, AttemptCount: cap, HighWater: 200, HaltNotified: false}
+	postManual := mrwRow(mrwRef, cap, 200)
 
 	t.Run("same comment set does not fire or halt", func(t *testing.T) {
 		st := &mrwStore{
 			candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-			ledgers:    map[string]store.MrReworkLedger{mrwRef: postManual},
+			ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: postManual},
 		}
 		runs := &mrwRuns{}
 		notifier := &mrwNotifier{}
@@ -579,7 +710,7 @@ func TestMRReworkPostManualLedgerStateNoRefire(t *testing.T) {
 	t.Run("a genuinely-new comment re-halts and comments once", func(t *testing.T) {
 		st := &mrwStore{
 			candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-			ledgers:    map[string]store.MrReworkLedger{mrwRef: postManual},
+			ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: postManual},
 		}
 		runs := &mrwRuns{}
 		notifier := &mrwNotifier{}
@@ -608,7 +739,7 @@ func TestMRReworkStrictlyAboveHighWaterFires(t *testing.T) {
 	// The other half of SC3: one comment STRICTLY ABOVE the mark fires and advances it.
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 1, HighWater: 100}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 1, 100)},
 	}
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(100, landed(), mrwHeadSHA), mrwComment(140, landed(), mrwHeadSHA))
@@ -631,7 +762,7 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 	// trigger, so the cap gate is actually reached.
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 5, 120)},
 	}
 	runs := &mrwRuns{}
 	notifier := &mrwNotifier{}
@@ -674,7 +805,7 @@ func TestMRReworkHaltedAndNotifiedSkipsListingAndLookups(t *testing.T) {
 	// eligible author would otherwise reach the assessment every tick.
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120, HaltNotified: true}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 5, 120, mrwHalted)},
 	}
 	runs := &mrwRuns{}
 	notifier := &mrwNotifier{}
@@ -706,7 +837,7 @@ func TestMRReworkHaltLatchWriteFailsNoComment(t *testing.T) {
 	// at-least-once), but it must NOT comment or start a run.
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 5, 120)},
 		haltErr:    context.DeadlineExceeded,
 	}
 	runs := &mrwRuns{}
@@ -729,7 +860,7 @@ func TestMRReworkHaltNotifyFailureRetriesNextTick(t *testing.T) {
 	var ops []string
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 5, 120)},
 		ops:        &ops,
 	}
 	runs := &mrwRuns{ops: &ops}
@@ -763,7 +894,7 @@ func TestMRReworkBranchInUseSwallows(t *testing.T) {
 	// advanced (retry next tick).
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 1, HighWater: 100}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 1, 100)},
 	}
 	runs := &mrwRuns{err: workersvc.ErrBranchInUse}
 	notifier := &mrwNotifier{}
@@ -785,12 +916,10 @@ func TestMRReworkBranchInUseSwallows(t *testing.T) {
 // This test stays serial because it captures the process-wide slog default.
 func TestMRReworkNoCredentialForHarnessSkipsWithoutErrorDetail(t *testing.T) {
 	const detail = "arbitrary fixture resolver detail"
-	ledger := store.MrReworkLedger{
-		RepoID: mrwRepoID, Ref: mrwRef, AttemptCount: 1, HighWater: 100,
-	}
+	ledger := mrwRow(mrwRef, 1, 100)
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: ledger},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: ledger},
 	}
 	runs := &mrwRuns{err: fmt.Errorf("%s: %w", detail, workersvc.ErrNoCredentialForHarness)}
 	notifier := &mrwNotifier{}
@@ -811,7 +940,7 @@ func TestMRReworkNoCredentialForHarnessSkipsWithoutErrorDetail(t *testing.T) {
 		call.ref != mrwRef || call.mrIID != mrwMrIID {
 		t.Fatalf("create attempt targeted wrong source: %+v", call)
 	}
-	if !reflect.DeepEqual(st.ledgers, map[string]store.MrReworkLedger{mrwRef: ledger}) ||
+	if !reflect.DeepEqual(st.ledgers, map[string]store.GetMRReworkLedgerRow{mrwRef: ledger}) ||
 		len(st.upserts) != 0 || len(st.haltSets) != 0 {
 		t.Fatalf("credential refusal changed ledger: ledgers=%+v upserts=%+v halts=%+v", st.ledgers, st.upserts, st.haltSets)
 	}
@@ -882,7 +1011,7 @@ func TestMRReworkEmptyCandidatesReconcilesRepo(t *testing.T) {
 	// Real structural eviction and eligibility retention are covered by live-DB tests.
 	st := &mrwStore{
 		candidates: nil, // the merged/closed MR is excluded by the candidate query
-		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 3, HighWater: 200}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 3, 200)},
 	}
 	runs := &mrwRuns{}
 	f := landedForge()
@@ -936,7 +1065,7 @@ func TestMRReworkIssuelessBranchDecoupled(t *testing.T) {
 	t.Run("at cap halts once, no comment, still notifies", func(t *testing.T) {
 		st := &mrwStore{
 			candidates: []store.ListMRReworkCandidatesRow{issuelessCand()},
-			ledgers:    map[string]store.MrReworkLedger{issuelessRef: {Ref: issuelessRef, AttemptCount: 5, HighWater: 120}},
+			ledgers:    map[string]store.GetMRReworkLedgerRow{issuelessRef: mrwRow(issuelessRef, 5, 120)},
 		}
 		runs := &mrwRuns{}
 		notifier := &mrwNotifier{}
@@ -995,6 +1124,7 @@ func mrwSummaryComment(id int64, created time.Time, login, body string) forge.MR
 		Body:              body,
 		CreatedAt:         created,
 		ReviewState:       forge.ReviewCommentSummary,
+		IDNamespace:       forge.CommentNSIssueComment,
 	}
 }
 
@@ -1113,5 +1243,17 @@ func TestMRReworkSummaryThenLowerIdInlineFires(t *testing.T) {
 	}
 	if len(st.upserts) != 1 || st.upserts[0].HighWater != 200 {
 		t.Fatalf("expected the fire to advance high_water to the actionable id 200 (not the summary 300), got %+v", st.upserts)
+	}
+}
+
+// Keys sharing a position (a tied supersession) are ordered numerically by (id, namespace), as
+// in the SQL, not lexically.
+func TestMergePendingKeysTiesOrderNumerically(t *testing.T) {
+	got := mergePendingKeys([]string{"review_comment:5"}, []string{"review_comment:10", "review_comment:9"}, nil,
+		[]string{"review_comment:5", "review_comment:5"}, []string{"review_comment:10", "review_comment:9"},
+		map[string]int64{"review_comment": 1})
+	want := []string{"review_comment:9", "review_comment:10"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

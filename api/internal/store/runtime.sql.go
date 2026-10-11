@@ -970,20 +970,33 @@ WITH claimant AS MATERIALIZED (
                WHERE ow.id = r.worker_id
                  AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
-                          AND ow.last_heartbeat_at >= $6)))
+                          AND ow.last_heartbeat_at >= $6)
+                      -- #2705 pin P: a run the stale sweeper requeued (stale_requeue_generation
+                      -- = claim_generation, set only by RequeueRunsOfStaleWorkers, cleared by
+                      -- every fresh claim) stays pinned to its stale owner for
+                      -- WORKER_STALE_REQUEUE_GRACE from status_since, so a returning worker
+                      -- (a roll, a network blip) resumes it. NULL cutoff (grace 0) never pins.
+                      -- Per-episode only: PromoteCodexAccountWaitRun resets status_since AND
+                      -- updated_at, so Codex account park/promote cycles renew both this grace
+                      -- and the ceiling below; there is NO global bound across cycles.
+                      -- stale_requeue_generation is deliberately kept through the park for
+                      -- #1390 readoption/refund provenance.
+                      OR (r.kind <> 'cross_check'
+                          AND r.stale_requeue_generation = r.claim_generation
+                          AND COALESCE(r.status_since > $7::timestamptz, false))))
            -- Generous ceiling bounding the live-but-can't-serve case; @affinity_cutoff is
            -- now now() - WORKER_AFFINITY_CEILING (default 2h), NOT the 2-min grace.
-           OR r.updated_at < $7)
+           OR r.updated_at < $8)
       -- PRD #1030 M2 / PRD #422 Decision 7: a DRAINING claimant claims NOTHING NEW. It
       -- reaches ClaimRun now (the workersvc early return that made it claim nothing was
       -- removed so it can re-claim its OWN promoted run through a roll), but it must be
       -- scoped to runs it already owns — never a new/unclaimed/fallen-open run. When the
       -- claimant is not draining this is a no-op; when it is, only its own runs qualify.
-      AND (NOT $8::boolean OR r.worker_id = $2)
+      AND (NOT $9::boolean OR r.worker_id = $2)
       -- PRD #216 D5: claiming-worker eligibility via the shared expression.
       -- PRD #84 M2 extends it: the run's required_capabilities must be a subset of the
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
-      AND fn_worker_can_claim($9::boolean, $10::uuid[], r.repo_id, r.kind, $11::text[], r.required_capabilities, $12::boolean)
+      AND fn_worker_can_claim($10::boolean, $11::uuid[], r.repo_id, r.kind, $12::text[], r.required_capabilities, $13::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
       -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
@@ -1013,13 +1026,13 @@ WITH claimant AS MATERIALIZED (
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
-      AND ($13::int <= 0
+      AND ($14::int <= 0
            OR (r.claim_generation >= 1
                AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
                              WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
                AND (SELECT count(*) FROM recovery_custody_holds oh2
-                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $13::int)
-           OR (SELECT fn_custody_admission_count($3::uuid, $6::timestamptz)) < $13::int)
+                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $14::int)
+           OR (SELECT fn_custody_admission_count($3::uuid, $6::timestamptz)) < $14::int)
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -1031,7 +1044,7 @@ WITH claimant AS MATERIALIZED (
       -- not implement the completion protocol. @worker_protocol_caps is the claiming worker's
       -- stored workers.protocol_capabilities column, passed by the Go caller.
       AND (r.completion_contract_version IS NULL
-           OR 'completion_interlock_v1' = ANY($14::text[]))
+           OR 'completion_interlock_v1' = ANY($15::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
@@ -1048,15 +1061,15 @@ WITH claimant AS MATERIALIZED (
       -- @worker_protocol_caps param the completion clause reads (the claimant's stored
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-           OR ('codex_harness_v1' = ANY($14::text[]) AND 'codex_runtime_v2' = ANY($14::text[])))
+           OR ('codex_harness_v1' = ANY($15::text[]) AND 'codex_runtime_v2' = ANY($15::text[])))
       -- Interlocked Codex turns require the newer completion loop, independently of overrides.
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-           OR 'codex_completion_interlock_v1' = ANY($14::text[]))
+           OR 'codex_completion_interlock_v1' = ANY($15::text[]))
       AND (NOT (r.plan_cross_check_required OR r.kind = 'cross_check')
-           OR 'cross_check_v1' = ANY($14::text[]))
+           OR 'cross_check_v1' = ANY($15::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude')
-           OR 'cross_check_codex_lead_v1' = ANY($14::text[]))
+           OR 'cross_check_codex_lead_v1' = ANY($15::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1068,9 +1081,9 @@ WITH claimant AS MATERIALIZED (
             AND protocol_lead.claim_generation = protocol_check.lead_claim_generation
             AND (protocol_check.round = 1 OR (protocol_check.automatic_rounds_enabled
                 AND protocol_check.round <= protocol_check.automatic_revision_limit + 1
-                AND 'cross_check_rounds_v1' = ANY($14::text[])))
+                AND 'cross_check_rounds_v1' = ANY($15::text[])))
       ))
-      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY($14::text[]))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY($15::text[]))
       -- PRD #1551 M4 (D6): the NON-BYPASSABLE custom-Codex-model claim clause, a SIBLING of the
       -- codex-harness clause directly above. A Codex run whose EFFECTIVE worker-root model is a
       -- CUSTOM (non-curated) id may be claimed ONLY by a worker whose protocol_capabilities contain
@@ -1090,12 +1103,12 @@ WITH claimant AS MATERIALIZED (
               AND r.kind NOT IN ('judge', 'chat')
               AND r.review_target_run_id IS NULL
               AND COALESCE(
-                  NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($15::text[]) THEN r.model
+                  NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($16::text[]) THEN r.model
                              ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
-                       = ANY($15::text[])),
+                       = ANY($16::text[])),
                   false)
           )
-          OR 'codex_custom_model_v1' = ANY($14::text[])
+          OR 'codex_custom_model_v1' = ANY($15::text[])
       )
       -- PRD #1908 (D-A): the NON-BYPASSABLE job-runner claim clause, a standalone sibling of the
       -- Codex clauses above. A repo-less 'job' run may be claimed ONLY by a NON-docker worker whose
@@ -1108,13 +1121,13 @@ WITH claimant AS MATERIALIZED (
       -- created since the file protocol landed) additionally needs 'job_files_v1'; a pre-change job
       -- (job_protocol NULL) stays claimable by any job_runner_v1 worker. Same OUTSIDE-the-bypasses rule.
       AND (r.kind <> 'job'
-           OR (NOT $9::boolean AND 'job_runner_v1' = ANY($14::text[])
-               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($14::text[]))
+           OR (NOT $10::boolean AND 'job_runner_v1' = ANY($15::text[])
+               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($15::text[]))
                -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
                -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
                -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
                -- the lane clause below (isolated_lane + isolated_fetch_v1) is unchanged.
-               AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY($14::text[]))))
+               AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY($15::text[]))))
       -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
       -- its SAME alias's account authority is on hold (D1's hold class):
       --   (1) quarantine: the linked account is quarantined and is still the run's
@@ -1183,8 +1196,8 @@ WITH claimant AS MATERIALIZED (
       -- the lane. The same three lines are mirrored for the spread peer below, in
       -- CountOnlineWorkersClaimableForRun and (as the lane half) in the CountOnlineWorkersSatisfying*
       -- rungs.
-      AND ((r.egress_profile_id IS NOT NULL) = $16::boolean)
-      AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY($14::text[]))
+      AND ((r.egress_profile_id IS NOT NULL) = $17::boolean)
+      AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY($15::text[]))
       AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
@@ -1204,18 +1217,18 @@ WITH claimant AS MATERIALIZED (
       -- or when the claimant still holds an open custody hold. A NULL @ephemeral_lease or an
       -- absent lease admits nothing, so lease 0 / a non-leased worker is exactly the bound-run-only
       -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
-      AND (NOT $17::boolean
-           OR (r.kind = 'cross_check' AND r.target_run_id = $18::uuid)
-           OR r.id = $18::uuid
+      AND (NOT $18::boolean
+           OR (r.kind = 'cross_check' AND r.target_run_id = $19::uuid)
+           OR r.id = $19::uuid
            OR ((fn_ephemeral_lease_admits(
-                   $19::timestamptz,
-                   $20::uuid,
-                   $21::text,
-                   $8::boolean,
-                   $22::interval,
-                   $23::timestamptz,
+                   $20::timestamptz,
+                   $21::uuid,
+                   $22::text,
+                   $9::boolean,
+                   $23::interval,
+                   $24::timestamptz,
                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $24::boolean, r.repo_id, r.kind, r.egress_profile_id, $10::uuid[]) OR COALESCE($9::boolean, false)))
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $25::boolean, r.repo_id, r.kind, r.egress_profile_id, $11::uuid[]) OR COALESCE($10::boolean, false)))
                AND NOT EXISTS (
                    SELECT 1 FROM workers bw
                    WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
@@ -1242,7 +1255,7 @@ WITH claimant AS MATERIALIZED (
       AND (
           (r.kind = 'cross_check' AND COALESCE($1::text, 'run') = 'cross_check')
           OR r.worker_id = $2
-          OR r.updated_at < $25
+          OR r.updated_at < $26
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -1272,16 +1285,16 @@ WITH claimant AS MATERIALIZED (
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
                      OR (fn_ephemeral_lease_admits(
                             p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
-                            $22::interval, now(),
+                            $23::interval, now(),
                             r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $24::boolean, r.repo_id, r.kind, r.egress_profile_id, $10::uuid[]) OR COALESCE(p.docker_enabled, false))))
+                   AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), $25::boolean, r.repo_id, r.kind, r.egress_profile_id, $11::uuid[]) OR COALESCE(p.docker_enabled, false))))
                 AND p.max_concurrent_runs IS NOT NULL
                 -- A legacy child can defer only to a peer eligible on the run lane;
                 -- explicit zero or dedicated cross-check capacity cannot use fallback.
                 -- Keep the protocol, pins and custom-model mirrors below as well.
                 AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(p, r, true,
                      'run', 'plan', $4::timestamptz, $5::timestamptz))
-                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $10::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $12::boolean)
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $11::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $13::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
                 -- the peer, or fleet-spread could DEFER an interlocked run to an INCAPABLE peer
                 -- that would never be able to claim it — making the run unclaimable. Reads the
@@ -1329,9 +1342,9 @@ WITH claimant AS MATERIALIZED (
                         AND r.kind NOT IN ('judge', 'chat')
                         AND r.review_target_run_id IS NULL
                         AND COALESCE(
-                            NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($15::text[]) THEN r.model
+                            NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($16::text[]) THEN r.model
                                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
-                                 = ANY($15::text[])),
+                                 = ANY($16::text[])),
                             false)
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
@@ -1410,7 +1423,7 @@ WITH claimant AS MATERIALIZED (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $26
+            AND (a.reported_at >= $27
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -1420,8 +1433,8 @@ WITH claimant AS MATERIALIZED (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($27::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($28::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($28::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($29::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -1452,7 +1465,7 @@ WITH claimant AS MATERIALIZED (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $2, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $29) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $30) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1472,10 +1485,10 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at, inventory_guarded)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $2, $30::text, $2, t.id, now(), now(),
-           ('recovery_inventory_v1' = ANY($14::text[]))
+           $2, $31::text, $2, t.id, now(), now(),
+           ('recovery_inventory_v1' = ANY($15::text[]))
     FROM target t
-    WHERE $31::boolean
+    WHERE $32::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
@@ -1534,6 +1547,7 @@ type ClaimRunParams struct {
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
 	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	ClaimantDraining         bool               `json:"claimant_draining"`
 	IsDockerWorker           bool               `json:"is_docker_worker"`
@@ -1564,8 +1578,12 @@ type ClaimRunParams struct {
 // The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
 // for the worker's user, EXCLUDING chat runs (which the chat lane claims via
 // ClaimChatRun). A re-queued run prefers its prior worker (own runs sort first, and
-// are the only claimant until the affinity grace lapses — @affinity_cutoff is now
-// minus WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
+// are the only claimant while the owner row exists and can still resume the run: it is
+// draining/fenced, heartbeat-fresh, or (a stale requeue, #2705) inside
+// WORKER_STALE_REQUEUE_GRACE via @stale_requeue_cutoff; the @affinity_cutoff ceiling
+// (now minus WORKER_AFFINITY_CEILING) bounds each queued episode (no global bound; see
+// the in-arm comment); once the owner row is gone or the pin
+// lapses any of the user's workers may claim it.
 // FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 // blocking. The kind<>'chat' predicate is what keeps
 // the run lane and the concurrent chat lane from stealing each other's work.
@@ -1604,6 +1622,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
 		arg.HeartbeatCutoff,
+		arg.StaleRequeueCutoff,
 		arg.AffinityCutoff,
 		arg.ClaimantDraining,
 		arg.IsDockerWorker,
@@ -2177,7 +2196,8 @@ type CountOnlineEligibleWorkersForRepoParams struct {
 // with capability_aware mirroring the claim path's flag so this count and the claim gate can
 // never disagree on ELIGIBILITY. It is deliberately an ELIGIBILITY count, NOT an
 // availability one: it does NOT exclude draining workers (nor busy ones). That is on
-// purpose — its sole consumer is PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowed),
+// purpose — it serves only PRD #361's Docker-allowlist rung (reasonRepoNotDockerAllowedAdmin/Member)
+// and the early probe that surfaces that rung under the queued threshold,
 // whose job is to isolate the docker-allowlist fence as the blocker. Excluding draining here
 // would MISATTRIBUTE a transient all-draining fleet (during a worker roll — CountOnlineWorkersForUser
 // keeps draining workers online, so the run still reaches that rung) to the allowlist, printing
@@ -2189,8 +2209,9 @@ type CountOnlineEligibleWorkersForRepoParams struct {
 // Params cast EXACTLY as ClaimRun passes them so a green sqlc generate is not mistaken for a
 // query Postgres will accept. The fence-BLIND capability-gap discriminator ("does the fleet
 // HAVE these caps at all") is a separate concern handled upstream by
-// CountOnlineWorkersSatisfyingCaps. Its sole caller is the queued-reason resolver, only for a
-// run already past its health threshold, so it is off the hot path.
+// CountOnlineWorkersSatisfyingCaps. Its callers are the queued-reason resolver (past the
+// health threshold, or under it once the early probe has fired) and the early
+// docker-allowlist probe itself, after CountOnlineWorkersForUser found an online worker.
 func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineEligibleWorkersForRepo,
 		arg.UserID,
@@ -2230,8 +2251,12 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6)))
-        OR run.updated_at < $7) AS affinity
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6)
+                            -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
+                            OR (run.kind <> 'cross_check'
+                                AND run.stale_requeue_generation = run.claim_generation
+                                AND COALESCE(run.status_since > $7::timestamptz, false))))
+        OR run.updated_at < $8) AS affinity
 FROM runs run
 JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
@@ -2241,7 +2266,7 @@ CROSS JOIN LATERAL (
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
-WHERE run.id = $8
+WHERE run.id = $9
   AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', $1::timestamptz, $2::timestamptz))
   AND w.last_heartbeat_at IS NOT NULL
   AND w.last_heartbeat_at >= $6
@@ -2252,7 +2277,7 @@ WHERE run.id = $8
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
         run.required_capabilities,
-        $9::boolean)
+        $10::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -2288,9 +2313,9 @@ WHERE run.id = $8
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
           AND COALESCE(
-              NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id)) WHEN run.model = ANY($10::text[]) THEN run.model
+              NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id)) WHEN run.model = ANY($11::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
-                   = ANY($10::text[])),
+                   = ANY($11::text[])),
               false)
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -2327,6 +2352,7 @@ type CountOnlineWorkersClaimableForRunParams struct {
 	WorkerDockerEnabled      bool               `json:"worker_docker_enabled"`
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
 	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	RunID                    uuid.UUID          `json:"run_id"`
 	CapabilityAware          bool               `json:"capability_aware"`
@@ -2373,6 +2399,7 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		arg.WorkerDockerEnabled,
 		arg.DockerRepoAllowlist,
 		arg.HeartbeatCutoff,
+		arg.StaleRequeueCutoff,
 		arg.AffinityCutoff,
 		arg.RunID,
 		arg.CapabilityAware,
@@ -2395,8 +2422,10 @@ SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
 `
 
 // How many of a user's workers are online — the queued-run reason resolver uses it
-// to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
-// for a queued run already past its threshold, so it is off the hot path.
+// to say "no worker is online" vs "waiting for a worker" (Decision 8), for a queued run
+// past its threshold. Under the threshold the early docker-allowlist probe calls it once
+// per tick for each queued run that has a repo, no egress profile and a configured
+// allowlist reader (one cheap count; it gates the costlier reads).
 // draining_since is DELIBERATELY NOT filtered here (PRD #422 Decision 7): a draining
 // worker keeps status='online' and still counts as an online worker for "no worker is
 // online" purposes — do not add a draining predicate.
@@ -2433,13 +2462,14 @@ type CountOnlineWorkersSatisfyingCapsParams struct {
 // capability nothing in the fleet has, distinct from the generic wait. It is EXPLICITLY NOT
 // a claim-time count: it does not apply the docker allowlist fence, so a worker it counts
 // may still be barred from THIS repo. That fence is applied separately by the
-// reasonRepoNotDockerAllowed rung via CountOnlineEligibleWorkersForRepo, which is the true
+// reasonRepoNotDockerAllowedAdmin/Member rung via CountOnlineEligibleWorkersForRepo, which is the true
 // claim-time count. The effective-caps fold is the shared fn_effective_worker_caps
 // (single source since #512 M5, migration 00151) — capabilities plus `docker` when
 // docker_enabled — the SAME function fn_worker_can_claim applies at claim time.
 // draining_since IS NULL mirrors CountOnlineWorkersWithFreeSlotForUser: a draining worker
 // claims nothing, so it cannot be the eligible worker. Only called for a queued run already
-// past its health threshold, so it is off the hot path.
+// past its health threshold (or one the early docker-allowlist probe found
+// online-but-ineligible), so it is off the hot path.
 //
 // AND NOT w.ephemeral (PRD #529 M2, Correction B): an ephemeral worker is bound to
 // ONE run (it can claim only its ephemeral_run_id), so it can never satisfy a
@@ -2515,7 +2545,8 @@ WHERE w.user_id = $1
 // (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
 // CountOnlineWorkersSatisfyingProtocol for the same reasons (a draining worker claims nothing; an
 // ephemeral worker is bound to one run and can never satisfy a different one). Only called for a
-// Codex-indicating queued run already past its health threshold, so it is off the hot path.
+// Codex-indicating queued run already past its health threshold (or one the early
+// docker-allowlist probe found online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCodexHarness, userID)
 	var count int64
@@ -2576,7 +2607,8 @@ WHERE w.user_id = $1
 // together), but the AND keeps this count exactly the set that could actually claim. Reads
 // workers.protocol_capabilities DIRECTLY, like its siblings; draining_since IS NULL and NOT
 // w.ephemeral for the same reasons. Only called for a custom-root queued run already past its
-// health threshold, so it is off the hot path.
+// health threshold (or one the early docker-allowlist probe found online-but-ineligible),
+// so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCustomCodex, userID)
 	var count int64
@@ -2644,7 +2676,8 @@ WHERE w.user_id = $1
 // kill-switch (see ClaimRun's dedicated clause). draining_since IS NULL and NOT w.ephemeral mirror
 // CountOnlineWorkersSatisfyingCaps for the same reasons (a draining worker claims nothing; an
 // ephemeral worker is bound to one run and can never satisfy a different one). Only called for an
-// interlocked queued run already past its health threshold, so it is off the hot path.
+// interlocked queued run already past its health threshold (or one the early docker-allowlist
+// probe found online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProtocol, userID)
 	var count int64
@@ -2679,7 +2712,8 @@ WHERE w.user_id = $1
 // worker is treated as always having room. Active count uses the SAME run-lane
 // definition as ListWorkersByUser.active_runs (status claimed/running/
 // awaiting_approval/awaiting_input/awaiting_followup, kind <> 'chat'). Only called for a queued run
-// already past its health threshold, so it is off the hot path.
+// already past its health threshold (or one the early docker-allowlist probe found
+// online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersWithFreeSlotForUser, userID)
 	var count int64
@@ -3029,7 +3063,10 @@ WITH extended AS (
       AND status NOT IN ('completed', 'failed', 'cancelled')
       AND kind NOT IN ('chat', 'judge', 'job', 'cross_check')
       AND interactive = false
-      AND budget_extension_seconds + $3::int <= $4::int
+      AND $3::int <= $4::int
+      AND GREATEST(COALESCE(budget_wall_seconds, 0), $5::int)::bigint
+          + budget_extension_seconds + $3::int
+          + GREATEST(budget_finalize_seconds, $6::int) <= $7::bigint
     RETURNING id, budget_extension_seconds
 ),
 consumed_wall AS (
@@ -3043,10 +3080,13 @@ RETURNING COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS b
 `
 
 type CreateExtendInputParams struct {
-	ID   uuid.UUID   `json:"id"`
-	Body pgtype.Text `json:"body"`
-	Secs int32       `json:"secs"`
-	Cap  int32       `json:"cap"`
+	ID                       uuid.UUID   `json:"id"`
+	Body                     pgtype.Text `json:"body"`
+	Secs                     int32       `json:"secs"`
+	Cap                      int32       `json:"cap"`
+	BaseWallUpperSeconds     int32       `json:"base_wall_upper_seconds"`
+	FinalizeAllowanceSeconds int32       `json:"finalize_allowance_seconds"`
+	MaxWallSeconds           int64       `json:"max_wall_seconds"`
 }
 
 // PRD #1189 M1: grant a run more wall-clock time AND write the kind='extend' audit row in
@@ -3056,11 +3096,15 @@ type CreateExtendInputParams struct {
 // ONLY (excluded from ConsumeRunInputs, so the worker never drains or routes it — the extension
 // is served to the worker as runs.budget_extension_seconds on the ACK/claim instead).
 //
-// The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS the cap:
-// a completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
-// request that would push the total extension past @cap all match 0 rows. A 0-row result is
+// The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS two bounds:
+// @cap is a PER-REQUEST maximum (@secs <= @cap; the cumulative budget_extension_seconds is not
+// capped by it), and a TECHNICAL bound keeps the served wall total inside the worker timer's range
+// (GREATEST(budget_wall_seconds, @base_wall_upper_seconds) + extension + @secs + GREATEST(
+// budget_finalize_seconds, @finalize_allowance_seconds) <= @max_wall_seconds; bigint arithmetic).
+// A completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
+// request failing either bound all match 0 rows. A 0-row result is
 // disambiguated in Go by re-reading the already-fetched run (terminal -> ErrRunTerminal; untimed
-// kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded). On 0 rows the INSERT selects from
+// kind -> ErrExtendNotTimed; else -> ErrExtensionCapExceeded / ErrExtensionLimitReached). On 0 rows the INSERT selects from
 // the empty CTE and writes NO audit row, so a refused extend leaves no trace.
 //
 // disposition = 'applied' at insert (the CHECK from 00162 admits it): an extension takes effect
@@ -3077,6 +3121,9 @@ func (q *Queries) CreateExtendInput(ctx context.Context, arg CreateExtendInputPa
 		arg.Body,
 		arg.Secs,
 		arg.Cap,
+		arg.BaseWallUpperSeconds,
+		arg.FinalizeAllowanceSeconds,
+		arg.MaxWallSeconds,
 	)
 	var budget_extension_seconds int32
 	err := row.Scan(&budget_extension_seconds)
@@ -4555,7 +4602,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $1 AND runs.user_id = $2
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
-      AND runs.budget_extension_seconds + $3::int <= $4::int
+      AND $3::int <= $4::int
+      AND GREATEST(COALESCE(runs.budget_wall_seconds, 0), $5::int)::bigint
+          + runs.budget_extension_seconds + $3::int
+          + GREATEST(runs.budget_finalize_seconds, $6::int) <= $7::bigint
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -4599,7 +4649,7 @@ WITH candidates AS MATERIALIZED (
         budget_extension_seconds = runs.budget_extension_seconds + $3::int,
         budget_paused_seconds = runs.budget_paused_seconds
             + GREATEST(0, (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds)
-                          - (COALESCE(runs.budget_wall_seconds, $5::int)
+                          - (COALESCE(runs.budget_wall_seconds, $8::int)
                              + runs.budget_extension_seconds + runs.budget_finalize_seconds))
             + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
         status = 'queued',
@@ -4613,7 +4663,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $1 AND runs.user_id = $2
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
-      AND runs.budget_extension_seconds + $3::int <= $4::int
+      AND $3::int <= $4::int
+      AND GREATEST(COALESCE(runs.budget_wall_seconds, 0), $5::int)::bigint
+          + runs.budget_extension_seconds + $3::int
+          + GREATEST(runs.budget_finalize_seconds, $6::int) <= $7::bigint
       AND runs.id IN (SELECT run_id FROM eligible_candidates)
       AND (runs.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM locked_checks cc
@@ -4627,7 +4680,8 @@ WITH candidates AS MATERIALIZED (
             AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
             AND lead.claim_generation = cc.lead_claim_generation
       ))
-    RETURNING runs.budget_extension_seconds
+    RETURNING runs.started_at, runs.budget_wall_seconds, runs.budget_extension_seconds,
+        runs.budget_finalize_seconds, runs.budget_paused_seconds
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
@@ -4638,32 +4692,45 @@ extend_audit AS (
     -- The audit rows use sqlc.arg('id') for run_id and ` + "`" + `FROM extended` + "`" + ` only for the row count (the
     -- CreateExtendInput shape), so no bare ` + "`" + `id` + "`" + ` collides with run_user_inputs.id in the INSERT scope.
     INSERT INTO run_user_inputs (run_id, kind, body, disposition)
-    SELECT $1, 'extend', $6, 'applied' FROM extended
+    SELECT $1, 'extend', $9, 'applied' FROM extended
 ),
 resume_audit AS (
     INSERT INTO run_user_inputs (run_id, kind, body)
     SELECT $1, 'resume', NULL::text FROM extended
 )
-SELECT COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budget_extension_seconds
+SELECT extended.started_at, extended.budget_wall_seconds, extended.budget_extension_seconds,
+    extended.budget_finalize_seconds, extended.budget_paused_seconds FROM extended
 `
 
 type ExtendAndResumeWallParkParams struct {
-	ID                   uuid.UUID   `json:"id"`
-	UserID               uuid.UUID   `json:"user_id"`
-	Secs                 int32       `json:"secs"`
-	Cap                  int32       `json:"cap"`
-	GlobalTimeoutSeconds int32       `json:"global_timeout_seconds"`
-	Body                 pgtype.Text `json:"body"`
+	ID                       uuid.UUID   `json:"id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	Secs                     int32       `json:"secs"`
+	Cap                      int32       `json:"cap"`
+	BaseWallUpperSeconds     int32       `json:"base_wall_upper_seconds"`
+	FinalizeAllowanceSeconds int32       `json:"finalize_allowance_seconds"`
+	MaxWallSeconds           int64       `json:"max_wall_seconds"`
+	GlobalTimeoutSeconds     int32       `json:"global_timeout_seconds"`
+	Body                     pgtype.Text `json:"body"`
+}
+
+type ExtendAndResumeWallParkRow struct {
+	StartedAt              pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
+	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
 }
 
 // PRD #1497 M1 (D7): the owner's Extend on a budget_exhausted wall park, in ONE statement — add the
 // extension AND resume, so an extension has one purpose and is one action. It:
-//  1. adds @secs to budget_extension_seconds under the SAME cap guard as CreateExtendInput (a
-//     request past @cap matches 0 rows -> ErrExtensionCapExceeded, worded for the park);
+//  1. adds @secs to budget_extension_seconds under the SAME per-request cap and technical
+//     wall bound as CreateExtendInput (a request past either matches 0 rows; the caller re-reads the run to word the refusal);
 //  2. BANKS THE OVERRUN into budget_paused_seconds so the extension buys exactly @secs of ACTIVE
 //     run-time however late the park landed (D7): overrun = active-at-park - total-before-extension,
 //     and the parked-wait interval is banked too (ResumePausedRun's rule), so the two banks leave the
-//     run resuming with precisely @secs of budget (proof: active_now = active_at_park - overrun =
+//     run resuming with precisely @secs of budget when the park landed at or past the deadline (every
+//     real wall park; otherwise @secs plus the unspent budget) (proof: active_now = active_at_park - overrun =
 //     total_before, remaining = (total_before + @secs) - total_before = @secs);
 //  3. does ResumePausedRun's transition — queued, codex cap/epoch, health reset, CLEAR
 //     hold_reason/hold_captured_head, and the D19 worker rule (a SERVER-parked row, claim_released_at
@@ -4674,20 +4741,30 @@ type ExtendAndResumeWallParkParams struct {
 // total_before and active-at-park read the OLD row (SET RHS is pre-update): budget_extension_seconds
 // in total_before is the pre-extension value, budget_finalize_seconds is included (a run may have been
 // Stopped then re-parked). Refuses (0 rows) a row that is not a budget_exhausted paused hold, or over
-// the cap. Returns the new total extension (CreateExtendInput's scalar shape); the handler re-reads
-// the run for the deadline + resumed:true response.
-func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (int32, error) {
+// the per-request cap or the technical wall bound, or a cross_check whose lead plan check is no longer pending and eligible. Returns the
+// POST-update budget row (started_at, budget_wall/extension/finalize/paused seconds) so the caller
+// computes the resumed deadline from the banked values; a refusal returns NO row (pgx.ErrNoRows), never a zero scalar.
+func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (ExtendAndResumeWallParkRow, error) {
 	row := q.db.QueryRow(ctx, extendAndResumeWallPark,
 		arg.ID,
 		arg.UserID,
 		arg.Secs,
 		arg.Cap,
+		arg.BaseWallUpperSeconds,
+		arg.FinalizeAllowanceSeconds,
+		arg.MaxWallSeconds,
 		arg.GlobalTimeoutSeconds,
 		arg.Body,
 	)
-	var budget_extension_seconds int32
-	err := row.Scan(&budget_extension_seconds)
-	return budget_extension_seconds, err
+	var i ExtendAndResumeWallParkRow
+	err := row.Scan(
+		&i.StartedAt,
+		&i.BudgetWallSeconds,
+		&i.BudgetExtensionSeconds,
+		&i.BudgetFinalizeSeconds,
+		&i.BudgetPausedSeconds,
+	)
+	return i, err
 }
 
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows
@@ -8031,6 +8108,11 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol,
+       COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
+                AND runs.worker_id IS NOT NULL
+                AND runs.stale_requeue_generation = runs.claim_generation
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
+       COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT a.terminal_pending_since FROM worker_active_runs a
          WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
@@ -8110,6 +8192,8 @@ type ListActiveRunsForHealthRow struct {
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
 	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	JobProtocol               pgtype.Int2        `json:"job_protocol"`
+	StaleRequeuePinnable      bool               `json:"stale_requeue_pinnable"`
+	StaleRequeueWorkerName    string             `json:"stale_requeue_worker_name"`
 	CrossCheckPinRequired     bool               `json:"cross_check_pin_required"`
 	TerminalPendingSince      pgtype.Timestamptz `json:"terminal_pending_since"`
 	CodexCustomRoot           bool               `json:"codex_custom_root"`
@@ -8173,6 +8257,13 @@ type ListActiveRunsForHealthRow struct {
 // Issue #1994: terminal_pending_since is the first-seen time of the run's CURRENT-owner, CURRENT-
 // generation, unexpired terminal-pending snapshot row (NULL otherwise), so the health ladder can
 // flag an outcome journaled on its worker that has stayed undelivered across lease renewals.
+// Issue #2705 M3: stale_requeue_pinnable and stale_requeue_worker_name project the NON-time half
+// of ClaimRun's stale-requeue pin (a queued, non-cross_check run whose owner row still exists and
+// whose stale_requeue_generation equals claim_generation); the time half (status_since + the
+// grace, capped by updated_at + the affinity ceiling) is computed in Go (staleRequeuePin)
+// from the status_since and updated_at already projected here. COALESCE keeps a NULL
+// stale_requeue_generation false rather than NULL. The name is the owner worker's, an empty string when the
+// owner row is gone (COALESCE keeps the scan target a plain string).
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModels []string) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth, codexCuratedModels)
 	if err != nil {
@@ -8212,6 +8303,8 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.ReleasedWorkerID,
 			&i.EgressProfileID,
 			&i.JobProtocol,
+			&i.StaleRequeuePinnable,
+			&i.StaleRequeueWorkerName,
 			&i.CrossCheckPinRequired,
 			&i.TerminalPendingSince,
 			&i.CodexCustomRoot,
@@ -8945,6 +9038,14 @@ FROM runs r
 WHERE r.health = 'waiting_worker'
   AND r.kind <> 'cross_check'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+  -- Issue #2705: during the stale-requeue grace a run is explicitly held for its returning owner
+  -- (workersvc reasonStaleRequeuePinPrefix, 'waiting until ...'), so it is not a capacity failure
+  -- yet. The pin reason is flagged from the first detector tick after the requeue (below the queued
+  -- threshold), so without this the 5m danger threshold would fire inside the grace, clear at the
+  -- pin exit and fire again. Excluding the pin row keeps today's timing: the age runs from the first
+  -- non-pin flag, about max(grace, health_queued_seconds) after the requeue. A NULL health_reason
+  -- must stay included, hence the COALESCE.
+  AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -8983,7 +9084,9 @@ type ListOwnersWaitingNoCapacityRow struct {
 // is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
 // usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 // other causes (vault locked, custody limit, all workers busy) — those surface through
-// queue.waiting by age instead. Expected plan cross-check waits are excluded:
+// queue.waiting by age instead. Rows held for a returning worker (issue #2705, the
+// 'waiting until ' stale-requeue pin reason) are excluded, see the predicate below.
+// Expected plan cross-check waits are excluded:
 // an owned check finishing is not a lead waiting for worker admission.
 func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwnersWaitingNoCapacityParams) ([]ListOwnersWaitingNoCapacityRow, error) {
 	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.HeartbeatCutoff)
@@ -9557,7 +9660,7 @@ const listRunUsageFrames = `-- name: ListRunUsageFrames :many
 
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
-WHERE run_id = $1 AND kind IN ('status', 'error', 'progress_note')
+WHERE run_id = $1 AND kind IN ('status', 'error', 'progress_note', 'summary_usage')
 ORDER BY seq ASC
 `
 
@@ -9568,9 +9671,10 @@ ORDER BY seq ASC
 // per-leg rows. 00188 added runs.usage_refolded (DEFAULT true, set false for every
 // non-chat row that existed at migration time), which scopes the job to history and
 // makes it converge: a post-migration run is born refolded and never selected here.
-// A run's full status/error/progress_note frame history in seq order — the exact frame shape
+// A run's full status/error/progress_note/summary_usage frame history in seq order — the exact frame shape
 // foldUsageFrames folds (never tool/text traffic). progress_note (PRD #2603) carries the usage of
-// a Now-summary call, so the refold MUST read it or it would drop spend the incremental fold
+// a Now-summary call, and summary_usage (issue #2686) that of an intent/plan/PR-description
+// summary pass, so the refold MUST read both or it would drop spend the incremental fold
 // recorded. Column order matches
 // ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 // the `init` markers CountRunInitFramesBefore counts and the success result frames;
@@ -10253,7 +10357,26 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
-  AND now() - r.status_since > $1::interval
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > $1::timestamptz
+    AND r.updated_at >= $2::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
+  AND now() - r.status_since > $3::interval
   AND EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
@@ -10261,16 +10384,16 @@ WHERE r.status = 'queued'
         AND NOT w.maintenance_fenced
         AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $2::timestamptz, $3::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $4::timestamptz, $5::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $4::interval, now(),
+                    $6::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $5::boolean, r.repo_id, r.kind, r.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false))
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $7::boolean, r.repo_id, r.kind, r.egress_profile_id, $8::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10287,9 +10410,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($7::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($7::text[])),
+                                  = ANY($9::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10326,16 +10449,16 @@ WHERE r.status = 'queued'
         AND NOT w.maintenance_fenced
         AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', $2::timestamptz, $3::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', 'plan', $4::timestamptz, $5::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $4::interval, now(),
+                    $6::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $5::boolean, r.repo_id, r.kind, r.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false))
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $7::boolean, r.repo_id, r.kind, r.egress_profile_id, $8::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10352,9 +10475,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($7::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($7::text[])),
+                                  = ANY($9::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10404,12 +10527,14 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $8::int
-ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $9) DESC, r.status_since ASC
-LIMIT $10
+      ) < $10::int
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $11) DESC, r.status_since ASC
+LIMIT $12
 `
 
 type ListSaturationQueuedRunsForEphemeralParams struct {
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
+	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	SaturationDelay          pgtype.Interval    `json:"saturation_delay"`
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
@@ -10499,6 +10624,8 @@ type ListSaturationQueuedRunsForEphemeralRow struct {
 // equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
 func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg ListSaturationQueuedRunsForEphemeralParams) ([]ListSaturationQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral,
+		arg.StaleRequeueCutoff,
+		arg.AffinityCutoff,
 		arg.SaturationDelay,
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
@@ -10546,6 +10673,25 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
+  -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
+  -- ClaimRun really blocks every peer:
+  --   * ONE NULL-safe COALESCE(..., false): a NULL stale_requeue_generation (an ordinary
+  --     requeued run) makes the AND chain NULL, and a bare NOT of NULL would drop the row.
+  --     COALESCE turns that into "not pinned", so such runs stay visible.
+  --   * status_since > @stale_requeue_cutoff: the grace window. A NULL cutoff (grace 0) is
+  --     NULL here, hence not pinned, which is today's behaviour.
+  --   * updated_at >= @affinity_cutoff: past ClaimRun's ceiling the peers CAN claim, so the
+  --     run counts as demand again.
+  --   * EXISTS owner row: a pinned run owned by a persistent worker must not mint a
+  --     run-bound ephemeral worker that ClaimRun would then block from claiming it. A
+  --     deleted owner row releases the run in ClaimRun too.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.stale_requeue_generation = r.claim_generation
+    AND r.status_since > $1::timestamptz
+    AND r.updated_at >= $2::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -10553,7 +10699,7 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]))
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -10562,16 +10708,16 @@ WHERE r.status = 'queued'
         AND NOT w.maintenance_fenced
         AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $3::timestamptz, $4::timestamptz))
+        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', 'plan', $5::timestamptz, $6::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
                     w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-                    $5::interval, now(),
+                    $7::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $1::boolean, r.repo_id, r.kind, r.egress_profile_id, $2::uuid[]) OR COALESCE(w.docker_enabled, false))
+                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false))
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
@@ -10588,9 +10734,9 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($6::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY($8::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($6::text[])),
+                                  = ANY($8::text[])),
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
@@ -10649,12 +10795,14 @@ WHERE r.status = 'queued'
                                     AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
-      ) < $7::int
-ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $8) DESC, r.created_at ASC
-LIMIT $9
+      ) < $9::int
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $10) DESC, r.created_at ASC
+LIMIT $11
 `
 
 type ListUnplaceableQueuedRunsForEphemeralParams struct {
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
+	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	WorkerDockerEnabled      bool               `json:"worker_docker_enabled"`
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
@@ -10726,6 +10874,8 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 // @max_rows bounds the work per tick.
 func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg ListUnplaceableQueuedRunsForEphemeralParams) ([]ListUnplaceableQueuedRunsForEphemeralRow, error) {
 	rows, err := q.db.Query(ctx, listUnplaceableQueuedRunsForEphemeral,
+		arg.StaleRequeueCutoff,
+		arg.AffinityCutoff,
 		arg.WorkerDockerEnabled,
 		arg.DockerRepoAllowlist,
 		arg.CrossCheckEvaluatedAt,
@@ -10767,6 +10917,12 @@ FROM runs
 WHERE health = 'waiting_worker'
   AND kind <> 'cross_check'
   AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
+  -- Issue #2705 M3: a run held for its returning worker (workersvc reasonStaleRequeuePinPrefix,
+  -- 'waiting until ...') is expected waiting, not a queue.waiting age signal. Only a positively
+  -- identified pin row is excluded; waiting_worker rows with a NULL health_reason must stay
+  -- included: the LIKE is wrapped in COALESCE(..., false) under the NOT rather than written as a
+  -- bare NOT LIKE (which is NULL for a NULL reason).
+  AND NOT COALESCE(health_reason LIKE 'waiting until %', false)
 ORDER BY CASE WHEN isfinite(health_since) THEN 0 ELSE 1 END, health_since, id
 `
 
@@ -15918,6 +16074,9 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     -- heartbeat re-adoption can refund the requeue only when the same generation is restored
     -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
     stale_requeue_generation = runs.claim_generation,
+    -- #2705 invariant: this column plus a fresh status_since (set above) is what pins the run
+    -- to its stale owner in ClaimRun for WORKER_STALE_REQUEUE_GRACE. Every fresh claim clears
+    -- it; park/promote paths keep it (per-episode pin, see ClaimRun's comment).
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
@@ -16694,7 +16853,8 @@ type RunPriorityClassForRunParams struct {
 // already in hand), the health projection ListActiveRunsForHealth carries none of
 // kind/priority/created_at, so this reads them by id — a per-run lookup like
 // RunHasVerdictSinceGateOpened, affordable for the same reason: it runs only behind
-// healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick.
+// healthTargetFor's queued-threshold guard, i.e. for ~zero runs per tick (plus, under the
+// threshold, runs the early docker-allowlist probe found online-but-ineligible).
 // @background_grace_cutoff is the D4 fail-open cutoff (now() - RUN_BACKGROUND_GRACE),
 // built the SAME way service.go builds ClaimRun's cutoff: a demoted run created before
 // it reads as stale -> class `restored` (past grace) rather than `background`.
@@ -19952,7 +20112,8 @@ type StopWallParkParams struct {
 //  1. sets scope_ceiling = @scope_ceiling (the completed count, the CreateScopeCeilingInput shape),
 //     marking any prior unsettled scope rows superseded;
 //  2. grants budget_finalize_seconds = 1800 WHERE budget_finalize_seconds = 0 — the once-only marker
-//     AND the accounting: it lives OUTSIDE budget_extension_seconds so the owner cap never sees it,
+//     AND the accounting: it lives OUTSIDE budget_extension_seconds (the extend predicates count it separately as
+//     GREATEST(budget_finalize_seconds, @finalize_allowance_seconds)),
 //     and a second Stop matches 0 rows (allowance already used) -> the handler answers 409;
 //  3. banks the overrun + parked interval so the run resumes with exactly 1800s of finalize budget
 //     (the same two-bank rule as ExtendAndResumeWallPark; budget_finalize_seconds is OLD (=0) in the
@@ -20332,8 +20493,8 @@ type UpdateRunLastSeqParams struct {
 // legacy caller (NULL) advances unconditionally, byte-identical to before.
 //
 // PRD #2603: @quiet_activity true advances the high-water mark but LEAVES last_activity_at
-// untouched. appendMessages passes it for a batch made only of progress_note messages (the
-// worker's Now summary), so a summary note neither revives a stalled run nor hides its stall.
+// untouched. appendMessages passes it for a batch made only of progress_note or summary_usage messages (the
+// worker's Now summary and summary-pass accounting), so a summary note neither revives a stalled run nor hides its stall.
 // The zero value (false) is the historical behaviour, so every other caller is unchanged.
 func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateRunLastSeq,

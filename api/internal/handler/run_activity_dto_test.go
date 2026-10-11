@@ -161,6 +161,45 @@ func TestCurrentActivityDTO(t *testing.T) {
 		}
 	})
 
+	// PRD #2602 / issue #2642: AdminListRuns sets progress.phase the same way ListRuns does.
+	t.Run("admin list builder: progress.phase follows the activity role", func(t *testing.T) {
+		admin := store.User{ID: uuid.New()}
+		runReview := uuid.New()
+		st := &runsStore{
+			activeRuns: []store.ListActiveRunsAllRow{
+				{Run: store.Run{ID: runReview, Kind: "issue", Status: "running"}},
+			},
+			latestToolUseRows: []store.LatestToolUseForRunsRow{
+				toolUseRow(runReview, 5, "reviewer", "review the diff",
+					`{"name":"Read","input":{"file_path":"api/internal/handler/runs.go"}}`),
+			},
+		}
+		h := newRunsHandler(t, st)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/runs", nil)
+		h.AdminListRuns(rec, req.WithContext(mw.ContextWithUser(req.Context(), admin)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("AdminListRuns = %d, want 200", rec.Code)
+		}
+
+		var body struct {
+			Runs []struct {
+				ID       string        `json:"id"`
+				Progress *progressJSON `json:"progress"`
+			} `json:"runs"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if len(body.Runs) != 1 || body.Runs[0].ID != runReview.String() {
+			t.Fatalf("AdminListRuns runs = %+v, want the one running run", body.Runs)
+		}
+		if p := body.Runs[0].Progress; p == nil || p.Phase != "review" {
+			t.Errorf("admin run (reviewer) progress = %+v, want phase review", p)
+		}
+	})
+
 	t.Run("get path: populates a non-terminal run's now line", func(t *testing.T) {
 		owner := store.User{ID: uuid.New()}
 		st := &runsStore{

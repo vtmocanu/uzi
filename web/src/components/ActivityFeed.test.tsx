@@ -181,13 +181,19 @@ const TERMINAL: RunStatus[] = ["completed", "failed", "cancelled"];
 // consistent with status, so a test states only status + health.
 function renderFeed(
   messages: RunMessage[],
-  opts: { status?: RunStatus; health?: RunHealth; connected?: boolean; harness?: Run["harness"] } = {},
+  opts: {
+    status?: RunStatus;
+    health?: RunHealth;
+    connected?: boolean;
+    harness?: Run["harness"];
+    is_revising?: boolean;
+  } = {},
 ) {
-  const { status = "running", health = "ok", connected = true, harness = "claude" } = opts;
+  const { status = "running", health = "ok", connected = true, harness = "claude", is_revising } = opts;
   return render(
     <ActivityFeed
       messages={messages}
-      run={runFixture({ status, health, harness })}
+      run={runFixture({ status, health, harness, is_revising })}
       runningLive={status === "running"}
       connected={connected}
       terminal={TERMINAL.includes(status)}
@@ -281,6 +287,28 @@ describe("ActivityFeed crew roster", () => {
     const { getByTitle } = renderFeed(leadWorkerLead(), { status: "awaiting_approval", health: "ok" });
     expect(getByTitle("lead: waiting")).toBeTruthy();
     expect(getByTitle("worker: waiting")).toBeTruthy();
+  });
+
+  // Issue #2760: a revising run stays awaiting_approval but the lead is re-planning, so the
+  // speaking lane reads `working` instead of the whole crew waiting on the owner.
+  it("a revising run's speaking lead reads `working`, not the whole crew `waiting`", () => {
+    const { getByTitle, queryByTitle } = renderFeed(leadWorkerLead(), {
+      status: "awaiting_approval",
+      health: "ok",
+      is_revising: true,
+    });
+    expect(getByTitle("lead: working")).toBeTruthy();
+    expect(queryByTitle("lead: waiting")).toBeNull();
+  });
+
+  it("a plan gate that is not revising (is_revising false) still reads `waiting`", () => {
+    const { getByTitle, queryByTitle } = renderFeed(leadWorkerLead(), {
+      status: "awaiting_approval",
+      health: "ok",
+      is_revising: false,
+    });
+    expect(getByTitle("lead: waiting")).toBeTruthy();
+    expect(queryByTitle("lead: working")).toBeNull();
   });
 
   // PRD #88: a clarification park stops the lead BETWEEN turns, so nothing else can
@@ -1580,6 +1608,18 @@ describe("progress_note exclusion (PRD #2603)", () => {
     expect(r.getAllByText("real one").length).toBeGreaterThan(0);
     expect(r.queryByText("ghost note")).toBeNull();
     expect(r.queryByText(/unrenderable/i)).toBeNull();
+  });
+});
+
+describe("summary_usage exclusion (issue #2686)", () => {
+  it.each(["agent", "timeline"])("shows no row or count for a summary_usage in %s", (view) => {
+    if (view === "timeline") selectTimelineView();
+    const messages = [m(1, "text", { text: "real one" }), m(2, "summary_usage", { pass: "plan", model_usage: {} })];
+    const r = renderFeed(messages, { status: "completed" });
+    expect(r.getAllByText("real one").length).toBeGreaterThan(0);
+    expect(r.queryByText(/unrenderable/i)).toBeNull();
+    // The feed filter, not only RunEventRow, must drop it: it is not counted as a message.
+    expect(r.getByText("1 messages")).toBeTruthy();
   });
 });
 

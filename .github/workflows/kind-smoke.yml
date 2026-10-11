@@ -69,9 +69,10 @@ jobs:
   kind-smoke:
     needs: changes
     # Run on every push/tag/dispatch; on a PR only when chart surfaces changed.
-    # always() ignores the `changes` job being skipped on non-PR events.
+    # !cancelled() ignores the `changes` job being skipped on non-PR events and,
+    # unlike always(), lets a superseded run cancel the smoke (#2707).
     if: |
-      always() &&
+      !cancelled() &&
       (github.event_name != 'pull_request' || needs.changes.outputs.chart == 'true')
     runs-on: ubuntu-latest
     steps:
@@ -196,23 +197,34 @@ jobs:
           cat /tmp/pf.log || true
 
   # Stable REQUIRED status context. Always reports, so a required check never wedges
-  # a PR that legitimately skipped the smoke: green when `kind-smoke` succeeded OR was
-  # skipped (non-chart PR), red only when it actually failed. Mark THIS context
-  # required in the branch ruleset, never `kind-smoke` itself (which is absent on a
-  # non-chart PR and would leave the PR Pending forever).
+  # a PR that legitimately skipped the smoke: green when `kind-smoke` succeeded, or
+  # was skipped on a PR whose path filter succeeded and reported no chart change.
+  # Anything else (failed, cancelled, or skipped because the filter failed or the run
+  # was cancelled first) is red (#2707). Mark THIS context required in the branch
+  # ruleset, never `kind-smoke` itself (which is absent on a non-chart PR and would
+  # leave the PR Pending forever).
   kind-smoke-gate:
     needs: [changes, kind-smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Gate on the kind-smoke result
+        env:
+          SMOKE_RESULT: ${{ needs.kind-smoke.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHART_CHANGED: ${{ needs.changes.outputs.chart }}
+          CI_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          result="${{ needs.kind-smoke.result }}"
-          echo "kind-smoke result: ${result}"
-          if [ "${result}" = "success" ] || [ "${result}" = "skipped" ]; then
+          echo "kind-smoke result: ${SMOKE_RESULT}"
+          if [ "${SMOKE_RESULT}" = "success" ]; then
             echo "gate: pass"
             exit 0
           fi
-          echo "gate: fail (kind-smoke did not pass)"
+          if [ "${SMOKE_RESULT}" = "skipped" ] && [ "${CI_EVENT}" = "pull_request" ] &&
+            [ "${CHANGES_RESULT}" = "success" ] && [ "${CHART_CHANGED}" = "false" ]; then
+            echo "gate: pass (no chart change)"
+            exit 0
+          fi
+          echo "gate: fail (kind-smoke did not pass; changes=${CHANGES_RESULT} chart=${CHART_CHANGED:-unset})"
           exit 1

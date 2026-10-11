@@ -1425,3 +1425,39 @@ describe("deriveRunUsage: progress_note cost comes from the server-resolved entr
     expect(deriveRunUsage([]).noteTotal.costStatus).toBe("");
   });
 });
+
+describe("deriveRunUsage: summary_usage (issue #2686)", () => {
+  const entry = (extra: Record<string, unknown>) => ({
+    inputTokens: 100,
+    outputTokens: 20,
+    cacheReadInputTokens: 5,
+    cacheCreationInputTokens: 10,
+    ...extra,
+  });
+  const pass = (p: string, e: Record<string, unknown>) =>
+    msg("summary_usage", "lead", { pass: p, model_usage: { "claude-haiku-4-5": e } });
+
+  it("sums passes into summaryTotal and the run total under summary_pass:<model>", () => {
+    seq = 0;
+    const d = deriveRunUsage([
+      pass("plan", entry({ costUSD: 0.01, costStatus: "metered" })),
+      pass("pr_description", entry({ costUSD: 0.02, costStatus: "metered" })),
+    ]);
+    expect(d.summaryTotal).toEqual({ fresh: 220, cached: 10, out: 40, costUsd: 0.03, costStatus: "metered" });
+    expect(d.total).toMatchObject({ fresh: 220, cached: 10, out: 40, costUsd: 0.03 });
+    expect(d.modelTotals.map((t) => t.model)).toEqual(["summary_pass:claude-haiku-4-5"]);
+    expect(d.noteTotal.out).toBe(0);
+    expect(d.phases).toHaveLength(0);
+    expect(d.agents).toHaveLength(0);
+  });
+
+  it("reports unavailable cost for a mix of metered and unreported passes", () => {
+    seq = 0;
+    const d = deriveRunUsage([
+      pass("plan", entry({ costUSD: 0.01, costStatus: "metered" })),
+      pass("intent", entry({ costStatus: "unreported" })),
+    ]);
+    expect(d.summaryTotal.costUsd).toBe(0.01);
+    expect(d.summaryTotal.costStatus).toBe("");
+  });
+});

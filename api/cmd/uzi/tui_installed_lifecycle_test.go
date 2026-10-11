@@ -281,13 +281,14 @@ func TestM2PendingUpgradeVerification(t *testing.T) {
 				}
 				return "", nil
 			},
-				InstalledVersion: func(formula string) (string, error) {
+				InstalledCLI: func(formula string) (installedCLI, error) {
 					probeCalls++
 					if brewCalls != 1 || formula != "uzi-cli-rc" {
 						t.Fatal("verification before brew or wrong formula")
 					}
-					return tc.raw, tc.err
-				}}
+					return installedCLI{Version: tc.raw}, tc.err
+				},
+				Exec: func(string, []string, []string) error { return nil }}
 			err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli-rc"}, "v0.85.0")
 			if (err == nil) != tc.success || strings.Contains(out.String(), "Update complete") != tc.success || probeCalls != 1 {
 				t.Fatalf("err=%v out=%q probes=%d", err, out.String(), probeCalls)
@@ -357,8 +358,9 @@ func TestM2LongOfferedUpgrade(t *testing.T) {
 	var out strings.Builder
 	calls := 0
 	env := Env{Stdout: &out, Stderr: &out,
-		Brew:             func(bool, ...string) (string, error) { calls++; return "", nil },
-		InstalledVersion: func(string) (string, error) { return "v0.85.0", nil },
+		Brew:         func(bool, ...string) (string, error) { calls++; return "", nil },
+		InstalledCLI: func(string) (installedCLI, error) { return installedCLI{Version: "v0.85.0"}, nil },
+		Exec:         func(string, []string, []string) error { return nil },
 	}
 	err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0+"+strings.Repeat("a", 210))
 	if err != nil || calls != 1 || !strings.Contains(out.String(), "Update complete") {

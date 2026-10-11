@@ -704,9 +704,9 @@ func (m tuiModel) detailHeaderLines() []string {
 	// elapsed time — a live run's runtime or a terminal run's total wall time.
 	statusTag := ""
 	if d.run.ID != "" {
-		// RunDTO carries no is_revising (issue #750): the detail header keeps its own
-		// derivePlanRevision panel, so revising is not surfaced through this token here.
-		tok := m.pal.runStateToken(d.run, false)
+		// RunDTO.IsRevising (issue #2760): a run mid-revise replan keeps status
+		// awaiting_approval, so the token must read revising, not the plan-gate amber.
+		tok := m.pal.runStateToken(d.run, d.run.IsRevising)
 		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
 		if dur := runDuration(d.run, time.Now()); dur != "" {
 			statusTag += m.pal.faint.Render(" · " + dur)
@@ -986,8 +986,9 @@ func (m tuiModel) detailFooter() string {
 	}
 	if owner {
 		// v review is meaningless at a plan gate (no verdict yet); everywhere else the owner
-		// gets it. y/n are inline in the band, so they are never here.
-		if !atPlanGate(m.detail.run) {
+		// gets it. y/n are inline in the band, so they are never here. A revising run
+		// (issue #2760) has no verdict yet either, so the hint stays hidden.
+		if !atPlanGate(m.detail.run) && !m.detail.run.IsRevising {
 			parts = append(parts, m.keyHint("v", "review"))
 		}
 		parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"))
@@ -1011,7 +1012,9 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 }
 
 // detailBanner is the S3 attention-band treatment: awaiting_approval gets the PLAN GATE band with
-// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
+// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated),
+// except while the run is revising (issue #2760): the agent is re-planning, it is not the
+// owner's turn, so no band is shown;
 // awaiting_input gets a DISTINCT needs-input band that never offers y/n — those keys do nothing
 // at a clarification park, where the owner answers with i; awaiting_followup
 // (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
@@ -1023,6 +1026,9 @@ func (m tuiModel) detailBanner() string {
 	owner := m.detail.steer.access == steerAllowed
 	switch m.detail.run.Status {
 	case "awaiting_approval":
+		if m.detail.run.IsRevising {
+			return ""
+		}
 		return m.attentionBanner("⚑ PLAN GATE", "the crew is waiting on your approval", owner)
 	case "awaiting_input":
 		if m.detail.steer.access == steerAllowed {

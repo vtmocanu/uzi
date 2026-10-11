@@ -962,6 +962,18 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		t.Fatalf("the TUI drew CredentialEpoch.Label — epochs are a CLI-only surface; a TUI epoch render must go through a sanitizer\n%s", detailOut)
 	}
 
+	// Issue #2705: a queued waiting_worker run's health_reason (it embeds a worker name) is drawn on
+	// the crew rail's waiting line (railWaitingLine) through renderer.Plain. The "waitsafe" tail is
+	// distinct from every other marker, so its survival proves THIS path put it in the frame.
+	waitReason := "waiting until 2026-07-12T12:19:00Z " + nasty + "waitsafe"
+	waiting := applyDetail(tuiTestModel(t, fake, runID), apitypes.RunDTO{ID: runID, Status: "queued",
+		Health: "waiting_worker", HealthReason: &waitReason, IssueTitle: nasty}, nil)
+	waitOut := waiting.View().Content
+	assertNoRawControls(t, "detail waiting line", waitOut)
+	if !strings.Contains(waitOut, "waitsafe") {
+		t.Fatalf("the crew rail is not drawing the waiting reason, so this test is not exercising railWaitingLine\n%s", waitOut)
+	}
+
 	// The ADMIN board is the only view that draws OwnerEmail (PRD #325 M2, B1). A hostile
 	// OwnerEmail must not emit control bytes into the frame. The clean-fixture screenshots
 	// cannot catch this, so this is the guard. OwnerEmail is *string, so bind a local.
@@ -1777,7 +1789,7 @@ func TestTUIBoardSummaryCountsFollowupPark(t *testing.T) {
 // belong. Mutation that reddens this: dropping the !r.IsRevising gate in boardSummary.
 func TestTUIBoardSummaryExcludesRevisingApproval(t *testing.T) {
 	genuine := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "awaiting_approval", IssueTitle: "plan gate"}}
-	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning"}, IsRevising: true}
+	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning", IsRevising: true}}
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{genuine, revising}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})

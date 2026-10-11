@@ -25,6 +25,7 @@ import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
+import { reportProofTiming } from "./report-proof-timing.js";
 
 /** PRD #1906 M4: the protocol capability proving this image runs the isolated research lane
  *  (the IsolatedRunner, the fetch tool and the fixed tool set). The api's dedicated claim
@@ -42,7 +43,7 @@ const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
 // Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
 // and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
-const finalizeAuthorities = new Map<string, Promise<boolean>>();
+const finalizeAuthorities = new Map<string, Promise<unknown>>();
 type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
 const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
 
@@ -197,10 +198,11 @@ export class Worker {
         typeof this.runner.recoveryInventoryPending !== "function") return;
     this.sweepingFinalizes = true;
     const pass = new AbortController();
-    const deadline = Date.now() + 5_000;
+    const passMs = reportProofTiming.finalizePassMs();
+    const deadline = Date.now() + passMs;
     const abort = () => pass.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), 5_000);
+    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), passMs);
     try {
       const candidates = frozen ?? this.captureFinalizes();
       const entries = candidates.map(candidate => candidate.entry);
@@ -279,25 +281,40 @@ export class Worker {
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
+    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")),
+      reportProofTiming.finalizeAuthorityMs());
     try {
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
-      const authority = Promise.resolve().then(() => this.hasFinalizeAuthority(entry, identity, registrationLower));
+      const authority = Promise.resolve().then(async () => {
+        const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
+          !this.admittedRunIds.has(entry.run_id) && !(this.activeRuns?.has(entry.run_id) ?? false);
+        if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
+          const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
+            expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
+          }, "finalize", outbox);
+          if (retired === true) {
+            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
+              entry.run_id, entry.claim_generation, incarnation);
+            return true;
+          }
+        }
+        if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
+            !reportEligible()) return;
+        if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return;
+        const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
+        if (!eligible()) return;
+        const retired = await outbox.retireFinalizeIfEligible(
+          entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
+        if (retired === true && incarnation && eligible())
+          await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+        return retired;
+      });
       finalizeAuthorities.set(key, authority);
       const settled = () => {
         if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
       };
       void authority.then(settled, settled);
-      const authorized = await waitForFinalize(authority, authorityWait.signal);
-      if (authorized !== true) return;
-      const eligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
-        !this.isFinalizeRunLive(entry.run_id);
-      if (!eligible()) return;
-      const retired = await waitForFinalize(outbox.retireFinalizeIfEligible(
-        entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity), authorityWait.signal);
-      if (retired === true && incarnation && eligible())
-        await waitForFinalize(this.runner.notifyPublicationCompletionRetired(
-          entry.run_id, entry.claim_generation, incarnation), authorityWait.signal);
+      await waitForFinalize(authority, authorityWait.signal);
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),

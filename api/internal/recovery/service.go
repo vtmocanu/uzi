@@ -120,8 +120,12 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		if s.limits.MaxCapturesPerClaim > 0 && perClaim >= s.limits.MaxCapturesPerClaim {
 			return apitypes.RecoveryReserveResponse{}, ErrQuota
 		}
+		// Per-owner ceiling: expired tombstones hold no payload, so they free their slot
+		// (TTL and early expiry alike); discarded likewise. Any other state, including one
+		// added later, keeps counting (fail closed). The per-claim count above still
+		// includes tombstones.
 		var perOwner int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM recovery_captures WHERE user_id = $1 AND state <> 'discarded'`, wkr.UserID).Scan(&perOwner); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM recovery_captures WHERE user_id = $1 AND state NOT IN ('discarded', 'expired')`, wkr.UserID).Scan(&perOwner); err != nil {
 			return apitypes.RecoveryReserveResponse{}, err
 		}
 		if s.limits.MaxCapturesPerOwner > 0 && perOwner >= s.limits.MaxCapturesPerOwner {

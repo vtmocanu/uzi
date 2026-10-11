@@ -168,8 +168,12 @@ func (m tuiModel) renderSteerQueue() string {
 // ---- rendering ------------------------------------------------------------
 
 // atPlanGate reports whether the run is parked at its approval gate, which is the only
-// state where approve/reject are meaningful.
-func atPlanGate(run apitypes.RunDTO) bool { return run.Status == "awaiting_approval" }
+// state where approve/reject are meaningful. A run mid-revise replan (issue #2760) keeps
+// status awaiting_approval but is not at the gate: the agent is re-planning, so the
+// approve/reject keys and review hint stay hidden until it re-gates.
+func atPlanGate(run apitypes.RunDTO) bool {
+	return run.Status == "awaiting_approval" && !run.IsRevising
+}
 
 func (m tuiModel) renderSteerBar() string {
 	s := &m.detail.steer

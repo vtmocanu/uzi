@@ -103,8 +103,8 @@ func TestRunExtendSuccessLine(t *testing.T) {
 	if !strings.Contains(stdout, wantTimesOut) {
 		t.Errorf("success line missing %q (the new deadline):\n%s", wantTimesOut, stdout)
 	}
-	if !strings.Contains(stdout, "Extensions on this run: 2h of 16h allowed.") {
-		t.Errorf("success line missing the allowance (new total of the cap):\n%s", stdout)
+	if !strings.Contains(stdout, "Extensions on this run: 2h total (up to 16h per extension).") {
+		t.Errorf("success line missing the allowance (new total and per-extension maximum):\n%s", stdout)
 	}
 }
 
@@ -117,15 +117,15 @@ func TestExtendSuccessLine(t *testing.T) {
 
 	got := extendSuccessLine("r1", 2*60*60, res, 57600, now)
 	want := "Extended r1 by 2h. 3h05m left, times out " + deadline.Local().Format("15:04") +
-		". Extensions on this run: 2h of 16h allowed."
+		". Extensions on this run: 2h total (up to 16h per extension)."
 	if got != want {
 		t.Errorf("extendSuccessLine =\n  %q\nwant\n  %q", got, want)
 	}
 
 	// No deadline (a queued/parked run the sweep has not clocked yet) drops the deadline clause;
-	// a failed cap read (capSeconds 0) drops the "of <cap> allowed" tail.
+	// a failed cap read (capSeconds 0) drops the "(up to <cap> per extension)" tail.
 	got = extendSuccessLine("r2", 90*60, apitypes.RunInputResponse{ExtensionSeconds: intPtr(5400)}, 0, now)
-	want = "Extended r2 by 1h30m. Extensions on this run: 1h30m."
+	want = "Extended r2 by 1h30m. Extensions on this run: 1h30m total."
 	if got != want {
 		t.Errorf("extendSuccessLine(no deadline, no cap) =\n  %q\nwant\n  %q", got, want)
 	}
@@ -197,7 +197,7 @@ func TestRunExtendBelowMinimumByIsUsageError(t *testing.T) {
 // surfaced as the client error's exit code (5) with the server's message printed verbatim on
 // stderr, and the kind still recorded as reached before the error.
 func TestRunExtendServer409FlowsThrough(t *testing.T) {
-	const msg = "20h exceeds the remaining extension cap (14h left of 16h)"
+	const msg = "extension cap exceeded: +20h is more than the 16h maximum per extension"
 	fc := &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitConflict, "%s", msg)}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "extend", "r1", "--by", "20h")
 	if code != uzicli.ExitConflict {

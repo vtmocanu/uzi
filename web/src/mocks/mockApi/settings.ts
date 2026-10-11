@@ -10,6 +10,7 @@ import {
   type UserSettingsPatch,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
   isAppearanceMode,
   isDarkTheme,
@@ -159,7 +160,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
-  // PRD #1189: per-run wall-clock extension allowance, default 16h (matching the server's
+  // PRD #1189: per-request wall-clock extension cap, default 16h (matching the server's
   // DefaultRunExtensionCapSeconds). 0 would turn extending off instance-wide.
   run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
@@ -951,7 +952,7 @@ export const settingsApi = {
         (nonSecret as Record<string, string>)[key] = String(n);
         continue;
       }
-      // Per-run extension allowance (PRD #1189), mirroring the server's
+      // Per-request extension cap (PRD #1189, #2735), mirroring the server's
       // validateExtensionCapSeconds: a whole number that is 0 (disable) or in the inclusive
       // range [3600, 604800] (1h to 7d). Note the bounds differ from the health-seconds fields.
       if (key === "run_extension_cap_seconds") {
@@ -978,11 +979,9 @@ export const settingsApi = {
       if (key === "docker_repo_allowlist") {
         const ok = value
           .split(",")
-          .map((t) => t.trim())
+          .map(trimAllowlistToken)
           .filter((t) => t !== "")
-          .every((t) =>
-            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t),
-          );
+          .every((t) => uuidIdentity(t) !== null);
         if (!ok) {
           throw new ApiError(
             400,

@@ -1,7 +1,7 @@
 # Worker UID test lane
 
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
-leaves from four test files through its root entrypoint, which drops to the worker UID with runner
+leaves from five test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own named container.
 
@@ -12,9 +12,16 @@ dependencies. Test inputs are mounted into `/app`, preserving their relative pat
 and resolving runtime packages from the image.
 
 Before execution, the locked TypeScript parser derives the leaf inventory from
-the current source. Each of the four files must contain its recognized UID gate
-and at least one leaf. Targeted tests must use literal titles and static `it` /
-`describe` declarations. The JUnit checker requires each leaf exactly once and
+the current source. The four ownership/cleanup files must each contain their
+recognized UID gate and at least one leaf. The fifth file,
+`agent/test/git-planning-diff.test.ts`, contributes exactly nine literal leaves
+inside the exact `Unit2 runner source capture` suite: two snapshot-copy
+cancellation leaves and seven symlink capture/refusal leaves. The suite itself
+is not targeted: generated titles, the command sandbox leaf, other capture
+leaves and the bounded stdout suite stay excluded. Missing or changed required
+titles, nonliteral replacements and duplicate identities fail closed. Targeted
+tests must use literal titles and static `it` / `describe` declarations. The JUnit
+checker requires each leaf exactly once and
 rejects skip, failure, error and missing results. Node and container failures,
 including exit 77 and watchdog timeouts, also fail the target even when the checker
 fails too. Container stderr stays visible. Reports remain in a unique directory
@@ -33,7 +40,9 @@ scratch reports and cleanup of exactly the wrapper's own container name.
 
 Selection uses escaped, anchored full leaf names from that inventory. Any extra
 executed leaf fails; unrelated leaves may only be absent or skipped. The normal
-host shards continue to own the other tests in these files.
+host shards continue to own the other tests in these files. This nine-leaf
+selection proves only the selected capture behavior under the worker UID;
+acceptance of the full capture suite remains a separate full-capture run.
 
 CI runs the base-only lane on every main push and on PRs changing agent sources,
 this harness, Taskfile or the CI workflow. The existing required `test-agent`

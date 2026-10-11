@@ -120,7 +120,7 @@ CI is GitHub Actions; there is no `.gitlab-ci.yml`. The workflows are
 
 | workflow | triggers | runs |
 |---|---|---|
-| `ci.yml` | every PR and `main` | validate/test across the toolchains, a `helm-chart` job (`helm lint`/`template` + the chart-render assertion scripts), `--no-push` validation builds of the api, web, controller and agent images |
+| `ci.yml` | every PR and `main` | component validate/test gates skip only on successfully classified PRs containing exclusively added/modified files under `.agents/skills/uzi-lander/`; repo lint and Helm checks always run. Main runs full component gates; image validation builds are path-filtered on PRs |
 | `kind-smoke.yml` | push to `main`, `v*` tags, manual dispatch, path-filtered on `pull_request` (`deploy/**`, `scripts/smoke.sh`, `.github/workflows/kind-smoke.yml`) | ephemeral KinD cluster, `helm install`, `scripts/smoke.sh` through the web→api reverse proxy. The always-reporting `kind-smoke-gate` job is the stable required check, so a non-chart PR never wedges Pending |
 | `e2e.yml` | nightly schedule + manual dispatch, never PR or push | the compose harness `./e2e/run-e2e.sh` |
 | `release.yml` | `v*` tags only | publishes the images + the OCI Helm chart to GHCR |

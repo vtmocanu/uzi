@@ -69,8 +69,10 @@ export interface CaptureView {
 
 // captureView maps a capture's lifecycle state onto its display. An unknown state (a
 // server that grew a new state before this client did) is treated as not-downloadable
-// and labelled honestly rather than mis-rendered as available.
-export function captureView(state: string): CaptureView {
+// and labelled honestly rather than mis-rendered as available. `reason` is the
+// server-supplied capture reason: it is only compared against a known value to pick a
+// fixed description, never rendered.
+export function captureView(state: string, reason?: string): CaptureView {
   switch (state) {
     case "preparing":
       return {
@@ -105,7 +107,10 @@ export function captureView(state: string): CaptureView {
       return {
         label: "Expired",
         tone: "neutral",
-        description: "The download window has passed and the bytes were purged.",
+        description:
+          reason === "published_redundant"
+            ? "Expired early: this run's work is already published on its branch, so the archive bytes were purged."
+            : "The download window has passed and the bytes were purged.",
         downloadable: false,
       };
     case "discarded":

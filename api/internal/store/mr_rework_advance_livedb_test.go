@@ -77,7 +77,7 @@ func TestCreateManualMRReworkRunAndAdvanceLiveDB(t *testing.T) {
 	const cap = 5
 	const ref = "agent/issue-7"
 
-	get := func(atRef string) store.MrReworkLedger {
+	get := func(atRef string) store.GetMRReworkLedgerRow {
 		t.Helper()
 		led, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: atRef})
 		if err != nil {
@@ -124,8 +124,8 @@ func TestCreateManualMRReworkRunAndAdvanceLiveDB(t *testing.T) {
 
 	// Pre-seed the post-cap state an owner would rework from: attempt_count AT the cap,
 	// high_water 100, halt_notified TRUE (the cap halt already commented once).
-	exec(`INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, halt_notified)
-	      VALUES ($1, $2, $3, 100, true)`, repoID, ref, cap)
+	exec(`INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, halt_notified, comment_marks)
+	      VALUES ($1, $2, $3, 100, true, '{}')`, repoID, ref, cap)
 
 	// ── ATOMIC SUCCESS ──────────────────────────────────────────────────────────────────
 	// Advance past the mark. The run commits (kind='mr_rework', trigger_source='manual'), AND
@@ -197,8 +197,8 @@ func TestCreateManualMRReworkRunAndAdvanceLiveDB(t *testing.T) {
 	// halt_notified reset) lands. mr_iid 700 is distinct from every mr_rework here, so the
 	// ONLY blocker is the occupied branch.
 	const skipRef = "agent/issue-skip"
-	exec(`INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, halt_notified)
-	      VALUES ($1, $2, 2, 100, true)`, repoID, skipRef)
+	exec(`INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, halt_notified, comment_marks)
+	      VALUES ($1, $2, 2, 100, true, '{}')`, repoID, skipRef)
 	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_id, pipeline_ref, status)
 	      VALUES ($1, $2, $3, 'ci_fix', 't', 'd', 4242, $4, 'running')`, uuid.New(), user, repoID, skipRef)
 

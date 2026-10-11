@@ -549,13 +549,15 @@ type MrReviewAuthorVerdict struct {
 }
 
 type MrReworkLedger struct {
-	RepoID            uuid.UUID          `json:"repo_id"`
-	Ref               string             `json:"ref"`
-	AttemptCount      int32              `json:"attempt_count"`
-	HighWater         int64              `json:"high_water"`
-	HaltNotified      bool               `json:"halt_notified"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	PendingUnknownIds []int64            `json:"pending_unknown_ids"`
+	RepoID             uuid.UUID          `json:"repo_id"`
+	Ref                string             `json:"ref"`
+	AttemptCount       int32              `json:"attempt_count"`
+	HighWater          int64              `json:"high_water"`
+	HaltNotified       bool               `json:"halt_notified"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	PendingUnknownIds  []int64            `json:"pending_unknown_ids"`
+	CommentMarks       []byte             `json:"comment_marks"`
+	PendingUnknownKeys []string           `json:"pending_unknown_keys"`
 }
 
 type Notification struct {
@@ -755,6 +757,9 @@ type RecoveryCapture struct {
 	CoverageDigest         pgtype.Text        `json:"coverage_digest"`
 	LocalReplicaWorkerID   pgtype.UUID        `json:"local_replica_worker_id"`
 	ReadyRetentionSeconds  pgtype.Int8        `json:"ready_retention_seconds"`
+	RedundancyProof        []byte             `json:"redundancy_proof"`
+	RedundancyRefusedAt    pgtype.Timestamptz `json:"redundancy_refused_at"`
+	RedundancyRefusal      pgtype.Text        `json:"redundancy_refusal"`
 }
 
 type RecoveryCaptureChunk struct {
@@ -1223,6 +1228,7 @@ type RunSchedule struct {
 	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
+	RecentFires                []byte             `json:"recent_fires"`
 }
 
 type RunUsage struct {

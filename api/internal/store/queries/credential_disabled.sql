@@ -409,5 +409,11 @@ RETURNING id, user_id, status;
 -- concurrent edit, disable or fire is never overwritten with a stale hold.
 -- name: RecordScheduleHeldFire :execrows
 UPDATE run_schedules
-SET last_fire = @last_fire, updated_at = now()
+SET last_fire = @last_fire,
+    -- recent_fires (issue #2519): same append rule as AdvanceSchedule (matched > 0, newest 10).
+    recent_fires = CASE
+      WHEN @last_fire::jsonb @@ '$.matched > 0'
+      THEN jsonb_path_query_array(jsonb_build_array(@last_fire::jsonb) || recent_fires, '$[0 to 9]')
+      ELSE recent_fires END,
+    updated_at = now()
 WHERE id = @id AND timing = 'once' AND status = 'active';

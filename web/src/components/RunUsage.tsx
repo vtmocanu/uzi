@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { AgentUsage, RunUsage } from "../lib/runUsage";
-import { cacheDisplayPct } from "../lib/runUsage";
+import { cacheDisplayPct, hasSideUsage, hasSpend } from "../lib/runUsage";
 import type { CostStatus, Harness, UsageTail } from "../lib/api";
 import { coverageReasonText, tailCostText, tailVisible } from "../lib/usageTail";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -14,7 +14,7 @@ import { cx } from "./ui";
 // client-side from the message stream (lib/runUsage.ts), so they fold in live as
 // new result frames arrive (Decision 9) with no accumulator.
 //
-// TWO states, gated by two independent flags off deriveRunUsage:
+// Three states, gated off deriveRunUsage:
 //   • CONFIRMED (`hasConfirmed`, once a result frame carried per-model usage): the
 //     billed totals — the 4-stat strip, per-phase table and cost — plus estimated
 //     deduplicated per-agent input attribution.
@@ -25,7 +25,10 @@ import { cx } from "./ui";
 //     would be wrong by ~25-100x (see runUsage.ts). Once `hasConfirmed` flips true the
 //     confirmed surfaces take over and this disappears — we never show the deduped
 //     live table beside the confirmed attribution table.
-// A pre-feature run has neither flag, so this renders nothing rather than a fabricated 0.
+//   • SIDE-ONLY (`hasSideUsage && !hasConfirmed`, issue #2686): a summary pass or Now note
+//     recorded spend before any result frame. Only those rows and their Run total render,
+//     beside the live view when that is also present.
+// A pre-feature run has none of these, so this renders nothing rather than a fabricated 0.
 
 const K_CLASS = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
 
@@ -149,14 +152,20 @@ export function RunUsagePanel({
   costStatus: CostStatus | "";
   harness?: Harness | null;
 }) {
-  if (!usage.hasLiveTokens && !usage.hasConfirmed) return null;
-  const { hasConfirmed, hasLiveTokens, total, noteTotal, model, phases, agents, agentTotal, agentModels } = usage;
+  if (!usage.hasLiveTokens && !usage.hasConfirmed && !hasSideUsage(usage)) return null;
+  const { hasConfirmed, hasLiveTokens, total, noteTotal, summaryTotal, model, phases, agents, agentTotal, agentModels } = usage;
   const { liveByModel, liveByAgent, liveTotal } = usage;
   const cost = costDisplay(costStatus, total.costUsd);
   // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
   // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
   const cachePct = cacheDisplayPct(total);
   const tokensIn = total.fresh + total.cached;
+  const sideRows = [
+    { label: "Now summaries", t: noteTotal },
+    { label: "Intent, plan & PR summaries", t: summaryTotal },
+  ].filter((r) => hasSpend(r.t));
+  const sideStatus: CostStatus | "" =
+    sideRows.length === 0 || sideRows.some((r) => r.t.costStatus !== sideRows[0]!.t.costStatus) ? "" : sideRows[0]!.t.costStatus;
 
   return (
     <div>
@@ -257,7 +266,7 @@ export function RunUsagePanel({
                   <Td>{costCellText(costDisplay(costStatus, p.costUsd))}</Td>
                 </tr>
               ))}
-              {(noteTotal.fresh + noteTotal.cached + noteTotal.out > 0 || noteTotal.costUsd > 0) && (
+              {hasSpend(noteTotal) && (
                 <tr>
                   <Td left>Now summaries</Td>
                   <Td>—</Td>
@@ -265,6 +274,16 @@ export function RunUsagePanel({
                   <Td>{formatTokens(noteTotal.cached)}</Td>
                   <Td>{formatTokens(noteTotal.out)}</Td>
                   <Td>{costCellText(costDisplay(noteTotal.costStatus, noteTotal.costUsd))}</Td>
+                </tr>
+              )}
+              {hasSpend(summaryTotal) && (
+                <tr>
+                  <Td left>Intent, plan &amp; PR summaries</Td>
+                  <Td>—</Td>
+                  <Td>{formatTokens(summaryTotal.fresh)}</Td>
+                  <Td>{formatTokens(summaryTotal.cached)}</Td>
+                  <Td>{formatTokens(summaryTotal.out)}</Td>
+                  <Td>{costCellText(costDisplay(summaryTotal.costStatus, summaryTotal.costUsd))}</Td>
                 </tr>
               )}
               <tr>
@@ -326,6 +345,52 @@ export function RunUsagePanel({
         </details>
       )}
         </>
+      )}
+
+      {/* SIDE-ONLY spend: no result frame landed (e.g. a lead that failed early) but a summary
+          pass or Now note carried usage, so `total` is purely side spend. No stat strip, no
+          per-phase or per-agent tables — nothing there would be real. The Run total's cost
+          status comes from the side totals' own statuses, NOT the run-level `costStatus`
+          prop: that prop can read "metered" while this spend was unpriced, which would
+          render a fabricated $0. One present side → its status; both with the same status →
+          that; otherwise unavailable. */}
+      {!hasConfirmed && sideRows.length > 0 && (
+        <div className={cx(hasLiveTokens && "mb-3")}>
+          <div className="overflow-x-auto" role="region" aria-label="Summary usage, scrollable">
+            <table aria-label="Summary usage" className="w-full min-w-[560px] border-collapse text-xs">
+              <thead>
+                <tr>
+                  <Th left>Phase</Th>
+                  <Th>Turns</Th>
+                  <Th>In (fresh)</Th>
+                  <Th>In (cached)</Th>
+                  <Th>Out</Th>
+                  <Th>Cost</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {sideRows.map((r) => (
+                  <tr key={r.label}>
+                    <Td left>{r.label}</Td>
+                    <Td>—</Td>
+                    <Td>{formatTokens(r.t.fresh)}</Td>
+                    <Td>{formatTokens(r.t.cached)}</Td>
+                    <Td>{formatTokens(r.t.out)}</Td>
+                    <Td>{costCellText(costDisplay(r.t.costStatus, r.t.costUsd))}</Td>
+                  </tr>
+                ))}
+                <tr>
+                  <Td left total>Run total</Td>
+                  <Td total>—</Td>
+                  <Td total>{formatTokens(total.fresh)}</Td>
+                  <Td total>{formatTokens(total.cached)}</Td>
+                  <Td total>{formatTokens(total.out)}</Td>
+                  <Td total>{costCellText(costDisplay(sideStatus, total.costUsd))}</Td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
 
       {/* The LIVE / in-flight surface. Rendered ONLY before any result frame confirms a

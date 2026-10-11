@@ -86,6 +86,8 @@ import {
   type RecoveryUploadManifest,
   type JobFileUploadMeta,
   type JobFileUploadResponse,
+  type RecoveryArchiveRedundancyRequest,
+  type RecoveryArchiveRedundancyResponse,
   type RecoveryCaptureStatusResponse,
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
@@ -1974,14 +1976,44 @@ export class WorkerClient {
     ) as RecoveryReconcileResponse;
   }
 
+  /** Issue #2625: claim a completed run's archive is already covered by its published branch. The
+   *  api decides; a malformed reply (unknown outcome, wrong capture id) is reported as retained with
+   *  reason "invalid_response" so a caller can never act on an unverified expiry. Throws RequestError
+   *  on 4xx/5xx and on abort/timeout. */
+  async proveRecoveryArchiveRedundancy(
+    runId: string,
+    captureId: string,
+    req: RecoveryArchiveRedundancyRequest,
+    signal?: AbortSignal,
+  ): Promise<RecoveryArchiveRedundancyResponse> {
+    const raw = await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/redundancy`,
+      req,
+      this.httpTimeoutMs,
+      signal,
+      16 * 1024,
+    );
+    const r = (raw ?? {}) as { capture_id?: unknown; outcome?: unknown; reason?: unknown };
+    const reason = typeof r.reason === "string" && r.reason.length <= 64 ? r.reason : undefined;
+    if (r.capture_id !== captureId || (r.outcome !== "expired" && r.outcome !== "retained")) {
+      return { capture_id: captureId, outcome: "retained", reason: "invalid_response" };
+    }
+    return { capture_id: captureId, outcome: r.outcome, ...(reason === undefined ? {} : { reason }) };
+  }
+
   /** By-id status poll of a capture (handles lost ACKs; on restart tells whether the byte
    * manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
   async getRecoveryCaptureStatus(
     runId: string,
     captureId: string,
+    options?: { signal?: AbortSignal; deadline: number },
   ): Promise<RecoveryCaptureStatusResponse> {
+    if (options && Date.now() >= options.deadline) throw new Error("report HTTP deadline");
     return (await this.getJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}`,
+      options ? Math.max(1, options.deadline - Date.now()) : undefined,
+      options ? 16 * 1024 : undefined,
+      options ? options.signal ?? AbortSignal.timeout(Math.max(1, options.deadline - Date.now())) : undefined,
     )) as RecoveryCaptureStatusResponse;
   }
 
@@ -2051,6 +2083,9 @@ export class WorkerClient {
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,
       body,
+      this.httpTimeoutMs,
+      undefined,
+      RECOVERY_RELEASE_RESPONSE_MAX_BYTES,
     )) as RecoveryReleaseResponse;
   }
 
@@ -2327,9 +2362,19 @@ export class WorkerClient {
    *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
-  async getRunOwnership(runId: string, signal?: AbortSignal): Promise<RunOwnershipResponse> {
+  async getRunOwnership(runId: string, options: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, signal?: AbortSignal): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse> {
+    const budget = options && !(options instanceof AbortSignal) ? options : undefined;
+    const signal = options instanceof AbortSignal ? options : budget
+      ? budget.signal ?? AbortSignal.timeout(Math.max(1, budget.deadline - Date.now())) : undefined;
+    signal?.throwIfAborted();
+    if (budget && Date.now() >= budget.deadline) throw new Error("report HTTP deadline");
     // Bound actual streamed bytes before ownership can authorize recovery retirement.
-    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024, signal)) as RunOwnershipResponse;
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`,
+      budget ? Math.max(1, budget.deadline - Date.now()) : undefined, 16 * 1024,
+      signal)) as RunOwnershipResponse;
   }
 
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
@@ -3333,9 +3378,15 @@ export class WorkerClient {
   }
 
   private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {
+    if (signal) signal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs ?? this.httpTimeoutMs)]);
+    signal?.throwIfAborted();
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
-    if (res.status >= 400) throw await this.toError("GET", path, res);
-    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
+    if (res.status >= 400) {
+      if (!signal) throw await this.toError("GET", path, res);
+      const text = await readBoundedText(res, maxResponseBytes ?? ERROR_BODY_MAX_BYTES, true, signal);
+      throw new RequestError("GET", path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
+    }
+    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true, signal);
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -3395,6 +3446,7 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; the cross-check methods and strict gate ACK opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
 
@@ -3439,14 +3491,19 @@ const ERROR_BODY_MAX_BYTES = 4096;
  *  whole, so a small body yields exactly what Response#text() would. A read failure rejects.
  *  With rejectOverflow, read through EOF (including at the exact cap) and reject any chunk
  *  exceeding the remaining byte budget before retaining or decoding it. */
-async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false): Promise<string> {
+async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<string> {
   if (!res.body) return "";
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
+  const abort = () => { void reader.cancel(signal?.reason).catch(() => undefined); };
+  signal?.addEventListener("abort", abort, { once: true });
   try {
+    signal?.throwIfAborted();
     while (total < maxBytes || rejectOverflow) {
+      signal?.throwIfAborted();
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       if (rejectOverflow && value.byteLength > maxBytes - total) {
         throw new ResponseBodyOverflowError(maxBytes);
@@ -3455,6 +3512,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
       total += parts[parts.length - 1]!.length;
     }
   } finally {
+    signal?.removeEventListener("abort", abort);
     // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
     await reader.cancel().catch(() => undefined);
   }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -109,9 +110,17 @@ type Env struct {
 	// exercises the prompt), read through the brew() accessor which then reports unknown ownership.
 	Brew       func(foreground bool, args ...string) (string, error)
 	Executable func() (string, error)
-	// InstalledVersion probes the formula-owned executable quietly. A nil seam
-	// reports verification failure; tests inject a fake without launching processes.
-	InstalledVersion func(formula string) (string, error)
+	// InstalledCLI probes the formula-owned executable quietly, returning its version
+	// and verified path. A nil seam reports verification failure; tests inject a fake
+	// without launching processes.
+	InstalledCLI func(formula string) (installedCLI, error)
+	// Exec replaces this process with argv run from path (syscall.Exec), so a verified
+	// "Update now" restarts the TUI on the new binary. Tests inject a recorder; a nil
+	// seam reports that the restart failed.
+	Exec func(path string, argv, envv []string) error
+	// Args is the argument slice Main was invoked with (without the program name),
+	// recorded so the post-upgrade relaunch repeats the exact invocation.
+	Args []string
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -163,7 +172,8 @@ func DefaultEnv() Env {
 		Git:                realGit,
 		Brew:               realBrew,
 		Executable:         os.Executable,
-		InstalledVersion:   realInstalledVersion,
+		InstalledCLI:       realInstalledCLI,
+		Exec:               syscall.Exec,
 		Store:              store,
 		Getenv:             os.Getenv,
 		AutoUpgradeSkill:   true,
@@ -193,6 +203,7 @@ type globalFlags struct {
 // Main builds the command tree, runs it, prints any error to stderr, and maps
 // the result to a process exit code.
 func Main(env Env, args []string) int {
+	env.Args = args
 	root := newRootCmd(env)
 	root.SetArgs(args)
 	err := root.Execute()

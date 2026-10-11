@@ -363,6 +363,7 @@ tasks:
       # Hermetic regressions for the landing scripts: no network, forge or live PR.
       # They pin review routing, fail-closed quota timing and stale-base push behavior.
       - task: test:uzi-lander
+      - task: test:ci-safe-paths
       # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
       # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
       - task: test:fmt-check-toolchain
@@ -885,6 +886,11 @@ tasks:
       # missing file exits 1 -- indistinguishable from "there are findings".
       - ./scripts/lint-yaml.sh .yamllint
 
+  test:ci-safe-paths:
+    desc: workflow safe-path skips, fallback conditions, cancellation and agent result gates
+    cmds:
+      - ruby scripts/ci-safe-paths.test.rb
+
   lint:actions:
     desc: actionlint + zizmor over .github/workflows (embedded shell + Actions hazards)
     cmds:
@@ -1164,6 +1170,7 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+      - python3 -I -B scripts/release-ci-coverage.test.py
 
   test:agent-runtime-key:
     desc: offline fixture test of scripts/agent-runtime-key.sh (builds temp git repos; issue 1720)
@@ -2365,6 +2372,27 @@ tasks:
     cmds:
       - npm run check-docs
 
+  check:release-metadata:
+    desc: validate the tagged chart and bundled changelog before publication
+    cmds:
+      - task: check-changelog:web
+      - task: test:release-changelog-parity
+      - ./scripts/check-release-chart.sh
+      - task: render:worker-tag-check
+      - task: render:openshift-check
+      - task: render:drain-knobs-check
+      - task: render:ephemeral-docker-check
+      - task: render:ephemeral-lease-check
+      # Reuse the tracked-tree scanner and its canaries instead of adding a weaker
+      # diff-only scanner. The parent supplies code coverage, not new-text scanning.
+      - task: scan:secrets
+
+  test:release-changelog-parity:
+    desc: compare the bundled changelog with release note extraction
+    dir: web
+    cmds:
+      - npx --no-install vitest run src/lib/changelog.parity.test.ts
+
   check-changelog:web:
     desc: assert the newest released CHANGELOG section matches Chart.yaml version
     dir: web
@@ -2456,7 +2484,7 @@ tasks:
 
   # ----------------------------------------------------------- agent (npm) ----
   test:codex-refresh-lostreply-e2e:
-    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker)
+    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker), plus the checkpoint chain bridge
     preconditions:
       - sh: '[ "$(uname -s)" = Linux ]'
         msg: 'test:codex-refresh-lostreply-e2e is Linux-only; requires the Linux-only session-copy fixture'
@@ -2470,9 +2498,51 @@ tasks:
           (cd agent && npm ci --ignore-scripts)
           task deps-check:agent
         fi
+      # Issue #2733: the agent<->broker checkpoint chain bridge rides this target on purpose.
+      # `test-codex-refresh-lostreply-e2e` is the only CI job that has Go, Node AND the agent's
+      # installed dependencies, and `.github/workflows` is deliberately untouched (the worker PAT
+      # cannot push it), so calling it here is the wiring. It runs right after the deps check and
+      # before the Postgres-backed step: the bridge needs no database, so a Docker or Postgres
+      # flake cannot skip it.
+      - task: test:checkpoint-chain-bridge
       - |
         mkdir -p .uzi/scratch
         UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
+
+  test:checkpoint-chain-bridge:
+    desc: real agent RunRunner checkpoint chain through the real pushbroker.Publish (needs Node and agent deps)
+    preconditions:
+      - sh: command -v node && node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+        msg: 'test:checkpoint-chain-bridge requires Node 24 or newer (the agent fixture runs under tsx)'
+      - sh: command -v go
+        msg: 'test:checkpoint-chain-bridge requires Go (the bridge is a Go test)'
+    cmds:
+      - |
+        if ! task deps-check:agent; then
+          (cd agent && npm ci --ignore-scripts)
+          task deps-check:agent
+        fi
+      - |
+        # The log lives under .uzi/scratch (inside the worktree, gitignored), not /tmp.
+        # -buildvcs=false: a linked worktree cannot stamp VCS info. -race: the test's loopback
+        # server records publishes from handler goroutines, and the sibling e2e leg runs -race too. -count=1: no
+        # silent-green from Go's test cache. -v: the RUN/PASS/SKIP lines below are read from it.
+        mkdir -p .uzi/scratch
+        LOG="$(mktemp "{{.ROOT_DIR}}/.uzi/scratch/checkpoint-chain-bridge-log.XXXXXX")"
+        rc=0
+        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 go test -buildvcs=false -count=1 -race -v \
+          -run '^TestAgentCheckpointChainBridge$' ./internal/pushbroker/) > "$LOG" 2>&1 || rc=$?
+        cat "$LOG"
+        [ "$rc" -eq 0 ] || { echo "checkpoint chain bridge failed (exit $rc): $LOG" >&2; exit 1; }
+        # A named RUN and PASS are mandatory and any SKIP fails: the test skips silently when its
+        # gate variable is unset, which would read as green (same discipline as e2e/run-store-it.sh).
+        if ! grep -q '^=== RUN   TestAgentCheckpointChainBridge$' "$LOG" ||
+          ! grep -q '^--- PASS: TestAgentCheckpointChainBridge ' "$LOG" ||
+          grep -q -- '--- SKIP:' "$LOG"; then
+          echo "checkpoint chain bridge did not run and pass without skips: $LOG" >&2
+          exit 1
+        fi
+        rm -f "$LOG"
 
   deps-check:agent:
     desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)

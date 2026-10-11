@@ -223,7 +223,7 @@ func TestCodexClaimCredentialDisabledCustodyLiveDB(t *testing.T) {
 	// The owner's Extend resumes it; the earlier generation's retained custody survives.
 	if _, err := env.q.ExtendAndResumeWallPark(env.ctx, store.ExtendAndResumeWallParkParams{
 		Secs: 3600, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
-		ID: fx.runID, UserID: fx.userID, Cap: 86400,
+		ID: fx.runID, UserID: fx.userID, Cap: 86400, BaseWallUpperSeconds: 86400, FinalizeAllowanceSeconds: WallParkFinalizeSeconds, MaxWallSeconds: MaxRunWallSeconds,
 	}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)
 	}

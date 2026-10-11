@@ -14,6 +14,7 @@
   "requeue_count": 0,
   "iteration_count": 0,
   "is_planning": false,
+  "is_revising": false,
   "progress": null,
   "auto_approve": false,
   "auto_approve_blocked_reasons": null,
@@ -139,6 +140,5 @@
   "repo_path": "",
   "worker_name": null,
   "judge_verdict": null,
-  "judge_todo_count": 0,
-  "is_revising": false
+  "judge_todo_count": 0
 }

@@ -135,6 +135,13 @@ export type MessageKind =
    *  payload never carries `event` or `usage` keys: the usage readers would take them for a
    *  result frame or count the usage twice. */
   | "progress_note"
+  /** Issue #2686: the model usage of one worker-side summary pass (the intent, plan or PR
+   *  description generation). Payload `{ pass: "intent" | "plan" | "pr_description",
+   *  model_usage }` with `model_usage` an AdviceUsageSnapshot. Emitted at most once per pass
+   *  and only when usage was observed; accounting only, no reader renders it. The payload
+   *  never carries `event` or `usage` keys: the usage readers would take them for a result
+   *  frame or count the usage twice. */
+  | "summary_usage"
   /** Revision feedback at the approval gate: human payload `{ feedback: string }`;
    *  automatic advice adds `{ automatic: true, cross_check_round: number }` and
    *  carries no human input receipt. Echoed so the revision is auditable. */
@@ -2281,7 +2288,15 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
 export interface PublishResponse {
   published: boolean;
   ref: string;
-  skipped?: "no_ref" | "not_descendant" | "unsupported" | "workflow_scope";
+  skipped?:
+    | "no_ref"
+    | "not_descendant"
+    | "unsupported"
+    | "workflow_scope"
+    | "superseded"
+    | "tip_missing"
+    | "pack_too_large"
+    | "pack_invalid";
 }
 
 /**
@@ -2914,6 +2929,27 @@ export interface RecoveryReconcileResponse {
   outcome: "accepted" | "replaceable" | "retained";
   final_receipt?: RecoveryFinalDisposition;
   release_evidence?: string;
+  reason?: string;
+}
+
+/** Claim that a completed run's guarded archive is redundant with its published branch (issue
+ *  #2625). Mirrors api/internal/apitypes/recovery_archive_redundancy.go; sent only when the server
+ *  advertises recovery_archive_redundancy_v1. Objects are standard padded base64 of raw commit bodies. */
+export interface RecoveryArchiveRedundancyRequest {
+  generation: number;
+  coverage_digest: string;
+  roots: string[];
+  current_sha: string;
+  tree: string;
+  aggregate_objects: string[];
+  current_object: string;
+  wip?: { witness_object: string };
+}
+
+/** The api's answer. reason is a bounded server token, or a local token when the reply was malformed. */
+export interface RecoveryArchiveRedundancyResponse {
+  capture_id: string;
+  outcome: "expired" | "retained";
   reason?: string;
 }
 

@@ -115,7 +115,7 @@ Open **Settings → Notifications**:
 
 If this instance has no Slack configured yet, the card shows an info alert
 saying so instead of a silently-disabled form — notifications can't be
-delivered until an admin sets it up under **Admin Settings → Slack**. All the
+delivered until an admin sets it up under **Admin → Instance → Slack**. All the
 card's controls (notify toggle, override field, **Save override**, and
 **Send test DM**) are disabled in that state; you can't cause a stuck link by
 clicking ahead of the admin.
@@ -285,7 +285,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   page. **Guardrail override decided** fires when an admin approves or
   rejects your [guardrail override
   request](./admin-settings.md#guardrail-override-per-repo), and links the
-  Repos page. All three need Slack enabled and your account linked, like
+  Boards page. All three need Slack enabled and your account linked, like
   every DM here. If Slack does not take one of the two halt DMs the first
   time (a full queue, a Slack error), uzi retries it every few minutes for
   up to about a day, so you may rarely see one twice or a while after the

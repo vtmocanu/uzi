@@ -406,8 +406,7 @@ const (
 // runStateToken is stateToken over a whole run: the Codex relogin_required hold (which the
 // status/cause pair cannot express, it hangs on CodexAccountAction) and the credential_disabled
 // hold (it hangs on HoldReason) read as amber attention tokens, and every other run takes
-// stateToken unchanged. isRevising is passed
-// separately because only the list DTO carries it (the detail header passes false).
+// stateToken unchanged. Every caller passes the run's own IsRevising (issues #750, #2760).
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if codexReloginHold(r) {
 		return runToken{glyph: codexReloginGlyph, word: codexReloginWord, color: p.amber}

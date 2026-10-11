@@ -466,9 +466,12 @@ type Config struct {
 	ActiveSnapshotDisabled bool
 	WorkerPollInterval     time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace    time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling  time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace      time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace  time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	// WorkerStaleRequeueGrace (#2705): how long a run the stale-worker sweeper requeued stays
+	// pinned to its (heartbeat-stale) previous worker so a returning worker can resume it. 0 disables.
+	WorkerStaleRequeueGrace time.Duration
+	WorkerAffinityCeiling   time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace   time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -770,7 +773,7 @@ type Config struct {
 	RecoveryReadyPayloadPerOwner   int64         // UZI_RECOVERY_READY_PAYLOAD_PER_OWNER_BYTES — ready payload quota per owner. Default 1 GiB.
 	RecoveryInstanceBytes          int64         // UZI_RECOVERY_INSTANCE_BYTES — instance-wide byte quota (scoped to the affected owner on breach, never a global stop). Default 4 GiB.
 	RecoveryMaxCapturesPerClaim    int           // UZI_RECOVERY_MAX_CAPTURES_PER_CLAIM — captures admitted under one hold. Default 16.
-	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded) captures per owner. Default 256.
+	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded, non-expired) captures per owner. Default 256.
 	RecoveryReadyRetention         time.Duration // UZI_RECOVERY_READY_RETENTION — ready-artifact TTL, begins at durable capture. Default 168h (7d).
 	RecoveryUploadRetryWindow      time.Duration // UZI_RECOVERY_UPLOAD_RETRY_WINDOW — governs the periodic stalled→needs_action sweep (workersvc ExpireStalledUploads), NOT an in-request loop: a capture stuck in a non-terminal upload state longer than this is surfaced as needs_action with the source retained. Default 24h; the sweep disables on a non-positive value.
 	RecoveryMaxConcurrentUploads   int           // UZI_RECOVERY_MAX_CONCURRENT_UPLOADS — concurrent uploads per API process. Default 2.
@@ -1177,6 +1180,11 @@ func Load() (Config, error) {
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+	// #2705: a stale-requeued run stays pinned to its previous worker this long while that
+	// worker's row exists; 0 disables the pin. The pin runs from status_since (the requeue, or
+	// a later Codex account promotion, which opens a new queued episode). WORKER_AFFINITY_CEILING
+	// bounds each queued episode, not the total.
+	cfg.WorkerStaleRequeueGrace = parseNonNegDuration("WORKER_STALE_REQUEUE_GRACE", 10*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
 	// to its prior worker while its row exists and it is heartbeating or draining
 	// (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment

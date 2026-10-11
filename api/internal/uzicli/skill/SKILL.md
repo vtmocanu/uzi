@@ -60,6 +60,18 @@ Anthropic token, autopilot, chat), answer from the docs embedded in this binary
 rather than guessing: `uzi docs search <query>` then `uzi docs show <slug>`. Offline,
 version-matched, no server needed — see *Onboarding & concepts* below.
 
+**Why is my run queued? (your own runs)**: `uzi run get <id> --json` and read `health` /
+`health_reason` (may be empty for the first `health_queued_seconds`, default 10 min); then
+`uzi worker list --json` and read each worker's `status`, `docker`, `active_runs`,
+`max_concurrent_runs` (a missing or null field is unknown, never "no"). If every online worker has
+`docker: true`, a repo-bearing run on a repo outside the Docker worker repo allowlist cannot be
+claimed: point to **Admin → Instance → Docker worker repo allowlist** (an admin edits it there;
+anyone else asks an admin). Then `uzi docs show run-health`.
+
+**On-screen labels**: name a web UI location only by the labels in `uzi docs`, never by a
+component name, a route path or an `/api/...` URL; if the docs do not name it, say the path is
+inferred.
+
 **`uzi tui` is not for you.** It is a full-screen, keyboard-driven UI for a human
 watching runs, and it refuses to start when stdout is not a terminal (exit 2). There
 is nothing it shows that the `--json` verbs do not: use `uzi run list --json` for the
@@ -575,12 +587,12 @@ uzi version
   wall-clock time so the sweep does not kill it at its current deadline (PRD #1189). `--by`
   takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit (`1d` = 24h); it
   must be positive (`0`, negative or unparseable is a usage error, exit 2). The added time
-  stacks on the frozen budget rather than replacing it, up to an admin-set per-run allowance.
+  stacks on the frozen budget rather than replacing it. `--by` is capped per request by an admin-set maximum per extension (default 16h), not per run: a run may be extended repeatedly, up to a technical total limit.
   Owner-only, and valid on any non-terminal run of a kind the sweep can time out (issue, task,
   prompt, self-improve, mr-rework, ci-fix), including a queued or parked one. A chat, judge or
   interactive-task run never times out, an over-cap request, or extending while the admin has
   turned extensions off, is a 409 (exit 5) with the server's message printed verbatim. Prints
-  the new deadline and the run's remaining extension allowance; `uzi run get` then shows the
+  the new deadline and the run's total extension (with the per-extension maximum); `uzi run get` then shows the
   extension on its `DEADLINE` row (`· +2h extended`).
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
@@ -1655,7 +1667,7 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   instance setting: review bots (`BASE URL`/`FORGE USER ID`/`STATUS`) whose MR review
   comments the rework lane ingests though the bot is not a collaborator. Empty prints a
   note that third-party bot comments are withheld; a malformed entry is shown verbatim and
-  flagged. Edit in the web Admin Settings page; the CLI never writes.
+  flagged. Edit in the web UI at **Admin → Instance → Trusted review bots**; the CLI never writes.
 - `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
   instance's egress profiles: named site lists for official-sources research. `list`
   prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's

@@ -34,6 +34,7 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	sb.WriteString(title + "\n")
 	sb.WriteString(m.railWorkerLine())
+	sb.WriteString(m.railWaitingLine())
 
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
@@ -61,7 +62,7 @@ func (m tuiModel) renderLaneRail() string {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
 		if l, ok := d.selectedLane(); ok {
-			active := activeLaneKey(d.run.Status, d.frames)
+			active := activeLaneKey(d.run.Status, d.run.IsRevising, d.frames)
 			suffixes := laneSuffixes(d.lanes)
 			sb.WriteString(m.laneRow(l, true, m.laneCrewState(l, active, now), suffixes[l.Key], d.leadCtx, d.leadCtxOK && l.Key == laneLead))
 		}
@@ -97,6 +98,46 @@ func (m tuiModel) railWorkerLine() string {
 	return m.pal.faint.Render("worker "+m.renderer.Plain(text.runWorkerName, 19)) + "\n"
 }
 
+// railWaitingMaxRows bounds the waiting explanation's height on the rail. Five rows keep the
+// stale-requeue pin reason's deadline AND a typical previous worker's name (up to about 50
+// characters) visible at laneRailWidth (issue #2705: the name is often shown nowhere else once
+// the run is queued); a longer user-chosen name is ellipsized.
+const railWaitingMaxRows = 5
+
+// railWaitingLabel leads the waiting explanation and stays faint; the reason follows it.
+const railWaitingLabel = "queued ▸ "
+
+// railWaitingLine explains why a queued run is waiting (issue #2705: for example a stale-requeued
+// run held for its returning worker, with the deadline). It draws only for a queued run whose
+// health is waiting_worker and carries a reason, wraps to railWaitingMaxRows rows within
+// laneRailWidth, and is also counted by railAutoFolded before the protected blocks. The reason is
+// server text but derived from worker names, so it goes through renderer.Plain (D7).
+func (m tuiModel) railWaitingLine() string {
+	run := m.detail.run
+	if run.Status != "queued" || run.Health != "waiting_worker" || run.HealthReason == nil || *run.HealthReason == "" {
+		return ""
+	}
+	text := struct{ runHealthReason string }{runHealthReason: *run.HealthReason}
+	plain := m.renderer.Plain(text.runHealthReason, laneRailWidth*railWaitingMaxRows+railWaitingMaxRows)
+	rows := wrapWords(railWaitingLabel+plain, laneRailWidth, railWaitingMaxRows)
+	if len(rows) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, row := range rows {
+		if i == 0 {
+			// TrimSpace: wrapWords drops the label's trailing space when the reason's first word
+			// does not fit beside it, and the label must stay faint either way.
+			label := strings.TrimSpace(railWaitingLabel)
+			if rest, ok := strings.CutPrefix(row, label); ok {
+				row = m.pal.faint.Render(label) + rest
+			}
+		}
+		sb.WriteString(row + "\n")
+	}
+	return sb.String()
+}
+
 // appendRailBlock appends a protected rail block beneath the content already built, separated by
 // EXACTLY one blank row regardless of whether the builder currently ends in a newline (PRD #1257
 // D6). Every laneRow ends in "\n", so a hand-written "\n\n" join after the roster used to yield a
@@ -126,7 +167,7 @@ func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewS
 		return crewIdle
 	}
 	d := &m.detail
-	return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+	return crewStateFor(d.run.Status, d.run.IsRevising, d.run.Health, l.Key, active, l.LastActivity, now)
 }
 
 // expandedRoster renders every crew lane row (the expanded rail's roster) into one joined string,
@@ -140,7 +181,7 @@ func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewS
 // a subagent lane and the synthetic ALL lane never get it.
 func (m tuiModel) expandedRoster(now time.Time) string {
 	d := &m.detail
-	active := activeLaneKey(d.run.Status, d.frames)
+	active := activeLaneKey(d.run.Status, d.run.IsRevising, d.frames)
 	suffixes := laneSuffixes(d.lanes)
 	fill, hasCtx := d.leadCtx, d.leadCtxOK
 	var sb strings.Builder
@@ -204,13 +245,14 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" && m.railWaitingLine() == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
 	var sb strings.Builder
 	sb.WriteString("crew\n") // stand-in title row: only its trailing "\n" counts toward the budget
 	sb.WriteString(m.railWorkerLine())
+	sb.WriteString(m.railWaitingLine())
 	sb.WriteString(m.expandedRoster(now))
 	appendRailBlock(&sb, progress)
 	appendRailBlock(&sb, block)

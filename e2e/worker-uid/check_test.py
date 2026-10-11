@@ -20,6 +20,47 @@ class CheckerTest(unittest.TestCase):
     def test_pass(self):
         self.assertEqual(check(self.expected, self.report(self.case())), [])
 
+    def test_capture_identities_must_run_not_skip_or_disappear(self):
+        titles = [
+            "cancels while the object-store snapshot streams and leaves no temp tree",
+            "cancels while many tiny object files are copied and leaves no temp tree",
+            "never reads a symlink target's content",
+            "reads each symlink only through its still-open pinned parent descriptor",
+            "refuses a leaf swapped to a regular file before readlink without resolving the pathname",
+            "refuses leaf and parent symlink escapes, nonregular ignores and an unavailable base",
+            "captures an unchanged tracked symlink tree as an empty patch",
+            "captures edits elsewhere next to unchanged tracked symlinks",
+            "treats a symlinked .gitignore as absent while the path stays a candidate",
+        ]
+        suite = "Unit2 runner source capture"
+        expected = [{"file": "agent/test/git-planning-diff.test.ts", "names": [suite, title]}
+                    for title in titles]
+
+        def report():
+            root = ET.Element("testsuites")
+            parent = ET.SubElement(root, "testsuite", name=suite)
+            for title in titles:
+                ET.SubElement(parent, "testcase", name=title, file="/app/test/git-planning-diff.test.ts")
+            return root, parent
+
+        root, _ = report()
+        self.assertEqual(check(expected, root), [])
+        for index, title in enumerate(titles):
+            for mode in ("missing", "skipped", "wrong-file", "wrong-suite"):
+                with self.subTest(title=title, mode=mode):
+                    root, parent = report()
+                    leaf = parent[index]
+                    if mode == "missing":
+                        parent.remove(leaf)
+                    elif mode == "skipped":
+                        ET.SubElement(leaf, "skipped", message="not selected")
+                    elif mode == "wrong-file":
+                        leaf.set("file", "/app/test/other.test.ts")
+                    else:
+                        parent.set("name", "Unit2 bounded runner stdout transport")
+                    errors = "\n".join(check(expected, root))
+                    self.assertIn(f"agent/test/git-planning-diff.test.ts: {suite} > {title}", errors)
+
     def test_failed_leaf_captured_output(self):
         root = self.report(self.case('<failure message="controlled"/><system-err>'
                                      'private unrelated output\nadvice-teardown-diagnostic {"failure":true}'
@@ -60,7 +101,9 @@ class CheckerTest(unittest.TestCase):
         self.assertNotIn('\u202e', ''.join(lines))
 
     def test_cli_keeps_node_diagnostic_comments(self):
-        with tempfile.TemporaryDirectory() as directory:
+        scratch = Path(__file__).resolve().parents[2] / ".uzi/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
             expected = Path(directory) / 'expected.json'
             report = Path(directory) / 'results.xml'
             expected.write_text('[{"file":"agent/test/example.test.ts","names":["suite","leaf"]}]')

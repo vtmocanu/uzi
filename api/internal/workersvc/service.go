@@ -180,20 +180,32 @@ var (
 	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
 	// invalid mode fall through to the 500 default arm.
 	ErrInvalidPauseMode = errors.New("invalid pause mode")
-	// The four `extend` sentinels (PRD #1189 M1). ErrInvalidExtension rejects a body that is
+	// The `extend` sentinels (PRD #1189 M1, #2735). ErrInvalidExtension rejects a body that is
 	// not a whole number of seconds >= 60 → 400. ErrExtendDisabled is the admin off-switch
-	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the per-run cap gate,
-	// whose message names the remaining allowance → 409. ErrExtendNotTimed rejects a run of a
-	// kind that never times out (chat/judge/interactive) → 409. The last two are disambiguated
-	// from a 0-row CreateExtendInput by extendRefusalReason over the already-fetched run.
-	ErrInvalidExtension     = errors.New("invalid extension")
-	ErrExtendDisabled       = errors.New("extending runs is turned off")
-	ErrExtensionCapExceeded = errors.New("extension cap exceeded")
-	ErrExtendNotTimed       = errors.New("this run has no wall-clock timeout to extend")
+	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the PER-REQUEST gate: one
+	// request may not exceed run_extension_cap_seconds (the cumulative total is not capped by it),
+	// → 409. ErrExtensionLimitReached is the technical gate: the run's total wall time (budget +
+	// extensions + finalize allowance) must stay inside MaxRunWallSeconds, → 409. ErrExtendNotTimed
+	// rejects a run of a kind that never times out (chat/judge/interactive) → 409. The last three
+	// are disambiguated from a 0-row CreateExtendInput by extendRefusalReason over the
+	// already-fetched run.
+	ErrInvalidExtension      = errors.New("invalid extension")
+	ErrExtendDisabled        = errors.New("extending runs is turned off")
+	ErrExtensionCapExceeded  = errors.New("extension cap exceeded")
+	ErrExtensionLimitReached = errors.New("total run time limit reached")
+	ErrExtendNotTimed        = errors.New("this run has no wall-clock timeout to extend")
 	// ErrWallParkStopUnavailable (PRD #1497 M1, D9) rejects a `stop` on a budget_exhausted wall park
 	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
 	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
 	ErrWallParkStopUnavailable = errors.New("this parked run has nothing to finalize; extend it to keep working, or cancel it")
+	// ErrWallParkChanged rejects an `extend` on a budget_exhausted wall park whose run changed
+	// between the owner's read and the extend statement (resumed, paused by its owner, finished,
+	// or otherwise no longer held at its time budget). Nothing was extended or resumed. → 409.
+	ErrWallParkChanged = errors.New("this run is no longer parked at its time budget; nothing was extended")
+	// ErrWallParkCrossCheckIneligible rejects an `extend` on a wall-parked plan cross-check whose
+	// lead's plan check is no longer pending (decided, expired, or its lead moved on), so the
+	// checker cannot resume. Nothing was extended or resumed. → 409.
+	ErrWallParkCrossCheckIneligible = errors.New("this plan cross-check can no longer resume: its lead's plan check is no longer pending; nothing was extended")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -484,11 +496,15 @@ type Store interface {
 	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
-	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error)
+	RemoveMRReworkPendingKeys(ctx context.Context, arg store.RemoveMRReworkPendingKeysParams) error
 	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
-	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
-	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance). It returns
+	// the rows written; 0 means the row is legacy (ADR-1199) and nothing was written.
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) (int64, error)
+	// BootstrapMRReworkLedgerMarks upgrades a legacy ledger row to the namespaced state once
+	// (Service.BootstrapReviewLedger); 0 rows means the row moved or was already upgraded.
+	BootstrapMRReworkLedgerMarks(ctx context.Context, arg store.BootstrapMRReworkLedgerMarksParams) (int64, error)
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
@@ -1027,9 +1043,10 @@ type Store interface {
 	CountOnlineWorkersClaimableForRun(ctx context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error)
 	// ExtendAndResumeWallPark / StopWallPark (PRD #1497 M1, D7/D9) are the owner's Extend and Stop on
 	// a budget_exhausted wall park, each in one statement: bank the overrun, resume, and (Stop) cap
-	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the new total
-	// extension; StopWallPark returns the run id (0 rows / ErrNoRows on refusal).
-	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (int32, error)
+	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the
+	// post-update budget row (pgx.ErrNoRows on refusal); StopWallPark returns the run id (0 rows /
+	// ErrNoRows on refusal).
+	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (store.ExtendAndResumeWallParkRow, error)
 	StopWallPark(ctx context.Context, arg store.StopWallParkParams) (uuid.UUID, error)
 	// StampCompletionBudgetExhausted (PRD #1226 M4, D3) arms the server-side served
 	// `budget_exhausted` steer on EXACTLY the post-attempt live-worker interlocked rows
@@ -1419,6 +1436,10 @@ type Params struct {
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration
+	// WorkerStaleRequeueGrace (#2705): how long ClaimRun keeps a run the stale-worker sweeper
+	// requeued pinned to its previous worker (while that worker's row exists). Zero or negative
+	// disables the pin (NULL cutoff); the zero value keeps existing tests unaffected.
+	WorkerStaleRequeueGrace time.Duration
 	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
 	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
 	WorkerSpreadGrace time.Duration
@@ -2204,6 +2225,24 @@ func (s *Service) notify(runID uuid.UUID, status string) {
 
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
+
+// MaxRunWallSeconds is the technical upper bound on a run's served wall total (frozen wall +
+// extensions + finalize allowance), in seconds. The worker arms its wall timer in milliseconds
+// with setTimeout, which clamps a delay above 2^31-1 ms to 1 ms (firing at once), so the total
+// must satisfy total*1000 <= math.MaxInt32 (about 24.8 days). Every extend path enforces it.
+const MaxRunWallSeconds = math.MaxInt32 / 1000
+
+// MaxRunWallCeiling is the largest RUN_WALL_CEILING the configuration can ever have: the
+// config.Load validator refuses an explicit value above it, and the derived default is capped at
+// it. The extend bound reserves max(frozen wall, it) for every run, because plan approval can
+// scale a NULL wall up to a ceiling raised after the extension was granted.
+// TestMaxRunWallCeilingMatchesConfigValidator keeps it equal to that validator's bound.
+const MaxRunWallCeiling = 72 * time.Hour
+
+// WallParkFinalizeSeconds is the one-time finalize allowance StopWallPark grants (SQL literal
+// budget_finalize_seconds = 1800). The extend bound reserves it so a later Stop cannot push the
+// served total past MaxRunWallSeconds; a LiveDB test pins it against the SQL.
+const WallParkFinalizeSeconds = 1800
 
 // defaultDispatchGrace is the undispatched-task-run reaper window (issue #1367): a
 // kind='task' (handoff) run may sit queued+undispatched this long before the sweep
@@ -3106,6 +3145,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
 		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		StaleRequeueCutoff:       StaleRequeueCutoff(claimNow, s.p.WorkerStaleRequeueGrace),
 		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
 		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:           isDocker,
@@ -5886,14 +5926,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
-// "superseded"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
 	Skipped   string
+	// Detail is a bounded, content-free reason behind Skipped (the broker's error text with
+	// secrets scrubbed), for the operator log only. It is never serialized to the worker.
+	Detail string
 }
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
@@ -5904,7 +5947,7 @@ type PublishResult struct {
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker
-// treats as "origin moved, nothing to do" — a diverged tip or an unsupported pack —
+// treats as "origin moved, nothing to do" — a diverged tip or an unusable pack —
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
@@ -6185,13 +6228,17 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
-	case errors.Is(err, pushbroker.ErrTipMissing),
-		errors.Is(err, pushbroker.ErrPackTooLarge),
-		errors.Is(err, pushbroker.ErrPackInvalid):
-		// A tip the pack never delivered, a pack over the reconstruction budget, or a
-		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
-		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
+	case errors.Is(err, pushbroker.ErrTipMissing):
+		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
+		// broker's content-free reason for the operator log (never serialized to the worker).
+		return PublishResult{Published: false, Ref: ref, Skipped: "tip_missing", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackTooLarge):
+		// A pack over the reconstruction budget: a best-effort skip. A worker pack may not
+		// OOM or 5xx-storm the shared api.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_too_large", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackInvalid):
+		// A malformed (or empty) pack: a best-effort skip, never a 5xx.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_invalid", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT
@@ -7402,7 +7449,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// other runs, but it is NOT polling this parked run (the worker parked it and awaits the
 	// server-owned promotion), so a cancel routed to a poller would sit unconsumed. It must
 	// go server-side too, so it reads as "no live poller" here alongside the other parks.
-	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || !run.WorkerID.Valid {
+	//
+	// Issue #1969: paused is a park of the same shape for EVERY hold_reason. An owner pause
+	// (NULL), a completion_blocked hold and a worker-side budget_exhausted wall park all end the
+	// worker's flight once the park lands; a server wall park and a credential_disabled park
+	// release the claim. Resume always requeues for a fresh claim, so no executor is polling a
+	// paused run even while its kept worker heartbeats for other runs, and a cancel enqueued here
+	// would never be consumed (the run would stay paused, still holding its branch).
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || run.Status == "paused" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))

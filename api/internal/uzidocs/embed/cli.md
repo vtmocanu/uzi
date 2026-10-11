@@ -338,12 +338,17 @@ A few worth knowing:
   of a kind the sweep can time out (issue, task, prompt, self-improve,
   mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
   interactive-task run never times out, so extending one is a 409 (exit 5).
-  Extending past the admin's per-run allowance, or while an admin has
-  turned extending off entirely, is also a 409, with the server's message
-  (naming the remaining allowance) printed verbatim. On success it prints
-  the new deadline and the running total against the allowance, e.g.
-  `Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this
-  run: 2h of 16h allowed.` Owner-only.
+  `--by` is limited per request by the admin's maximum per extension
+  (default 16h), not per run: you may extend the same run repeatedly, and
+  each extension is an audited action. A request above that maximum, a
+  request past the run's technical total limit (see [How much time a run
+  can have in total](./run-health.md#how-much-time-a-run-can-have-in-total)),
+  or an extend while an admin has turned extending off entirely, is a 409
+  (exit 5) with the server's message printed verbatim (for example `+20h is
+  more than the 16h maximum per extension`). On success it prints the new
+  deadline and the run's total extension, e.g. `Extended <id> by 2h. 3h05m
+  left, times out 17:20. Extensions on this run: 18h total (up to 16h per
+  extension).` Owner-only.
 - **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
@@ -527,9 +532,16 @@ A few worth knowing:
   ahead of them were skipped (it no longer suggests raising `--max-issues`:
   the fix is to clear those skips, and a higher cap also raises how many runs
   one fire can start). A label sweep also prints how many open issues
-  match its selector but aren't eligible (`ineligible_matched`), when known;
-  a never-fired schedule reads `Last fire: never fired`, and `--json` carries
-  the same detail under `.last_fire` (including `.last_fire.ineligible_matched`
+  match its selector but aren't eligible (`ineligible_matched`), when known.
+  After it, a **Recent fires** block lists the schedule's
+  last 10 scheduled fires that started or skipped something, newest first
+  (nothing is printed when there are none): each entry is a summary line
+  (`<RFC 3339 UTC stamp> · started N · skipped M`), then one line per started
+  issue (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
+  schedule), then one line per skipped issue with its human reason label and
+  title.
+  A never-fired schedule reads `Last fire: never fired`, and `--json` carries
+  the same detail under `.last_fire` and the list under `.recent_fires` (including `.last_fire.ineligible_matched`
   when present — absent means unknown, not zero). `run-now` prints the
   matching per-candidate breakdown inline — a `Started N run(s)` header with
   the created run id(s), a line per started run, then an `Examined N
@@ -900,7 +912,7 @@ A few worth knowing:
   bot's numeric forge user id) whose MR review comments the
   [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may ingest although
   they are not repo collaborators. It is **read-only by design**: edit the list
-  from Admin Settings in the web UI or through the cookie-only
+  from **Admin → Instance → Trusted review bots** in the web UI or through the cookie-only
   `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
   `STATUS` (`ok`, or `malformed` when the entry is not parseable as
   `<url>#<id>`; the CLI is lenient, so an entry the server skips can still show
@@ -1431,7 +1443,10 @@ A newer release is available.
   the offered version. If it is older, the command exits nonzero with
   `Installed CLI is vY; requested vX was not reached. Try again later.`
   (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
-  On verified success it tells you to rerun `uzi tui`; there is no automatic re-exec.
+  On verified success it restarts the TUI on the new version, running the
+  verified formula-owned binary with your original arguments (`--context` and
+  the rest). If that restart fails, the command exits nonzero saying the update
+  succeeded; run `uzi tui` yourself.
   For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
