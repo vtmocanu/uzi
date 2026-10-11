@@ -44,6 +44,7 @@ type ppRow struct {
 	waitCount    int32
 	claimRelease pgtype.Timestamptz
 	workerID     pgtype.UUID
+	generation   int64
 	pauseReq     pgtype.Timestamptz
 	pauseMode    pgtype.Text
 	durability   pgtype.Bool
@@ -53,9 +54,9 @@ func (e interlockLiveDB) ppRun(t *testing.T, runID uuid.UUID) ppRow {
 	t.Helper()
 	var r ppRow
 	if err := e.pool.QueryRow(e.ctx, `SELECT status, hold_reason, recovery_wait_cause, provider_park_count, provider_park_streak_started_at,
-	       recovery_wait_count, claim_released_at, worker_id, pause_requested_at, pause_mode, checkpoint_contains_latest
+	       recovery_wait_count, claim_released_at, worker_id, claim_generation, pause_requested_at, pause_mode, checkpoint_contains_latest
 	  FROM runs WHERE id = $1`, runID).
-		Scan(&r.status, &r.holdReason, &r.cause, &r.count, &r.streakStart, &r.waitCount, &r.claimRelease, &r.workerID, &r.pauseReq, &r.pauseMode, &r.durability); err != nil {
+		Scan(&r.status, &r.holdReason, &r.cause, &r.count, &r.streakStart, &r.waitCount, &r.claimRelease, &r.workerID, &r.generation, &r.pauseReq, &r.pauseMode, &r.durability); err != nil {
 		t.Fatalf("read run: %v", err)
 	}
 	return r
@@ -473,6 +474,106 @@ func TestProviderHoldAwaitingGuardLiveDB(t *testing.T) {
 		if n, err := write(wall); err != nil || n != 1 {
 			t.Fatalf("control: %s onto a budget_exhausted park rows=%d err=%v, want 1 (unchanged behaviour)", name, n, err)
 		}
+	}
+}
+
+// TestProviderHoldResumeRejectsLateWritersLiveDB covers the retained-marker interval:
+// owner Resume queues the same unreleased worker/generation, so generation fencing alone
+// cannot reject its old flight yet. The real ClaimRun query then opens a fresh generation.
+func TestProviderHoldResumeRejectsLateWritersLiveDB(t *testing.T) {
+	for _, name := range []string{
+		"service failed", "service failed legacy",
+		"failed", "failed legacy", "plan rejected", "plan rejected legacy",
+		"superseded", "awaiting input", "awaiting followup",
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc, clock := e.providerParkService(t, ppBound)
+			w := e.seedWorker(t, nil)
+			worker := store.Worker{ID: w, UserID: e.userID}
+			wid := pgconv.UUID(w)
+			runID, gen := e.ppHold(t, svc, clock, w)
+
+			// The count from SetRunFailedPlanRejected is transitioned runs, not settled inputs.
+			// SupersedeRunByWorker exercises both its candidate and final UPDATE guards.
+			write := func(id uuid.UUID, generation int64) (int64, error) {
+				g := pgtype.Int8{Int64: generation, Valid: true}
+				switch name {
+				case "service failed", "service failed legacy":
+					req := StateRequest{State: "failed", FailureReason: strPtr("late"), ClaimGeneration: i64Ptr(generation)}
+					if name == "service failed legacy" {
+						req.ClaimGeneration = nil
+					}
+					_, applied, err := svc.SetState(e.ctx, worker, id, req)
+					if applied {
+						return 1, err
+					}
+					return 0, err
+				case "failed", "failed legacy":
+					if name == "failed legacy" {
+						g = pgtype.Int8{}
+					}
+					return e.q.SetRunFailed(e.ctx, store.SetRunFailedParams{ID: id, WorkerID: wid, ClaimGeneration: g})
+				case "plan rejected", "plan rejected legacy":
+					if name == "plan rejected legacy" {
+						g = pgtype.Int8{}
+					}
+					return e.q.SetRunFailedPlanRejected(e.ctx, store.SetRunFailedPlanRejectedParams{ID: id, WorkerID: wid, ClaimGeneration: g})
+				case "superseded":
+					return e.q.SupersedeRunByWorker(e.ctx, store.SupersedeRunByWorkerParams{ID: id, WorkerID: wid, StopReason: "superseded"})
+				case "awaiting input":
+					return e.q.SetRunAwaitingInput(e.ctx, store.SetRunAwaitingInputParams{ID: id, WorkerID: wid, OpenQuestionID: pgtype.Text{String: "q", Valid: true}})
+				default:
+					return e.q.SetRunAwaitingFollowup(e.ctx, store.SetRunAwaitingFollowupParams{ID: id, WorkerID: wid})
+				}
+			}
+
+			held := e.ppRun(t, runID)
+			if n, err := write(runID, gen); err != nil || n != 0 {
+				t.Fatalf("late writer on hold: rows=%d err=%v, want 0", n, err)
+			}
+			if after := e.ppRun(t, runID); after != held {
+				t.Fatalf("late writer changed hold: %+v -> %+v", held, after)
+			}
+			if _, err := e.q.ResumePausedRun(e.ctx, store.ResumePausedRunParams{ID: runID, UserID: e.userID, GlobalTimeoutSeconds: 3600}); err != nil {
+				t.Fatalf("owner resume: %v", err)
+			}
+			queued := e.ppRun(t, runID)
+			if queued.status != "queued" || queued.count != 0 || queued.streakStart.Valid ||
+				queued.holdReason != held.holdReason || queued.workerID != held.workerID ||
+				queued.generation != gen || queued.claimRelease.Valid {
+				t.Fatalf("resume must clear accounting and retain marker/claim: %+v -> %+v", held, queued)
+			}
+			if n, err := write(runID, gen); err != nil || n != 0 {
+				t.Fatalf("late writer after owner resume: rows=%d err=%v, want 0", n, err)
+			}
+			if after := e.ppRun(t, runID); after != queued {
+				t.Fatalf("late writer changed queued resume: %+v -> %+v", queued, after)
+			}
+
+			// Exercise ClaimRun itself, not a manually fired promotion helper. No active
+			// snapshot was seeded, so the old flight's snapshot exclusion does not apply.
+			fresh, err := e.q.ClaimRun(e.ctx, claimRunParams(worker))
+			if err != nil {
+				t.Fatalf("ClaimRun: %v", err)
+			}
+			if fresh.ID != runID || fresh.Status != "claimed" || fresh.ClaimGeneration != gen+1 ||
+				fresh.WorkerID != wid || fresh.ClaimReleasedAt.Valid || fresh.HoldReason != held.holdReason {
+				t.Fatalf("fresh claim must advance generation and retain marker: %+v", fresh)
+			}
+			if _, applied, err := svc.SetState(e.ctx, worker, runID, StateRequest{State: "failed", ClaimGeneration: i64Ptr(gen)}); !errors.Is(err, ErrStaleClaim) || applied {
+				t.Fatalf("old generation after reclaim: applied=%v err=%v, want ErrStaleClaim", applied, err)
+			}
+			if run, applied, err := svc.SetState(e.ctx, worker, runID, StateRequest{State: "running", ClaimGeneration: i64Ptr(fresh.ClaimGeneration)}); err != nil || !applied || run.Status != "running" {
+				t.Fatalf("fresh running report: applied=%v status=%q err=%v", applied, run.Status, err)
+			}
+			if r := e.ppRun(t, runID); r.holdReason.Valid || r.generation != gen+1 {
+				t.Fatalf("fresh running report did not clear marker: %+v", r)
+			}
+			if n, err := write(runID, fresh.ClaimGeneration); err != nil || n != 1 {
+				t.Fatalf("ordinary writer on fresh running flight: rows=%d err=%v, want 1", n, err)
+			}
+		})
 	}
 }
 

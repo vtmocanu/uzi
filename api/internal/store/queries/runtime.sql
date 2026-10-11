@@ -3673,7 +3673,10 @@ UPDATE runs SET
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
     -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
-    -- hold_reason stays 'provider_unavailable' until the next claim, like completion_blocked.
+    -- The provider_unavailable marker survives queued and claimed until SetRunRunning clears it.
+    -- While queued, affinity and generation still belong to the old flight: report writers must
+    -- protect this interval too. ClaimRun atomically enters claimed with a fresh generation,
+    -- so the service fence rejects reports carrying the old generation and admits the new flight.
     provider_park_count = CASE WHEN runs.hold_reason = 'provider_unavailable' THEN 0 ELSE runs.provider_park_count END,
     provider_park_streak_started_at = CASE WHEN runs.hold_reason = 'provider_unavailable' THEN NULL ELSE runs.provider_park_streak_started_at END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
@@ -4008,9 +4011,10 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
-  -- into a question/follow-up park. Only provider_unavailable: every other paused reason keeps
-  -- today's behaviour.
-  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
+  -- into a question/follow-up park, including ResumePausedRun's queued interval with its
+  -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
+  -- Only provider_unavailable: every other hold reason keeps today's behaviour.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -4119,9 +4123,10 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
-  -- into a question/follow-up park. Only provider_unavailable: every other paused reason keeps
-  -- today's behaviour.
-  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
+  -- into a question/follow-up park, including ResumePausedRun's queued interval with its
+  -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
+  -- Only provider_unavailable: every other hold reason keeps today's behaviour.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -4309,7 +4314,10 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
+  -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -4361,7 +4369,10 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
+      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+      -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
+      -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+      AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -4647,7 +4658,10 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
+  -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+  AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -4689,7 +4703,10 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'provider_unavailable'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
+  -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+  AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: FailRunAutoStop :execrows
