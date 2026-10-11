@@ -36,6 +36,9 @@ through `[0.52.0]`.)
 - **Worker images exclude run-local artifacts from their baked source ([#2523](https://github.com/vtmocanu/uzi/issues/2523)).**
   Both worker templates exclude `.uzi/`, keeping scratch and recovery artifacts out of `/opt/uzi-src` and preventing scratch updates from invalidating the source-copy cache.
 
+- **Codex evidence is refused as soon as an unterminated line exceeds 64 KiB ([#2522](https://github.com/vtmocanu/uzi/issues/2522)).**
+  The launcher counts incoming bytes before readline buffers them and destroys an oversized evidence stream immediately, while retaining the existing delimiter handling and refusal classification.
+
 - **Mock Docker allowlist saves match the server UUID parser.**
   Saves accept compact UUIDs, URN prefixes, ASCII wrappers and Go whitespace while preserving the raw input; invalid tokens, including BOM padding, leave the saved allowlist unchanged.
 
