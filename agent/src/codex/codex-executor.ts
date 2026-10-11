@@ -2571,7 +2571,7 @@ export class CodexExecutor implements Executor {
         if (result.questions?.length) ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_IGNORED_NOTICE } });
       };
       let clarificationPaused = false;
-      const clarify = async (questions: AskUserQuestion[], parkAt?: { completedCount: number; total?: number }): Promise<string> => {
+      const clarify = async (questions: AskUserQuestion[], parkAt?: { completedCount: number; total?: number }, requestPark = ctx.requestParkRun): Promise<string> => {
         if (!ctx.askUser) {
           ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_UNWIRED_NOTICE } });
           return unansweredPrompt(questions);
@@ -2588,13 +2588,11 @@ export class CodexExecutor implements Executor {
         }
         let verdict = await ctx.askUser(questions);
         questionBudget.asked++;
-        while (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && ctx.requestParkRun) {
-          if (questionBudget.asked > questionMax(ctx)) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
-          const disposition = await ctx.requestParkRun(parkAt);
+        // The worker callback owns explicit owner retries and their absolute deadline.
+        if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
+          const disposition = await requestPark(parkAt);
           if (disposition.kind === "paused") { clarificationPaused = true; return ""; }
           if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
-          questionBudget.asked++;
-          if (questionBudget.asked > questionMax(ctx)) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
           verdict = disposition;
         }
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
@@ -3051,17 +3049,29 @@ export class CodexExecutor implements Executor {
             declaredPrSummary = await stampPrSummaryHead(result.prSummary, ctx.worktreePath);
           }
           const parkAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
+          // Idle park waits use the turn's existing wall/hold lifecycle, including generation
+          // consumption and epoch recreation after a refused capture.
+          let idleParkResult: ExecutorResult | undefined;
+          const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
+            let disposition: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
+            const outcome = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer,
+              "implement", nextPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker,
+              shared.selection.current, at, shared.scrubProjected, beforeReapingSink, pauseNow,
+              recreateEpochAfterReap, completionAttempted, onProgress, undefined, async () => {
+                disposition = await ctx.requestParkRun!(at);
+                return { done: false };
+              });
+            if (outcome.kind === "turn") return disposition!;
+            if (outcome.kind === "walled") idleParkResult = { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+            else if (outcome.kind === "held") idleParkResult = { branch: ctx.branch, agentSelection, completionHeld: { reason: outcome.reason } };
+            else { pausedAt = outcome.at; idleParkResult = loopResult(); }
+            return { kind: "paused" };
+          };
           if (result.parkRun) {
             if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new TrustedExecutionRefusal("illicit park_run signal");
             if (clarificationRounds++ >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
-            // Each failure question answer spends the shared clarification budget.
-            let disposition = await ctx.requestParkRun(parkAt);
-            while (disposition.kind === "answer") {
-              questionBudget.asked++;
-              if (questionBudget.asked > questionMax(ctx)) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
-              if (!isParkAnswer(disposition)) break;
-              disposition = await ctx.requestParkRun(parkAt);
-            }
+            const disposition = await requestPark(parkAt);
+            if (idleParkResult) return idleParkResult;
             if (disposition.kind === "paused") { pausedAt = parkAt; return loopResult(); }
             if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
             nextPrompt = disposition.answers.join("\n") + "\n\n" + PARK_RUN_CONTINUATION;
@@ -3082,7 +3092,8 @@ export class CodexExecutor implements Executor {
           // With max_iterations=1, clarify inside this same iteration before its budget check.
           if (clarificationRounds >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
           clarificationRounds++;
-          const followUp = await clarify(result.questions, parkAt);
+          const followUp = await clarify(result.questions, parkAt, ctx.requestParkRun ? requestPark : undefined);
+          if (idleParkResult) return idleParkResult;
           if (clarificationPaused) { pausedAt = parkAt; return loopResult(); }
           const continuationBody = parkRunEnabled(ctx, "implement") ? followUp : `${followUp}\n\nContinue the implementation.`;
           nextPrompt = withMilestoneNote(continuationBody, milestoneNote());
@@ -3948,6 +3959,7 @@ export class CodexExecutor implements Executor {
     completionAttempted = false,
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
     onFirstEvent?: () => void,
+    idleOperation?: () => Promise<ReducedTurnResult>,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -3963,7 +3975,7 @@ export class CodexExecutor implements Executor {
     let buildPhaseBroker = buildPhaseBrokerIn;
     for (;;) {
       try {
-        const result = await this.driveCodexTurn(
+        const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
           ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
@@ -3976,13 +3988,14 @@ export class CodexExecutor implements Executor {
         // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
-        let err: unknown = caught;
+        let err: unknown = idleOperation && caught instanceof PauseNowSignal
+          ? new CodexTurnTripError(REASON_PAUSE, pauseNow.capture()) : caught;
         // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
         // (sticky, or a cancel/shutdown trip) always wins; a pause/wall/idle trip that fired FIRST
         // keeps its existing arm below; anything else (the vault trip, or the turn failing on the
         // refused refresh) defers with NO transient retry (a locked vault is not transient).
         if (pauseNow.vaultLock.latched) {
-          const lockedMsg = caught instanceof Error ? caught.message : "";
+          const lockedMsg = err instanceof Error ? err.message : "";
           if (ctx.cancelRequested?.() || lockedMsg === REASON_CANCEL) throw new Error(REASON_CANCEL);
           if (lockedMsg !== REASON_PAUSE && lockedMsg !== REASON_WALL && lockedMsg !== REASON_IDLE) {
             throw new CodexCredentialDeferredError();

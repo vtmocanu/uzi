@@ -1072,6 +1072,7 @@ describe("buildSignalMcpServer", () => {
 describe("M3 park_run scanning", () => {
   it("takes only noarg main-thread park signals", () => {
     assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", {})), { parkRun: true });
+    assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", [])), {});
     assert.deepEqual(scanSignals(subagentToolUse("mcp__uzi__park_run", {})), {});
     assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", { reason: "wait" })), {});
     assert.equal(isSignalToolName("mcp__uzi__park_run"), true);

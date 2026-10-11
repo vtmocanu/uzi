@@ -1106,7 +1106,7 @@ export function scanSignals(message: unknown): ScannedSignals {
       out.checkpoint = true;
     } else if (name === PARK_RUN_QUALIFIED) {
       const input = asRecord(block["input"]);
-      if (input && Object.keys(input).length === 0) out.parkRun = true;
+      if (input && !Array.isArray(block["input"]) && Object.keys(input).length === 0) out.parkRun = true;
     }
   }
   return out;

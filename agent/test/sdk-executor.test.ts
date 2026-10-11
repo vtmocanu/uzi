@@ -14,7 +14,7 @@ import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
-import { CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
@@ -6681,6 +6681,47 @@ describe("M3 dependency wait Claude", () => {
   });
 });
 
+
+describe("M3 idle park lifecycle precedence", () => {
+  for (const direct of [false, true]) {
+    for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {
+      it(`routes ${direct ? "exact answer" : "tool"} ${control} competing wall`, async () => {
+        let mode: "wall" | null = null;
+        let cancelled = false, parks = 0, walls = 0, pauses = 0, holds = 0;
+        const park = { type: "assistant", session_id: "sess-1", message: { content: [
+          { type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} },
+        ] } } as unknown as SDKMessage;
+        const controls = [direct ? askUserTurn("Ready?") : park, resultSuccess()];
+        const script = fakeTurns(control === "post-attempt"
+          ? [[signalDone(), resultSuccess()], controls] : [controls]);
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+          kind: "issue", parkRunSupported: true, completionInterlock: true, config: { max_iterations: 3 },
+          checkpoint: async () => undefined,
+          recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+          pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => { parks++; mode = "wall"; cancelled = control === "cancel"; throw new PauseNowSignal(); },
+          enterCompletionHold: async () => { holds++; return true; },
+          parkForWall: async () => { walls++; return "parked"; },
+          parkForPause: async () => { pauses++; return true; },
+        });
+        const running = new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+        if (control === "cancel") await assert.rejects(running, /cancel/);
+        else {
+          const result = await running;
+          assert.deepEqual(control === "post-attempt" ? result.completionHeld : result.walled,
+            { reason: "run exceeded its wall-clock timeout" });
+          assert.equal(result.pausedAt, undefined);
+        }
+        assert.equal(parks, 1); assert.equal(pauses, 0);
+        assert.equal(holds, control === "post-attempt" ? 1 : 0);
+        assert.equal(walls, control === "pre-attempt" ? 1 : 0);
+        assert.equal(script.turns.length, control === "post-attempt" ? 2 : 1);
+      });
+    }
+  }
+});
+
 describe("M3 Claude bounded park controls", () => {
   it("denies a subagent at the actual hook and never folds its park signal", async () => {
     let parks = 0;
@@ -6699,17 +6740,44 @@ describe("M3 Claude bounded park controls", () => {
     assert.equal((await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx)).pausedAt, undefined);
     assert.equal(parks, 0);
   });
-  it("bounds repeated failure-question /park answers without another provider turn", async () => {
-    let parks = 0;
-    const script = fakeTurns([[askUserTurn("Ready?"), resultSuccess()]]);
-    const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
-      parkRunSupported: false, config: { max_iterations: 1, question_max: 2 },
-      askUser: async () => ({ kind: "answer", answers: ["/park"] }),
-      requestParkRun: async () => { parks++; return { kind: "answer", answers: ["/park"] }; } });
-    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx), /clarification rounds exhausted/);
-    assert.equal(parks, 2);
-    assert.equal(script.turns.length, 1);
-  });
+  for (const direct of [false, true]) {
+    for (const finish of ["paused", "answer"] as const) {
+      it(`keeps one ${direct ? "exact answer" : "tool"} callback pending across owner retries then ${finish}`, async () => {
+        let parks = 0;
+        let release!: () => void;
+        let entered!: () => void;
+        let nextRetry = new Promise<void>(resolve => { entered = resolve; });
+        const park = { type: "assistant", session_id: "sess-1", message: { content: [
+          { type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} },
+        ] } } as unknown as SDKMessage;
+        const script = fakeTurns([[direct ? askUserTurn("Ready?") : park, resultSuccess()], [signalDone(), resultSuccess()]]);
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+          parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => {
+            parks++;
+            // Model the worker's internal explicit owner retries, with one callback pending.
+            for (let retry = 0; retry < 3; retry++) {
+              await new Promise<void>(resolve => { release = resolve; entered(); });
+            }
+            return finish === "paused" ? { kind: "paused" } : { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+        });
+        const running = new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+        for (let retry = 0; retry < 3; retry++) {
+          await nextRetry;
+          assert.equal(parks, 1);
+          assert.equal(script.turns.length, 1, "no provider turn while callback is pending");
+          nextRetry = new Promise<void>(resolve => { entered = resolve; });
+          release();
+        }
+        const result = await running;
+        assert.equal(!!result.pausedAt, finish === "paused");
+        assert.equal(parks, 1);
+        assert.equal(script.turns.length, finish === "paused" ? 1 : 2);
+      });
+    }
+  }
   it("cancels through the existing clarification handling", async () => {
     const script = fakeTurns([[askUserTurn("Ready?"), resultSuccess()]]);
     const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",

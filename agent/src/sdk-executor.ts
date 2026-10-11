@@ -2873,6 +2873,107 @@ export class SdkExecutor implements Executor {
         let turn: TurnResult;
         try {
           turn = await turnPromise;
+          resumeId = turn.sessionId ?? resumeId;
+          if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
+          // PRD #265 M1: latch the finished-milestone declaration the same way, so it
+          // survives the terminating turn's `break` into the completed report.
+          if (turn.milestonesCompleted !== undefined) {
+            declaredMilestonesCompleted = turn.milestonesCompleted;
+            for (const id of turn.milestonesCompleted) seenCompletedIds.add(id);
+          }
+          // issue #279: latch report_only true (like done) and take the last-wins summary
+          // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
+          // the final ExecutorResult after the break below.
+          if (turn.reportOnly) declaredReportOnly = true;
+          if (turn.summary !== undefined) declaredSummary = turn.summary;
+          // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
+          // the terminating turn reaches the final ExecutorResult after the break below.
+          if (turn.proposal !== undefined) declaredProposal = turn.proposal;
+          // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the turn
+          // that CARRIED the claims, so a later bare signal_done (an interlock rework, an interactive
+          // follow-up) keeps the earlier claims with the sha they were made at. A turn carrying
+          // claims is always a done turn: scanSignals extracts pr_summary only inside the
+          // signal_done branch that latches `done`. A HEAD read failure leaves verifiedAtSha absent
+          // and never throws.
+          if (turn.prSummary !== undefined) {
+            declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
+          }
+          if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
+          // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
+          // `running` report. Only overwrite when the turn reported something, so a quiet
+          // turn keeps the last known progress rather than blanking it.
+          if (turn.progress) {
+            latestProgress = turn.progress;
+            for (const id of turn.progress.completed) seenCompletedIds.add(id);
+          }
+          const parkAt = { completedCount: lastServedScope?.completedCount ?? latestProgress?.completed?.length ?? 0, total: (frozenMilestones ?? ctx.frozenMilestones)?.length };
+          if (turn.parkRun) {
+            if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
+            if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
+            // The worker callback owns explicit owner retries and their absolute deadline.
+            const parkStep = await this.runThroughSwitch(ctx, state, () => ctx.requestParkRun!(parkAt));
+            if ("released" in parkStep) { switchReleased = true; break; }
+            const disposition = parkStep.value;
+            if (disposition.kind === "paused") { pausedAt = parkAt; break; }
+            if (disposition.kind === "cancel") throw new PlanRejectedError("run cancelled while awaiting clarification");
+            followUp = disposition.answers.join("\n") + "\n\n" + (parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : "");
+            iteration--;
+            resetStallState();
+            continue;
+          }
+          // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
+          // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
+          // human cannot trip REASON_IDLE. That property is free by construction here,
+          // not something the park has to defend.
+          //
+          // The answer is fed to the next turn as an ordinary user turn (via followUp)
+          // rather than returned as the tool's result — the lead was told to end its
+          // turn after asking, so there is no tool call still open to return into. The
+          // resumed session keeps full context, so nothing is replayed.
+          //
+          // `iteration` is deliberately NOT advanced for the answer round-trip: a
+          // clarification is not an implement/review iteration, and counting it would
+          // let a talkative lead burn the loop budget on questions. The `continue`
+          // re-enters the loop, which increments — so the decrement below keeps the
+          // clarification turn free.
+          const asked = turn.questions;
+          if (asked?.length) {
+            if (turn.checkpoint) await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
+            // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
+            // credential switch can trip while awaiting the answer (steering rejects the answer waiter
+            // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
+            // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
+            // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
+            // askUserOrContinue — keep waiting), never a terminal failure.
+            const askStep = await this.runThroughSwitch(ctx, state, () =>
+              this.askUserOrContinue(ctx, asked, budget.asked, parkAt),
+            );
+            if ("released" in askStep) {
+              switchReleased = true;
+              break;
+            }
+            const verdict = askStep.value;
+            if (verdict.runPaused) { pausedAt = parkAt; break; }
+            if (verdict.parked) {
+              budget.asked += verdict.questionsUsed ?? 1;
+              if (verdict.cancelled)
+                throw new PlanRejectedError(
+                  "run cancelled while awaiting clarification",
+                );
+              followUp = verdict.followUp;
+              iteration--;
+              resetStallState(); // a clarification park is not a refusal turn → breaks the streak
+              continue;
+            }
+            // Not parked: the cap is spent, or no askUser is wired. Either way the run
+            // continues on the lead's judgment; the notice is already on the feed.
+            followUp = verdict.followUp;
+            iteration--;
+            resetStallState(); // a clarification turn is not a refusal → breaks the streak
+            continue;
+          }
+
         } catch (err) {
           // PRD #1247 M5b (data-integrity fix): a held-state credential switch tripped this
           // implement turn (the SDK abort / re-armable interrupt → driveTurn throws
@@ -2905,6 +3006,7 @@ export class SdkExecutor implements Executor {
             throw err;
           }
           if (err instanceof PauseNowSignal) {
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             const at = {
               // The server's fresh completed count off THIS iteration's ACK, matching the
               // loop-top branch; fall back to the worker's own live progress if the ACK carried
@@ -3009,116 +3111,6 @@ export class SdkExecutor implements Executor {
           }
           throw err;
         }
-        resumeId = turn.sessionId ?? resumeId;
-        if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
-        // PRD #265 M1: latch the finished-milestone declaration the same way, so it
-        // survives the terminating turn's `break` into the completed report.
-        if (turn.milestonesCompleted !== undefined) {
-          declaredMilestonesCompleted = turn.milestonesCompleted;
-          for (const id of turn.milestonesCompleted) seenCompletedIds.add(id);
-        }
-        // issue #279: latch report_only true (like done) and take the last-wins summary
-        // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
-        // the final ExecutorResult after the break below.
-        if (turn.reportOnly) declaredReportOnly = true;
-        if (turn.summary !== undefined) declaredSummary = turn.summary;
-        // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
-        // the terminating turn reaches the final ExecutorResult after the break below.
-        if (turn.proposal !== undefined) declaredProposal = turn.proposal;
-        // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the turn
-        // that CARRIED the claims, so a later bare signal_done (an interlock rework, an interactive
-        // follow-up) keeps the earlier claims with the sha they were made at. A turn carrying
-        // claims is always a done turn: scanSignals extracts pr_summary only inside the
-        // signal_done branch that latches `done`. A HEAD read failure leaves verifiedAtSha absent
-        // and never throws.
-        if (turn.prSummary !== undefined) {
-          declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
-        }
-        if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
-        // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
-        // `running` report. Only overwrite when the turn reported something, so a quiet
-        // turn keeps the last known progress rather than blanking it.
-        if (turn.progress) {
-          latestProgress = turn.progress;
-          for (const id of turn.progress.completed) seenCompletedIds.add(id);
-        }
-        const parkAt = { completedCount: lastServedScope?.completedCount ?? latestProgress?.completed?.length ?? 0, total: (frozenMilestones ?? ctx.frozenMilestones)?.length };
-        if (turn.parkRun) {
-          if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
-          if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
-          const parkStep = await this.runThroughSwitch(ctx, state, async () => {
-            // A failure answer can itself request another pause. Each answer spends the
-            // existing question budget; no command answer is sent to the provider.
-            for (;;) {
-              const disposition = await ctx.requestParkRun!(parkAt);
-              if (disposition.kind !== "answer") return disposition;
-              budget.asked++;
-              if (budget.asked > questionMax(ctx.config ?? null)) throw new Error("clarification rounds exhausted during implementation");
-              if (!isParkAnswer(disposition)) return disposition;
-            }
-          });
-          if ("released" in parkStep) { switchReleased = true; break; }
-          const disposition = parkStep.value;
-          if (disposition.kind === "paused") { pausedAt = parkAt; break; }
-          if (disposition.kind === "cancel") throw new PlanRejectedError("run cancelled while awaiting clarification");
-          followUp = disposition.answers.join("\n") + "\n\n" + (parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : "");
-          iteration--;
-          resetStallState();
-          continue;
-        }
-        // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
-        // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
-        // human cannot trip REASON_IDLE. That property is free by construction here,
-        // not something the park has to defend.
-        //
-        // The answer is fed to the next turn as an ordinary user turn (via followUp)
-        // rather than returned as the tool's result — the lead was told to end its
-        // turn after asking, so there is no tool call still open to return into. The
-        // resumed session keeps full context, so nothing is replayed.
-        //
-        // `iteration` is deliberately NOT advanced for the answer round-trip: a
-        // clarification is not an implement/review iteration, and counting it would
-        // let a talkative lead burn the loop budget on questions. The `continue`
-        // re-enters the loop, which increments — so the decrement below keeps the
-        // clarification turn free.
-        const asked = turn.questions;
-        if (asked?.length) {
-          if (turn.checkpoint) await ctx.checkpoint?.({ reap: true, progress: latestProgress });
-          if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
-          // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
-          // credential switch can trip while awaiting the answer (steering rejects the answer waiter
-          // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
-          // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
-          // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
-          // askUserOrContinue — keep waiting), never a terminal failure.
-          const askStep = await this.runThroughSwitch(ctx, state, () =>
-            this.askUserOrContinue(ctx, asked, budget.asked, parkAt),
-          );
-          if ("released" in askStep) {
-            switchReleased = true;
-            break;
-          }
-          const verdict = askStep.value;
-          if (verdict.runPaused) { pausedAt = parkAt; break; }
-          if (verdict.parked) {
-            budget.asked += verdict.questionsUsed ?? 1;
-            if (verdict.cancelled)
-              throw new PlanRejectedError(
-                "run cancelled while awaiting clarification",
-              );
-            followUp = verdict.followUp;
-            iteration--;
-            resetStallState(); // a clarification park is not a refusal turn → breaks the streak
-            continue;
-          }
-          // Not parked: the cap is spent, or no askUser is wired. Either way the run
-          // continues on the lead's judgment; the notice is already on the feed.
-          followUp = verdict.followUp;
-          iteration--;
-          resetStallState(); // a clarification turn is not a refusal → breaks the streak
-          continue;
-        }
-
         clarificationRounds = 0;
         // PRD #122 M6 (Decision 10): the lead cooperatively checkpointed a completed
         // milestone. Reap + fetch-back durably, then continue — it ended its turn and will
@@ -3957,16 +3949,13 @@ export class SdkExecutor implements Executor {
       return { parked: false, followUp: unansweredPrompt(questions) };
     }
     let verdict = await ctx.askUser(questions);
-    let questionsUsed = 1;
+    const questionsUsed = 1;
     // Only a validated answer to an active implementation question is a command.
-    // Every failure question consumes this same bounded clarification budget.
-    for (let used = questionsAsked + 1; parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && ctx.requestParkRun; used++) {
-      if (used > cap) throw new Error("clarification rounds exhausted during implementation");
+    // The worker callback consumes owner retries internally; only the model question uses budget.
+    if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && ctx.requestParkRun) {
       const disposition = await ctx.requestParkRun(parkAt);
       if (disposition.kind === "paused") return { parked: true, runPaused: true, followUp: "" };
       if (disposition.kind === "cancel") return { parked: true, cancelled: true, followUp: "" };
-      questionsUsed++;
-      if (questionsAsked + questionsUsed > cap) throw new Error("clarification rounds exhausted during implementation");
       verdict = disposition;
     }
     if (verdict.kind === "cancel")

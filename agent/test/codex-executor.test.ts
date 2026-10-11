@@ -16030,23 +16030,95 @@ describe("M3 dependency wait Codex", () => {
   }
 });
 
+
+describe("M3 idle park lifecycle precedence", () => {
+  for (const direct of [false, true]) {
+    for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {
+      it(`routes ${direct ? "exact answer" : "tool"} ${control} competing wall`, async () => {
+        let mode: "wall" | null = null;
+        let cancelled = false, parks = 0, walls = 0, pauses = 0, holds = 0;
+        const controlResponder = epochResponder("th-1", "tn-control", (t, th, tn) => {
+          t.push(toolCall(201, direct ? "ask_user" : "park_run",
+            direct ? { questions: [{ question: "Ready?" }] } : {}, th, tn, "park"));
+          t.push(turnCompleted("completed", th, tn));
+        });
+        const rig = makeMultiEpochRig(control === "post-attempt" ? [
+          epochResponder("th-1", "tn-done", (t, th, tn) => {
+            t.push(toolCall(101, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+          }), controlResponder,
+        ] : [controlResponder]);
+        const { ctx } = makeCtx({ kind: "issue", parkRunSupported: true, completionInterlock: true,
+          config: { max_iterations: 3 }, checkpoint: async () => undefined,
+          recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+          pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => { parks++; mode = "wall"; cancelled = control === "cancel"; throw new PauseNowSignal(); },
+          enterCompletionHold: async () => { holds++; return true; },
+          parkForWall: async () => { walls++; return "parked"; },
+          parkForPause: async () => { pauses++; return true; },
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        if (control === "cancel") await assert.rejects(running, /cancel/);
+        else {
+          const result = await running;
+          assert.deepEqual(control === "post-attempt" ? result.completionHeld : result.walled,
+            { reason: "codex run wall-clock timeout" });
+          assert.equal(result.pausedAt, undefined);
+        }
+        assert.equal(parks, 1); assert.equal(pauses, 0);
+        assert.equal(holds, control === "post-attempt" ? 1 : 0);
+        assert.equal(walls, control === "pre-attempt" ? 1 : 0);
+        assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0),
+          control === "post-attempt" ? 2 : 1);
+      });
+    }
+  }
+});
+
 describe("M3 Codex bounded park controls", () => {
-  it("bounds repeated failure-question /park answers without another provider turn", async () => {
-    let parks = 0;
-    const rig = makeRig({ responder: (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
-      if (c.method !== "turn/start") return {};
-      c.transport.push(toolCall(401, "ask_user", { questions: [{ question: "Ready?" }] }, "th-1", "tn-1", "ask"));
-      c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
-      return { turn: { id: "tn-1" } };
-    } });
-    const { ctx } = makeCtx({ parkRunSupported: false, config: { max_iterations: 1, question_max: 2 },
-      askUser: async () => ({ kind: "answer", answers: ["/park"] }),
-      requestParkRun: async () => { parks++; return { kind: "answer", answers: ["/park"] }; } });
-    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /clarification rounds exhausted/);
-    assert.equal(parks, 2);
-    assert.equal(rig.transport.turnStartCount, 1);
-  });
+  for (const direct of [false, true]) {
+    for (const finish of ["paused", "answer"] as const) {
+      it(`keeps one ${direct ? "exact answer" : "tool"} callback pending across owner retries then ${finish}`, async () => {
+        let parks = 0;
+        let release!: () => void;
+        let entered!: () => void;
+        let nextRetry = new Promise<void>(resolve => { entered = resolve; });
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          const tn = `tn-${c.turnStartCount}`;
+          c.transport.push(toolCall(400 + c.turnStartCount, c.turnStartCount > 1 ? "signal_done" : direct ? "ask_user" : "park_run",
+            c.turnStartCount === 1 && direct ? { questions: [{ question: "Ready?" }] } : {}, "th-1", tn, "control"));
+          c.transport.push(turnCompleted("completed", "th-1", tn));
+          return { turn: { id: tn } };
+        } });
+        const { ctx } = makeCtx({
+          parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => {
+            parks++;
+            // Model the worker's internal explicit owner retries, with one callback pending.
+            for (let retry = 0; retry < 3; retry++) {
+              await new Promise<void>(resolve => { release = resolve; entered(); });
+            }
+            return finish === "paused" ? { kind: "paused" } : { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        for (let retry = 0; retry < 3; retry++) {
+          await nextRetry;
+          assert.equal(parks, 1);
+          assert.equal(rig.transport.turnStartCount, 1, "no provider turn while callback is pending");
+          nextRetry = new Promise<void>(resolve => { entered = resolve; });
+          release();
+        }
+        const result = await running;
+        assert.equal(!!result.pausedAt, finish === "paused");
+        assert.equal(parks, 1);
+        assert.equal(rig.transport.turnStartCount, finish === "paused" ? 1 : 2);
+      });
+    }
+  }
   for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } }]) {
     it(`does not advertise or admit illicit park ${JSON.stringify(overrides)}`, async () => {
       let parks = 0;
