@@ -61,6 +61,32 @@ it("one authorized repair then durable empty finalizer; later done never snapsho
   assert.equal(summary.dispositions?.[0]?.disposition, "not_reported");
 });
 
+it("transient status failure refuses report then fresh validation recovers within the single repair pass", async () => {
+  const r = rig();
+  assert.equal((await r.gate.done()).action, "repair");
+  const batch: CodeCrossCheckDispositionBatch = [
+    { finding_id: "F_1", disposition: "addressed", reason: "fixed; affected test passed" },
+  ];
+  r.defer(Promise.reject(new Error("transient status GET failure")));
+  await assert.rejects(r.gate.report(batch), /not active/);
+  assert.deepEqual(r.batches, [], "unavailable status must not authorize a POST");
+  assert.equal(r.gate.repairActive(), true, "unknown status retains eligibility for fresh validation");
+
+  let release!: (row: CodeCrossCheckStatus) => void;
+  r.defer(new Promise(resolve => { release = resolve; }));
+  const recovered = r.gate.report(batch);
+  assert.deepEqual(r.batches, [], "cached evidence cannot authorize while the fresh GET is pending");
+  release(r.row());
+  await recovered;
+  assert.deepEqual(r.batches, [batch], "fresh unchanged server row permits known-ID reporting");
+
+  assert.deepEqual(await r.gate.done(), { action: "proceed" });
+  assert.equal(r.gate.repairActive(), false);
+  await assert.rejects(r.gate.report(batch), /not active/);
+  assert.deepEqual(r.batches, [batch], "second done closes reporting without another POST");
+  assert.deepEqual(r.counts(), { submits: 0, snapshots: 0 });
+});
+
 it("report refuses before/after authority, unknown/duplicate IDs and oversized UTF-8 reasons", async () => {
   const r = rig();
   await assert.rejects(r.gate.report([]), /not active/);

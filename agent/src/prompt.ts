@@ -14,6 +14,7 @@
 import { randomBytes } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 import type { PlanCrossCheckFindings } from "./client.js";
+import type { CodeFinding } from "./code-cross-check-contract.js";
 import type {
   IssueCommentsSnapshot,
   MemoryBasis,
@@ -1841,7 +1842,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
 /** Automated advice has no independent execution authority, in either stage. */
 export function buildAutomaticRevisionPrompt(
   stage: "plan" | "code",
-  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] } | { findings: import("./code-cross-check-contract.js").CodeFinding[] },
+  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] } | { findings: CodeFinding[] },
   priorPlan?: string,
   nonceSource: () => string = fenceNonce,
 ): string {

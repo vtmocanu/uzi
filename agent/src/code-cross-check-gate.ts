@@ -30,19 +30,21 @@ export class CodeCrossCheckGate {
     return "incomplete" in this.summary ? undefined : this.summary;
   }
 
-  private async read(): Promise<CodeCrossCheckRecord | undefined> {
+  private async read(): Promise<CodeCrossCheckStatus | undefined> {
     try {
-      return this.remember(await this.options.client.codeCrossCheckStatus(
+      const status = await this.options.client.codeCrossCheckStatus(
         this.options.runId, this.options.generation,
-        AbortSignal.any([this.options.signal, AbortSignal.timeout(this.options.requestMs ?? 3000)])));
+        AbortSignal.any([this.options.signal, AbortSignal.timeout(this.options.requestMs ?? 3000)]));
+      this.remember(status);
+      return status;
     } catch {
       this.options.signal.throwIfAborted();
       return this.remember(undefined);
     }
   }
 
-  private current(row: CodeCrossCheckRecord | undefined): row is CodeCrossCheckRecord {
-    return row !== undefined && row.candidate_generation === this.options.generation
+  private current(row: CodeCrossCheckStatus | undefined): row is CodeCrossCheckRecord {
+    return row !== undefined && !("result" in row) && row.candidate_generation === this.options.generation
       && row.interrupted_at === null && row.outcome === "completed"
       && row.head_commit !== null && row.base_commit !== null;
   }
@@ -62,6 +64,8 @@ export class CodeCrossCheckGate {
     const authorized = this.active;
     if (!authorized) return undefined;
     const row = await this.read();
+    // An unavailable GET refuses this use; only a fresh successful read can authorize a retry.
+    if (row === undefined) return undefined;
     if (this.active !== authorized || this.options.signal.aborted || !this.current(row) || !this.same(row, authorized)) {
       if (this.active === authorized) this.active = undefined;
       return undefined;
