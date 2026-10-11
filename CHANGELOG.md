@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cancelling a paused run now cancels it ([#1969](https://github.com/vtmocanu/uzi/issues/1969)).**
+  A paused run (owner pause, credential disabled, wall-clock budget exhausted, or completion hold) whose worker was still online for other runs had its cancel queued for a worker that was not running it, so the run stayed paused and kept blocking new runs on its branch. The cancel now applies immediately.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

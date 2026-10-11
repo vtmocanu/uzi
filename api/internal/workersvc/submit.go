@@ -206,7 +206,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// below (the generic `extend` already admits a paused row; the milestone `stop` branch is
 	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
 	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
-	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged,
+	// because hasLivePoller reads every paused run as having no poller even while its kept worker
+	// heartbeats for other runs (issue #1969).
 	// PRD #1908 D-E: a job is never extended, on ANY extend path. Refuse it here, above the
 	// budget_exhausted wall-park branch (which routes to ExtendAndResumeWallPark with no kind
 	// filter) and the generic CTE (whose kind list admits a job).

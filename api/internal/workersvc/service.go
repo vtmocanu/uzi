@@ -7395,7 +7395,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// other runs, but it is NOT polling this parked run (the worker parked it and awaits the
 	// server-owned promotion), so a cancel routed to a poller would sit unconsumed. It must
 	// go server-side too, so it reads as "no live poller" here alongside the other parks.
-	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || !run.WorkerID.Valid {
+	//
+	// Issue #1969: paused is a park of the same shape for EVERY hold_reason. An owner pause
+	// (NULL), a completion_blocked hold and a worker-side budget_exhausted wall park all end the
+	// worker's flight once the park lands; a server wall park and a credential_disabled park
+	// release the claim. Resume always requeues for a fresh claim, so no executor is polling a
+	// paused run even while its kept worker heartbeats for other runs, and a cancel enqueued here
+	// would never be consumed (the run would stay paused, still holding its branch).
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || run.Status == "paused" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
