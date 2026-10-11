@@ -187,6 +187,7 @@ apiget /api/admin/workers \
   || fail "case b: uzi admin workers did not report both runs for worker $WORKER1"
 pass "case b: re-adopted to exact phase — requeue refunded, provenance cleared, gen unchanged, gate queued-interval banked ($BP_G_BEFORE -> $BP_G_AFTER), no new custody hold, worker_active_runs + admin workers list both"
 cancel_run "$E"; cancel_run "$G"
+wait_runs_terminal_off_worker 60 "$E" "$G"
 
 # =============================================================================
 # CASE (a) — BOOT GRACE (proves M1). The api is stopped under both live runs for longer than
@@ -222,6 +223,7 @@ BP_GA_AFTER="$(run_field "$GA" budget_paused_seconds)"
 [ "$BP_GA_AFTER" = "$BP_GA_BEFORE" ] || fail "case a: GATE run park time moved across the restart ($BP_GA_BEFORE -> $BP_GA_AFTER) — a stale requeue fired inside the boot grace"
 pass "case a: boot grace held — both runs read their ORIGINAL status, no requeue, no provenance, gate park time unchanged ($BP_GA_BEFORE)"
 cancel_run "$EA"; cancel_run "$GA"
+wait_runs_terminal_off_worker 60 "$EA" "$GA"
 
 # =============================================================================
 # CASE (c) — silent execution loss (missing path) + no sibling steal + one reclaim (M2b/M3).
@@ -314,6 +316,7 @@ GEN_X1="$(run_field "$X" claim_generation)"
 [ "$GEN_X1" = "$((GEN_X0 + 1))" ] || fail "case c: reclaim did not advance the generation by exactly one ($GEN_X0 -> $GEN_X1)"
 pass "case c: first worker's claim loop reclaimed X exactly once — generation $GEN_X0 -> $GEN_X1"
 cancel_run "$X"
+wait_runs_terminal_off_worker 60 "$X"
 
 # =============================================================================
 # CASE (d) — api ROLLBACK simulation (proves D7). Restart the api with
@@ -368,6 +371,7 @@ unset UZI_ACTIVE_SNAPSHOT_DISABLED UZI_E2E_MAX_CONCURRENT_RUNS UZI_E2E_DROP_ON_S
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login
+wait_runs_terminal_off_worker 60 "$ED"
 RA_RESTORE_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
