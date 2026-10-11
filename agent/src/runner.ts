@@ -137,6 +137,7 @@ import {
 } from "./quarantine-archive.js";
 import {
   ResidueQuarantinedError,
+  RetainedStoppedSourceError,
   RunResidueBlockedError,
   assertResidueQuarantineOpen,
   latchOnUnattributedUnreadable,
@@ -1730,6 +1731,9 @@ interface RunFlight {
   inventoryArchiveNotices: Set<string>;
   /** Credential deferral/switch leaves this generation's guarded inventory open for resume. */
   keepGuardedInventoryOpen: boolean;
+  /** issue #1786: a stopped (fenced or stale) flight kept its worker-local source and latched
+   *  {@link RunFlight.preserveRecoveryClone}; no later teardown path may dispose of it. */
+  stoppedSourceKept: boolean;
   /** issue #1751 M2: the resolved claim kind, gating which live-settle trigger (checkpoint publish
    *  or finalize branch push) this run may fire. */
   readonly runKind: RunKind;
@@ -2047,6 +2051,9 @@ export interface RunnerOptions {
   quiesceRun?: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
   /** issue #1783: the worker's live-attempt set; injected for tests (default: one per runner). */
   liveAttempts?: LiveAttemptRegistry;
+  /** issue #1786: called (fire-and-forget; a throw is swallowed) after a stopped flight retained its
+   *  worker-local source, so the operator channel can log the bounded retained count and bytes. */
+  onSourceRetained?: () => void;
   /** Plan-approval gate cap; 0 disables (default 24h). */
   planApprovalTimeoutMs?: number;
   /** PRD #88: fallback answer deadline in ms. The claim's question_timeout_seconds
@@ -2354,6 +2361,8 @@ export class RunRunner {
   private readonly quiesceImpl: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
   /** issue #1783: the Docker endpoint the teardown half talks to (undefined ⇒ not wired). */
   private readonly dockerHost: string | undefined;
+  /** issue #1786: see {@link RunnerOptions.onSourceRetained}. */
+  private readonly onSourceRetained: (() => void) | undefined;
   /** issue #1783 M2: a Docker-wired worker (the resolved DockerWiring carries a dockerHost) seeds
    *  every execution attempt at a FRESH `<key>.attempt-<attemptId>` clone path, so a late Docker
    *  create binding a predecessor's path can never land in the successor's tree. Unwired workers
@@ -2382,6 +2391,7 @@ export class RunRunner {
     this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
     this.quiesceImpl = opts.quiesceRun ?? ((req) => quiesceRunAttempt(req));
     this.dockerHost = opts.dockerHost;
+    this.onSourceRetained = opts.onSourceRetained;
     this.attemptPaths = !!opts.dockerHost;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.questionTimeoutMs = opts.questionTimeoutMs ?? 24 * 60 * 60_000;
@@ -3661,12 +3671,16 @@ export class RunRunner {
       } else if (flight.steering?.claimFence() !== undefined) {
         // Issue #1673: an input receipt said this claim was released or superseded (or the run is
         // terminal), and the steering channel ended the flight. Like the StaleClaimError arm below:
-        // report NO terminal state and journal nothing (the server fence would refuse it), close
-        // the batcher, and let the finally run ordinary teardown. A server wall park is still
+        // report NO terminal state and journal nothing (the server fence would refuse it) and close
+        // the batcher. Issue #1786: the new claim owns the RUN, not this worker's clone, so any
+        // source here stays until proven preserved; the finally then runs the rest of the
+        // teardown (HOME and skills cleanup) without disposing of it. A server wall park is still
         // recognised by the ServerWallParkedError arm above, when a report surfaced it first.
+        const stopped = await this.retainStoppedSource(flight, executor, "claim_fence");
         runLog.info("input receipt fenced this claim; stopping this flight", {
           run_id: flight.runId,
           reason: flight.steering.claimFence(),
+          stopped_source: stopped,
         });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof StaleClaimError) {
@@ -3674,23 +3688,29 @@ export class RunRunner {
         // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
         // run now, so STOP this flight. Caught here BEFORE the generic terminal path (mirroring the
         // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
-        // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
-        // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        // terminal state — a `failed` here would fight the owning claim. Issue #1786: the owning
+        // claim has its own clone but cannot see THIS worker's bytes, so a source here is kept
+        // (retainStoppedSource latches the preserve flag) until proven preserved; the finally then
+        // runs the rest of the teardown (HOME and skills cleanup) without disposing of it.
         // Issue #1742: deliberately NO retireFinalizeRecord here (nor in the claim-fence,
         // RunningAckTerminalError and CredentialSwitchSignal "released" arms): none of them is an
         // accepted park/hold for this generation, and the api only acts on a finalize record for a
         // run still running at that exact generation, so the record stays until a register offers it.
-        runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
+        const stopped = await this.retainStoppedSource(flight, executor, "stale_claim");
+        runLog.info("run claim superseded server-side (stale_claim); stopping this flight", { stopped_source: stopped });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RunningAckTerminalError) {
         // PRD #1391 Run B M4: phaseClone's first `running` report was refused with a TERMINAL status
         // (the run reached completed/failed/cancelled out from under this claim). STOP with NO
-        // terminal report (the authoritative outcome already landed) and NO preserve flag — nothing
-        // was cloned before the running report, so the finally runs ordinary teardown. Caught here
-        // BEFORE the generic terminal path so this never becomes a `failed` run.
+        // terminal report (the authoritative outcome already landed). The refusal comes before
+        // ensureClone, so normally no clone exists and retainStoppedSource answers `no_source`
+        // (ordinary teardown); issue #1786: a source that does exist is kept, not discarded. Caught
+        // here BEFORE the generic terminal path so this never becomes a `failed` run.
+        const stopped = await this.retainStoppedSource(flight, executor, "running_ack_terminal");
         runLog.info("run reached a terminal status before the phase clone started; stopping this flight", {
           run_id: flight.runId,
           status: err.runStatus,
+          stopped_source: stopped,
         });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RetainedRecoveryStop) {
@@ -4115,7 +4135,7 @@ export class RunRunner {
       }
       // A completed retained episode keeps its predecessors and shared HOME. Only an
       // authenticated covering FINAL for this exact successor can retire its own clone.
-      if (flight.completedRetainedSuccessor && flight.terminalResolved && !flight.parked &&
+      if (flight.completedRetainedSuccessor && flight.terminalResolved && !flight.parked && !flight.stoppedSourceKept &&
           claim.inventory_guarded === true && !terminalDisposeUnproven && flight.barePath && flight.branch && flight.worktreePath &&
           flight.attemptId && !flight.retainedLocalCustody) {
         const acknowledged = async () => {
@@ -5092,6 +5112,9 @@ export class RunRunner {
   /** Recheck higher-priority interruptions throughout the terminal-failure policy. */
   private terminalDiskInterruption(flight: RunFlight): void {
     if (flight.steering.claimFence() !== undefined) {
+      // The clears below only drop the session keep. issue #1786: the StaleClaimError (or the claim-fence
+      // arm, which a set fence reaches first) re-latches preserveRecoveryClone through
+      // retainStoppedSource, so a clone is never left to the ordinary teardown by this clear.
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
       throw new StaleClaimError();
@@ -8309,6 +8332,7 @@ export class RunRunner {
       owedAnnounced: this.owedAnnouncedFor(runId),
       inventoryArchiveNotices: new Set(),
       keepGuardedInventoryOpen: false,
+      stoppedSourceKept: false,
       terminalInventoryQuiesced: false,
       inventoryGuarded: claim.inventory_guarded === true,
       prepareTerminalInventory: async () => {
@@ -9027,7 +9051,9 @@ export class RunRunner {
           flight.preserveSession = true;
           flight.keepGuardedInventoryOpen = true;
           flight.retainedLocalCustody = true;
-          let reason = error instanceof RetainedRecoveryMissingJournalError ? error.message :
+          // issue #1786: a canonical clone a stopped flight retained refuses reuse; its message already
+          // carries the worker_residue_blocked prefix (the typed fail_origin) and the operator command.
+          let reason = error instanceof RetainedRecoveryMissingJournalError || error instanceof RetainedStoppedSourceError ? error.message :
             error instanceof RetainedDiscoveryExhaustedError ?
               "Retained recovery blocked: local recovery storage busy or unavailable after bounded retries; local work and custody retained" :
               "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
@@ -15789,6 +15815,116 @@ export class RunRunner {
     if (profile) return { branch: profile.branch, key: profile.slug };
     if (claim.issue_iid == null) throw new Error("issue run claim is missing issue_iid");
     return { branch: `agent/issue-${claim.issue_iid}`, key: `issue-${claim.issue_iid}`, issueIid: claim.issue_iid };
+  }
+
+  /**
+   * issue #1786 — a flight stopped because its claim is no longer current (a stale_claim ack, a
+   * steering claim fence, a terminal refusal of the first running report) keeps whatever its clone
+   * holds: the successor claim owns the RUN, but it cannot see this worker's unpublished commits,
+   * dirty tracked bytes or untracked files. The caller ends the flight with no report; this only
+   * decides what happens to the local source, and makes no /state, publish, archive, finalize,
+   * credential or provider call and writes no `refs/uzi-runner` ref.
+   *
+   * Order: (1) with a clone, latch `preserveRecoveryClone` SYNCHRONOUSLY, before any await, so no
+   * teardown path can dispose of it while the rest runs; (2) prove the run's processes and
+   * attributed containers quiet (`own` mode, forced process scan), which kills only attributed
+   * processes; (3) when the proof holds and the clone is clean at a head the bare's tracking ref
+   * already holds under this run's committed ownership, hand teardown back its normal retire
+   * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock); otherwise (4) record
+   * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
+   * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
+   * clone. Step 4 runs whatever the proof said; it only protects. A blocked or throwing proof, an
+   * unreadable bare or a refused record gives `unknown` (the record, when written, stays): the
+   * clone and its journal stay.
+   *
+   * `no_source`: there was no clone, or the covered case above (ordinary teardown proceeds).
+   * `retained_local`: the source is kept and recorded for the operator channel (or already held by
+   * retained-recovery custody, which this does not touch). `unknown`: kept, not recorded. None of the three grants custody release or successor authority.
+   */
+  private async retainStoppedSource(
+    flight: RunFlight, executor: Executor, reason: string,
+  ): Promise<"no_source" | "retained_local" | "unknown"> {
+    const clonePath = flight.worktreePath;
+    if (clonePath === undefined) return "no_source";
+    // A retained-recovery flight (its retained source journaled, an episode, a predecessor capture)
+    // is already held by its own custody: the finally latches it, and its ledger and journal stay.
+    // The proof and the record below would only reap and rewrite what that machinery owns.
+    if (flight.retainedLocalCustody || flight.retainedEpisode || flight.retainedEpisodeCustody ||
+        flight.completedRetainedSuccessor || flight.predecessorCapture) return "retained_local";
+    const priorPreserve = flight.preserveRecoveryClone;
+    flight.preserveRecoveryClone = true;
+    flight.stoppedSourceKept = true;
+    // The stale claim owns the guarded inventory now: no ownership probe, freeze or upload from here.
+    flight.keepGuardedInventoryOpen = true;
+    const log = flight.runLog;
+    let blocked = true;
+    try {
+      const q = await this.quiesceRun(flight, executor, { mode: "own", site: "stopped_source", forceProcessScan: true });
+      blocked = q.blocked;
+    } catch (err) {
+      log.warn("stopped source: the quiescence proof failed; the clone is kept", { error: errMessage(err), reason });
+    }
+    if (blocked) {
+      log.warn("stopped source: unresolved writers; the clone is kept and not provably quiet", { clone: clonePath, reason });
+    }
+    const barePath = flight.barePath, branch = flight.branch;
+    if (barePath === undefined || branch === undefined) {
+      log.warn("stopped source: no bare or branch to record the retention in; the clone is kept", { clone: clonePath, reason });
+      return "unknown";
+    }
+    const attemptId = flight.runnerClone?.attemptId;
+    const key = pathBasename(cloneKeyOf(clonePath).canonicalPath);
+    if (!blocked && !priorPreserve && !flight.predecessorCapture && flight.claimGeneration > 0) {
+      try {
+        const head = await this.git.worktreeHead(clonePath);
+        if (head !== null) {
+          const quiesce = async (paths: string[]): Promise<boolean> => {
+            if (process.platform !== "linux") return false;
+            const outcome = await this.quiesceImpl({
+              mode: "own", attempt: flight.attempt, cloneKey: cloneKeyOf(clonePath).cloneKey, targetPaths: paths,
+              processes: true, dockerHost: undefined, registry: this.liveAttempts,
+              otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),
+              site: "stopped_source:covered",
+            });
+            return outcome.process?.state === "quiescent";
+          };
+          const covered = await this.git.verifyStoppedSourceCovered(
+            barePath, branch, key,
+            { runId: flight.runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) },
+            head, { runId: flight.runId, generation: flight.claimGeneration }, quiesce,
+          );
+          if (covered === "covered") {
+            flight.preserveRecoveryClone = priorPreserve;
+            flight.stoppedSourceKept = false;
+            log.info("stopped source: clean and fully held by the worker's tracking ref; teardown proceeds", { clone: clonePath, reason });
+            return "no_source";
+          }
+        }
+      } catch (err) {
+        log.warn("stopped source: coverage could not be checked; the clone is kept", { error: errMessage(err), reason });
+      }
+    }
+    let result: "retained" | "unknown";
+    try {
+      result = attemptId !== undefined
+        ? await this.git.retainStoppedAttempt(barePath, branch, { runId: flight.runId, clonePath, attemptId })
+        : await this.git.markStoppedCanonical(barePath, branch, key, {
+          runId: flight.runId, clonePath, generation: flight.claimGeneration > 0 ? flight.claimGeneration : null, reason,
+        });
+    } catch (err) {
+      log.warn("stopped source: the retention record could not be written; the clone is kept", { error: errMessage(err), reason });
+      result = "unknown";
+    }
+    if (result !== "retained") {
+      log.warn("stopped source: kept in place but not recorded", { clone: clonePath, reason });
+      return "unknown";
+    }
+    log.warn("stopped source retained on this worker; inspect it with the operator channel before any disposal", {
+      clone: clonePath, reason, proof: blocked ? "unresolved" : "quiescent",
+    });
+    try { this.onSourceRetained?.(); } catch { /* diagnostics only */ }
+    // Recorded, but with unresolved writers the source is not known to be at rest: `unknown`.
+    return blocked ? "unknown" : "retained_local";
   }
 
   private retainedTerminalGuard(flight: RunFlight): void {

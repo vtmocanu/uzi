@@ -555,8 +555,12 @@ async function main(): Promise<void> {
     thresholdOf: () => client.diskPressureThreshold,
     reclaim: () => reclaimNow?.() ?? Promise.resolve(),
   });
+  // issue #1786: the runner's stopped-source retention exits notify the operator channel (built below
+  // from the runner), which logs the bounded retained count and bytes. Late-bound for that reason.
+  let notifyRetained: (() => void) | undefined;
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
+    onSourceRetained: () => notifyRetained?.(),
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
     // issue #1597 M2: the mid-turn checkpoint tick cadence (CHECKPOINT_TICK_INTERVAL; 0 disables).
@@ -821,6 +825,7 @@ async function main(): Promise<void> {
     dataDir: config.dataDir, git, client, gate: dindGate, runner, log,
     isIdle: () => worker?.isIdle() ?? false,
   });
+  notifyRetained = () => { void retainedSource.reportRetained(); };
   worker = new Worker(
     config,
     client,
