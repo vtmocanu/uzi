@@ -190,3 +190,35 @@ func TestWallParkExtendCrossCheckIneligible409LiveDB(t *testing.T) {
 	rec := e.postExtend(checkerID, 3600)
 	e.assertRefused409(rec, checkerID, workersvc.ErrWallParkCrossCheckIneligible.Error(), "paused", 0)
 }
+
+// Issue #2750: kind=stop on a wall park that cannot Stop returns workersvc.ErrWallParkStopUnavailable,
+// which used to fall through CreateRunInput's error switch to a 500.
+func (e *wallParkExtendHTTPEnv) assertStopRefused409(id uuid.UUID) {
+	e.t.Helper()
+	rec := httptest.NewRecorder()
+	e.h.CreateRunInput(rec, inputReq(e.owner, id, `{"kind":"stop"}`))
+	e.assertRefused409(rec, id, workersvc.ErrWallParkStopUnavailable.Error(), "paused", 0)
+	var stops int
+	if err := e.query(`SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='stop'`, id).Scan(&stops); err != nil {
+		e.t.Fatal(err)
+	}
+	if stops != 0 {
+		e.t.Fatalf("refused stop wrote %d stop audit rows", stops)
+	}
+}
+
+// TestWallParkStopNonMilestone409LiveDB: a non-milestone issue run has nothing to finalize.
+func TestWallParkStopNonMilestone409LiveDB(t *testing.T) {
+	e := newWallParkExtendHTTPEnv(t, 57600)
+	e.assertStopRefused409(e.wallPark(0))
+}
+
+// TestWallParkStopFinalizeUsed409LiveDB: a milestone run with a completed milestone whose finalize
+// allowance was already granted cannot Stop again.
+func TestWallParkStopFinalizeUsed409LiveDB(t *testing.T) {
+	e := newWallParkExtendHTTPEnv(t, 57600)
+	id := e.wallPark(0)
+	e.exec(`UPDATE runs SET milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
+		milestones_completed='["m1"]', budget_finalize_seconds=1800 WHERE id=$1`, id)
+	e.assertStopRefused409(id)
+}
