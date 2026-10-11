@@ -532,9 +532,7 @@ func (h *Handler) recovery() *recovery.Service {
 				// Step B's forge listing spends the owner's forge quota: one shared per-worker
 				// bucket, consulted by the service only just before that listing.
 				if lim := h.heldListLimiter; lim != nil {
-					h.recoverySvc.SetHeldListAllow(func(workerID uuid.UUID) bool {
-						return lim.Allow("held-final-list|" + workerID.String())
-					})
+					h.recoverySvc.SetHeldListAllow(heldListAllowFor(lim))
 				}
 			}
 		}

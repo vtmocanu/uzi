@@ -32,13 +32,14 @@ func TestHeldLogTextSanitizes(t *testing.T) {
 	}
 }
 
-// A token split by a separator must not be rejoined by sanitizing after the scrub: every
-// separator is replaced by a space BEFORE secretscrub runs.
+// A token split by a separator must not survive the scrub: every separator is dropped BEFORE
+// secretscrub runs, so the rejoined token is redacted whole.
 func TestHeldLogTextRedactsSplitTokens(t *testing.T) {
 	seps := map[string]string{
 		"newline": "\n", "nul": "\x00", "esc": "\x1b", "zwnj": "\u200c", "zwj": "\u200d",
 		"rlo": "\u202e", "ls": "\u2028", "bom": "\ufeff", "word joiner": "\u2060",
 		"csi sequence": "\x1b[31m", "osc sequence": "\x1b]0;t\x07",
+		"cgj": "\u034f", "vs16": "\ufe0f", "combining acute": "\u0301", "hangul filler": "\u3164",
 	}
 	body := strings.Repeat("a1B2", 9)
 	for name, sep := range seps {

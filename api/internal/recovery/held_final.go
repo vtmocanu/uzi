@@ -58,8 +58,8 @@ var ErrHeldRemoteGone = errors.New("recovery: held publication: the run, its rep
 const maxHeldLogLen = 400
 
 // heldLogText renders a forge listing error for a log line. go-git puts the whole response
-// body of the (attacker-controlled) forge in the error, so the text is secret-scrubbed, then
-// stripped of control, escape, bidi and zero-width runes and truncated.
+// body of the (attacker-controlled) forge in the error, so control, escape, bidi, zero-width and
+// combining runes are dropped FIRST, then the text is secret-scrubbed and truncated.
 func heldLogText(err error) string {
 	return truncateRunes(secretscrub.Scrub(dropUnsafeRunes(err.Error())), maxHeldLogLen)
 }
@@ -71,17 +71,24 @@ var ansiSeqRe = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*
 // split by a separator is rejoined and then redacted whole (replacing the separator with a space
 // would leave the token body behind, unrecognised). Unsafe is what isUnsafeLabelRune rejects plus
 // the Unicode format, line and paragraph separator classes (U+2028, U+2029, U+FEFF, U+2060 to
-// U+2064 and the rest of Cf).
+// U+2064 and the rest of Cf), nonspacing marks (Mn: combining marks, variation selectors) and the
+// zero-width Hangul fillers. A CSI's final byte goes with its sequence, so a token can lose one
+// character; a real (36+ character) token body still scrubs.
 func dropUnsafeRunes(s string) string {
 	s = ansiSeqRe.ReplaceAllString(s, "")
 	var b strings.Builder
 	for _, r := range s {
-		if isUnsafeLabelRune(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+		if isUnsafeLabelRune(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp, unicode.Mn) || isHangulFiller(r) {
 			continue
 		}
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+// isHangulFiller reports the Hangul filler code points, which render with zero width.
+func isHangulFiller(r rune) bool {
+	return r == 0x115f || r == 0x1160 || r == 0x3164 || r == 0xffa0
 }
 
 // truncateRunes cuts s to at most max runes and trims surrounding space.
