@@ -6,6 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { Readable, PassThrough, Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
+import { loadConfig } from "../src/config.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -1289,18 +1290,31 @@ test("explicit owner discard keeps paths intact and per-key attempt mode outlive
   assert.ok(clone.path.endsWith(".attempt-" + aid(3)));
 });
 
-test("nested recovery verification shares one delivered-byte budget across prerequisite roots", async () => {
+test("configured nested recovery verification shares a cumulative budget and fallback uses the same cap", async () => {
   const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
+  const oids = git(bare, ["rev-list", "--objects", "--no-object-names", tip]).split("\n");
+  const decoded = oids.reduce((total, oid) => total + Number(git(bare, ["cat-file", "-s", oid])), 0);
+  const limit = decoded * 2 - 1;
+  const config = loadConfig({ UZI_API_URL: "http://api:8080", UZI_WORKER_TOKEN: "fixture-token",
+    UZI_RECOVERY_DECODED_LIMIT_BYTES: String(limit) });
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined,
+    testGitCacheOptions({ recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes }));
+  assert.equal(await cache.verifyRecoveryClosure(bare, tip), true, "standalone read is below cap");
+  assert.equal(await cache.verifyRecoveryClosure(bare, tip), true, "standalone reads have independent budgets");
   await cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000, async () => {
-    assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
     const budget = (cache as any).recoveryOperations.getStore().closureBudget;
-    assert.ok(budget.delivered > 0);
-    const delivered = budget.delivered;
-    budget.limit = delivered;
-    await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000,
-      () => cache.verifyRecoveryClosure(bare, tip)), RecoveryClosureLimitError);
-    assert.equal(budget.delivered, delivered);
+    assert.equal(budget.limit, limit, "outer budget uses explicit configured cap");
+    assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
+    assert.equal(budget.delivered, decoded);
+    await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000, async () => {
+      assert.equal((cache as any).recoveryOperations.getStore().closureBudget, budget, "nested budget identity");
+      return cache.verifyRecoveryClosure(bare, tip);
+    }), { message: `reachable recovery history exceeds the ${limit} bytes decoded verification limit` });
+    assert.equal(budget.delivered, decoded, "metadata refusal does not refund or charge unread bytes");
   });
+  const tiny = new GitCache(fx.dataDir, nullLogger(), undefined, { recoveryDecodedLimitBytes: decoded - 1 });
+  await assert.rejects(tiny.verifyRecoveryClosure(bare, tip), RecoveryClosureLimitError,
+    "no-operation fallback must use instance cap");
 });
 test("invalid SHA lists and batch metadata never request raw content", async () => {
   const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
@@ -1333,8 +1347,9 @@ function loose(oid: string, bytes: Buffer): string {
   return file;
 }
 test("unreachable compressed bomb and corrupt blob do not affect reachable verification", async () => {
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined, { recoveryDecodedLimitBytes: 4096 });
   const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
-  loose("e".repeat(40), deflateSync(Buffer.from("blob 1073741825\0")));
+  loose("e".repeat(40), deflateSync(Buffer.from("blob 4097\0")));
   loose("d".repeat(40), Buffer.from("corrupt unreachable blob"));
   assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
 });
@@ -1356,8 +1371,9 @@ for (const damage of ["unreadable", "hash mismatch"] as const) {
   });
 }
 test("production oversized declared loose object is refused before any content producer", async () => {
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined, { recoveryDecodedLimitBytes: 4096 });
   const oid = "b".repeat(40);
-  loose(oid, deflateSync(Buffer.from("blob 1073741825\0")));
+  loose(oid, deflateSync(Buffer.from("blob 4097\0")));
   const treeBytes = Buffer.concat([Buffer.from("100644 huge\0"), Buffer.from(oid, "hex")]);
   const tree = execFileSync("git", ["-C", bare, "hash-object", "-t", "tree", "-w", "--stdin"], { input: treeBytes, encoding: "utf8" }).trim();
   const tip = git(bare, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", "oversize"]);
