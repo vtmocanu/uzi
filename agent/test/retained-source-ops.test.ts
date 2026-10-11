@@ -576,7 +576,7 @@ describe("inspect and the plain discard", () => {
     }
   });
 
-  it("an open server hold of the generation is the owner's to discard; other generations and a failed read behave", async () => {
+  it("an open server hold of any generation is the owner's to discard; a failed read refuses", async () => {
     const a = await seedAttempt("run-a", 1);
     assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
     const sel = selectorOf(a, 1);
@@ -591,8 +591,12 @@ describe("inspect and the plain discard", () => {
     assert.equal(unknown.kind, "refused");
     assert.ok(fs.existsSync(a.path));
     assert.equal((await inspectOne(sel, { state: "unknown" })).disposition?.kind, "refused");
-    assert.equal((await inspectOne(sel, hold(9))).disposition?.kind, "local_discard", "another generation's hold is not this source's");
-    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor, { holds: hold(9) }))).kind, "done");
+    // Any open hold of this worker on the run counts, whatever its generation: the run's inventory
+    // includes every ledger entry across generations.
+    assert.deepEqual((await inspectOne(sel, hold(9))).disposition, { kind: "owner_hold_discard", holdIds: ["hold-77"] }, "another generation's hold still depends on this source");
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor, { holds: hold(9) }))).kind, "refused");
+    assert.ok(fs.existsSync(a.path));
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor))).kind, "done", "with no hold it is a local discard");
   });
 
   it("refuses unknown attribution without deleting", async () => {
@@ -1002,6 +1006,326 @@ describe("protected-source disposition", () => {
     assert.throws(() => gitIn(bare, ["rev-parse", "--verify", "refs/heads/nothing"]));
     await git.discardRetainedRecovery(bare, e.branch, e.key, expected, true);
     assert.equal(cfgAll(`uzi-retained.${EP_RUN}.journal`).length, 0);
+  });
+});
+
+// ─── review rework of M0a ──────────────────────────────────────────────────────────────────
+
+describe("rework: local custody, holds and stale markers", () => {
+  const recordFile = (root: string, runId: string, name: string, body: object): void => {
+    fs.mkdirSync(path.join(fx.dataDir, root, runId), { recursive: true });
+    fs.writeFileSync(path.join(fx.dataDir, root, runId, name), JSON.stringify(body));
+  };
+
+  it("a plain source with a local custody record is resolve_local_record and a discard refuses without deleting", async () => {
+    const a = await seedAttempt("run-a", 1);
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    recordFile("recovery", "run-a", "capture-1.json", { generation: 1 });
+    const sel = selectorOf(a, 1);
+    const ev = await inspectOne(sel);
+    assert.equal(ev.disposition?.kind, "resolve_local_record");
+    assert.deepEqual(ev.localRecords.map((r) => [r.kind, r.name]), [["recovery", "capture-1.json"]]);
+    const refused = await git.discardStoppedSource(discardOpts(sel, ev.descriptor));
+    assert.deepEqual([refused.kind, refused.kind === "refused" && refused.disposition?.kind], ["refused", "resolve_local_record"]);
+    assert.ok(fs.existsSync(a.path));
+    assert.equal(ledgerState(a.branch, a.attemptId), "reclaimed");
+    fs.rmSync(path.join(fx.dataDir, "recovery", "run-a"), { recursive: true });
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor))).kind, "done", "resolved record: a local discard");
+  });
+
+  it("an abandoned attempt with a settlement record and a marked canonical source with a recovery record refuse the same way", async () => {
+    const planted = plantAttempt("agent/issue-3001", "issue-3001", attemptIdAt(3), "run-ab", "abandoned");
+    recordFile("recovery-settlement", "run-ab", "hold-1.json", { predecessorGeneration: 1 });
+    const absel: RetainedSourceSelector = { runId: "run-ab", generation: 1, attempt: attemptIdAt(3) };
+    const ab = await inspectOne(absel);
+    assert.equal(ab.disposition?.kind, "resolve_local_record");
+    assert.deepEqual(ab.localRecords.map((r) => [r.kind, r.name]), [["settlement", "hold-1.json"]]);
+    assert.equal((await git.discardStoppedSource(discardOpts(absel, ab.descriptor))).kind, "refused");
+    assert.ok(fs.existsSync(planted.dir));
+
+    const c = await seedCanonical("run-c");
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 2, reason: "claim_fence" }), "retained");
+    recordFile("recovery", "run-c", "capture-2.json", { generation: 2 });
+    const csel: RetainedSourceSelector = { runId: "run-c", generation: 2, attempt: "canonical" };
+    const ev = await inspectOne(csel);
+    assert.equal(ev.disposition?.kind, "resolve_local_record");
+    assert.equal((await git.discardStoppedSource(discardOpts(csel, ev.descriptor))).kind, "refused");
+    assert.ok(fs.existsSync(c.path));
+    assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 1);
+  });
+
+  it("terminal record protection also blocks a plain discard", async () => {
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ terminalRecordProtection: async () => true }));
+    const a = await seedAttempt("run-a", 1);
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    const sel = selectorOf(a, 1);
+    const ev = await inspectOne(sel);
+    assert.equal(ev.disposition?.kind, "resolve_local_record");
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor))).kind, "refused");
+    assert.ok(fs.existsSync(a.path));
+  });
+
+  it("every open server hold of the run is listed whatever its generation, and a non-array holds list refuses", async () => {
+    const a = await seedAttempt("run-a", 1);
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    const sel = selectorOf(a, 1);
+    const holds: RetainedHoldsSnapshot = { state: "read", holds: [{ id: "hold-b", generation: 9 }, { id: "hold-a", generation: 1 }] };
+    const ev = await inspectOne(sel, holds);
+    assert.deepEqual(ev.disposition, { kind: "owner_hold_discard", holdIds: ["hold-a", "hold-b"] });
+    assert.deepEqual(ev.holds, { state: "read", ids: ["hold-a", "hold-b"] });
+    const malformed = { state: "read", holds: "hold-a" } as unknown as RetainedHoldsSnapshot;
+    assert.equal((await inspectOne(sel, malformed)).disposition?.kind, "refused");
+    const refused = await git.discardStoppedSource(discardOpts(sel, ev.descriptor, { holds: malformed }));
+    assert.equal(refused.kind, "refused", "a non-array holds list is a refusal, not a thrown error");
+    assert.ok(fs.existsSync(a.path));
+  });
+
+  async function markedCanonical(runId: string, iid: number, generation: number | null) {
+    const c = await seedCanonical(runId, iid);
+    fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId, clonePath: c.path, generation, reason: "stale_claim" }), "retained");
+    return c;
+  }
+
+  it("a marker whose journal and path are gone is retired by the next seed, so a later discovery does not throw", async () => {
+    const c = await markedCanonical("run-c", 2600, 3);
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, ""]);
+    fs.rmSync(c.path, { recursive: true, force: true });
+    const next = await git.createOrAttachRunnerClone(bare, 2600, noProofReseed, "run-next");
+    assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0, "the stale marker was retired where it was evaluated");
+    await git.markRecoveryCapture(bare, next.path, c.branch, "run-next");
+    const found = await git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, "run-next");
+    assert.equal(found?.journal.runId, "run-next");
+  });
+
+  it("a stale generation-1 marker cannot rebind to the same run's generation-2 source at the same path", async () => {
+    const c = await markedCanonical("run-c", 2600, 1);
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, ""]);
+    fs.rmSync(c.path, { recursive: true, force: true });
+    const c2 = await seedCanonical("run-c", 2600);
+    fs.writeFileSync(path.join(c2.path, "gen2.txt"), "generation two work\n");
+    assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0, "the old marker is gone");
+    assert.equal(await git.markStoppedCanonical(bare, c2.branch, c2.key, { runId: "run-c", clonePath: c2.path, generation: 2, reason: "stale_claim" }), "retained");
+    const values = cfgAll("uzi-stopped.run-c.entry").map((v) => JSON.parse(v) as { generation: number });
+    assert.deepEqual(values.map((v) => v.generation), [2]);
+    const one: RetainedSourceSelector = { runId: "run-c", generation: 1, attempt: "canonical" };
+    assert.equal((await git.inspectRetainedSources({ selector: one, holds: NO_HOLDS, isLivePath: notLive, barePath: bare })).sources.length, 0);
+    const ev = await inspectOne({ ...one, generation: 2 });
+    const wrong = await git.discardStoppedSource(discardOpts(one, ev.descriptor));
+    assert.equal(wrong.kind, "refused");
+    assert.equal(fs.readFileSync(path.join(c2.path, "gen2.txt"), "utf8"), "generation two work\n");
+  });
+
+  it("an existing marker of the path with another generation is never rewritten or inherited", async () => {
+    const c = await markedCanonical("run-c", 2600, 3);
+    const before = configBytes();
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: "run-c", clonePath: c.path, generation: 4, reason: "stale_claim" }), "unknown");
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: "run-c", clonePath: c.path, generation: null, reason: "stale_claim" }), "unknown");
+    assert.deepEqual(configBytes(), before);
+  });
+
+  it("retire, remove and detach refuse a path a valid marker names, and keep everything", async () => {
+    const c = await markedCanonical("run-c", 2600, 3);
+    const before = configBytes();
+    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), RetainedStoppedSourceError);
+    await assert.rejects(git.removeRunnerClone(c.path, c.runId), RetainedStoppedSourceError);
+    await assert.rejects(git.detachTerminalRetained(bare, c.branch, c.key, JSON.parse(journalRaw(c.branch))), RetainedStoppedSourceError);
+    assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n");
+    assert.deepEqual(configBytes(), before, "journal, marker and ledger are untouched");
+    // An unmarked canonical clone is still retired normally.
+    const plain = await seedCanonical("run-plain", 2610);
+    await git.retireRunnerClone(bare, plain.path, plain.branch, plain.runId, { discard: true });
+    assert.equal(fs.existsSync(plain.path), false);
+  });
+
+  it("discarding one marked source never retires the marker of a source whose path it prefixes (issue-26 vs issue-260)", async () => {
+    const short = await markedCanonical("run-m", 26, 1);
+    const long = await markedCanonical("run-m", 260, 2);
+    const sel: RetainedSourceSelector = { runId: "run-m", generation: 1, attempt: "canonical" };
+    const ev = await inspectOne(sel);
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor))).kind, "done");
+    assert.equal(fs.existsSync(short.path), false);
+    const left = cfgAll("uzi-stopped.run-m.entry").map((v) => (JSON.parse(v) as { clonePath: string }).clonePath);
+    assert.deepEqual(left, [long.path], "the other source's marker survives");
+    assert.ok(fs.existsSync(long.path));
+    const other = await inspectOne({ runId: "run-m", generation: 2, attempt: "canonical" });
+    assert.equal(other.markerState, "bound");
+  });
+
+  it("a journal naming another run is labelled other, not episode", async () => {
+    const c = await markedCanonical("run-c", 2600, 3);
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, JSON.stringify({ runId: "run-new", clonePath: c.path })]);
+    const ev = await inspectOne({ runId: "run-c", generation: 3, attempt: "canonical" });
+    assert.equal(ev.journalState, "other");
+    assert.equal(ev.markerState, "mismatch");
+  });
+
+  it("a g<N> beyond a safe integer is attribution_unknown and refuses, never generation none", async () => {
+    const id = `20260101T000009Z-g99999999999999999999-${hex16(10)}`;
+    const planted = plantAttempt("agent/issue-3001", "issue-3001", id, "run-big", "reclaimed");
+    const sel: RetainedSourceSelector = { runId: "run-big", generation: "none", attempt: id };
+    const ev = await inspectOne(sel);
+    assert.equal(ev.disposition?.kind, "refused");
+    assert.ok(ev.consumers.includes("blocker:attribution_unknown"), ev.consumers.join());
+    const result = await git.discardStoppedSource(discardOpts(sel, ev.descriptor));
+    assert.equal(result.kind, "refused");
+    assert.ok(fs.existsSync(planted.dir));
+  });
+});
+
+describe("rework: coverage proof does not trust the clone's git config or index flags", () => {
+  async function captured() {
+    const a = await seedAttempt("run-v", 1);
+    fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+    gitIn(a.path, ["add", "work.txt"]);
+    gitIn(a.path, ["commit", "-m", "milestone"]);
+    await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+    return { a, head: gitIn(a.path, ["rev-parse", "HEAD"]) };
+  }
+  const verify = (a: Attempt, head: string) =>
+    git.verifyStoppedSourceCovered(bare, a.branch, a.key, { runId: a.runId, clonePath: a.path, attemptId: a.attemptId }, head, { runId: a.runId, generation: 1 }, quiet);
+
+  it("an untracked file is not covered even when the clone config hides untracked files", async () => {
+    const { a, head } = await captured();
+    gitIn(a.path, ["config", "status.showUntrackedFiles", "no"]);
+    assert.equal(await verify(a, head), "covered");
+    fs.writeFileSync(path.join(a.path, "unpreserved.txt"), "new\n");
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "the clone's own config really hides it");
+    assert.equal(await verify(a, head), "not_covered");
+  });
+
+  it("a dirty tracked file hidden by assume-unchanged or skip-worktree is not covered", async () => {
+    const { a, head } = await captured();
+    gitIn(a.path, ["update-index", "--assume-unchanged", "work.txt"]);
+    fs.appendFileSync(path.join(a.path, "work.txt"), "unpreserved\n");
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "status really hides the change");
+    assert.equal(await verify(a, head), "not_covered", "assume-unchanged");
+    gitIn(a.path, ["update-index", "--no-assume-unchanged", "work.txt"]);
+    gitIn(a.path, ["checkout", "--", "work.txt"]);
+    assert.equal(await verify(a, head), "covered");
+    gitIn(a.path, ["update-index", "--skip-worktree", "work.txt"]);
+    assert.equal(await verify(a, head), "not_covered", "skip-worktree");
+  });
+});
+
+describe("rework: discard under the residue quarantine and a failed delete", () => {
+  it("a latch landing inside the caller's quiescence deletes nothing and retires nothing", async () => {
+    const a = await seedAttempt("run-a", 1);
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    const sel = selectorOf(a, 1);
+    const ev = await inspectOne(sel);
+    const result = await git.discardStoppedSource(discardOpts(sel, ev.descriptor, {
+      quiesce: async () => { latchResidueQuarantine({ cause: "test", site: "test" }); return true; },
+    }));
+    assert.equal(result.kind, "unknown", JSON.stringify(result));
+    assert.ok(fs.existsSync(a.path));
+    assert.equal(ledgerState(a.branch, a.attemptId), "reclaimed");
+  });
+
+  it("a latch landing between two deletes keeps the remaining source and the whole descriptor", async () => {
+    let calls = 0;
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      retentionDelete: {
+        split: true,
+        run: async (_command, args) => {
+          fs.rmSync(args.at(-1)!, { recursive: true, force: true });
+          if (++calls === 1) latchResidueQuarantine({ cause: "test", site: "test" });
+        },
+      },
+    }));
+    const e = await buildEpisode();
+    const ev = await inspectOne({ runId: EP_RUN, generation: 2, attempt: aid(2) });
+    const result = await git.discardProtectedSource(discardOpts({ runId: EP_RUN, generation: 2, attempt: aid(2) }, ev.descriptor));
+    assert.equal(result.kind, "unknown", JSON.stringify(result));
+    assert.equal(calls, 1, "no second delete after the latch");
+    assert.deepEqual(result.kind === "unknown" ? result.sources.map((x) => x.outcome).sort() : [], ["removed", "retained"]);
+    assert.equal(result.kind === "unknown" ? result.metadata : "", "kept");
+    assert.ok(fs.existsSync(e.sourcePath) !== fs.existsSync(e.successorPath), "exactly one source remains");
+    assert.equal(cfgAll(`uzi-recovery.${e.branch}.clone`).length, 1, "the journal is kept");
+  });
+
+  it("a delete that reports success while the path is still present keeps the metadata", async () => {
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      retentionDelete: { split: true, run: async () => {} },
+    }));
+    const a = await seedAttempt("run-a", 1);
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    const sel = selectorOf(a, 1);
+    const ev = await inspectOne(sel);
+    const result = await git.discardStoppedSource(discardOpts(sel, ev.descriptor));
+    assert.deepEqual(result, { kind: "incomplete", sources: [{ clonePath: a.path, outcome: "unknown" }], metadata: "kept" });
+    assert.ok(fs.existsSync(a.path));
+    assert.equal(ledgerState(a.branch, a.attemptId), "reclaimed");
+  });
+});
+
+describe("rework: bounded measurement and one-lock inspection", () => {
+  async function tree(): Promise<{ a: Attempt; sel: RetainedSourceSelector }> {
+    const a = await seedAttempt("run-a", 1);
+    for (const d of ["x", "y", "z"]) {
+      fs.mkdirSync(path.join(a.path, "big", d), { recursive: true });
+      for (let i = 0; i < 4; i++) fs.writeFileSync(path.join(a.path, "big", d, `f${i}`), "x");
+    }
+    fs.mkdirSync(path.join(a.path, "n1", "n2", "n3", "n4"), { recursive: true });
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    return { a, sel: selectorOf(a, 1) };
+  }
+
+  for (const [label, caps] of [
+    ["entries", { maxEntries: 5 }], ["pending directories", { maxPending: 1 }], ["depth", { maxDepth: 2 }],
+  ] as const) {
+    it(`a cap on ${label} is partial with unknown bytes, never a complete total`, async () => {
+      const { sel } = await tree();
+      const full = await inspectOne(sel);
+      assert.equal(full.bytesState, "measured", "default caps measure this tree fully");
+      const r = await git.inspectRetainedSources({ selector: sel, holds: NO_HOLDS, isLivePath: notLive, barePath: bare, measureCaps: caps });
+      assert.equal(r.partial, true);
+      assert.notEqual(r.sources[0]!.bytesState, "measured");
+      assert.equal(r.sources[0]!.allocatedBytes, null);
+    });
+  }
+
+  it("inspection evaluates inside the lock that gathered, and an exhausted budget while the lock is queued is partial", async () => {
+    const a = await seedAttempt("run-a", 1);
+    assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
+    const seam = git as unknown as {
+      withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T>;
+      evaluateRetained: (...args: unknown[]) => Promise<unknown>;
+    };
+    let held = false;
+    const realLock = seam.withLock.bind(git);
+    seam.withLock = (key, fn) => realLock(key, async () => {
+      if (key === bare) held = true;
+      try { return await fn(); } finally { if (key === bare) held = false; }
+    });
+    const evaluations: boolean[] = [];
+    const realEvaluate = seam.evaluateRetained.bind(git);
+    seam.evaluateRetained = async (...args) => { evaluations.push(held); return realEvaluate(...args); };
+    const ok = await git.inspectRetainedSources({ selector: selectorOf(a, 1), holds: NO_HOLDS, isLivePath: notLive, barePath: bare });
+    assert.equal(ok.sources.length, 1);
+    assert.deepEqual(evaluations, [true], "the disposition is computed from the lock-held snapshot");
+
+    let release!: () => void;
+    const holder = realLock(bare, () => new Promise<void>((resolve) => { release = resolve; }));
+    const timer = setTimeout(() => release(), 2500);
+    const started = Date.now();
+    const starved = await git.inspectRetainedSources({ selector: selectorOf(a, 1), holds: NO_HOLDS, isLivePath: notLive, barePath: bare, budgetMs: 200 });
+    const waited = Date.now() - started;
+    clearTimeout(timer);
+    release();
+    await holder;
+    assert.equal(starved.partial, true, "a budget exhausted behind the lock is partial");
+    assert.equal(starved.sources.length, 0);
+    assert.ok(waited < 2000, `the lock wait is bounded by the budget (${waited} ms)`);
+  });
+
+  it("the aggregate view omits a ledger-live attempt the worker reports live, and lists it otherwise", async () => {
+    const a = await seedAttempt("run-a", 1);
+    const listed = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    assert.equal(listed.sources.length, 1);
+    assert.equal(listed.sources[0]!.ledgerState, "live");
+    const hidden = await git.inspectRetainedSources({ barePath: bare, isLivePath: (p) => p === a.path });
+    assert.equal(hidden.sources.length, 0);
   });
 });
 
