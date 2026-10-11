@@ -291,6 +291,7 @@ func evaluate(r *ConfigResult, live *LiveBaseline, a *Attrib, readers []int, lar
 				notes = append(notes, "straggler inserts overlapping an open rollup transaction were not demonstrated (none was blocked by one)")
 			}
 			if c.MixedOnMultiTxRun == 0 {
+				ok = false
 				notes = append(notes, "mixed archived+live state of a run rolled in several transactions was NOT observed; that half of the check is unproven for this config")
 			}
 		} else {
@@ -328,7 +329,10 @@ func evaluate(r *ConfigResult, live *LiveBaseline, a *Attrib, readers []int, lar
 		var note string
 		switch {
 		case ll.NotMeasure != "":
-			note = "live-reader ratio not evaluated: " + ll.NotMeasure
+			// An unevaluated sub-bar is not a pass: a corpus without live runs (every
+			// --corpus-ndjson run is terminal) must not report C5 green.
+			ok = false
+			problems = append(problems, "live-reader ratio not evaluated: "+ll.NotMeasure)
 		case ll.IdleP95Ms <= 0 || ll.DuringN == 0:
 			ok = false
 			problems = append(problems, "live-reader ratio not measured (no idle or no during-backfill samples)")

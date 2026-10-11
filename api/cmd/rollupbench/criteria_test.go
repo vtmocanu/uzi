@@ -201,11 +201,23 @@ func TestEvaluateOversizedNotExpectedIsNotApplicable(t *testing.T) {
 	}
 }
 
-func TestEvaluateSkipsLiveRatioOnlyWhenTheHarnessSaysSo(t *testing.T) {
+func TestEvaluateUnmeasuredLiveRatioFailsC5AndOverall(t *testing.T) {
 	fx := newEvalFixture()
 	fx.r.Backfill.LiveLoad = LiveLoadReport{NotMeasure: "no live runs in the corpus"}
 	c := fx.eval()["C5"]
-	if c.Pass == nil || !*c.Pass || !strings.Contains(c.Note, "no live runs in the corpus") {
-		t.Fatalf("an explicitly skipped live-reader ratio must pass C5 and carry the reason: %+v", c)
+	if c.Pass == nil || *c.Pass || !strings.Contains(c.Note, "no live runs in the corpus") {
+		t.Fatalf("a live-reader ratio the harness did not evaluate must fail C5 and carry the reason: %+v", c)
+	}
+	if fx.r.Overall != "fail" {
+		t.Fatalf("overall must not be pass with an unevaluated C5 sub-bar: %q", fx.r.Overall)
+	}
+}
+
+func TestEvaluateUnobservedMixedStateFailsC4(t *testing.T) {
+	fx := newEvalFixture()
+	fx.r.Concurrency.MixedOnMultiTxRun = 0
+	c := fx.eval()["C4"]
+	if c.Pass == nil || *c.Pass || !strings.Contains(c.Note, "mixed archived+live state") {
+		t.Fatalf("C4 must fail when the mixed archived+live half was not observed: %+v", c)
 	}
 }
