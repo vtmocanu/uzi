@@ -48,6 +48,8 @@ const CONFIRM_RE = /^[0-9a-f]{64}$/;
 const DRAIN_BUDGET_MS = 5_000;
 const DRAIN_POLL_MS = 50;
 const REQUEST_READ_TIMEOUT_MS = 10_000;
+/** Absolute cap from connect to the request newline; the idle timer alone is reset by every byte. */
+const REQUEST_DEADLINE_MS = 15_000;
 const HOLDS_READ_TIMEOUT_MS = 10_000;
 const SHUTDOWN_SETTLE_MS = 5_000;
 const MAX_CONNECTIONS = 8;
@@ -83,6 +85,8 @@ export interface RetainedSourceServerDeps {
   drainPollMs?: number;
   holdsTimeoutMs?: number;
   requestReadTimeoutMs?: number;
+  /** Absolute connect-to-newline deadline (a slow-trickle client is cut off even while bytes arrive). */
+  requestDeadlineMs?: number;
   /** GitCache's destructive deadline override (default: GitCache's 30 s). */
   deadlineMs?: number;
 }
@@ -103,7 +107,7 @@ interface LastDisposition {
 /** The operator-facing refusal reasons the channel itself adds to GitCache's. */
 type ChannelRefusal =
   | "busy" | "shutting_down" | "no_claim_gate" | "claims_not_drained" | "worker_not_idle" | "run_reserved"
-  | "holds_unknown" | "client_disconnected" | "not_found" | "ambiguous" | "wrong_discard_kind" | "inspect_failed";
+  | "holds_unknown" | "client_disconnected" | "not_found" | "inspect_partial" | "ambiguous" | "wrong_discard_kind" | "inspect_failed";
 
 function parseRequest(line: string): Request | string {
   let raw: unknown;
@@ -283,6 +287,9 @@ export class RetainedSourceServer {
     conn.on("close", () => { gone = true; this.connections.delete(conn); });
     conn.on("error", () => undefined);
     conn.setTimeout(this.deps.requestReadTimeoutMs ?? REQUEST_READ_TIMEOUT_MS, () => conn.destroy());
+    const deadline = setTimeout(() => conn.destroy(), this.deps.requestDeadlineMs ?? REQUEST_DEADLINE_MS);
+    deadline.unref();
+    conn.on("close", () => clearTimeout(deadline));
     let buf = Buffer.alloc(0);
     let handled = false;
     const reply = (body: Record<string, unknown> & { sources?: unknown[] }): void => {
@@ -302,16 +309,16 @@ export class RetainedSourceServer {
       if (nl === -1) return;
       handled = true;
       conn.setTimeout(0);
+      clearTimeout(deadline);
       const parsed = parseRequest(buf.subarray(0, nl).toString("utf8"));
       if (typeof parsed === "string") {
         reply({ ok: false, error: parsed });
         return;
       }
-      const work = this.handle(parsed, () => gone).then(reply, (err) => {
+      void this.handle(parsed, () => gone).then(reply, (err) => {
         this.deps.log.warn("retained-source request failed", { error: errMessage(err) });
         reply({ ok: false, error: "internal_error" });
       });
-      if (parsed.op === "discard") this.inflight = work;
     });
   }
 
@@ -386,15 +393,21 @@ export class RetainedSourceServer {
     const gate = this.deps.gate;
     if (!gate) return this.refusal("no_claim_gate");
     this.busy = true;
-    try {
-      const out = await this.discardSequence(req, gate, clientGone);
-      const result = out.result;
-      this.remember(req.selector, result.kind, result.kind === "refused" ? result.reason : undefined);
-      return out;
-    } finally {
-      this.busy = false;
-      void this.reportRetained();
-    }
+    // Only the request that took `busy` is the in-flight operation close() waits for; a refused
+    // one must never replace it.
+    const run = (async () => {
+      try {
+        const out = await this.discardSequence(req, gate, clientGone);
+        const result = out.result;
+        this.remember(req.selector, result.kind, result.kind === "refused" ? result.reason : undefined);
+        return out;
+      } finally {
+        this.busy = false;
+        void this.reportRetained();
+      }
+    })();
+    this.inflight = run;
+    return run;
   }
 
   private async discardSequence(
@@ -409,10 +422,12 @@ export class RetainedSourceServer {
       this.deps.log.warn("retained-source: locate failed", { error: errMessage(err) });
       return this.refusal("inspect_failed");
     }
-    if (located.sources.length === 0) return this.refusal("not_found");
+    if (located.sources.length === 0) return this.refusal(located.partial || located.unreadable > 0 ? "inspect_partial" : "not_found");
     if (located.sources.length > 1) return this.refusal("ambiguous");
     const ev = located.sources[0]!;
     if ((ev.kind === "protected") !== req.protectedSource) return this.refusal("wrong_discard_kind", [ev.kind]);
+    // A wrong digest is refused before the claim gate is touched (GitCache re-checks it under its lock).
+    if (req.confirm !== ev.descriptor) return this.refusal("descriptor_changed");
     const clonePaths = ev.sources.map((s) => s.clonePath);
 
     const now = this.deps.now ?? Date.now;
@@ -466,7 +481,7 @@ export class RetainedSourceServer {
 
   /**
    * Log the bounded retained-source count and allocated bytes (structured, content-free). Called
-   * after every discard operation, and by the runner after it retains a source. Single-flight,
+   * after every discard operation. Public so the runner's retention exits can call it too. Single-flight,
    * never throws and never touches fleet.disk or telemetry.
    */
   async reportRetained(): Promise<void> {

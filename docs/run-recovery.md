@@ -767,8 +767,12 @@ a read-only **inspect** and a guarded **discard**, run on the worker itself.
   then unavailable, not the worker.
 - **Invocation.** Run the helper as the `worker` user, with a scrubbed environment and
   the image-owned node binary. `env -i` plus that binary is why a planted `NODE_OPTIONS`,
-  `NODE_PATH` or tsx cache cannot influence it. Plain exec runs as root on compose and on
-  split-UID Kubernetes, which is why the user must be named:
+  `NODE_PATH` or tsx cache cannot influence it. **Never run the client as root:** the
+  client file is owned by the worker uid (the image runs `chown -R worker:worker /app`),
+  so running it as root would execute a worker-writable script with root privileges.
+  Plain `docker exec` runs as root on compose, and `kubectl exec` has no user flag, so
+  under the uid split (the container itself runs as root) you must drop to the worker uid
+  first:
 
   ```sh
   # Docker Compose
@@ -776,18 +780,33 @@ a read-only **inspect** and a guarded **discard**, run on the worker itself.
     env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
     inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
 
-  # Kubernetes
+  # Kubernetes, single-UID workers (the default, workers.uidSplit.enabled: false):
+  # the container already runs as the worker uid
   kubectl exec -c worker <pod> -- \
     env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
     inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
+
+  # Kubernetes, split-UID workers: drop to the worker uid (10001) first;
+  # setpriv is the util-linux binary at /bin/setpriv in the image
+  kubectl exec -c worker <pod> -- \
+    setpriv --reuid=10001 --regid=10001 --init-groups \
+    env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
   ```
+
+  Under `env -i` the client cannot read `UZI_DATA_DIR` and defaults to `/data`; for a
+  non-default data directory pass `--socket <path>` naming the socket. As defense in
+  depth, the run's Bash guardrail denies commands that name the installed client or the
+  socket path from inside a run; the uid split, not that guardrail, is the real boundary.
 
 **Inspect** is read-only and content-free. It reports the generation (or `none`), the
 attempt or `canonical`, the ledger, journal and marker state, a descriptor digest,
 whether the source is present, and its size in bytes. A size that hit the scan budget is
 reported as partial or unknown, never as `0`. Server hold state comes from the worker
 API (this worker's open holds); an empty list means the hold is absent or released,
-never something inferred from local files. It then names one disposition:
+never something inferred from local files. When a source is selected
+(`--run`/`--generation`/`--attempt`) it names one disposition; an aggregate inspect (no
+selector) only lists sources, without holds or a disposition:
 
 | Disposition | Meaning and next step |
 |---|---|
@@ -800,8 +819,17 @@ never something inferred from local files. It then names one disposition:
 `--confirm <descriptor digest from inspect>` added; pass `--protected` as well for an
 episode or protected source. It closes new claims briefly, waits at most 5 s for
 in-flight claims, requires the worker to be idle, reserves the run, then deletes the
-exact source under one lock. Busy or timed out means refused. It never cancels a run or
-stops the worker, and the metadata is retired only after the files are verified gone.
+exact source under one lock. It never cancels a run or stops the worker.
+
+- A busy channel, a drain timeout (claims did not drain in 5 s), a non-idle worker, a
+  reserved run, a wrong digest or an unreadable holds read is **refused**, and nothing is
+  deleted. If the lookup that locates the source ran out of its budget or could not read a
+  repository, the refusal says `inspect_partial` rather than `not_found`; retry the inspect.
+- Running out the 30 s operation deadline reports `unknown`; a partial delete reports
+  `incomplete`.
+- Per-source results are `removed`, `retained`, `missing` or `unknown`. Metadata is
+  retired only when every path is verified gone.
+- The client exits non-zero on anything other than a successful result.
 
 > **Discard destroys possibly unique work.** Inspect first, and export or back up
 > anything you may want before confirming (the `uzi-watcher` skill's `backup-runs.sh`

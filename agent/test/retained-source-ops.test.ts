@@ -1259,6 +1259,20 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered", "core.worktree");
   });
 
+  it("core.ignorecase=true in the clone config cannot hide an untracked README behind a tracked readme", async () => {
+    const a = await seedAttempt("run-ic", 1);
+    fs.writeFileSync(path.join(a.path, "readme"), "captured\n");
+    gitIn(a.path, ["add", "readme"]);
+    gitIn(a.path, ["commit", "-m", "milestone"]);
+    await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+    const head = gitIn(a.path, ["rev-parse", "HEAD"]);
+    assert.equal(await verify(a, head), "covered");
+    gitIn(a.path, ["config", "core.ignorecase", "true"]);
+    fs.writeFileSync(path.join(a.path, "README"), "unpreserved\n");
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "the clone's own config really hides it");
+    assert.equal(await verify(a, head), "not_covered");
+  });
+
   it("a clone with a filter driver configured or an info/attributes file is not covered", async () => {
     const { a, head } = await captured();
     gitIn(a.path, ["config", "filter.lfsish.clean", "cat"]);

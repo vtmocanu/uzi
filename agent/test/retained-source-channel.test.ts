@@ -374,7 +374,7 @@ function claimWorker(rig: Rig, opts: { claimRun: () => Promise<ClaimResponse | n
   rig.idle.value = true;
   const retained = new RetainedSourceServer({
     ...(rig.server as unknown as { deps: RetainedSourceServerDeps }).deps,
-    isIdle: () => { const v = worker.isIdle(); events.push(`idle:${v}`); return v; },
+    isIdle: () => { const v = worker.isIdle(); events.push(`in_flight_claims:${rig.gate.inFlightClaims()}`, `idle:${v}`); return v; },
   });
   worker = new Worker(config, client as unknown as WorkerClient, runner as unknown as RunRunner,
     {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }),
@@ -570,6 +570,68 @@ describe("discard through the real socket", () => {
   });
 });
 
+/** A GitCache stand-in whose evidence is fixed; `discard` is whatever the test needs. */
+function fakeGitOf(o: {
+  inspect?: () => Promise<Json>;
+  discard?: () => Promise<unknown>;
+}): GitCache {
+  const evidence = {
+    kind: "attempt", barePath: bare, descriptor: "d".repeat(64), sources: [{ clonePath: path.join(os.tmpdir(), "rso-fake-clone") }],
+  };
+  return {
+    inspectRetainedSources: o.inspect ?? (async () => ({ sources: [evidence], partial: false, unreadable: 0, sampledAt: new Date().toISOString() })),
+    discardStoppedSource: o.discard ?? (async () => ({ kind: "done", sources: [], metadata: "retired" })),
+    discardProtectedSource: async () => { throw new Error("unused"); },
+  } as unknown as GitCache;
+}
+const fakeDiscard = { op: "discard", run: "run-fake", generation: 1, attempt: "canonical", confirm: "d".repeat(64) };
+
+describe("discard hardening", () => {
+  it("a discard refused busy does not displace the in-flight one: close() still waits for the first", async () => {
+    const release = deferred();
+    const entered = deferred();
+    const git2 = fakeGitOf({ discard: async () => { entered.resolve(); await release.promise; return { kind: "done", sources: [], metadata: "retired" }; } });
+    const rig = await rigOf({ server: { git: git2 } });
+    const first = send(rig.sock, fakeDiscard).catch(() => ({ closed: true }) as Json);
+    await within(5000, "the first discard reached deletion", entered.promise);
+    const second = await send(rig.sock, fakeDiscard);
+    assert.equal(second.result.reason, "busy");
+    let closed = false;
+    const closing = rig.abort().then(() => { closed = true; });
+    await tick(150);
+    assert.equal(closed, false, "close() is still waiting for the first discard");
+    release.resolve();
+    await within(7000, "close() after the first discard ends", closing);
+    await first;
+    assert.equal(closed, true);
+  });
+
+  it("a wrong confirm digest is refused before the claim gate is ever closed", async () => {
+    const a = await retainedAttempt("run-dig", 1);
+    const rig = await rigOf();
+    rig.events.length = 0;
+    const r = await send(rig.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: "0".repeat(64) });
+    assert.equal(r.ok, false);
+    assert.equal(r.result.reason, "descriptor_changed");
+    assert.equal(rig.events.some((e) => e.startsWith("gate_closed")), false, rig.events.join(","));
+    assert.equal(rig.events.includes("reservation_installed"), false);
+    assert.equal(fs.existsSync(a.path), true);
+  });
+
+  it("a partial or unreadable locate that finds no source is inspect_partial; a complete empty one is not_found", async () => {
+    let state: { partial: boolean; unreadable: number } = { partial: true, unreadable: 0 };
+    const rig = await rigOf({ server: { git: fakeGitOf({
+      inspect: async () => ({ sources: [], ...state, sampledAt: new Date().toISOString() }),
+    }) } });
+    assert.equal((await send(rig.sock, fakeDiscard)).result.reason, "inspect_partial");
+    state = { partial: false, unreadable: 2 };
+    assert.equal((await send(rig.sock, fakeDiscard)).result.reason, "inspect_partial");
+    state = { partial: false, unreadable: 0 };
+    assert.equal((await send(rig.sock, fakeDiscard)).result.reason, "not_found");
+    assert.equal(rig.events.some((e) => e.startsWith("gate_closed")), false);
+  });
+});
+
 describe("the claim race, through the real Worker claim loops", () => {
   it("a claim in flight when the discard arrives completes: the worker is not idle, the discard refuses and no claim starts under the closed gate", async () => {
     const a = await retainedAttempt("run-race", 1);
@@ -622,6 +684,8 @@ describe("the claim race, through the real Worker claim loops", () => {
   });
 
   it("with no claim in flight the discard completes first under the closed gate: no claim starts between the idle proof and the deletion", async () => {
+    // Invariant under test: gate closed, claims drained, idle proven, run reservation held through
+    // disposal; the claim CTE is the only production hold insertion, so the pre-lock holds read is current.
     const a = await retainedAttempt("run-race2", 1);
     const rig = await rigOf();
     let claimCount = 0;
@@ -644,6 +708,13 @@ describe("the claim race, through the real Worker claim loops", () => {
       assert.equal(names.slice(closed, opened).includes("claim_started"), false, names.join(","));
       assert.ok(names.indexOf("idle:true") > closed && names.indexOf("idle:true") < names.indexOf("reservation_installed"));
       assert.ok(names.indexOf("delete") > names.indexOf("holds_read"));
+      assert.equal(names.indexOf("in_flight_claims:0") + 1, names.indexOf("idle:true"), `no claim was in flight at the idle proof: ${names.join(",")}`);
+      // The pre-gate locate inspect and the lane's own work may lock the bare earlier; the invariant
+      // is about the first bare lock inside the reservation.
+      const firstLock = names.findIndex((e, i) => i > names.indexOf("reservation_installed") && e === "lock:bare");
+      assert.ok(names.indexOf("holds_read") >= 0 && names.indexOf("holds_read") < firstLock, `holds read before the first bare lock: ${names.join(",")}`);
+      assert.ok(names.indexOf("deletion_finished") >= 0 && names.indexOf("deletion_finished") < names.indexOf("reservation_released"),
+        `the reservation is held until the deletion finished: ${names.join(",")}`);
       // The lane resumes once the gate is back.
       const before = claimCount;
       await until(() => claimCount > before, "the lane claims again after the gate reopens");
@@ -917,6 +988,18 @@ describe("the wire", () => {
       assert.equal(r.ok, false, bad);
       assert.match(String(r.error), /^invalid_/, bad);
     }
+  });
+
+  it("a client that trickles bytes without a newline is disconnected by the absolute deadline despite the idle timer", async () => {
+    const rig = await rigOf({ server: { requestDeadlineMs: 200, requestReadTimeoutMs: 5_000 } });
+    const started = Date.now();
+    const elapsed = await within(4000, "the trickling client is cut off", new Promise<number>((resolve) => {
+      const c = net.createConnection(rig.sock);
+      c.on("error", () => undefined);
+      const t = setInterval(() => { if (!c.destroyed) c.write("x"); }, 20);
+      c.on("close", () => { clearInterval(t); resolve(Date.now() - started); });
+    }));
+    assert.ok(elapsed < 2000, `disconnected after ${elapsed} ms, well before the 5 s idle timeout`);
   });
 
   it("serves one request per connection: a second line on the same connection is ignored", async () => {

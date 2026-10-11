@@ -71,14 +71,21 @@ function run(command: string, args: string[], parentEnv: NodeJS.ProcessEnv): Pro
   });
 }
 
-/** The exact documented form, with the image's node path replaced by this test's node binary. */
+/** The exact documented form (argv derived from DOCUMENTED_PREFIX), with the image's node path and
+ *  client path replaced by this test's node binary and the source client. */
 function documented(clientArgs: string[]): { command: string; args: string[] } {
-  return { command: "env", args: ["-i", "PATH=/usr/local/bin:/usr/bin:/bin", process.execPath, CLIENT, ...clientArgs] };
+  const [command, ...rest] = DOCUMENTED_PREFIX.split(" ").map((tok) =>
+    tok === "/usr/local/bin/node" ? process.execPath : tok.endsWith("/ops/retained-source.mjs") ? CLIENT : tok);
+  return { command: command!, args: [...rest, ...clientArgs] };
 }
 const RUN_ID = "11111111-2222-3333-4444-555555555555";
 const ATTEMPT = "20261008T171401Z-g1-0123456789abcdef";
 
 describe("the documented invocation", () => {
+  it("starts with the scrubbed-environment form and the image-owned node", () => {
+    assert.ok(DOCUMENTED_PREFIX.startsWith("env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node "), DOCUMENTED_PREFIX);
+  });
+
   it("is the text the runbook carries", () => {
     const runbook = fs.readFileSync(path.join(REPO_DIR, "docs", "run-recovery.md"), "utf8");
     assert.ok(runbook.includes(DOCUMENTED_PREFIX), "docs/run-recovery.md documents the exact env -i form");

@@ -5538,21 +5538,23 @@ export class GitCache {
 
   /**
    * Is the clone's tracked and untracked non-ignored state provably empty? The clone's own git
-   * config is runner-writable, so the proof does not take its settings on trust: command-line `-c`
-   * overrides pin the excludes file, the worktree root, the stat and ctime checks and the file-mode
-   * check, turn every untracked file into a status entry and disable the untracked cache and the
-   * fsmonitor, and the index flags are read separately, because an assume-unchanged or
-   * skip-worktree entry hides a modified tracked file from `status`. Clean and smudge filters
-   * cannot be blanket-disabled, so a clone with `.git/info/attributes` or any `filter.` config key
-   * is not provable (false). What IS still trusted: the ignore rules of the tree's `.gitignore`
-   * files and of `.git/info/exclude`, which define the scope the WIP capture's `git add -A`
-   * honours too, so an ignored file is outside both. Any such flag, any entry, or any failed read
-   * is `false`.
+   * config is runner-writable, so the proof does not take its settings on trust. Command-line `-c`
+   * overrides (they outrank every config file) pin: the excludes file (`/dev/null`), the worktree
+   * root, the stat and ctime checks, the file-mode check and `core.ignoreCase=false`; they turn
+   * every untracked file into a status entry and disable the untracked cache and the fsmonitor.
+   * The index flags are read separately, because an assume-unchanged or skip-worktree entry hides
+   * a modified tracked file from `status`. REFUSED (false, not provable) rather than overridden:
+   * a `.git/info/attributes` file; any config key starting `filter.`, `include.`, `includeif.`,
+   * `extensions.worktreeconfig` or `core.attributesfile` (clean/smudge filters and config
+   * indirection cannot be blanket-disabled); and `core.ignorecase` set true. What IS still trusted:
+   * the ignore rules of the tree's `.gitignore` files and of `.git/info/exclude`, which define the
+   * scope the WIP capture's `git add -A` honours too, so an ignored file is outside both. Any
+   * such flag, any status entry, or any failed read is `false`.
    */
   private async worktreeCleanHardened(cwd: string): Promise<boolean> {
     const hardened = [
       "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
-      "-c", "core.checkStat=default", "-c", "core.fileMode=true",
+      "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
     try {
@@ -5564,7 +5566,11 @@ export class GitCache {
       // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
       // config.worktree exactly as `status` does, which `--local` would not.
       const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"]);
-      if (config.split("\0").some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
+      const entries = config.split("\0");
+      if (entries.some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
+      // A case-folding clone could hide a tracked `readme` behind an untracked `README`; the
+      // override below makes status case-sensitive, but a clone that claims otherwise is not provable.
+      if (entries.some((e) => /^core\.ignorecase(\n(true|yes|on|1))?$/i.test(e))) return false;
       const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain"]);
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"]);
