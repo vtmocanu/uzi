@@ -118,6 +118,13 @@ func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
 		cost = crossCheckPlain(costDetailCell(*s.Usage))
 	}
 	rows = append(rows, []string{label + "_COST", cost})
+	if s.CustomGuidanceApplied {
+		digest := []rune(crossCheckPlain(s.GuidanceDigest))
+		if len(digest) > 12 {
+			digest = digest[:12]
+		}
+		rows = append(rows, []string{label + "_GUIDANCE", "custom guidance applied (sha256 " + string(digest) + ")"})
+	}
 	// The raw byte bound precedes parsing, including for legacy responses.
 	type finding struct {
 		ID       string `json:"id"`

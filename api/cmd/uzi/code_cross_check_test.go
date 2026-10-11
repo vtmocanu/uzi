@@ -272,3 +272,21 @@ func TestRunGetCodeCrossCheckJSONUnchanged(t *testing.T) {
 		t.Fatalf("JSON changed: %s", out)
 	}
 }
+
+func TestRunGetCodeCrossCheckGuidanceRow(t *testing.T) {
+	digest := "0123456789abcdef0123456789abcdef"
+	out := codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: json.RawMessage("[]"),
+		CustomGuidanceApplied: true, GuidanceDigest: digest})
+	if !strings.Contains(out, "custom guidance applied (sha256 0123456789ab)") || strings.Contains(out, "0123456789abc") {
+		t.Fatalf("guidance row wrong: %s", out)
+	}
+	out = codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: json.RawMessage("[]"), GuidanceDigest: digest})
+	if strings.Contains(out, "custom guidance") || strings.Contains(out, "0123456789ab") {
+		t.Fatalf("guidance row shown when not applied: %s", out)
+	}
+	out = codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: json.RawMessage("[]"),
+		CustomGuidanceApplied: true, GuidanceDigest: "\x1b[31mab\x07\nZZ"})
+	if strings.ContainsAny(out, "\x1b\x07") {
+		t.Fatalf("hostile digest not sanitised: %q", out)
+	}
+}
