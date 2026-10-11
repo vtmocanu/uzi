@@ -9435,7 +9435,9 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
     const realClearTimeout = globalThis.clearTimeout;
     const controller = new AbortController();
     const rig = makeRig({ responder: timedTurns({ turnMs: 150, turns: 6 }) });
-    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 350 };
+    // This test advances Date and native timers together; inject that same virtual
+    // clock as the helper's monotonic clock so no host time enters the budget.
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 350, timeoutNow: () => Date.now() };
     const { ctx, spies } = lwallCtx({ signal: controller.signal });
     let watchdogHandle: ReturnType<typeof setTimeout> | undefined;
     let cleanupHandle: ReturnType<typeof setTimeout> | undefined;
