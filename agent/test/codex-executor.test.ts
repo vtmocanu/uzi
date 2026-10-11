@@ -1,4 +1,5 @@
 import { describe, it, mock } from "node:test";
+import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
@@ -189,6 +190,55 @@ interface ResponderCtx {
   turnStartCount: number;
 }
 type Responder = (c: ResponderCtx) => unknown;
+
+describe("M1 dependency wait characterization Codex", () => {
+  it("M1 dependency wait Codex prose exhausts iterations before completion", async (t) => {
+    const leadScript = scriptedDependencyWait("identical");
+    const fixture = dependencyWaitCallbacks();
+    let advertisedTools: unknown;
+    const prompts: string[] = [];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        advertisedTools = rec(c.params).dynamicTools;
+        return { thread: { id: "th-1" } };
+      }
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount;
+      const tn = `tn-wait-${n}`;
+      const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+      prompts.push(continuation);
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        const response = leadScript.next({ continuation, advertisedTools });
+        assert.ok("text" in response, "M1 baseline advertises no dependency-wait control");
+        c.transport.push(agentMessage(response.text));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeRig({ responder });
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true });
+    const observation = await observeDependencyWait(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+      () => ({ providerCalls: rig.transport.turnStartCount, iterations: fixture.iterations }),
+    );
+    t.diagnostic("M1_WAIT_OBSERVATION " + JSON.stringify({ harness: "codex", ...observation, providerLaunches: rig.providerLaunches() }));
+    assert.equal(observation.paused, false);
+    assert.throws(() => expectDependencyWaitPaused(observation), /dependency waiting must not fail the run/);
+    assert.equal(observation.error, "codex run reached its implement/review iteration budget without completing");
+    assert.equal(observation.providerCalls, 9);
+    assert.deepEqual(fixture.iterations, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+    assert.equal(leadScript.surfaces.length, 7);
+    assert.ok(Array.isArray(advertisedTools), "fixture sees the actual advertised dynamic tools");
+    fixture.assertPreserved();
+  });
+});
 
 class FakeTransport implements CodexTransport {
   requests: { method: string; params: unknown; opts?: { signal?: AbortSignal; deadlineMs?: number } }[] = [];

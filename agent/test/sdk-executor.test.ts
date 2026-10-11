@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { dependencyWaitQuestion, dependencyWaitAnswer, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
 const HAS_PROCFS = process.platform === "linux";
@@ -1075,6 +1076,55 @@ describe("SdkExecutor implement/review loop", () => {
 // an unchanged worktree fingerprint, no subagent activity, and verbatim-identical lead
 // text. Any progress resets the streak, and the whole detector is inert unless the runner
 // wired `worktreeFingerprint` (the stub/chat/non-issue executors leave it absent).
+describe("M1 dependency wait characterization Claude", () => {
+  for (const wording of ["identical", "reworded"] as const) {
+    it(`M1 dependency wait Claude ${wording} fails before completion`, async (t) => {
+      const leadScript = scriptedDependencyWait(wording);
+      const fixture = dependencyWaitCallbacks();
+      let providerCalls = 0;
+      const prompts: string[] = [];
+      const queryFn: SdkQueryFn = (params) => (async function* () {
+        let continuation = "";
+        for await (const p of params.prompt) {
+          const content = (p as { message?: { content?: unknown } }).message?.content;
+          continuation = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        prompts.push(continuation);
+        providerCalls++;
+        if (providerCalls === 1) {
+          yield reportProgress(["m1"], []);
+          yield checkpointSignal();
+        } else if (providerCalls === 2) {
+          yield askUserTurn(dependencyWaitQuestion);
+        } else {
+          const server = params.options.mcpServers?.["uzi"] as { instance?: { _registeredTools?: Record<string, unknown> } } | undefined;
+          const advertisedTools = server?.instance?._registeredTools;
+          assert.ok(advertisedTools, "fixture sees the actual registered MCP tools");
+          const response = leadScript.next({ continuation, advertisedTools });
+          assert.ok("text" in response, "M1 baseline advertises no dependency-wait control");
+          yield assistantText(response.text);
+        }
+        yield resultSuccess();
+      })();
+      const probe = makeCtx({ ...fixture.callbacks, sessionId: "sess-1", kind: "issue", completionInterlock: true });
+      const observation = await observeDependencyWait(
+        new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+        () => ({ providerCalls, iterations: fixture.iterations }),
+      );
+      t.diagnostic("M1_WAIT_OBSERVATION " + JSON.stringify({ harness: "claude", wording, ...observation }));
+      assert.equal(observation.paused, false);
+      assert.throws(() => expectDependencyWaitPaused(observation), /dependency waiting must not fail the run/);
+      assert.match(observation.error!, wording === "identical" ? /the lead declined the task and made no progress/ : /milestone-scaled implement\/review iteration budget/);
+      assert.equal(providerCalls, wording === "identical" ? 5 : 9);
+      assert.deepEqual(fixture.iterations, wording === "identical" ? [1, 2, 2, 3, 4] : [1, 2, 2, 3, 4, 5, 6, 7, 8]);
+      assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+      assert.ok(leadScript.surfaces.every((s) => !s.continuation.includes("questions could not")));
+      assert.equal(probe.gated.length, 0, "already-approved plan is not gated again");
+      fixture.assertPreserved();
+    });
+  }
+});
+
 describe("SdkExecutor no-progress detection (issue #281)", () => {
   it("trips early on a repeated refusal with an unchanged tree", async () => {
     // Planning turn, then a loop turn that repeats the same refusal verbatim. The tree
