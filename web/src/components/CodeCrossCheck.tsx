@@ -113,6 +113,10 @@ export function CodeCrossCheck({ run }: { run: Run }) {
     {s && <>
       {s.reason_class && <p>Reason: {reasonLabel(s.reason_class)}</p>}
       {typeof s.head_commit === "string" && /^[a-f0-9]{40}(?![\s\S])/i.test(s.head_commit) && <p>Checked SHA: {s.head_commit}</p>}
+      {s.custom_guidance_applied === true && <p>
+        Custom guidance applied{typeof s.guidance_digest === "string" && /^[0-9a-f]{12}/i.test(s.guidance_digest)
+          && <> <code className="font-mono">{s.guidance_digest.slice(0, 12).toLowerCase()}</code></>}
+      </p>}
       <p>{evidence.state}</p>
       {!historical && s.outcome === "completed" && evidence.state === "Finalized" && <p>{counts.addressed} addressed, {counts.declined} declined, {counts.not_reported} not reported</p>}
       <Findings value={s.findings} dispositions={evidence.entries} />

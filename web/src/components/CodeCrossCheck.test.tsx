@@ -161,3 +161,23 @@ it("rejects forged links and IDs and discloses field and item truncation", () =>
   expect(screen.getByText("Findings truncated for display.")).toBeTruthy();
   expect(screen.queryByText(/Finding: f20/)).toBeNull();
 });
+it("shows custom guidance with the first 12 hex chars of its digest", () => {
+  const { container } = view({ custom_guidance_applied: true, guidance_digest: "0123456789abcdef".repeat(4) });
+  expect(screen.getByText(/Custom guidance applied/)).toBeTruthy();
+  const code = container.querySelector("code");
+  expect(code?.textContent).toBe("0123456789ab");
+  expect(code?.className).toContain("font-mono");
+});
+it.each([
+  [{}],
+  [{ custom_guidance_applied: false, guidance_digest: "0123456789abcdef".repeat(4) }],
+])("shows nothing about guidance when it was not applied (%j)", (over) => {
+  const { container } = view(over);
+  expect(screen.queryByText(/Custom guidance/)).toBeNull();
+  expect(container.querySelector("code")).toBeNull();
+});
+it("omits a digest that is not hex", () => {
+  const { container } = view({ custom_guidance_applied: true, guidance_digest: "<b>not-hex</b>" });
+  expect(screen.getByText("Custom guidance applied")).toBeTruthy();
+  expect(container.querySelector("code")).toBeNull();
+});
