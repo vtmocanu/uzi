@@ -15,7 +15,7 @@ import (
 )
 
 // TestScheduleRecentFiresBackfillLiveDB (issue #2519) is the regression gate for the data
-// backfill in 00318_schedule_recent_fires.sql: an existing row whose last_fire dispatched
+// backfill in 00321_schedule_recent_fires.sql: an existing row whose last_fire dispatched
 // (matched > 0) gets recent_fires = [last_fire]; a capacity-blocked or examined-0 last_fire,
 // and a NULL one, get []. Every other live-DB test reaches the schema at HEAD, so the
 // backfill only ever sees an empty table there; this test stands a throwaway database at
