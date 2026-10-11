@@ -22,7 +22,7 @@ import (
 //
 //   - (a) an owner holding 256 expired tombstones (the ceiling) can still Reserve a NEW identity.
 //   - (b) once the live (non-expired, non-discarded) count, including (a)'s capture, is 256
-//     across available/preparing/uploading/needs_action, a new identity is ErrQuota.
+//     across available/preparing/uploading/needs_action plus one unknown state, a new identity is ErrQuota.
 //   - (c) discarding one live capture frees a slot again.
 //   - (d) an idempotent retry of an existing key still succeeds at the ceiling.
 //
@@ -117,8 +117,11 @@ func TestRecoveryOwnerCeilingExcludesExpiredLiveDB(t *testing.T) {
 	}
 
 	// ── (b) fill the live set to exactly the ceiling across every counted state. ──
-	// (a)'s capture is 1 of the 256; seed the other 255 across four states.
-	remaining := ceiling - 1
+	// (a)'s capture is 1 of the 256; one row in an unknown (future) state pins the fail-closed
+	// rule, and the other 254 span the four known live states.
+	rf, hf := freshHold()
+	seed(rf, hf, "future_state", 1)
+	remaining := ceiling - 2
 	states := []string{"available", "preparing", "uploading", "needs_action"}
 	var firstLive uuid.UUID
 	for remaining > 0 {
