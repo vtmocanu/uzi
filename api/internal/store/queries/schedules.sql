@@ -260,6 +260,12 @@ SET last_fired_at = @last_fired_at,
     next_fire_at  = sqlc.narg('next_fire_at'),
     status        = @status,
     last_fire     = @last_fire,
+    -- recent_fires (issue #2519): prepend this fire when it did something (matched > 0), keep the
+    -- newest 10; a blocked/examined-0 tick or a NULL summary leaves the list as it was.
+    recent_fires  = CASE
+      WHEN @last_fire::jsonb @@ '$.matched > 0'
+      THEN jsonb_path_query_array(jsonb_build_array(@last_fire::jsonb) || recent_fires, '$[0 to 9]')
+      ELSE recent_fires END,
     updated_at    = now()
 WHERE id = @id
 RETURNING *;

@@ -1195,6 +1195,7 @@ type RunSchedule struct {
 	CapacityLimit              pgtype.Int4        `json:"capacity_limit"`
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
+	RecentFires                []byte             `json:"recent_fires"`
 }
 
 type RunUsage struct {

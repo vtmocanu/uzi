@@ -2010,6 +2010,13 @@ export interface Schedule {
   // fired (or a parked/transient fire left the prior summary — or none — in place, since
   // only the success/benign advance path persists).
   last_fire: LastFire | null;
+  // Issue #2519: the last (up to 10) scheduled fires that did something (matched > 0),
+  // newest first, each shaped like last_fire. last_fire stays the latest persisted tick,
+  // so it can be a capacity-blocked tick (matched 0) newer than recent_fires[0]. The
+  // server always emits an array; OPTIONAL and nullable because an older server omits it
+  // (and the zero fixture carries null). Absent or null reads as empty, so the row falls
+  // back to last_fire exactly as before.
+  recent_fires?: LastFire[] | null;
   /** PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit (the
    *  fired run follows the worker binding), else the {mode, label} a fired run stamps onto
    *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.

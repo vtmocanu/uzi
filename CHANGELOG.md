@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Schedules keep the last 10 fires that started or skipped something, so an earlier dispatch is no longer hidden by a later empty tick ([#2519](https://github.com/vtmocanu/uzi/issues/2519)).**
+  A new `recent_fires` list (newest first, same shape as `last_fire`) is exposed on the schedule API, in an expandable **Recent fires** panel on the Schedules page, and as a **Recent fires** block in `uzi schedule get` (`--json` `.recent_fires`); `last_fire` is unchanged and can differ from `recent_fires[0]`. Only fires with `matched > 0` are appended, so a capacity-blocked tick, a tick that examined nothing, run-now, and the parked and transient paths add nothing; skips count, so a long pause (a `schedules_paused` skip on every tick) can push older dispatches out of the 10. Existing schedules are backfilled with their current `last_fire` when it matched something.
+
 ### Changed
 
 - **The lead context meter reads the Claude SDK's summary context usage ([#1300](https://github.com/vtmocanu/uzi/issues/1300)).**
