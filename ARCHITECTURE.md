@@ -1091,8 +1091,8 @@ chain in the diagram above, with no intervening `running`.
   `ckpt(overlay):` wrapper whose `.github/workflows` tree byte-matches the current
   default, so the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as a
   fast-forward and adoption peels it back to the real tip. Tick and iteration
-  checkpoints chain over a prior overlay rather than being refused
-  `not_descendant` (#2733). GitHub-only. See
+  checkpoints chain over a prior overlay (when its history verifies as
+  bounded, wrapper-only) rather than being refused `not_descendant` (#2733). GitHub-only. See
   [ADR-1036](adr/1036-checkpoint-workflow-overlay.md).
 
 - **queued → claimed**: `POST /api/worker/runs/claim` atomically claims an eligible
