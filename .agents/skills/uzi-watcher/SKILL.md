@@ -245,12 +245,10 @@ reject — the rest of a good plan stays.
 
 uzi's worker pushes with a GitHub PAT that **deliberately lacks the `workflow` scope** — a
 worker that could rewrite CI is a supply-chain risk, so this is by design, not a bug to
-"fix" by granting scope. A push creating a new ref that carries an authored workflow change
-is rejected **atomically** (`refusing to allow a Personal Access Token to create or update
-workflow … without workflow scope`), so nothing lands (#377, #456). #1869's spike (branch
-refs only) found GitHub judges the pushed tip per workflow path: each blob must already be
-held at that path by some existing branch tip, and deletions pass; other ref namespaces
-were not probed. The worker checks before pushing: a run whose pushed tip carries a
+"fix" by granting scope. In #1869's branch-ref probes, a pushed tip carrying a workflow blob absent from that path
+on every existing branch tip was rejected **atomically** (`refusing to allow a Personal
+Access Token to create or update workflow … without workflow scope`), so nothing lands
+(#377, #456). Deletions passed; other ref namespaces were not tested. The worker checks before pushing: a run whose pushed tip carries a
 `.github/workflows/**` blob matching neither the fresh default's nor the target ref's
 current tip at that path ends `failed` with
 `workflow_scope_missing` ("branch changes .github/workflows … failing early"), with a
@@ -271,12 +269,15 @@ work from the worker PVC* below.
   worker-side overlay (#1036). Tick and iteration checkpoints do not fetch a fresh overlay,
   but chain over the last overlay checkpoint (#2733); if GitHub rejects their push for
   missing workflow scope, the broker still returns a best-effort `workflow_scope` skip. The
-  precheck runs first, so an inherited workflow commit blocks this realign.
+  precheck runs first, so an inherited workflow blob matching neither allowed tip blocks
+  this realign.
 - **Telling them apart on a recovered branch:** `git log --name-only origin/main..TIP --
   .github/workflows/` empty is evidence of base staleness only; a rebase onto main that
-  succeeds clears it, then gate and push as usual. A listed commit needs inspection: `git diff origin/main TIP --
-  .github/workflows/` empty means its content is already on main and the precheck passes
-  (#1869); otherwise it is a real workflow change (the split below).
+  succeeds clears it, then gate and push as usual. For a listed commit, compare each workflow blob in the pushed tip with the
+  fresh default and the current target tip at the same path. Matching either passes the
+  precheck; deleted paths pass (#1869). Commit lists and a nonempty diff against main alone
+  do not establish a blocker; a blob matching neither is a real workflow change (the split
+  below).
 
 **The split** (for a plan that genuinely *edits* a workflow file): uzi implements everything except `.github/workflows`; **you** add the
 workflow-file pieces locally, because your own token has `workflow` scope (confirm with
