@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Recovery archive downloads use their configured transfer deadline.**
+  Downloads set the socket write deadline from the recovery service's normalized request limit before metadata lookup, allowing complete transfers past the server's shorter base write timeout while retaining a bounded socket deadline.
+
 - **A run re-planning after a revise no longer shows as waiting on you ([#2760](https://github.com/vtmocanu/uzi/issues/2760)).**
   After a revise the run stays awaiting approval while the lead re-plans, and the progress badge, the run page status pill and activity feed, the TUI detail header, its PLAN GATE banner and approve keys, and `uzi run get` all still said it was waiting on you. The status now reads revising and the progress planning, and the TUI hides the PLAN GATE banner and approve keys, until the new plan lands; then the run waits on you again. The run detail API (`GET /api/runs/{id}`) now carries `is_revising` as well as the run lists.
 
