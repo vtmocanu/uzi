@@ -14,8 +14,8 @@ import (
 
 const bootstrapMRReworkLedgerMarks = `-- name: BootstrapMRReworkLedgerMarks :execrows
 UPDATE mr_rework_ledger
-SET comment_marks = COALESCE($1::jsonb, '{}'::jsonb),
-    pending_unknown_keys = COALESCE($2::text[], '{}'::text[]),
+SET comment_marks = mr_rework_merge_marks('{}'::jsonb, $1::jsonb),
+    pending_unknown_keys = mr_rework_merge_pending_keys($2::text[], '{}'::text[], '{}'::text[], '{}'::text[], '{}'::text[], NULL),
     updated_at = now()
 WHERE repo_id = $3::uuid
   AND ref = $4
@@ -37,7 +37,11 @@ type BootstrapMRReworkLedgerMarksParams struct {
 // (ADR-1199). Guarded by compare-and-set on the legacy scalars the caller READ
 // (@legacy_high_water, @legacy_pending): if a concurrent writer moved either, or another
 // replica already bootstrapped (comment_marks no longer NULL), zero rows match and the caller
-// re-reads. After it applies the row is non-legacy for good, even if an older binary later
+// re-reads. Marks are normalized through mr_rework_merge_marks (a non-object, SQL or JSON null
+// alike, stores {}; a non-integer value fails loudly on the cast, and the table CHECK would
+// refuse it anyway). The keys go through mr_rework_merge_pending_keys as the EXISTING set with
+// nothing added: deduped, first position kept, order preserved, the 10000 cap applied, NULL
+// elements dropped. After it applies the row is non-legacy for good, even if an older binary later
 // advances the legacy columns.
 func (q *Queries) BootstrapMRReworkLedgerMarks(ctx context.Context, arg BootstrapMRReworkLedgerMarksParams) (int64, error) {
 	result, err := q.db.Exec(ctx, bootstrapMRReworkLedgerMarks,
@@ -847,7 +851,7 @@ func (q *Queries) SetMRReworkHaltNotified(ctx context.Context, arg SetMRReworkHa
 	return err
 }
 
-const upsertMRReworkLedger = `-- name: UpsertMRReworkLedger :exec
+const upsertMRReworkLedger = `-- name: UpsertMRReworkLedger :execrows
 INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, comment_marks, pending_unknown_keys)
 VALUES ($1::uuid, $2, 1, $3,
         mr_rework_merge_marks('{}'::jsonb, $4::jsonb),
@@ -856,13 +860,10 @@ ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
-    comment_marks = CASE WHEN mr_rework_ledger.comment_marks IS NULL
-                         THEN mr_rework_ledger.comment_marks
-                         ELSE mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks) END,
-    pending_unknown_keys = CASE WHEN mr_rework_ledger.comment_marks IS NULL
-                                THEN mr_rework_ledger.pending_unknown_keys
-                                ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $5::text[], $6::text[], $7::text[], $8::text[], mr_rework_ledger.comment_marks) END,
+    comment_marks = mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks),
+    pending_unknown_keys = mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $5::text[], $6::text[], $7::text[], $8::text[], mr_rework_ledger.comment_marks),
     updated_at    = now()
+WHERE mr_rework_ledger.comment_marks IS NOT NULL
 `
 
 type UpsertMRReworkLedgerParams struct {
@@ -885,19 +886,20 @@ type UpsertMRReworkLedgerParams struct {
 // halt episode, so once a proceed advances the counter a later cap halt can comment
 // again.
 // comment_marks (ADR-1199): @marks is a namespace -> id object merged per key with GREATEST
-// (mr_rework_merge_marks), never backward. A LEGACY row (comment_marks NULL) keeps NULL here:
-// the service bootstraps it from the legacy scalars, so this statement must not invent marks
-// for it (the CASE arm is the existing column, never a bare NULL: 42P08).
+// (mr_rework_merge_marks), never backward.
+// Returns the rows written: an INSERT of a new row is 1; an UPDATE of a non-legacy row is 1; a
+// LEGACY row (comment_marks NULL) matches the ON CONFLICT WHERE below, writes NOTHING and
+// returns 0. 0 rows therefore means the row is legacy (or was bootstrapped-away concurrently):
+// the caller must refuse (ErrReworkLedgerChanged) and roll back, then re-read and bootstrap.
 // pending_unknown_keys: the source-qualified keys ('<namespace>:<id>') of permission-unknown
 // comments the marks moved past (@pending_add, kept only when above the PER-NAMESPACE mark the
 // row had BEFORE this update) merged with the existing set, minus @pending_remove. An author's
 // older key is replaced by its newer representative only through the parallel
 // @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
 // replacement is retained in the same statement; the merge keeps the oldest-admitted 10000
-// (mr_rework_merge_pending_keys). A legacy row's pending_unknown_keys is left untouched, and
-// pending_unknown_ids is no longer written.
-func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) error {
-	_, err := q.db.Exec(ctx, upsertMRReworkLedger,
+// (mr_rework_merge_pending_keys). pending_unknown_ids is no longer written.
+func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertMRReworkLedger,
 		arg.RepoID,
 		arg.Ref,
 		arg.HighWater,
@@ -907,5 +909,8 @@ func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLe
 		arg.PendingSuperseded,
 		arg.PendingSupersededBy,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

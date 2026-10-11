@@ -158,6 +158,11 @@ func TestMRReworkMergeMarksLiveDB(t *testing.T) {
 		"NULL and a value":    {nil, s(`{"a":3}`), map[string]int64{"a": 3}},
 		"per-key max + union": {s(`{"a":5,"b":9}`), s(`{"a":7,"c":1}`), map[string]int64{"a": 7, "b": 9, "c": 1}},
 		"never backward":      {s(`{"a":9}`), s(`{"a":2}`), map[string]int64{"a": 9}},
+		"JSON null":           {s(`null`), s(`null`), map[string]int64{}},
+		"JSON null + value":   {s(`null`), s(`{"a":3}`), map[string]int64{"a": 3}},
+		"array":               {s(`[]`), s(`{"a":3}`), map[string]int64{"a": 3}},
+		"array incoming":      {s(`{"a":3}`), s(`[1,2]`), map[string]int64{"a": 3}},
+		"scalar":              {s(`5`), s(`5`), map[string]int64{}},
 	} {
 		if got := merge(tc.a, tc.b); !reflect.DeepEqual(got, tc.want) {
 			t.Fatalf("%s: got %v, want %v", name, got, tc.want)
@@ -242,20 +247,79 @@ func TestMRReworkLedgerBootstrapLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("an upsert on a legacy row leaves the namespaced state alone", func(t *testing.T) {
+	t.Run("an upsert on a legacy row writes nothing and returns 0 rows", func(t *testing.T) {
 		ref := "agent/issue-boot-4"
-		legacyRow(ctx, t, pool, repo, ref, 5, nil)
+		legacyRow(ctx, t, pool, repo, ref, 5, []int64{3})
 		if _, err := pool.Exec(ctx, `UPDATE mr_rework_ledger SET pending_unknown_keys = '{review_comment:1}' WHERE repo_id = $1 AND ref = $2`, repo, ref); err != nil {
 			t.Fatal(err)
 		}
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+		before := get(ref)
+		n, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
 			RepoID: repo, Ref: ref, HighWater: 40, Marks: rmarks(40), PendingAdd: rkeys(30), PendingRemove: rkeys(1),
-		}); err != nil {
-			t.Fatal(err)
+		})
+		if err != nil || n != 0 {
+			t.Fatalf("legacy upsert rows=%d err=%v, want 0", n, err)
 		}
-		led := get(ref)
-		if !led.Legacy || led.CommentMarks != nil || !slices.Equal(led.PendingUnknownKeys, rkeys(1)) || led.HighWater != 40 || led.AttemptCount != 2 {
-			t.Fatalf("legacy upsert must advance only the scalars: %+v", led)
+		after := get(ref)
+		if !after.Legacy || after.CommentMarks != nil || after.AttemptCount != before.AttemptCount || after.HighWater != before.HighWater ||
+			!slices.Equal(after.PendingUnknownKeys, before.PendingUnknownKeys) || !slices.Equal(after.PendingUnknownIds, before.PendingUnknownIds) ||
+			!after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) || after.HaltNotified != before.HaltNotified {
+			t.Fatalf("a refused legacy upsert changed the row:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+
+	t.Run("an upsert inserting a new row returns 1", func(t *testing.T) {
+		n, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: "agent/issue-boot-4b", HighWater: 4, Marks: rmarks(4)})
+		if err != nil || n != 1 {
+			t.Fatalf("insert rows=%d err=%v, want 1", n, err)
+		}
+		n, err = q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: "agent/issue-boot-4b", HighWater: 5, Marks: rmarks(5)})
+		if err != nil || n != 1 {
+			t.Fatalf("non-legacy update rows=%d err=%v, want 1", n, err)
+		}
+	})
+
+	t.Run("bootstrap normalizes JSON null marks to an empty object", func(t *testing.T) {
+		for i, raw := range [][]byte{[]byte("null"), nil, []byte("[]")} {
+			ref := fmt.Sprintf("agent/issue-boot-nullmarks-%d", i)
+			legacyRow(ctx, t, pool, repo, ref, 1, nil)
+			n, err := q.BootstrapMRReworkLedgerMarks(ctx, store.BootstrapMRReworkLedgerMarksParams{RepoID: repo, Ref: ref, Marks: raw, LegacyHighWater: 1})
+			if err != nil || n != 1 {
+				t.Fatalf("marks %q: rows=%d err=%v", raw, n, err)
+			}
+			if led := get(ref); led.Legacy || !reflect.DeepEqual(marksOf(t, led.CommentMarks), map[string]int64{}) {
+				t.Fatalf("marks %q stored %s legacy=%v, want {}", raw, led.CommentMarks, led.Legacy)
+			}
+		}
+	})
+
+	t.Run("bootstrap dedups keys keeping the first position", func(t *testing.T) {
+		ref := "agent/issue-boot-dups"
+		legacyRow(ctx, t, pool, repo, ref, 1, nil)
+		keys := []string{"review_comment:9", "issue_comment:2", "review_comment:9", "review_comment:3", "issue_comment:2"}
+		n, err := q.BootstrapMRReworkLedgerMarks(ctx, store.BootstrapMRReworkLedgerMarksParams{RepoID: repo, Ref: ref, Marks: []byte(`{}`), PendingKeys: keys, LegacyHighWater: 1})
+		if err != nil || n != 1 {
+			t.Fatalf("rows=%d err=%v", n, err)
+		}
+		if got, want := get(ref).PendingUnknownKeys, []string{"review_comment:9", "issue_comment:2", "review_comment:3"}; !slices.Equal(got, want) {
+			t.Fatalf("keys = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("bootstrap refuses a non-integer mark loudly and leaves the row legacy", func(t *testing.T) {
+		for i, bad := range []string{`{"rc":1.5}`, `{"rc":"x"}`, `{"rc":true}`, `{"rc":99999999999999999999}`} {
+			ref := fmt.Sprintf("agent/issue-boot-badmark-%d", i)
+			legacyRow(ctx, t, pool, repo, ref, 1, nil)
+			n, err := q.BootstrapMRReworkLedgerMarks(ctx, store.BootstrapMRReworkLedgerMarksParams{RepoID: repo, Ref: ref, Marks: []byte(bad), LegacyHighWater: 1})
+			if err == nil || n != 0 {
+				t.Fatalf("marks %s: rows=%d err=%v, want an error", bad, n, err)
+			}
+			if c := pgCode(err); c != "22P02" && c != "22003" && c != "23514" {
+				t.Fatalf("marks %s: code %q (%v), want a cast (22P02/22003) or check (23514) error", bad, c, err)
+			}
+			if !get(ref).Legacy {
+				t.Fatalf("marks %s: a failed bootstrap must leave the row legacy", bad)
+			}
 		}
 	})
 
@@ -278,13 +342,30 @@ func TestMRReworkLedgerBootstrapLiveDB(t *testing.T) {
 				t.Fatalf("key %q: err = %v, want 23514", bad, err)
 			}
 		}
-		err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 1, PendingAdd: []string{"Review:1"}})
+		_, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 1, PendingAdd: []string{"Review:1"}})
 		if pgCode(err) != "23514" {
 			t.Fatalf("upsert of a malformed key: err = %v, want 23514", err)
 		}
-		_, err = pool.Exec(ctx, `INSERT INTO mr_rework_ledger (repo_id, ref, comment_marks) VALUES ($1, $2, '[]')`, repo, ref)
+		for _, bad := range []string{"review_comment:" + "12345678901234567890", "review_comment:0123"} {
+			_, err = pool.Exec(ctx, `INSERT INTO mr_rework_ledger (repo_id, ref, pending_unknown_keys) VALUES ($1, $2, ARRAY[$3]::text[])`, repo, ref, bad)
+			if pgCode(err) != "23514" {
+				t.Fatalf("key %q: err = %v, want 23514", bad, err)
+			}
+		}
+		_, err = pool.Exec(ctx, `INSERT INTO mr_rework_ledger (repo_id, ref, pending_unknown_keys) VALUES ($1, $2, ARRAY['review_comment:1', NULL]::text[])`, repo, ref)
 		if pgCode(err) != "23514" {
-			t.Fatalf("array comment_marks: err = %v, want 23514", err)
+			t.Fatalf("NULL key element: err = %v, want 23514", err)
+		}
+		for _, bad := range []string{`[]`, `null`, `5`, `{"rc":1.5}`, `{"rc":"x"}`, `{"rc":-1}`, `{"rc":null}`, `{"rc":true}`, `{"rc":99999999999999999999}`, `{"rc":9223372036854775808}`} {
+			_, err = pool.Exec(ctx, `INSERT INTO mr_rework_ledger (repo_id, ref, comment_marks) VALUES ($1, $2, $3::jsonb)`, repo, ref, bad)
+			if pgCode(err) != "23514" {
+				t.Fatalf("comment_marks %s: err = %v, want 23514", bad, err)
+			}
+		}
+		for _, good := range []string{`{}`, `{"rc":0}`, `{"rc":9223372036854775807}`} {
+			if _, err = pool.Exec(ctx, `INSERT INTO mr_rework_ledger (repo_id, ref, comment_marks) VALUES ($1, $2, $3::jsonb) ON CONFLICT (repo_id, ref) DO UPDATE SET comment_marks = EXCLUDED.comment_marks`, repo, ref, good); err != nil {
+				t.Fatalf("comment_marks %s: %v", good, err)
+			}
 		}
 	})
 }
@@ -354,10 +435,10 @@ func TestMRReworkLedgerNonLegacyAdvanceLiveDB(t *testing.T) {
 
 	t.Run("upsert", func(t *testing.T) {
 		ref := "agent/issue-adv-1"
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 10, Marks: []byte(`{"review_comment":10}`)}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 10, Marks: []byte(`{"review_comment":10}`)}); err != nil {
 			t.Fatal(err)
 		}
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 8, Marks: incoming, PendingAdd: add}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 8, Marks: incoming, PendingAdd: add}); err != nil {
 			t.Fatal(err)
 		}
 		led := get(ref)
@@ -397,10 +478,10 @@ func TestMRReworkLedgerNonLegacyAdvanceLiveDB(t *testing.T) {
 
 	t.Run("removal preserves stored order and skips legacy rows", func(t *testing.T) {
 		ref := "agent/issue-adv-3"
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 1, Marks: []byte(`{}`), PendingAdd: []string{"ns_b:9", "ns_a:3"}}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 1, Marks: []byte(`{}`), PendingAdd: []string{"ns_b:9", "ns_a:3"}}); err != nil {
 			t.Fatal(err)
 		}
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 1, Marks: []byte(`{}`), PendingAdd: []string{"ns_c:1", "ns_a:2"}}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 1, Marks: []byte(`{}`), PendingAdd: []string{"ns_c:1", "ns_a:2"}}); err != nil {
 			t.Fatal(err)
 		}
 		if got := get(ref).PendingUnknownKeys; !slices.Equal(got, []string{"ns_a:3", "ns_b:9", "ns_c:1", "ns_a:2"}) {
@@ -424,4 +505,38 @@ func TestMRReworkLedgerNonLegacyAdvanceLiveDB(t *testing.T) {
 			t.Fatalf("a legacy row's keys were changed: %v", got)
 		}
 	})
+}
+
+// The manual create's led CTE keeps CASE arms for a legacy row (the service guards legacy under
+// the branch lock); this executes that arm: the legacy row's marks and keys must stay untouched.
+func TestMRReworkManualCreateOnLegacyRowLiveDB(t *testing.T) {
+	ctx, pool, q, repo := reviewAuthorEnv(t)
+	var user uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT user_id FROM forge_connections WHERE id = (SELECT connection_id FROM repos WHERE id = $1)`, repo).Scan(&user); err != nil {
+		t.Fatal(err)
+	}
+	ref := "agent/issue-legacy-manual"
+	legacyRow(ctx, t, pool, repo, ref, 5, []int64{3})
+	if _, err := pool.Exec(ctx, `UPDATE mr_rework_ledger SET pending_unknown_keys = '{review_comment:1}' WHERE repo_id = $1 AND ref = $2`, repo, ref); err != nil {
+		t.Fatal(err)
+	}
+	target := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status) VALUES ($1, $2, $3, 'issue', 904, 't', 'd', 'completed')`, target, user, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
+		Harness: "claude", UserID: user, RepoID: repo, IssueTitle: "t", IssueDescription: "d",
+		PipelineRef: pgtype.Text{String: ref, Valid: true}, MrIid: pgtype.Int8{Int64: 69, Valid: true},
+		TargetRunID: pgtype.UUID{Bytes: target, Valid: true}, ReviewComments: []byte(`{}`),
+		HighWater: 40, Marks: rmarks(40), PendingAdd: rkeys(30), PendingRemove: rkeys(1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	led, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !led.Legacy || led.CommentMarks != nil || !slices.Equal(led.PendingUnknownKeys, rkeys(1)) || !slices.Equal(led.PendingUnknownIds, []int64{3}) || led.HighWater != 40 {
+		t.Fatalf("manual create on a legacy row must advance only high_water: %+v", led)
+	}
 }

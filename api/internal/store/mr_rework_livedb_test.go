@@ -248,7 +248,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 	// still incrementing the counter.
 	up := func(hw int64) {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7", HighWater: hw}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7", HighWater: hw}); err != nil {
 			t.Fatalf("UpsertMRReworkLedger(%d): %v", hw, err)
 		}
 	}
@@ -447,7 +447,7 @@ func TestMRReworkLedgerLifetimeLiveDB(t *testing.T) {
 	}
 	seedLedger := func(repoID uuid.UUID, ref string) store.GetMRReworkLedgerRow {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: ref, HighWater: 120}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: ref, HighWater: 120}); err != nil {
 			t.Fatal(err)
 		}
 		if err := q.SetMRReworkHaltNotified(ctx, store.SetMRReworkHaltNotifiedParams{RepoID: repoID, Ref: ref}); err != nil {

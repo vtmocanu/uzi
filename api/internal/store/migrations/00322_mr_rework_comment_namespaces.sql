@@ -29,23 +29,42 @@ ALTER TABLE mr_rework_ledger
     ADD COLUMN pending_unknown_keys text[] NOT NULL DEFAULT '{}';
 
 -- Every pending key is '<namespace>:<id>': a lowercase/underscore namespace (possibly empty),
--- one colon, then a canonical non-negative decimal id (no leading zeros). Empty array is well
--- formed.
+-- one colon, then a canonical non-negative decimal id (no leading zeros, at most 19 digits so it
+-- is bounded to bigint width). A NULL element is rejected. Empty array is well formed.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_pending_keys_wellformed(keys text[]) RETURNS boolean
 LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT COALESCE(bool_and(k ~ '^[a-z_]*:(0|[1-9][0-9]*)$'), true)
+  SELECT COALESCE(bool_and(k IS NOT NULL AND k ~ '^[a-z_]*:(0|[1-9][0-9]{0,18})$'), true)
   FROM unnest(keys) AS k
 $$;
 -- +goose StatementEnd
 
--- Split a key at its LAST colon.
+-- comment_marks is a jsonb object whose every value is a JSON number that is a canonical
+-- non-negative integer within bigint (what mr_rework_merge_marks casts to). The regex gates the
+-- numeric comparison inside one CASE so a non-numeric value never reaches the cast.
+-- +goose StatementBegin
+CREATE FUNCTION mr_rework_marks_wellformed(m jsonb) RETURNS boolean
+LANGUAGE sql IMMUTABLE
+AS $$
+  SELECT jsonb_typeof(m) = 'object'
+     AND NOT EXISTS (
+       SELECT 1 FROM jsonb_each(m) AS e
+       WHERE NOT (CASE WHEN jsonb_typeof(e.value) = 'number'
+                        AND e.value::text ~ '^(0|[1-9][0-9]{0,18})$'
+                       THEN e.value::text::numeric <= 9223372036854775807
+                       ELSE false END))
+$$;
+-- +goose StatementEnd
+
+-- Split a key at its LAST colon (split_part with a negative position counts from the end). A
+-- key with no colon has no namespace (NULL).
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_key_ns(k text) RETURNS text
 LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT substring(k from '^(.*):[^:]*$')
+  SELECT CASE WHEN strpos(k, ':') > 0
+              THEN left(k, -length(split_part(k, ':', -1)) - 1) END
 $$;
 -- +goose StatementEnd
 
@@ -53,12 +72,12 @@ $$;
 CREATE FUNCTION mr_rework_key_id(k text) RETURNS bigint
 LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT substring(k from '([^:]*)$')::bigint
+  SELECT split_part(k, ':', -1)::bigint
 $$;
 -- +goose StatementEnd
 
--- Per-key maximum over the union of keys of two mark objects. NOT STRICT: NULL on either side
--- is the empty object. jsonb_object_agg over zero rows is NULL, so the result is COALESCEd to
+-- Per-key maximum over the union of keys of two mark objects. NOT STRICT: any non-object input
+-- (SQL NULL, JSON null, an array or a scalar) is the empty object. jsonb_object_agg over zero rows is NULL, so the result is COALESCEd to
 -- '{}'.
 -- +goose StatementBegin
 CREATE FUNCTION mr_rework_merge_marks(existing jsonb, incoming jsonb) RETURNS jsonb
@@ -69,10 +88,10 @@ AS $$
     SELECT u.k, max(u.v) AS v
     FROM (
       SELECT e.key AS k, e.value::bigint AS v
-        FROM jsonb_each_text(COALESCE(existing, '{}'::jsonb)) AS e
+        FROM jsonb_each_text(CASE WHEN jsonb_typeof(existing) = 'object' THEN existing ELSE '{}'::jsonb END) AS e
       UNION ALL
       SELECT i.key AS k, i.value::bigint AS v
-        FROM jsonb_each_text(COALESCE(incoming, '{}'::jsonb)) AS i
+        FROM jsonb_each_text(CASE WHEN jsonb_typeof(incoming) = 'object' THEN incoming ELSE '{}'::jsonb END) AS i
     ) u
     GROUP BY u.k
   ) m
@@ -149,7 +168,8 @@ AS $$
     SELECT sl.k,
            row_number() OVER (
              ORDER BY (sl.pos IS NULL), sl.pos,
-                      mr_rework_key_id(sl.k), mr_rework_key_ns(sl.k), sl.k
+                      CASE WHEN sl.pos IS NULL THEN mr_rework_key_id(sl.k) END,
+                      CASE WHEN sl.pos IS NULL THEN mr_rework_key_ns(sl.k) END, sl.k
            ) AS rn
     FROM slotted sl
   )
@@ -159,8 +179,8 @@ $$;
 -- +goose StatementEnd
 
 ALTER TABLE mr_rework_ledger
-    ADD CONSTRAINT mr_rework_ledger_comment_marks_object
-        CHECK (comment_marks IS NULL OR jsonb_typeof(comment_marks) = 'object'),
+    ADD CONSTRAINT mr_rework_ledger_comment_marks_wellformed
+        CHECK (comment_marks IS NULL OR mr_rework_marks_wellformed(comment_marks)),
     ADD CONSTRAINT mr_rework_ledger_pending_unknown_keys_check
         CHECK (cardinality(pending_unknown_keys) <= 10000),
     ADD CONSTRAINT mr_rework_ledger_pending_unknown_keys_wellformed
@@ -170,11 +190,12 @@ ALTER TABLE mr_rework_ledger
 ALTER TABLE mr_rework_ledger
     DROP CONSTRAINT mr_rework_ledger_pending_unknown_keys_wellformed,
     DROP CONSTRAINT mr_rework_ledger_pending_unknown_keys_check,
-    DROP CONSTRAINT mr_rework_ledger_comment_marks_object,
+    DROP CONSTRAINT mr_rework_ledger_comment_marks_wellformed,
     DROP COLUMN pending_unknown_keys,
     DROP COLUMN comment_marks;
 DROP FUNCTION mr_rework_merge_pending_keys(text[], text[], text[], text[], text[], jsonb);
 DROP FUNCTION mr_rework_merge_marks(jsonb, jsonb);
 DROP FUNCTION mr_rework_key_id(text);
 DROP FUNCTION mr_rework_key_ns(text);
+DROP FUNCTION mr_rework_marks_wellformed(jsonb);
 DROP FUNCTION mr_rework_pending_keys_wellformed(text[]);

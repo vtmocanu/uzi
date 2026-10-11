@@ -484,7 +484,7 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 	}
 	upsert := func(ref string, hw int64, add, remove []int64) {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: rkeys(remove...)}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: rkeys(remove...)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -501,7 +501,7 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 			t.Fatalf("after update = %v, want [9 12]", got)
 		}
 		// NULL arrays (a caller that sets neither list) leave the set alone.
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 13}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 13}); err != nil {
 			t.Fatal(err)
 		}
 		if got := pending(ref); !slices.Equal(got, []int64{9, 12}) {
@@ -603,7 +603,7 @@ func TestMRReworkPendingUnknownIDsLiveDB(t *testing.T) {
 func TestRemoveMRReworkPendingKeysLiveDB(t *testing.T) {
 	ctx, _, q, repo := reviewAuthorEnv(t)
 	ref := "agent/issue-pending-remove"
-	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 20, Marks: rmarks(20), PendingAdd: rkeys(5, 9, 12)}); err != nil {
+	if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repo, Ref: ref, HighWater: 20, Marks: rmarks(20), PendingAdd: rkeys(5, 9, 12)}); err != nil {
 		t.Fatal(err)
 	}
 	before, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repo, Ref: ref})
@@ -666,7 +666,7 @@ func TestMRReworkStaleSupersessionKeepsRepresentativeLiveDB(t *testing.T) {
 	}
 	upsert := func(ref string, hw int64, add, remove, sup, supBy []int64) {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
 			RepoID: repo, Ref: ref, HighWater: hw, Marks: rmarks(hw), PendingAdd: rkeys(add...), PendingRemove: rkeys(remove...),
 			PendingSuperseded: rkeys(sup...), PendingSupersededBy: rkeys(supBy...),
 		}); err != nil {

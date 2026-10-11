@@ -91,7 +91,7 @@ SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pendi
 FROM mr_rework_ledger
 WHERE repo_id = @repo_id::uuid AND ref = @ref;
 
--- name: UpsertMRReworkLedger :exec
+-- name: UpsertMRReworkLedger :execrows
 -- The PROCEED path: record that a rework cycle was spent and advance the consumed
 -- marks. attempt_count counts AUTO cycles only; the first proceed INSERTs
 -- count = 1, every subsequent proceed increments. high_water is ADVANCE-ONLY
@@ -101,17 +101,18 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- halt episode, so once a proceed advances the counter a later cap halt can comment
 -- again.
 -- comment_marks (ADR-1199): @marks is a namespace -> id object merged per key with GREATEST
--- (mr_rework_merge_marks), never backward. A LEGACY row (comment_marks NULL) keeps NULL here:
--- the service bootstraps it from the legacy scalars, so this statement must not invent marks
--- for it (the CASE arm is the existing column, never a bare NULL: 42P08).
+-- (mr_rework_merge_marks), never backward.
+-- Returns the rows written: an INSERT of a new row is 1; an UPDATE of a non-legacy row is 1; a
+-- LEGACY row (comment_marks NULL) matches the ON CONFLICT WHERE below, writes NOTHING and
+-- returns 0. 0 rows therefore means the row is legacy (or was bootstrapped-away concurrently):
+-- the caller must refuse (ErrReworkLedgerChanged) and roll back, then re-read and bootstrap.
 -- pending_unknown_keys: the source-qualified keys ('<namespace>:<id>') of permission-unknown
 -- comments the marks moved past (@pending_add, kept only when above the PER-NAMESPACE mark the
 -- row had BEFORE this update) merged with the existing set, minus @pending_remove. An author's
 -- older key is replaced by its newer representative only through the parallel
 -- @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
 -- replacement is retained in the same statement; the merge keeps the oldest-admitted 10000
--- (mr_rework_merge_pending_keys). A legacy row's pending_unknown_keys is left untouched, and
--- pending_unknown_ids is no longer written.
+-- (mr_rework_merge_pending_keys). pending_unknown_ids is no longer written.
 INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, comment_marks, pending_unknown_keys)
 VALUES (@repo_id::uuid, @ref, 1, @high_water,
         mr_rework_merge_marks('{}'::jsonb, @marks::jsonb),
@@ -120,13 +121,10 @@ ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
-    comment_marks = CASE WHEN mr_rework_ledger.comment_marks IS NULL
-                         THEN mr_rework_ledger.comment_marks
-                         ELSE mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks) END,
-    pending_unknown_keys = CASE WHEN mr_rework_ledger.comment_marks IS NULL
-                                THEN mr_rework_ledger.pending_unknown_keys
-                                ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], mr_rework_ledger.comment_marks) END,
-    updated_at    = now();
+    comment_marks = mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks),
+    pending_unknown_keys = mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], mr_rework_ledger.comment_marks),
+    updated_at    = now()
+WHERE mr_rework_ledger.comment_marks IS NOT NULL;
 
 -- name: RemoveMRReworkPendingKeys :exec
 -- Drop keys from a ledger row's pending_unknown_keys WITHOUT spending a cycle (issue #2347): the
@@ -149,11 +147,15 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref AND comment_marks IS NOT NULL;
 -- (ADR-1199). Guarded by compare-and-set on the legacy scalars the caller READ
 -- (@legacy_high_water, @legacy_pending): if a concurrent writer moved either, or another
 -- replica already bootstrapped (comment_marks no longer NULL), zero rows match and the caller
--- re-reads. After it applies the row is non-legacy for good, even if an older binary later
+-- re-reads. Marks are normalized through mr_rework_merge_marks (a non-object, SQL or JSON null
+-- alike, stores {}; a non-integer value fails loudly on the cast, and the table CHECK would
+-- refuse it anyway). The keys go through mr_rework_merge_pending_keys as the EXISTING set with
+-- nothing added: deduped, first position kept, order preserved, the 10000 cap applied, NULL
+-- elements dropped. After it applies the row is non-legacy for good, even if an older binary later
 -- advances the legacy columns.
 UPDATE mr_rework_ledger
-SET comment_marks = COALESCE(@marks::jsonb, '{}'::jsonb),
-    pending_unknown_keys = COALESCE(@pending_keys::text[], '{}'::text[]),
+SET comment_marks = mr_rework_merge_marks('{}'::jsonb, @marks::jsonb),
+    pending_unknown_keys = mr_rework_merge_pending_keys(@pending_keys::text[], '{}'::text[], '{}'::text[], '{}'::text[], '{}'::text[], NULL),
     updated_at = now()
 WHERE repo_id = @repo_id::uuid
   AND ref = @ref
