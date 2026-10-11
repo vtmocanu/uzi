@@ -35,7 +35,7 @@ repo allowlist. When the owner has workers online but every one of them is a
 Docker worker and the run's repo isn't on the Docker worker repo allowlist,
 no worker is eligible to claim it, so the run stays `queued` and the reason
 names it specifically, distinct from "no worker online" or "all workers busy".
-Unlike the other waiting reasons, it is flagged as soon as the next health
+Like the stale-requeue pin reason, and unlike the other waiting reasons, it is flagged as soon as the next health
 sweep detects the block, without waiting for **Stuck queued after**
 (`health_queued_seconds`); a higher-precedence block (locked vault, custody
 limit, and so on) still hides it, and setting `health_queued_seconds` to `0`

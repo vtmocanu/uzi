@@ -1475,7 +1475,7 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 // waiting out the threshold only delays the owner's actionable message. It returns
 // (healthWaitingWorker, reason) only when the owner has an online worker, no online worker
 // is eligible for the repo, and queuedReason resolves to the docker-allowlist reason (so
-// every more-fundamental rung still wins); every other path, including any read error,
+// every more-fundamental rung still wins); every other path, including any probe read error (an owner-lookup failure still shows the Member wording),
 // returns (healthOK, "").
 func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) (string, string) {
 	if !r.RepoID.Valid || r.EgressProfileID.Valid || s.dockerAllowlist == nil {
