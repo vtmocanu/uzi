@@ -49,6 +49,13 @@ function codeSummary(overrides: Partial<import("../src/code-cross-check-contract
 }
 
 describe("structured code cross-check completion section", () => {
+  it("uses the singular for exactly one finding", () => {
+    const one = codeSummary({ findings: [codeSummary().findings[0]!], dispositions: [codeSummary().dispositions![0]!] });
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: one }]] });
+    assert.match(body, /\n1 finding: 1 addressed, 0 declined/);
+    assert.doesNotMatch(body, /1 findings/);
+  });
+
   for (const kind of ["issue", "prompt", "self_improve", "ci_fix", "mr_rework", "task"] as const) {
     it(`${kind} preserves original checked identity and exact counts in either completion arm`, () => {
       const body = mrCompletionBlock(makeClaim({ kind }), "rewritten-tip-branch", undefined, undefined, undefined,

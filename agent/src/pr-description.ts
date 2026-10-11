@@ -1266,7 +1266,7 @@ function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").Code
   const identity = `Code cross-check (checked ${codeSpan(summary.head_commit.slice(0, 7))}, ${family} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
   const counts = summary.findings.length === 0
     ? `${identity}: no findings`
-    : `${identity}\n${summary.findings.length} findings: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+    : `${identity}\n${summary.findings.length} ${summary.findings.length === 1 ? "finding" : "findings"}: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
   // The digest is the frozen guidance's sha256; only its first 12 hex characters are shown.
   const guidance = summary.custom_guidance_applied
     ? [`custom guidance applied${summary.guidance_digest ? ` (sha256 ${codeSpan(summary.guidance_digest.slice(0, 12))})` : ""}`]

@@ -90,7 +90,9 @@ export class CrossCheckRunner {
         if (server.lead_run_id !== leadId || (!leadTerminal && server.owned_by_worker !== false)) continue;
         const leadDisposition = leadTerminal ? "terminal" as const : "foreign" as const;
         if (!server.row_present) {
-          // The server validly has no code row for this lead: nothing can read the ref.
+          // The server has no code row for this lead. Delete only when local metadata shows no
+          // checker ever read the ref; a child history with no server row is inconclusive.
+          if (metadata.latestChild || metadata.readers.length > 0) continue;
           await this.git.deleteCodeSnapshot(barePath, leadId, head, {
             sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId, outcome: "no_row" },
             bootCandidate: candidate, leadDisposition,

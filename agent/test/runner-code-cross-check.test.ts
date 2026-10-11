@@ -202,7 +202,7 @@ for (const harness of ["claude", "codex"] as const) {
       assert.notEqual(original, repaired);
       assert.ok(JSON.stringify(forge.calls).includes(`checked \`${original.slice(0, 7)}\``));
       assert.ok(!JSON.stringify(forge.calls).includes(`checked \`${repaired.slice(0, 7)}\``));
-      assert.ok(JSON.stringify(forge.calls).includes("1 findings: 1 addressed, 0 declined"));
+      assert.ok(JSON.stringify(forge.calls).includes("1 finding: 1 addressed, 0 declined"));
     });
   }
 }

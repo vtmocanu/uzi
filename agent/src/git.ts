@@ -4274,7 +4274,8 @@ export class GitCache {
       const decided = outcome && outcome.outcome !== "no_row" ? outcome : undefined;
       if (!m || m.head !== head || !outcome || outcome.persisted !== true || outcome.sealed !== true || outcome.stage !== "code" ||
           outcome.leadId !== runId || m.readers.some(r => r.state !== "CLOSED") ||
-          !(noRow ? !!evidence.bootCandidate && !evidence.child && !evidence.freshNoReader
+          !(noRow ? !!evidence.bootCandidate && !evidence.child && !evidence.freshNoReader &&
+                    m.latestChild === null && m.readers.length === 0
             : !!decided && decided.head === head && decided.pinGeneration === m.pinGeneration &&
               ["completed", "failed"].includes(decided.outcome)))
         throw new Error("code snapshot retirement evidence incomplete");
@@ -4284,7 +4285,8 @@ export class GitCache {
           boot.metadataToken !== token || !["terminal", "foreign"].includes(evidence.leadDisposition ?? "")))
         throw new Error("code snapshot boot evidence changed");
       if (noRow) {
-        // The server has no code row for this lead, so there is no child to prove terminal.
+        // The server has no code row for this lead, and the guard above already required that local
+        // metadata records no child or reader history, so nothing ever read this ref.
       } else if (m.latestChild) {
         const child = evidence.child;
         if (evidence.freshNoReader || !child || child.childId !== m.latestChild.childId ||

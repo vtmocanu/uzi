@@ -169,7 +169,7 @@ const PIN = 7;
 const swept = ["terminal", "foreign", "never-claimed", "decided-no-child", "terminal-child-no-local", "rowless-terminal", "rowless-foreign"];
 const retained = ["live", "rowless-live", "pending-no-reader", "running-child-no-local", "open", "throw", "http-500", "old-api",
   "malformed", "moved", "child-generation", "child-id", "lead-generation", "head", "lead-id", "local-child-server-none",
-  "decided-pending-outcome", "missing-metadata", "malformed-metadata"];
+  "decided-pending-outcome", "missing-metadata", "malformed-metadata", "rowless-lead-id", "rowless-child-terminal", "rowless-child-foreign"];
 
 it("real Git CODE boot sweep deletes only on fenced positive proof and retains everything else", async () => {
   const fx = makeFixture({ "source.txt": "code\n" });
@@ -191,7 +191,7 @@ it("real Git CODE boot sweep deletes only on fenced positive proof and retains e
       row_present: false, lead_claim_generation: 0, head_commit: null, outcome: null,
       child_present: false, checker_run_id: null, checker_claim_generation: 0, checker_status: null, ...over });
     const noChildRef = new Set(["never-claimed", "decided-no-child", "terminal-child-no-local", "rowless-terminal", "rowless-foreign",
-      "rowless-live", "pending-no-reader", "running-child-no-local", "decided-pending-outcome"]);
+      "rowless-live", "rowless-lead-id", "pending-no-reader", "running-child-no-local", "decided-pending-outcome"]);
     for (const control of [...swept, ...retained]) {
       const lead = randomUUID(), child = randomUUID();
       leads.set(control, lead);
@@ -212,6 +212,9 @@ it("real Git CODE boot sweep deletes only on fenced positive proof and retains e
         "terminal-child-no-local": row(lead, child, { checker_status: "cancelled" }),
         "rowless-terminal": noRow(lead),
         "rowless-foreign": noRow(lead, foreign),
+        "rowless-lead-id": noRow(lead, { lead_run_id: randomUUID() }),
+        "rowless-child-terminal": noRow(lead),
+        "rowless-child-foreign": noRow(lead, foreign),
         live: row(lead, child, live),
         "rowless-live": noRow(lead, live),
         "pending-no-reader": row(lead, child, { outcome: "pending", checker_claim_generation: 0, checker_status: "queued" }),

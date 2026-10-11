@@ -74,7 +74,7 @@ for (const interrupted of [false, true]) {
       assert.doesNotMatch(pr.description, /checked `bbbb|findings:|F1/);
     } else {
       assert.match(pr.description, /checked `bbbbbbb`, Codex test-checker · high/);
-      assert.match(pr.description, /1 findings: 0 addressed, 1 declined/);
+      assert.match(pr.description, /1 finding: 0 addressed, 1 declined/);
       assert.ok(pr.description.includes("**Changes after the check were not cross-checked.**"));
     }
   });

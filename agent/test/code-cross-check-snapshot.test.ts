@@ -642,3 +642,24 @@ for (const kind of ["no-row", "decided-no-child"] as const) {
     });
   }
 }
+
+// A rowless boot retirement needs local metadata with no child or reader history (PRD #2170 U2).
+for (const leadDisposition of ["terminal", "foreign"] as const) {
+  it(`boot retirement with no server row keeps a ref a checker child read: ${leadDisposition} lead`, async () => {
+    const f = await fixture();
+    try {
+      await f.git.pinCodeSnapshot(f.bare, "norow", f.head, f.base, true, 3);
+      const child = randomUUID();
+      const checkout = await f.git.runnerCloneAtCommit(f.bare, f.head, child, "norow", 1);
+      await f.git.removeRunnerClone(checkout);
+      await f.git.closeCodeSnapshotReader(f.bare, "norow", checkout,
+        { childId: child, childGeneration: 1, terminalStatus: "completed", cleanupConfirmed: true });
+      const [candidate] = (await f.git.discoverCodeSnapshots()).filter(c => c.leadId === "norow");
+      assert.ok(candidate?.metadata.latestChild, "the observation is fresh and records the child");
+      await assert.rejects(f.git.deleteCodeSnapshot(f.bare, "norow", f.head, {
+        sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId: "norow", outcome: "no_row" },
+        bootCandidate: candidate, leadDisposition }), /retirement evidence incomplete/);
+      assert.equal(await f.git.codeSnapshotTip(f.bare, "norow"), f.head, "the ref survives");
+    } finally { f.fx.cleanup(); }
+  });
+}
