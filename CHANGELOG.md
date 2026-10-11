@@ -24,9 +24,6 @@ through `[0.52.0]`.)
 
 ### Changed
 
-- **Completion signals validate and retain a non-closing reason for issue deliveries.**
-  Claude and Codex reject malformed declarations before accepting completion data; valid reasons survive in-process rework.
-
 - **A newer inline review finding is no longer skipped after a higher-numbered top-level comment was consumed on GitHub or Forgejo ([#1199](https://github.com/vtmocanu/uzi/issues/1199)).**
   The MR review watcher and on-demand rework now identify a comment by id namespace and id (PR conversation comment, inline review comment, review summary; GitLab has one note sequence) and keep a consumed mark and pending keys per namespace instead of one high-water mark, so ids from different sequences are never compared. Existing MRs upgrade automatically on the next watcher tick that lists the comments (green head pipeline, not halted at the cap) or the next on-demand rework; findings skipped before the upgrade stay skipped (run `uzi run rework` with guidance), and a ledger whose legacy pending set is too large to upgrade is refused until an operator resets it (see docs/mr-review-watcher.md). During a mixed-version window or after a binary rollback, a comment the new code already consumed may trigger one extra rework, within the cap, because the old binary still treats the frozen legacy pending ids as pending; see ADR-1199.
 
@@ -40,6 +37,9 @@ through `[0.52.0]`.)
 
 - **Missing terminal reports no longer leave finalization pending ([#2655](https://github.com/vtmocanu/uzi/issues/2655)).**
   When a terminal journal is already absent or disappears during retirement, the worker clears its pending report entry so that the run's finalize records can be offered and retired again. Unreadable or unsafe journals stay protected, and report absence does not release custody or delete sources.
+
+- **Issue deliveries explicitly declared non-closing now leave their issue open.**
+  Claude and Codex can declare a reason when the approved plan permits leaving the issue open. The PR shows that reason with secrets redacted and omits closing directives, including on adopted PRs; interlocked runs still require a completion permit, both exact-head checks, and a confirmed non-closing body. Runs without a declaration retain their closing behavior, and MR rework keeps existing completion semantics.
 
 - **Long run walls no longer time out immediately when they exceed the native timer range ([#2761](https://github.com/vtmocanu/uzi/issues/2761)).**
   Shared chunked relative timers honor larger served totals without clamping for the SDK wall, Codex turn wall and both install waits, and isolated wall. Each arm fixes its deadline using a monotonic clock (`performance.now()` by default, injectable for tests) and schedules native chunks of at most 2147483646 ms against that deadline. Extension admission retains the 2147483 s room limit and its frozen-wall/72h, finalize and existing-extension reserves; later configuration increases can serve totals above it. Existing executor `Date.now()` elapsed accounting and absolute-time predicates are unchanged, so this fix does not make all budget accounting monotonic.
