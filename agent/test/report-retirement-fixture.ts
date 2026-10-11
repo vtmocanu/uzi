@@ -342,19 +342,30 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.ok(outbox.finalizeRecordIdentity(claim.run_id, generation), "finalize must remain pending");
     await assertCustody();
   };
+  // Deterministic first-proof expiry. Headroom keeps the production budget from lapsing on a slow
+  // runner before the proof reaches its first budgeted boundary (the hooked withReportProofBudget).
+  // At that boundary the captured PRODUCTION deadline callback (retireRecoveryReport's timer) is
+  // fired by hand, so the abort is the production one and no real time passes. `observation` says
+  // whether the boundary was reached and the signal aborted; the caller asserts both. `restore`
+  // must run on every exit path (it also unhooks a boundary that was never reached, so the mock
+  // cannot intercept a later fresh replay).
   const expireNextProof = () => {
+    const restoreHeadroom = useHeadroom();
+    const timer = captureTimers(ms => ms > headroom.proofMs - 5_000 && ms <= headroom.proofMs);
     const real = git.withReportProofBudget.bind(git);
-    const observation = { expired: false };
-    const mock = t.mock.method(git, "withReportProofBudget", async <T>(
+    const observation = { reached: false, timersCaptured: 0, aborted: false };
+    const mock = t.mock.method(git, "withReportProofBudget", <T>(
       budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>,
     ): Promise<T> => {
-      mock.mock.restore(); // Only this proof stalls; the next attempt gets a fresh budget.
-      if (!budget.signal.aborted) await new Promise<void>(resolve =>
-        budget.signal.addEventListener("abort", () => resolve(), { once: true }));
-      observation.expired = budget.signal.aborted && Date.now() >= budget.deadline;
+      mock.mock.restore(); // Only this proof expires; the next attempt gets a fresh budget.
+      observation.reached = true;
+      observation.timersCaptured = timer.count();
+      timer.fire();
+      observation.aborted = budget.signal.aborted;
       return real(budget, action);
     });
-    return observation;
+    const restore = () => { mock.mock.restore(); timer.restore(); restoreHeadroom(); };
+    return { observation, restore };
   };
   const liveFlight = { flight, release: leave.resolve, executions: () => executions };
   return { headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,

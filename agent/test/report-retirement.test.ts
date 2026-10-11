@@ -85,8 +85,10 @@ it("finalize retirement consumes the exact archived report while keeping source 
 it("fresh positive replay succeeds after a deterministic first proof budget expiry", async t => {
   const f = await reportRetirementFixture(t);
   const expiry = f.expireNextProof();
-  await f.replay();
-  assert.equal(expiry.expired, true);
+  try { await f.replay(); } finally { expiry.restore(); }
+  assert.equal(expiry.observation.reached, true, "the proof reached its first budgeted boundary");
+  assert.ok(expiry.observation.timersCaptured >= 1, "production registered its proof-deadline timer");
+  assert.equal(expiry.observation.aborted, true, "the production deadline abort fired");
   assert.equal(f.calls.cancelledAcks, 1);
   await f.assertPending();
   if (process.platform !== "linux") {
