@@ -1471,11 +1471,22 @@ export class Outbox {
     if (this.disabled) return false;
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return false;
-      if (!await this.readTerminalAuthed(runId, claimGeneration)) return false;
+      const terminals = this.runs.get(runId)?.terminals;
+      const pending = terminals?.get(claimGeneration);
+      const fileName = pending?.fileName ?? terminalFileName(claimGeneration);
+      const { observation, record } = await this.inspectTerminal(runId, claimGeneration, fileName);
+      if (observation.kind === "absent") {
+        if (!pending) return false;
+        terminals?.delete(claimGeneration);
+        return true;
+      }
+      if (!record || observation.kind !== "authenticated") return false;
       try {
-        await fs.unlink(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)));
-      } catch { return false; }
-      this.runs.get(runId)?.terminals.delete(claimGeneration);
+        await fs.unlink(path.join(this.runDir(runId), fileName));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
+      terminals?.delete(claimGeneration);
       return true;
     });
   }

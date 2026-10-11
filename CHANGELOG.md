@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Missing terminal reports no longer leave finalization pending ([#2655](https://github.com/vtmocanu/uzi/issues/2655)).**
+  When a terminal journal is already absent or disappears during retirement, the worker clears its pending report entry so that the run's finalize records can be offered and retired again. Unreadable or unsafe journals stay protected, and report absence does not release custody or delete sources.
+
 - **Long run walls no longer time out immediately when they exceed the native timer range ([#2761](https://github.com/vtmocanu/uzi/issues/2761)).**
   Shared chunked relative timers honor larger served totals without clamping for the SDK wall, Codex turn wall and both install waits, and isolated wall. Each arm fixes its deadline using a monotonic clock (`performance.now()` by default, injectable for tests) and schedules native chunks of at most 2147483646 ms against that deadline. Extension admission retains the 2147483 s room limit and its frozen-wall/72h, finalize and existing-extension reserves; later configuration increases can serve totals above it. Existing executor `Date.now()` elapsed accounting and absolute-time predicates are unchanged, so this fix does not make all budget accounting monotonic.
 

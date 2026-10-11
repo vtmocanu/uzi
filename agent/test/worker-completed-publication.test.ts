@@ -733,6 +733,39 @@ it("Unit 1: eligible unguarded failed generation detaches only after runner reti
   } finally { await f.close(); }
 });
 
+it("M1: absent retirement no-ops do not notify publication or alter recovery custody", async t => {
+  const f = await fixture();
+  try {
+    // Exercise the ordinary fallback; custody authorization has separate protected-retirement tests.
+    t.mock.method(f.run, "recoveryInventoryPending", async () => false);
+    const notify = t.mock.method(f.run, "notifyPublicationCompletionRetired");
+    const reports = f.run.protectRecoveryTerminalDeps({ outbox: f.outbox!, client: f.client,
+      gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }).outbox;
+    const records = await f.recovery.inspect(literal.run_id);
+    const holds = await f.client.listRecoveryHolds(literal.run_id);
+    const claims = new Map(Reflect.get(f.client, "completionClaims") as Map<string, unknown>);
+    const holdBindings = new Map(Reflect.get(f.client, "completionHolds") as Map<string, unknown>);
+    assert.equal(await reports.retireTerminal(literal.run_id, 1), false, "never installed is no event");
+    assert.equal(notify.mock.callCount(), 0);
+    assert.deepEqual(Reflect.get(f.client, "completionClaims"), claims);
+    assert.deepEqual(Reflect.get(f.client, "completionHolds"), holdBindings);
+    await f.outbox!.journalTerminal(literal.run_id, 1, "running", 7, { status: "failed" });
+    await fs.unlink(path.join(f.root, "outbox", literal.run_id, "terminal-1.json"));
+    assert.equal(await reports.retireTerminal(literal.run_id, 1), true);
+    assert.equal(notify.mock.callCount(), 1, "clearing an installed pending entry is one event");
+    const remainingClaims = new Map(Reflect.get(f.client, "completionClaims") as Map<string, unknown>);
+    const remainingHolds = new Map(Reflect.get(f.client, "completionHolds") as Map<string, unknown>);
+    assert.equal(await reports.retireTerminal(literal.run_id, 1), false);
+    assert.equal(notify.mock.callCount(), 1, "repeated absence cannot notify again");
+    assert.deepEqual(Reflect.get(f.client, "completionClaims"), remainingClaims);
+    assert.deepEqual(Reflect.get(f.client, "completionHolds"), remainingHolds);
+    assert.deepEqual(await f.recovery.inspect(literal.run_id), records, "source pins and custody records are unchanged");
+    assert.deepEqual(await f.client.listRecoveryHolds(literal.run_id), holds, "server hold remains open");
+    assert.deepEqual(f.sent, [], "retirement sends no state transition");
+    assert.deepEqual(f.events, [], "retirement performs no custody or capture RPC");
+  } finally { await f.close(); }
+});
+
 it("Unit 1: publication refusal reclaims only after acknowledged archive fallback retires the original", async t => {
   const f = await fixture();
   let archived = false;
