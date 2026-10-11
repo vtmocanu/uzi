@@ -2501,6 +2501,45 @@ tasks:
       - |
         mkdir -p .uzi/scratch
         UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
+      # Issue #2733: the agent<->broker checkpoint chain bridge rides this target on purpose.
+      # `test-codex-refresh-lostreply-e2e` is the only CI job that has Go, Node AND the agent's
+      # installed dependencies, and `.github/workflows` is deliberately untouched (the worker PAT
+      # cannot push it), so calling it here is the wiring. The agent deps check above has
+      # already run, and the bridge needs no database.
+      - task: test:checkpoint-chain-bridge
+
+  test:checkpoint-chain-bridge:
+    desc: real agent RunRunner checkpoint chain through the real pushbroker.Publish (needs Node and agent deps)
+    preconditions:
+      - sh: command -v node
+        msg: 'test:checkpoint-chain-bridge requires Node (the agent fixture runs under tsx)'
+    cmds:
+      - |
+        if ! task deps-check:agent; then
+          (cd agent && npm ci --ignore-scripts)
+          task deps-check:agent
+        fi
+      - |
+        # The log lives under .uzi/scratch (inside the worktree, gitignored), not /tmp.
+        # -buildvcs=false: a linked worktree cannot stamp VCS info. -race: the test's loopback
+        # server records publishes from handler goroutines, and the sibling e2e leg runs -race too. -count=1: no
+        # silent-green from Go's test cache. -v: the RUN/PASS/SKIP lines below are read from it.
+        mkdir -p .uzi/scratch
+        LOG="$(mktemp "{{.ROOT_DIR}}/.uzi/scratch/checkpoint-chain-bridge-log.XXXXXX")"
+        rc=0
+        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 go test -buildvcs=false -count=1 -race -v \
+          -run '^TestAgentCheckpointChainBridge$' ./internal/pushbroker/) > "$LOG" 2>&1 || rc=$?
+        cat "$LOG"
+        [ "$rc" -eq 0 ] || { echo "checkpoint chain bridge failed (exit $rc): $LOG" >&2; exit 1; }
+        # A named RUN and PASS are mandatory and any SKIP fails: the test skips silently when its
+        # gate variable is unset, which would read as green (same discipline as e2e/run-store-it.sh).
+        if ! grep -q '^=== RUN   TestAgentCheckpointChainBridge$' "$LOG" ||
+          ! grep -q '^--- PASS: TestAgentCheckpointChainBridge ' "$LOG" ||
+          grep -q -- '--- SKIP:' "$LOG"; then
+          echo "checkpoint chain bridge did not run and pass without skips: $LOG" >&2
+          exit 1
+        fi
+        rm -f "$LOG"
 
   deps-check:agent:
     desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)

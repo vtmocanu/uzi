@@ -77,6 +77,20 @@ func TestStrictDescendsOverlayParentOrderDepth1(t *testing.T) {
 			"(the parent[0]-first walk runs off the pack before reaching the base) — " +
 			"this is the not_descendant regression the base-first parent order fixes")
 	}
+
+	// RAW realTipNew over the prior ref: refused (issue #2733). A tick or iteration checkpoint
+	// that packs the bare real tip, with no chain over the prior overlay, is not a strict
+	// descendant of prevRef on a depth-1 store: the walk runs off the pack into the absent D_old
+	// and maps to (false, nil). The agent-side chain [prevRef, realTipNew] is what the base-first
+	// case above accepts.
+	ok, err = strictDescends(repo, prevRef, getCommit(t, repo, realTipNew))
+	if err != nil {
+		t.Fatalf("raw realTipNew: the shallow-boundary miss must map to (false, nil), got err: %v", err)
+	}
+	if ok {
+		t.Fatalf("a raw realTipNew must NOT be accepted over the prior overlay ref " +
+			"(it is why tick and iteration checkpoints are chained over the overlay)")
+	}
 }
 
 // TestStrictDescendsLostAckReconcileDepth1 pins the depth-1 broker property that makes the
