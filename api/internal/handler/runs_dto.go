@@ -439,14 +439,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	}
 	// PRD #2602: the progress estimate, from the row-only inputs decoded above. Phase is
 	// filled by the callers that also set CurrentActivity.
-	frozenIDs := make([]string, 0, len(dto.Milestones))
-	for _, m := range dto.Milestones {
-		frozenIDs = append(frozenIDs, m.ID)
-	}
-	dto.Progress = runprogress.Derive(runprogress.Input{
-		Kind: r.Kind, Status: r.Status, Health: r.Health, IsPlanning: dto.IsPlanning,
-		FrozenIDs: frozenIDs, Completed: dto.MilestonesCompleted, InProgress: dto.MilestonesInProgress,
-	})
+	deriveProgress(&dto)
 	// PRD #1224: the validated per-milestone agent attribution. Degrades to nil on a decode
 	// error (the stored value is the already-validated subset), same as the id arrays above.
 	if agents, err := workersvc.DecodeMilestoneAgents(r.MilestonesAgents); err != nil {
@@ -776,4 +769,27 @@ func setProgressPhase(dto *apitypes.RunDTO) {
 	if dto.Progress != nil && dto.CurrentActivity != nil {
 		dto.Progress.Phase = runprogress.Phase(dto.CurrentActivity.Agent)
 	}
+}
+
+// deriveProgress (re)builds dto.Progress from the DTO's own fields (PRD #2602), so
+// applyRevising can re-run it once IsRevising is known. Phase is left empty.
+func deriveProgress(dto *apitypes.RunDTO) {
+	frozenIDs := make([]string, 0, len(dto.Milestones))
+	for _, m := range dto.Milestones {
+		frozenIDs = append(frozenIDs, m.ID)
+	}
+	dto.Progress = runprogress.Derive(runprogress.Input{
+		Kind: dto.Kind, Status: dto.Status, Health: dto.Health,
+		IsPlanning: dto.IsPlanning, IsRevising: dto.IsRevising,
+		FrozenIDs: frozenIDs, Completed: dto.MilestonesCompleted, InProgress: dto.MilestonesInProgress,
+	})
+}
+
+// applyRevising stamps the derived is_revising flag (issues #750, #2760) and re-derives
+// Progress, since a revising awaiting_approval run is planning, not waiting. It rebuilds
+// Progress from scratch, so it must run before setProgressPhase, MaybeBlockedByRunID and
+// overlayNowNote, which refine the Progress it replaces.
+func applyRevising(dto *apitypes.RunDTO, revising bool) {
+	dto.IsRevising = revising
+	deriveProgress(dto)
 }

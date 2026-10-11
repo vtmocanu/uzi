@@ -454,6 +454,13 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	// Issues #750/#2760: the derived is_revising flag (and the Progress it changes), same
+	// unconditional lookup as the lists. A lookup error leaves it false.
+	if revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), []uuid.UUID{run.ID}); err != nil {
+		slog.Error("plan revising state", "run_id", run.ID, "error", err)
+	} else {
+		applyRevising(&dto, revising[run.ID])
+	}
 	h.overlayPlanCrossCheckSummary(r.Context(), user.ID, run, &dto)
 	// PRD #1064 M2: the server-derived "now" line. runToDTO stays pure, so the field is
 	// set here in the caller from the batched lookup (one run this time). null for a
