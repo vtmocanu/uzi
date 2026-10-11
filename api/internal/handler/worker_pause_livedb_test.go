@@ -369,6 +369,55 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 			assertPause(t, call(t, id, "pause", `{"claim_generation":4}`, e.worker), 200, true, "running")
 		}
 	})
+	t.Run("guarded_question_replay_is_no_write_and_fenced", func(t *testing.T) {
+		id := newRun(t)
+		body := `{"status":"awaiting_input","claim_generation":4,"require_running":true,"open_question_id":"accepted"}`
+		if rec := call(t, id, "state", body, e.worker); rec.Code != 200 {
+			t.Fatalf("first question=%d %s", rec.Code, rec.Body.String())
+		}
+		snapshot := func() string {
+			t.Helper()
+			var value string
+			if err := e.pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'run',to_jsonb(r), 'messages',(SELECT jsonb_agg(m ORDER BY seq) FROM run_messages m WHERE run_id=r.id),
+ 'inputs',(SELECT jsonb_agg(i ORDER BY id) FROM run_user_inputs i WHERE run_id=r.id))::text FROM runs r WHERE id=$1`, id).Scan(&value); err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+		before := snapshot()
+		for _, replay := range []string{body, strings.Replace(body, `"accepted"`, `" \u0000accepted "`, 1)} {
+			if rec := call(t, id, "state", replay, e.worker); rec.Code != 200 {
+				t.Fatalf("replay=%d %s", rec.Code, rec.Body.String())
+			}
+			if snapshot() != before {
+				t.Fatal("accepted replay mutated run, accounting, messages or inputs")
+			}
+		}
+		for _, qid := range []string{"unrelated", "", strings.Repeat("x", 1025)} {
+			payload, err := json.Marshal(map[string]any{"status": "awaiting_input", "claim_generation": 4, "require_running": true, "open_question_id": qid})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rec := call(t, id, "state", string(payload), e.worker); rec.Code == 200 {
+				t.Fatalf("invalid replay accepted: %q", qid)
+			}
+			if snapshot() != before {
+				t.Fatal("refused replay mutated state")
+			}
+		}
+		for _, change := range []string{"pause_requested_at=now(),pause_mode='wall'", "credential_switch_requested_at=now(),credential_switch_generation=4", "claim_generation=5", "claim_released_at=now()"} {
+			fenced := newRun(t)
+			if rec := call(t, fenced, "state", body, e.worker); rec.Code != 200 {
+				t.Fatalf("first question=%d %s", rec.Code, rec.Body.String())
+			}
+			e.exec(t, "UPDATE runs SET "+change+" WHERE id=$1", fenced)
+			if rec := call(t, fenced, "state", body, e.worker); rec.Code != 409 {
+				t.Fatalf("%s replay=%d %s", change, rec.Code, rec.Body.String())
+			}
+		}
+	})
+
 	t.Run("require_running_guard_and_legacy_question", func(t *testing.T) {
 		for _, change := range []string{"claim_generation=5", "claim_released_at=now()", "status='paused'", "pause_requested_at=now(),pause_mode='wall'", "credential_switch_requested_at=now(),credential_switch_generation=4"} {
 			id := newRun(t)

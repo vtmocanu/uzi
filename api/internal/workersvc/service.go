@@ -4234,8 +4234,26 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
-		if req.RequireRunning && (locked.Status != "running" || locked.PauseMode.String == "wall" || PendingCredentialSwitchSignal(locked) != nil) {
-			return locked, false, nil
+		if req.RequireRunning {
+			if locked.PauseMode.String == "wall" || PendingCredentialSwitchSignal(locked) != nil {
+				return locked, false, nil
+			}
+			if locked.Status == "awaiting_input" {
+				var qid string
+				if req.OpenQuestionID != nil {
+					clean, _ := stripNUL(*req.OpenQuestionID)
+					qid = strings.TrimSpace(clean)
+				}
+				// The same accepted question can be replayed after a lost ACK. Return
+				// under the lock without repeating accounting or transition fan-out.
+				if qid != "" && len([]rune(qid)) <= maxQuestionIDRunes && locked.OpenQuestionID.Valid && locked.OpenQuestionID.String == qid {
+					return locked, true, nil
+				}
+				return locked, false, nil
+			}
+			if locked.Status != "running" {
+				return locked, false, nil
+			}
 		}
 		// Locked and current: the arms below mutate through the tx, and the lock is held
 		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the

@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { RequestError } from "../src/client.js";
 import { isParkAnswer } from "../src/park-run.js";
 import type { AnswerVerdict } from "../src/steering.js";
 import assert from "node:assert/strict";
@@ -452,7 +453,8 @@ describe("RunRunner — M2 explicit park callback", () => {
     unattended?: boolean; ownership?: "wall" | "released" | "foreign";
     deadlineRetry?: boolean; cancelledBefore?: boolean; legacyGeneration?: boolean;
     nonissue?: boolean; requestRefused?: boolean; wallPending?: boolean; guardedWall?: boolean;
-    guardedExistingQuestion?: boolean;
+    guardedExistingQuestion?: boolean; failedProbe?: boolean;
+    pauseTransport?: "before" | "after"; questionTransport?: "replay" | "exhausted" | "httpFailure" | "unreadable" | "refused";
   } = {}) {
     const claim = { ...gitlabClaim(2657), claim_generation: options.legacyGeneration ? 0 : 1,
       ...(options.nonissue ? { kind: "prompt" as const } : {}),
@@ -477,6 +479,41 @@ describe("RunRunner — M2 explicit park callback", () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-run-"));
     const publish = spyPublish();
     const report = client.reportState.bind(client);
+    const requestPause = client.requestWorkerPause.bind(client);
+    const ownership = client.getRunOwnership.bind(client);
+    const originalFetch = globalThis.fetch;
+    let pauseAttempts = 0;
+    let clonePath: string | undefined;
+    const questionBodies: string[] = [];
+    client.requestWorkerPause = async (...args) => {
+      pauseAttempts++;
+      if (options.pauseTransport === "before") throw new RequestError("POST", "/pause", 0, "transport failed");
+      const ack = await requestPause(...args);
+      if (options.pauseTransport === "after") throw new RequestError("POST", "/pause", 0, "lost ACK");
+      return ack;
+    };
+    client.getRunOwnership = async (...args) => {
+      if (options.failedProbe) throw new TypeError("probe unavailable");
+      const own = await ownership(...args);
+      // Keep the empty-checkpoint seam empty until the sink has declined it.
+      if (["exhausted", "httpFailure", "unreadable"].includes(options.questionTransport ?? "") && clonePath) fs.writeFileSync(path.join(clonePath, "DIRTY.txt"), "retained uncommitted work\n");
+      return own;
+    };
+    if (options.questionTransport) globalThis.fetch = async (input, init) => {
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      if (!body?.require_running || body.status !== "awaiting_input") return originalFetch(input, init);
+      questionBodies.push(init!.body as string);
+      if (options.questionTransport === "refused") return new Response("refused", { status: 403 });
+      if (options.questionTransport === "exhausted") throw new TypeError("question transport unavailable");
+      if (options.questionTransport === "httpFailure") return new Response("unavailable", { status: 503 });
+      if (options.questionTransport === "unreadable") return new Response("unreadable ACK");
+      if (questionBodies.length === 1) {
+        await originalFetch(input, init); // Commit the question, then lose the response.
+        throw new TypeError("lost question ACK");
+      }
+      // Model the API no-write replay response; the real client must retry the exact body.
+      return Response.json({ run: { status: "awaiting_input" } });
+    };
     if (options.lostAck) client.reportState = async (...args) => {
       const ack = await report(...args);
       if (args[1].status === "paused") throw new Error("lost paused ACK");
@@ -502,6 +539,8 @@ describe("RunRunner — M2 explicit park callback", () => {
       homeDir: path.join(homeRoot, runId),
       executor: { run: async (ctx) => {
         turns++;
+        clonePath = ctx.worktreePath;
+        if (!options.empty) fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "retained uncommitted work\n");
         fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
         assert.equal(ctx.parkRunSupported, options.supported !== false);
         if (!options.empty) commitInTree(ctx.worktreePath, "WORK.txt", "callback checkpoint\n");
@@ -520,6 +559,8 @@ describe("RunRunner — M2 explicit park callback", () => {
         const readsBefore = api.ownershipRequests.length;
         try { result = await ctx.requestParkRun!({ completedCount: 1, total: 2 }); }
         finally { callbackReads = api.ownershipRequests.length - readsBefore; }
+        if (options.questionTransport === "replay" && result.kind === "answer")
+          commitInTree(ctx.worktreePath, "WORK.txt", "work after recovered guidance\n");
         return result.kind === "paused"
           ? { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } }
           : { branch: ctx.branch };
@@ -534,9 +575,15 @@ describe("RunRunner — M2 explicit park callback", () => {
           })
         : runnerWithGit(factory, gitlab);
       await runner.execute(claim);
-      return { claim, result, turns, questions, callbackReads, published: publish.calls.length };
+      const workPreserved = !!clonePath && fs.existsSync(path.join(clonePath, "DIRTY.txt")) &&
+        fs.existsSync(path.join(homeRoot, claim.run_id));
+      return { claim, result, turns, questions, callbackReads, published: publish.calls.length,
+        pauseAttempts, questionBodies, workPreserved };
     } finally {
       client.reportState = report;
+      client.requestWorkerPause = requestPause;
+      client.getRunOwnership = ownership;
+      globalThis.fetch = originalFetch;
       publish.restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -585,6 +632,42 @@ describe("RunRunner — M2 explicit park callback", () => {
     assert.equal(outcome.callbackReads, 1);
     assert.equal(outcome.questions, 0);
     assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  for (const options of [
+    { lostAck: true, failedProbe: true },
+    { pauseTransport: "before" as const }, { pauseTransport: "after" as const },
+    { empty: true, questionTransport: "exhausted" as const },
+    { empty: true, questionTransport: "httpFailure" as const },
+    { empty: true, questionTransport: "unreadable" as const },
+  ]) {
+    it(`retains ambiguous park work without failing or retrying: ${JSON.stringify(options)}`, async () => {
+      const outcome = await exercise(options);
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.turns, 1);
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.questions, 0);
+      assert.equal(outcome.workPreserved, true);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+      if (options.questionTransport) assert.equal(outcome.questionBodies.length, options.questionTransport === "unreadable" ? 1 : 3, "bounded client transport attempts");
+    });
+  }
+
+  it("the real client recovers a lost guarded question ACK by replaying the same ID", async () => {
+    const outcome = await exercise({ empty: true, questionTransport: "replay" });
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    assert.equal(outcome.questionBodies.length, 2);
+    assert.equal(outcome.questionBodies[0], outcome.questionBodies[1]);
+    assert.equal(outcome.questions, 1);
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  it("authoritative guarded question HTTP refusal keeps the ordinary failure disposition", async () => {
+    const outcome = await exercise({ empty: true, questionTransport: "refused" });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questionBodies.length, 1);
+    assert.ok(stateStatuses(outcome.claim.run_id).includes("failed"));
   });
 
   it("guard refusal reporting an ordinary pause returns paused without waiting or terminal failure", async () => {

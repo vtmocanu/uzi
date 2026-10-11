@@ -1666,7 +1666,7 @@ export class WorkerClient {
       if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) <= 0)
         throw new Error("guarded question state requires awaiting_input and positive claim_generation");
-      return this.reportStateOnce(runId, path, body, signal);
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
@@ -2870,7 +2870,7 @@ export class WorkerClient {
     try {
       const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
       if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
-      const fields = await readRunAck(res);
+      const fields = await readRunAck(res, CROSS_CHECK_RESPONSE_MAX_BYTES);
       if (fields.status === undefined || fields.applied === undefined)
         throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
       const ack: StateAck = { status: fields.status, applied: fields.applied };

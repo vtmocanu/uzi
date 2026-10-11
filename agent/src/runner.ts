@@ -10932,7 +10932,8 @@ export class RunRunner {
               requested = await this.client.requestWorkerPause(runId, flight.claimGeneration!, steering.lifecycleSignal());
             } catch (error) {
               checkLifecycle();
-              throw new TrustedExecutionRefusal("park run request could not be confirmed", { cause: error });
+              if (isRunOwnershipLost(error, runId)) throw new StaleClaimError();
+              throw new RetainedRecoveryStop();
             }
             checkAck(requested);
             if (requested.status === "cancelled") return { kind: "cancel" };
@@ -10953,7 +10954,7 @@ export class RunRunner {
             } catch (error) {
               checkLifecycle();
               if (isRunOwnershipLost(error, runId)) throw new StaleClaimError();
-              throw new TrustedExecutionRefusal("park run ownership could not be confirmed", { cause: error });
+              throw new RetainedRecoveryStop();
             }
             if (steering.isCancelled()) return { kind: "cancel" };
             checkLifecycle();
@@ -10964,7 +10965,7 @@ export class RunRunner {
               throw new StaleClaimError();
             if (ownership.status === "cancelled") return { kind: "cancel" };
             if (ownership.claim_generation !== flight.claimGeneration || ownership.claim_released !== false)
-              throw new TrustedExecutionRefusal("park run ownership is unreadable");
+              throw new RetainedRecoveryStop();
             if (ownership.status === "paused" && ownership.hold_reason === null) return retainPause();
             if (ownership.status !== "running")
               throw new TrustedExecutionRefusal("park run ownership refused");
@@ -16913,12 +16914,26 @@ export class RunRunner {
     // A concurrent cancel is the one decline that resolves itself (the steering
     // channel's sticky `cancelled` flag settles the wait independently), so this is
     // belt-and-braces on that path and the only defence on the others.
-    const ack = await reportState({
-      status: "awaiting_input",
-      open_question_id: questionId,
-      ...(options.requireRunning ? { require_running: true } : {}),
-    });
+    let ack: unknown;
+    try {
+      ack = await reportState({
+        status: "awaiting_input",
+        open_question_id: questionId,
+        ...(options.requireRunning ? { require_running: true } : {}),
+      });
+    } catch (error) {
+      // requestParkRun checks lifecycle fences before propagating this retained stop.
+      // Only an exhausted transport failure leaves the guarded write ambiguous;
+      // authoritative refusals and the answer wait keep their existing dispositions.
+      if (options.requireRunning && (error instanceof RequestError
+          ? error.status === 0 || error.status >= 500 || error.status === 408 || error.status === 429
+          : !(error instanceof StaleClaimError) && !(error instanceof CredentialSwitchSignal) &&
+            !(error instanceof ServerWallParkedError)))
+        throw new RetainedRecoveryStop();
+      throw error;
+    }
     const parked = (ack as { status?: string } | undefined)?.status;
+    if (options.requireRunning && parked === undefined) throw new RetainedRecoveryStop();
     if (parked !== "awaiting_input" || (options.requireRunning && !(ack as StateAck).applied)) {
       this.openQuestionIds.delete(runId);
       if (options.requireRunning && (ack as StateAck).reason === "wall_pending") {

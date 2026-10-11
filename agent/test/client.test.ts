@@ -75,6 +75,41 @@ describe("park_run_v1 M2 client", () => {
     assert.equal((await newClient().requestWorkerPause("run-1", 7)).applied, false);
   });
 
+  for (const route of ["pause", "guarded question"] as const) {
+    it(`bounds actual streamed ${route} ACK bytes despite a misleading Content-Length`, async (t) => {
+      let sends = 0;
+      let bytes = 0;
+      let cancelled = false;
+      const cap = 6 * 1024 * 1024;
+      const chunkSize = 64 * 1024;
+      t.mock.method(globalThis, "fetch", async () => {
+        sends++;
+        const prefix = new TextEncoder().encode(JSON.stringify({
+          run: { status: route === "pause" ? "running" : "awaiting_input" }, applied: true,
+        }));
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (bytes === 0) { bytes += prefix.length; controller.enqueue(prefix); return; }
+            if (bytes > 8 * 1024 * 1024) { controller.close(); return; }
+            bytes += chunkSize;
+            controller.enqueue(new Uint8Array(chunkSize).fill(32));
+          },
+          cancel() { cancelled = true; },
+        }, { highWaterMark: 0 });
+        return new Response(stream, { headers: { "Content-Length": "1" } });
+      });
+      const client = newClient();
+      await assert.rejects(route === "pause"
+        ? client.requestWorkerPause("run-1", 7)
+        : client.reportState("run-1", {
+          status: "awaiting_input", claim_generation: 7, require_running: true, open_question_id: "q-1",
+        }));
+      assert.equal(sends, 1, "overflow must not replay the mutation");
+      assert.equal(cancelled, true);
+      assert.ok(bytes <= cap + chunkSize, `consumed ${bytes} bytes`);
+    });
+  }
+
   it("rejects invalid generations before any pause or guarded state request", async (t) => {
     let sends = 0;
     t.mock.method(globalThis, "fetch", async () => { sends++; return Response.json({}); });

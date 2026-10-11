@@ -67,7 +67,7 @@ func (s *Service) RequestWorkerPause(ctx context.Context, wkr store.Worker, runI
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	if !(run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded) {
+	if !run.AutoApprove && !rc.HumanPlanApproved && run.PlanSource != planSourceSeeded {
 		return run, false, nil
 	}
 	stopped, err := q.WorkerPauseHasStopInput(ctx, runID)
