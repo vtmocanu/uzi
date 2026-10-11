@@ -1,7 +1,9 @@
 package workersvc
 
 import (
+	"errors"
 	"testing"
+	"time"
 )
 
 // TestSubmitInputCancelPausedRunLiveDB is the live-DB regression for issue #1969: a paused run
@@ -76,6 +78,37 @@ func TestSubmitInputCancelPausedRunLiveDB(t *testing.T) {
 		}
 		if n := cancelInputs(t, id); n != 1 {
 			t.Fatalf("%d cancel input(s) enqueued, want 1", n)
+		}
+	})
+
+	// The paused clause returns from hasLivePoller BEFORE its RunHasPendingOutcomeLease check, so a
+	// paused run holding a pending-outcome lease on its fresh-heartbeat worker relies on SubmitInput's
+	// own confirmation gate: an ordinary cancel is refused and changes nothing.
+	t.Run("paused run with a pending outcome refuses an ordinary cancel", func(t *testing.T) {
+		id := seedRunningRun(t, env, o, 19697, 0)
+		setRunGeneration(t, env, id, 4)
+		seedTerminalPendingLease(t, env, o.workerID, id, 4, time.Now().Add(time.Hour))
+		env.exec(`UPDATE runs SET status = 'paused', status_since = now(), hold_reason = 'completion_blocked' WHERE id = $1`, id)
+		snapshot := func() string {
+			var s string
+			if err := env.pool.QueryRow(env.ctx, `SELECT status || '|' || coalesce(hold_reason,'') || '|' || claim_generation
+			    || '|' || (SELECT count(*) FROM run_user_inputs WHERE run_id = $1)
+			    || '|' || (SELECT count(*) FROM worker_active_runs WHERE run_id = $1 AND terminal_pending)
+			    FROM runs WHERE id = $1`, id).Scan(&s); err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+			return s
+		}
+		before := snapshot()
+		_, err := svc.SubmitInputWithOptions(env.ctx, o.userID, id, "cancel", "", nil, SubmitInputOptions{})
+		if !errors.Is(err, ErrOutcomePendingConfirmationRequired) {
+			t.Fatalf("err = %v, want ErrOutcomePendingConfirmationRequired", err)
+		}
+		if after := snapshot(); after != before {
+			t.Fatalf("refused cancel changed state: before %q after %q", before, after)
+		}
+		if before != "paused|completion_blocked|4|0|1" {
+			t.Fatalf("unexpected seeded snapshot %q", before)
 		}
 	})
 }

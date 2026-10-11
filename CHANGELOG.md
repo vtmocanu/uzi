@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **Cancelling a paused run now cancels it ([#1969](https://github.com/vtmocanu/uzi/issues/1969)).**
-  A paused run (owner pause, credential disabled, wall-clock budget exhausted, or completion hold) whose worker was still online for other runs had its cancel queued for a worker that was not running it, so the run stayed paused and kept blocking new runs on its branch. The cancel now applies immediately.
+  A paused run (owner pause, credential disabled, wall-clock budget exhausted, or completion hold) whose worker was still online for other runs had its cancel queued for a worker that was not running it, so the run stayed paused and kept blocking new runs on its branch. The cancel now applies immediately (a run holding an unreported finished outcome still asks you to confirm discarding it first). A plan reject sent to a paused run, and an MR-close cancel of a paused MR rework run, now also apply immediately instead of being stranded.
 
 ## [0.86.0] - 2026-10-06
 
