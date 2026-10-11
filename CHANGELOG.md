@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **A newer inline review finding is no longer skipped after a higher-numbered top-level comment was consumed on GitHub or Forgejo ([#1199](https://github.com/vtmocanu/uzi/issues/1199)).**
+  The MR review watcher and on-demand rework now identify a comment by id namespace and id (PR conversation comment, inline review comment, review summary; GitLab has one note sequence) and keep a consumed mark and pending keys per namespace instead of one high-water mark, so ids from different sequences are never compared. Existing MRs upgrade automatically on their next check; findings skipped before the upgrade stay skipped (run `uzi run rework` with guidance), and a ledger whose legacy pending set is too large to upgrade is refused until an operator resets it (see docs/mr-review-watcher.md). During a mixed-version rollout an old binary may replay a consumed comment once; see ADR-1199.
+
 - **`uzi tui` restarts itself after "Update now".**
   Once the Homebrew upgrade from the startup update prompt is verified, the TUI starts again on the new version with the same arguments, instead of asking you to rerun `uzi tui`. If the restart fails, the command exits nonzero and says the update itself succeeded.
 
