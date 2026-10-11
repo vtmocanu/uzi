@@ -770,6 +770,23 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
     assert.strictEqual((await chainPack(sc, dangling))!.tipOid, n);
   });
 
+  it("verifier negative: a wrapper verified earlier is refused once its tree goes missing (no stale verdict)", async () => {
+    const sc = await overlayScene();
+    const seam = sc.git as unknown as {
+      verifyWrapperOnlyHistory(bare: string, tip: string, excludeTip: string): Promise<boolean>;
+    };
+    assert.strictEqual(await seam.verifyWrapperOnlyHistory(sc.bare, sc.p, sc.r), true, "P verifies while intact");
+    // P's root tree was written loose by the overlay synthesis; drop it from the same bare.
+    const tree = gitIn(sc.bare, ["rev-parse", `${sc.p}^{tree}`]);
+    const loose = path.join(sc.bare, "objects", tree.slice(0, 2), tree.slice(2));
+    assert.ok(fs.existsSync(loose), "scene: P's tree is a loose object");
+    fs.rmSync(loose);
+    assert.strictEqual(
+      await seam.verifyWrapperOnlyHistory(sc.bare, sc.p, sc.r), false,
+      "the same GitCache re-reads the trees and fails closed",
+    );
+  });
+
   it("verifier bounds: too many wrappers or an oversized diff listing refuses the chain", async () => {
     // maxWrappers: P's history over N holds two wrappers (C1 and the overlay), over a bound of 1.
     const many = await overlayScene({ checkpointChainBounds: { maxWrappers: 1 } });

@@ -1583,10 +1583,6 @@ export class GitCache {
   /** issue #2733: the checkpoint-chain verifier bounds (see {@link GitCacheOptions.checkpointChainBounds}). */
   private readonly chainMaxWrappers: number;
   private readonly chainMaxDiffBytes: number;
-  /** issue #2733: OIDs of `ckpt(overlay):` wrappers already verified as workflow-only by
-   *  {@link verifyWrapperOnlyHistory}. A commit's content and parents are fixed by its OID, so a
-   *  verdict never goes stale; in-memory per GitCache, so each tick verifies only unseen wrappers. */
-  private readonly verifiedWrappers = new Set<string>();
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
@@ -6286,7 +6282,8 @@ export class GitCache {
    * every path is under `.github/workflows/`; an EMPTY diff counts only for a merge-shaped
    * (>= 2 parents) wrapper. Anything unreadable, malformed, truncated or over a bound
    * ({@link CHECKPOINT_CHAIN_MAX_WRAPPERS}, {@link CHECKPOINT_CHAIN_MAX_DIFF_BYTES}) answers false.
-   * A boundary abort propagates. Verified OIDs are cached per GitCache.
+   * A boundary abort propagates. Nothing is cached: every call re-reads each wrapper's trees, so an
+   * object that has since gone missing from this bare still answers false.
    */
   private async verifyWrapperOnlyHistory(
     barePath: string,
@@ -6318,7 +6315,6 @@ export class GitCache {
         if (!SHA40_RE.test(oid)) return false;
         const parents = parentField === "" ? [] : parentField.split(" ");
         if (parents.some((p) => !SHA40_RE.test(p))) return false;
-        if (this.verifiedWrappers.has(oid)) continue;
         if (!subject.startsWith(OVERLAY_COMMIT_PREFIX) || parents.length < 1) return false;
         // A missing last parent makes `diff-tree` below fail, which answers false.
         const last = parents[parents.length - 1]!;
@@ -6331,7 +6327,6 @@ export class GitCache {
         const paths = diff.stdout === "" ? [] : diff.stdout.slice(0, -1).split("\0");
         if (paths.length === 0 && parents.length < 2) return false;
         if (!paths.every((p) => p.startsWith(".github/workflows/"))) return false;
-        this.verifiedWrappers.add(oid);
       }
       return true;
     } catch (e) {
