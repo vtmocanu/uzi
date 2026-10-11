@@ -249,8 +249,9 @@ type RunDTO struct {
 	IsRevising bool `json:"is_revising"`
 	// Progress is the server-derived progress estimate (PRD #2602): a percent from the
 	// frozen milestone list, or a state flag when a percent would mislead. null for a
-	// terminal run. Derived in runToDTO (runprogress.Derive), never stored; Phase is
-	// filled only where current_activity is. A pre-feature api pod omits it.
+	// terminal run. Derived in runToDTO (runprogress.Derive) and re-derived by the handlers'
+	// applyRevising once is_revising is known, never stored; Phase is filled only where
+	// current_activity is. A pre-feature api pod omits it.
 	Progress                  *RunProgress `json:"progress"`
 	AutoApprove               bool         `json:"auto_approve"`
 	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`
@@ -1063,8 +1064,9 @@ type RunSummaryItemDTO struct {
 	IsPlanning bool `json:"is_planning"`
 	// Progress is the server-derived progress estimate (PRD #2602): a percent from the
 	// frozen milestone list, or a state flag when a percent would mislead. null for a
-	// terminal run. Derived in runToDTO (runprogress.Derive), never stored; Phase is
-	// filled only where current_activity is. A pre-feature api pod omits it.
+	// terminal run. Derived in runToDTO (runprogress.Derive) and re-derived by the handlers'
+	// applyRevising once is_revising is known, never stored; Phase is filled only where
+	// current_activity is. A pre-feature api pod omits it.
 	Progress                  *RunProgress `json:"progress"`
 	AutoApprove               bool         `json:"auto_approve"`
 	AutoApproveBlockedReasons []string     `json:"auto_approve_blocked_reasons"`

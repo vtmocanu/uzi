@@ -5,6 +5,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -36,6 +37,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -72,6 +74,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -108,6 +111,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -144,6 +148,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -178,6 +183,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -213,6 +219,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [],
     "milestones_completed": [
       "m1"
@@ -235,6 +242,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": null,
     "milestones_completed": null,
     "milestones_in_progress": null,
@@ -253,6 +261,7 @@
     "status": "awaiting_input",
     "health": "stalled",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -286,6 +295,7 @@
     "status": "awaiting_approval",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": null,
     "milestones_completed": null,
     "milestones_in_progress": null,
@@ -299,11 +309,31 @@
     }
   },
   {
+    "name": "plan gate re-planning after a revise is planning",
+    "kind": "issue",
+    "status": "awaiting_approval",
+    "health": "ok",
+    "is_planning": false,
+    "is_revising": true,
+    "milestones": null,
+    "milestones_completed": null,
+    "milestones_in_progress": null,
+    "progress": {
+      "state": "planning",
+      "pct": null,
+      "milestone_done": 0,
+      "milestone_total": 0,
+      "active_milestone_id": "",
+      "phase": ""
+    }
+  },
+  {
     "name": "limit wait is parked",
     "kind": "issue",
     "status": "limit_wait",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -335,6 +365,7 @@
     "status": "claimed",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": null,
     "milestones_completed": null,
     "milestones_in_progress": null,
@@ -353,6 +384,7 @@
     "status": "running",
     "health": "looping",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
@@ -388,6 +420,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": true,
+    "is_revising": false,
     "milestones": null,
     "milestones_completed": null,
     "milestones_in_progress": null,
@@ -406,6 +439,7 @@
     "status": "running",
     "health": "ok",
     "is_planning": false,
+    "is_revising": false,
     "milestones": [
       {
         "id": "m1",
