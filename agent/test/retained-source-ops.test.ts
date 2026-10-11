@@ -1156,6 +1156,15 @@ describe("rework: local custody, holds and stale markers", () => {
     assert.ok(fs.existsSync(c.path));
   });
 
+  it("a malformed marker of the owner run refuses retire and remove even when its text names no path", async () => {
+    const c = await seedCanonical("run-m", 2621);
+    fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
+    gitIn(bare, ["config", "--local", "--add", `uzi-stopped.${c.runId}.entry`, `{"version":1,"runId":"${c.runId}","clo`]);
+    await assert.rejects(git.removeRunnerClone(c.path, c.runId), RetainedStoppedSourceError);
+    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), RetainedStoppedSourceError);
+    assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n", "the dirty clone stays");
+  });
+
   it("the marker comparison resolves the caller's path (a trailing slash does not bypass it)", async () => {
     const c = await markedCanonical("run-c", 2600, 3);
     await assert.rejects(git.removeRunnerClone(`${c.path}/`, c.runId), RetainedStoppedSourceError);
@@ -1259,6 +1268,32 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     fs.mkdirSync(path.join(a.path, ".git", "info"), { recursive: true });
     fs.writeFileSync(path.join(a.path, ".git", "info", "attributes"), "* -diff\n");
     assert.equal(await verify(a, head), "not_covered", "info/attributes");
+  });
+
+  it("a filter driver reached through include.path, config.worktree or core.attributesFile is not covered", async () => {
+    const { a, head } = await captured();
+    const orig = path.join(path.dirname(a.path), "orig-work.txt");
+    fs.writeFileSync(orig, "captured\n");
+    fs.writeFileSync(path.join(a.path, ".gitattributes"), "work.txt filter=x\n");
+    gitIn(a.path, ["add", ".gitattributes"]);
+    gitIn(a.path, ["commit", "-m", "attributes"]);
+    await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+    const tip = gitIn(a.path, ["rev-parse", "HEAD"]);
+    assert.notEqual(tip, head);
+    assert.equal(await verify(a, tip), "covered");
+    const included = path.join(path.dirname(a.path), "included.cfg");
+    fs.writeFileSync(included, `[filter "x"]\n\tclean = cat ${orig}\n`);
+    gitIn(a.path, ["config", "include.path", included]);
+    fs.writeFileSync(path.join(a.path, "work.txt"), "UNSAVED!\n");
+    assert.equal(await verify(a, tip), "not_covered", "include.path");
+    gitIn(a.path, ["config", "--unset", "include.path"]);
+    gitIn(a.path, ["config", "extensions.worktreeConfig", "true"]);
+    gitIn(a.path, ["config", "--worktree", "filter.y.clean", `cat ${orig}`]);
+    assert.equal(await verify(a, tip), "not_covered", "config.worktree");
+    gitIn(a.path, ["config", "--worktree", "--unset", "filter.y.clean"]);
+    gitIn(a.path, ["config", "--unset", "extensions.worktreeConfig"]);
+    gitIn(a.path, ["config", "core.attributesFile", path.join(path.dirname(a.path), "attrs")]);
+    assert.equal(await verify(a, tip), "not_covered", "core.attributesFile");
   });
 
   // core.trustctime=false with a same-size edit and a restored mtime cannot be reproduced reliably

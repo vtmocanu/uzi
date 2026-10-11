@@ -5351,10 +5351,12 @@ export class GitCache {
       }
     }
     // Fail closed on unattributable evidence, by the rule of assertNoStoppedMarker: a malformed
-    // marker whose text names a path, or an overflowing run whose marker text names one.
+    // marker of the owner run, or one whose text names a path; and an overflowing owner run.
     for (const m of markers.malformed) {
       const hit = paths.find((x) => m.raw.includes(JSON.stringify(path.resolve(x)).slice(1, -1)));
-      if (hit !== undefined) throw new RetainedStoppedSourceError({ runId: m.runId, generation: "unknown", clonePath: hit });
+      if (hit !== undefined || (runId !== undefined && m.runId === runId)) {
+        throw new RetainedStoppedSourceError({ runId: m.runId, generation: "unknown", clonePath: hit ?? paths[0] ?? "" });
+      }
     }
     if (runId !== undefined && markers.overflow.has(runId)) {
       throw new RetainedStoppedSourceError({ runId, generation: "unknown", clonePath: paths[0] ?? "" });
@@ -5559,8 +5561,10 @@ export class GitCache {
         throw err;
       });
       if (attributes) return false;
-      const config = await this.runGitAsRunner(cwd, ["config", "--local", "--null", "--list"]);
-      if (config.split("\0").some((e) => /^filter\./i.test(e))) return false;
+      // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
+      // config.worktree exactly as `status` does, which `--local` would not.
+      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"]);
+      if (config.split("\0").some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
       const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain"]);
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"]);
