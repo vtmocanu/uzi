@@ -20,8 +20,10 @@ SELECT * FROM run_held_publications WHERE id = @id;
 SELECT * FROM run_held_publications WHERE run_id = @run_id AND generation = @generation;
 
 -- name: LockHeldPublicationByRunGeneration :one
--- The publication lock of the worker, run, hold, publication order.
-SELECT * FROM run_held_publications WHERE run_id = @run_id AND generation = @generation FOR UPDATE;
+-- The publication lock of the worker, run, hold, publication order. FOR NO KEY UPDATE, not FOR
+-- UPDATE: step B's hold release takes the recovery_custody_holds.final_publication_id FK KEY
+-- SHARE on this row, which FOR UPDATE would conflict with; the key never changes.
+SELECT * FROM run_held_publications WHERE run_id = @run_id AND generation = @generation FOR NO KEY UPDATE;
 
 -- name: MarkHeldCreateInvoked :one
 -- The monotonic "may have invoked" marker. Exactly one caller wins (the row it returns); a
@@ -77,12 +79,14 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
   AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open';
 
 -- name: AcknowledgeHeldPublication :one
--- Step B's second write: created -> acknowledged and the retention clock. An earlier
--- expires_at is kept. Matches no row unless the hold was released against this publication
--- (held_publication_guard).
+-- Step B's second write: created -> acknowledged and the retention clock. expires_at is computed
+-- here, from the database clock, so it is exactly retention_seconds after acknowledged_at (the
+-- same now() in one statement). An earlier expires_at is kept. Matches no row unless the hold was
+-- released against this publication (held_publication_guard).
 UPDATE run_held_publications
 SET state = 'acknowledged', acknowledged_at = now(),
-    expires_at = LEAST(COALESCE(expires_at, @expires_at::timestamptz), @expires_at::timestamptz),
+    expires_at = LEAST(COALESCE(expires_at, now() + make_interval(secs => @retention_seconds::float8)),
+                       now() + make_interval(secs => @retention_seconds::float8)),
     next_attempt_at = NULL, updated_at = now()
 WHERE id = @id AND state = 'created'
 RETURNING *;

@@ -4883,7 +4883,7 @@ export interface RecoveryCustodyHold {
   };
   completed_publication_reason?: string;
   inventory_guarded: boolean;
-  final_receipt?: { kind: string; capture_id?: string; source_sha?: string; coverage_digest: string };
+  final_receipt?: { kind: string; capture_id?: string; publication_id?: string; source_sha?: string; coverage_digest: string };
   terminal_record_rejection?: string;
   id: string;
   run_id: string;
@@ -4900,6 +4900,9 @@ export interface RecoveryCustodyHold {
   checkpoint_ref?: string;
   checkpoint_tip?: string;
   checkpoint_state?: string;
+  // Issue #2545: a hold released by held publication names its publication and forge ref.
+  final_publication_id?: string;
+  held_ref?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the

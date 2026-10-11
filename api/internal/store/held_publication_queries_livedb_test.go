@@ -104,7 +104,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		expires := time.Now().Add(24 * time.Hour)
-		if _, err := q.AcknowledgeHeldPublication(ctx, store.AcknowledgeHeldPublicationParams{ID: row.ID, ExpiresAt: tstz(expires)}); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := q.AcknowledgeHeldPublication(ctx, store.AcknowledgeHeldPublicationParams{ID: row.ID, RetentionSeconds: 24 * 3600}); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("acknowledge before the hold is released = %v, want no rows", err)
 		}
 		rel := store.ReleaseHeldPublicationHoldParams{
@@ -122,7 +122,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 		if n, err := q.ReleaseHeldPublicationHold(ctx, rel); err != nil || n != 0 {
 			t.Fatalf("second release: rows=%d err=%v", n, err)
 		}
-		ack, err := q.AcknowledgeHeldPublication(ctx, store.AcknowledgeHeldPublicationParams{ID: row.ID, ExpiresAt: tstz(expires)})
+		ack, err := q.AcknowledgeHeldPublication(ctx, store.AcknowledgeHeldPublicationParams{ID: row.ID, RetentionSeconds: 24 * 3600})
 		if err != nil || ack.State != "acknowledged" || !ack.AcknowledgedAt.Valid || !ack.ExpiresAt.Valid {
 			t.Fatalf("acknowledge = %+v, %v", ack, err)
 		}
@@ -231,7 +231,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 		}); err != nil || n != 1 {
 			t.Fatalf("release: rows=%d err=%v", n, err)
 		}
-		if _, err := q.AcknowledgeHeldPublication(ctx, store.AcknowledgeHeldPublicationParams{ID: row.ID, ExpiresAt: tstz(time.Now().Add(48 * time.Hour))}); err != nil {
+		if _, err := q.AcknowledgeHeldPublication(ctx, store.AcknowledgeHeldPublicationParams{ID: row.ID, RetentionSeconds: 48 * 3600}); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := q.OwnerExpireHeldPublications(ctx, store.OwnerExpireHeldPublicationsParams{RunID: f.run, UserID: uuid.New()}); err != nil || len(got) != 0 {

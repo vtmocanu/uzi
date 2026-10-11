@@ -10,6 +10,9 @@
 -- Nothing here cascades from runs, repos or owners (the ADR-1296 rule): run_id, user_id and
 -- repo_id are plain provenance, and the nullable live_run_id is the ON DELETE RESTRICT pointer
 -- (the run_salvage precedent) held while a remote ref may exist for the row.
+-- A second ON DELETE RESTRICT FK, recovery_custody_holds.final_publication_id, pins the
+-- publication row for as long as a released hold names it as its FINAL receipt, so the receipt
+-- cannot dangle; the retention delete removes the ref and marks the row deleted, never the row.
 --
 -- The migration number is a draft: it is renumbered above the live head at landing.
 SET LOCAL lock_timeout = '5s';

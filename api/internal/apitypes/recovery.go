@@ -321,6 +321,11 @@ type RecoveryCustodyHoldDTO struct {
 	CheckpointRef               string                       `json:"checkpoint_ref,omitempty"`
 	CheckpointTip               string                       `json:"checkpoint_tip,omitempty"`
 	CheckpointState             string                       `json:"checkpoint_state,omitempty"`
+
+	// FinalPublicationID and HeldRef (issue #2545) are set only for a hold released against a
+	// held publication: the publication row and the forge ref its work lives on.
+	FinalPublicationID string `json:"final_publication_id,omitempty"`
+	HeldRef            string `json:"held_ref,omitempty"`
 }
 
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the
@@ -368,9 +373,14 @@ type RecoveryReconcileResponse struct {
 
 // RecoveryFinalDisposition binds a final archive or empty settled inventory to an exact hold.
 // It is also the owner's read-only receipt after worker deletion.
+//
+// Kind "held_publication" (issue #2545) binds a failed run's held work published to the forge
+// ref refs/uzi-held/<run-id>/<generation>: PublicationID names the run_held_publications row,
+// SourceSha is the ref's tip and CoverageDigest the digest step A published; CaptureID is empty.
 type RecoveryFinalDisposition struct {
 	Kind           string `json:"kind"`
 	CaptureID      string `json:"capture_id,omitempty"`
+	PublicationID  string `json:"publication_id,omitempty"`
 	SourceSha      string `json:"source_sha,omitempty"`
 	CoverageDigest string `json:"coverage_digest"`
 }

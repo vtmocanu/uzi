@@ -1104,6 +1104,7 @@ SELECT
     h.final_capture_id,
     h.final_source_sha,
     h.final_coverage_digest,
+    h.final_publication_id,
     h.completed_publication_receipt,
     h.completed_publication_reason,
     COALESCE(w.name, '')::text AS worker_name,
@@ -1145,6 +1146,7 @@ type ListCustodyHoldsForOwnerRow struct {
 	FinalCaptureID              pgtype.UUID        `json:"final_capture_id"`
 	FinalSourceSha              pgtype.Text        `json:"final_source_sha"`
 	FinalCoverageDigest         pgtype.Text        `json:"final_coverage_digest"`
+	FinalPublicationID          pgtype.UUID        `json:"final_publication_id"`
 	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
 	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
 	WorkerName                  string             `json:"worker_name"`
@@ -1211,6 +1213,7 @@ func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyH
 			&i.FinalCaptureID,
 			&i.FinalSourceSha,
 			&i.FinalCoverageDigest,
+			&i.FinalPublicationID,
 			&i.CompletedPublicationReceipt,
 			&i.CompletedPublicationReason,
 			&i.WorkerName,

@@ -2,11 +2,13 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -554,6 +556,26 @@ func TestHeldPublicationLifecycleGuardsLiveDB(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A released hold's FINAL receipt pins its publication row: even a row the lifecycle delete
+// guard would let go (state deleted) cannot be removed while the receipt names it.
+func TestHeldPublicationFinalReceiptPinsRowLiveDB(t *testing.T) {
+	ctx, _, pool := heldMigratedPool(t, "held_final_fk_")
+	f := heldNewFixture(ctx, t, pool, true, "failed", nil)
+	if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 1 {
+		t.Fatalf("release: rows=%d err=%v", n, err)
+	}
+	f.setState(ctx, t, "deleted")
+	_, err := pool.Exec(ctx, `DELETE FROM run_held_publications WHERE id=$1`, f.pub)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Fatalf("delete of a receipt-pinned row = %v, want 23503", err)
+	}
+	heldCheckName(t, err, "recovery_custody_holds_final_publication_id_fkey")
+	if pgErr.ConstraintName != "recovery_custody_holds_final_publication_id_fkey" {
+		t.Fatalf("constraint = %q", pgErr.ConstraintName)
+	}
 }
 
 // setState forces the fixture's publication into state with the columns that state's CHECKs need,

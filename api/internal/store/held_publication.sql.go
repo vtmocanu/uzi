@@ -15,22 +15,24 @@ import (
 const acknowledgeHeldPublication = `-- name: AcknowledgeHeldPublication :one
 UPDATE run_held_publications
 SET state = 'acknowledged', acknowledged_at = now(),
-    expires_at = LEAST(COALESCE(expires_at, $1::timestamptz), $1::timestamptz),
+    expires_at = LEAST(COALESCE(expires_at, now() + make_interval(secs => $1::float8)),
+                       now() + make_interval(secs => $1::float8)),
     next_attempt_at = NULL, updated_at = now()
 WHERE id = $2 AND state = 'created'
 RETURNING id, run_id, generation, hold_id, user_id, repo_id, worker_id, live_run_id, ref, tip, coverage_digest, state, attempts, created_at, updated_at, create_invoked_at, ref_created_at, acknowledged_at, expires_at, owner_expired_at, deleted_at, next_attempt_at, last_error, refusal_reason
 `
 
 type AcknowledgeHeldPublicationParams struct {
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	ID        uuid.UUID          `json:"id"`
+	RetentionSeconds float64   `json:"retention_seconds"`
+	ID               uuid.UUID `json:"id"`
 }
 
-// Step B's second write: created -> acknowledged and the retention clock. An earlier
-// expires_at is kept. Matches no row unless the hold was released against this publication
-// (held_publication_guard).
+// Step B's second write: created -> acknowledged and the retention clock. expires_at is computed
+// here, from the database clock, so it is exactly retention_seconds after acknowledged_at (the
+// same now() in one statement). An earlier expires_at is kept. Matches no row unless the hold was
+// released against this publication (held_publication_guard).
 func (q *Queries) AcknowledgeHeldPublication(ctx context.Context, arg AcknowledgeHeldPublicationParams) (RunHeldPublication, error) {
-	row := q.db.QueryRow(ctx, acknowledgeHeldPublication, arg.ExpiresAt, arg.ID)
+	row := q.db.QueryRow(ctx, acknowledgeHeldPublication, arg.RetentionSeconds, arg.ID)
 	var i RunHeldPublication
 	err := row.Scan(
 		&i.ID,
@@ -577,7 +579,7 @@ func (q *Queries) ListLiveHeldPublicationRefsForRepo(ctx context.Context, arg Li
 }
 
 const lockHeldPublicationByRunGeneration = `-- name: LockHeldPublicationByRunGeneration :one
-SELECT id, run_id, generation, hold_id, user_id, repo_id, worker_id, live_run_id, ref, tip, coverage_digest, state, attempts, created_at, updated_at, create_invoked_at, ref_created_at, acknowledged_at, expires_at, owner_expired_at, deleted_at, next_attempt_at, last_error, refusal_reason FROM run_held_publications WHERE run_id = $1 AND generation = $2 FOR UPDATE
+SELECT id, run_id, generation, hold_id, user_id, repo_id, worker_id, live_run_id, ref, tip, coverage_digest, state, attempts, created_at, updated_at, create_invoked_at, ref_created_at, acknowledged_at, expires_at, owner_expired_at, deleted_at, next_attempt_at, last_error, refusal_reason FROM run_held_publications WHERE run_id = $1 AND generation = $2 FOR NO KEY UPDATE
 `
 
 type LockHeldPublicationByRunGenerationParams struct {
@@ -585,7 +587,9 @@ type LockHeldPublicationByRunGenerationParams struct {
 	Generation int64     `json:"generation"`
 }
 
-// The publication lock of the worker, run, hold, publication order.
+// The publication lock of the worker, run, hold, publication order. FOR NO KEY UPDATE, not FOR
+// UPDATE: step B's hold release takes the recovery_custody_holds.final_publication_id FK KEY
+// SHARE on this row, which FOR UPDATE would conflict with; the key never changes.
 func (q *Queries) LockHeldPublicationByRunGeneration(ctx context.Context, arg LockHeldPublicationByRunGenerationParams) (RunHeldPublication, error) {
 	row := q.db.QueryRow(ctx, lockHeldPublicationByRunGeneration, arg.RunID, arg.Generation)
 	var i RunHeldPublication

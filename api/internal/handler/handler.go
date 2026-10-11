@@ -33,6 +33,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
@@ -518,6 +519,13 @@ func (h *Handler) recovery() *recovery.Service {
 			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
 			if h.wsvc != nil {
 				h.recoverySvc.SetCustodySettledHook(h.wsvc.SettleRetainedCheckpoint)
+				// Issue #2545 step B: the held-ref listing goes through the same SSRF-gated
+				// derivation as step A's push.
+				heldRemote := h.wsvc.HeldRemote()
+				h.recoverySvc.SetHeldPublication(h.cfg.HeldPublication, func(ctx context.Context, runID uuid.UUID) (pushbroker.ListRefsOptions, error) {
+					f, err := heldRemote(ctx, runID)
+					return f.ListOptions(), err
+				})
 			}
 		}
 	})
