@@ -225,17 +225,6 @@ func heldReason(t *testing.T, err error) string {
 	return r.Reason
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // A failed run's step A creates the ref once: the row is created with the identity the SERVER
 // derived (repo, user, worker from the hold and run), the live pointer is set, the credential
 // reached the broker only from the sealed connection, and the hold is untouched.
@@ -621,7 +610,7 @@ func TestHeldPublishStoredErrorIsSanitizedLiveDB(t *testing.T) {
 	f := newHeldFix(t)
 	// Assembled at runtime: no token-shaped literal in tracked source.
 	secret := "glpat-" + strings.Repeat("a1b2", 5)
-	hostile := "remote: " + secret + "\nline two\x1b[31mred\x1b[0m‮evil\u0085next end\x00nul " + strings.Repeat("x", 2000)
+	hostile := "remote: " + secret + "\nline two\x1b[31mred\x1b[0m\u202eevil\u0085next\u2028end\x00nul " + strings.Repeat("x", 2000)
 	f.fake.sendFn = func(_ context.Context, _ pushbroker.HeldPackOptions) (pushbroker.HeldCreateOutcome, error) {
 		return pushbroker.HeldCreateRefused, fmt.Errorf("%w: %s", pushbroker.ErrHeldCreateRefused, hostile)
 	}
@@ -703,12 +692,12 @@ func TestHeldPublishSlotsBounded(t *testing.T) {
 func TestSanitizeHeldText(t *testing.T) {
 	secret := "ghp_" + strings.Repeat("Ab3", 8)
 	for in, want := range map[string]string{
-		"plain text":             "plain text",
-		"a\nb\r\nc\td":           "a b c d",
-		"x\x1b[31mred\x1b[0my":   "x red y",
-		"bidi‮RLO⁦iso​":          "bidi RLO iso",
-		"c1\u0085\u009bend":      "c1 end",
-		"tok " + secret + " end": "tok [redacted] end",
+		"plain text":                   "plain text",
+		"a\nb\r\nc\td":                 "a b c d",
+		"x\x1b[31mred\x1b[0my":         "x red y",
+		"bidi\u202eRLO\u2066iso\u200b": "bidi RLO iso",
+		"c1\u0085\u009bend":            "c1 end",
+		"tok " + secret + " end":       "tok [redacted] end",
 	} {
 		got := sanitizeHeldText(in)
 		if strings.Contains(got, secret) {

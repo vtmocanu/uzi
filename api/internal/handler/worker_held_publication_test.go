@@ -357,14 +357,14 @@ func TestWorkerRunHeldPublicationSlowPushOutlivesBaseTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the ACK did not arrive: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var got apitypes.HeldPublicationResponse
 	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&got) != nil || got.State != "created" {
 		t.Fatalf("status %d %+v", resp.StatusCode, got)
 	}
 	if resp, err := heldPost(t, srv, "/sibling", strings.NewReader("x")); err == nil {
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if string(body) == "late" {
 			t.Fatal("the sibling route outlived the base timeouts: the deadline extension leaked beyond its route")
 		}
@@ -395,7 +395,7 @@ func TestWorkerRunHeldPublicationCombinedBudgets(t *testing.T) {
 	pr, pw := io.Pipe()
 	start := time.Now()
 	go func() {
-		defer pw.Close()
+		defer func() { _ = pw.Close() }()
 		for i := 0; i < 10; i++ {
 			_, _ = pw.Write([]byte("x"))
 			time.Sleep(heldUploadBudget * 8 / 10 / 10)
@@ -405,7 +405,7 @@ func TestWorkerRunHeldPublicationCombinedBudgets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the ACK did not arrive after %v: %v", time.Since(start), err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var got apitypes.HeldPublicationResponse
 	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&got) != nil || got.State != "created" {
 		t.Fatalf("status %d %+v after %v", resp.StatusCode, got, time.Since(start))
@@ -427,12 +427,12 @@ func TestWorkerRunHeldPublicationStalledUploadTimesOut(t *testing.T) {
 	go func() {
 		_, _ = pw.Write([]byte("x"))
 		time.Sleep(heldUploadBudget * 3)
-		pw.Close()
+		_ = pw.Close()
 	}()
 	start := time.Now()
 	resp, err := heldPost(t, srv, "/held-publication", pr)
 	if err == nil {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusRequestTimeout {
 			t.Fatalf("status = %d, want 408", resp.StatusCode)
 		}
