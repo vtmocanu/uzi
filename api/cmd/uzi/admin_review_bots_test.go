@@ -81,3 +81,17 @@ func TestAdminReviewBotsNonAdminErrorPassthrough(t *testing.T) {
 		t.Errorf("stderr = %q", errOut)
 	}
 }
+
+func TestAdminReviewBotsHelpNamesOnScreenLabel(t *testing.T) {
+	out, errOut, code := runCLI(t, fakeEnv(reviewBotsFake("")), "admin", "review-bots", "--help")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, errOut)
+	}
+	help := out + errOut
+	if !strings.Contains(help, "Admin → Instance") {
+		t.Errorf("help does not name Admin → Instance:\n%s", help)
+	}
+	if strings.Contains(help, "Admin Settings") {
+		t.Errorf("help still says Admin Settings:\n%s", help)
+	}
+}

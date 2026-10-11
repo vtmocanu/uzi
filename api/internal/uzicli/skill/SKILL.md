@@ -60,6 +60,18 @@ Anthropic token, autopilot, chat), answer from the docs embedded in this binary
 rather than guessing: `uzi docs search <query>` then `uzi docs show <slug>`. Offline,
 version-matched, no server needed — see *Onboarding & concepts* below.
 
+**Why is my run queued? (your own runs)**: `uzi run get <id> --json` and read `health` /
+`health_reason` (may be empty for the first `health_queued_seconds`, default 10 min); then
+`uzi worker list --json` and read each worker's `status`, `docker`, `active_runs`,
+`max_concurrent_runs` (a missing or null field is unknown, never "no"). If every online worker has
+`docker: true`, a repo-bearing run on a repo outside the Docker worker repo allowlist cannot be
+claimed: point to **Admin → Instance → Docker worker repo allowlist** (an admin edits it there;
+anyone else asks an admin). Then `uzi docs show run-health`.
+
+**On-screen labels**: name a web UI location only by the labels in `uzi docs`, never by a
+component name, a route path or an `/api/...` URL; if the docs do not name it, say the path is
+inferred.
+
 **`uzi tui` is not for you.** It is a full-screen, keyboard-driven UI for a human
 watching runs, and it refuses to start when stdout is not a terminal (exit 2). There
 is nothing it shows that the `--json` verbs do not: use `uzi run list --json` for the
@@ -1655,7 +1667,7 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   instance setting: review bots (`BASE URL`/`FORGE USER ID`/`STATUS`) whose MR review
   comments the rework lane ingests though the bot is not a collaborator. Empty prints a
   note that third-party bot comments are withheld; a malformed entry is shown verbatim and
-  flagged. Edit in the web Admin Settings page; the CLI never writes.
+  flagged. Edit in the web UI at **Admin → Instance → Trusted review bots**; the CLI never writes.
 - `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
   instance's egress profiles: named site lists for official-sources research. `list`
   prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's
