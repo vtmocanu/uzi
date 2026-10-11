@@ -2615,9 +2615,16 @@ export class RecoveryCoordinator {
     try {
       for (const claim of claims) {
         if (budget.aborted) break;
+        // Arm the abort wait BEFORE invoking the client: a client that aborts the budget
+        // synchronously would otherwise fire the event before anyone listens, and the
+        // already-aborted signal never fires again, so the race would hang forever.
+        let onAbort: (() => void) | undefined;
+        const expired = new Promise<undefined>(resolve => {
+          onAbort = () => resolve(undefined);
+          budget.addEventListener("abort", onAbort, { once: true });
+        });
         const pending = this.client.proveRecoveryArchiveRedundancy(claim.runId, claim.captureId, claim.request, budget);
         pending.catch(() => undefined);
-        const expired = new Promise<undefined>(resolve => budget.addEventListener("abort", () => resolve(undefined), { once: true }));
         try {
           const res = await Promise.race([pending, expired]);
           if (!res) break;
@@ -2632,6 +2639,8 @@ export class RecoveryCoordinator {
           this.log.info("recovery: archive redundancy claim failed", {
             run_id: claim.runId, generation: claim.generation, capture_id: claim.captureId, error: errText(err),
           });
+        } finally {
+          if (onAbort) budget.removeEventListener("abort", onAbort);
         }
       }
     } finally {

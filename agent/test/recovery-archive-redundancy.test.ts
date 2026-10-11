@@ -280,6 +280,9 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     claimReads: [] as Array<Record<string, unknown>>,
     // behaviour of the redundancy RPC
     prove: async (): Promise<RecoveryArchiveRedundancyResponse> => ({ capture_id: "", outcome: "retained", reason: "not_ancestor" }),
+    // when set, called synchronously from the client method before any await (a client
+    // that aborts the caller in its synchronous part)
+    syncProve: undefined as ((signal?: AbortSignal) => Promise<RecoveryArchiveRedundancyResponse>) | undefined,
     proveCalls: [] as Array<{ runId: string; captureId: string; req: RecoveryArchiveRedundancyRequest; signal?: AbortSignal;
       lockFree: boolean; cleanupCallsAtSend: number }>,
   };
@@ -307,9 +310,15 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
       if (state.releaseError) throw state.releaseError;
       return { run_id: runId, generation, released: true, holds_released: 1 };
     },
-    proveRecoveryArchiveRedundancy: async (run: string, captureId: string, req: RecoveryArchiveRedundancyRequest, signal?: AbortSignal) => {
-      state.proveCalls.push({ runId: run, captureId, req, ...(signal ? { signal } : {}), lockFree: await journalLockFree(), cleanupCallsAtSend: state.cleanupCalls });
-      return { ...(await state.prove()), capture_id: captureId };
+    proveRecoveryArchiveRedundancy: (run: string, captureId: string, req: RecoveryArchiveRedundancyRequest, signal?: AbortSignal): Promise<RecoveryArchiveRedundancyResponse> => {
+      if (state.syncProve) {
+        state.proveCalls.push({ runId: run, captureId, req, ...(signal ? { signal } : {}), lockFree: true, cleanupCallsAtSend: state.cleanupCalls });
+        return state.syncProve(signal);
+      }
+      return (async () => {
+        state.proveCalls.push({ runId: run, captureId, req, ...(signal ? { signal } : {}), lockFree: await journalLockFree(), cleanupCallsAtSend: state.cleanupCalls });
+        return { ...(await state.prove()), capture_id: captureId };
+      })();
     },
   };
   const cloneClaim: RecoveryCoverageClaim = {
@@ -564,6 +573,21 @@ describe("RecoveryCoordinator redundancy claims", () => {
         const started = Date.now();
         await running;
         assert.ok(Date.now() - started < 5_000);
+        assert.equal(h.state.proveCalls[0]!.signal?.aborted, true);
+      } finally { await h.close(); }
+    });
+    it("a client that aborts the caller synchronously and never settles still returns by the deadline", async () => {
+      const h = await harness({ redundancyDeadlineMs: 40 });
+      try {
+        const rec = await h.uploaded(false);
+        const abort = new AbortController();
+        h.state.syncProve = () => { abort.abort(); return new Promise<RecoveryArchiveRedundancyResponse>(() => undefined); };
+        const withReceipt = await h.receipted(rec);
+        const started = Date.now();
+        const guard = new Promise<"hung">(resolve => setTimeout(() => resolve("hung"), 3_000).unref());
+        const outcome = await Promise.race([h.coordinator.resumePending(abort.signal, [withReceipt]).then(() => "returned" as const), guard]);
+        assert.equal(outcome, "returned", `submission hung after a synchronous caller abort (${Date.now() - started}ms)`);
+        assert.equal(h.state.proveCalls.length, 1);
         assert.equal(h.state.proveCalls[0]!.signal?.aborted, true);
       } finally { await h.close(); }
     });
