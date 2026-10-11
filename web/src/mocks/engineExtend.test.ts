@@ -7,7 +7,7 @@ import { patchRun, state } from "./store";
 // it must mirror the real api's rejections and apply the extension in place, so a web surface
 // built against the mock is not laxer than the wire.
 
-const RUN_ID = "run-live"; // a running `issue` kind with an 8h budget and a 16h allowance.
+const RUN_ID = "run-live"; // a running `issue` kind with an 8h budget and a 16h per-extension cap.
 const DEADLINE = "2026-01-01T20:00:00Z";
 
 beforeEach(() => {
@@ -54,12 +54,27 @@ describe("mock engine: extend (PRD #1189)", () => {
     expect(state.runs.get(RUN_ID)!.budget_extension_seconds).toBe(0);
   });
 
-  it("refuses an over-cap total with 409 naming the remaining allowance", () => {
-    patchRun(RUN_ID, { budget_extension_seconds: 54000 }); // 15h of the 16h cap already granted
-    const rej = handleInput(RUN_ID, "extend", "7200"); // +2h would exceed the remaining 1h
+  it("refuses a single request over the per-request cap with 409 naming the maximum", () => {
+    const rej = handleInput(RUN_ID, "extend", "61200"); // 17h > the 16h cap
     expect(rej).toMatchObject({ status: 409 });
-    expect(rej!.message).toMatch(/left of 57600s/);
-    expect(state.runs.get(RUN_ID)!.budget_extension_seconds).toBe(54000);
+    expect(rej!.message).toMatch(/17h is more than the 16h maximum per extension/);
+    expect(state.runs.get(RUN_ID)!.budget_extension_seconds).toBe(0);
+  });
+
+  it("applies an extend past the old cumulative cap: 57000s already granted, +3600 still fits", () => {
+    patchRun(RUN_ID, { budget_extension_seconds: 57000 });
+    expect(handleInput(RUN_ID, "extend", "3600")).toBeNull();
+    expect(state.runs.get(RUN_ID)!.budget_extension_seconds).toBe(60600);
+  });
+
+  it("refuses with 409 when the total wall would exceed the technical room", () => {
+    // room = 2147483 - max(28800, 6h, 24h) - 1800 - ext; ext = 2000000 leaves 59283s.
+    patchRun(RUN_ID, { budget_extension_seconds: 2000000 });
+    const rej = handleInput(RUN_ID, "extend", "57600"); // within the cap, but 57600 < 59283 fits
+    expect(rej).toBeNull();
+    const over = handleInput(RUN_ID, "extend", "3600"); // ext now 2057600, room 1683
+    expect(over).toMatchObject({ status: 409 });
+    expect(over!.message).toMatch(/technical room/);
   });
 
   it("refuses a kind that never times out (a judge run) with 409", () => {

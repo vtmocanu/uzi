@@ -7,9 +7,16 @@
 import type { IssueProposal, RunInputKind } from "../lib/api";
 // isTerminalRun comes from the leaf module (not the ../lib/api barrel) to stay clear of the
 // mock↔barrel runtime cycle the api-acyclic test guards.
+import { formatBudgetDuration } from "../lib/budget";
 import { isTerminalRun } from "../lib/runStatus";
 import { HEARTBEAT_MILESTONES, SAMPLE_PLAN } from "./data";
 import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putProposal } from "./store";
+
+// Mock stand-ins for the server-side technical wall limit an extend must fit under.
+const MOCK_MAX_TOTAL_WALL_SECONDS = 2147483;
+const MOCK_RUN_TIMEOUT_SECONDS = 6 * 3600;
+const MOCK_RUN_WALL_CEILING_SECONDS = 24 * 3600;
+const MOCK_MIN_FINALIZE_SECONDS = 1800;
 
 // ── Result frames (extracted, single source) ─────────────────────────────────
 // PRD #311: the plan-turn and implement-turn `result` frames are the cost/usage
@@ -744,11 +751,24 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       if (cap <= 0) {
         return { status: 409, message: "extensions are turned off for this instance" };
       }
-      if (currentExt + secs > cap) {
-        const leftSec = Math.max(0, cap - currentExt);
+      // The cap is a per-request maximum (#2735): earlier extensions do not shrink it.
+      if (secs > cap) {
         return {
           status: 409,
-          message: `${secs}s exceeds the remaining extension cap (${leftSec}s left of ${cap}s)`,
+          message: `${formatBudgetDuration(secs)} is more than the ${formatBudgetDuration(cap)} maximum per extension`,
+        };
+      }
+      // Mirror the server's technical room (a ~24.8 day total wall), with a mock RUN_TIMEOUT of 6h
+      // and wall ceiling of 24h standing in for the instance settings the web never sees.
+      const room =
+        MOCK_MAX_TOTAL_WALL_SECONDS -
+        Math.max(run.budget_wall_seconds ?? 0, MOCK_RUN_TIMEOUT_SECONDS, MOCK_RUN_WALL_CEILING_SECONDS) -
+        Math.max(run.budget_finalize_seconds ?? 0, MOCK_MIN_FINALIZE_SECONDS) -
+        currentExt;
+      if (secs > room) {
+        return {
+          status: 409,
+          message: `${formatBudgetDuration(secs)} is more than the ${formatBudgetDuration(Math.max(0, room))} of technical room left on this run`,
         };
       }
       const newExt = currentExt + secs;
