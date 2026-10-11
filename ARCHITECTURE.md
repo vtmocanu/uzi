@@ -827,8 +827,8 @@ that older file, or none. See the amendment in
 text are frozen into the check row, with digests the worker verifies on claim.
 
 The local snapshot ref is deleted once the checker has settled. A boot sweep
-deletes leftovers only on positive server evidence matching the lead id, claim
-generation and head, and only when the lead is finished or not held by that
+deletes leftovers only on positive server evidence matching the lead id and,
+when a check row exists, its claim generation and head, and only when the lead is finished or not held by that
 worker (for a lead with no check row, additionally only when the ref was never
 read), and keeps the ref on any doubt. Roll out the api and migrations 00322 to 00325 before workers
 that advertise `cross_check_code_v1`.
