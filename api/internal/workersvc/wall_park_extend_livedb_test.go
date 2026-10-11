@@ -141,6 +141,10 @@ func TestWallParkExtendStateChangedLiveDB(t *testing.T) {
 	}{
 		{"owner-paused (hold cleared)", `UPDATE runs SET hold_reason=NULL WHERE id=$1`},
 		{"already resumed (queued)", `UPDATE runs SET status='queued', hold_reason=NULL WHERE id=$1`},
+		// Over the cap AND no longer a budget_exhausted park: the state-change refusal must win over
+		// the cap wording, since the cap arithmetic on a run that is not parked is meaningless.
+		{"owner-paused and over the cap", `UPDATE runs SET hold_reason=NULL, budget_extension_seconds=57000 WHERE id=$1`},
+		{"queued and over the cap", `UPDATE runs SET status='queued', hold_reason=NULL, budget_extension_seconds=57000 WHERE id=$1`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newWallParkExtendFixture(t, 57600)
@@ -150,7 +154,7 @@ func TestWallParkExtendStateChangedLiveDB(t *testing.T) {
 			before := mustRun(t, f.env, id)
 
 			res, err := f.svc.extendAndResumeWallPark(f.env.ctx, f.userID, stale, 3600, 57600)
-			if !errors.Is(err, ErrWallParkChanged) {
+			if !errors.Is(err, ErrWallParkChanged) || errors.Is(err, ErrExtensionCapExceeded) {
 				t.Fatalf("extendAndResumeWallPark err = %v (res %+v), want ErrWallParkChanged", err, res)
 			}
 			if res.Resumed {

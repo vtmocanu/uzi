@@ -1208,7 +1208,7 @@ func (s *Service) wallParkExtendRefusal(ctx context.Context, userID uuid.UUID, r
 	switch {
 	case terminalStatuses[cur.Status]:
 		return ErrRunTerminal
-	case !(cur.Status == "paused" && cur.HoldReason.Valid && cur.HoldReason.String == "budget_exhausted"):
+	case cur.Status != "paused" || !cur.HoldReason.Valid || cur.HoldReason.String != "budget_exhausted":
 		return ErrWallParkChanged
 	case int(cur.BudgetExtensionSeconds)+secs > capSeconds:
 		return extendRefusalReason(cur, secs, capSeconds)

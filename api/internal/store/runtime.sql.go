@@ -4705,7 +4705,7 @@ type ExtendAndResumeWallParkRow struct {
 //  1. adds @secs to budget_extension_seconds under the SAME cap guard as CreateExtendInput (a
 //     request past @cap matches 0 rows; the caller re-reads the run to word the refusal);
 //  2. BANKS THE OVERRUN into budget_paused_seconds so the extension buys exactly @secs of ACTIVE
-//     run-time however late the park landed at or past the deadline (D7): overrun = active-at-park - total-before-extension,
+//     run-time however late the park landed (D7): overrun = active-at-park - total-before-extension,
 //     and the parked-wait interval is banked too (ResumePausedRun's rule), so the two banks leave the
 //     run resuming with precisely @secs of budget when the park landed at or past the deadline (every
 //     real wall park; otherwise @secs plus the unspent budget) (proof: active_now = active_at_park - overrun =
@@ -4719,9 +4719,9 @@ type ExtendAndResumeWallParkRow struct {
 // total_before and active-at-park read the OLD row (SET RHS is pre-update): budget_extension_seconds
 // in total_before is the pre-extension value, budget_finalize_seconds is included (a run may have been
 // Stopped then re-parked). Refuses (0 rows) a row that is not a budget_exhausted paused hold, or over
-// the cap, or a cross_check whose lead plan check is no longer pending. Returns the POST-update budget
-// row (started_at, budget_wall/extension/finalize/paused seconds) so the caller computes the resumed
-// deadline from the banked values; a refusal returns NO row (pgx.ErrNoRows), never a zero scalar.
+// the cap, or a cross_check whose lead plan check is no longer pending and eligible. Returns the
+// POST-update budget row (started_at, budget_wall/extension/finalize/paused seconds) so the caller
+// computes the resumed deadline from the banked values; a refusal returns NO row (pgx.ErrNoRows), never a zero scalar.
 func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (ExtendAndResumeWallParkRow, error) {
 	row := q.db.QueryRow(ctx, extendAndResumeWallPark,
 		arg.ID,
