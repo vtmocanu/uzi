@@ -12872,7 +12872,7 @@ export class RunRunner {
         // precedence as #1086's overlay base), so a lost-ack or confirmed overlay does not wedge
         // later tick/iteration publishes with `not_descendant`. GitHub only, like the overlay.
         flight.checkpointChainForge === true
-          ? flight.lastAttemptedCheckpointRefTip ?? flight.lastCheckpointRefTip
+          ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
           : undefined);
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent

@@ -522,8 +522,11 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
 
   /** Worker A commits R, main advances its workflow, an overlay P is built over R and "published"
    *  (the ref points at P in origin). */
-  async function overlayScene(opts: ConstructorParameters<typeof GitCache>[3] = {}): Promise<Scene> {
-    const fx = mk();
+  async function overlayScene(
+    opts: ConstructorParameters<typeof GitCache>[3] = {},
+    files?: Record<string, string>,
+  ): Promise<Scene> {
+    const fx = mk(files);
     const git = workerWith(fx, "A", opts);
     const bare = await git.ensureClone(fx.originPath);
     const seed = await git.createOrAttachRunnerClone(bare, 2733, noProofReseed, "run-A");
@@ -557,11 +560,12 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
 
   const chainPack = (
     sc: Scene,
-    chainFrom: string | undefined,
+    chainFrom: string | readonly (string | undefined)[] | undefined,
     extra: { beforePack?: (sha: string) => Promise<void>; onStep?: (s: string) => void; git?: GitCache } = {},
   ) =>
     (extra.git ?? sc.git).checkpointPack(
-      sc.bare, branch, undefined, undefined, extra.onStep as never, undefined, extra.beforePack, chainFrom,
+      sc.bare, branch, undefined, undefined, extra.onStep as never, undefined, extra.beforePack,
+      typeof chainFrom === "string" ? [chainFrom] : chainFrom,
     );
 
   it("chains a raw tip over the overlay: parents [P, N], P's workflow subtree, N's everything else", async () => {
@@ -641,12 +645,39 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
     assert.deepStrictEqual(judged, [sc.p], "the #1964 hold judges the actual candidate");
     assert.ok(steps.filter((s) => s === "scratch_preflight").length >= 2, "preflight re-ran on the chosen tip");
     await drain(packed.pack);
-    // The same on the pinned path, with a floor that is not an ancestor of P: refused.
+    // The same on the pinned path with a real floor (the seed commit below P): P is re-declared
+    // and the preflight and the #1964 hold run on P itself, not on the pinned tip R.
+    const floor = gitIn(sc.bare, ["merge-base", sc.r, sc.p]);
+    const pinnedJudged: string[] = [];
+    const pinnedSteps: string[] = [];
+    const pinned = await sc.git.checkpointPack(
+      sc.bare, branch, undefined, { tipSha: sc.r, excludeSha: floor }, (s) => pinnedSteps.push(s), undefined,
+      async (sha) => { pinnedJudged.push(sha); }, [sc.p],
+    );
+    assert.ok(pinned);
+    assert.strictEqual(pinned.tipOid, sc.p, "pinned: the existing wrapper is re-declared");
+    assert.deepStrictEqual(pinnedJudged, [sc.p], "pinned: the #1964 hold judges P, not the pinned tip");
+    assert.ok(pinnedSteps.filter((s) => s === "scratch_preflight").length >= 2, "pinned: preflight re-ran on P");
+    await drain(pinned.pack);
+    // A floor that is not an ancestor of P is still refused.
     const stray = rawCommit(sc.bare, gitIn(sc.bare, ["rev-parse", `${sc.r}^{tree}`]), [], "unrelated root");
     await assert.rejects(
-      sc.git.checkpointPack(sc.bare, branch, undefined, { tipSha: sc.r, excludeSha: stray }, undefined, undefined, undefined, sc.p),
+      sc.git.checkpointPack(sc.bare, branch, undefined, { tipSha: sc.r, excludeSha: stray }, undefined, undefined, undefined, [sc.p]),
       ScratchPublicationError,
     );
+  });
+
+  it("a raw tip that shipped ambiguously (the attempted tip) does not shadow the confirmed overlay", async () => {
+    const sc = await overlayScene();
+    const n = commit(sc.clone, "M2.txt");
+    const n2 = commit(sc.clone, "M3.txt");
+    await track(sc);
+    // attempted = N is an ancestor of the packed N2, so the chain must come from the confirmed P.
+    const packed = await chainPack(sc, [n, sc.p]);
+    assert.ok(packed);
+    assert.deepStrictEqual(parentsOf(sc.bare, packed.tipOid), [sc.p, n2], "chained over the confirmed tip");
+    // An attempted tip that is NOT contained in the raw tip still wins.
+    assert.deepStrictEqual(parentsOf(sc.bare, (await chainPack(sc, [sc.p, sc.r]))!.tipOid), [sc.p, n2]);
   });
 
   it("no chain when P is an ancestor of N, absent from the bare, or equals N", async () => {
@@ -708,11 +739,12 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
   it("verifier bounds: too many wrappers or an oversized diff listing refuses the chain", async () => {
     // maxWrappers: P's history over N holds two wrappers (C1 and the overlay), over a bound of 1.
     const many = await overlayScene({ checkpointChainBounds: { maxWrappers: 1 } });
-    commit(many.clone, "M2.txt");
+    const n1 = commit(many.clone, "M2.txt");
     await track(many);
     const first = await chainPack(many, many.p);
     assert.ok(first);
     const c1 = first.tipOid;
+    assert.deepStrictEqual(parentsOf(many.bare, c1), [many.p, n1], "the first pack is a real chain [P, N]");
     publishPackToOrigin(many.fx, await drain(first.pack), c1, checkpointRef);
     const n2 = commit(many.clone, "M3.txt");
     await track(many);
@@ -723,6 +755,43 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
     const n = commit(big.clone, "M2.txt");
     await track(big);
     assert.strictEqual((await chainPack(big, big.p))!.tipOid, n, "diff over maxDiffBytes: raw tip");
+  });
+
+  it("a chain built over exactly maxWrappers wrappers is still peeled on adoption", async () => {
+    // maxWrappers 1: P is one wrapper over N, so the chain is allowed; the adopter then sees the
+    // chain plus P (two wrappers), which only verifies with the peel's one-wrapper headroom.
+    const sc = await overlayScene({ checkpointChainBounds: { maxWrappers: 1 } });
+    mergeMainInto(sc);
+    const n = commit(sc.clone, "M2.txt");
+    await track(sc);
+    const packed = await chainPack(sc, sc.p);
+    assert.ok(packed);
+    const c = packed.tipOid;
+    assert.deepStrictEqual(parentsOf(sc.bare, c), [sc.p, n]);
+    assert.strictEqual(gitIn(sc.bare, ["rev-parse", `${c}^{tree}`]), gitIn(sc.bare, ["rev-parse", `${n}^{tree}`]));
+    publishPackToOrigin(sc.fx, await drain(packed.pack), c, checkpointRef);
+    const gitB = workerWith(sc.fx, "B", { checkpointChainBounds: { maxWrappers: 1 } });
+    const bareB = await gitB.ensureClone(sc.fx.originPath);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 2733, noProofReseed, "run-B", true, c);
+    assert.strictEqual(rc.baseCommit, n, "the MAX-wrapper chain peels back to N");
+  });
+
+  it("a branch with no .github at all still chains with P's workflow subtree and peels back to N", async () => {
+    const sc = await overlayScene({}, { "README.md": "readme\n" });
+    const n = commit(sc.clone, "M2.txt");
+    await track(sc);
+    assert.strictEqual(wfTreeOf(sc.bare, n), "", "scene: the branch has no workflows");
+    assert.notStrictEqual(wfTreeOf(sc.bare, sc.p), "", "scene: P carries the default's workflows");
+    const packed = await chainPack(sc, sc.p);
+    assert.ok(packed);
+    const c = packed.tipOid;
+    assert.deepStrictEqual(parentsOf(sc.bare, c), [sc.p, n]);
+    assert.strictEqual(wfTreeOf(sc.bare, c), wfTreeOf(sc.bare, sc.p), "P's workflow subtree");
+    publishPackToOrigin(sc.fx, await drain(packed.pack), c, checkpointRef);
+    const gitB = worker(sc.fx, "B");
+    const bareB = await gitB.ensureClone(sc.fx.originPath);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 2733, noProofReseed, "run-B", true, c);
+    assert.strictEqual(rc.baseCommit, n, "adoption peels the chain to N");
   });
 
   it("adoption negative: a forged tree-equal merge hiding non-workflow history is not peeled", async () => {

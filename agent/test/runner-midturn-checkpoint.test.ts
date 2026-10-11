@@ -2609,9 +2609,9 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
   /** Milestone reap publish builds overlay O (answered per `firstAck`), then a clean N is published
    *  at the tick or the iteration boundary: it must advance the ref past O. */
   for (const boundary of ["tick", "iteration"] as const) {
-    for (const firstAck of ["clean", "landed", "dropped"] as const) {
-      it(`${boundary}: a raw publish after a ${firstAck === "clean" ? "clean-ACK" : firstAck === "landed" ? "lost-ACK (O landed)" : "lost-ACK (O not landed)"} overlay advances the ref`, async () => {
-        const iid = 2733_000 + (boundary === "tick" ? 0 : 10) + ["clean", "landed", "dropped"].indexOf(firstAck);
+    for (const firstAck of ["clean", "landed"] as const) {
+      it(`${boundary}: a raw publish after a ${firstAck === "clean" ? "clean-ACK" : "lost-ACK (O landed)"} overlay advances the ref`, async () => {
+        const iid = 2733_000 + (boundary === "tick" ? 0 : 10) + ["clean", "landed"].indexOf(firstAck);
         commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
         const g = mkGit(fx.dataDir);
         const ctl = control();
@@ -2635,8 +2635,8 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
             );
             assert.equal(
               refOr(fx.originPath, checkpointRef),
-              firstAck === "dropped" ? null : overlay,
-              "the ref holds O exactly when it landed",
+              overlay,
+              "the ref holds O",
             );
             const newTip = commitIn(ctx.worktreePath, "new.txt", "clean new work\n");
             ctl.advance(INTERVAL_MS + 1);
@@ -2656,6 +2656,93 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
       });
     }
   }
+
+  // The ref sits at a CONFIRMED overlay O1; a second overlay milestone O2 is dropped (500, not
+  // landed), so the attempted tip is O2 while the ref is still O1. A raw N then must not be refused
+  // `not_descendant`: it chains over O2 (which descends O1).
+  for (const boundary of ["tick", "iteration"] as const) {
+    it(`${boundary}: a raw publish after a lost-ACK second overlay (O2 not landed) advances the ref`, async () => {
+      const iid = 2733_002 + (boundary === "tick" ? 0 : 10);
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+      const g = mkGit(fx.dataDir);
+      const ctl = control();
+      const claim = githubClaim(iid);
+      const { github } = fakeGitHub();
+      const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+      const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+      const pub = stubPublish(broker.impl);
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "r1.txt", "real 1\n");
+          commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid} a\n`);
+          await ctx.checkpoint!({ reap: true, progress });
+          const o1 = pub.tips[0]!;
+          assert.equal(refOr(fx.originPath, checkpointRef), o1, "O1 is confirmed");
+          const r2 = commitIn(ctx.worktreePath, "r2.txt", "real 2\n");
+          commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid} b\n`);
+          await ctx.checkpoint!({ reap: true, progress });
+          assert.equal(pub.count(), 2, "the second milestone publish was attempted");
+          const o2 = pub.tips[1]!;
+          assert.equal(parentsIn(g.barePathFor(fx.originPath), o2).at(-1), r2, "milestone 2 built an overlay over R2");
+          assert.equal(refOr(fx.originPath, checkpointRef), o1, "O2 was dropped: the ref still sits at O1");
+          const newTip = commitIn(ctx.worktreePath, "new.txt", "clean new work\n");
+          ctl.advance(INTERVAL_MS + 1);
+          if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
+          else await ctx.checkpoint!({ reap: false, progress });
+          assert.equal(pub.count(), 3);
+          const chain = pub.tips[2]!;
+          const chainParents = parentsIn(fx.originPath, chain);
+          assert.equal(chainParents[0], o2, "chain's first parent is O2");
+          assert.equal(chainParents.at(-1), newTip, "chain's last parent is N");
+          assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
+          const last = (broker.answers[2]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+          assert.deepEqual([last?.published, last?.skipped], [true, undefined], "no not_descendant refusal");
+        }), ctl, { github }).execute(claim);
+        if (turnErrors.length > 0) throw turnErrors[0];
+      } finally {
+        pub.restore();
+      }
+    });
+  }
+
+  it("a raw tip that shipped ambiguously does not shadow the confirmed overlay on the next tick", async () => {
+    const iid = 2733_070;
+    commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+    const g = mkGit(fx.dataDir);
+    const ctl = control();
+    const claim = githubClaim(iid);
+    const { github } = fakeGitHub();
+    const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+    const pub = stubPublish(broker.impl);
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "r.txt", "real\n");
+        commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+        await ctx.checkpoint!({ reap: true, progress });
+        const overlay = pub.tips[0]!;
+        assert.equal(refOr(fx.originPath, checkpointRef), overlay, "O is confirmed");
+        // Force one refused chain so raw N ships and its ACK is lost: attempted = N, confirmed = O.
+        const hook = g as unknown as { buildCheckpointChain: (...a: unknown[]) => Promise<string | null> };
+        const realBuild = hook.buildCheckpointChain.bind(g);
+        hook.buildCheckpointChain = async () => null;
+        const n = commitIn(ctx.worktreePath, "n.txt", "raw N\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.notEqual(await ctl.fire(), "published", "raw N is not acknowledged");
+        assert.equal(pub.tips[1], n, "raw N shipped");
+        hook.buildCheckpointChain = realBuild;
+        const n2 = commitIn(ctx.worktreePath, "n2.txt", "raw N2\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published", "the next tick must advance, not wedge on not_descendant");
+        const chain = pub.tips[2]!;
+        assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, n2], "chained over the confirmed overlay");
+        assert.equal(refOr(fx.originPath, checkpointRef), chain);
+      }), ctl, { github }).execute(claim);
+      if (turnErrors.length > 0) throw turnErrors[0];
+    } finally {
+      pub.restore();
+    }
+  });
 
   it("reap fallback: a failed default fetch (no overlay) still chains over the prior overlay", async () => {
     const iid = 2733_050;
