@@ -25,7 +25,29 @@ function reasonLabel(value: string): string {
   }
 }
 
-function Findings({ value }: { value: unknown }) {
+type Disposition = { finding_id: string; disposition: "addressed" | "declined" | "not_reported"; reason: string };
+
+function dispositionEvidence(findings: unknown, value: unknown, finalized: boolean) {
+  const unavailable = { state: "Dispositions unavailable", entries: new Map<string, Disposition>() };
+  if (!Array.isArray(findings) || findings.length > 20 || !Array.isArray(value) || value.length > 20) return unavailable;
+  const known = new Set<string>();
+  for (const f of findings) {
+    if (!f || typeof f.id !== "string" || !/^[A-Za-z0-9_-]{1,64}(?![\s\S])/.test(f.id) || known.has(f.id)) return unavailable;
+    known.add(f.id);
+  }
+  const entries = new Map<string, Disposition>();
+  for (const d of value) {
+    if (!d || typeof d !== "object" || !known.has(d.finding_id) || entries.has(d.finding_id)
+      || !["addressed", "declined", "not_reported"].includes(d.disposition)
+      || typeof d.reason !== "string" || d.reason.length > 1024 || !d.reason.isWellFormed()
+      || new TextEncoder().encode(d.reason).length > 1024) return unavailable;
+    entries.set(d.finding_id, d);
+  }
+  if (finalized && entries.size !== known.size) return unavailable;
+  return { state: finalized ? "Finalized" : "Pending report", entries };
+}
+
+function Findings({ value, dispositions }: { value: unknown; dispositions: Map<string, Disposition> }) {
   const items = Array.isArray(value) ? value : [];
   let remaining = 32768;
   let truncated = items.length > 20;
@@ -51,6 +73,7 @@ function Findings({ value }: { value: unknown }) {
     const f = item as Record<string, unknown>;
     const id = typeof f.id === "string" && /^[A-Za-z0-9_-]{1,64}(?![\s\S])/.test(f.id) && !seen.has(f.id) ? f.id : "";
     if (id) seen.add(id);
+    const disposition = id ? dispositions.get(id) : undefined;
     const path = plain(bounded(f.path, 512), 512);
     const title = bounded(f.title, 512);
     const detail = bounded(f.detail, 2048);
@@ -59,6 +82,7 @@ function Findings({ value }: { value: unknown }) {
       {path && <p>Path: {path}{Number.isSafeInteger(f.line) && (f.line as number) > 0 && (f.line as number) <= 2147483647 ? `:${f.line}` : ""}</p>}
       <Markdown content={title} />
       <Markdown content={detail} />
+      {disposition && <><p>Disposition: {disposition.disposition}</p><Markdown content={disposition.reason} /></>}
     </article>;
   });
   return <div className="max-h-96 overflow-auto space-y-3">
@@ -75,6 +99,9 @@ export function CodeCrossCheck({ run }: { run: Run }) {
   const historical = s?.interrupted_at != null;
   const outcome = s?.outcome === "pending" ? "Pending" : s?.outcome === "completed" ? "Completed"
     : s?.outcome === "failed" ? "Incomplete" : "Outcome unavailable";
+  const evidence = dispositionEvidence(s?.findings, s?.dispositions, s?.finalized_at != null);
+  const counts = { addressed: 0, declined: 0, not_reported: 0 };
+  for (const d of evidence.entries.values()) counts[d.disposition]++;
   const usage = s?.usage;
   const cost = usage?.cost_status === "subscription" ? costHeadline(costDisplay("subscription", 0))
     : usage && Number.isFinite(usage.cost_usd) && usage.cost_usd >= 0
@@ -86,7 +113,9 @@ export function CodeCrossCheck({ run }: { run: Run }) {
     {s && <>
       {s.reason_class && <p>Reason: {reasonLabel(s.reason_class)}</p>}
       {typeof s.head_commit === "string" && /^[a-f0-9]{40}(?![\s\S])/i.test(s.head_commit) && <p>Checked SHA: {s.head_commit}</p>}
-      <Findings value={s.findings} />
+      <p>{evidence.state}</p>
+      {!historical && s.outcome === "completed" && evidence.state === "Finalized" && <p>{counts.addressed} addressed, {counts.declined} declined, {counts.not_reported} not reported</p>}
+      <Findings value={s.findings} dispositions={evidence.entries} />
       <p>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"} · Model: {plain(s.checker_model) || "Unreported"} · Effort: {plain(s.checker_effort) || "Unreported"}</p>
       <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : ""}</p>
       {typeof s.checker_run_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/i.test(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}

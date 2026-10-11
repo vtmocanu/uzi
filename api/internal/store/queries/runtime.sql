@@ -5850,7 +5850,7 @@ WITH locked AS (
 ), eligible_parent_exits AS MATERIALIZED (
     -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+    SELECT id, status, kind, interactive, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
     WHERE (target.kind = 'cross_check'
@@ -5859,8 +5859,8 @@ WITH locked AS (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
-            AND exiting.status IN ('claimed', 'running')
+            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.interrupted_at IS NULL))
+            AND (exiting.status IN ('claimed', 'running') OR (cc.stage = 'code' AND exiting.status = 'awaiting_followup' AND exiting.kind = 'task' AND exiting.interactive))
             AND exiting.claim_released_at IS NULL
       )
 )
@@ -5958,6 +5958,7 @@ WITH locked AS (
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
       AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
+      AND (cc.stage <> 'code' OR lead.worker_id = (SELECT child.worker_id FROM runs child WHERE child.id = cc.checker_run_id))
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
     ORDER BY cc.lead_run_id
@@ -6161,7 +6162,7 @@ WITH candidates AS MATERIALIZED (
 ), eligible_parent_exits AS MATERIALIZED (
     -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+    SELECT id, status, kind, interactive, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
     WHERE (target.kind = 'cross_check'
@@ -6170,8 +6171,8 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
-            AND exiting.status IN ('claimed', 'running')
+            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.interrupted_at IS NULL))
+            AND (exiting.status IN ('claimed', 'running') OR (cc.stage = 'code' AND exiting.status = 'awaiting_followup' AND exiting.kind = 'task' AND exiting.interactive))
             AND exiting.claim_released_at IS NULL
       )
 )
@@ -6286,6 +6287,7 @@ WITH candidates AS MATERIALIZED (
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
       AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
+      AND (cc.stage <> 'code' OR lead.worker_id = @worker_id)
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
     ORDER BY cc.lead_run_id
@@ -6487,7 +6489,7 @@ WITH candidates AS MATERIALIZED (
 ), eligible_parent_exits AS MATERIALIZED (
     -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+    SELECT id, status, kind, interactive, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
     WHERE (target.kind = 'cross_check'
@@ -6496,8 +6498,8 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
-            AND exiting.status IN ('claimed', 'running')
+            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.interrupted_at IS NULL))
+            AND (exiting.status IN ('claimed', 'running') OR (cc.stage = 'code' AND exiting.status = 'awaiting_followup' AND exiting.kind = 'task' AND exiting.interactive))
             AND exiting.claim_released_at IS NULL
       )
 )
@@ -6591,6 +6593,7 @@ WITH candidates AS MATERIALIZED (
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
       AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
+      AND (cc.stage <> 'code' OR lead.worker_id = @worker_id)
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
     ORDER BY cc.lead_run_id
@@ -6835,6 +6838,7 @@ WITH candidates AS MATERIALIZED (
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
       AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
+      AND (cc.stage <> 'code' OR lead.worker_id = @worker_id)
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
     ORDER BY cc.lead_run_id
@@ -6877,6 +6881,7 @@ WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = fals
         AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
         AND cc.deadline_at > now()
         AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
+        AND (cc.stage <> 'code' OR lead.worker_id = @worker_id)
         AND lead.claim_generation = cc.lead_claim_generation
   ))
 RETURNING r.id, r.user_id, r.status;
@@ -7079,7 +7084,7 @@ WITH candidates AS MATERIALIZED (
 ), eligible_parent_exits AS MATERIALIZED (
     -- Shared by parent writes and suppression; 00312 owns settlement and cancellation
     -- for an unreleased active lead with the latest eligible pending plan round.
-    SELECT id, status, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
+    SELECT id, status, kind, interactive, claim_released_at FROM final_targets WHERE kind <> 'cross_check'
 ), eligible_candidates AS MATERIALIZED (
     SELECT target.id AS run_id FROM final_targets target
     WHERE (target.kind = 'cross_check'
@@ -7088,8 +7093,8 @@ WITH candidates AS MATERIALIZED (
           SELECT 1 FROM cross_checks cc
           JOIN eligible_parent_exits exiting ON exiting.id = cc.lead_run_id
           WHERE cc.checker_run_id = target.id
-            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
-            AND exiting.status IN ('claimed', 'running')
+            AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.interrupted_at IS NULL))
+            AND (exiting.status IN ('claimed', 'running') OR (cc.stage = 'code' AND exiting.status = 'awaiting_followup' AND exiting.kind = 'task' AND exiting.interactive))
             AND exiting.claim_released_at IS NULL
       )
 )
@@ -7205,6 +7210,7 @@ WITH candidates AS MATERIALIZED (
       AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
       AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
+      AND (cc.stage <> 'code' OR lead.worker_id = @worker_id)
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
     ORDER BY cc.lead_run_id

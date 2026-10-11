@@ -5,11 +5,65 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 var codeFindingID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+type codeDisposition struct {
+	FindingID   string  `json:"finding_id"`
+	Disposition string  `json:"disposition"`
+	Reason      *string `json:"reason"`
+}
+
+// Validate identities before any presentation sanitizing. A malformed batch
+// yields no associations or counts; findings still display independently.
+func codeDispositionEvidence(s *apitypes.CodeCrossCheck, ids []string) (map[string]codeDisposition, string) {
+	unavailable := "Dispositions unavailable"
+	if len(ids) > 20 {
+		return nil, unavailable
+	}
+	known := make(map[string]bool)
+	for _, id := range ids {
+		if !codeFindingID.MatchString(id) || known[id] {
+			return nil, unavailable
+		}
+		known[id] = true
+	}
+	if len(s.Dispositions) == 0 || string(s.Dispositions) == "null" {
+		return nil, unavailable
+	}
+	var batch []codeDisposition
+	if len(s.Dispositions) > 64*1024 || !utf8.Valid(s.Dispositions) || json.Unmarshal(s.Dispositions, &batch) != nil || batch == nil || len(batch) > 20 {
+		return nil, unavailable
+	}
+	result := make(map[string]codeDisposition)
+	for _, d := range batch {
+		if !known[d.FindingID] {
+			return nil, unavailable
+		}
+		if _, exists := result[d.FindingID]; exists {
+			return nil, unavailable
+		}
+		if d.Disposition != "addressed" && d.Disposition != "declined" && d.Disposition != "not_reported" {
+			return nil, unavailable
+		}
+		if d.Reason == nil || len(*d.Reason) > 1024 || !utf8.ValidString(*d.Reason) {
+			return nil, unavailable
+		}
+		result[d.FindingID] = d
+	}
+	if s.FinalizedAt == nil {
+		return result, "Pending report"
+	}
+	if len(result) != len(known) {
+		return nil, unavailable
+	}
+	return result, "Finalized"
+}
+
 var codeCheckedSHA = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
 
 func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
@@ -75,7 +129,21 @@ func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
 	}
 	var findings []finding
 	if len(s.Findings) > 64*1024 || json.Unmarshal(s.Findings, &findings) != nil || findings == nil {
-		return append(rows, []string{label + "_FINDINGS", "Findings unavailable"})
+		return append(rows, []string{label + "_FINDINGS", "Findings unavailable"},
+			[]string{label + "_DISPOSITIONS", "Dispositions unavailable"})
+	}
+	ids := make([]string, len(findings))
+	for i, f := range findings {
+		ids[i] = f.ID
+	}
+	dispositions, dispositionState := codeDispositionEvidence(s, ids)
+	rows = append(rows, []string{label + "_DISPOSITIONS", dispositionState})
+	if dispositionState == "Finalized" && s.Outcome == "completed" && s.InterruptedAt == nil {
+		counts := map[string]int{"addressed": 0, "declined": 0, "not_reported": 0}
+		for _, d := range dispositions {
+			counts[d.Disposition]++
+		}
+		rows = append(rows, []string{label + "_COUNTS", fmt.Sprintf("%d addressed, %d declined, %d not reported", counts["addressed"], counts["declined"], counts["not_reported"])})
 	}
 	if len(findings) == 0 {
 		return append(rows, []string{label + "_FINDINGS", "No findings recorded"})
@@ -96,6 +164,10 @@ func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
 			[]string{prefix + "_PATH", crossCheckPlain(f.Path)},
 			[]string{prefix + "_TITLE", crossCheckPlain(f.Title)},
 			[]string{prefix + "_DETAIL", crossCheckPlain(f.Detail)})
+		if d, ok := dispositions[f.ID]; ok && id == f.ID {
+			rows = append(rows, []string{prefix + "_DISPOSITION", d.Disposition},
+				[]string{prefix + "_DISPOSITION_REASON", crossCheckPlain(*d.Reason)})
+		}
 		if f.Line != nil && *f.Line > 0 {
 			rows = append(rows, []string{prefix + "_LINE", fmt.Sprint(*f.Line)})
 		}

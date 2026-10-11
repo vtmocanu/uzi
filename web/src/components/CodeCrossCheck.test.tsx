@@ -72,6 +72,86 @@ it("renders hostile prose and paths safely, strict IDs, validated child and subs
   expect(screen.getByText("Checker cost: Subscription · subscription usage")).toBeTruthy();
   expect(container.textContent).not.toContain("$0");
 });
+const persistedFindings = [
+  { id: "KEEP_id-1", severity: "major", title: "First finding" },
+  { id: "f2", severity: "minor", title: "Second finding" },
+  { id: "f3", severity: "critical", title: "Third finding" },
+];
+const persistedDispositions = [
+  { finding_id: "f2", disposition: "declined", reason: "**Verified second**" },
+  { finding_id: "KEEP_id-1", disposition: "addressed", reason: "**Fixed first**" },
+  { finding_id: "f3", disposition: "not_reported", reason: "" },
+];
+it("associates persisted dispositions by stable identity and counts only finalized active evidence", () => {
+  const { container } = view({ findings: persistedFindings, dispositions: persistedDispositions, finalized_at: "2026-10-11T00:00:00Z" });
+  expect(screen.getByText("1 addressed, 1 declined, 1 not reported")).toBeTruthy();
+  expect(screen.getByText("Finalized")).toBeTruthy();
+  const articles = container.querySelectorAll("article");
+  expect(articles[0].textContent).toContain("KEEP_id-1");
+  expect(articles[0].textContent).toContain("Disposition: addressed");
+  expect(articles[0].querySelector("strong")?.textContent).toBe("Fixed first");
+  expect(articles[1].textContent).toContain("Disposition: declined");
+  expect(articles[1].querySelector("strong")?.textContent).toBe("Verified second");
+  cleanup();
+  view({ findings: persistedFindings, dispositions: persistedDispositions });
+  expect(screen.getByText("Pending report")).toBeTruthy();
+  expect(screen.queryByText(/1 addressed,/)).toBeNull();
+  cleanup();
+  view({ findings: persistedFindings, dispositions: persistedDispositions, finalized_at: "2026-10-11T00:00:00Z", interrupted_at: "2026-10-11T01:00:00Z" });
+  expect(screen.getByText("Superseded · Earlier attempt evidence")).toBeTruthy();
+  expect(screen.getByText("Fixed first")).toBeTruthy();
+  expect(screen.queryByText(/1 addressed,/)).toBeNull();
+});
+it.each([undefined, null])("does not turn legacy dispositions %s into not reported", (dispositions) => {
+  view({ findings: persistedFindings, dispositions, finalized_at: "2026-10-11T00:00:00Z" });
+  expect(screen.getByText("Dispositions unavailable")).toBeTruthy();
+  expect(screen.queryByText(/Disposition:/)).toBeNull();
+  expect(screen.queryByText(/not reported/)).toBeNull();
+});
+it.each([
+  ["unknown", persistedFindings, [{ finding_id: "unknown", disposition: "addressed", reason: "hidden reason" }]],
+  ["duplicate dispositions", persistedFindings, [...persistedDispositions, persistedDispositions[0]]],
+  ["duplicate findings", [persistedFindings[0], persistedFindings[0]], [persistedDispositions[1]]],
+  ["forged identity", [{ id: "KEEP_id-1\n" }], [persistedDispositions[1]]],
+  ["bad status", persistedFindings, [{ finding_id: "f2", disposition: "accepted", reason: "hidden reason" }]],
+  ["missing reason", persistedFindings, [{ finding_id: "f2", disposition: "addressed" }]],
+  ["reason bytes", persistedFindings, [{ finding_id: "f2", disposition: "addressed", reason: "界".repeat(342) }]],
+  ["reason length", persistedFindings, [{ finding_id: "f2", disposition: "addressed", reason: "x".repeat(1025) }]],
+  ["invalid UTF16", persistedFindings, [{ finding_id: "f2", disposition: "addressed", reason: "\ud800" }]],
+  ["incomplete finalized", persistedFindings, []],
+  ["overlimit findings", Array.from({ length: 21 }, (_, i) => ({ id: "f" + i })), persistedDispositions],
+  ["overlimit dispositions", persistedFindings, Array.from({ length: 21 }, () => persistedDispositions[0])],
+] as const)("rejects %s as a batch without binding or counts", (_name, findings, dispositions) => {
+  view({ findings: [...findings], dispositions: [...dispositions], finalized_at: "2026-10-11T00:00:00Z" });
+  expect(screen.getByText("Dispositions unavailable")).toBeTruthy();
+  expect(screen.queryByText(/Disposition:/)).toBeNull();
+  expect(screen.queryByText(/addressed,/)).toBeNull();
+  expect(screen.queryByText("hidden reason")).toBeNull();
+  expect(screen.getAllByRole("article").length).toBeGreaterThan(0);
+});
+it("renders bounded hostile reasons through hardened Markdown and preserves sibling details", () => {
+  const hostile = "**Fixed**\n<script>alert(1)</script> [bad](javascript:alert(1))\u001b[31m\u0007\u202e";
+  const { container } = view({ findings: persistedFindings, dispositions: [
+    { ...persistedDispositions[1], reason: hostile }, persistedDispositions[0], persistedDispositions[2],
+  ], finalized_at: "2026-10-11T00:00:00Z" });
+  expect(screen.getByText("1 addressed, 1 declined, 1 not reported")).toBeTruthy();
+  expect(screen.getByText("Fixed").tagName).toBe("STRONG");
+  expect(screen.getByText("Verified second")).toBeTruthy();
+  expect(container.querySelector("script, img")).toBeNull();
+  expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+  for (const unsafe of ["\u001b", "\u0007", "\u202e"]) expect(container.textContent).not.toContain(unsafe);
+});
+it("accepts twenty dispositions and a reason at the UTF8 byte boundary", () => {
+  const findings = Array.from({ length: 20 }, (_, i) => ({ id: "f" + i }));
+  const dispositions = findings.map(f => ({ finding_id: f.id, disposition: "addressed", reason: "界".repeat(341) + "a" }));
+  view({ findings, dispositions, finalized_at: "2026-10-11T00:00:00Z" });
+  expect(screen.getByText("20 addressed, 0 declined, 0 not reported")).toBeTruthy();
+  expect(screen.getAllByText("Disposition: addressed")).toHaveLength(20);
+});
+it("renders no opt-out evidence", () => {
+  const { container } = render(<MemoryRouter><CodeCrossCheck run={{ ...mockRuns[0], code_cross_check_required: false, code_cross_check_summary: undefined }} /></MemoryRouter>);
+  expect(container.textContent).toBe("");
+});
 it("rejects forged links and IDs and discloses field and item truncation", () => {
   view({ checker_run_id: "../settings", findings: Array.from({ length: 21 }, (_, i) => ({
     id: i === 0 ? "bad\n" : "f" + i, path: "界".repeat(900), title: "a".repeat(4000), detail: "b".repeat(4000), severity: "minor"

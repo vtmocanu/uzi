@@ -144,6 +144,107 @@ func TestRunGetCodeCrossCheckHostileBounds(t *testing.T) {
 	}
 }
 
+func TestRunGetCodeCrossCheckDispositions(t *testing.T) {
+	now := time.Now()
+	findings := json.RawMessage(`[{"id":"KEEP_id-1","title":"first"},{"id":"f2","title":"second"},{"id":"f3","title":"third"}]`)
+	batch := json.RawMessage(`[{"finding_id":"f2","disposition":"declined","reason":"verified second"},{"finding_id":"KEEP_id-1","disposition":"addressed","reason":"fixed first"},{"finding_id":"f3","disposition":"not_reported","reason":""}]`)
+	s := &apitypes.CodeCrossCheck{Outcome: "completed", Findings: findings, Dispositions: batch, FinalizedAt: &now}
+	out := codeCheckCommand(t, s)
+	for _, want := range []string{"1 addressed, 1 declined, 1 not reported", "CODE_CHECK_1_DISPOSITION", "fixed first", "verified second", "Finalized", "KEEP_id-1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q: %s", want, out)
+		}
+	}
+	s.InterruptedAt = &now
+	out = codeCheckCommand(t, s)
+	if strings.Contains(out, "_COUNTS") || !strings.Contains(out, "EARLIER_CODE_CHECK_1_DISPOSITION") || !strings.Contains(out, "fixed first") {
+		t.Fatalf("history: %s", out)
+	}
+	s.InterruptedAt = nil
+	s.FinalizedAt = nil
+	out = codeCheckCommand(t, s)
+	if !strings.Contains(out, "Pending report") || strings.Contains(out, "_COUNTS") {
+		t.Fatalf("pending: %s", out)
+	}
+	for _, raw := range []json.RawMessage{nil, json.RawMessage("null")} {
+		s.Dispositions = raw
+		out = codeCheckCommand(t, s)
+		if !strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS") || strings.Contains(out, "not reported") {
+			t.Fatalf("legacy: %s", out)
+		}
+	}
+	s.FinalizedAt = &now
+	s.Dispositions = batch
+	rawJSON := codeCheckCommand(t, s, "--json")
+	var decoded apitypes.RunDTO
+	if json.Unmarshal([]byte(rawJSON), &decoded) != nil || decoded.CodeCrossCheckSummary == nil {
+		t.Fatalf("JSON: %s", rawJSON)
+	}
+	expected, _ := json.Marshal(s)
+	actual, _ := json.Marshal(decoded.CodeCrossCheckSummary)
+	if string(expected) != string(actual) {
+		t.Fatalf("JSON evidence changed: %s", rawJSON)
+	}
+}
+
+func TestRunGetCodeCrossCheckDispositionValidation(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name                   string
+		findings, dispositions string
+	}{
+		{"unknown", `[{"id":"f1"}]`, `[{"finding_id":"f2","disposition":"addressed","reason":"hidden reason"}]`},
+		{"duplicate disposition", `[{"id":"f1"}]`, `[{"finding_id":"f1","disposition":"addressed","reason":"hidden reason"},{"finding_id":"f1","disposition":"declined","reason":""}]`},
+		{"duplicate finding", `[{"id":"f1"},{"id":"f1"}]`, `[{"finding_id":"f1","disposition":"addressed","reason":"hidden reason"}]`},
+		{"forged ID", `[{"id":"f1\n"}]`, `[{"finding_id":"f1","disposition":"addressed","reason":"hidden reason"}]`},
+		{"bad status", `[{"id":"f1"}]`, `[{"finding_id":"f1","disposition":"accepted","reason":"hidden reason"}]`},
+		{"missing reason", `[{"id":"f1"}]`, `[{"finding_id":"f1","disposition":"addressed","reason":null}]`},
+		{"incomplete finalized", `[{"id":"f1"}]`, `[]`},
+		{"null", `[{"id":"f1"}]`, `null`},
+		{"object", `[{"id":"f1"}]`, `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: json.RawMessage(tc.findings), Dispositions: json.RawMessage(tc.dispositions), FinalizedAt: &now})
+			if !strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS") || strings.Contains(out, "hidden reason") {
+				t.Fatalf("invalid evidence: %s", out)
+			}
+		})
+	}
+	for _, reason := range []string{strings.Repeat("界", 342), strings.Repeat("x", 1025), strings.Repeat("界", 341) + "a", "safe\nFORGED_ROW\t\x1b[31m\x07\u202e"} {
+		raw, _ := json.Marshal([]map[string]string{{"finding_id": "f1", "disposition": "addressed", "reason": reason}})
+		out := codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: json.RawMessage(`[{"id":"f1"}]`), Dispositions: raw, FinalizedAt: &now})
+		if len(reason) > 1024 {
+			if !strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS") {
+				t.Fatalf("byte cap: %s", out)
+			}
+		} else if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Contains(out, "\nFORGED_ROW") || !strings.Contains(out, "1 addressed, 0 declined, 0 not reported") {
+			t.Fatalf("unsafe: %q", out)
+		}
+	}
+	rawInvalid := []byte(`[{"finding_id":"f1","disposition":"addressed","reason":"`)
+	rawInvalid = append(rawInvalid, byte(0xff))
+	rawInvalid = append(rawInvalid, []byte(`"}]`)...)
+	out := codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: json.RawMessage(`[{"id":"f1"}]`), Dispositions: rawInvalid, FinalizedAt: &now})
+	if !strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS") {
+		t.Fatalf("invalid UTF8: %s", out)
+	}
+	for _, count := range []int{20, 21} {
+		findings := make([]map[string]string, count)
+		batch := make([]map[string]string, count)
+		for i := range count {
+			id := fmt.Sprintf("f%d", i)
+			findings[i] = map[string]string{"id": id}
+			batch[i] = map[string]string{"finding_id": id, "disposition": "addressed", "reason": strings.Repeat("x", 1024)}
+		}
+		f, _ := json.Marshal(findings)
+		d, _ := json.Marshal(batch)
+		out := codeCheckCommand(t, &apitypes.CodeCrossCheck{Outcome: "completed", Findings: f, Dispositions: d, FinalizedAt: &now})
+		if count == 20 && !strings.Contains(out, "20 addressed") || count == 21 && (!strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS")) {
+			t.Fatalf("item cap %d: %s", count, out)
+		}
+	}
+}
+
 func TestRunGetCodeCrossCheckJSONUnchanged(t *testing.T) {
 	s := &apitypes.CodeCrossCheck{Outcome: "pending", Findings: json.RawMessage("[]")}
 	out := codeCheckCommand(t, s, "--json")
