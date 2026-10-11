@@ -67,6 +67,7 @@ jobs:
               - '.github/workflows/kind-smoke.yml'
 
   kind-smoke:
+    # TEMP #2707 validation push A (old condition); removed before merge.
     needs: changes
     # Run on every push/tag/dispatch; on a PR only when chart surfaces changed.
     # always() ignores the `changes` job being skipped on non-PR events.
