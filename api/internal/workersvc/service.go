@@ -496,11 +496,15 @@ type Store interface {
 	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
-	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error)
+	RemoveMRReworkPendingKeys(ctx context.Context, arg store.RemoveMRReworkPendingKeysParams) error
 	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
-	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
-	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance). It returns
+	// the rows written; 0 means the row is legacy (ADR-1199) and nothing was written.
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) (int64, error)
+	// BootstrapMRReworkLedgerMarks upgrades a legacy ledger row to the namespaced state once
+	// (Service.BootstrapReviewLedger); 0 rows means the row moved or was already upgraded.
+	BootstrapMRReworkLedgerMarks(ctx context.Context, arg store.BootstrapMRReworkLedgerMarksParams) (int64, error)
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
