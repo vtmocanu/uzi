@@ -205,7 +205,10 @@ func TestRecoveryDownloadOutlivesServerWriteTimeoutLiveDB(t *testing.T) {
 		complete                  bool
 	}{
 		{"past_base_timeout", 5 * time.Second, 0, 750 * time.Millisecond, true},
-		{"absolute_upper_bound", 2 * time.Second, 1400 * time.Millisecond, 1400 * time.Millisecond, recoveryDeadlineUpperWantComplete},
+		// 4s effective deadline, 2s lookup pause, 3s producer pause: the first flush lands ~2s before the
+		// socket deadline and the second write ~1s after it and ~1s before the streaming context
+		// deadline (lookup + limit), so CI scheduling noise cannot erase either 300ms margin.
+		{"absolute_upper_bound", 4 * time.Second, 2 * time.Second, 3 * time.Second, recoveryDeadlineUpperWantComplete},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newRecoveryEnv(t)
