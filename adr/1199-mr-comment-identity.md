@@ -27,7 +27,7 @@ namespace per comment (`forge.CommentNS*`):
   `review_comment` (inline), `review` (review-summary bodies).
 - GitLab: `note` (one notes sequence covers inline and top-level notes).
 
-**Ledger state.** Migration 00322 adds two columns to `mr_rework_ledger`:
+**Ledger state.** Migration 00323 adds two columns to `mr_rework_ledger`:
 
 - `comment_marks` (jsonb): the highest consumed id per namespace, advanced per
   key only, never backward.
