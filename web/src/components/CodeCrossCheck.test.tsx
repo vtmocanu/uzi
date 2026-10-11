@@ -69,7 +69,7 @@ it("renders hostile prose and paths safely, strict IDs, validated child and subs
   expect(container.querySelector("script, img")).toBeNull();
   expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
   expect(screen.getByRole("link", { name: "Checker run" }).getAttribute("href")).toBe("/runs/12345678-abcd-abcd-abcd-123456789abc");
-  expect(screen.getByText("Checker cost: Subscription · subscription usage")).toBeTruthy();
+  expect(screen.getByText("Checker cost: No estimate · subscription usage")).toBeTruthy();
   expect(container.textContent).not.toContain("$0");
 });
 const persistedFindings = [
