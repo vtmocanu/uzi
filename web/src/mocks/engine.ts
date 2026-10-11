@@ -15,7 +15,9 @@ import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putPropo
 // Mock stand-ins for the server-side technical wall limit an extend must fit under.
 const MOCK_MAX_TOTAL_WALL_SECONDS = 2147483;
 const MOCK_RUN_TIMEOUT_SECONDS = 6 * 3600;
-const MOCK_RUN_WALL_CEILING_SECONDS = 24 * 3600;
+// The server reserves the maximum validated RUN_WALL_CEILING (72h) for every run, not the current
+// setting, so a later ceiling raise cannot push a run past the timer range (#2735).
+const MOCK_MAX_RUN_WALL_CEILING_SECONDS = 72 * 3600;
 const MOCK_MIN_FINALIZE_SECONDS = 1800;
 
 // ── Result frames (extracted, single source) ─────────────────────────────────
@@ -758,11 +760,11 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
           message: `${formatBudgetDuration(secs)} is more than the ${formatBudgetDuration(cap)} maximum per extension`,
         };
       }
-      // Mirror the server's technical room (a ~24.8 day total wall), with a mock RUN_TIMEOUT of 6h
-      // and wall ceiling of 24h standing in for the instance settings the web never sees.
+      // Mirror the server's technical room (a ~24.8 day total wall): it reserves the larger of the
+      // run's frozen wall, RUN_TIMEOUT (mock 6h) and the 72h maximum wall ceiling.
       const room =
         MOCK_MAX_TOTAL_WALL_SECONDS -
-        Math.max(run.budget_wall_seconds ?? 0, MOCK_RUN_TIMEOUT_SECONDS, MOCK_RUN_WALL_CEILING_SECONDS) -
+        Math.max(run.budget_wall_seconds ?? 0, MOCK_RUN_TIMEOUT_SECONDS, MOCK_MAX_RUN_WALL_CEILING_SECONDS) -
         Math.max(run.budget_finalize_seconds ?? 0, MOCK_MIN_FINALIZE_SECONDS) -
         currentExt;
       if (secs > room) {

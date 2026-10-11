@@ -68,13 +68,19 @@ describe("mock engine: extend (PRD #1189)", () => {
   });
 
   it("refuses with 409 when the total wall would exceed the technical room", () => {
-    // room = 2147483 - max(28800, 6h, 24h) - 1800 - ext; ext = 2000000 leaves 59283s.
-    patchRun(RUN_ID, { budget_extension_seconds: 2000000 });
-    const rej = handleInput(RUN_ID, "extend", "57600"); // within the cap, but 57600 < 59283 fits
+    // room = 2147483 - max(28800, 6h, 72h reserve) - 1800 - ext; ext = 1820000 leaves 66483s.
+    patchRun(RUN_ID, { budget_extension_seconds: 1820000 });
+    const rej = handleInput(RUN_ID, "extend", "57600"); // within the cap, and 57600 < 66483 fits
     expect(rej).toBeNull();
-    const over = handleInput(RUN_ID, "extend", "3600"); // ext now 2057600, room 1683
+    const over = handleInput(RUN_ID, "extend", "10800"); // ext now 1877600, room 8883
     expect(over).toMatchObject({ status: 409 });
     expect(over!.message).toMatch(/technical room/);
+  });
+
+  it("mirrors the server's 72h reserve at the fencepost (room 1886483s on a fresh run)", () => {
+    patchRun(RUN_ID, { budget_extension_seconds: 1886483 - 60 });
+    expect(handleInput(RUN_ID, "extend", "60")).toBeNull(); // exactly fills the room
+    expect(handleInput(RUN_ID, "extend", "60")).toMatchObject({ status: 409 }); // one more is refused
   });
 
   it("refuses a kind that never times out (a judge run) with 409", () => {
