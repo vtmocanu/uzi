@@ -365,6 +365,10 @@ func TestHeldFinalReplayRacingReleaseLiveDB(t *testing.T) {
 				if err != nil || !res.Released {
 					t.Errorf("winner = %+v, %v", res, err)
 				}
+				// After the winner commits, every mutable gate turns against the loser: the
+				// locked receipt compare must still answer the original ACK first.
+				e.exec("UPDATE workers SET protocol_capabilities='{}' WHERE id=$1", e.w.ID)
+				e.exec("UPDATE runs SET claim_generation=claim_generation+1 WHERE id=$1", e.run)
 				ran = true
 			}
 			res, err := e.release(e.w, e.request())

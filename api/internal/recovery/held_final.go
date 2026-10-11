@@ -44,6 +44,22 @@ const (
 // heldListTimeout bounds the one forge listing of step B (the reconcile listing's bound).
 const heldListTimeout = 10 * time.Second
 
+// ErrHeldRemoteGone is what a HeldRemoteFunc returns when the run, its repo or its forge
+// connection no longer exists, so no forge call can ever be brokered for it again. The handler
+// maps workersvc.ErrHeldRemoteGone onto it; step B then answers held_publication_not_eligible
+// (definitive, the worker falls back to the archive) instead of a retry that never ends.
+var ErrHeldRemoteGone = errors.New("recovery: held publication: the run, its repo or its forge connection is gone")
+
+// maxHeldLogLen bounds the forge error text a held release logs, in runes.
+const maxHeldLogLen = 400
+
+// heldLogText renders a forge listing error for a log line. go-git puts the whole response
+// body of the (attacker-controlled) forge in the error, so the text is secret-scrubbed, then
+// stripped of control, escape, bidi and zero-width runes and truncated.
+func heldLogText(err error) string {
+	return sanitizeLabel(secretscrub.Scrub(err.Error()), maxHeldLogLen)
+}
+
 var heldShaRe = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
 // HeldRemoteFunc derives the server-side forge connection of runID's repo for the held-ref
@@ -123,15 +139,73 @@ func (s *Service) releaseHeldPublication(ctx context.Context, wkr store.Worker, 
 	if !s.heldSupported(wkr.ProtocolCapabilities) {
 		return heldRetained(runID, generation, HeldReleaseUnsupported), nil
 	}
-	refDefect, err := s.heldRefDefect(ctx, runID, generation, f.SourceSha)
-	if err != nil {
-		slog.Warn("held publication release: forge recheck failed", "run", runID, "error", secretscrub.Scrub(err.Error()))
-		return heldRetained(runID, generation, HeldReleaseUnavailable), nil
+	// Cheap unlocked pre-check: an ineligible request must not make the API spend the owner's
+	// forge quota. A failed pre-check skips the listing but still goes through the locked
+	// transaction, whose receipt compare comes first.
+	fp := heldForgeProof{}
+	eligible, err := s.heldPrecheck(ctx, wkr, runID, generation, hold, publication, f)
+	switch {
+	case err != nil:
+		return apitypes.RecoveryReleaseResponse{}, err
+	case !eligible:
+		fp.skipped = true
+	default:
+		fp.refDefect, err = s.heldRefDefect(ctx, runID, generation, f.SourceSha)
+		switch {
+		case errors.Is(err, ErrHeldRemoteGone):
+			fp.gone = true
+		case err != nil:
+			slog.Warn("held publication release: forge recheck failed", "run", runID, "error", heldLogText(err))
+			return heldRetained(runID, generation, HeldReleaseUnavailable), nil
+		}
 	}
 	if s.heldPreLockHook != nil {
 		s.heldPreLockHook()
 	}
-	return s.releaseHeldLocked(ctx, wkr, runID, req, publication, refDefect)
+	return s.releaseHeldLocked(ctx, wkr, runID, req, publication, fp)
+}
+
+// heldForgeProof is the unlocked phase's verdict handed to the locked transaction.
+type heldForgeProof struct {
+	refDefect string // definitive ref reason to confirm under the locks, "" when the ref is at tip
+	skipped   bool   // the pre-check failed: no listing was made, so there is no proof to release on
+	gone      bool   // the forge connection is gone for good
+}
+
+// heldStateEligible is the mutable-state predicate shared by the unlocked pre-check and the
+// locked re-check.
+func heldStateEligible(status string, claimGen int64, runWorker pgtype.UUID, failOrigin pgtype.Text,
+	hold store.RecoveryCustodyHold, wkrID uuid.UUID, havePub bool, pub store.RunHeldPublication,
+	generation int64, publication uuid.UUID, f *apitypes.RecoveryFinalDisposition) bool {
+	return status == "failed" && !(failOrigin.Valid && (failOrigin.String == "push_secret_blocked" || failOrigin.String == "worker_residue_blocked")) &&
+		claimGen == generation && runWorker.Valid && uuid.UUID(runWorker.Bytes) == hold.OriginalWorkerID &&
+		hold.LiveWorkerID.Valid && uuid.UUID(hold.LiveWorkerID.Bytes) == wkrID &&
+		havePub && pub.ID == publication && pub.HoldID == hold.ID && pub.State == "created" &&
+		pub.Tip == f.SourceSha && pub.CoverageDigest == f.CoverageDigest
+}
+
+// heldPrecheck reads the mutable state without locks. false means the request is ineligible as
+// seen now (the locked transaction re-decides).
+func (s *Service) heldPrecheck(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64,
+	hold store.RecoveryCustodyHold, publication uuid.UUID, f *apitypes.RecoveryFinalDisposition) (bool, error) {
+	var (
+		status     string
+		claimGen   int64
+		runWorker  pgtype.UUID
+		failOrigin pgtype.Text
+	)
+	if err := s.pool.QueryRow(ctx, "SELECT status, claim_generation, worker_id, fail_origin FROM runs WHERE id=$1 AND user_id=$2",
+		runID, wkr.UserID).Scan(&status, &claimGen, &runWorker, &failOrigin); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	pub, err := store.New(s.pool).GetHeldPublicationByRunGeneration(ctx, store.GetHeldPublicationByRunGenerationParams{RunID: runID, Generation: generation})
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	return heldStateEligible(status, claimGen, runWorker, failOrigin, hold, wkr.ID, err == nil, pub, generation, publication, f), nil
 }
 
 // heldRefDefect lists the held ref once and returns "" when it is at tip, or the definitive
@@ -160,9 +234,10 @@ func (s *Service) heldRefDefect(ctx context.Context, runID uuid.UUID, generation
 	return "", nil
 }
 
-// releaseHeldLocked is step B's transaction. refDefect is the unlocked forge recheck's verdict;
-// it becomes a refusal only after the locked state agrees with the request.
-func (s *Service) releaseHeldLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest, publication uuid.UUID, refDefect string) (apitypes.RecoveryReleaseResponse, error) {
+// releaseHeldLocked is step B's transaction. fp is the unlocked phase's verdict; a ref defect
+// becomes a refusal only after the locked state agrees with the request, and a release needs a
+// forge proof (a skipped pre-check or a mutable state that changed to eligible is retried).
+func (s *Service) releaseHeldLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest, publication uuid.UUID, fp heldForgeProof) (apitypes.RecoveryReleaseResponse, error) {
 	f := req.FinalDisposition
 	generation := *req.Generation
 	ack := apitypes.RecoveryReleaseResponse{RunID: runID.String(), Released: true, HoldsReleased: 1, Generation: &generation}
@@ -230,15 +305,18 @@ func (s *Service) releaseHeldLocked(ctx context.Context, wkr store.Worker, runID
 	if !s.heldSupported(caps) || s.limits.ReadyRetention < time.Second {
 		return retained(HeldReleaseUnsupported)
 	}
-	if status != "failed" || (failOrigin.Valid && (failOrigin.String == "push_secret_blocked" || failOrigin.String == "worker_residue_blocked")) ||
-		claimGen != generation || !runWorker.Valid || uuid.UUID(runWorker.Bytes) != hold.OriginalWorkerID ||
-		!hold.LiveWorkerID.Valid || uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID ||
-		!havePub || pub.ID != publication || pub.HoldID != hold.ID || pub.State != "created" ||
-		pub.Tip != f.SourceSha || pub.CoverageDigest != f.CoverageDigest {
+	if !heldStateEligible(status, claimGen, runWorker, failOrigin, hold, wkr.ID, havePub, pub, generation, publication, f) {
 		return retained(HeldReleaseNotEligible)
 	}
-	if refDefect != "" {
-		return retained(refDefect)
+	if fp.gone {
+		return retained(HeldReleaseNotEligible)
+	}
+	if fp.skipped {
+		// Ineligible at the pre-check, eligible now: no forge proof was taken, so do not release.
+		return retained(HeldReleaseUnavailable)
+	}
+	if fp.refDefect != "" {
+		return retained(fp.refDefect)
 	}
 
 	n, err := qt.ReleaseHeldPublicationHold(ctx, store.ReleaseHeldPublicationHoldParams{

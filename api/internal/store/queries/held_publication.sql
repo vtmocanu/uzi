@@ -20,9 +20,9 @@ SELECT * FROM run_held_publications WHERE id = @id;
 SELECT * FROM run_held_publications WHERE run_id = @run_id AND generation = @generation;
 
 -- name: LockHeldPublicationByRunGeneration :one
--- The publication lock of the worker, run, hold, publication order. FOR NO KEY UPDATE, not FOR
--- UPDATE: step B's hold release takes the recovery_custody_holds.final_publication_id FK KEY
--- SHARE on this row, which FOR UPDATE would conflict with; the key never changes.
+-- The publication lock of the worker, run, hold, publication order.
+-- FOR NO KEY UPDATE, not FOR UPDATE: the key never changes, and the weaker mode does not block
+-- another transaction's FK KEY SHARE on this row (recovery_custody_holds.final_publication_id).
 SELECT * FROM run_held_publications WHERE run_id = @run_id AND generation = @generation FOR NO KEY UPDATE;
 
 -- name: MarkHeldCreateInvoked :one

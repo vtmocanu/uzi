@@ -587,9 +587,9 @@ type LockHeldPublicationByRunGenerationParams struct {
 	Generation int64     `json:"generation"`
 }
 
-// The publication lock of the worker, run, hold, publication order. FOR NO KEY UPDATE, not FOR
-// UPDATE: step B's hold release takes the recovery_custody_holds.final_publication_id FK KEY
-// SHARE on this row, which FOR UPDATE would conflict with; the key never changes.
+// The publication lock of the worker, run, hold, publication order.
+// FOR NO KEY UPDATE, not FOR UPDATE: the key never changes, and the weaker mode does not block
+// another transaction's FK KEY SHARE on this row (recovery_custody_holds.final_publication_id).
 func (q *Queries) LockHeldPublicationByRunGeneration(ctx context.Context, arg LockHeldPublicationByRunGenerationParams) (RunHeldPublication, error) {
 	row := q.db.QueryRow(ctx, lockHeldPublicationByRunGeneration, arg.RunID, arg.Generation)
 	var i RunHeldPublication

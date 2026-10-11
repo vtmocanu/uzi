@@ -20,7 +20,7 @@ const heldContractDir = "../../../fixtures/api-contract"
 
 func readHeldContract(t *testing.T, name string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(heldContractDir, name))
+	b, err := os.ReadFile(filepath.Join(heldContractDir, name)) //nolint:gosec // G304: reads a fixed repo fixture path, never run data.
 	if err != nil {
 		t.Fatal(err)
 	}

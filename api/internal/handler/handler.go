@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -524,6 +525,9 @@ func (h *Handler) recovery() *recovery.Service {
 				heldRemote := h.wsvc.HeldRemote()
 				h.recoverySvc.SetHeldPublication(h.cfg.HeldPublication, func(ctx context.Context, runID uuid.UUID) (pushbroker.ListRefsOptions, error) {
 					f, err := heldRemote(ctx, runID)
+					if errors.Is(err, workersvc.ErrHeldRemoteGone) {
+						err = recovery.ErrHeldRemoteGone
+					}
 					return f.ListOptions(), err
 				})
 			}
