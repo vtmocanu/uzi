@@ -10937,6 +10937,7 @@ export class RunRunner {
             }
             checkAck(requested);
             if (requested.status === "cancelled") return { kind: "cancel" };
+            if (requested.status === "awaiting_input") throw new RetainedRecoveryStop();
             if (requested.status !== "running" && requested.status !== "paused")
               throw new TrustedExecutionRefusal("park run request refused");
             const parked = requested.applied && requested.status === "running" &&
@@ -10967,6 +10968,8 @@ export class RunRunner {
             if (ownership.claim_generation !== flight.claimGeneration || ownership.claim_released !== false)
               throw new RetainedRecoveryStop();
             if (ownership.status === "paused" && ownership.hold_reason === null) return retainPause();
+            if (ownership.status === "paused" || ownership.status === "awaiting_input")
+              throw new RetainedRecoveryStop();
             if (ownership.status !== "running")
               throw new TrustedExecutionRefusal("park run ownership refused");
           }
@@ -16944,6 +16947,8 @@ export class RunRunner {
         throw new ServerWallParkedError();
       if (options.requireRunning && parked === "paused" && !(ack as StateAck).holdReason)
         throw new OrdinaryOwnerPaused();
+      if (options.requireRunning && (parked === "paused" || parked === "awaiting_input"))
+        throw new RetainedRecoveryStop();
       throw new TrustedExecutionRefusal(
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );

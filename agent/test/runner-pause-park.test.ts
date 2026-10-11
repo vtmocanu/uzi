@@ -450,11 +450,11 @@ describe("RunRunner — M2 explicit park callback", () => {
   async function exercise(options: {
     supported?: boolean; empty?: boolean; answer?: string; cancel?: boolean;
     retry?: boolean; lostAck?: boolean; guardedPause?: boolean; unknown?: boolean;
-    unattended?: boolean; ownership?: "wall" | "released" | "foreign";
+    unattended?: boolean; ownership?: "wall" | "released" | "foreign" | "completion";
     deadlineRetry?: boolean; cancelledBefore?: boolean; legacyGeneration?: boolean;
     nonissue?: boolean; requestRefused?: boolean; wallPending?: boolean; guardedWall?: boolean;
     guardedExistingQuestion?: boolean; failedProbe?: boolean;
-    pauseTransport?: "before" | "after"; questionTransport?: "replay" | "exhausted" | "httpFailure" | "unreadable" | "refused";
+    pauseTransport?: "before" | "after"; questionTransport?: "replay" | "exhausted" | "httpFailure" | "unreadable" | "completionHold" | "refused";
   } = {}) {
     const claim = { ...gitlabClaim(2657), claim_generation: options.legacyGeneration ? 0 : 1,
       ...(options.nonissue ? { kind: "prompt" as const } : {}),
@@ -466,6 +466,10 @@ describe("RunRunner — M2 explicit park callback", () => {
     };
     if (options.ownership === "wall") api.parkRunOwnership!.hold_reason = "budget_exhausted";
     if (options.ownership === "wall") api.parkRunOwnership!.status = "paused";
+    if (options.ownership === "completion") {
+      api.parkRunOwnership!.status = "paused";
+      api.parkRunOwnership!.hold_reason = "completion_blocked";
+    }
     if (options.ownership === "released") api.parkRunOwnership!.claim_released = true;
     if (options.ownership === "foreign") api.parkRunOwnership!.claim_generation = 2;
     if (options.guardedPause) api.guardedQuestionStatus = "paused";
@@ -496,7 +500,7 @@ describe("RunRunner — M2 explicit park callback", () => {
       if (options.failedProbe) throw new TypeError("probe unavailable");
       const own = await ownership(...args);
       // Keep the empty-checkpoint seam empty until the sink has declined it.
-      if (["exhausted", "httpFailure", "unreadable"].includes(options.questionTransport ?? "") && clonePath) fs.writeFileSync(path.join(clonePath, "DIRTY.txt"), "retained uncommitted work\n");
+      if ((options.ownership === "completion" || options.guardedExistingQuestion || ["exhausted", "httpFailure", "unreadable", "completionHold"].includes(options.questionTransport ?? "")) && clonePath) fs.writeFileSync(path.join(clonePath, "DIRTY.txt"), "retained uncommitted work\n");
       return own;
     };
     if (options.questionTransport) globalThis.fetch = async (input, init) => {
@@ -507,6 +511,7 @@ describe("RunRunner — M2 explicit park callback", () => {
       if (options.questionTransport === "exhausted") throw new TypeError("question transport unavailable");
       if (options.questionTransport === "httpFailure") return new Response("unavailable", { status: 503 });
       if (options.questionTransport === "unreadable") return new Response("unreadable ACK");
+      if (options.questionTransport === "completionHold") return Response.json({ run: { status: "paused", hold_reason: "completion_blocked" }, applied: false }, { status: 409 });
       if (questionBodies.length === 1) {
         await originalFetch(input, init); // Commit the question, then lose the response.
         throw new TypeError("lost question ACK");
@@ -669,6 +674,21 @@ describe("RunRunner — M2 explicit park callback", () => {
     assert.equal(outcome.questionBodies.length, 1);
     assert.ok(stateStatuses(outcome.claim.run_id).includes("failed"));
   });
+
+  for (const options of [
+    { empty: true, ownership: "completion" as const },
+    { empty: true, questionTransport: "completionHold" as const },
+    { empty: true, guardedExistingQuestion: true },
+  ]) {
+    it(`preserves a concurrent hold or unrelated question: ${JSON.stringify(options)}`, async () => {
+      const outcome = await exercise(options);
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.questions, 0);
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.workPreserved, true);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
 
   it("guard refusal reporting an ordinary pause returns paused without waiting or terminal failure", async () => {
     const outcome = await exercise({ empty: true, guardedPause: true });
