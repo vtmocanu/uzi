@@ -57,8 +57,6 @@ jobs:
       chart: ${{ steps.filter.outputs.chart }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - name: TEMP #2707 validation E, simulate a failed path filter
-        run: exit 1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4
         id: filter
         with:
@@ -69,7 +67,6 @@ jobs:
               - '.github/workflows/kind-smoke.yml'
 
   kind-smoke:
-    # TEMP #2707 validation push E (fix, failed filter); removed by the final head.
     needs: changes
     # Run on every push/tag/dispatch; on a PR only when chart surfaces changed.
     # !cancelled() ignores the `changes` job being skipped on non-PR events and,
