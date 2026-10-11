@@ -539,7 +539,49 @@ budget_exhausted`, not `failed` (PRD #1497).** It no longer has a
 `fail_origin` for the clock alone — do not wait for a `failed` state that no
 longer comes from the wall. Extend it (`uzi run extend RUN --by 2h`, which
 resumes it in one step) or recover it the same way you would any other
-non-terminal park.
+non-terminal park. After an extend, confirm with `uzi run get` that the run left
+`paused`: an extend refused at the cumulative cap can still print success
+(#2734).
+
+### Continue a run in a successor run (extension cap spent, or a harness switch)
+
+A run's harness is frozen at create. Until #2735 ships, an extend past the cumulative
+`budget_extension_cap_seconds` cannot add time; once it ships, the cap applies per
+request and this cap case goes away. To continue such a run, start a successor run. The successor is
+seeded from `origin/agent/issue-N` if that branch exists, otherwise from main. It never
+adopts another run's checkpoint, and `run create` has no base flag. `uzi handoff --base`
+gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
+
+1. **Capture commits plus dirty and untracked work.** Run `scripts/backup-runs.sh RUN`,
+   and compare its HEAD with the worker tracking ref and `refs/uzi-checkpoints/agent/issue-N`.
+   A `ckpt(overlay)` commit's message names its realTip: verify that SHA and the tree
+   difference rather than trusting the message. Push the freshest tip to
+   `recover/issue-N`. Before publishing the seed, account for every dirty and untracked
+   file in the backup. Put substantive unpublished work in a verified recovery commit,
+   or restore it into the successor through the recovery procedure before it runs: a
+   clean checkout of TIP alone does not bring over the backup's uncommitted work. Keep
+   the ref and the backup until both committed and uncommitted work are verified in the
+   successor.
+2. **Cancel normally, then verify the run is terminal** (`uzi run get RUN --json | jq -r
+   .status`). "cancellation sent" on a `paused` run, instead of "run cancelled", is
+   #1969: the cancel was queued for a worker that never polls a paused run. `uzi worker
+   rm` refuses while that worker holds the run. If cancellation remains queued, wait
+   for the #1969 fix, or use the exceptional workaround below after confirming its
+   worker-wide impact. Remove the workaround from this step once #1969 ships.
+   - Back up every flight on that worker first: a Docker worker's `/data/runner` is an
+     `emptyDir` lost with its pod.
+   - Confirm the impact on the whole worker with the user.
+   - Scale the worker's Deployment to 0.
+   - Wait until `uzi worker list` shows it `offline`. The threshold is
+     `WORKER_HEARTBEAT_STALE`, default 45s; a fixed sleep is not proof that it has passed.
+   - Re-cancel, and expect "run cancelled". Then scale the Deployment back to 1.
+3. **Publish the seed without force:** `git push origin TIP:refs/heads/agent/issue-N`.
+   If that branch already exists, or moves, stop and reconcile; never overwrite it.
+   Verify the remote tip with `git ls-remote`.
+4. **Create the successor gated** with `scripts/create-run.sh` plus `--harness` and
+   `--token`. Verify `harness`, `credential_override.label` and `auto_approve=false`
+   from `uzi run get`. At the gate, require the plan to build on the existing
+   commits and finish the in-progress milestone, and co-review it with the buddy.
 
 ## Cross-session handoff
 
