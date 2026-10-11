@@ -276,7 +276,7 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     releaseError: undefined as Error | undefined,
     cleanup: "removed" as "removed" | "retained",
     cleanupCalls: 0,
-    claimResult: "ok" as "ok" | "none" | "throw",
+    claimResult: "ok" as "ok" | "none" | "throw" | "hang",
     claimReads: [] as Array<Record<string, unknown>>,
     // behaviour of the redundancy RPC
     prove: async (): Promise<RecoveryArchiveRedundancyResponse> => ({ capture_id: "", outcome: "retained", reason: "not_ancestor" }),
@@ -354,6 +354,7 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     readRecoveryCoverageClaim: async (_b: string, o: Record<string, unknown>) => {
       state.claimReads.push(o);
       if (state.claimResult === "throw") throw new Error("read failed");
+      if (state.claimResult === "hang") return new Promise<RecoveryCoverageClaim | undefined>(() => undefined);
       return state.claimResult === "none" ? undefined : { ...cloneClaim, coverageDigest: o.fingerprint as string };
     },
   };
@@ -576,6 +577,21 @@ describe("RecoveryCoordinator redundancy claims", () => {
         assert.equal(h.state.proveCalls[0]!.signal?.aborted, true);
       } finally { await h.close(); }
     });
+    it("a claim read that hangs under the journal lock is cut off by the same deadline and cleanup completes", async () => {
+      const h = await harness({ redundancyDeadlineMs: 60 });
+      try {
+        await h.uploaded(true);
+        h.state.claimResult = "hang";
+        const guard = new Promise<"hung">(resolve => setTimeout(() => resolve("hung"), 3_000).unref());
+        const started = Date.now();
+        const outcome = await Promise.race([h.coordinator.forgetGeneration(h.runId, 7).then(() => "returned" as const), guard]);
+        assert.equal(outcome, "returned", `cleanup stalled behind a hung claim read (${Date.now() - started}ms)`);
+        assert.equal(h.state.claimReads.length, 1, "the read was attempted");
+        assert.equal(h.state.proveCalls.length, 0, "no claim is sent when its read did not finish");
+        assert.deepEqual(await h.coordinator.inspect(h.runId), [], "cleanup is unchanged");
+      } finally { await h.close(); }
+    });
+
     it("a client that aborts the caller synchronously and never settles still returns by the deadline", async () => {
       const h = await harness({ redundancyDeadlineMs: 40 });
       try {
