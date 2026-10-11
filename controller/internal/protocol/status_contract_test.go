@@ -35,14 +35,18 @@ func sampleStatusReport() StatusReport {
 	reason := "CrashLoopBackOff"
 	var exit int32 = 2
 
+	canary := "11111111-1111-1111-1111-111111111111"
+	blockingReason := "waiting_for_registration"
+	retained := "0.11.6"
 	return StatusReport{
-		ReportedAt:          time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
+		Kind: "fleet", ReportedAt: time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
 		PollIntervalSeconds: 10,
 		WorkerImageTag:      "0.11.7",
 		Workers: []WorkerStatus{
 			{
 				// The motivating incident, in fixture form: an init container wedged in
 				// CrashLoopBackOff reseeding the browser's nix closure.
+				Pacing:            &Pacing{State: "waiting_evidence", TargetImage: "harbor.example.com/uzi/agent-base:0.11.7", TargetVersion: "0.11.7", CanaryID: &canary, BlockingWorkerID: &canary, BlockingReason: &blockingReason, RetainedImage: &retained, RetainedVersion: &retained},
 				ID:                "11111111-1111-1111-1111-111111111111",
 				Phase:             PhaseStuck,
 				PhaseSince:        &phaseSince,

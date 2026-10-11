@@ -24,6 +24,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Hosted worker registrations now carry evidence for paced upgrades ([#1470](https://github.com/vtmocanu/uzi/issues/1470)).**
+  The API records a hosted pod's registration identity and a subsequent nonce-proven heartbeat, exposes additive controller evidence, and keeps image-roll drain ownership separate from maintenance fences. Older controllers retain their existing upgrade behavior; paced replacement is introduced by the accompanying controller changes.
 - **Cancelling a paused run now cancels it ([#1969](https://github.com/vtmocanu/uzi/issues/1969)).**
   A paused run (owner pause, credential disabled, wall-clock budget exhausted, or completion hold) whose worker was still online for other runs had its cancel queued for a worker that was not running it, so the run stayed paused and kept blocking new runs on its branch. The cancel now applies immediately (a run holding an unreported finished outcome still asks you to confirm discarding it first). A plan reject sent to a paused run, and an MR-close cancel of a paused MR rework run, now also apply immediately instead of being stranded.
 - **An owner's Extend on a time-budget park no longer reports a resume that never happened, and returns the right deadline ([#2734](https://github.com/vtmocanu/uzi/issues/2734)).**

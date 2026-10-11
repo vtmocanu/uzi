@@ -251,6 +251,9 @@ WITH prev AS (
         -- while any delayed high-epoch snapshot from the PREVIOUS process is rejected by the
         -- now-stale nonce — not by epoch. The nonce must live on the row (not in memory)
         -- because it is checked exactly when an api restart has forgotten everything else.
+        registered_pod_uid = sqlc.narg('registered_pod_uid')::uuid,
+        roll_heartbeat_at = NULL,
+        draining_reason = NULL,
         snapshot_register_nonce = @snapshot_register_nonce,
         snapshot_epoch      = 0,
         last_heartbeat_at   = now(),

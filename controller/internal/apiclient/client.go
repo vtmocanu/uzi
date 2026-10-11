@@ -13,7 +13,6 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -21,11 +20,6 @@ import (
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
-
-// maxErrorBodyBytes bounds how much of a non-2xx response we read back for the
-// error message, so a misrouted request to something that streams cannot balloon
-// the controller's memory.
-const maxErrorBodyBytes = 4 << 10
 
 // Client calls the uzi api's controller endpoints.
 type Client struct {
@@ -94,18 +88,10 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return protocol.PollResponse{}, fmt.Errorf("apiclient: poll: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return protocol.PollResponse{}, fmt.Errorf("apiclient: poll: api returned %d", resp.StatusCode)
 	}
 
-	var out protocol.PollResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		// The body may carry join-token plaintext, so the decode error is reported
-		// bare — json.Decode errors quote the offending token, and this response is
-		// the one place a plaintext could end up in a log line.
-		return protocol.PollResponse{}, fmt.Errorf("apiclient: decode poll response")
-	}
-	return out, nil
+	return decodePoll(resp)
 }
 
 // Report POSTs per-worker roll health to the api (PRD #113 M3).
@@ -162,8 +148,7 @@ func (c *Client) reportStatus(ctx context.Context, report protocol.StatusReport,
 	// exactly, so an api that grows a body later does not break this side — the
 	// response is never read regardless, which is what keeps the channel one-way.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return fmt.Errorf("apiclient: status report: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return fmt.Errorf("apiclient: status report: api returned %d", resp.StatusCode)
 	}
 	// Deliberately NOT decoding the response. A display-only sink returns 204 with no
 	// body, and reading one would be the first step towards this becoming a second
@@ -182,8 +167,15 @@ func (c *Client) reportStatus(ctx context.Context, report protocol.StatusReport,
 // without this endpoint) — is returned as an error, so the caller DEFERS the roll
 // rather than proceeding. A busy worker whose cordon could not be written is left
 // running, never hard-killed; deferring costs a tick, hard-killing costs a run.
-func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/workers/"+workerID+"/drain", nil)
+func (c *Client) RequestDrainWithReason(ctx context.Context, workerID string, reason ...string) error {
+	var body []byte
+	if len(reason) > 0 && reason[0] != "" {
+		if len(reason) != 1 || reason[0] != "image_roll" {
+			return fmt.Errorf("apiclient: invalid drain reason")
+		}
+		body = []byte(`{"reason":"image_roll"}`)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/workers/"+workerID+"/drain", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("apiclient: build drain request: %w", err)
 	}
@@ -197,8 +189,7 @@ func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
 
 	// 204 is the documented success. Accept the 2xx band rather than pinning 204.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return fmt.Errorf("apiclient: drain request: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return fmt.Errorf("apiclient: drain request: api returned %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -226,8 +217,15 @@ func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
 //
 // Only OTHER non-2xx (5xx store errors) and transport/build errors are returned as
 // errors; the caller logs and retries next tick.
-func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/controller/workers/"+workerID+"/drain", nil)
+func (c *Client) ClearDrainWithReason(ctx context.Context, workerID string, reason ...string) error {
+	var body []byte
+	if len(reason) > 0 && reason[0] != "" {
+		if len(reason) != 1 || reason[0] != "image_roll" {
+			return fmt.Errorf("apiclient: invalid drain reason")
+		}
+		body = []byte(`{"reason":"image_roll"}`)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/controller/workers/"+workerID+"/drain", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("apiclient: build clear-drain request: %w", err)
 	}
@@ -246,8 +244,14 @@ func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
 		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return fmt.Errorf("apiclient: clear-drain request: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return fmt.Errorf("apiclient: clear-drain request: api returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
+	return c.RequestDrainWithReason(ctx, workerID)
+}
+func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
+	return c.ClearDrainWithReason(ctx, workerID)
 }

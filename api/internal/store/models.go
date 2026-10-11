@@ -1500,6 +1500,9 @@ type Worker struct {
 	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
 	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
+	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason           pgtype.Text        `json:"draining_reason"`
 }
 
 type WorkerActiveRun struct {

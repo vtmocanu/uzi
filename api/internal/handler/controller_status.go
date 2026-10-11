@@ -75,6 +75,10 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if req.Kind != "" && req.Kind != "fleet" && req.Kind != "readiness" {
+		httpx.Error(w, http.StatusBadRequest, "invalid report kind")
+		return
+	}
 	if len(req.Workers) > maxStatusReportWorkers {
 		httpx.Error(w, http.StatusBadRequest, "too many workers in report")
 		return

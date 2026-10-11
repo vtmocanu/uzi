@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -33,7 +36,11 @@ func (h *Handler) ControllerCordonWorker(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	found, err := h.hsvc.Cordon(r.Context(), id)
+	reason, ok := controllerDrainReason(w, r)
+	if !ok {
+		return
+	}
+	found, err := h.hsvc.Cordon(r.Context(), id, reason)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -67,7 +74,11 @@ func (h *Handler) ControllerUncordonWorker(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	found, err := h.hsvc.Uncordon(r.Context(), id)
+	reason, ok := controllerDrainReason(w, r)
+	if !ok {
+		return
+	}
+	found, err := h.hsvc.Uncordon(r.Context(), id, reason)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -77,4 +88,26 @@ func (h *Handler) ControllerUncordonWorker(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func controllerDrainReason(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var req struct {
+		Reason string `json:"reason,omitempty"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpx.Error(w, http.StatusBadRequest, "invalid drain request")
+		return "", false
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		httpx.Error(w, http.StatusBadRequest, "invalid drain request")
+		return "", false
+	}
+	if req.Reason != "" && req.Reason != "image_roll" {
+		httpx.Error(w, http.StatusBadRequest, "invalid drain reason")
+		return "", false
+	}
+	return req.Reason, true
 }

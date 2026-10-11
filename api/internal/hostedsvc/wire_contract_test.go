@@ -29,8 +29,20 @@ const wireContractFixture = "testdata/controller_poll_wire.json"
 // token is an obvious non-credential so secret scanners never flag the fixture.
 func samplePollResponse() PollResponse {
 	token := "uzw_EXAMPLE-NOT-A-REAL-TOKEN" //nolint:gosec // G101: a deliberate non-credential fixture value (see the doc comment above), not a hardcoded secret.
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	owner := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	nonce := "registration-nonce"
+	version := "0.11.7"
+	pod := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	reason := "image_roll"
 	return PollResponse{Workers: []DesiredWorker{
 		{
+			RollEvidence: &RollEvidence{
+				Version: 1, OwnerID: owner, Registered: true,
+				SchedulingCapabilities: []string{"docker"}, ProtocolCapabilities: []string{"cross_check_v1", "cross_check_lane_v1"},
+				OrdinaryCoverage: true, CheckerCoverage: true, RegisteredVersion: &version,
+				RegisterNonce: &nonce, PodUID: &pod, HeartbeatAt: &at, EvaluatedAt: at, ValidUntil: at.Add(45 * time.Second),
+			},
 			ID:         "11111111-1111-1111-1111-111111111111",
 			Template:   "base",
 			Size:       "s",
@@ -61,10 +73,12 @@ func samplePollResponse() PollResponse {
 			JoinToken:   &token,
 		},
 		{
-			ID:         "22222222-2222-2222-2222-222222222222",
-			Template:   "jvm",
-			Size:       "l",
-			Generation: 4,
+			RollEvidence:   &RollEvidence{Version: 1, OwnerID: owner, SchedulingCapabilities: []string{}, ProtocolCapabilities: []string{}, EvaluatedAt: at, ValidUntil: at},
+			DrainingReason: &reason,
+			ID:             "22222222-2222-2222-2222-222222222222",
+			Template:       "jvm",
+			Size:           "l",
+			Generation:     4,
 			// docker false: #58's plain single-container worker in the restricted
 			// namespace — both docker states on one wire so a drop of the field is a
 			// red build on both sides.
