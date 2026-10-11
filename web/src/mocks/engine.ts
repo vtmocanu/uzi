@@ -456,8 +456,9 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
       delay: 1500,
       step: () => {
         const plan = `${SAMPLE_PLAN()}\n\n> Revised after rejection: ${reason || "(no reason given)"}`;
-        appendMessage(runId, "plan", "lead", { plan_md: plan });
-        appendMessage(runId, "status", null, { text: "revised plan submitted — awaiting approval" });
+        // Patch the run BEFORE appending: appendMessage broadcasts synchronously and the
+        // plan frame makes the page re-read the run, which must already be un-revising
+        // with the bumped gate_revision (issue #2760).
         // PRD #122: the re-gate still shows the milestones as PRE-APPROVAL candidates.
         patchRun(runId, {
           status: "awaiting_approval",
@@ -469,6 +470,8 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
           milestones_completed: null,
           milestones_in_progress: null,
         });
+        appendMessage(runId, "plan", "lead", { plan_md: plan });
+        appendMessage(runId, "status", null, { text: "revised plan submitted — awaiting approval" });
       },
     },
   ];
@@ -639,11 +642,12 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     case "revise_plan": {
       if (run.status !== "awaiting_approval") return null;
       const round = countPlanFeedback(runId) + 1;
-      appendMessage(runId, "plan_feedback", null, { feedback: body });
-      appendMessage(runId, "plan_revising", "lead", { round });
       // Mirrors the server's runToDTO: the latest plan-family message is plan_revising, so
       // is_revising is true and progress derives to "planning" until the next plan lands.
+      // Patched BEFORE the broadcasting appends so the plan_revising frame's run re-read sees it.
       patchRun(runId, { is_revising: true });
+      appendMessage(runId, "plan_feedback", null, { feedback: body });
+      appendMessage(runId, "plan_revising", "lead", { round });
       schedule(runId, revisedPlanScript(runId, body));
       return null;
     }

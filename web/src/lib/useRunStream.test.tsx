@@ -565,4 +565,55 @@ describe("useRunStream live revise cycle (issue #2760)", () => {
     await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(false));
     expect(result.current.run?.progress?.state).toBe("waiting");
   });
+
+  it("re-reads the run when a gap-repair replay ingests a plan_revising message", async () => {
+    let serverRevising = false;
+    vi.spyOn(api, "getRun").mockImplementation(async () => ({ run: gate(serverRevising) }));
+    const getMsgs = vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.status).toBe("awaiting_approval"));
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+    expect(isRevisingRun(result.current.run!)).toBe(false);
+
+    // The server entered the revise while frames were dropped: the live frame that
+    // arrives is seq 3 (a gap), and the replay carries the missed plan_revising.
+    serverRevising = true;
+    getMsgs.mockResolvedValue({
+      messages: [1, 2, 3].map((seq) => ({
+        seq,
+        kind: seq === 2 ? "plan_revising" : "text",
+        agent: null,
+        agent_instance: null,
+        agent_label: null,
+        payload: {},
+        created_at: "",
+      })),
+    });
+    await act(async () => {
+      LiveSocket.last!.deliver(frame(3, "text"));
+    });
+    await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(true));
+    expect(result.current.run?.progress?.state).toBe("planning");
+  });
+
+  it("re-reads the run on reconnect", async () => {
+    let serverRevising = false;
+    vi.spyOn(api, "getRun").mockImplementation(async () => ({ run: gate(serverRevising) }));
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.status).toBe("awaiting_approval"));
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+
+    serverRevising = true;
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+    await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(true));
+  });
 });

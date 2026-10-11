@@ -12,7 +12,7 @@ import {
   type SteerInput,
   type WsEvent,
 } from "./api";
-import { applyFrame, emptyStream, ingestMany, type StreamState } from "./runStream";
+import { applyFrame, emptyStream, hasRefreshKind, ingestMany, type StreamState } from "./runStream";
 
 const RECONNECT_MS = 1500;
 const CATCHUP_DEBOUNCE_MS = 150;
@@ -61,19 +61,6 @@ export function useRunStream(runId: string) {
     setMessages(s.messages);
   }, []);
 
-  const replay = useCallback(async () => {
-    if (runId !== activeRunIdRef.current) return;
-    const gen = genRef.current;
-    try {
-      const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
-      if (gen !== genRef.current) return;
-      commit(ingestMany(streamRef.current, batch).state);
-    } catch {
-      // Transient; the next frame or reconnect retries. The log is durable, so a
-      // failed catch-up only delays rendering, never loses a message.
-    }
-  }, [runId, commit]);
-
   const refreshRun = useCallback(async () => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
@@ -87,6 +74,23 @@ export function useRunStream(runId: string) {
       if (e instanceof ApiError) setError(e.message);
     }
   }, [runId]);
+
+  const replay = useCallback(async () => {
+    if (runId !== activeRunIdRef.current) return;
+    const gen = genRef.current;
+    try {
+      const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
+      if (gen !== genRef.current) return;
+      commit(ingestMany(streamRef.current, batch).state);
+      // A replayed plan/plan_revising/progress_note never arrived as a live frame, so
+      // nothing else re-reads the run for it (a revise changes no status, hence no state
+      // frame follows): apply the same refresh a live frame of that kind would (issue #2760).
+      if (hasRefreshKind(batch)) void refreshRun();
+    } catch {
+      // Transient; the next frame or reconnect retries. The log is durable, so a
+      // failed catch-up only delays rendering, never loses a message.
+    }
+  }, [runId, commit, refreshRun]);
 
   // refreshInputs re-reads the steer queue (PRD #95). Best-effort and SILENT on error:
   // a non-owner viewer (an admin on someone else's run) 404s here, which Decision 8/N2
@@ -159,6 +163,9 @@ export function useRunStream(runId: string) {
       ws.onopen = () => {
         setConnected(true);
         void replay();
+        // A reconnect may have missed a plan/plan_revising frame, and a revise changes
+        // no status, so re-read the run here too (issue #2760).
+        void refreshRun();
         // Reconcile the steer queue on every (re)connect, alongside the message
         // replay (PRD #95 S1): the `input` frame is droppable, so a follow-up
         // consumed while we were disconnected would otherwise strand at Queued —

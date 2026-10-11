@@ -82,6 +82,12 @@ export interface FrameEffects {
 // Message kinds whose arrival changes a server-derived Run field, so the page re-reads the run.
 const REFRESH_KINDS = new Set<string>(["progress_note", "plan", "plan_revising"]);
 
+// hasRefreshKind: true when any message in a replayed/caught-up batch is one whose live
+// arrival would have re-read the run, so replay paths trigger the same re-read.
+export function hasRefreshKind(msgs: readonly RunMessage[]): boolean {
+  return msgs.some((m) => REFRESH_KINDS.has(m.kind));
+}
+
 // applyFrame folds one live WS frame into the stream and reports the side-effects
 // it triggers. A "message" frame is ingested (a seq gap asks for a replay to fill
 // it). A "state" frame carries NO authoritative data — it asks for a run re-read
