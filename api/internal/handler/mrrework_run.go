@@ -172,10 +172,10 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		// The ledger row is read BEFORE the comment listing: every pending id in it existed before
-		// the list was fetched, so a pending id absent from the list is gone, whatever the forge's
-		// comment-id order. StartMRReworkForRun plans against these values (carried on the
-		// assessment result), never a later re-read.
+		// The ledger row is read BEFORE the comment listing: every pending key in it existed before
+		// the list was fetched, so a pending key absent from the list is gone. A legacy row is
+		// bootstrapped from the listing below (ADR-1199). StartMRReworkForRun plans against the
+		// resulting state (carried on the assessment result), never a later re-read.
 		led, err := h.q.GetMRReworkLedger(r.Context(), store.GetMRReworkLedgerParams{RepoID: repo.ID, Ref: run.Branch.String})
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			slog.Error("mr-rework: read ledger", "error", err)
@@ -188,6 +188,22 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadGateway, "could not read the merge request comments: "+err.Error())
 			return
 		}
+		state, err := h.wsvc.BootstrapReviewLedger(r.Context(), repo.ID, run.Branch.String, led, comments)
+		if err != nil {
+			var overflow *workersvc.ReviewLedgerBootstrapOverflowError
+			switch {
+			case errors.As(err, &overflow):
+				slog.Warn("mr-rework: review ledger bootstrap overflow", "repo_id", repo.ID, "ref", run.Branch.String,
+					"legacy_ids", overflow.LegacyIDs, "expanded_keys", overflow.ExpandedKeys)
+				httpx.Error(w, http.StatusConflict, err.Error())
+			case errors.Is(err, workersvc.ErrReworkLedgerChanged):
+				httpx.Error(w, http.StatusConflict, err.Error())
+			default:
+				slog.Error("mr-rework: bootstrap review ledger", "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
 		as, err := assessor.Begin(r.Context(), workersvc.ReviewAssessParams{
 			AssessmentTimeout: issueinput.InteractiveAssessmentTimeout,
 			RepoID:            repo.ID,
@@ -198,8 +214,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			Lookup:            f,
 			Trusted:           trusted,
 			Comments:          comments,
-			HighWater:         led.HighWater,
-			Pending:           led.PendingUnknownIds,
+			Ledger:            state,
 			QueueBound:        queueBound,
 		})
 		if err != nil {
@@ -225,7 +240,9 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, workersvc.ErrReworkMRNotOpen),
 			errors.Is(err, workersvc.ErrReworkNoToken),
 			errors.Is(err, workersvc.ErrReworkNothingNew),
-			errors.Is(err, workersvc.ErrReworkPermissionUnknown):
+			errors.Is(err, workersvc.ErrReworkPermissionUnknown),
+			errors.Is(err, workersvc.ErrReworkLedgerChanged),
+			errors.Is(err, workersvc.ErrReviewLedgerBootstrapOverflow):
 			// Each carries its own user-facing reason (the service's sentinel message).
 			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrBranchInUse):
