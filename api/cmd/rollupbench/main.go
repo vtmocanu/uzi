@@ -376,7 +376,6 @@ func run(ctx context.Context, opt Options) error {
 	seenCodec := map[CodecID]bool{}
 	for i, sel := range selected {
 		first := !seenCodec[sel.Config.Spec.ID]
-		seenCodec[sel.Config.Spec.ID] = true
 		cr, err := env.runConfig(ctx, i, sel, &attrib)
 		if cr != nil {
 			if err != nil {
@@ -390,6 +389,7 @@ func run(ctx context.Context, opt Options) error {
 			continue
 		}
 		if first {
+			seenCodec[sel.Config.Spec.ID] = true // only a config that completed counts as this codec's check
 			rep, cerr := env.runCorrectness(ctx, i, sel)
 			if rep == nil {
 				rep = &ConcurrencyReport{}
@@ -415,7 +415,7 @@ func run(ctx context.Context, opt Options) error {
 	}
 	res.Notes = append(res.Notes,
 		"C7 (reader inventory) is written by the lead in the PRD: C7: not evaluated by harness",
-		"pg_waldump --stats per phase is not run by the harness; pg_stat_wal and pg_current_wal_lsn deltas are the WAL evidence",
+		"pg_waldump --stats per phase is not run by the harness; the pg_current_wal_insert_lsn delta is the WAL evidence; pg_stat_wal figures (wal_bytes, wal_fpi, wal_records) are a cross-check, not exact: backends report their counters lazily, so they are a lower bound",
 		"percentiles are nearest-rank; p99 over ~1000 samples is indicative only; heavy shapes ran fewer iterations (recorded per cell)")
 	res.CompletedAll = true
 	res.Meta["finished_utc"] = time.Now().UTC().Format(time.RFC3339)

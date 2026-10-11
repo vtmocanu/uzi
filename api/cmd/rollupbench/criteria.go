@@ -191,7 +191,7 @@ func evaluate(r *ConfigResult, live *LiveBaseline, a *Attrib, readers []int, lar
 		d["post_over_pre"] = ratio
 		d["reusable_free_space_bytes_after_vacuum"] = reusable
 		d["reusable_over_pre"] = reuse
-		c := verdict("C1", "post-VACUUM-FULL footprint <= 50% of pre-rollup AND reusable space after plain VACUUM >= 40%", pre > 0 && ratio <= 0.5 && reuse >= 0.4, d)
+		c := verdict("C1", "footprint <= 50% (pre: VACUUM FULL baseline of the archived runs; post: chunk + watermark tables after plain VACUUM, insert-only) AND reusable space after plain VACUUM >= 40%", pre > 0 && ratio <= 0.5 && reuse >= 0.4, d)
 		c.Note = r.C1.Note
 		if pre <= 0 {
 			c.Note = "pre-rollup footprint of the archived runs is zero: nothing was archived or measured"

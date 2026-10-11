@@ -132,6 +132,12 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 	if bo.withLoad {
 		rep.LiveLoad = e.idleLive(ctx, pool)
 	}
+	// markWAL resets the pool, so it runs before the live readers, the probe and the hooks take
+	// their connections: a reset after that would drop them mid-measurement.
+	wm, err := markWAL(ctx, pool)
+	if err != nil {
+		return rep, err
+	}
 	// Every background goroutine is stopped on every return path (the stops are idempotent), so
 	// an error mid-backfill cannot leave readers, probes or the straggler running into the next phase.
 	loadStop := sync.OnceValue(e.startLiveLoad(ctx, pool, bo.withLoad))
@@ -145,10 +151,6 @@ func (e *Env) backfill(ctx context.Context, pool *pgxpool.Pool, bo backfillOpts)
 	if bo.hooks != nil {
 		bo.hooks.start(ctx)
 		stopHooks = sync.OnceFunc(bo.hooks.stop)
-	}
-	wm, err := markWAL(ctx, pool)
-	if err != nil {
-		return rep, err
 	}
 	t0 = time.Now()
 	var lockWaits []time.Duration
@@ -390,6 +392,11 @@ type ConcurrencyReport struct {
 	Digests   *DigestCheck     `json:"reader_results_after_the_concurrent_backfill,omitempty"`
 }
 
+// stragglerInsertTimeout bounds one straggler insert. It sits well above the C5 largest
+// transaction bar (30 s): an insert blocked behind a rollup transaction at that bar must not
+// be cut off and counted as an error.
+const stragglerInsertTimeout = 120 * time.Second
+
 // blockedAfter is the insert wait that counts as "blocked by the rollup's row lock": an
 // unblocked insert on a local server takes well under a millisecond.
 const blockedAfter = 2 * time.Millisecond
@@ -560,7 +567,7 @@ func (c *concurrencyCheck) stragglerLoop(ctx context.Context) {
 		c.intent[id][seq] = true // recorded before the insert, so a reader can never see an unexplained row
 		c.mu.Unlock()
 		issuedOpen := c.fl.isOpen(id)
-		ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stragglerInsertTimeout)
 		t0 := time.Now()
 		_, err := c.pool.Exec(ictx, `INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, $2, 'text', '{"text":"late"}')`, id, seq)
 		d := time.Since(t0)

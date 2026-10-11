@@ -47,27 +47,34 @@ func explainRequest(ctx context.Context, pool *pgxpool.Pool, run uuid.UUID, sp R
 	var b strings.Builder
 	b.WriteString("-- chunk metadata query\n")
 	sql, args := metasQuery(run, sp, 0, false)
-	plan, err := explainText(ctx, tx, sql, args)
+	plan, err := explainText(ctx, tx, "", sql, args)
 	b.WriteString(plan)
 	if err != nil {
 		return b.String(), err
 	}
 	metas, err := (&pgArchStore{q: tx, run: run}).metas(ctx, sp, 0, false)
-	if err != nil || len(metas) == 0 {
+	if err != nil {
 		return b.String(), err
+	}
+	if len(metas) == 0 {
+		b.WriteString("\n-- chunk body fetch: not recorded, the metadata query found no chunks for this request\n")
+		return b.String(), nil
 	}
 	var firsts []int
 	for i := 0; i < len(metas) && i < 2; i++ {
 		firsts = append(firsts, metas[i].first)
 	}
 	b.WriteString("\n-- chunk body fetch (first two candidate chunks)\n")
-	plan, err = explainText(ctx, tx, sqlChunkBodies, []any{run, firsts})
+	// SERIALIZE (PG17) makes the plan include the cost of detoasting and converting the bytea
+	// result, which is where the chunk bodies' I/O sits.
+	plan, err = explainText(ctx, tx, ", SERIALIZE TEXT", sqlChunkBodies, []any{run, firsts})
 	b.WriteString(plan)
 	return b.String(), err
 }
 
-func explainText(ctx context.Context, q queryer, sql string, args []any) (string, error) {
-	rows, err := q.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) "+sql, args...)
+// explainText runs EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT<extra>) over sql.
+func explainText(ctx context.Context, q queryer, extra, sql string, args []any) (string, error) {
+	rows, err := q.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT"+extra+") "+sql, args...)
 	if err != nil {
 		return "", err
 	}

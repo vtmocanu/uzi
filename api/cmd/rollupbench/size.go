@@ -143,7 +143,9 @@ const statsSettleTimeout = 15 * time.Second
 // new window after the reset.
 func markWAL(ctx context.Context, pool *pgxpool.Pool) (walMark, error) {
 	m := walMark{t: time.Now(), taken: true}
-	pool.Reset()
+	if err := resetAndWaitGone(ctx, pool); err != nil {
+		return m, err
+	}
 	if _, err := pool.Exec(ctx, `SELECT pg_stat_reset_shared('wal')`); err != nil {
 		return m, err
 	}
@@ -153,6 +155,37 @@ func markWAL(ctx context.Context, pool *pgxpool.Pool) (walMark, error) {
 	var err error
 	m.ckpt, err = checkpointerStats(ctx, pool)
 	return m, err
+}
+
+// pidsGoneTimeout bounds how long markWAL waits for the reset pool's old backends to exit.
+const pidsGoneTimeout = 5 * time.Second
+
+// resetAndWaitGone resets the pool and polls pg_stat_activity until the backends it held have
+// exited, so their final stats report cannot land after the following pg_stat_reset_shared.
+// It stops waiting after pidsGoneTimeout; the window is then a best effort.
+func resetAndWaitGone(ctx context.Context, pool *pgxpool.Pool) error {
+	var pids []int32
+	for _, c := range pool.AcquireAllIdle(ctx) {
+		pids = append(pids, int32(c.Conn().PgConn().PID())) //nolint:gosec // G115: a backend pid fits int32.
+		c.Release()
+	}
+	pool.Reset()
+	deadline := time.Now().Add(pidsGoneTimeout)
+	for len(pids) > 0 && time.Now().Before(deadline) {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE pid = ANY($1)`, pids).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 // endWAL reads the counters since mark. The pool is reset so every backend that wrote reports
