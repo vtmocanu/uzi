@@ -309,6 +309,44 @@ retained head once: a later checkpoint or a resume on the same worker
 announces only heads it has not announced, and archive notices are tracked
 separately from head notices.
 
+### When a run is stopped by a stale or fenced claim
+
+A worker stops a flight when its claim has gone stale (`stale_claim`), when an
+input receipt fenced it, or when its first running report came back with a terminal
+status. In each case the worker keeps the clone's unfetched commits and its dirty
+and untracked files instead of tearing the clone down. It stops the flight's own
+processes first, then makes no further report, publish or tracking write through
+the stopped claim, and records the source as retained:
+
+- **Attempt clone (Docker-wired worker):** the attempt ledger entry is marked
+  `reclaimed` and the plain recovery journal is cleared.
+- **Canonical clone:** a `uzi-stopped` marker is written and the journal is kept.
+
+A clean clone sitting at a tracking tip owned by this run and generation still
+tears down, because there is nothing in it to lose.
+
+What a successor sees depends on the worker. On a Docker-wired (attempt-path)
+worker, a successor for the same run starts in a fresh attempt and leaves the
+retained clone alone. On a non-Docker worker, a successor that would reuse the
+retained canonical clone fails with `fail_origin` `worker_residue_blocked`; its
+message names the worker-local inspect command.
+
+This is **local retention only**. It is not a published checkpoint, an archive or
+server custody, and nothing about it appears in the feed or in `uzi run recovery`
+as a hold:
+
+- A restart of the same worker pod keeps the retained clone.
+- Replacing the pod loses an `emptyDir` clone on the Docker tier, even though the
+  bare repository's ledger entry or marker survive on the data volume. Inspect
+  then reports the source as missing, never as empty.
+- Tearing down the PVC loses both.
+
+A successor's release of the old hold is not proof that the old clone's dirty
+bytes were preserved; only a published checkpoint, an archive or the retained
+clone itself holds them. A retained source is removed only through the
+worker-local inspect and discard commands in
+[Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard).
+
 ### Guarded inventory and final custody transfer
 
 A claim is inventory-guarded when it has `inventory_guarded: true` and the
