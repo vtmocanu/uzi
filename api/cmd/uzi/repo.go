@@ -102,8 +102,9 @@ func confirmRemoveRepo(env Env, id string) (bool, error) {
 	return ans == "y" || ans == "yes", nil
 }
 
-// crossCheckGuidanceCell reports only whether owner guidance is set and its
-// size. The body is never rendered: the CLI shows guidance, it does not echo it.
+// crossCheckGuidanceCell is the table cell for the owner's code cross-check
+// guidance: only whether it is set and its byte length, never the text.
+// `--json` carries the stored value; the CLI never writes guidance.
 func crossCheckGuidanceCell(g *string) string {
 	if g == nil || *g == "" {
 		return "none"

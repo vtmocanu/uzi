@@ -1605,32 +1605,6 @@ export class WorkerClient {
     });
   }
 
-  /**
-   * Report a run state and return what the server made of it. Every report —
-   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
-   * limit_wait) alike — is retried with bounded backoff on transient failures: the
-   * server transition is idempotent, so a retried non-terminal report is safe
-   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
-   * server. An "already terminal" server response (409, or a 4xx body mentioning
-   * terminal) does not throw, so a lost ack / duplicate replay is safe. A
-   * 4xx is otherwise fatal.
-   *
-   * A durability-boundary caller supplies its permit signal. It cancels the
-   * in-flight request and any retry backoff, so the boundary awaits real request
-   * settlement without multiplying its own deadline by this retry schedule.
-   *
-   * The RESULT used to be discarded. It is now returned, because `limit_wait`
-   * (PRD #35) is the first report whose consequence is that the caller SKIPS
-   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
-   * Read the warning on StateAck before branching on it: the answer is
-   * `status === "limit_wait"`, never `applied`.
-   *
-   * 200 and 409 are both read for their body rather than routed through
-   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
-   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
-   * so parsing a 409's status back out of the error text would work in tests and
-   * fail on real runs.
-   */
   async codeCrossCheckStatus(runId: string, generation: number, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
     return decodeCodeCrossCheckStatus(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/code/latest?claim_generation=${generation}`,
       undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal));
@@ -1694,6 +1668,32 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
+  /**
+   * Report a run state and return what the server made of it. Every report —
+   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
+   * limit_wait) alike — is retried with bounded backoff on transient failures: the
+   * server transition is idempotent, so a retried non-terminal report is safe
+   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
+   * server. An "already terminal" server response (409, or a 4xx body mentioning
+   * terminal) does not throw, so a lost ack / duplicate replay is safe. A
+   * 4xx is otherwise fatal.
+   *
+   * A durability-boundary caller supplies its permit signal. It cancels the
+   * in-flight request and any retry backoff, so the boundary awaits real request
+   * settlement without multiplying its own deadline by this retry schedule.
+   *
+   * The RESULT used to be discarded. It is now returned, because `limit_wait`
+   * (PRD #35) is the first report whose consequence is that the caller SKIPS
+   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
+   * Read the warning on StateAck before branching on it: the answer is
+   * `status === "limit_wait"`, never `applied`.
+   *
+   * 200 and 409 are both read for their body rather than routed through
+   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
+   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
+   * so parsing a 409's status back out of the error text would work in tests and
+   * fail on real runs.
+   */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
@@ -2365,15 +2365,15 @@ export class WorkerClient {
     return out;
   }
 
-  /** issue #559: lightweight read-only ownership/terminality probe for the interactive
-   *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
-   *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
-   *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getCodeSnapshotCleanup(leadId: string, signal?: AbortSignal): Promise<CodeSnapshotCleanup> {
     return decodeCodeSnapshotCleanup(await this.getJSON(
       `${WORKER_API_PREFIX}/runs/${leadId}/ownership?purpose=code_snapshot`, 3000, 16 * 1024, signal));
   }
 
+  /** issue #559: lightweight read-only ownership/terminality probe for the interactive
+   *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
+   *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
+   *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string, options: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   async getRunOwnership(runId: string, signal?: AbortSignal): Promise<RunOwnershipResponse>;
   async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;

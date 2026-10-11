@@ -88,8 +88,6 @@ repos = [
 ];
 // Cross-user admin-only fixtures leave the existing owner-list demo intact.
 // UUID IDs can round-trip through the settings validator.
-// A UTF-16 lone surrogate: not valid UTF-8 once encoded, which PatchRepo refuses.
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 const dockerDemoRepos = [
   { id: "a1111111-1111-4111-8111-111111111111", path_with_namespace: "vtmocanu/uzi", enabled: true, connection_id: "conn-dana" },
@@ -343,7 +341,7 @@ export const forgeApi = {
       );
     }
     const g = inputs.code_cross_check_guidance;
-    if (g !== undefined && g !== null && (typeof g !== "string" || LONE_SURROGATE.test(g) || new TextEncoder().encode(g).length > 8192)) {
+    if (g !== undefined && g !== null && (typeof g !== "string" || new TextEncoder().encode(g).length > 8192)) {
       throw new ApiError(400, "invalid code cross-check guidance");
     }
     if (g !== undefined) r.code_cross_check_guidance = g;

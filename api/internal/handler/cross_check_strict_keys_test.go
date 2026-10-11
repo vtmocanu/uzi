@@ -45,7 +45,7 @@ func TestJSONWireNamesReflection(t *testing.T) {
 
 func TestJSONWireNamesIncludeEmbeddedPlanCandidate(t *testing.T) {
 	names := jsonWireNames(reflect.TypeOf(planCrossCheckRequest{}))
-	for _, n := range []string{"plan_md", "milestones", "required_capabilities", "required_tools", "size_class", "base_commit", "planning_diff", "repo_instructions_enabled", "repo_instructions_text", "claim_generation", "stage"} {
+	for _, n := range []string{"plan_md", "milestones", "required_capabilities", "required_tools", "size_class", "base_commit", "planning_diff", "repo_instructions_enabled", "repo_instructions_text", "claim_generation", "stage", "round", "head_commit"} {
 		if _, ok := names[n]; !ok {
 			t.Errorf("missing %s", n)
 		}
@@ -53,6 +53,42 @@ func TestJSONWireNamesIncludeEmbeddedPlanCandidate(t *testing.T) {
 	for _, n := range []string{"instructionFields", "planFields", "PlanCrossCheckCandidate"} {
 		if _, ok := names[n]; ok {
 			t.Errorf("unexpected %s", n)
+		}
+	}
+}
+
+// A json:"-" field with no json:"-," sibling must contribute no name at all;
+// wireProbe cannot pin this because its Dash field also yields the name "-".
+func TestJSONWireNamesSkipsDashTag(t *testing.T) {
+	type onlySkipped struct {
+		Skipped string `json:"-"`
+		Kept    string `json:"kept"`
+	}
+	names := jsonWireNames(reflect.TypeOf(onlySkipped{}))
+	if _, ok := names["-"]; ok {
+		t.Fatalf(`json:"-" field produced the name "-": %v`, names)
+	}
+	if _, ok := names["kept"]; !ok || len(names) != 1 {
+		t.Fatalf("names = %v, want only kept", names)
+	}
+}
+
+// Two allowed wire names that differ only by case must still not both appear:
+// encoding/json binds keys case-insensitively, so the pair is one field.
+func TestRequireExactTopLevelKeysRefusesCaseFoldedPair(t *testing.T) {
+	type caseTwins struct {
+		A string `json:"k"`
+		B string `json:"K"`
+	}
+	allowed := jsonWireNames(reflect.TypeOf(caseTwins{}))
+	for _, body := range []string{`{"k":"1","K":"2"}`, `{"K":"2","k":"1"}`} {
+		if err := requireExactTopLevelKeys([]byte(body), allowed); err == nil {
+			t.Errorf("%s: accepted", body)
+		}
+	}
+	for _, body := range []string{`{"k":"1"}`, `{"K":"2"}`} {
+		if err := requireExactTopLevelKeys([]byte(body), allowed); err != nil {
+			t.Errorf("%s: %v", body, err)
 		}
 	}
 }
