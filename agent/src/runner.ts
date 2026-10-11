@@ -205,6 +205,7 @@ import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
 import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
+import { reportProofTiming } from "./report-proof-timing.js";
 import {
   clampUtf8Bytes,
   DECISIONS_MEMO_MAX_BYTES,
@@ -1850,6 +1851,10 @@ interface RunFlight {
    *  clears it. In-memory only — NOT seeded from the claim: `claim.checkpoint_tip` is a
    *  server-confirmed anchor, and a resume self-heals via `lastCheckpointRefTip`. */
   lastAttemptedCheckpointRefTip: string | undefined;
+  /** issue #2733: the run's repo is on GitHub, the only forge with checkpoint workflow overlays and
+   *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
+   *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
+  checkpointChainForge?: boolean;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -4284,7 +4289,7 @@ export class RunRunner {
   async retireRecoveryReport(runId: string, generation: number, context: ReportRetirementContext,
     kind: "terminal" | "finalize" = "terminal", outbox = this.outbox): Promise<boolean> {
     if (!outbox || !context.expectedIdentity || context.signal?.aborted || context.eligible?.() === false) return false;
-    const deadline = Math.min(Date.now() + 1_000, context.deadline ?? Infinity);
+    const deadline = Math.min(Date.now() + reportProofTiming.proofBudgetMs(), context.deadline ?? Infinity);
     if (deadline <= Date.now()) return false;
     const abort = new AbortController();
     const cancel = () => abort.abort(context.signal?.reason);
@@ -8400,6 +8405,7 @@ export class RunRunner {
       // overlay on the ref), advanced on every confirmed publish.
       lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
       lastAttemptedCheckpointRefTip: undefined,
+      checkpointChainForge: claim.repo.forge_type === "github",
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -12861,7 +12867,15 @@ export class RunRunner {
           if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
             throw new SecretRemediationPendingError();
           }
-        });
+        },
+        // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed
+        // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
+        // ordered [attempted, confirmed]: the first candidate that is not already contained in the
+        // raw tip and verifies as wrapper-only is used. (The reap overlay's own base still uses
+        // `attempted ?? confirmed`, unchanged #1086 behaviour.) GitHub only, like the overlay.
+        flight.checkpointChainForge === true
+          ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
+          : undefined);
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };

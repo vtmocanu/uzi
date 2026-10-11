@@ -125,10 +125,10 @@ func TestWorkerExhaustionNonOwnerGuardsLiveDB(t *testing.T) {
 			return nil
 		}},
 		{"wall extend resume", func() error {
-			total, err := env.q.ExtendAndResumeWallPark(env.ctx, store.ExtendAndResumeWallParkParams{ID: run, UserID: user, Secs: 60, Cap: 3600})
-			// ExtendAndResumeWallPark's scalar SELECT returns zero when no row is extended.
-			if err != nil || total != 0 {
-				t.Fatalf("wall extend total=%d error=%v", total, err)
+			_, err := env.q.ExtendAndResumeWallPark(env.ctx, store.ExtendAndResumeWallParkParams{ID: run, UserID: user, Secs: 60, Cap: 3600})
+			// A refused extend matches no row, so the :one statement returns pgx.ErrNoRows.
+			if !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("wall extend error=%v, want pgx.ErrNoRows", err)
 			}
 			if got := exhaustionRun(t, env, run); got.BudgetExtensionSeconds != before.BudgetExtensionSeconds {
 				t.Fatalf("wall extend changed budget: before=%d after=%d", before.BudgetExtensionSeconds, got.BudgetExtensionSeconds)

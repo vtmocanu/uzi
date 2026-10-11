@@ -52,9 +52,10 @@ reaches a final status. Each retained capture is in one of these six states:
   storage limit was hit); the source stays retained. Retries depend on the
   recovery path's budget; terminal retained-source failure does not cycle
   automatically or offer Resume.
-- **Expired** — the ready download window passed and the bytes were purged, or
-  uzi proved the archive redundant with your published branch and purged it
-  early (see [Early expiry of a published archive](#early-expiry-of-a-published-archive)).
+- **Expired** — uzi purged the bytes, either when the ready download window passed or
+  early, after proving the archive redundant with your published branch (see
+  [Early expiry of a published archive](#early-expiry-of-a-published-archive)). The
+  record stays for audit and no longer counts toward the per-owner capture limit.
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
 
 When a run has **no** retained captures at all, the section reports one of
@@ -239,7 +240,7 @@ operator-configurable environment variable on the API:
 | Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. A completed run's archive can expire earlier, only after uzi proves its commits are already on the published branch. |
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
-| Retained captures per owner | 256 | Non-discarded captures on file, including expired metadata. |
+| Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
 | Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**
@@ -490,9 +491,8 @@ guaranteed. This is the same after-publication risk as the automatic custody
 release above.
 
 **Quota effect.** Early expiry returns the archive's bytes to your ready
-payload and the instance byte quota, but not its slot in the retained-captures
-limit: an expired archive still counts toward the per-owner capture count
-(every state except discarded). Early expiry does not clear that count. The
+payload and the instance byte quota, and, because an expired archive no longer
+counts toward the per-owner capture limit (#2744), it also frees that slot. The
 database may reuse the freed space, but its file size does not shrink at once.
 
 When its existing outbox can journal the terminal report, the worker saves

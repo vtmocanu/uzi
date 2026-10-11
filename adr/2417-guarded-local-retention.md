@@ -297,10 +297,10 @@ without complete proof.
 ### Quota and storage
 
 Early expiry frees payload bytes, so the per-owner ready payload and instance
-byte quotas recover. It does not free capture-count slots: the capture stays
-`expired`, and the per-owner count (`MaxCapturesPerOwner`, `UZI_RECOVERY_MAX_CAPTURES_PER_OWNER`,
-"retained (non-discarded) captures per owner") counts every state except
-`discarded`. #2625 does not address expired-tombstone count exhaustion.
+byte quotas recover. The capture stays `expired`, and since #2744 the per-owner
+count (`MaxCapturesPerOwner`, `UZI_RECOVERY_MAX_CAPTURES_PER_OWNER`) counts every
+state except `discarded` and `expired`, so an early-expired capture also frees its
+count slot. The per-claim ceiling still counts it.
 PostgreSQL can reuse the freed pages; no immediate reduction in database file
 size is promised.
 

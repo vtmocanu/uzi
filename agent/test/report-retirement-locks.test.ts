@@ -11,6 +11,7 @@ for (const boundary of ["J", "B", "O"] as const) {
       "integrated O requires Linux procfs/no-follow report content proof",
   }, async t => {
     const f = await reportRetirementFixture(t);
+    f.useHeadroom(); // reaching O needs the full two-pass proof; this test cancels, it does not expire
     const retirement = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, 2))!;
     // The runner owns a separate coordinator over the same process-wide journal queue.
     const entered = deferred(), release = deferred(), queued = deferred();
@@ -24,9 +25,11 @@ for (const boundary of ["J", "B", "O"] as const) {
     t.after(async () => { release.resolve(); await predecessor; });
     await entered.promise;
     let proofs = 0, unlinks = 0;
+    const secondProof = deferred();
     const clean = git.credentialFreeCancelCleanHead.bind(git);
     t.mock.method(git, "credentialFreeCancelCleanHead", async (...args: Parameters<typeof clean>) => {
-      proofs++; return clean(...args);
+      if (++proofs === 2) secondProof.resolve();
+      return clean(...args);
     });
     const unlink = fs.unlink.bind(fs);
     t.mock.method(fs, "unlink", async (...args: Parameters<typeof unlink>) => {
@@ -59,8 +62,7 @@ for (const boundary of ["J", "B", "O"] as const) {
     assert.equal(f.r.isExecuting(f.claim.run_id), true);
     // O is reached only after the real two-pass content proof.
     if (boundary === "O") {
-      for (let i = 0; i < 100 && proofs < 2; i++)
-        await new Promise<void>(r => setTimeout(r, 5));
+      await secondProof.promise;
       assert.equal(proofs, 2);
     }
     abort.abort(new Error("integrated cancellation"));

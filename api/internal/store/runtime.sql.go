@@ -4661,7 +4661,8 @@ WITH candidates AS MATERIALIZED (
             AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
             AND lead.claim_generation = cc.lead_claim_generation
       ))
-    RETURNING runs.budget_extension_seconds
+    RETURNING runs.started_at, runs.budget_wall_seconds, runs.budget_extension_seconds,
+        runs.budget_finalize_seconds, runs.budget_paused_seconds
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
@@ -4678,7 +4679,8 @@ resume_audit AS (
     INSERT INTO run_user_inputs (run_id, kind, body)
     SELECT $1, 'resume', NULL::text FROM extended
 )
-SELECT COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budget_extension_seconds
+SELECT extended.started_at, extended.budget_wall_seconds, extended.budget_extension_seconds,
+    extended.budget_finalize_seconds, extended.budget_paused_seconds FROM extended
 `
 
 type ExtendAndResumeWallParkParams struct {
@@ -4690,14 +4692,23 @@ type ExtendAndResumeWallParkParams struct {
 	Body                 pgtype.Text `json:"body"`
 }
 
+type ExtendAndResumeWallParkRow struct {
+	StartedAt              pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
+	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
+}
+
 // PRD #1497 M1 (D7): the owner's Extend on a budget_exhausted wall park, in ONE statement — add the
 // extension AND resume, so an extension has one purpose and is one action. It:
 //  1. adds @secs to budget_extension_seconds under the SAME cap guard as CreateExtendInput (a
-//     request past @cap matches 0 rows -> ErrExtensionCapExceeded, worded for the park);
+//     request past @cap matches 0 rows; the caller re-reads the run to word the refusal);
 //  2. BANKS THE OVERRUN into budget_paused_seconds so the extension buys exactly @secs of ACTIVE
 //     run-time however late the park landed (D7): overrun = active-at-park - total-before-extension,
 //     and the parked-wait interval is banked too (ResumePausedRun's rule), so the two banks leave the
-//     run resuming with precisely @secs of budget (proof: active_now = active_at_park - overrun =
+//     run resuming with precisely @secs of budget when the park landed at or past the deadline (every
+//     real wall park; otherwise @secs plus the unspent budget) (proof: active_now = active_at_park - overrun =
 //     total_before, remaining = (total_before + @secs) - total_before = @secs);
 //  3. does ResumePausedRun's transition — queued, codex cap/epoch, health reset, CLEAR
 //     hold_reason/hold_captured_head, and the D19 worker rule (a SERVER-parked row, claim_released_at
@@ -4708,9 +4719,10 @@ type ExtendAndResumeWallParkParams struct {
 // total_before and active-at-park read the OLD row (SET RHS is pre-update): budget_extension_seconds
 // in total_before is the pre-extension value, budget_finalize_seconds is included (a run may have been
 // Stopped then re-parked). Refuses (0 rows) a row that is not a budget_exhausted paused hold, or over
-// the cap. Returns the new total extension (CreateExtendInput's scalar shape); the handler re-reads
-// the run for the deadline + resumed:true response.
-func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (int32, error) {
+// the cap, or a cross_check whose lead plan check is no longer pending and eligible. Returns the
+// POST-update budget row (started_at, budget_wall/extension/finalize/paused seconds) so the caller
+// computes the resumed deadline from the banked values; a refusal returns NO row (pgx.ErrNoRows), never a zero scalar.
+func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResumeWallParkParams) (ExtendAndResumeWallParkRow, error) {
 	row := q.db.QueryRow(ctx, extendAndResumeWallPark,
 		arg.ID,
 		arg.UserID,
@@ -4719,9 +4731,15 @@ func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResu
 		arg.GlobalTimeoutSeconds,
 		arg.Body,
 	)
-	var budget_extension_seconds int32
-	err := row.Scan(&budget_extension_seconds)
-	return budget_extension_seconds, err
+	var i ExtendAndResumeWallParkRow
+	err := row.Scan(
+		&i.StartedAt,
+		&i.BudgetWallSeconds,
+		&i.BudgetExtensionSeconds,
+		&i.BudgetFinalizeSeconds,
+		&i.BudgetPausedSeconds,
+	)
+	return i, err
 }
 
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows

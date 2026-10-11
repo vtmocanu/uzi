@@ -554,6 +554,10 @@ export interface GitCacheOptions {
   /** Test-only override of {@link MAX_OWED_CANDIDATES_PER_RUN} so the cap boundary is cheap to
    *  exercise. Production never passes it. */
   maxOwedCandidates?: number;
+  /** issue #2733 — test-only overrides of {@link CHECKPOINT_CHAIN_MAX_WRAPPERS} /
+   *  {@link CHECKPOINT_CHAIN_MAX_DIFF_BYTES} so the bound-exhaustion refusals are cheap to exercise.
+   *  Production never passes it. */
+  checkpointChainBounds?: { maxWrappers?: number; maxDiffBytes?: number };
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
@@ -588,6 +592,17 @@ export interface GitCacheOptions {
  *  children together), enforced by OUR kill of the children — never by gitleaks' own `--timeout`
  *  (see runCheckpointGitleaks). The scan never runs inside a Codex permit (see runner.ts). */
 export const CHECKPOINT_SCAN_TIMEOUT_MS = 60_000;
+
+/** issue #2733 — bounds on {@link GitCache.verifyWrapperOnlyHistory}. A history longer than
+ *  MAX_WRAPPERS un-published wrappers, or one wrapper whose workflow diff listing exceeds
+ *  MAX_DIFF_BYTES, is refused (no chain; the raw tip ships as before) rather than verified
+ *  unboundedly. The chain grows by one wrapper per checkpoint publish after the first overlay,
+ *  for the life of the ref (each chain commit `[P, N]` keeps P reachable), and every pack
+ *  re-sends the whole chain beyond the floor. At the default 5-minute tick that is roughly 12
+ *  wrappers an hour, so 4096 is about 14 days of continuous publishing, far above any honest
+ *  run; 1 MiB of changed-path names is far above any honest workflow directory. */
+const CHECKPOINT_CHAIN_MAX_WRAPPERS = 4096;
+const CHECKPOINT_CHAIN_MAX_DIFF_BYTES = 1024 * 1024;
 
 // issue #1597 M2 (review item 6) — pre-scan SIZE CAPS on what gitleaks will read for a checkpoint
 // scan: the new AND old side of every blob the scanned commits touch (`git log --raw`), so a
@@ -1576,6 +1591,9 @@ export class GitCache {
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
   private readonly maxOwedCandidates: number;
+  /** issue #2733: the checkpoint-chain verifier bounds (see {@link GitCacheOptions.checkpointChainBounds}). */
+  private readonly chainMaxWrappers: number;
+  private readonly chainMaxDiffBytes: number;
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
@@ -1603,6 +1621,8 @@ export class GitCache {
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
+    this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
+    this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.canonicalFreeSeam = opts.canonicalFree;
@@ -3109,8 +3129,23 @@ export class GitCache {
             ? (await this.tryGitStdout(barePath, ["diff", "--name-only", realTip, overlaySha])).trim()
             : "";
         const changedPaths = changed === "" ? [] : changed.split("\n");
+        // issue #2733: the other genuine shape is a TREE-EQUAL chain (`[P, N]` whose workflow
+        // subtree caught up with N's): an empty diff to its last parent. It peels only when it is
+        // merge-shaped and every commit it adds beyond that parent verifies as a workflow-only
+        // wrapper; anything unverifiable stays unpeeled.
+        let treeEqualChain = false;
+        if (/^[0-9a-f]{40}$/.test(realTip) && changedPaths.length === 0 && nParents >= 2) {
+          const [wrapperTree, tipTree] = [
+            await this.tryGitStdout(barePath, ["rev-parse", `${overlaySha}^{tree}`]),
+            await this.tryGitStdout(barePath, ["rev-parse", `${realTip}^{tree}`]),
+          ];
+          treeEqualChain =
+            SHA40_RE.test(wrapperTree) && wrapperTree === tipTree &&
+            (await this.verifyWrapperOnlyHistory(barePath, overlaySha, realTip, 1));
+        }
         const isOverlayStructure =
-          changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/"));
+          treeEqualChain ||
+          (changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/")));
         if (/^[0-9a-f]{40}$/.test(realTip) && isOverlayStructure) {
           baseSha = realTip;
           this.log.info("runner clone: peeled .github/workflows overlay wrapper to its realTip", {
@@ -5437,6 +5472,11 @@ export class GitCache {
     sourceSha?: string,
     /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
     beforePack?: (wantedSha: string) => Promise<void>,
+    /** issue #2733: the checkpoint ref tips this run knows, in preference order (attempted, then
+     *  confirmed). When no overlay wrapper was built, the raw tip is chained over the first one
+     *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
+     *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
+    chainFrom?: readonly (string | undefined)[],
   ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
@@ -5455,6 +5495,14 @@ export class GitCache {
         wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay, onStep) ?? wanted;
         onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wanted);
+      }
+      if (wanted === pinned.tipSha && chainFrom) {
+        const chain = await this.buildCheckpointChain(barePath, branch, pinned.tipSha, chainFrom, onStep);
+        if (chain) {
+          wanted = chain;
+          onStep?.("scratch_preflight");
+          await this.scratchPublicationPreflight(barePath, branch, wanted);
+        }
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
       await beforePack?.(wanted);
@@ -5499,6 +5547,17 @@ export class GitCache {
       const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay, onStep);
       if (ov) {
         wantRev = ov;
+        onStep?.("scratch_preflight");
+        await this.scratchPublicationPreflight(barePath, branch, wantRev);
+      }
+    }
+    // issue #2733 — no overlay wrapper was produced (none requested, or the branch is not behind
+    // on workflows): chain the raw tip over the prior checkpoint tip when that is what keeps it a
+    // strict descendant of the remote ref. The floor and the #1964 hold below judge the chain.
+    if (wantRev === realTip && chainFrom) {
+      const chain = await this.buildCheckpointChain(barePath, branch, realTip, chainFrom, onStep);
+      if (chain) {
+        wantRev = chain;
         onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wantRev);
       }
@@ -6016,6 +6075,63 @@ export class GitCache {
     if (changed === null) return null;
     if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
 
+    try {
+      // Parent order: base (a prior overlay tip) FIRST, realTip LAST — see the method doc and
+      // the PRD's broker note. A missing / non-40-hex prevCheckpointTip ⇒ single parent realTip.
+      const parents: string[] = [];
+      const prev = overlay.prevCheckpointTip;
+      if (prev && /^[0-9a-f]{40}$/.test(prev)) parents.push(prev);
+      parents.push(realTip);
+      const ovSha = await this.synthesizeWorkflowWrapper(
+        barePath,
+        realTip,
+        defaultTip,
+        parents,
+        `${OVERLAY_COMMIT_PREFIX} align .github/workflows with ${defaultTip} (realTip ${realTip.slice(0, 12)})`,
+        // If the synthesised root equals realTip's own tree the branch is not actually behind
+        // (e.g. realTip has no `.github` and the default has none) ⇒ ship realTip.
+        false,
+      );
+      if (ovSha === null) return null;
+      this.log.info("checkpoint overlay built (.github/workflows aligned to default)", {
+        branch,
+        real_tip: realTip,
+        default_tip: defaultTip,
+        overlay_sha: ovSha,
+        parents: parents.length,
+      });
+      return ovSha;
+    } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
+        branch,
+        error: gitErrorMessage(e),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Shared object-DB synthesis of a `.github/workflows` transport wrapper, used by
+   * {@link buildWorkflowOverlay} (workflows from the default tip) and {@link buildCheckpointChain}
+   * (workflows from the prior checkpoint tip). The wrapper's tree is `realTip`'s with its
+   * `.github/workflows` subtree swapped for `workflowSource`'s (dropped when the source has none);
+   * its parents are `parents` (base FIRST, realTip LAST); its identity and committer date are
+   * deterministic (realTip's own date) so a no-new-work rebuild yields the same OID.
+   *
+   * Pure object-DB work via a TEMP INDEX (no live worktree, no filter drivers, no runner-clone
+   * perturbation). Worker-uid, base git env, NO PAT. Returns null when `keepTreeEqual` is false and
+   * the synthesised root equals `realTip`'s tree (nothing to align). Errors propagate to the caller.
+   */
+  private async synthesizeWorkflowWrapper(
+    barePath: string,
+    realTip: string,
+    workflowSource: string,
+    parents: string[],
+    message: string,
+    keepTreeEqual: boolean,
+  ): Promise<string | null> {
     // Temp index + empty throwaway work-tree, both cleaned up in the finally. The work-tree is
     // required ONLY by `read-tree --prefix` (it refuses in a bare repo); WITHOUT `-u` nothing is
     // checked out into it, so no `.gitattributes` filter/smudge driver ever fires — a security
@@ -6034,42 +6150,31 @@ export class GitCache {
         ["rm", "--cached", "-r", "--ignore-unmatch", ".github/workflows"],
         idxEnv,
       );
-      // Restore the default's workflow subtree ONLY when the default actually has one; an empty
-      // ls-tree means the default deleted its whole `.github/workflows/`, and the rm above
-      // already equalised to "none" (the #627 deleted-workflows edge).
-      const defaultWfTree = (
-        await this.runGit(barePath, ["ls-tree", defaultTip, "--", ".github/workflows"])
+      // Restore the source's workflow subtree ONLY when the source actually has one; an empty
+      // ls-tree means it has no `.github/workflows/`, and the rm above already equalised to
+      // "none" (the #627 deleted-workflows edge).
+      const sourceWfTree = (
+        await this.runGit(barePath, ["ls-tree", workflowSource, "--", ".github/workflows"])
       ).trim();
-      if (defaultWfTree.length > 0) {
+      if (sourceWfTree.length > 0) {
         await this.runGitWithEnv(
           barePath,
-          ["read-tree", "--prefix=.github/workflows", `${defaultTip}:.github/workflows`],
+          ["read-tree", "--prefix=.github/workflows", `${workflowSource}:.github/workflows`],
           { ...idxEnv, GIT_WORK_TREE: tmpWork },
         );
       }
       const newRoot = (await this.runGitWithEnv(barePath, ["write-tree"], idxEnv)).trim();
       if (!/^[0-9a-f]{40}$/.test(newRoot)) return null;
-      // If the synthesised root equals realTip's own tree the branch is not actually behind
-      // (e.g. realTip has no `.github` and the default has none) ⇒ ship realTip.
       const realTipTree = (await this.runGit(barePath, ["rev-parse", `${realTip}^{tree}`])).trim();
-      if (newRoot === realTipTree) return null;
+      if (!keepTreeEqual && newRoot === realTipTree) return null;
       // Deterministic committer date = realTip's own, so a no-new-work rebuild is byte-identical.
       const committerDate = (
         await this.runGit(barePath, ["show", "-s", "--format=%cI", realTip])
       ).trim();
-      // Parent order: base (a prior overlay tip) FIRST, realTip LAST — see the method doc and
-      // the PRD's broker note. A missing / non-40-hex prevCheckpointTip ⇒ single parent realTip.
-      const parents: string[] = [];
-      const prev = overlay.prevCheckpointTip;
-      if (prev && /^[0-9a-f]{40}$/.test(prev)) parents.push(prev);
-      parents.push(realTip);
       const commitArgs = ["-c", "commit.gpgsign=false", "commit-tree", newRoot];
       for (const p of parents) commitArgs.push("-p", p);
-      commitArgs.push(
-        "-m",
-        `${OVERLAY_COMMIT_PREFIX} align .github/workflows with ${defaultTip} (realTip ${realTip.slice(0, 12)})`,
-      );
-      const ovSha = (
+      commitArgs.push("-m", message);
+      const sha = (
         await this.runGitWithEnv(barePath, commitArgs, {
           ...idxEnv,
           GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
@@ -6080,26 +6185,166 @@ export class GitCache {
           GIT_COMMITTER_DATE: committerDate,
         })
       ).trim();
-      if (!/^[0-9a-f]{40}$/.test(ovSha)) return null;
-      this.log.info("checkpoint overlay built (.github/workflows aligned to default)", {
+      return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    } finally {
+      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
+      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * issue #2733 — chain a RAW checkpoint tip over a prior checkpoint-ref tip P, chosen from the ordered
+   * candidate list `chainFrom` (attempted, then confirmed: the first that is not already contained
+   * in realTip and verifies as wrapper-only), or
+   * return null to ship `realTip` as today. Called only when no overlay wrapper was built.
+   *
+   * Why: after an overlay publish the remote checkpoint ref sits at P, a `ckpt(overlay):` wrapper
+   * whose parent[0] chain does NOT contain later raw work N. The broker takes a publish only when
+   * the declared tip strictly descends the ref, so a raw N is refused `not_descendant` and the
+   * ref wedges. The chain commit `C = [P, N]` (base first, realTip last, like the overlay) has P's
+   * `.github/workflows` subtree and N's everything else, so it descends P and changes no workflow
+   * file relative to the ref it advances. Credential-free and fetch-free (no PAT), so it is safe
+   * while the agent tree is alive.
+   *
+   * Guards, all fail-soft to null (a boundary abort propagates):
+   *  - A candidate is 40-hex and resolves locally; candidate === realTip or an ancestor of realTip
+   *    needs no chain and is skipped, as is a candidate that fails the wrapper-only check below.
+   *  - GATE 3 (as in the overlay): the branch must not itself modify a workflow file.
+   *  - {@link verifyWrapperOnlyHistory}(P, realTip): everything P adds beyond realTip is a verified
+   *    workflow-only wrapper, so the pack carries no new non-workflow content beyond realTip's own
+   *    history. That is not "nothing unscanned": P's workflow blobs come from the default branch,
+   *    and the unpinned park/shutdown sinks publish realTip's history unscanned anyway.
+   * When lastParent(P) === realTip nothing is new since P: P itself is returned (a re-declare).
+   * The chain tree MAY equal realTip's tree (the branch caught up with main's workflows): it is
+   * still emitted so the ref keeps advancing. The structural check is not provenance: ADR-1036's
+   * accepted-residual forgery case applies unchanged.
+   */
+  private async buildCheckpointChain(
+    barePath: string,
+    branch: string,
+    realTip: string,
+    chainFrom: readonly (string | undefined)[],
+    onStep?: (step: BoundaryStep) => void,
+  ): Promise<string | null> {
+    if (!SHA40_RE.test(realTip)) return null;
+    try {
+      onStep?.("checkpoint_overlay");
+      // GATE 3 is candidate-independent: the branch must not itself modify a workflow file.
+      const changed = await this.changedFiles(barePath, realTip);
+      if (changed === null) return null;
+      if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
+      // First candidate that is not already contained in realTip AND verifies as a wrapper-only
+      // history over it. A raw tip that shipped ambiguously (the attempted tip) becomes an ancestor
+      // of the next raw tip, and chaining from it would be a no-op the broker refuses
+      // `not_descendant` forever; an attempted tip the agent amended away is no longer a wrapper
+      // of realTip, so a failing candidate falls through to the next (the confirmed tip).
+      let prev: string | undefined;
+      for (const cand of chainFrom) {
+        if (!cand || !SHA40_RE.test(cand) || cand === realTip) continue;
+        if ((await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${cand}^{commit}`])) !== cand) continue;
+        if (await this.isAncestor(barePath, cand, realTip)) continue;
+        if (!(await this.verifyWrapperOnlyHistory(barePath, cand, realTip))) continue;
+        prev = cand;
+        break;
+      }
+      if (prev === undefined) return null;
+      const lastParent = (
+        await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", prev])
+      ).split(/\s+/).filter(Boolean).pop();
+      if (lastParent === realTip) return prev;
+      const chain = await this.synthesizeWorkflowWrapper(
+        barePath,
+        realTip,
+        prev,
+        [prev, realTip],
+        `${OVERLAY_COMMIT_PREFIX} chain .github/workflows from checkpoint ${prev.slice(0, 12)} (realTip ${realTip.slice(0, 12)})`,
+        true,
+      );
+      if (chain === null) return null;
+      this.log.info("checkpoint chain built over the prior checkpoint tip", {
         branch,
         real_tip: realTip,
-        default_tip: defaultTip,
-        overlay_sha: ovSha,
-        parents: parents.length,
+        chain_from: prev,
+        chain_sha: chain,
       });
-      return ovSha;
+      return chain;
     } catch (e) {
+      if (e instanceof RunResidueBlockedError) throw e;
       const abort = this.boundaryAbortError(e);
       if (abort) throw abort;
-      this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
+      this.log.warn("checkpoint chain synthesis failed — shipping realTip", {
         branch,
         error: gitErrorMessage(e),
       });
       return null;
-    } finally {
-      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
-      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * issue #2733 — is every commit reachable from `tip` but not from `excludeTip` a verified
+   * `ckpt(overlay):` wrapper that differs from its LAST parent only under `.github/workflows/`?
+   * Shared by {@link buildCheckpointChain} (tip = P, excludeTip = the raw real tip) and the
+   * adoption peel of a tree-equal chain (tip = the candidate, excludeTip = its last parent).
+   *
+   * A parent outside the listed set is reachable from `excludeTip` by construction, so when every
+   * listed commit verifies, `tip ^excludeTip` carries no content beyond `excludeTip`'s own history
+   * except workflow-subtree swaps. Per wrapper: subject prefix, at least one parent, a resolvable
+   * last parent L, and an explicit two-tree `diff-tree -r -z --no-renames --name-only L W` whose
+   * every path is under `.github/workflows/`; an EMPTY diff counts only for a merge-shaped
+   * (>= 2 parents) wrapper. Anything unreadable, malformed, truncated or over a bound
+   * ({@link CHECKPOINT_CHAIN_MAX_WRAPPERS}, {@link CHECKPOINT_CHAIN_MAX_DIFF_BYTES}) answers false.
+   * A boundary abort propagates. Nothing is cached: every call re-reads each wrapper's trees, so an
+   * object that has since gone missing from this bare still answers false.
+   */
+  private async verifyWrapperOnlyHistory(
+    barePath: string,
+    tip: string,
+    excludeTip: string,
+    /** Extra wrappers allowed over the bound: the adoption peel verifies a chain commit that sits
+     *  one above the MAX-wrapper history it was built over, so it passes 1. */
+    headroom = 0,
+  ): Promise<boolean> {
+    try {
+      if (!SHA40_RE.test(tip) || !SHA40_RE.test(excludeTip)) return false;
+      const listed = await this.execScoped(
+        "git",
+        withDir(barePath, [
+          "log", "-z", "--format=%H%x1f%P%x1f%s", tip, `^${excludeTip}`,
+          `--max-count=${this.chainMaxWrappers + headroom + 1}`,
+        ]),
+        { env: gitEnv(), timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER },
+      );
+      const out = listed.stdout;
+      if (out === "") return true;
+      if (!out.endsWith("\0")) return false;
+      const records = out.slice(0, -1).split("\0");
+      if (records.length > this.chainMaxWrappers + headroom) return false;
+      for (const record of records) {
+        const fields = record.split("\x1f");
+        if (fields.length !== 3) return false;
+        const [oid, parentField, subject] = fields as [string, string, string];
+        if (!SHA40_RE.test(oid)) return false;
+        const parents = parentField === "" ? [] : parentField.split(" ");
+        if (parents.some((p) => !SHA40_RE.test(p))) return false;
+        if (!subject.startsWith(OVERLAY_COMMIT_PREFIX) || parents.length < 1) return false;
+        // A missing last parent makes `diff-tree` below fail, which answers false.
+        const last = parents[parents.length - 1]!;
+        const diff = await this.execScoped(
+          "git",
+          withDir(barePath, ["diff-tree", "-r", "-z", "--no-renames", "--name-only", last, oid]),
+          { env: gitEnv(), timeout: GIT_TIMEOUT_MS, maxBuffer: this.chainMaxDiffBytes },
+        );
+        if (diff.stdout !== "" && !diff.stdout.endsWith("\0")) return false;
+        const paths = diff.stdout === "" ? [] : diff.stdout.slice(0, -1).split("\0");
+        if (paths.length === 0 && parents.length < 2) return false;
+        if (!paths.every((p) => p.startsWith(".github/workflows/"))) return false;
+      }
+      return true;
+    } catch (e) {
+      if (e instanceof RunResidueBlockedError) throw e;
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      return false;
     }
   }
 

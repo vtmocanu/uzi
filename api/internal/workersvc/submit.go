@@ -206,7 +206,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// below (the generic `extend` already admits a paused row; the milestone `stop` branch is
 	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
 	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
-	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged,
+	// because hasLivePoller reads every paused run as having no poller even while its kept worker
+	// heartbeats for other runs (issue #1969).
 	// PRD #1908 D-E: a job is never extended, on ANY extend path. Refuse it here, above the
 	// budget_exhausted wall-park branch (which routes to ExtendAndResumeWallPark with no kind
 	// filter) and the generic CTE (whose kind list admits a job).
@@ -1150,11 +1152,13 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 
 // extendAndResumeWallPark applies the owner's Extend on a budget_exhausted wall park (PRD #1497 M1,
 // D7): add @secs of wall-clock time AND resume, in ONE statement (ExtendAndResumeWallPark). It banks
-// the overrun so the extension buys exactly @secs of active run-time, clears the hold, drops the
-// released worker (D19), and writes the extend + resume audit rows. Refusals mirror submitExtend's
-// (a 0-row CTE — over the cap — is mapped by extendRefusalReason). The projected deadline is
-// computed from the committed new total; Resumed is true so the CLI says the run resumed. Callers
-// have already validated secs ∈ [60, capSeconds].
+// the overrun so the extension buys @secs of active run-time (exactly @secs when the park landed at
+// or past the deadline), clears the hold, drops the released worker (D19), and writes the extend +
+// resume audit rows. A refused statement returns no row (pgx.ErrNoRows); wallParkExtendRefusal then
+// re-reads the run to name why, and nothing is published or notified. The projected deadline is
+// computed from the POST-update budget row the statement returns (it has banked the overrun and the
+// parked interval into budget_paused_seconds); Resumed is true so the CLI says the run resumed.
+// Callers have already validated secs in [60, capSeconds].
 func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
 	secs32, cap32 := int32(0), int32(0)
 	if secs >= 0 && secs <= math.MaxInt32 {
@@ -1164,7 +1168,7 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 		cap32 = int32(capSeconds)
 	}
 	auditBody := fmt.Sprintf("extend and resume +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
-	newTotal, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
+	row, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
 		ID:                   run.ID,
 		UserID:               userID,
 		Secs:                 secs32,
@@ -1174,9 +1178,7 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The only refusal reachable here (the caller pre-validated the cap and the status is a
-			// budget_exhausted paused hold) is a raced cap violation; extendRefusalReason words it.
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.wallParkExtendRefusal(ctx, userID, run, secs, capSeconds)
 		}
 		return SubmitInputResult{}, err
 	}
@@ -1186,10 +1188,35 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 		s.bcast.PublishState(run.ID, "queued")
 	}
 	s.notify(run.ID, "queued")
-	// Deadline reflects the new total extension; the finalize term is unchanged by an extend.
-	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, newTotal, run.BudgetFinalizeSeconds)
-	nt := int(newTotal)
+	// Deadline comes from the post-update row: the statement banked the overrun and the parked
+	// interval into budget_paused_seconds, which the pre-update run snapshot does not carry.
+	deadline := RunDeadline(row.StartedAt, row.BudgetWallSeconds, row.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, row.BudgetExtensionSeconds, row.BudgetFinalizeSeconds)
+	nt := int(row.BudgetExtensionSeconds)
 	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: deadline, Resumed: true}, nil
+}
+
+// wallParkExtendRefusal names why ExtendAndResumeWallPark matched no row. The statement's guards
+// (status/hold, cumulative cap, cross_check plan-check eligibility) all collapse into "0 rows", and
+// the run snapshot the caller holds can be stale, so it re-reads the run and classifies from the
+// fresh row: terminal, no longer a budget_exhausted park, over the cap, a cross_check that can no
+// longer resume, else a concurrent change. A re-read failure is returned as is.
+func (s *Service) wallParkExtendRefusal(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) error {
+	cur, err := s.GetRun(ctx, userID, run.ID)
+	if err != nil {
+		return err
+	}
+	switch {
+	case terminalStatuses[cur.Status]:
+		return ErrRunTerminal
+	case cur.Status != "paused" || !cur.HoldReason.Valid || cur.HoldReason.String != "budget_exhausted":
+		return ErrWallParkChanged
+	case int(cur.BudgetExtensionSeconds)+secs > capSeconds:
+		return extendRefusalReason(cur, secs, capSeconds)
+	case cur.Kind == runkind.CrossCheck:
+		return ErrWallParkCrossCheckIneligible
+	default:
+		return ErrWallParkChanged
+	}
 }
 
 // stopWallPark applies the owner's Stop on a budget_exhausted wall park of a milestone issue run
@@ -1267,8 +1294,9 @@ func (s *Service) runExtensionCap(ctx context.Context) (int, error) {
 	return s.healthSettings.RunExtensionCapSeconds(ctx)
 }
 
-// extendRefusalReason turns a 0-row CreateExtendInput into the specific 409 the owner sees
-// (PRD #1189 M1), decided from the already-loaded run row — the causes the CTE's predicate
+// extendRefusalReason turns a 0-row CreateExtendInput (or, via wallParkExtendRefusal, a 0-row
+// ExtendAndResumeWallPark) into the specific 409 the owner sees (PRD #1189 M1), decided from a
+// loaded run row (the caller's snapshot, or a fresh re-read) — the causes the CTE's predicate
 // collapses into "0 rows". Terminal first (the run is dead, the clock is already stopped),
 // then a kind that never times out (chat/judge, or an interactive task — the runWallClock
 // exclusion set), then the residual cause: budget_extension_seconds + secs would exceed the

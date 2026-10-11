@@ -121,6 +121,7 @@ it("late dirty source hook remains available across the proof's asynchronous rea
   skip: process.platform !== "linux" && "requires Linux procfs/no-follow report content proof",
 }, async t => {
   const f = await reportRetirementFixture(t);
+  f.useHeadroom(); // the hook must be reached after a complete positive inspection on any runner speed
   const read = git.credentialFreeCancelCleanHead.bind(git);
   let reached = 0;
   t.mock.method(git, "credentialFreeCancelCleanHead", async (clone: string, bare: string, head: string) => {
@@ -143,6 +144,7 @@ for (const mutation of ["swap", "addition"] as const) {
     skip: process.platform !== "linux" && "requires Linux procfs/no-follow report content proof",
   }, async t => {
     const f = await reportRetirementFixture(t);
+    f.useHeadroom(); // the hook must be reached after a complete positive inspection on any runner speed
     const read = git.credentialFreeCancelCleanHead.bind(git);
     const saved = f.clone + "-saved";
     const extra = path.join(f.clone, "late-addition.txt");
