@@ -404,8 +404,13 @@ func TestArchiveRedundancyProtectedFinalCaptureLiveDB(t *testing.T) {
 		isGuardRefusal(t, err)
 		_, err = r.e.pool.Exec(r.e.ctx, "UPDATE recovery_captures SET state='expired' WHERE id=$1", r.capture)
 		isGuardRefusal(t, err)
-		// The TTL sweep skips a protected capture whatever the clock says.
-		if _, err := r.e.q.ExpireReadyCaptures(r.e.ctx, pgtype.Timestamptz{Time: time.Now().Add(30 * 24 * time.Hour), Valid: true}); err != nil {
+		// The TTL sweep skips a protected capture even once its TTL has passed. Backdate this
+		// capture rather than sweeping at a future clock: the sweep is global, and a future clock
+		// would trip the guard on other tests' protected captures in the shared database.
+		if _, err := r.e.pool.Exec(r.e.ctx, "UPDATE recovery_captures SET expires_at = now() - interval '1 hour' WHERE id=$1", r.capture); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.e.q.ExpireReadyCaptures(r.e.ctx, pgtype.Timestamptz{Time: time.Now(), Valid: true}); err != nil {
 			t.Fatal(err)
 		}
 		if c := r.row(t); c.State != "available" || !c.LocalReplica.Valid {

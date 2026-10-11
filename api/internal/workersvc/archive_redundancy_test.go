@@ -240,6 +240,9 @@ type redundancyForge struct {
 	unknown                         map[string]bool           // candidate -> forge.AncestryUnknown
 	calls                           int
 	compared                        []string
+	// cancelAfter cancels the request once a candidate other than the final head was answered.
+	cancelAfter context.CancelFunc
+	finalHead   string
 }
 
 func (f *redundancyForge) GetMergeRequestSummary(context.Context, int64, int64) (forge.MergeRequestSummary, error) {
@@ -261,6 +264,9 @@ func (f *redundancyForge) CompareAncestry(_ context.Context, _ int64, head, cand
 	defer f.mu.Unlock()
 	f.calls++
 	f.compared = append(f.compared, candidate)
+	if f.cancelAfter != nil && candidate != f.finalHead {
+		defer f.cancelAfter()
+	}
 	if f.compareErr != nil {
 		return forge.AncestryUnknown, f.compareErr
 	}
@@ -311,31 +317,37 @@ type fakeRedundancyTxQ struct {
 	expire  func() []uuid.UUID
 	expires int
 	proof   []byte
-	// workerErr fails the first locked read (GetWorkerForUpdate) when set.
-	workerErr error
+	// errs fails the named locked read when set, keyed by store method name.
+	errs map[string]error
 }
 
 func (t *fakeRedundancyTxQ) GetWorkerForUpdate(context.Context, uuid.UUID) (store.Worker, error) {
-	return store.Worker{}, t.workerErr
+	return store.Worker{}, t.errs["GetWorkerForUpdate"]
 }
 
 func (t *fakeRedundancyTxQ) GetRunOwnedByWorkerForUpdate(context.Context, store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error) {
-	return store.Run{}, nil
+	return store.Run{}, t.errs["GetRunOwnedByWorkerForUpdate"]
 }
 
 func (t *fakeRedundancyTxQ) GetFinalInventoryHold(context.Context, store.GetFinalInventoryHoldParams) (store.RecoveryCustodyHold, error) {
-	return store.RecoveryCustodyHold{ID: t.q.view.HoldID}, nil
+	return store.RecoveryCustodyHold{ID: t.q.view.HoldID}, t.errs["GetFinalInventoryHold"]
 }
 
 func (t *fakeRedundancyTxQ) GetFinalInventoryCapture(context.Context, store.GetFinalInventoryCaptureParams) (store.RecoveryCapture, error) {
-	return store.RecoveryCapture{}, nil
+	return store.RecoveryCapture{}, t.errs["GetFinalInventoryCapture"]
 }
 
 func (t *fakeRedundancyTxQ) GetArchiveRedundancyView(ctx context.Context, a store.GetArchiveRedundancyViewParams) (store.GetArchiveRedundancyViewRow, error) {
+	if err := t.errs["GetArchiveRedundancyView"]; err != nil {
+		return store.GetArchiveRedundancyViewRow{}, err
+	}
 	return t.q.GetArchiveRedundancyView(ctx, a)
 }
 
 func (t *fakeRedundancyTxQ) LockCompletedPublicationBinding(context.Context, store.LockCompletedPublicationBindingParams) (store.LockCompletedPublicationBindingRow, error) {
+	if err := t.errs["LockCompletedPublicationBinding"]; err != nil {
+		return store.LockCompletedPublicationBindingRow{}, err
+	}
 	b := t.q.binding
 	return store.LockCompletedPublicationBindingRow{RepoID: b.RepoID, ConnectionID: b.ConnectionID, ProjectID: b.ProjectID, ForgeType: b.ForgeType, BaseUrl: b.BaseUrl}, nil
 }
@@ -401,7 +413,7 @@ func newRedundancyUnit(t *testing.T, vecName string) *redundancyUnit {
 		},
 		binding: store.GetCompletedPublicationBindingRow{RepoID: repoID, ConnectionID: connID, ProjectID: 11, ForgeType: "gitlab", BaseUrl: "https://forge.e2e"},
 	}
-	u.forge = &redundancyForge{branch: "agent/issue-1", head: u.head, summaryHead: u.head, answers: map[string]forge.Ancestry{u.final: forge.AncestryAncestor}}
+	u.forge = &redundancyForge{branch: "agent/issue-1", head: u.head, summaryHead: u.head, finalHead: u.final, answers: map[string]forge.Ancestry{u.final: forge.AncestryAncestor}}
 	for _, r := range c.Roots {
 		u.forge.answers[r] = forge.AncestryAncestor
 	}
@@ -710,7 +722,6 @@ func TestArchiveRedundancyOnlyForgeEvidenceIsMemoized(t *testing.T) {
 		ctx    func() (context.Context, context.CancelFunc)
 		reason string
 	}{
-		{"binding_db_error", func(u *redundancyUnit) { u.q.bindingErr = errors.New("db down") }, nil, apitypes.RecoveryRedundancyAncestryUnknown},
 		{"binding_mismatch", func(u *redundancyUnit) { u.q.binding.ProjectID = 12 }, nil, apitypes.RecoveryRedundancyIdentityChanged},
 		{"nil_forges", func(u *redundancyUnit) { u.p.forges = nil }, nil, apitypes.RecoveryRedundancyAncestryUnknown},
 		{"cancelled_request", func(u *redundancyUnit) { u.forge.compareErr = context.Canceled }, func() (context.Context, context.CancelFunc) {
@@ -739,21 +750,73 @@ func TestArchiveRedundancyOnlyForgeEvidenceIsMemoized(t *testing.T) {
 	}
 }
 
-// A store error on the locked reads is an infrastructure failure, not an identity change.
+// A store error on any locked read is an infrastructure failure, not an identity change; a
+// missing row is the bounded identity_changed reason.
 func TestArchiveRedundancyExpireStoreErrorIsAnError(t *testing.T) {
+	for _, site := range []string{
+		"GetWorkerForUpdate", "GetRunOwnedByWorkerForUpdate", "GetFinalInventoryHold",
+		"GetFinalInventoryCapture", "GetArchiveRedundancyView", "LockCompletedPublicationBinding",
+	} {
+		t.Run(site, func(t *testing.T) {
+			u := newRedundancyUnit(t, "small")
+			u.txq.errs = map[string]error{site: errors.New("connection reset")}
+			res, err := u.p.prove(context.Background(), u.w, u.run, u.capID, u.req)
+			if err == nil || res.Outcome != "" {
+				t.Fatalf("got %+v %v want an error", res, err)
+			}
+			if u.tx.commits != 0 || u.txq.expires != 0 {
+				t.Fatalf("commits=%d expires=%d", u.tx.commits, u.txq.expires)
+			}
+			u = newRedundancyUnit(t, "small")
+			u.txq.errs = map[string]error{site: pgx.ErrNoRows}
+			u.wantRetained(t, apitypes.RecoveryRedundancyIdentityChanged)
+		})
+	}
+}
+
+// The unlocked binding read in prove splits the same way: a missing row is identity_changed, any
+// other error is returned, and neither is memoized.
+func TestArchiveRedundancyBindingReadErrorSplit(t *testing.T) {
 	u := newRedundancyUnit(t, "small")
-	u.txq.workerErr = errors.New("connection reset")
-	res, err := u.p.prove(context.Background(), u.w, u.run, u.capID, u.req)
-	if err == nil || res.Outcome != "" {
+	u.q.bindingErr = errors.New("db down")
+	if res, err := u.p.prove(context.Background(), u.w, u.run, u.capID, u.req); err == nil || res.Outcome != "" {
 		t.Fatalf("got %+v %v want an error", res, err)
 	}
-	if u.tx.commits != 0 || u.txq.expires != 0 {
-		t.Fatalf("commits=%d expires=%d", u.tx.commits, u.txq.expires)
-	}
-	// A missing row is still the bounded identity_changed reason.
 	u = newRedundancyUnit(t, "small")
-	u.txq.workerErr = pgx.ErrNoRows
+	u.q.bindingErr = pgx.ErrNoRows
 	u.wantRetained(t, apitypes.RecoveryRedundancyIdentityChanged)
+	if len(u.q.memos) != 0 || u.forge.callCount() != 0 {
+		t.Fatalf("memos=%v forge calls=%d", u.q.memos, u.forge.callCount())
+	}
+}
+
+// A worker that cancels its request right after the forge answered must not escape the memo: the
+// refusal is definitive, so it is recorded and the next claim cools down without a forge call.
+func TestArchiveRedundancyCancelAfterDefinitiveAnswerStillMemoizes(t *testing.T) {
+	u := newRedundancyUnit(t, "small")
+	u.forge.answers = map[string]forge.Ancestry{u.final: forge.AncestryAncestor} // roots are not ancestors
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u.forge.cancelAfter = cancel
+	res, err := u.p.prove(ctx, u.w, u.run, u.capID, u.req)
+	if err != nil || res.Outcome != apitypes.RecoveryRedundancyRetained || res.Reason != apitypes.RecoveryRedundancyUncoveredRoot {
+		t.Fatalf("%+v %v want retained/uncovered_root", res, err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the fake forge never cancelled the request")
+	}
+	if len(u.q.memos) != 1 || u.q.memos[0] != apitypes.RecoveryRedundancyUncoveredRoot {
+		t.Fatalf("memos=%v want one uncovered_root", u.q.memos)
+	}
+	// The store memo is a fake, so replay it as the view the next claim would read.
+	u.q.view.RedundancyRefusedAt = pgtype.Timestamptz{Time: u.p.timeNow(), Valid: true}
+	u.q.view.RedundancyRefusal = pgconv.Text(u.q.memos[0])
+	before := u.forge.callCount()
+	u.forge.cancelAfter = nil
+	u.wantRetained(t, apitypes.RecoveryRedundancyCoolingDown)
+	if u.forge.callCount() != before {
+		t.Fatalf("a cooling claim made %d forge calls", u.forge.callCount()-before)
+	}
 }
 
 // A forged current_object can list far more parents than a real commit; the proof must not turn
