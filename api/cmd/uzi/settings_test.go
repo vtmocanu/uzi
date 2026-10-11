@@ -73,7 +73,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 		"code claude inactive Default SDK/account default SDK/account default worker default Pin · low low pin",
 		"code codex active Pin · code-only code-worker code-only pin Default medium worker default",
 	}
-	if len(lines) != 5 {
+	if len(lines) != 6 || lines[5] != "Now summary: on (default)" {
 		t.Fatalf("four cells: %s", out)
 	}
 	for i, row := range want {
@@ -98,7 +98,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 	}
 	fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[2:]...)
 	out, _, code = runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || strings.Count(out, "\n") != 3 {
+	if code != 0 || strings.Count(out, "\n") != 4 {
 		t.Fatalf("input bound: %s", out)
 	}
 }

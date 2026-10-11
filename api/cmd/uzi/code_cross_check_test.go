@@ -94,7 +94,7 @@ func TestRunGetCodeCrossCheckMetadata(t *testing.T) {
 				wantCost = "$1.25"
 			}
 			if usage != nil && usage.CostStatus == "subscription" {
-				wantCost = "subscription"
+				wantCost = "no estimate"
 			}
 			for _, want := range []string{family, model, effort, head, wantCost} {
 				if !strings.Contains(out, want) {
