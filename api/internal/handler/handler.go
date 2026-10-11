@@ -4,7 +4,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -104,6 +103,9 @@ type Handler struct {
 	// never nil-panics, mirroring forgeMemo/memo(). New sets it directly.
 	forgeBudget     *forgeBudget
 	forgeBudgetOnce sync.Once
+	// heldListLimiter is the proposal limiter, stored by mountWorkerRoutes for step B's
+	// per-worker forge-listing bucket (recovery()); nil permits every listing.
+	heldListLimiter *mw.Limiter
 	// recoverySvc is the durable-recovery archive service (PRD #1296 M2). Accessed only
 	// through recovery(), which lazily constructs it under recoveryOnce from h.q/h.pool/
 	// h.box + the cfg limits (production and struct-literal test Handlers alike, so the
@@ -525,11 +527,15 @@ func (h *Handler) recovery() *recovery.Service {
 				heldRemote := h.wsvc.HeldRemote()
 				h.recoverySvc.SetHeldPublication(h.cfg.HeldPublication, func(ctx context.Context, runID uuid.UUID) (pushbroker.ListRefsOptions, error) {
 					f, err := heldRemote(ctx, runID)
-					if errors.Is(err, workersvc.ErrHeldRemoteGone) {
-						err = recovery.ErrHeldRemoteGone
-					}
-					return f.ListOptions(), err
+					return f.ListOptions(), heldRemoteForRecovery(err)
 				})
+				// Step B's forge listing spends the owner's forge quota: one shared per-worker
+				// bucket, consulted by the service only just before that listing.
+				if lim := h.heldListLimiter; lim != nil {
+					h.recoverySvc.SetHeldListAllow(func(workerID uuid.UUID) bool {
+						return lim.Allow("held-final-list|" + workerID.String())
+					})
+				}
 			}
 		}
 	})
@@ -1159,6 +1165,8 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 // token (sha256 lookup), not a session cookie. No CSRF step — the credential is a
 // held bearer secret, not an ambient cookie.
 func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
+	// Read once by recovery() when it builds the recovery service, after routes are mounted.
+	h.heldListLimiter = proposalLimiter
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))
 		// PRD #1906 M5 (D-D): an isolated-lane worker reaches only the lifecycle routes its

@@ -147,6 +147,7 @@ type Service struct {
 	heldRemote      HeldRemoteFunc
 	heldListFn      func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	heldPreLockHook func()
+	heldListAllow   func(workerID uuid.UUID) bool
 	heldPreAckHook  func(tx pgx.Tx)
 }
 

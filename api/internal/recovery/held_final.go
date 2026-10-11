@@ -6,7 +6,10 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -37,7 +40,8 @@ const (
 	// HeldReleaseRefMismatch: the held ref is at a tip other than the declared one (definitive).
 	HeldReleaseRefMismatch = "held_publication_ref_mismatch"
 	// HeldReleaseNotEligible: the hold, run or publication is not in a state a held release may
-	// end (cancelled or excluded run, stale generation, hold not open, publication not created).
+	// end (cancelled or excluded run, stale generation, hold not open, publication not created), or
+	// the run's repo or forge connection is gone so no listing can ever be brokered (definitive).
 	HeldReleaseNotEligible = "held_publication_not_eligible"
 )
 
@@ -57,7 +61,35 @@ const maxHeldLogLen = 400
 // body of the (attacker-controlled) forge in the error, so the text is secret-scrubbed, then
 // stripped of control, escape, bidi and zero-width runes and truncated.
 func heldLogText(err error) string {
-	return sanitizeLabel(secretscrub.Scrub(err.Error()), maxHeldLogLen)
+	return truncateRunes(secretscrub.Scrub(dropUnsafeRunes(err.Error())), maxHeldLogLen)
+}
+
+// ansiSeqRe matches CSI and OSC escape sequences.
+var ansiSeqRe = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+
+// dropUnsafeRunes DELETES every ANSI sequence and unsafe rune BEFORE secretscrub runs, so a token
+// split by a separator is rejoined and then redacted whole (replacing the separator with a space
+// would leave the token body behind, unrecognised). Unsafe is what isUnsafeLabelRune rejects plus
+// the Unicode format, line and paragraph separator classes (U+2028, U+2029, U+FEFF, U+2060 to
+// U+2064 and the rest of Cf).
+func dropUnsafeRunes(s string) string {
+	s = ansiSeqRe.ReplaceAllString(s, "")
+	var b strings.Builder
+	for _, r := range s {
+		if isUnsafeLabelRune(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// truncateRunes cuts s to at most max runes and trims surrounding space.
+func truncateRunes(s string, max int) string {
+	if utf8.RuneCountInString(s) > max {
+		s = string([]rune(s)[:max])
+	}
+	return strings.TrimSpace(s)
 }
 
 var heldShaRe = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
@@ -67,6 +99,10 @@ var heldShaRe = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 // workersvc's tests import this package; the derivation applies the SSRF gate before the PAT is
 // decrypted.
 type HeldRemoteFunc func(ctx context.Context, runID uuid.UUID) (pushbroker.ListRefsOptions, error)
+
+// SetHeldListAllow wires the per-worker limiter consulted immediately before the one forge
+// listing of step B. A nil allow permits every listing. Call once at construction.
+func (s *Service) SetHeldListAllow(allow func(workerID uuid.UUID) bool) { s.heldListAllow = allow }
 
 // SetHeldPublication wires step B: enabled is UZI_HELD_PUBLICATION and remote the forge
 // connection derivation. Call once at construction, before the service serves requests. Without
@@ -149,6 +185,10 @@ func (s *Service) releaseHeldPublication(ctx context.Context, wkr store.Worker, 
 		return apitypes.RecoveryReleaseResponse{}, err
 	case !eligible:
 		fp.skipped = true
+	case s.heldListAllow != nil && !s.heldListAllow(wkr.ID):
+		// Consulted only here, after the pre-check: archive and settled FINALs and exact
+		// replays never reach it. Over the limit nothing is decided, so the worker retries.
+		return heldRetained(runID, generation, HeldReleaseUnavailable), nil
 	default:
 		fp.refDefect, err = s.heldRefDefect(ctx, runID, generation, f.SourceSha)
 		switch {
@@ -177,7 +217,7 @@ type heldForgeProof struct {
 func heldStateEligible(status string, claimGen int64, runWorker pgtype.UUID, failOrigin pgtype.Text,
 	hold store.RecoveryCustodyHold, wkrID uuid.UUID, havePub bool, pub store.RunHeldPublication,
 	generation int64, publication uuid.UUID, f *apitypes.RecoveryFinalDisposition) bool {
-	return status == "failed" && !(failOrigin.Valid && (failOrigin.String == "push_secret_blocked" || failOrigin.String == "worker_residue_blocked")) &&
+	return status == "failed" && (!failOrigin.Valid || (failOrigin.String != "push_secret_blocked" && failOrigin.String != "worker_residue_blocked")) &&
 		claimGen == generation && runWorker.Valid && uuid.UUID(runWorker.Bytes) == hold.OriginalWorkerID &&
 		hold.LiveWorkerID.Valid && uuid.UUID(hold.LiveWorkerID.Bytes) == wkrID &&
 		havePub && pub.ID == publication && pub.HoldID == hold.ID && pub.State == "created" &&
