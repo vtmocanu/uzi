@@ -223,6 +223,14 @@ export class FakeApi {
   // with no override answers 200 {status:"running"} — the "still ours, keep going"
   // default the skip path proceeds on. An override expresses a terminal status, a
   // 404 not-owned, or a transient 5xx.
+  /** Opt-in M2 fixtures; legacy tests retain their original wire shape. */
+  parkRunGeneration: number | undefined;
+  readonly workerPauseRequests: Array<{ runId: string; generation: unknown }> = [];
+  parkRunOwnership: { status: string; claim_generation: number; hold_reason: string | null; claim_released: boolean } | undefined;
+  guardedQuestionStatus: string | undefined;
+  workerPauseRefused = false;
+  workerPauseReason: string | undefined;
+  guardedQuestionReason: string | undefined;
   private readonly ownershipByRun = new Map<
     string,
     { httpStatus: number; status?: string; generation?: number; inventoryGuarded?: boolean }
@@ -1330,6 +1338,17 @@ export class FakeApi {
       });
     }
 
+    const pauseRunMatch = /^\/api\/worker\/runs\/([^/]+)\/pause$/.exec(p);
+    if (req.method === "POST" && pauseRunMatch && this.parkRunGeneration !== undefined) {
+      const runId = pauseRunMatch[1]!;
+      this.workerPauseRequests.push({ runId, generation: json.claim_generation });
+      return send(res, json.claim_generation === this.parkRunGeneration && !this.workerPauseRefused ? 200 : 409, {
+        applied: json.claim_generation === this.parkRunGeneration && !this.workerPauseRefused,
+        ...(this.workerPauseReason ? { reason: this.workerPauseReason } : {}),
+        run: { status: "running", hold_reason: null },
+        ...(json.claim_generation !== this.parkRunGeneration ? { disposition: "stale_claim" } : {}),
+      });
+    }
     // issue #559 M3: the read-only ownership probe. Not part of the runMatch
     // alternation above (it is a GET-only read of a distinct segment), so it is
     // routed here. No override ⇒ 200 {status:"running"} (still ours, keep going).
@@ -1337,6 +1356,7 @@ export class FakeApi {
     if (req.method === "GET" && ownMatch) {
       const runId = ownMatch[1] as string;
       this.ownershipRequests.push(runId);
+      if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
       if (!o) return send(res, 200, { status: "running" });
       if (o.httpStatus !== 200)
@@ -1542,6 +1562,15 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
+    if (body.require_running === true && this.parkRunGeneration !== undefined &&
+        (json.claim_generation !== this.parkRunGeneration || this.guardedQuestionStatus !== undefined)) {
+      return send(res, 409, {
+        applied: false,
+        run: { status: this.guardedQuestionStatus ?? "running", hold_reason: null },
+        ...(this.guardedQuestionReason ? { reason: this.guardedQuestionReason } : {}),
+        ...(json.claim_generation !== this.parkRunGeneration ? { disposition: "stale_claim" } : {}),
+      });
+    }
     const drop = this.droppedStates.get(runId);
     if (drop?.matches(body)) {
       if (drop.beforeDrop !== undefined) await drop.beforeDrop;

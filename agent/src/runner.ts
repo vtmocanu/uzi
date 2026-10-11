@@ -1,4 +1,5 @@
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
+import { isParkAnswer } from "./park-run.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -639,6 +640,8 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
 type PublishFailClass = "secret_remediation_pending" | "preservation_refused" | "no_local_tip" | "skipped" | "rejected" | "aborted" | "scratch_publication_refused" | "error";
 
 /** Local refusal before any checkpoint pack producer or broker attempt. */
+class OrdinaryOwnerPaused extends Error {}
+
 class SecretRemediationPendingError extends Error {}
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
@@ -3522,6 +3525,13 @@ export class RunRunner {
         // NO reportState: the run stays non-terminal so the server's sweeper requeues
         // it. Reporting `failed` here would turn a recoverable interruption into a dead
         // run — the exact outcome the fetch-back exists to prevent.
+      } else if (err instanceof OrdinaryOwnerPaused) {
+        flight.parked = true;
+        await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
+          .catch((error) => runLog.warn("recovery: owner pause pin failed", { error: errMessage(error) }));
+        if (claim.inventory_guarded === true)
+          await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof PauseNowSignal) {
         // PRD #1190 M2: a `now` pause aborted a turn OUTSIDE the implement loop's own catch (e.g.
         // during the plan turn), so the signal reached here. Caught BEFORE the generic terminal
@@ -10613,6 +10623,7 @@ export class RunRunner {
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
+          { confirmRunning: resolveRunKind(claim.kind) === "issue" && !claim.interactive },
         ),
       // Issue #1593: the worker-authored fallback park for a planning turn that stayed
       // prose-only after a nudge. Fixed question, no model text; autopilot never parks.
@@ -10883,6 +10894,101 @@ export class RunRunner {
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
       // issue #1597 M2: gated — a tick can never fetch/publish the wip marker this path commits.
+      parkRunSupported: claim.park_run_supported === true,
+      requestParkRun: async (pausedAt) => {
+        const supported = claim.park_run_supported === true;
+        const checkLifecycle = (): void => {
+          if (steering.getPauseMode() === "disk") throw new DiskParkSignal(false);
+          if (steering.getPauseMode() === "wall") throw new PauseNowSignal();
+          steering.lifecycleSignal().throwIfAborted();
+        };
+        const retainPause = async () => {
+          flight.parked = true;
+          await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
+            .catch((error) => runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
+              run_id: runId, error: errMessage(error),
+            }));
+          if (claim.inventory_guarded === true)
+            await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+          return { kind: "paused" } as const;
+        };
+        const checkAck = (ack: StateAck): void => {
+          if (ack.credentialSwitch) steering.tripCredentialSwitch(ack.credentialSwitch.generation);
+          if (ack.status === "paused" && ack.holdReason === "budget_exhausted") throw new ServerWallParkedError();
+          if (ack.staleClaim || ack.credentialSwitchReleased) throw new StaleClaimError();
+          if (ack.reason === "wall_pending") steering.seedPauseRequested("wall");
+          checkLifecycle();
+        };
+        if (resolveRunKind(claim.kind) !== "issue" || claim.interactive ||
+            (supported && (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration! <= 0)))
+          throw new TrustedExecutionRefusal("park run requires a noninteractive issue and supported current claim generation");
+        // One attempt per explicit, consumed owner command. Failures never restart a provider turn.
+        for (;;) {
+          if (steering.isCancelled()) return { kind: "cancel" };
+          checkLifecycle();
+          if (supported) {
+            let requested: StateAck;
+            try {
+              requested = await this.client.requestWorkerPause(runId, flight.claimGeneration!, steering.lifecycleSignal());
+            } catch (error) {
+              checkLifecycle();
+              throw new TrustedExecutionRefusal("park run request could not be confirmed", { cause: error });
+            }
+            checkAck(requested);
+            if (requested.status === "cancelled") return { kind: "cancel" };
+            if (requested.status !== "running" && requested.status !== "paused")
+              throw new TrustedExecutionRefusal("park run request refused");
+            const parked = requested.applied && requested.status === "running" &&
+              await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt));
+            if (steering.isCancelled()) return { kind: "cancel" };
+            checkLifecycle();
+            if (parked) return { kind: "paused" };
+            // One diagnostic read, bounded in wall time. It grants no question-write authority.
+            let ownership: RunOwnershipResponse;
+            try {
+              ownership = await this.client.getRunOwnership(runId, {
+                signal: AbortSignal.any([steering.lifecycleSignal(), AbortSignal.timeout(5000)]),
+                deadline: Date.now() + 5000,
+              });
+            } catch (error) {
+              checkLifecycle();
+              if (isRunOwnershipLost(error, runId)) throw new StaleClaimError();
+              throw new TrustedExecutionRefusal("park run ownership could not be confirmed", { cause: error });
+            }
+            if (steering.isCancelled()) return { kind: "cancel" };
+            checkLifecycle();
+            if (ownership.status === "paused" && ownership.hold_reason === "budget_exhausted")
+              throw new ServerWallParkedError();
+            if (ownership.claim_released === true ||
+                (ownership.claim_generation !== undefined && ownership.claim_generation !== flight.claimGeneration))
+              throw new StaleClaimError();
+            if (ownership.status === "cancelled") return { kind: "cancel" };
+            if (ownership.claim_generation !== flight.claimGeneration || ownership.claim_released !== false)
+              throw new TrustedExecutionRefusal("park run ownership is unreadable");
+            if (ownership.status === "paused" && ownership.hold_reason === null) return retainPause();
+            if (ownership.status !== "running")
+              throw new TrustedExecutionRefusal("park run ownership refused");
+          }
+          if (claim.auto_approve)
+            throw new TrustedExecutionRefusal("park run needs an owner decision after refusal");
+          let verdict: AnswerVerdict;
+          try {
+            verdict = await this.parkQuestion(runId, [{
+              header: "Park run",
+              question: supported
+                ? "The pause did not complete. What should happen next? Answer /park to try once more, give actionable guidance, or cancel the run."
+                : `Parking here requires both server and worker support. Use uzi run pause ${runId} --now, give actionable guidance, or cancel. Answer /park to check again.`,
+            }], "worker", undefined, batcher, steering, reportState, runLog, claim.config ?? null,
+            { confirmRunning: true, requireRunning: supported });
+          } catch (error) {
+            if (steering.isCancelled()) return { kind: "cancel" };
+            checkLifecycle();
+            if (error instanceof OrdinaryOwnerPaused) return retainPause();
+            throw error;
+          }
+          if (!isParkAnswer(verdict)) return verdict;
+        }
+      },
       parkForPause: async (pausedAt) => {
         const parked = await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt));
         if (!parked) steering.rearmLifecycle();
@@ -16673,6 +16779,7 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     config: ClaimConfig | null,
+    options: { confirmRunning?: boolean } = {},
   ): Promise<AnswerVerdict> {
     if (autoApprove) {
       // Autopilot is "no human in the loop" (PRD #19), so a park would wedge the run
@@ -16704,6 +16811,7 @@ export class RunRunner {
       reportState,
       runLog,
       config,
+      options,
     );
   }
 
@@ -16763,6 +16871,7 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<unknown>,
     runLog: Logger,
     config: ClaimConfig | null,
+    options: { confirmRunning?: boolean; requireRunning?: boolean } = {},
   ): Promise<AnswerVerdict> {
     const ordinal = (this.questionCounts.get(runId) ?? 0) + 1;
     this.questionCounts.set(runId, ordinal);
@@ -16807,10 +16916,19 @@ export class RunRunner {
     const ack = await reportState({
       status: "awaiting_input",
       open_question_id: questionId,
+      ...(options.requireRunning ? { require_running: true } : {}),
     });
     const parked = (ack as { status?: string } | undefined)?.status;
-    if (parked !== "awaiting_input") {
+    if (parked !== "awaiting_input" || (options.requireRunning && !(ack as StateAck).applied)) {
       this.openQuestionIds.delete(runId);
+      if (options.requireRunning && (ack as StateAck).reason === "wall_pending") {
+        steering.seedPauseRequested("wall");
+        throw new PauseNowSignal();
+      }
+      if (options.requireRunning && parked === "paused" && (ack as StateAck).holdReason === "budget_exhausted")
+        throw new ServerWallParkedError();
+      if (options.requireRunning && parked === "paused" && !(ack as StateAck).holdReason)
+        throw new OrdinaryOwnerPaused();
       throw new TrustedExecutionRefusal(
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );
@@ -16828,7 +16946,7 @@ export class RunRunner {
     // primary defence. Its server-side counterparts are the two clears in
     // runtime.sql (SetRunRunning and SetRunAwaitingApproval); this is the worker's
     // half of the same invariant — no resolved id is left behind anywhere.
-    const settle = (v: AnswerVerdict): AnswerVerdict => {
+    const settle = async (v: AnswerVerdict): Promise<AnswerVerdict> => {
       this.openQuestionIds.delete(runId);
       if (v.kind === "answer") {
         // PRD #307: a plan-phase clarification resumes into more PLANNING turns, so
@@ -16843,7 +16961,14 @@ export class RunRunner {
         // on the consumed-answer guard — it is NOT a running -> running no-op, because the
         // awaiting_input park report is awaited and persisted before settle runs). NOT
         // emitted on cancel/timeout (timeout throws before settle; cancel is guarded out).
-        void reportState({ status: "running" }).catch((e) =>
+        if (options.confirmRunning) {
+          const running = await reportState({ status: "running" }) as StateAck;
+          if (running.status !== "running") {
+            if (running.status === "paused" && running.holdReason === "budget_exhausted") throw new ServerWallParkedError();
+            if (running.status === "paused" && !running.holdReason) throw new OrdinaryOwnerPaused();
+            throw new TrustedExecutionRefusal("clarification running settlement was not confirmed");
+          }
+        } else void reportState({ status: "running" }).catch((e) =>
           runLog.warn("could not report running after clarification", {
             error: errMessage(e),
           }),

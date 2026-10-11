@@ -714,6 +714,7 @@ export class Worker {
           // row can be asked to park itself; an image WITHOUT it has its out-of-time run parked
           // server-side at once (never failed), so advertising it is negotiation, not a toggle.
           "wall_park_v1",
+          "park_run_v1",
           "input_receipts_v1",
           // Issue #1800: this image reports when an owner follow-up was really put into an
           // executor prompt (POST /inputs/included); the api refuses the route without it.

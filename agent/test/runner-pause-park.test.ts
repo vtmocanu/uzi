@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import { isParkAnswer } from "../src/park-run.js";
+import type { AnswerVerdict } from "../src/steering.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -440,5 +442,250 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("RunRunner — M2 explicit park callback", () => {
+  async function exercise(options: {
+    supported?: boolean; empty?: boolean; answer?: string; cancel?: boolean;
+    retry?: boolean; lostAck?: boolean; guardedPause?: boolean; unknown?: boolean;
+    unattended?: boolean; ownership?: "wall" | "released" | "foreign";
+    deadlineRetry?: boolean; cancelledBefore?: boolean; legacyGeneration?: boolean;
+    nonissue?: boolean; requestRefused?: boolean; wallPending?: boolean; guardedWall?: boolean;
+    guardedExistingQuestion?: boolean;
+  } = {}) {
+    const claim = { ...gitlabClaim(2657), claim_generation: options.legacyGeneration ? 0 : 1,
+      ...(options.nonissue ? { kind: "prompt" as const } : {}),
+      park_run_supported: options.supported !== false, auto_approve: options.unattended ?? false };
+    api.parkRunGeneration = options.supported === false ? undefined : 1;
+    if (!options.unknown) api.parkRunOwnership = {
+      status: options.lostAck ? "paused" : "running",
+      claim_generation: 1, hold_reason: null, claim_released: false,
+    };
+    if (options.ownership === "wall") api.parkRunOwnership!.hold_reason = "budget_exhausted";
+    if (options.ownership === "wall") api.parkRunOwnership!.status = "paused";
+    if (options.ownership === "released") api.parkRunOwnership!.claim_released = true;
+    if (options.ownership === "foreign") api.parkRunOwnership!.claim_generation = 2;
+    if (options.guardedPause) api.guardedQuestionStatus = "paused";
+    if (options.guardedExistingQuestion) api.guardedQuestionStatus = "awaiting_input";
+    api.workerPauseRefused = !!options.requestRefused || !!options.wallPending;
+    if (options.wallPending) api.workerPauseReason = "wall_pending";
+    if (options.guardedWall) {
+      api.guardedQuestionStatus = "running";
+      api.guardedQuestionReason = "wall_pending";
+    }
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-run-"));
+    const publish = spyPublish();
+    const report = client.reportState.bind(client);
+    if (options.lostAck) client.reportState = async (...args) => {
+      const ack = await report(...args);
+      if (args[1].status === "paused") throw new Error("lost paused ACK");
+      return ack;
+    };
+    let result: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
+    let turns = 0;
+    let questions = 0;
+    let callbackReads = 0;
+    const clockStart = Date.now();
+    api.onState(claim.run_id, (state) => {
+      if (state.status !== "awaiting_input") return;
+      questions++;
+      if (options.deadlineRetry && questions > 1) return;
+      const answer = (options.retry || options.deadlineRetry) && questions === 1 ? " /park " : options.answer ?? "repair the checkpoint";
+      api.setInputs(claim.run_id, [{
+        id: questions, kind: options.cancel ? "cancel" : "answer",
+        body: options.cancel ? null : JSON.stringify({ question_id: state.open_question_id, answers: [answer] }),
+      }]);
+      if (options.retry && questions === 1) api.parkRunOwnership!.status = "paused";
+    });
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: { run: async (ctx) => {
+        turns++;
+        fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+        assert.equal(ctx.parkRunSupported, options.supported !== false);
+        if (!options.empty) commitInTree(ctx.worktreePath, "WORK.txt", "callback checkpoint\n");
+        if (options.cancelledBefore) {
+          api.setInputs(claim.run_id, [{ id: 99, kind: "cancel", body: null }]);
+          await new Promise<void>((resolve, reject) => {
+            const deadline = Date.now() + 1000;
+            const check = () => {
+              if (ctx.cancelRequested?.()) return resolve();
+              if (Date.now() >= deadline) return reject(new Error("cancel delivery deadline"));
+              setTimeout(check, 5);
+            };
+            check();
+          });
+        }
+        const readsBefore = api.ownershipRequests.length;
+        try { result = await ctx.requestParkRun!({ completedCount: 1, total: 2 }); }
+        finally { callbackReads = api.ownershipRequests.length - readsBefore; }
+        return result.kind === "paused"
+          ? { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } }
+          : { branch: ctx.branch };
+      } },
+    });
+    try {
+      const { gitlab } = fakeGitlab();
+      const runner = options.deadlineRetry
+        ? new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
+            pollMs: 5, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+            now: () => clockStart + questions * 601,
+          })
+        : runnerWithGit(factory, gitlab);
+      await runner.execute(claim);
+      return { claim, result, turns, questions, callbackReads, published: publish.calls.length };
+    } finally {
+      client.reportState = report;
+      publish.restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  }
+
+  it("parks through the real checkpoint sink without finalizing", async () => {
+    const outcome = await exercise();
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(outcome.published, 1);
+    assert.deepEqual(api.workerPauseRequests, [{ runId: outcome.claim.run_id, generation: 1 }]);
+    assert.equal(outcome.callbackReads, 0);
+    assert.equal(outcome.questions, 0);
+    assert.ok(!stateStatuses(outcome.claim.run_id).some(s => s === "failed" || s === "completed"));
+  });
+
+  it("empty checkpoint asks a guarded question once and returns actionable guidance", async () => {
+    const outcome = await exercise({ empty: true });
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    assert.equal(outcome.published, 0);
+    assert.equal(outcome.turns, 1);
+    assert.equal(api.workerPauseRequests.length, 1);
+    assert.equal(outcome.callbackReads, 1);
+    assert.equal(api.states.find(s => s.body.status === "awaiting_input")?.body.require_running, true);
+    assert.equal(messageKinds(outcome.claim.run_id).filter(k => k === "pause_failed").length, 1);
+  });
+
+  it("only a consumed /park answer authorizes another attempt after confirmed running settlement", async () => {
+    const outcome = await exercise({ empty: true, retry: true });
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(api.workerPauseRequests.length, 2);
+    assert.equal(outcome.questions, 1);
+    assert.equal(outcome.turns, 1);
+    const statuses = stateStatuses(outcome.claim.run_id);
+    assert.ok(statuses.indexOf("running", statuses.indexOf("awaiting_input")) > statuses.indexOf("awaiting_input"));
+  });
+
+  it("returns an owner cancel without another pause request", async () => {
+    const outcome = await exercise({ empty: true, cancel: true });
+    assert.deepEqual(outcome.result, { kind: "cancel" });
+    assert.equal(api.workerPauseRequests.length, 1);
+  });
+
+  it("reconciles a lost paused ACK using exact unreleased ordinary ownership", async () => {
+    const outcome = await exercise({ lostAck: true });
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(outcome.callbackReads, 1);
+    assert.equal(outcome.questions, 0);
+    assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  it("guard refusal reporting an ordinary pause returns paused without waiting or terminal failure", async () => {
+    const outcome = await exercise({ empty: true, guardedPause: true });
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(outcome.questions, 0);
+    assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  it("a refused guarded write cannot wait on an unrelated existing question", async () => {
+    const outcome = await exercise({ empty: true, guardedExistingQuestion: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questions, 0);
+    assert.equal(api.workerPauseRequests.length, 1);
+  });
+
+  it("unsupported server asks an unguarded worker question and never calls pause", async () => {
+    const outcome = await exercise({ supported: false });
+    assert.equal(outcome.result?.kind, "answer");
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.callbackReads, 0);
+    assert.equal(api.states.find(s => s.body.status === "awaiting_input")?.body.require_running, undefined);
+    assert.ok(JSON.stringify(api.messages(outcome.claim.run_id)).includes("uzi run pause"));
+  });
+
+  it("an unsupported generation-zero server still gets a bounded compatibility question", async () => {
+    const outcome = await exercise({ supported: false, legacyGeneration: true });
+    assert.equal(outcome.result?.kind, "answer");
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.questions, 1);
+  });
+
+  it("refuses nonissue callbacks independently of the harness", async () => {
+    const outcome = await exercise({ nonissue: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.questions, 0);
+  });
+
+  it("a running request refusal skips the checkpoint sink before asking", async () => {
+    const outcome = await exercise({ requestRefused: true });
+    assert.equal(outcome.result?.kind, "answer");
+    assert.equal(outcome.published, 0);
+    assert.equal(outcome.questions, 1);
+  });
+
+  for (const options of [{ wallPending: true }, { empty: true, guardedWall: true }]) {
+    it(`a pending wall control wins at ${options.wallPending ? "request" : "question"} boundary`, async () => {
+      const outcome = await exercise(options);
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.questions, 0);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("unknown ownership ends once without a question or another attempt", async () => {
+    const outcome = await exercise({ empty: true, unknown: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(api.workerPauseRequests.length, 1);
+    assert.equal(outcome.callbackReads, 1);
+    assert.equal(outcome.questions, 0);
+  });
+
+  it("unattended refusal never enters awaiting_input", async () => {
+    const outcome = await exercise({ empty: true, unattended: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questions, 0);
+    assert.equal(api.workerPauseRequests.length, 1);
+  });
+
+  it("reuses the absolute question deadline across explicit retries", async () => {
+    const outcome = await exercise({ empty: true, deadlineRetry: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questions, 2);
+    assert.equal(api.workerPauseRequests.length, 2);
+    assert.ok(JSON.stringify(api.messages(outcome.claim.run_id)).includes("timed out"));
+  });
+
+  it("a sticky cancel wins before requesting any pause", async () => {
+    const outcome = await exercise({ cancelledBefore: true });
+    assert.deepEqual(outcome.result, { kind: "cancel" });
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.published, 0);
+  });
+
+  for (const ownership of ["wall", "released", "foreign"] as const) {
+    it(`preserves the existing ${ownership} ownership disposition without asking`, async () => {
+      const outcome = await exercise({ empty: true, ownership });
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.questions, 0);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("recognizes only exact trimmed nonempty park answers", () => {
+    const verdicts: Array<[AnswerVerdict, boolean]> = [
+      [{ kind: "cancel" }, false], [{ kind: "answer", answers: [] }, false],
+      [{ kind: "answer", answers: [" ", " /park ", "/park"] }, true],
+      [{ kind: "answer", answers: ["/park", "continue"] }, false],
+      [{ kind: "answer", answers: ["/park later"] }, false],
+    ];
+    for (const [verdict, expected] of verdicts) assert.equal(isParkAnswer(verdict), expected);
   });
 });

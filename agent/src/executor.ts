@@ -118,6 +118,12 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Claim support assertion; absent means false. The runner separately gates root and phase. */
+  parkRunSupported?: boolean;
+  /** Request a park and await its authoritative outcome or a racing owner answer. */
+  requestParkRun?(pausedAt: { completedCount: number; total?: number }): Promise<
+    { kind: "paused" } | { kind: "answer"; answers: string[] } | { kind: "cancel" }
+  >;
   /** Issue #2686: true once this run's claim is fenced (lost), so accounting-only side messages
    *  (summary_usage) are suppressed. Absent = never fenced (stub/test executors). */
   claimFenced?(): boolean;

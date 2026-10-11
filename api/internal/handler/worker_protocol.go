@@ -1425,10 +1425,20 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
+		ack := h.workerStateAck(r, run)
+		if req.RequireRunning {
+			ack["applied"] = false
+			if run.Status == "running" && run.PauseMode.String == "wall" {
+				ack["reason"] = "wall_pending"
+			}
+		}
+		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
 	ack := h.workerStateAck(r, run)
+	if req.RequireRunning {
+		ack["applied"] = true
+	}
 	if result.CompletedPublicationReceipt != nil {
 		ack["completed_publication_receipt"] = result.CompletedPublicationReceipt
 	}
@@ -1642,7 +1652,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1665,7 +1675,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded}
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}

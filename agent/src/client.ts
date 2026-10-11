@@ -1662,6 +1662,12 @@ export class WorkerClient {
 
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.require_running === true) {
+      if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
+          (body.claim_generation ?? 0) <= 0)
+        throw new Error("guarded question state requires awaiting_input and positive claim_generation");
+      return this.reportStateOnce(runId, path, body, signal);
+    }
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
     // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
@@ -2855,6 +2861,31 @@ export class WorkerClient {
     });
   }
 
+  /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
+   * One HTTP attempt, bounded by httpTimeoutMs, with no generation or owner fallback. */
+  async requestWorkerPause(runId: string, claimGeneration: number, signal?: AbortSignal): Promise<StateAck> {
+    if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0)
+      throw new Error("worker pause requires positive claim_generation");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pause`;
+    try {
+      const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
+      if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+      const fields = await readRunAck(res);
+      if (fields.status === undefined || fields.applied === undefined)
+        throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
+      const ack: StateAck = { status: fields.status, applied: fields.applied };
+      if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
+      if (fields.reason !== undefined) ack.reason = fields.reason;
+      if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;
+      if (fields.credentialSwitch !== undefined) ack.credentialSwitch = fields.credentialSwitch;
+      if (fields.credentialSwitchReleased !== undefined) ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+      return ack;
+    } catch (err) {
+      if (err instanceof RequestError) throw err;
+      throw new RequestError("POST", path, 0, "worker pause transport failed");
+    }
+  }
+
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
   // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
   // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
@@ -3512,6 +3543,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * applied it.
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
+  applied?: boolean;
   completedPublicationCandidate?: unknown;
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
@@ -3541,6 +3573,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const text = boundedText ?? await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
+      applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
       completed_publication_receipt?: unknown;
@@ -3574,6 +3607,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     };
     const run = parsed?.run;
     const out: {
+      applied?: boolean;
       completedPublicationCandidate?: unknown;
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
@@ -3598,6 +3632,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gateRevision?: number;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
     if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
     const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);
     if (completionReason) out.completedPublicationReason = completionReason;

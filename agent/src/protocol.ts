@@ -1215,6 +1215,8 @@ export interface ClaimPlanCrossCheck {
 }
 
 export interface ClaimResponse {
+  /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
+  park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
   cross_check?: ClaimPlanCrossCheck;
@@ -2316,6 +2318,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
+  require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
   completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
@@ -2806,6 +2810,9 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  /** Same-row park classification; omission cannot prove an ordinary owner pause. */
+  hold_reason?: string | null;
+  claim_released?: boolean;
   inventory_guarded?: boolean;
   status: string;
   /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane

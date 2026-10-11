@@ -708,8 +708,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #1190 M1: re-deliver a pending pause so a worker that died with one set re-arms
 		// it on resume. Derived from the loaded row like StopPending/OpenQuestionID; the
 		// columns survive every requeue, so the re-claim carries the intent forward.
-		PausePending: run.PauseRequestedAt.Valid,
-		PauseMode:    run.PauseMode.String,
+		ParkRunSupported: slices.Contains(wkr.ProtocolCapabilities, capability.ParkRunV1),
+		PausePending:     run.PauseRequestedAt.Valid,
+		PauseMode:        run.PauseMode.String,
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
