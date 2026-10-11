@@ -1434,6 +1434,38 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
   return [COMPLETION_START, paras.join("\n\n"), COMPLETION_END].join("\n");
 }
 
+const CODE_CROSS_CHECK_PARAGRAPH_RE = /^Code cross-check (?:\(checked |incomplete: )/u;
+
+/**
+ * Refresh-mode swap of ONLY the code cross-check paragraph (renderCodeCrossCheck's output, which
+ * never contains a blank line) inside an existing completion block. The fresh block's paragraph
+ * replaces the old one in place; with no old one it is inserted before the bridge sentence, the
+ * staleness pair or the footer, whichever comes first; with no fresh one the old paragraph is
+ * dropped unless it names `headSha` as the commit it checked (an earlier run's evidence for another
+ * head, or an incomplete note, must not outlive its run). Every other
+ * paragraph, the closing-reference text included, is returned byte-for-byte.
+ */
+export function swapCodeCrossCheckSection(oldCompletion: string, freshCompletion: string, headSha: string): string {
+  const paras = oldCompletion.split("\n\n");
+  const fresh = freshCompletion.split("\n\n").find((p) => CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  const at = paras.findIndex((p) => CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  if (fresh === undefined) {
+    if (at < 0) return oldCompletion;
+    const checked = /^Code cross-check \(checked `([0-9a-f]{7})`/u.exec(paras[at]!)?.[1];
+    if (checked !== undefined && headSha.startsWith(checked)) return oldCompletion;
+    paras.splice(at, 1);
+    return paras.join("\n\n");
+  }
+  if (at >= 0) {
+    paras[at] = fresh;
+    return paras.join("\n\n");
+  }
+  const anchor = paras.findIndex((p) => p === BRIDGE_SENTENCE || p.includes(STALENESS_START) || p.startsWith("---\n"));
+  if (anchor < 0) return oldCompletion;
+  paras.splice(anchor, 0, fresh);
+  return paras.join("\n\n");
+}
+
 // ── Parsing and composing a body (D10, D15) ─────────────────────────────────────────────────
 
 /** A body split around uzi's blocks. `region` / `completion` are the exact block text, markers
