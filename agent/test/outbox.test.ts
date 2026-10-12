@@ -1548,6 +1548,70 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
     });
   }
 
+  for (const failure of ["empty root symlink", "broken root symlink", "root EACCES", "root EIO", "root file"] as const) {
+    it("M1: ordinary retirement protects " + failure, async t => {
+      const root = await mkRoot();
+      const o = makeOutbox(root);
+      await o.init();
+      await o.journalTerminal("r1", 2, "reviewing", 7, { status: "completed" });
+      await o.journalFinalize("r1", 2);
+      const identity = o.finalizeRecordIdentity("r1", 2)!;
+      const pending = o.listPendingTerminals();
+      const saved = path.join(path.dirname(root), "saved");
+      const file = path.join(root, "r1", "terminal-2.json");
+      const original = await fs.readFile(file);
+      const finalize = await fs.readFile(path.join(root, "r1", "finalize-2.json"));
+      let retainedRoot = root;
+      if (failure === "root EACCES" || failure === "root EIO") {
+        const lstat = fs.lstat.bind(fs);
+        t.mock.method(fs, "lstat", async (...args: Parameters<typeof lstat>) => {
+          if (String(args[0]) === root) throw Object.assign(new Error("root inspection failed"), {
+            code: failure === "root EACCES" ? "EACCES" : "EIO",
+          });
+          return lstat(...args);
+        });
+      } else {
+        await fs.rename(root, saved);
+        retainedRoot = saved;
+        if (failure === "root file") await fs.writeFile(root, "not a directory");
+        else {
+          const target = path.join(path.dirname(root), "target");
+          if (failure === "empty root symlink") await fs.mkdir(target);
+          await fs.symlink(target, root);
+        }
+      }
+      const unlink = t.mock.method(fs, "unlink", async () => { throw new Error("unexpected unlink"); });
+      assert.equal(await o.retireTerminal("r1", 2), false);
+      assert.equal(unlink.mock.callCount(), 0);
+      assert.equal(o.hasPendingTerminal("r1", 2), true);
+      assert.deepEqual(o.listPendingTerminals(), pending);
+      assert.equal(o.finalizeRecordIdentity("r1", 2), identity);
+      assert.deepEqual(o.listPendingFinalizes(), []);
+      assert.equal(await o.retireFinalizeIfEligible("r1", 2, () => true, new AbortController().signal, identity), false);
+      assert.deepEqual(await fs.readFile(path.join(retainedRoot, "r1", "terminal-2.json")), original);
+      assert.deepEqual(await fs.readFile(path.join(retainedRoot, "r1", "finalize-2.json")), finalize);
+    });
+  }
+
+  for (const missing of ["root", "run directory"] as const) {
+    it("M1: ordinary retirement accepts safe missing " + missing, async t => {
+      const root = await mkRoot();
+      const o = makeOutbox(root);
+      await o.init();
+      await o.journalTerminal("r1", 2, "reviewing", 7, { status: "completed" });
+      await o.journalFinalize("r1", 2);
+      const identity = o.finalizeRecordIdentity("r1", 2)!;
+      await fs.rm(missing === "root" ? root : path.join(root, "r1"), { recursive: true });
+      const unlink = t.mock.method(fs, "unlink", async () => { throw new Error("unexpected unlink"); });
+      assert.equal(await o.retireTerminal("r1", 2), true);
+      assert.equal(unlink.mock.callCount(), 0);
+      assert.equal(o.hasPendingTerminal("r1", 2), false);
+      assert.equal(o.finalizeRecordIdentity("r1", 2), identity);
+      assert.deepEqual(o.listPendingFinalizes(), [{ run_id: "r1", claim_generation: 2 }]);
+      assert.equal(await o.retireTerminal("r1", 2), false);
+    });
+  }
+
   it("M1: retiring an absent generation retains sibling terminal finalize protection", async () => {
     const root = await mkRoot();
     const o = makeOutbox(root);

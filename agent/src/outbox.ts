@@ -1471,6 +1471,13 @@ export class Outbox {
     if (this.disabled) return false;
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return false;
+      // inspectTerminal can observe ENOENT below an unsafe root; that is not safe absence.
+      try {
+        const root = await fs.lstat(this.root);
+        if (!root.isDirectory() || root.isSymbolicLink()) return false;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
       const terminals = this.runs.get(runId)?.terminals;
       const pending = terminals?.get(claimGeneration);
       const fileName = pending?.fileName ?? terminalFileName(claimGeneration);
