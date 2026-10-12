@@ -18,8 +18,15 @@
 # (uzi-recovery.<branch>.clone), protected descriptor (uzi-retained.<runId>.journal),
 # or attempt ledger (uzi-attempts.<branch>.entry, last value per attemptId wins)
 # names it for THIS run, and its .git reports the run's
-# branch. The journal-named candidate wins, else the newest valid attemptId (the
-# canonical dir counts as oldest). A kept canonical clone that a stopped run left
+# branch. The PRIMARY capture (issue-N.tgz) is the journal-named candidate, else a
+# retained one, else the newest valid attemptId (the canonical dir counts as oldest).
+# Every OTHER attributed source is captured too, as its own verified artifact
+# <stem>.source-<N>.tgz (N = 2, 3, ...): a candidate the journal names (plain journal,
+# protected descriptor, retainedSources, recovery source/successor), the stopped-marker
+# canonical, or a ledger attempt whose last entry names this run in state live or
+# reclaimed (the never-deleted states). Retired and abandoned ledger attempts are not
+# extras. Every running worker pod is searched (no early exit), so a source on a pod
+# other than the current worker's is captured as well. A kept canonical clone that a stopped run left
 # detached has no journal or ledger name (the worker clears the plain journal once it
 # writes the stopped-source marker uzi-stopped.<runId>.entry); that marker, when it
 # names THIS run, branch, key and the key's exact canonical path, makes the canonical
@@ -30,7 +37,8 @@
 # worker roll or a cross-worker migration), then searches every running worker pod
 # when that current pod has lost the clone. It prefers the live working clone and
 # falls back to refs/uzi-runner/<branch> in a worker bare repo when no clone remains:
-#   issue-N.tgz               a tarball of:
+#   issue-N.tgz               a tarball of (extras: issue-N.source-<N>.tgz, same members
+#                             under the stem issue-N.source-<N>):
 #     issue-N.bundle            git bundle of the branch (commits not on origin/main)
 #     issue-N.uncommitted.patch git diff HEAD  (staged+unstaged tracked changes)
 #     issue-N.untracked.tar.gz  new, non-ignored untracked files
@@ -64,7 +72,13 @@
 # Completed and cancelled runs capture an exact protected source when one is present,
 # or the kept canonical clone named by a matching uzi-stopped marker; otherwise they
 # are status-only, unless the source search itself could not complete (FAIL).
-# Exit: 0 when every active target produced a verified recovery artifact (terminal
+# Coverage is fail-closed: when an attributed source is listed but unreadable, a pod's
+# source search is inconclusive after a clone was found (a failed kubectl listing or
+# exec), or an extra source's capture is not verified, the run logs
+# "FAIL ... incomplete coverage: <k> of <m> attributed sources captured" and the script
+# exits 1 (latest not advanced). The artifacts that were captured are kept.
+# Exit: 0 when every active target produced a verified recovery artifact for every
+# attributed source (terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
 # surviving source could not be captured intact, or a bound completed/cancelled run's
 # source search was inconclusive (a failed kubectl listing or exec, an unparseable
@@ -308,6 +322,9 @@ tar cf - -C "$OUT" . 2>/dev/null | gzip -c
 # kubectl listing or exec that did not complete) is recorded in a per-run file, not a
 # variable. A failed run is reported status-only only after a conclusive search.
 probe_inconclusive(){ : > "$PROBE_ERR_FILE"; }
+# mark_gap <reason>: record, in a per-run file (the searches run in subshells), that an
+# attributed source could not be listed or read, so the run's coverage is incomplete.
+mark_gap(){ printf '%s\n' "$1" >> "$GAP_FILE"; }
 
 running_pods(){   # $1=ns ; prints Running pod names; marks the search inconclusive on error
   local out
@@ -374,7 +391,7 @@ list_pods(){
 # On-pod candidate listing: one "<path><TAB><branch>" line per existing candidate
 # dir ($1=runner base, $2=stem): the canonical dir plus every <stem>.attempt-*
 # sibling (quoted prefix, so the glob can never reach another stem). <branch> is
-# empty when the dir has no readable .git (a recreated empty or root-owned attempt
+# empty when the dir has a .git it cannot read, or cannot be searched (a root-owned attempt
 # dir). Quarantined residue and skills-plugin dirs never qualify (defensive: the
 # stem-anchored glob cannot produce them today). A path carrying a newline or a TAB is
 # skipped: a newline could forge a second line, a tab could forge the branch field.
@@ -388,6 +405,9 @@ for d in "$1/$2" "$1/$2".attempt-*; do
   case "${d##*/}" in .uzi-residue-*|.uzi-skills-*) continue ;; esac
   case "$d" in *"
 "*|*"$tab"*) continue ;; esac
+  # A searchable dir with no .git (e.g. a delayed Docker create recreating an empty
+  # attempt path) holds no clone this capture could read: it is absent, not unknown.
+  if [ ! -e "$d/.git" ] && [ -r "$d" ] && [ -x "$d" ]; then continue; fi
   br=""
   if [ -r "$d/.git" ]; then
     br="$(git -c safe.directory="$d" -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)" || br=""
@@ -415,14 +435,17 @@ aid_newer(){
 }
 
 # select_clone <ns> <pod> <stem> <branch> <rid>: print the identity-verified working
-# clone for run <rid> on this pod, or return 1 (see the header's "Clone layout").
+# clones for run <rid> on this pod, or return 1 when there is none (see the header's
+# "Clone layout"). Line 1 is the primary; each further line is another attributed source
+# (journal-named, marker canonical, or a ledger attempt in state live/reclaimed), deduped.
 # A candidate is valid only when (a) the journal or the ledger names it for <rid>
 # (runId equal, clonePath equal, attemptId equal when the entry carries one) and
 # (b) its .git reports <branch>. Journal-named wins; else the newest attemptId
 # (aid_newer).
 select_clone(){
   local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
-  local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_ok journal_ok="" journal_current="" retained="" path br name aid
+  local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_rows ledger_ok ledger_live journal_ok="" journal_current="" retained="" path br name aid
+  local attributed="" primary=""
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
   local stopped="" marker_path="" marker_verdict=""
   [ -n "$branch" ] || return 1
@@ -585,15 +608,19 @@ select_clone(){
   # The marker-named canonical dir joins the retained set only now, so it can never
   # be journal-current.
   if [ -n "$marker_path" ]; then journal_ok="${journal_ok:+$journal_ok$'\n'}$tab$marker_path"; fi
-  # Ledger: the LAST value per attemptId wins. Keep "<attemptId><TAB><clonePath>" for
-  # each attempt whose winning entry names this run; unparseable values are skipped.
+  # Ledger: the LAST value per attemptId wins. Keep "<attemptId><TAB><clonePath><TAB><state>"
+  # for each attempt whose winning entry names this run; unparseable values are skipped.
+  # ledger_ok (every state) drives the primary rule; ledger_live (state live or reclaimed,
+  # the never-deleted states) marks an attempt clone as an attributed extra source.
   # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
-  ledger_ok="$(printf '%s\n' "$ledger" | "$JQ" -rRn --arg rid "$rid" '
+  ledger_rows="$(printf '%s\n' "$ledger" | "$JQ" -rRn --arg rid "$rid" '
     [inputs | fromjson? | select(type == "object"
        and (.attemptId | type) == "string" and .attemptId != ""
        and (.clonePath | type) == "string")]
     | reduce .[] as $e ({}; .[$e.attemptId] = $e)
-    | .[] | select(.runId == $rid) | "\(.attemptId)\t\(.clonePath)"' 2>/dev/null)" || ledger_ok=""
+    | .[] | select(.runId == $rid) | "\(.attemptId)\t\(.clonePath)\t\(.state // "")"' 2>/dev/null)" || ledger_rows=""
+  ledger_ok="$(printf '%s\n' "$ledger_rows" | cut -f1,2)"
+  ledger_live="$(printf '%s\n' "$ledger_rows" | awk -F'\t' '$3 == "live" || $3 == "reclaimed" { print $1 "\t" $2 }')"
   while IFS="$tab" read -r path br; do
     [ -n "$path" ] && [ "${path%/*}" = "$RUNNER_BASE" ] || continue
     # Belt-and-braces for the on-pod tab filter: a tab left in the branch field
@@ -613,34 +640,38 @@ select_clone(){
       if { printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; } \
          || { [ -n "$aid" ] && printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path"; }; then
         probe_inconclusive
+        mark_gap "attributed source $path is listed but unreadable"
       fi
       continue
     fi
     [ "$br" = "$branch" ] || continue
     if [ "$journal_current" = "$aid$tab$path" ]; then
-      if [ -n "$marker_path" ] && [ "$marker_path" != "$path" ] \
-         && printf '%s\n' "$listing" | grep -qF -- "$marker_path$tab"; then
-        log "WARN $rid kept canonical $marker_path not captured (journal names a live clone)" >&2
-      fi
-      printf '%s\n' "$path"
-      return 0
+      primary="$path"
+      attributed="${attributed:+$attributed$'\n'}$path"
+      continue
     fi
     if printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; then
       [ -n "$retained" ] || retained="$path"
+      attributed="${attributed:+$attributed$'\n'}$path"
       continue
     fi
     [ -n "$aid" ] || continue
     printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path" || continue
+    if printf '%s\n' "$ledger_live" | grep -qxF -- "$aid$tab$path"; then
+      attributed="${attributed:+$attributed$'\n'}$path"
+    fi
     if [ "$have_best" -eq 0 ] || aid_newer "$aid" "$best_aid"; then
       best="$path"; best_aid="$aid"; have_best=1
     fi
   done <<< "$listing"
-  if [ -n "$retained" ]; then
-    printf '%s\n' "$retained"
-    return 0
-  fi
-  [ "$have_best" -eq 1 ] || return 1
-  printf '%s\n' "$best"
+  [ -n "$primary" ] || primary="$retained"
+  [ -n "$primary" ] || { [ "$have_best" -eq 1 ] && primary="$best"; }
+  [ -n "$primary" ] || return 1
+  printf '%s\n' "$primary"
+  while IFS= read -r path; do
+    [ -n "$path" ] && [ "$path" != "$primary" ] && printf '%s\n' "$path"
+  done <<< "$attributed"
+  return 0
 }
 
 pod_has_ref(){
@@ -697,8 +728,105 @@ attempt_retirement(){
 }
 
 PROBE_ERR_FILE="$DEST/.probe-inconclusive"
+GAP_FILE="$DEST/.coverage-gap"
+
+# add_sources <ns> <pod> <select_clone-output>: append each printed clone path (primary
+# first) to the SRC_* tuple arrays.
+add_sources(){
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    SRC_NS+=("$1"); SRC_POD+=("$2"); SRC_PATH+=("$p")
+  done <<< "$3"
+}
+
+# capture_one <artifact-stem> <kind clone|bare> <ns> <pod> <clone>: stream one capture out
+# of the pod into $DEST/<artifact-stem>.tgz, verify it end to end and log OK/PART/BARE/FAIL.
+# Returns 0 only for a verified-intact archive. Any failure sets failures=1.
+# Uses the per-run globals RID LBL STEM st wid TRACK_REF RUN_BRANCH terminal_capture.
+capture_one(){
+  local art="$1" kind="$2" ns="$3" pod="$4" clone="$5"
+  local REALMAIN f tmp cap_rc cap_try kc_rc att
+  # The clone's origin/main is a private worker checkpoint, so read the TRUE public
+  # remote main from the shared bare repo and pass it to the capture: the bundle then
+  # excludes a forge-recoverable base instead of silently dropping checkpointed work.
+  REALMAIN="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null \
+    | tr -d '[:space:]')"
+  f="$DEST/$art.tgz"
+  # The capture streams a ~10-20 MB gzip out of the pod over `kubectl exec`, and
+  # that stream can be TRUNCATED mid-transfer (observed once the bundle grows past
+  # ~13 MB). A truncated .tgz still carries the bundle member's NAME in an early
+  # tar header, so the old name-only `tar tzf | grep` logged a false OK on a file
+  # whose bundle DATA was cut off. So verify the gzip END-TO-END (`gzip -t` plus a
+  # full `tar tzf` listing) and RETRY the whole capture a few times, since the
+  # truncation is transient — a re-exec usually succeeds within seconds.
+  cap_rc=1
+  tmp="$f.part"
+  for cap_try in 1 2 3; do
+    # Write each attempt to a scratch path, NEVER straight to $f: a later attempt
+    # whose exec dies before emitting any stdout must not wipe a nonempty archive an
+    # earlier attempt already produced — a truncated archive is still the best
+    # forensic artifact we have. Promote to $f only when the attempt produced bytes.
+    rm -f "$tmp"
+    if [ "$kind" = "clone" ]; then
+      "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+        sh -c "$CAPTURE" _ "$art" "$REALMAIN" "$clone" > "$tmp" 2>>"$LOG"
+    else
+      "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+        sh -c "$BARE_CAPTURE" _ "$art" "$TRACK_REF" "$REALMAIN" "$REPOS_BASE" > "$tmp" 2>>"$LOG"
+    fi
+    kc_rc=$?
+    if [ "$kc_rc" -ne 0 ]; then
+      log "WARN $RID ($LBL): exec/capture attempt $cap_try exit=$kc_rc; see $LOG"
+    fi
+    if [ ! -s "$tmp" ]; then
+      # A typed missing-source/no-new-commits result is deterministic; retrying the same
+      # pod three times cannot create a clone or tracking ref. Other failures may be a
+      # transient kubectl stream break, so retry those.
+      case "$kc_rc" in 3|4|5|7) break ;; esac
+      [ "$kc_rc" -ne 0 ] && continue
+      break
+    fi
+    # Nonempty output — even on a nonzero exec exit, kubectl may have streamed a
+    # PARTIAL archive; keep it as the best-so-far and let the verify below decide.
+    mv -f "$tmp" "$f"
+    if gzip -t "$f" 2>/dev/null && tar tzf "$f" >/dev/null 2>&1; then
+      cap_rc=0
+      break
+    fi
+    log "WARN $RID ($LBL): truncated .tgz on attempt $cap_try ($(du -h "$f" | cut -f1)); retrying"
+  done
+  rm -f "$tmp"
+  if [ "$cap_rc" -eq 0 ]; then
+    # A verified-intact archive. The git bundle carries the committed work, so if
+    # it is absent, say so (PART) rather than OK — the patch/untracked/status are
+    # still useful, but there are no committed commits to restore.
+    if tar tzf "$f" 2>/dev/null | grep -qF "$art.bundle"; then
+      if [ "$kind" = "bare" ]; then
+        att=""
+        [ "$terminal_capture" -eq 1 ] || att="; $(attempt_retirement "$ns" "$pod" "$RUN_BRANCH" "$RID")"
+        log "BARE $RID ($LBL) status=$st pod=$pod ref=$TRACK_REF -> $f ($(du -h "$f" | cut -f1)); committed history only, uncommitted WIP unavailable$att"
+      else
+        log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod clone=$clone -> $f ($(du -h "$f" | cut -f1))"
+      fi
+    else
+      log "PART $RID ($LBL) pod=$pod clone=$clone: verified .tgz but WITHOUT a git bundle (uncommitted/status only) -> $f"
+    fi
+    recoverable=1
+    return 0
+  elif [ -s "$f" ]; then
+    log "FAIL $RID ($LBL) pod=$pod clone=$clone: .tgz still truncated after retries -> $f kept for forensics; see $LOG"
+  else
+    log "FAIL $RID ($LBL) pod=$pod clone=$clone: empty artifact from $kind source; see $LOG"
+    rm -f "$f"
+  fi
+  failures=1
+  return 1
+}
+
 for RID in "${RUNS[@]}"; do
-  rm -f "$PROBE_ERR_FILE"
+  rm -f "$PROBE_ERR_FILE" "$GAP_FILE"
   J="$("$UZI" run get "$RID" --json 2>/dev/null)"
   st="$(printf '%s' "$J" | "$JQ" -r '.status // ""' 2>/dev/null)"
   if [ -z "${st:-}" ]; then
@@ -806,21 +934,23 @@ for RID in "${RUNS[@]}"; do
   preferred=""
   preferred="$(resolve_pod "$wid" || true)"
   ns=""; pod=""; capture_kind=""; CLONE_PATH=""
+  SRC_NS=(); SRC_POD=(); SRC_PATH=()
+  # Sweep the preferred (current-worker) pod and then EVERY other running worker pod
+  # with no early exit: a run may have resumed on a new worker, and each pod can hold a
+  # different attributed clone. The first path found (preferred pod first) is the primary
+  # capture; every other attributed path from any pod is captured as an extra source.
   if [ -n "$preferred" ]; then
-    ns="${preferred%% *}"; pod="${preferred#* }"
-    if CLONE_PATH="$(select_clone "$ns" "$pod" "$STEM" "$RUN_BRANCH" "$RID")"; then capture_kind="clone"; fi
+    out="$(select_clone "${preferred%% *}" "${preferred#* }" "$STEM" "$RUN_BRANCH" "$RID")" || out=""
+    add_sources "${preferred%% *}" "${preferred#* }" "$out"
   fi
-
-  # A run may have resumed on a new worker. Search all running worker pods for its
-  # clone before falling back to the bare ref. A rolled Docker pod loses its emptyDir clone.
-  if [ -z "$capture_kind" ]; then
-    while read -r cns cpod; do
-      [ -n "$cpod" ] || continue
-      if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
-      if CLONE_PATH="$(select_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID")"; then
-        ns="$cns"; pod="$cpod"; capture_kind="clone"; break
-      fi
-    done < <(list_pods)
+  while read -r cns cpod; do
+    [ -n "$cpod" ] || continue
+    if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
+    out="$(select_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID")" || out=""
+    add_sources "$cns" "$cpod" "$out"
+  done < <(list_pods)
+  if [ "${#SRC_PATH[@]}" -gt 0 ]; then
+    ns="${SRC_NS[0]}"; pod="${SRC_POD[0]}"; CLONE_PATH="${SRC_PATH[0]}"; capture_kind="clone"
   fi
 
   # No clone survived. Preserve the latest committed checkpoint from whichever
@@ -856,85 +986,30 @@ for RID in "${RUNS[@]}"; do
     continue
   fi
 
-  # The clone's origin/main is a private worker checkpoint, so read the TRUE public
-  # remote main from the shared bare repo and pass it to the capture: the bundle then
-  # excludes a forge-recoverable base instead of silently dropping checkpointed work.
-  REALMAIN="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null \
-    | tr -d '[:space:]')"
-  f="$DEST/$STEM.tgz"
-  # The capture streams a ~10-20 MB gzip out of the pod over `kubectl exec`, and
-  # that stream can be TRUNCATED mid-transfer (observed once the bundle grows past
-  # ~13 MB). A truncated .tgz still carries the bundle member's NAME in an early
-  # tar header, so the old name-only `tar tzf | grep` logged a false OK on a file
-  # whose bundle DATA was cut off. So verify the gzip END-TO-END (`gzip -t` plus a
-  # full `tar tzf` listing) and RETRY the whole capture a few times, since the
-  # truncation is transient — a re-exec usually succeeds within seconds.
-  cap_rc=1
-  tmp="$f.part"
-  for cap_try in 1 2 3; do
-    # Write each attempt to a scratch path, NEVER straight to $f: a later attempt
-    # whose exec dies before emitting any stdout must not wipe a nonempty archive an
-    # earlier attempt already produced — a truncated archive is still the best
-    # forensic artifact we have. Promote to $f only when the attempt produced bytes.
-    rm -f "$tmp"
-    if [ "$capture_kind" = "clone" ]; then
-      "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-        sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" "$CLONE_PATH" > "$tmp" 2>>"$LOG"
-    else
-      "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-        sh -c "$BARE_CAPTURE" _ "$STEM" "$TRACK_REF" "$REALMAIN" "$REPOS_BASE" > "$tmp" 2>>"$LOG"
-    fi
-    kc_rc=$?
-    if [ "$kc_rc" -ne 0 ]; then
-      log "WARN $RID ($LBL): exec/capture attempt $cap_try exit=$kc_rc; see $LOG"
-    fi
-    if [ ! -s "$tmp" ]; then
-      # A typed missing-source/no-new-commits result is deterministic; retrying the same
-      # pod three times cannot create a clone or tracking ref. Other failures may be a
-      # transient kubectl stream break, so retry those.
-      case "$kc_rc" in 3|4|5|7) break ;; esac
-      [ "$kc_rc" -ne 0 ] && continue
-      break
-    fi
-    # Nonempty output — even on a nonzero exec exit, kubectl may have streamed a
-    # PARTIAL archive; keep it as the best-so-far and let the verify below decide.
-    mv -f "$tmp" "$f"
-    if gzip -t "$f" 2>/dev/null && tar tzf "$f" >/dev/null 2>&1; then
-      cap_rc=0
-      break
-    fi
-    log "WARN $RID ($LBL): truncated .tgz on attempt $cap_try ($(du -h "$f" | cut -f1)); retrying"
-  done
-  rm -f "$tmp"
-  if [ "$cap_rc" -eq 0 ]; then
-    # A verified-intact archive. The git bundle carries the committed work, so if
-    # it is absent, say so (PART) rather than OK — the patch/untracked/status are
-    # still useful, but there are no committed commits to restore.
-    if tar tzf "$f" 2>/dev/null | grep -qF "$STEM.bundle"; then
-      if [ "$capture_kind" = "bare" ]; then
-        att=""
-        [ "$terminal_capture" -eq 1 ] || att="; $(attempt_retirement "$ns" "$pod" "$RUN_BRANCH" "$RID")"
-        log "BARE $RID ($LBL) status=$st pod=$pod ref=$TRACK_REF -> $f ($(du -h "$f" | cut -f1)); committed history only, uncommitted WIP unavailable$att"
+  captured=0; total=1
+  capture_one "$STEM" "$capture_kind" "$ns" "$pod" "$CLONE_PATH" && captured=1
+  if [ "$capture_kind" = "clone" ]; then
+    total="${#SRC_PATH[@]}"
+    # Every other attributed source is its own verified artifact: <stem>.source-<N>.tgz.
+    n=1
+    while [ "$n" -lt "$total" ]; do
+      n=$((n + 1))
+      if capture_one "$STEM.source-$n" clone "${SRC_NS[n-1]}" "${SRC_POD[n-1]}" "${SRC_PATH[n-1]}"; then
+        captured=$((captured + 1))
       else
-        log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod clone=$CLONE_PATH -> $f ($(du -h "$f" | cut -f1))"
+        mark_gap "extra source ${SRC_PATH[n-1]} on pod ${SRC_POD[n-1]} not captured intact"
       fi
-      recoverable=1
-    else
-      log "PART $RID ($LBL) clone=$CLONE_PATH: verified .tgz but WITHOUT a git bundle (uncommitted/status only) -> $f"
-      recoverable=1
+    done
+    # A search that did not complete may have hidden an attributed source.
+    [ ! -e "$PROBE_ERR_FILE" ] || mark_gap "the source search was inconclusive (a kubectl listing or exec failed)"
+    if [ -e "$GAP_FILE" ]; then
+      log "FAIL $RID ($LBL): incomplete coverage: $captured of $total attributed sources captured ($(sort -u "$GAP_FILE" | paste -sd ';' - | sed 's/;/; /g')); latest not advanced, retry"
+      failures=1
     fi
-  elif [ -s "$f" ]; then
-    log "FAIL $RID ($LBL): .tgz still truncated after retries -> $f kept for forensics; see $LOG"
-    failures=1
-  else
-    log "FAIL $RID ($LBL): empty artifact from $capture_kind source; see $LOG"
-    rm -f "$f"
-    failures=1
   fi
 done
 
-rm -f "$PROBE_ERR_FILE"
+rm -f "$PROBE_ERR_FILE" "$GAP_FILE"
 ln -sfn "$DEST" "$OUTROOT/latest-attempt"
 if [ "$failures" -eq 0 ] && [ "$recoverable" -eq 1 ]; then
   ln -sfn "$DEST" "$OUTROOT/latest"

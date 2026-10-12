@@ -70,11 +70,24 @@ done
 case " \${args[*]} " in
   *" config current-context "*) echo test-ctx; exit 0 ;;
   *" get pods "*) [ "\${UZI_TEST_GETFAIL:-}" = 1 ] && exit 1
-                                echo "pod/uzi-hw-${WID:-w0rker}-test"; exit 0 ;;
+                                if [ -n "\${UZI_TEST_PODS:-}" ]; then
+                                  for p in \$UZI_TEST_PODS; do echo "\$p"; done
+                                else
+                                  echo "pod/uzi-hw-${WID:-w0rker}-test"
+                                fi
+                                exit 0 ;;
 esac
 # exec ...: distinguish the REALMAIN git read from the capture sh -c.
 # A transport failure: the exec never ran the probe, so nothing reaches stdout.
 [ "\${UZI_TEST_EXECFAIL:-}" = 1 ] && exit 1
+# Per-pod transport failure: the pod name is the argument after "exec".
+if [ -n "\${UZI_TEST_EXECFAIL_POD:-}" ]; then
+  prev=""
+  for a in "\${args[@]}"; do
+    if [ "\$prev" = exec ] && [ "\$a" = "\$UZI_TEST_EXECFAIL_POD" ]; then exit 1; fi
+    prev="\$a"
+  done
+fi
 if [ "\${cmd[0]:-}" = git ]; then
   # Execute the real bare-repo probes. This covers the public-main read and the
   # missing-clone fallback's show-ref lookup against the local fake worker bare.
@@ -84,6 +97,8 @@ if [ "\${cmd[0]:-}" = sh ]; then
   # cmd = (sh -c <LIST_CANDIDATES> _ <RUNNER_BASE> <STEM>) or
   # (sh -c <CAPTURE> _ <STEM> <REALMAIN> <CLONE>); the host already forwarded the
   # runner base / concrete clone as arguments, so run it verbatim.
+  # UZI_TEST_CAPFAIL_PATH: the capture (its last arg is the clone path) exits 3, no stdout.
+  if [ -n "\${UZI_TEST_CAPFAIL_PATH:-}" ] && [ "\${cmd[\$((\${#cmd[@]} - 1))]}" = "\$UZI_TEST_CAPFAIL_PATH" ]; then exit 3; fi
   if [ "\${UZI_TEST_DUBIOUS:-}" = 1 ]; then export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; fi
   exec "\${cmd[@]}"
 fi
@@ -540,6 +555,11 @@ mkdir -p "$RB/issue-4242.attempt-$A2"
 journal run-4242 "$RB/issue-4242.attempt-$A1" "$A1"
 ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
 ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+# The empty A2 dir has no .git, so it is absent (not an unreadable source): no
+# coverage gap, the run exits 0 and the journal-named clone is captured.
+D_11="$WORK/out.11"
+rc="$(backup_rc "$D_11" run-4242)"
+[ "$rc" -eq 0 ] || fail "11: exit $rc, want 0; log: $(cat "$D_11/latest-attempt/backup.log")"
 expect_pick 11 "$RB/issue-4242.attempt-$A1" a1
 echo "PASS case11: newer empty recreated attempt dir ignored"
 
@@ -914,19 +934,32 @@ for bad in 'not json' '{"version":1}' \
 done
 echo "PASS marker-c: a value that is not an exact-shape marker -> inconclusive"
 
-# case M-d: the journal names a live attempt: live work is captured first and the
-# gap (the kept canonical) is logged.
+# case M-d: the journal names a live attempt A2; the detached kept canonical (valid
+# marker) is a second attributed source, captured as issue-4242.source-2.tgz.
 reset_layout
 make_clone "$CANON" agent/issue-4242 kept-canon
 make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
 journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
 ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
 stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
-expect_pick marker-d "$RB/issue-4242.attempt-$A2" live-attempt
-grep -qF "WARN run-4242 kept canonical $CANON not captured (journal names a live clone)" \
-  "$WORK/out.marker-d/latest-attempt/backup.log" \
-  || fail "marker-d: missing WARN; got: $(cat "$WORK/out.marker-d/latest-attempt/backup.log")"
-echo "PASS marker-d: journal-current attempt wins and the uncaptured kept canonical is logged"
+# source_check <tag> <primary-clone> <primary-marker> <extra-clone> <extra-marker>: exit 0,
+# the primary holds only its own bytes, source-2 holds the extra's bytes and clone path.
+source_check() {
+  local d="$WORK/out.$1" rc p x
+  rc="$(backup_rc "$d" run-4242)"
+  [ "$rc" -eq 0 ] || fail "$1: exit $rc, want 0; log: $(cat "$d/latest-attempt/backup.log")"
+  p="$d/latest/issue-4242.tgz"; x="$d/latest/issue-4242.source-2.tgz"
+  [ -f "$p" ] && [ -f "$x" ] || fail "$1: missing primary or source-2 archive; log: $(cat "$d/latest-attempt/backup.log")"
+  tar -xOzf "$p" ./issue-4242.meta.txt | grep -qxF "clone=$2" || fail "$1: primary is not $2"
+  tar -xOzf "$p" ./issue-4242.uncommitted.patch | grep -qxF "+$3" || fail "$1: primary lacks +$3"
+  tar -xOzf "$p" ./issue-4242.uncommitted.patch | grep -qxF "+$5" && fail "$1: extra bytes leaked into the primary"
+  tar -xOzf "$x" ./issue-4242.source-2.meta.txt | grep -qxF "clone=$4" || fail "$1: source-2 is not $4"
+  tar -xOzf "$x" ./issue-4242.source-2.uncommitted.patch | grep -qxF "+$5" || fail "$1: source-2 lacks +$5"
+  grep -qE "(OK|PART) .*pod=[^ ]+ clone=$4[: ].*issue-4242[.]source-2[.]tgz" "$d/latest-attempt/backup.log" \
+    || fail "$1: missing its own OK/PART line for source-2 naming pod and clone; log: $(cat "$d/latest-attempt/backup.log")"
+}
+source_check marker-d "$RB/issue-4242.attempt-$A2" live-attempt "$CANON" kept-canon
+echo "PASS marker-d: journal-current attempt is primary; the kept canonical is captured as source-2"
 
 # case M-e: a completed run (terminal_capture=2) captures only through a marker; a
 # journal alone stays status-only.
@@ -980,5 +1013,70 @@ grep -q 'SNAP completed-1 .*status=completed' "$D_ME3/latest-attempt/backup.log"
 [ ! -e "$D_ME3/latest-attempt/issue-4242.tgz" ] \
   || fail "marker-e canonical-gone: a ledger attempt was captured for a terminal run"
 echo "PASS marker-e: completed run captures the marker-named canonical; journal alone stays status-only"
+
+# case M-f(a): live successor (journal-current, ledger live) + detached dirty canonical
+# predecessor with a valid marker: both captured (same layout as marker-d, asserted
+# through source_check including that no predecessor byte is in the primary).
+reset_layout
+make_clone "$CANON" agent/issue-4242 kept-canon
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
+source_check marker-f-a "$RB/issue-4242.attempt-$A2" live-attempt "$CANON" kept-canon
+tar -tzf "$WORK/out.marker-f-a/latest/issue-4242.source-2.tgz" | grep -q 'issue-4242[.]source-2[.]meta[.]txt' \
+  || fail "marker-f-a: source-2 inner members not named by the source stem"
+[ ! -e "$WORK/out.marker-f-a/latest-attempt/.coverage-gap" ] || fail "marker-f-a: gap state file left behind"
+
+# (b) Docker-wired: live successor A2 (journal-current) + dirty predecessor attempt A1
+# whose ledger state is reclaimed: both captured.
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 reclaimed-a1
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" reclaimed
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+source_check marker-f-b "$RB/issue-4242.attempt-$A2" live-attempt "$RB/issue-4242.attempt-$A1" reclaimed-a1
+
+# A retired (or abandoned) ledger predecessor is NOT an extra source.
+for st_retired in retired abandoned; do
+  reset_layout
+  make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 old-a1
+  make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+  journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+  ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" "$st_retired"
+  ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+  D_RET="$WORK/out.marker-f-$st_retired"
+  rc="$(backup_rc "$D_RET" run-4242)"
+  [ "$rc" -eq 0 ] || fail "marker-f $st_retired: exit $rc, want 0"
+  [ -f "$D_RET/latest/issue-4242.tgz" ] || fail "marker-f $st_retired: no primary"
+  [ ! -e "$D_RET/latest/issue-4242.source-2.tgz" ] || fail "marker-f $st_retired: a $st_retired attempt was captured as an extra"
+done
+
+# (c) as (a) but the extra's capture fails: exit 1, incomplete coverage, primary kept.
+reset_layout
+make_clone "$CANON" agent/issue-4242 kept-canon
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
+D_FC="$WORK/out.marker-f-c"
+rc="$(backup_rc "$D_FC" run-4242 "UZI_TEST_CAPFAIL_PATH=$CANON")"
+[ "$rc" -eq 1 ] || fail "marker-f-c: exit $rc, want 1"
+grep -q 'incomplete coverage' "$D_FC/latest-attempt/backup.log" \
+  || fail "marker-f-c: missing 'incomplete coverage'; got: $(cat "$D_FC/latest-attempt/backup.log")"
+[ -f "$D_FC/latest-attempt/issue-4242.tgz" ] || fail "marker-f-c: primary artifact missing"
+[ ! -e "$D_FC/latest" ] || fail "marker-f-c: latest advanced despite incomplete coverage"
+[ ! -e "$D_FC/latest-attempt/.coverage-gap" ] || fail "marker-f-c: gap state file left behind"
+
+# (d) two pods, exec into the second fails: its source search is inconclusive, so the
+# run fails closed even though the primary (current worker's pod) was captured.
+D_FD="$WORK/out.marker-f-d"
+rc="$(backup_rc "$D_FD" run-4242 "UZI_TEST_PODS=pod/uzi-hw-$WID-test pod/uzi-hw-second-test" "UZI_TEST_EXECFAIL_POD=uzi-hw-second-test")"
+[ "$rc" -eq 1 ] || fail "marker-f-d: exit $rc, want 1"
+grep -q 'incomplete coverage' "$D_FD/latest-attempt/backup.log" \
+  || fail "marker-f-d: missing 'incomplete coverage'; got: $(cat "$D_FD/latest-attempt/backup.log")"
+[ -f "$D_FD/latest-attempt/issue-4242.tgz" ] || fail "marker-f-d: primary artifact missing"
+echo "PASS marker-f: every attributed source captured; retired not extra; a coverage gap fails closed"
 
 echo "ALL PASS"
