@@ -184,6 +184,22 @@ it("late prepared transaction spawn after cancellation never commits", async () 
   assert.equal(present(), sha);
   assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
 });
+it("cancelling right after the prepared spawn never strands the ref lock", async () => {
+  const seam = cache as unknown as { spawnGit: (...args: any[]) => Promise<any> };
+  const original = seam.spawnGit.bind(cache);
+  let stop = new AbortController();
+  mock.method(seam, "spawnGit", async (...args: any[]) => {
+    const child = await original(...args);
+    if (args[1].includes("update-ref") && args[1].includes("--stdin")) stop.abort();
+    return child;
+  });
+  for (let i = 0; i < 20; i++) {
+    stop = new AbortController();
+    assert.deepEqual(await cleanup({ signal: stop.signal }), { state: "retained", reason: "cancelled" }, "iteration " + i);
+    assert.equal(existsSync(path.join(bare, ref + ".lock")), false, "stale lock at iteration " + i);
+    assert.equal(present(), sha);
+  }
+});
 it("prepared transaction cancellation aborts and reaps before returning", async () => {
   const stop = new AbortController();
   let locked = false;
@@ -444,7 +460,7 @@ for (const symbolic of [false, true]) it("prepared cleanup inside supervised bou
       transaction = true;
       if (symbolic) git(bare, "symbolic-ref", ref, "refs/heads/main");
     }
-    assert.ok(request.timeoutMs && request.timeoutMs > 0 && request.timeoutMs <= 30_000);
+    assert.ok(request.timeoutMs && request.timeoutMs > 0 && request.timeoutMs <= 35_000); // 30 s deadline plus the 5 s abort grace backstop
     timeouts.push(request.timeoutMs!);
     const child = spawn(request.argv[0]!, request.argv.slice(1), {
       cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"],

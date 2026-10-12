@@ -859,6 +859,9 @@ const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 /** A full 40-hex commit SHA (issue #1597 M2: pinned checkpoint ranges are validated with it). */
 const SHA40_RE = /^[0-9a-f]{40}$/;
 
+/** How long an aborted prepared ref transaction may take to exit on its own before it is killed. */
+const PREPARED_ABORT_GRACE_MS = 5_000;
+
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
   /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this).
@@ -5022,15 +5025,29 @@ export class GitCache {
           // Prepare holds the exact ref lock while we independently prove directness.
           const child = await this.spawnGit(chosen.bare, ["--git-dir", chosen.bare, "--no-replace-objects", "update-ref", "--stdin"],
             `option no-deref\ndelete ${ref} ${input.sourceSha}\nprepare\n`, {
-              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()),
+              // The native timeout is only a backstop past the caller deadline: the teardown below gets
+              // PREPARED_ABORT_GRACE_MS to let Git exit on its own before anything sends SIGTERM.
+              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()) + PREPARED_ABORT_GRACE_MS,
               stderrMaxBytes: 65536, cancelOnAbandon: true,
               env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_COMMON_DIR: chosen.bare },
             }).catch(() => refuse("git_failure"));
           activeChildren.add(child.exited);
-          const onAbort = () => child.cancel();
+          // SIGTERM between Git's O_EXCL create of the ref lock and arming its tempfile cleanup would
+          // leave a stale `<ref>.lock` that this code did not remove and must never delete. So an
+          // uncommitted transaction is ended with `abort` on stdin and Git exits by itself; the signal
+          // is only a fallback after PREPARED_ABORT_GRACE_MS. The caller's bound can therefore stretch
+          // by up to that grace, in this teardown only. cancelOnAbandon (boundary abandon) may still
+          // kill the child; that path is left unchanged.
+          let committed = false;
+          let abortSent = false;
+          const sendAbort = (): void => {
+            if (committed || abortSent) return;
+            abortSent = true;
+            try { child.stdin?.end("abort\n"); } catch { /* stdin already closed: Git is exiting */ }
+          };
+          const onAbort = sendAbort;
           stop.signal.addEventListener("abort", onAbort, { once: true });
           if (stop.signal.aborted) onAbort();
-          let committed = false;
           try {
             check();
             if (!child.stdin) refuse("git_failure");
@@ -5096,8 +5113,17 @@ export class GitCache {
             refuse("git_failure");
           } finally {
             stop.signal.removeEventListener("abort", onAbort);
-            if (!committed) child.stdin?.end("abort\n");
-            child.cancel();
+            if (committed) child.cancel();
+            else {
+              sendAbort();
+              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              const exitedInGrace = await Promise.race([
+                child.exited.then(() => true, () => true),
+                new Promise<boolean>(resolve => { graceTimer = setTimeout(() => resolve(false), PREPARED_ABORT_GRACE_MS); }),
+              ]);
+              clearTimeout(graceTimer);
+              if (!exitedInGrace) child.cancel();
+            }
             await child.exited;
             activeChildren.delete(child.exited);
           }

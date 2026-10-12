@@ -1906,7 +1906,7 @@ export class RecoveryCoordinator {
     // throws RecordGoneError instead of recreating the removed record.
     const uploaded = await this.writeExistingRecord(current, (cur) => ({ ...cur, state: "uploaded", reason: undefined }));
     if (!uploaded.inventoryGuarded) {
-      // A runner-driven settle is still executing, so this usually retains `executing`; the live pass
+      // In capture mode a runner-driven settle is still executing, so this usually retains `executing`; the live pass
       // or boot deletes the pin once the run is no longer executing.
       await this.cleanupUploadedRecoveryPin(uploaded, { mode, signal });
     }
