@@ -834,9 +834,9 @@ The local snapshot ref is deleted once the checker has settled. A boot sweep
 deletes leftovers only on positive server evidence matching the lead id and,
 when a check row exists, its claim generation and head, and only when the lead is finished or not held by that
 worker (for a lead with no check row, additionally only when the ref was never
-read), and keeps the ref on any doubt. Roll out the api and migrations 00324 to 00328 before upgraded workers
+read), and keeps the ref on any doubt. Roll out the api and migrations 00324 to 00327 and 00329 before upgraded workers
 that advertise `cross_check_code_v1`. Roll back workers before the api, retaining
-00328's column, stored pins and digests; its Down destructively removes provenance.
+00329's column, stored pins and digests; its Down destructively removes provenance.
 See [rollout details](docs/cross-check.md#rolling-out-code-cross-check).
 
 ### Run lifecycle

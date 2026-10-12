@@ -416,7 +416,7 @@ It is not a subagent: it is a separate run on the other model family.
   Advisory fencing does not prevent semantic injection. Pre-existing unbounded
   Git acquisition budgets remain outside this follow-up; it adds no acquisition
   credential, source or background process and makes no stronger security claim.
-- **Rollout and rollback.** Deploy the api and migration 00328 before upgraded
+- **Rollout and rollback.** Deploy the api and migration 00329 before upgraded
   workers. Old-worker omission is accepted as legacy. A new worker on an old
   strict api gets bounded advisory refusal handling and publication proceeds,
   without dropping the pin. Roll back workers before the api, retaining the

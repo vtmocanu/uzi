@@ -383,19 +383,19 @@ deletes the ref only if it was also never read. On any doubt the ref is kept.
 
 ### Rolling out Code cross-check
 
-Deploy the api and its migrations (00324 to **00328**) before any upgraded worker that
+Deploy the api and its migrations (00324 to **00327** and **00329**) before any upgraded worker that
 advertises `cross_check_code_v1`. A worker advertises it only with a
 cross-check lane (`WORKER_CROSS_CHECK_SLOTS` above zero) and the Codex
 harness. The Downs of 00324, 00325 and 00327 delete data: 00324 deletes
 the code-stage checks and their checker runs and drops the new columns,
 00325 deletes your Code pins, and 00327 drops the per-repository guidance
 columns. The Down of 00326 deletes nothing (it only restores two functions).
-Migration 00328 adds the nullable instruction commit and its immutability guard;
+Migration 00329 adds the nullable instruction commit and its immutability guard;
 old workers may omit it and are accepted as legacy. A new worker's pin is
 refused by an old strict api: bounded advisory submission handling fails open
 for publication without dropping the pin to retry as legacy.
 
 For a binary rollback, roll back workers **before** the api and retain migration
-00328's column, stored pins and digests. Its Down removes provenance and is a
+00329's column, stored pins and digests. Its Down removes provenance and is a
 destructive schema operation, not normal rollback. Run a deliberate Down only
 with the upgraded api stopped. PRD #2170's hosted acceptance is still pending.
