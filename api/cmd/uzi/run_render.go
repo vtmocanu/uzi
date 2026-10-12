@@ -2306,7 +2306,8 @@ func isProviderUnavailableHold(r apitypes.RunDTO) bool {
 func providerCommandID(id string) string {
 	id = cellText(id)
 	if id != "" && !strings.HasPrefix(id, "-") && strings.IndexFunc(id, func(c rune) bool {
-		return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_')
+		return (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
+			(c < '0' || c > '9') && c != '-' && c != '_'
 	}) == -1 {
 		return id
 	}
