@@ -4668,6 +4668,14 @@ export class GitCache {
    * would let `update-ref -d` delete a file in another repository.
    */
   private async recoveryPinMetadataSafe(barePath: string, pinRef: string): Promise<boolean> {
+    // A repository redirect would point Git's ref store at another repository entirely, and a
+    // symlinked packed-refs would let Git rewrite another repository's file through its lock.
+    for (const redirect of [".git", "commondir", "gitdir"]) {
+      try { await fs.lstat(path.join(barePath, redirect)); return false; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    }
+    try { if (!(await fs.lstat(path.join(barePath, "packed-refs"))).isFile()) return false; }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
     const parts = pinRef.split("/");
     for (const top of ["logs", ""]) {
       let cur = barePath;
@@ -4696,22 +4704,20 @@ export class GitCache {
   async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
     if (expectedSha === undefined) {
       const pinRef = recoveryPinRef(runId, generation);
-      try {
-        // No lock is taken here: callers may already hold this bare's lock, as before.
-        if (!(await this.recoveryPinMetadataSafe(barePath, pinRef))) {
-          this.log.warn("recovery: recovery pin retained", {
-            bare: barePath, run_id: runId, generation, reason: "unsafe_metadata",
-          });
-          return;
-        }
-        // Residual userspace TOCTOU: a symlink planted between the check above and Git's
-        // unlink of the ref or reflog is not detected here (same as the archived path).
-        await this.tryGit(barePath, ["update-ref", "-d", pinRef]);
-      } catch (err) {
-        this.log.warn("recovery: recovery pin cleanup failed", {
-          bare: barePath, run_id: runId, generation, error: gitErrorMessage(err),
+      // No lock is taken here: callers may already hold this bare's lock, as before.
+      let safe = false;
+      try { safe = await this.recoveryPinMetadataSafe(barePath, pinRef); }
+      catch { safe = false; }
+      if (!safe) {
+        this.log.warn("recovery: recovery pin retained", {
+          bare: barePath, run_id: runId, generation, reason: "unsafe_metadata",
         });
+        return;
       }
+      // Residual userspace TOCTOU: a symlink planted between the check above and Git's
+      // unlink of the ref or reflog is not detected here (same as the archived path).
+      // tryGit keeps its own failure handling, including boundary-abort propagation.
+      await this.tryGit(barePath, ["update-ref", "-d", pinRef]);
       return;
     }
     const root = path.resolve(this.reposRoot);

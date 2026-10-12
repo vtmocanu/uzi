@@ -688,3 +688,37 @@ it("3-argument deleteRecoveryPin refuses a symlinked loose ref directory", async
   await cache.deleteRecoveryPin(bare, runId, 4);
   assert.equal(present(), sha);
 });
+for (const redirect of ["commondir", "gitdir", ".git"] as const) it(`3-argument deleteRecoveryPin refuses a ${redirect} redirect and spares the foreign pin`, async () => {
+  const { logger, lines } = recordingLogger();
+  const logged = new GitCache(path.join(root, "data"), logger, undefined, testGitCacheOptions());
+  const foreign = path.join(root, "foreign-redirect.git");
+  await fs.mkdir(foreign);
+  git(foreign, "init", "--bare");
+  git(foreign, "fetch", bare, sha + ":refs/heads/main");
+  git(foreign, "update-ref", ref, sha);
+  git(bare, "update-ref", "-d", ref);
+  await fs.writeFile(path.join(bare, redirect), redirect === "commondir" ? foreign + "\n" : `gitdir: ${foreign}\n`);
+  await logged.deleteRecoveryPin(bare, runId, 4);
+  assert.equal(present(foreign), sha);
+  assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
+    level: "warn", msg: "recovery: recovery pin retained", bare, run_id: runId, generation: 4, reason: "unsafe_metadata",
+  }]);
+});
+it("3-argument deleteRecoveryPin refuses a symlinked packed-refs and spares the foreign pin", async () => {
+  const foreign = path.join(root, "foreign-packed.git");
+  await fs.mkdir(foreign);
+  git(foreign, "init", "--bare");
+  git(foreign, "fetch", bare, sha + ":refs/heads/main");
+  git(foreign, "update-ref", ref, sha);
+  git(foreign, "pack-refs", "--all", "--prune");
+  git(bare, "update-ref", "-d", ref);
+  await fs.rm(path.join(bare, "packed-refs"), { force: true });
+  symlinkSync(path.join(foreign, "packed-refs"), path.join(bare, "packed-refs"));
+  await cache.deleteRecoveryPin(bare, runId, 4);
+  assert.equal(present(foreign), sha);
+});
+it("3-argument deleteRecoveryPin deletes a packed-only pin", async () => {
+  git(bare, "pack-refs", "--all", "--prune");
+  await cache.deleteRecoveryPin(bare, runId, 4);
+  assert.throws(() => present());
+});
