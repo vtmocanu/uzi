@@ -63,11 +63,11 @@ function mount(modeA: Mode = "ordinary", modeB: Mode = modeA) {
     messages: [], connected: true, error: "", submit, refreshRun,
     inputs: [], refreshInputs: vi.fn(), canSteer: true, confirmedOwner: owner,
   } as ReturnType<typeof useRunStream>));
-  const tree = <MemoryRouter initialEntries={["/runs/A"]}><Controls />
+  const tree = () => <MemoryRouter initialEntries={["/runs/A"]}><Controls />
     <Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
   </MemoryRouter>;
-  const view = render(tree);
-  return { ...view, delayA: () => { delayedA = true; } };
+  const view = render(tree());
+  return { ...view, updateRun: () => view.rerender(tree()), delayA: () => { delayedA = true; } };
 }
 function click(name: RegExp | string) {
   const button = screen.getAllByRole("button", { name })[0] as HTMLButtonElement;
@@ -226,13 +226,66 @@ it("provider Stop scope refusal never resumes", async () => {
   expect(screen.getByText("Scope refused")).toBeTruthy();
 });
 
-it("provider Stop scope success Resume failure honestly remains held", async () => {
-  vi.mocked(api.resumeRun).mockRejectedValueOnce(new ApiError(409, "Resume refused"));
+it.each(["queued", "paused"] as const)("provider Stop Resume error refreshes actual %s state without false held claim", async (status) => {
+  vi.mocked(api.resumeRun).mockRejectedValueOnce(new ApiError(409, "Resume response lost or refused"));
+  const view = mount("provider");
+  refreshRun.mockImplementationOnce(async () => {
+    runOverrides = { status, hold_reason: status === "paused" ? "provider_unavailable" : null };
+    view.updateRun();
+  });
+  await act(async () => click("Stop completed work"));
+  expect(screen.getByText(/Scope saved through milestone 1; Resume outcome unconfirmed/)).toBeTruthy();
+  expect(screen.queryByText(/The run remains on hold/)).toBeNull();
+  expect(refreshRun).toHaveBeenCalledOnce();
+  if (status === "paused") expect(screen.getByText("Provider unavailable — waiting for owner")).toBeTruthy();
+  else {
+    expect(screen.queryByText("Provider unavailable — waiting for owner")).toBeNull();
+    expect(screen.getAllByText(/Queued/i).length).toBeGreaterThan(0);
+  }
+});
+
+it("provider Stop preserves unknown Resume outcome when error refresh fails", async () => {
+  vi.mocked(api.resumeRun).mockRejectedValueOnce(new ApiError(500, "Response lost"));
+  refreshRun.mockRejectedValueOnce(new Error("Read failed"));
   mount("provider");
   await act(async () => click("Stop completed work"));
-  expect(screen.getByText(/Scope saved through milestone 1; Resume failed. The run remains on hold/)).toBeTruthy();
-  expect(screen.getByText("Provider unavailable — waiting for owner")).toBeTruthy();
+  expect(screen.getByText(/Scope saved through milestone 1; Resume outcome unconfirmed.*Current state unavailable/)).toBeTruthy();
+  expect(screen.queryByText(/The run remains on hold/)).toBeNull();
+  expect(refreshRun).toHaveBeenCalledOnce();
+});
+
+it.each(["navigation", "roundtrip", "unmount"])("provider Stop guards stale error refresh on %s", async (change) => {
+  const refresh = deferred();
+  vi.mocked(api.resumeRun).mockRejectedValueOnce(new ApiError(500, "Response lost"));
+  refreshRun.mockReturnValueOnce(refresh.promise);
+  const view = mount("provider");
+  await act(async () => click("Stop completed work"));
+  expect(refreshRun).toHaveBeenCalledOnce();
+  if (change === "unmount") view.unmount();
+  else {
+    navigate(change === "roundtrip");
+    const newer = deferred();
+    vi.mocked(api.resumeRun).mockReturnValueOnce(newer.promise);
+    click(/^Resume$/);
+    resumeBusy(true);
+    await settle(refresh, "failure");
+    resumeBusy(true);
+    expect(screen.queryByText(/Current state unavailable|Resume outcome unconfirmed|Old action failed/)).toBeNull();
+    await settle(newer, "success");
+    return;
+  }
+  await settle(refresh, "failure");
+});
+
+it("provider Stop stale Resume error never starts a refresh", async () => {
+  const resume = deferred();
+  vi.mocked(api.resumeRun).mockReturnValueOnce(resume.promise);
+  mount("provider");
+  await act(async () => click("Stop completed work"));
+  navigate(true);
+  await settle(resume, "failure");
   expect(refreshRun).not.toHaveBeenCalled();
+  expect(screen.queryByText(/Resume outcome unconfirmed/)).toBeNull();
 });
 
 beforeEach(() => {

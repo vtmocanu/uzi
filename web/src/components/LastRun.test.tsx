@@ -20,7 +20,7 @@ vi.mock("../lib/api", async (original) => {
 // an AuthProvider.
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ uziLabel: "uzi" }) }));
 
-afterEach(() => { cleanup(); vi.mocked(api.getRun).mockClear(); });
+afterEach(() => { cleanup(); vi.mocked(api.getRun).mockReset().mockRejectedValue(new ApiError(404, "Not found")); });
 
 function startedFire(id: string): LastFire {
   return { ...fire([]), matched: 1, started: [{ run_id: id, issue_iid: 1, title: "Snapshot title",
@@ -74,6 +74,63 @@ it("LastRun ignores response identity mismatch and retires read on unmount", asy
   expect(screen.getByText("Loading current state…")).toBeTruthy();
   view.unmount();
   expect(api.getRun).toHaveBeenCalledOnce();
+});
+
+it("LastRun caps a 1000-entry expanded fire at four total and in-flight reads while preserving snapshots and links", async () => {
+  const snapshot = startedFire("entry-0");
+  snapshot.started = Array.from({ length: 1000 }, (_, index) => ({
+    ...snapshot.started[0], run_id: `entry-${index}`, title: `Snapshot ${index}`,
+  }));
+  const saved = JSON.stringify(snapshot);
+  const requests = Array.from({ length: 4 }, pendingRun);
+  let inFlight = 0;
+  let peak = 0;
+  vi.mocked(api.getRun).mockImplementation((id) => {
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    const index = Number(id.slice("entry-".length));
+    return (requests[index]?.promise ?? new Promise<Awaited<ReturnType<typeof api.getRun>>>(() => {}))
+      .finally(() => { inFlight--; });
+  });
+  const collapsed = render(<MemoryRouter><LastRunOutcome fire={snapshot} expanded={false} onToggle={() => {}} panelId="panel" /></MemoryRouter>);
+  expect(api.getRun).not.toHaveBeenCalled();
+  collapsed.unmount();
+  const view = renderDetail(snapshot);
+  expect(vi.mocked(api.getRun).mock.calls.map(([id]) => id)).toEqual(["entry-0", "entry-1", "entry-2", "entry-3"]);
+  expect(inFlight).toBe(4);
+  expect(peak).toBe(4);
+  expect(screen.getAllByText("Open run for current state")).toHaveLength(996);
+  expect(screen.getByText("Current state is checked for only the first four started entries in each expanded fire.")).toBeTruthy();
+  for (const index of [4, 999]) {
+    const title = screen.getByText(`Snapshot ${index}`);
+    expect(title.closest(".rounded-lg")?.querySelector("a[href='/runs/entry-" + index + "']")).toBeTruthy();
+    expect(title.closest(".rounded-lg")?.textContent).toContain("scheduled removed");
+  }
+  await act(async () => {
+    requests.forEach((request, index) => request.resolve({ run: { ...mockRuns[0], id: `entry-${index}`, status: "running" } }));
+  });
+  expect(inFlight).toBe(0);
+  expect(api.getRun).toHaveBeenCalledTimes(4);
+  view.rerender(<MemoryRouter><LastFireDetail s={sched()} fire={snapshot} /></MemoryRouter>);
+  await act(async () => {});
+  expect(api.getRun).toHaveBeenCalledTimes(4);
+  expect(JSON.stringify(snapshot)).toBe(saved);
+});
+
+it("LastRun caps multiple expanded fires independently at four reads each", async () => {
+  const snapshots = ["A", "B"].map((prefix) => {
+    const snapshot = startedFire(prefix);
+    snapshot.started = Array.from({ length: 6 }, (_, index) => ({
+      ...snapshot.started[0], run_id: `${prefix}-${index}`,
+    }));
+    return snapshot;
+  });
+  vi.mocked(api.getRun).mockImplementation(() => new Promise(() => {}));
+  render(<MemoryRouter>{snapshots.map((snapshot, index) =>
+    <LastFireDetail key={index} s={sched()} fire={snapshot} />)}</MemoryRouter>);
+  expect(vi.mocked(api.getRun).mock.calls.map(([id]) => id)).toEqual(["A-0", "A-1", "A-2", "A-3", "B-0", "B-1", "B-2", "B-3"]);
+  expect(screen.getAllByText("Current state is checked for only the first four started entries in each expanded fire.")).toHaveLength(2);
+  expect(screen.getAllByText("Open run for current state")).toHaveLength(4);
 });
 
 it("LastRun bounds reads to displayed started siblings and never polls", async () => {

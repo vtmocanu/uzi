@@ -127,8 +127,11 @@ export function LastRunOutcome({
   );
 }
 
-// One authorized read per displayed started run per expansion. No retries or polling;
-// failures do not block sibling reads. Cleanup retires the response on collapse/unmount.
+const CURRENT_STARTED_RUN_LIMIT = 4;
+
+// Only the first CURRENT_STARTED_RUN_LIMIT entries mount a read per expanded fire:
+// at most four parallel attempts, no retries or polling; failures do not block siblings.
+// Cleanup retires responses on collapse/unmount; it does not cancel pending requests.
 function CurrentStartedRun({ runId }: { runId: string }) {
   const [state, setState] = useState<{ id: string; run?: Run; unavailable?: boolean } | null>(null);
   useEffect(() => {
@@ -301,7 +304,8 @@ export function LastFireDetail({ s, fire, heading = "Last fire" }: { s: Schedule
         </div>
       ) : (fire.started.length > 0 || fire.skips.length > 0) && (
         <div className="flex flex-col gap-2">
-          {fire.started.map((r) => (
+          {fire.started.length > CURRENT_STARTED_RUN_LIMIT && <p className="text-[12px] text-muted">Current state is checked for only the first four started entries in each expanded fire.</p>}
+          {fire.started.map((r, index) => (
             <div
               key={r.run_id}
               className="flex items-start gap-3 rounded-lg border border-edge bg-raised/50 px-3 py-2"
@@ -311,7 +315,8 @@ export function LastFireDetail({ s, fire, heading = "Last fire" }: { s: Schedule
                 {r.title && <div className="text-[12.5px] text-muted">{r.title}</div>}
                 {labelRemovalOutcome(r) && <div className={cx("text-[11.5px]", r.label_remove_failed ? "text-warn" : "text-muted")}>{labelRemovalOutcome(r)}</div>}
               </div>
-              <CurrentStartedRun runId={r.run_id} />
+              {index < CURRENT_STARTED_RUN_LIMIT ? <CurrentStartedRun runId={r.run_id} /> :
+                <span className="text-[11.5px] text-muted">Open run for current state</span>}
               <Link
                 to={`/runs/${r.run_id}`}
                 className="inline-flex shrink-0 items-center gap-1 rounded-md border border-ok/35 bg-ok/[0.08] px-2 py-0.5 font-mono text-[11.5px] text-ok hover:bg-ok/15"

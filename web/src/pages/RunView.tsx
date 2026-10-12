@@ -2911,7 +2911,14 @@ export function RunView() {
           try {
             await api.resumeRun(requestRunId);
           } catch (e) {
-            if (isCurrent()) setActionErr(`Scope saved through milestone ${ceiling}; Resume failed. The run remains on hold. ${errorMessage(e, "Action failed")}`);
+            if (!isCurrent()) return;
+            const message = `Scope saved through milestone ${ceiling}; Resume outcome unconfirmed. ${errorMessage(e, "Action failed")}`;
+            setActionErr(message);
+            try {
+              await refreshRun();
+            } catch (refreshError) {
+              if (isCurrent()) setActionErr(`${message} Current state unavailable. ${errorMessage(refreshError, "Refresh failed")}`);
+            }
             return;
           }
           if (isCurrent()) await refreshRun();
