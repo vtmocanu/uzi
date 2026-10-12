@@ -686,6 +686,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		IsActive:                u.IsActive,
 		AutopilotEnabled:        u.AutopilotEnabled,
 		PlanCrossCheckEnabled:   u.PlanCrossCheckEnabled,
+		CodeCrossCheckEnabled:   u.CodeCrossCheckEnabled,
 		WaitOnLimit:             u.WaitOnLimit,
 		NotifyEarlyLimitReset:   u.NotifyEarlyLimitReset,
 		JudgeEnabled:            u.JudgeEnabled,
@@ -1188,6 +1189,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Post("/runs/{id}/cross-checks", h.WorkerSubmitPlanCrossCheck)
+		r.Get("/runs/{id}/cross-checks/code/latest", h.WorkerCodeCrossCheckStatus)
+		r.Post("/runs/{id}/cross-checks/code/dispositions", h.WorkerCodeCrossCheckDispositions)
 		r.Get("/runs/{id}/cross-checks/plan/latest", h.WorkerLatestPlanCrossCheck)
 		r.Get("/runs/{id}/cross-checks/plan/{round}", h.WorkerPlanCrossCheckStatus)
 		r.Post("/runs/{id}/cross-check-verdict", h.WorkerCrossCheckVerdict)

@@ -585,6 +585,8 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  setCodeCrossCheckEnabled: (code: boolean) =>
+    request<{ user: User; warning?: string }>("PUT", "/me/cross-check", { code }),
   setPlanCrossCheckEnabled: (plan: boolean) =>
     request<{ user: User; warning?: string }>("PUT", "/me/cross-check", { plan }),
   // Flip the current user's CI-autofix opt-in (PRD #71). Session identity only —
@@ -916,6 +918,13 @@ const realApi = {
     id: string,
     flags: { repo_skills_enabled?: boolean; repo_claudemd_enabled?: boolean },
   ) => request<{ repo: Repo }>("PATCH", `/repos/${id}`, flags),
+  // Code cross-check owner inputs (PRD #2170 M3). Owner or admin. Mutually exclusive
+  // in one request with the trust/devbox/caps/fold groups, so it is sent alone.
+  // A null guidance clears it; the server caps it at 8192 UTF-8 bytes.
+  setRepoCodeCrossCheckInputs: (
+    id: string,
+    inputs: { code_cross_check_guidance?: string | null; cross_check_repo_instructions_enabled?: boolean },
+  ) => request<{ repo: Repo }>("PATCH", `/repos/${id}`, inputs),
   // Tier-2 repo devbox.json opt-in (PRD #18 M5). Owner or admin.
   setRepoDevboxOptIn: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {

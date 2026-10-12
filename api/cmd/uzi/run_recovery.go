@@ -414,13 +414,13 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 			// shows available ids without downloading; run export needs --output and fetches a sole capture.
 			_, _ = fmt.Fprintf(env.Stderr,
 				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
-				n, sanitizeTTY(runID))
+				n, cellText(runID))
 		}
 		return p.JSON(holdsWithCaptures(holds, archives, reasons))
 	}
 	if len(holds) == 0 {
 		if !gf.quiet {
-			p.Printf("run %s has no retained custody holds\n", sanitizeTTY(runID))
+			p.Printf("run %s has no retained custody holds\n", cellText(runID))
 		}
 		return nil
 	}
@@ -469,7 +469,7 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 				p.Printf("%s\n", line)
 			}
 		}
-		printRecoveryHint(p, exportable, decisionNeeded, sanitizeTTY(runID))
+		printRecoveryHint(p, exportable, decisionNeeded, cellText(runID))
 	}
 	return nil
 }

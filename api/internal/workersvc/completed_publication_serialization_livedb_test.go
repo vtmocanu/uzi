@@ -258,6 +258,31 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 	if _, err = pool.Exec(ctx, "ALTER TABLE recovery_custody_holds ADD COLUMN final_publication_id uuid"); err != nil {
 		t.Fatal(err)
 	}
+	// The sqlc queries these paths drive track head, but this private database sits
+	// below the code cross-check migrations (00324 and 00327), so add the columns
+	// those queries select as inert shims: plain columns with the migrations' types
+	// and defaults, no constraints or triggers. Down/Up of 00320 never touches them.
+	for _, ddl := range []string{
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS code_cross_check_enabled boolean NOT NULL DEFAULT false",
+		"ALTER TABLE runs ADD COLUMN IF NOT EXISTS code_cross_check_required boolean NOT NULL DEFAULT false",
+		`ALTER TABLE repos ADD COLUMN IF NOT EXISTS code_cross_check_guidance text,
+			ADD COLUMN IF NOT EXISTS cross_check_repo_instructions_enabled boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE cross_checks ADD COLUMN IF NOT EXISTS head_commit text,
+			ADD COLUMN IF NOT EXISTS outcome text,
+			ADD COLUMN IF NOT EXISTS code_context jsonb,
+			ADD COLUMN IF NOT EXISTS guidance_snapshot text,
+			ADD COLUMN IF NOT EXISTS guidance_text text,
+			ADD COLUMN IF NOT EXISTS guidance_digest bytea,
+			ADD COLUMN IF NOT EXISTS repo_instructions_enabled boolean NOT NULL DEFAULT false,
+			ADD COLUMN IF NOT EXISTS repo_instructions_text text,
+			ADD COLUMN IF NOT EXISTS repo_instructions_digest bytea,
+			ADD COLUMN IF NOT EXISTS dispositions jsonb,
+			ADD COLUMN IF NOT EXISTS finalized_at timestamptz`,
+	} {
+		if _, err = pool.Exec(ctx, ddl); err != nil {
+			t.Fatalf("shim %q: %v", ddl, err)
+		}
+	}
 	iid := int64(1)
 	e := interlockLiveDB{ctx: ctx, pool: pool, q: store.New(pool), userID: uuid.New(), repoID: uuid.New(), nextIID: &iid}
 	conn := uuid.New()

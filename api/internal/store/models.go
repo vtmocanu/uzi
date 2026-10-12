@@ -257,35 +257,46 @@ type ControllerReportStatus struct {
 }
 
 type CrossCheck struct {
-	ID                     uuid.UUID          `json:"id"`
-	LeadRunID              uuid.UUID          `json:"lead_run_id"`
-	Stage                  string             `json:"stage"`
-	Round                  int32              `json:"round"`
-	LeadClaimGeneration    int64              `json:"lead_claim_generation"`
-	PlanMd                 pgtype.Text        `json:"plan_md"`
-	Milestones             []byte             `json:"milestones"`
-	RequiredCapabilities   []string           `json:"required_capabilities"`
-	RequiredTools          []string           `json:"required_tools"`
-	SizeClass              pgtype.Text        `json:"size_class"`
-	BaseCommit             pgtype.Text        `json:"base_commit"`
-	PlanningDiff           pgtype.Text        `json:"planning_diff"`
-	CandidateDigest        []byte             `json:"candidate_digest"`
-	CheckerRunID           pgtype.UUID        `json:"checker_run_id"`
-	CheckerHarness         pgtype.Text        `json:"checker_harness"`
-	CheckerModel           pgtype.Text        `json:"checker_model"`
-	CheckerEffort          pgtype.Text        `json:"checker_effort"`
-	Verdict                string             `json:"verdict"`
-	ReasonClass            pgtype.Text        `json:"reason_class"`
-	Findings               []byte             `json:"findings"`
-	DecidedAt              pgtype.Timestamptz `json:"decided_at"`
-	DeadlineAt             pgtype.Timestamptz `json:"deadline_at"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	CheckerModelSource     pgtype.Text        `json:"checker_model_source"`
-	CheckerEffortSource    pgtype.Text        `json:"checker_effort_source"`
-	AutomaticRevisionLimit int32              `json:"automatic_revision_limit"`
-	AutomaticRoundsEnabled bool               `json:"automatic_rounds_enabled"`
-	InterruptedAt          pgtype.Timestamptz `json:"interrupted_at"`
-	WaitCredited           bool               `json:"wait_credited"`
+	ID                      uuid.UUID          `json:"id"`
+	LeadRunID               uuid.UUID          `json:"lead_run_id"`
+	Stage                   string             `json:"stage"`
+	Round                   int32              `json:"round"`
+	LeadClaimGeneration     int64              `json:"lead_claim_generation"`
+	PlanMd                  pgtype.Text        `json:"plan_md"`
+	Milestones              []byte             `json:"milestones"`
+	RequiredCapabilities    []string           `json:"required_capabilities"`
+	RequiredTools           []string           `json:"required_tools"`
+	SizeClass               pgtype.Text        `json:"size_class"`
+	BaseCommit              pgtype.Text        `json:"base_commit"`
+	PlanningDiff            pgtype.Text        `json:"planning_diff"`
+	CandidateDigest         []byte             `json:"candidate_digest"`
+	CheckerRunID            pgtype.UUID        `json:"checker_run_id"`
+	CheckerHarness          pgtype.Text        `json:"checker_harness"`
+	CheckerModel            pgtype.Text        `json:"checker_model"`
+	CheckerEffort           pgtype.Text        `json:"checker_effort"`
+	Verdict                 string             `json:"verdict"`
+	ReasonClass             pgtype.Text        `json:"reason_class"`
+	Findings                []byte             `json:"findings"`
+	DecidedAt               pgtype.Timestamptz `json:"decided_at"`
+	DeadlineAt              pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	CheckerModelSource      pgtype.Text        `json:"checker_model_source"`
+	CheckerEffortSource     pgtype.Text        `json:"checker_effort_source"`
+	AutomaticRevisionLimit  int32              `json:"automatic_revision_limit"`
+	AutomaticRoundsEnabled  bool               `json:"automatic_rounds_enabled"`
+	InterruptedAt           pgtype.Timestamptz `json:"interrupted_at"`
+	WaitCredited            bool               `json:"wait_credited"`
+	HeadCommit              pgtype.Text        `json:"head_commit"`
+	Outcome                 pgtype.Text        `json:"outcome"`
+	CodeContext             []byte             `json:"code_context"`
+	GuidanceSnapshot        pgtype.Text        `json:"guidance_snapshot"`
+	GuidanceText            pgtype.Text        `json:"guidance_text"`
+	GuidanceDigest          []byte             `json:"guidance_digest"`
+	RepoInstructionsEnabled bool               `json:"repo_instructions_enabled"`
+	RepoInstructionsText    pgtype.Text        `json:"repo_instructions_text"`
+	RepoInstructionsDigest  []byte             `json:"repo_instructions_digest"`
+	Dispositions            []byte             `json:"dispositions"`
+	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -818,21 +829,23 @@ type RecoveryCustodyHoldFact struct {
 }
 
 type Repo struct {
-	ID                      uuid.UUID          `json:"id"`
-	ConnectionID            uuid.UUID          `json:"connection_id"`
-	ForgeProjectID          int64              `json:"forge_project_id"`
-	PathWithNamespace       string             `json:"path_with_namespace"`
-	WebUrl                  string             `json:"web_url"`
-	DefaultBranch           pgtype.Text        `json:"default_branch"`
-	Enabled                 bool               `json:"enabled"`
-	RepoSkillsEnabled       bool               `json:"repo_skills_enabled"`
-	RepoDevboxOptIn         bool               `json:"repo_devbox_opt_in"`
-	RepoClaudemdEnabled     bool               `json:"repo_claudemd_enabled"`
-	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
-	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
-	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
-	RequiredCapabilities    []string           `json:"required_capabilities"`
-	FoldImproveUziBacklog   bool               `json:"fold_improve_uzi_backlog"`
+	ID                                uuid.UUID          `json:"id"`
+	ConnectionID                      uuid.UUID          `json:"connection_id"`
+	ForgeProjectID                    int64              `json:"forge_project_id"`
+	PathWithNamespace                 string             `json:"path_with_namespace"`
+	WebUrl                            string             `json:"web_url"`
+	DefaultBranch                     pgtype.Text        `json:"default_branch"`
+	Enabled                           bool               `json:"enabled"`
+	RepoSkillsEnabled                 bool               `json:"repo_skills_enabled"`
+	RepoDevboxOptIn                   bool               `json:"repo_devbox_opt_in"`
+	RepoClaudemdEnabled               bool               `json:"repo_claudemd_enabled"`
+	GuardrailOverrideReason           pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy               pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt               pgtype.Timestamptz `json:"guardrail_override_at"`
+	RequiredCapabilities              []string           `json:"required_capabilities"`
+	FoldImproveUziBacklog             bool               `json:"fold_improve_uzi_backlog"`
+	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
+	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 }
 
 type RepoToolProfile struct {
@@ -1029,6 +1042,7 @@ type Run struct {
 	CrossCheckLane            bool               `json:"cross_check_lane"`
 	CrossCheckLaneGeneration  pgtype.Int8        `json:"cross_check_lane_generation"`
 	CompletionFinalHead       pgtype.Text        `json:"completion_final_head"`
+	CodeCrossCheckRequired    bool               `json:"code_cross_check_required"`
 }
 
 type RunCompletionAttempt struct {
@@ -1429,6 +1443,7 @@ type User struct {
 	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
 	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
 	NowSummaryEnabled       pgtype.Bool        `json:"now_summary_enabled"`
+	CodeCrossCheckEnabled   bool               `json:"code_cross_check_enabled"`
 }
 
 type UserCrossCheckPin struct {

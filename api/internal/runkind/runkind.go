@@ -45,6 +45,16 @@ func All() []string {
 	return []string{Issue, CIFix, Chat, Judge, SelfImprove, Prompt, Task, MRRework, Job, CrossCheck}
 }
 
+// CodeCrossCheckable reports which lead kinds snapshot owner code consent.
+// Auto-approval and seeded plans do not affect code consent.
+func CodeCrossCheckable(kind string) bool {
+	switch kind {
+	case Issue, Prompt, SelfImprove, CIFix, MRRework, Task:
+		return true
+	}
+	return false
+}
+
 // PlanCrossCheckable reports whether the executor reaches the plan gate on an
 // auto-approved run. Task has no plan gate despite being planning-capable.
 func PlanCrossCheckable(kind string) bool {

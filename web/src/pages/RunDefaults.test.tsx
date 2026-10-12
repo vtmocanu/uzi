@@ -34,6 +34,7 @@ vi.mock("../lib/api", async (importActual) => {
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       setAutopilotEnabled: vi.fn(),
       setPlanCrossCheckEnabled: vi.fn(),
+      setCodeCrossCheckEnabled: vi.fn(),
       setWaitOnLimit: vi.fn(),
       setNotifyEarlyReset: vi.fn(),
       setJudgeEnabled: vi.fn(),
@@ -202,6 +203,35 @@ describe("Run defaults — autopilot opt-in (PRD #19 M3, Decision 7)", () => {
 
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(toggle().disabled).toBe(false);
+  });
+});
+
+describe("Run defaults — code cross-check consent", () => {
+  const code = () => screen.getByLabelText("Code cross-check · Advisory before publication") as HTMLInputElement;
+  it("defaults absent code consent off independently of plan", () => {
+    mockAuth({ ...baseUser, plan_cross_check_enabled: true });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    expect(code().checked).toBe(false);
+    expect((screen.getByLabelText("Plan cross-check · Required before implementation") as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByText("Adds the other model family's findings to the merge request; never blocks it")).toBeTruthy();
+  });
+  it("writes only code consent and displays local worker warning", async () => {
+    mockApi.setCodeCrossCheckEnabled.mockResolvedValue({ user: baseUser, warning: "No online local worker supports code cross-check" });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    fireEvent.click(code());
+    expect(await screen.findByText("No online local worker supports code cross-check")).toBeTruthy();
+    expect(mockApi.setCodeCrossCheckEnabled).toHaveBeenCalledWith(true);
+    expect(mockApi.setPlanCrossCheckEnabled).not.toHaveBeenCalled();
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+  it("surfaces both-family 400 refusal and preserves consent", async () => {
+    mockApi.setCodeCrossCheckEnabled.mockRejectedValue(new ApiError(400, "both Claude and Codex credentials must be usable"));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    fireEvent.click(code());
+    expect(await screen.findByText("both Claude and Codex credentials must be usable")).toBeTruthy();
+    expect(code().checked).toBe(false);
+    expect(code().disabled).toBe(false);
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 

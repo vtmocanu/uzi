@@ -309,6 +309,7 @@ func run() error {
 		RunTimeout:                    cfg.RunTimeout,
 		RunWallCeiling:                cfg.RunWallCeiling,
 		PlanCrossCheckTimeout:         cfg.PlanCrossCheckTimeout,
+		CodeCrossCheckTimeout:         cfg.CodeCrossCheckTimeout,
 		PlanCrossCheckMaxRevisions:    cfg.PlanCrossCheckMaxRevisions,
 		PlanCrossCheckMaxRevisionsSet: true,
 		RunIdleTimeout:                cfg.RunIdleTimeout,

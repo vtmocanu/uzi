@@ -92,6 +92,8 @@ cd "$ROOT" || { echo "cannot cd to repo root $ROOT" >&2; exit 3; }
 # coverage oracle uses), so promote-only and the oracle can never disagree about "shipping".
 # shellcheck source=scripts/lib/shipping-paths.sh
 . "$ROOT/scripts/lib/shipping-paths.sh"
+# shellcheck source=scripts/lib/ghcr.sh
+. "$ROOT/scripts/lib/ghcr.sh"
 # is_dependency_manifest / is_dependency_subject: the per-PR changelog check's dependency
 # exemption, shared so the merges it spares are exactly the ones cited at cut time.
 # shellcheck source=scripts/lib/dependency-bump.sh
@@ -258,6 +260,40 @@ if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" = "1" ]; then
   fi
 elif [ "$VERB" != "--promote-only" ]; then
   python3 -I "$ROOT/scripts/release-ci-coverage.py" tip HEAD --wait 0 || exit 3
+fi
+
+# Check the current pin before discovery or any release-tree mutation. Only
+# explicit --promote-only skips this; --promote may still cut a candidate.
+if [ "$VERB" != "--promote-only" ]; then
+  PIN="$(ghcr_read_pin HEAD)"; pin_rc=$?
+  if [ "$pin_rc" -ne 0 ] || [ -z "$PIN" ]; then
+    echo "release-cut: worker pin pre-flight instrument failure: could not read workers.image.tag from HEAD:deploy/chart/values.yaml (status $pin_rc)" >&2
+    exit 3
+  fi
+  ghcr_resolve_owner; owner_rc=$?
+  if [ "$owner_rc" -ne 0 ]; then
+    echo "release-cut: warning: worker pin pre-flight for $PIN could not resolve owner/repo; continuing with the publish gate as authority" >&2
+  else
+    pin_absent=0; pin_error=0; pin_outcomes=""
+    # Two queries, one per image; an error does not block the sibling query.
+    for img in agent-base agent-jvm; do  # worker images agent-<name>; workertmpl.Names (pinned by template_sources_test.go)
+      img_has_tag "$img" "$PIN"; pin_image_rc=$?
+      case "$pin_image_rc" in
+        0) outcome=present ;;
+        1) outcome=absent; pin_absent=1 ;;
+        *) outcome="query error"; pin_error=1 ;;
+      esac
+      pin_outcomes+="  ${REPO}/${img}:${PIN}: ${outcome}"$'\n'
+    done
+    if [ "$pin_absent" -eq 1 ]; then
+      echo "release-cut: worker pin pre-flight refused: $PIN" >&2
+      printf '%s' "$pin_outcomes" >&2
+      echo "the pinned tag's publication did not complete; re-run or complete the release.yml publish for that tag, confirm both worker images exist (e.g. release-verify.sh on that tag), then re-run the cut." >&2
+      exit 3
+    elif [ "$pin_error" -eq 1 ]; then
+      echo "release-cut: warning: worker pin pre-flight for $PIN encountered a query error; continuing with the publish gate as authority" >&2
+    fi
+  fi
 fi
 
 # --- discovery ----------------------------------------------------------------

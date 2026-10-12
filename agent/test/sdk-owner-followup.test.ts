@@ -146,6 +146,95 @@ const PLAN: ScriptedTurn = { messages: [submitPlan("# Plan"), resultSuccess()] }
 const WORK: ScriptedTurn = { messages: [assistantText("working"), resultSuccess()] };
 const DONE: ScriptedTurn = { messages: [assistantText("finished"), signalDone(), resultSuccess()] };
 
+for (const reason of ["idle", "stopped"] as const) {
+  for (const repairs of [0, 1]) {
+    it(`interactive ${reason}: multiple owner parks then ${repairs} repair in the same SDK session`, async () => {
+      const queue: string[] = [];
+      const scripts = [PLAN, DONE, DONE, DONE, DONE];
+      const turns = fakeTurns(scripts, queue);
+      const resumes: Array<string | undefined> = [];
+      const queryFn: SdkQueryFn = params => {
+        resumes.push(params.options?.resume);
+        return turns.queryFn(params);
+      };
+      let parks = 0, checks = 0, reports = 0, secrets = 0;
+      const probe = makeCtx(queue, {
+        kind: "task", interactive: true, config: { max_iterations: 6 },
+        awaitFollowUp: async () => {
+          assert.equal(checks, 0, "owner parks never check code");
+          if (++parks < 3) return { kind: "followup", id: parks, body: `owner ${parks}` };
+          return { kind: "ended", reason };
+        },
+        reportIteration: async () => { reports++; return undefined; },
+        secretRemediationGate: async () => { secrets++; return { action: "proceed" }; },
+        codeCrossCheckGate: async () => ++checks === 1 && repairs
+          ? { action: "repair", followUp: "REPAIR-FOLLOWUP-MARKER" } : { action: "proceed" },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(parks, 3, "repair done bypasses the owner park");
+      assert.equal(checks, 1 + repairs);
+      assert.equal(secrets, 0, "interactive finalization preserves the existing secret gate exclusion");
+      assert.equal(reports, 3, "repair does not fake a server running wake");
+      assert.equal(turns.prompts.length, 4 + repairs);
+      assert.ok(resumes.slice(1).every(id => id === "sess-1"));
+      if (repairs) assert.ok(turns.prompts.at(-1)?.includes("REPAIR-FOLLOWUP-MARKER"));
+    });
+  }
+}
+
+it("consent-off interactive finalization calls neither secret nor code tools", async () => {
+  const turns = fakeTurns([PLAN, DONE], []);
+  let secrets = 0;
+  const { ctx } = makeCtx([], {
+    interactive: true, kind: "task",
+    awaitFollowUp: async () => ({ kind: "ended", reason: "idle" }),
+    secretRemediationGate: async () => { secrets++; return { action: "proceed" }; },
+  });
+  assert.equal(ctx.codeCrossCheckGate, undefined);
+  assert.equal(ctx.codeCrossCheckRepair, undefined);
+  assert.equal(ctx.reportCrossCheckDispositions, undefined);
+  await new SdkExecutor(nullLogger(), homeDir, { queryFn: turns.queryFn }).run(ctx);
+  assert.equal(secrets, 0);
+  assert.equal(turns.prompts.length, 2);
+});
+
+it("interactive cancellation never checks or repairs", async () => {
+  const turns = fakeTurns([PLAN, DONE], []);
+  let checks = 0;
+  const { ctx } = makeCtx([], {
+    interactive: true, kind: "task",
+    awaitFollowUp: async () => ({ kind: "ended", reason: "cancelled" }),
+    codeCrossCheckGate: async () => { checks++; return { action: "proceed" }; },
+  });
+  await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn: turns.queryFn }).run(ctx), /cancel/);
+  assert.equal(checks, 0);
+});
+
+for (const interlocked of [false, true]) {
+  it(`SDK ${interlocked ? "interlocked" : "legacy"} done re-enters once after secret and unmet controls`, async () => {
+    const turns = fakeTurns([PLAN, DONE, DONE, DONE], []);
+    const events: string[] = [];
+    let checks = 0, attempts = 0;
+    const { ctx } = makeCtx([], {
+      completionInterlock: interlocked,
+      secretRemediationGate: async () => { events.push("secret"); return { action: "proceed" }; },
+      checkpoint: async () => { events.push("checkpoint"); },
+      recordCompletionAttempt: async () => { events.push("attempt"); return { unmet: ++attempts === 1 ? ["M1"] : [], attemptCount: attempts }; },
+      codeCrossCheckGate: async () => {
+        events.push("code");
+        return ++checks === 1 ? { action: "repair", followUp: "ONE-REPAIR-MARKER" } : { action: "proceed" };
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn: turns.queryFn }).run(ctx);
+    assert.equal(checks, 2);
+    assert.equal(turns.prompts.length, interlocked ? 4 : 3);
+    assert.ok(turns.prompts.at(-1)?.includes("ONE-REPAIR-MARKER"));
+    assert.deepEqual(events, interlocked
+      ? ["secret", "checkpoint", "attempt", "secret", "checkpoint", "attempt", "code", "secret", "checkpoint", "attempt", "code"]
+      : ["secret", "code", "secret", "code"]);
+  });
+}
+
 const A = "FOLLOWUP-MARKER-ALPHA-7f3a";
 const SYSTEM_TEXT = "SYSTEM-REMEDIATION-TEXT-91bc";
 
@@ -484,3 +573,72 @@ describe("issue #1800: a follow-up is stamped only once the model processed its 
     assert.deepStrictEqual(probe.included, [1]);
   });
 });
+
+for (const mode of ["repair", "off", "no findings"] as const) {
+  it(`U3 D9 SDK actual query conditionally registers repair tool and retained handler refuses after pass: ${mode}`, async () => {
+    const row: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
+  "stage": "code",
+  "round": 1,
+  "candidate_generation": 7,
+  "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "candidate_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "checker_run_id": "child",
+  "checker_harness": "codex",
+  "checker_model": "m",
+  "checker_effort": "high",
+  "outcome": "completed",
+  "reason_class": null,
+  "findings": [
+    {
+      "id": "F_1",
+      "severity": "major",
+      "path": "a.ts",
+      "line": 2,
+      "title": "Verify guard",
+      "detail": "untrusted advice"
+    }
+  ],
+  "dispositions": null,
+  "finalized_at": null,
+  "interrupted_at": null,
+  "deadline_at": "2030-01-01T00:00:00Z"
+};
+    let active = false, checks = 0, effects = 0;
+    type Registered = { handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ isError?: boolean; content: unknown }> };
+    let retained: Registered | undefined;
+    const seen: boolean[] = [];
+    const scripts = mode === "repair" ? [PLAN, DONE, DONE] : [PLAN, DONE];
+    let index = 0;
+    const queryFn: SdkQueryFn = params => (async function* () {
+      const server = params.options.mcpServers?.uzi as unknown as { instance: { _registeredTools: Record<string, Registered> } };
+      const handler = server.instance._registeredTools.report_cross_check_dispositions;
+      seen.push(!!handler);
+      if (handler) {
+        retained = handler;
+        const response = await handler.handler({ dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] }, {});
+        assert.equal(response.isError, undefined);
+      }
+      for await (const _prompt of params.prompt) { /* consume SDK input before scripted response */ }
+      for (const message of scripts[index++]!.messages) yield message;
+    })();
+    const { ctx } = makeCtx([], mode === "off" ? {} : {
+      claimGeneration: 7,
+      codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => mode === "no findings" ? { ...row, findings: [] } : active ? row : undefined,
+      reportCrossCheckDispositions: async () => { effects++; return row; },
+      codeCrossCheckGate: async () => {
+        active = mode === "repair" && ++checks === 1;
+        return active ? { action: "repair", followUp: "D9-REPAIR" } : { action: "proceed" };
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(seen, mode === "repair" ? [false, false, true] : [false, false]);
+    assert.equal(effects, mode === "repair" ? 1 : 0);
+    if (retained) {
+      const response = await retained.handler({ dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] }, {});
+      assert.equal(response.isError, true);
+      assert.deepEqual(response.content, [{ type: "text", text: "Code repair is not active or dispositions are invalid." }]);
+      assert.equal(effects, 1);
+    }
+  });
+}

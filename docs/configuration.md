@@ -235,6 +235,7 @@ Matching is exact and case-sensitive after trimming whitespace from the config v
 | `PLAN_CROSS_CHECK_TIMEOUT` | `30m`, or half of `RUN_TIMEOUT` when `RUN_TIMEOUT` is 30 minutes or less | Server verdict deadline, including checker queue time. An explicit value must be a positive duration, at most `2h` and strictly below `RUN_TIMEOUT`; invalid values fail boot. Pending check time is excluded from the lead's wall budget. |
 | `PLAN_CROSS_CHECK_MAX_REVISIONS` | `2` | Automatic revision allowance, integer `0`–`4`; invalid values fail boot. The server checks at most limit + 1 candidates across generations, counting superseded attempts. The first candidate snapshots the enabled flag and limit; later rounds copy them, so configuration changes affect new checks only. A round-capable worker with `0` parks REVISE as exhausted; an older worker snapshots disabled/0 and keeps the changes-requested human gate. Separate from human `PLAN_MAX_REVISIONS` and `runs.revise_count`. |
 | `CROSS_CHECK_MODEL_TIMEOUT` | `15m` | Worker checker-turn cap; positive and at most `2h`. The turn is also bounded by the remaining server verdict deadline. |
+| `CODE_CROSS_CHECK_TIMEOUT` | `30m` | Wall-clock budget of the [Code cross-check](./cross-check.md#code-cross-check) checker. An explicit value must be a positive duration, at most `2h`; invalid values fail boot. The wait is excluded from the lead's wall budget. |
 
 Checker model and effort follow the child's resolved claim and are recorded as delivered. Dedicated checker slots are configured separately in [worker setup](./worker-setup.md#cross-check-slots). Automatic rounds require `cross_check_rounds_v1` on the lead worker and on later-round checker workers. Later-round claimability and provisioning require that durable protocol capability independently of the runtime kill switch. Each candidate has a fresh verdict deadline.
 
@@ -242,15 +243,15 @@ Checker model and effort follow the child's resolved claim and are recorded as d
 
 The Plan cross-check row in Run defaults stores independent model and effort pins for each family. **Default · value (source)** follows that family's worker default; choosing a model leaves effort independent, and choosing effort leaves model independent. Reset either field to Default to remove its pin. Curated and custom model IDs are accepted after local syntax/family validation. Both cells are active: the Claude cell configures the Claude checker that checks a Codex lead, and at Default it follows the user's Claude worker default.
 
-`GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` and `effort_source` (`pin` or `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.1-sol`. Effort Default follows the family preference, otherwise `medium`.
+`GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan" | "code"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` and `effort_source` (`pin` or `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.1-sol`. Effort Default follows the family preference, otherwise `medium`.
 
-The cookie-only `PUT /api/me/settings` accepts at most two keyed cells. Omitted cells or fields remain unchanged; explicit `null` resets a field to Default. Duplicate cells, unknown stages/families or fields, malformed model IDs, family mismatch and invalid effort are rejected. Submitted pin cells are validated before their transaction, so a bad cell writes no pin cells. GET metadata fields are not writable. CLI set/reset, admin defaults and per-run overrides remain outside this release.
+The cookie-only `PUT /api/me/settings` accepts at most four keyed cells. Omitted cells or fields remain unchanged; explicit `null` resets a field to Default. Duplicate cells, unknown stages/families or fields, malformed model IDs, family mismatch and invalid effort are rejected. Submitted pin cells are validated before their transaction, so a bad cell writes no pin cells. GET metadata fields are not writable. CLI set/reset, admin defaults and per-run overrides remain outside this release.
 
-A Claude checker (the Claude cell) always requires `cross_check_codex_lead_v1` on its worker, pinned or not. A pinned Claude model that the account cannot use (SDK `model_not_found`) fails the child as `checker_unavailable`. For a Codex checker with either pin non-null, placement requires `cross_check_pins_v1`. A custom resolved model independently requires `codex_custom_model_v1`; a curated pin does not require that custom capability even when the worker default is custom. Default resolving to a custom worker model does require it. Unpinned round-1 checks can still use older `cross_check_v1` workers; later rounds additionally require `cross_check_rounds_v1` on the same worker. Claim preflight repeats both capability checks before credentials; a post-placement mismatch requeues, with the verdict deadline still including queue time.
+A Claude checker (the Claude cell) always requires `cross_check_codex_lead_v1` on its worker, pinned or not. A pinned Claude model that the account cannot use (SDK `model_not_found`) fails the child as `checker_unavailable`. For a checker of either family with either pin non-null, placement requires `cross_check_pins_v1`. A custom resolved model independently requires `codex_custom_model_v1`; a curated pin does not require that custom capability even when the worker default is custom. Default resolving to a custom worker model does require it. Unpinned round-1 checks can still use older `cross_check_v1` workers; later rounds additionally require `cross_check_rounds_v1` on the same worker. Claim preflight repeats both capability checks before credentials; a post-placement mismatch requeues, with the verdict deadline still including queue time.
 
 A claim-time snapshot freezes delivered values and independent provenance for the checker record. Hard pins do not substitute, clamp or retry on defaults. Local model syntax/family and effort checks happen before delivery; an intrinsically invalid stored pin fails visibly. There is no account-aware model-availability check in the API. Only recognized authenticated pinned-model rejection at checker startup maps to `checker_unavailable`, fails the child with `plan cross-check: checker unavailable` and forces a human gate. Other startup failures, including worker-default or effort-only model errors, retain the existing cross-check failure handling.
 
-Recorded sources are nullable for legacy checks and remain unknown when absent; later settings edits do not rewrite history. Each new round resolves pins at its own claim time. See [CLI settings](./cli.md#plan-cross-check-settings) and [the completed pin design](../prds/done/2151-cross-check-model-pins.md). Code cross-check (#2170) remains outside this implementation.
+Recorded sources are nullable for legacy checks and remain unknown when absent; later settings edits do not rewrite history. Each new round resolves pins at its own claim time. See [CLI settings](./cli.md#plan-cross-check-settings) and [the completed pin design](../prds/done/2151-cross-check-model-pins.md). The **Code** row of the same grid (`stage: "code"`) holds the pins for [Code cross-check](./cross-check.md#code-cross-check) (#2170), the opt-in advisory stage set with the cookie-only `PUT /api/me/cross-check` (`{"code": bool}`). A pinned checker of either family is placed only on a worker advertising `cross_check_pins_v1`, as for the Plan row; a claim on a worker without it is requeued rather than run unpinned.
 
 ## Agent runtime (PRD #4)
 
@@ -406,6 +407,7 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_WORKER_TOKEN` | — (required, unless `_FILE` is set) | The join token from Settings → Workers, sent as a Bearer credential on every worker call. |
 | `UZI_WORKER_TOKEN_FILE` | — (optional, preferred) | Path to a file containing the join token; the worker reads it once at startup. The bundled compose profile mounts it as a read-only compose file secret at `/run/secrets/worker_token`, which the root-started entrypoint forces to `0400 worker`-owned so the cap-less `runner` uid cannot read it (PRD #51; a restricted-namespace non-root single-uid start runs without the split — the PRD #58 posture); the post-read unlink no-ops on the read-only mount, so the file persists and the uid boundary — not removal — is the close. Takes precedence over `UZI_WORKER_TOKEN` when set. Keeps the token out of every process's `/proc/<pid>/environ`; see [proc-hardening.md](proc-hardening.md). A hosted worker's controller sets it; on OpenShift the Secret mounts elsewhere (`workers.secretMountPath`, see [openshift.md](openshift.md)) and the entrypoint's ownership check and the guardrails follow this path. |
 | `UZI_DATA_DIR` | `/data` | Persistent storage: the bare-clone cache, per-run git worktrees, and the pinned Claude Agent SDK session directory. Must be a durable volume for resume-after-restart to work. In the bundled compose profile this is **hardcoded** to `/data` (matching the `agentdata` volume mount), not read from `.env`; it's only a real knob for a standalone `docker run` or a compose override. |
+| `UZI_RECOVERY_DECODED_LIMIT_BYTES` | `8589934592` (8 GiB) | Cumulative delivered decoded object-content limit per recovery operation; nested operations share the counter and repeated reads count again. Positive decimal bytes, fixed ceiling `68719476736` (64 GiB); invalid values reject worker startup. Parsed once; restart required. Worker/operator setting, not a RAM limit. Bundled hosted Helm chart and docker-compose do not expose it yet and use the default. See [Recovery decoded-history limit](#recovery-decoded-history-limit). |
 | `UZI_WORKER_NAME` | container hostname | Display name shown in Settings → Workers / Admin. |
 | `UZI_AGENT_VERSION` | — (baked into the image at build) | The release this worker image was built from. CI's `publish:agent` stamps it from the release tag as `<release>+g<short-sha>` and the templates bake it into image `ENV` with a leading `v` stripped. It therefore matches the worker image tag (`workers.image.tag`, independent of `appVersion` since ADR-422) **up to the `+g…` build metadata**: a worker on the `0.11.7` image reports `0.11.7+g1a2b3c4`, not `0.11.7`. The suffix names the commit the image was built from, and SemVer excludes build metadata from precedence, so every version comparison still treats the two as the same release — but the strings differ, which is expected and not a sign that the wrong image is deployed. Reported **at register only** — the api discards the `version` a heartbeat carries and never reads the `X-Client-Version` header, so a running worker's stored value does not change until it re-registers. Unset on a locally built or MR-validation image, and deliberately so: the worker then reports no version at all (`-` in `uzi worker list`) rather than a placeholder a version comparison could not tell apart from a real report. Shown in Settings → Workers and `uzi worker list`. |
 | `UZI_EXECUTOR` | `sdk` | `sdk` runs real Claude Agent SDK turns (the product path); `stub` is a no-AI executor the project's own tests use — leave at `sdk` for real use. |
@@ -430,6 +432,55 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. At `debug` the worker also writes every raw run event (each `tool_use`, `tool_result`, status, etc.) to its stdout as it is emitted, so `docker logs uzi-agent-1` becomes the full-frame debug surface. Secrets are redacted before logging. `info` stays terse (no per-event lines). |
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
+
+### Recovery decoded-history limit
+
+`UZI_RECOVERY_DECODED_LIMIT_BYTES` bounds delivered decoded object contents
+cumulatively within a recovery operation. The default is **8589934592 bytes
+(8 GiB)**; the fixed ceiling is **68719476736 bytes (64 GiB)**. An unset
+variable uses the default. A set value is trimmed and must contain decimal
+digits representing a positive safe integer in `1..68719476736`. Leading
+zeroes are accepted. Blank or malformed values, fractions, exponent notation,
+signs, zero, negatives, nonfinite values, unsafe integers and values above the
+ceiling reject worker startup. The startup error names the variable and valid
+range without echoing the raw value.
+
+The worker parses this once at startup and keeps it in its GitCache instance;
+restart the worker to change it. This is an operator setting on the worker
+container, not a server/API setting or repository/model input. The bundled
+hosted Helm chart and docker-compose **do not expose it yet**: those workers
+use the 8 GiB default. Setting it in `.env`, the API or controller alone does
+not inject it into the worker. No chart or compose wiring ships in #2743.
+
+For a standalone worker, add `-e UZI_RECOVERY_DECODED_LIMIT_BYTES=17179869184`
+to the [standalone docker run command](./worker-setup.md#3-run-the-worker)
+before its image argument to select 16 GiB. Alternatively, explicitly inject
+the variable through an operator-managed container environment override.
+Preserve the worker's existing token delivery, volume and security options.
+
+The finite ceiling is eight times the default, allowing larger histories
+while retaining exact arithmetic and existing deadlines; it is not a memory
+guarantee. Verification still hashes the full reachable history, including
+prerequisites, and refuses missing or corrupt objects. Repeated reads count
+again; nested operations share the delivered-byte counter. There is no
+deduplication or history exclusion. Cap exhaustion fails closed with local
+work and custody retained. Cancellation, deadlines, encoded archive caps and
+storage quotas are unchanged.
+
+Object contents stream through a pipe chunk and bounded header without
+content buffers proportional to the cap. Metadata listings retain the 64 MiB
+output cap (`GIT_MAX_BUFFER`), with object arrays bounded by that listing.
+The cap is **not a RAM limit** and does not bound Git-internal delta
+decompression. Sibling runs share worker resources; the residual exhaustion
+risk accepted under ADR-1197 #2512 remains deferred.
+
+Errors report exact cap bytes, adding GiB for caps of at least 1 GiB.
+An already blocked recovery journal stays blocked after restart or a cap
+increase; its reason reports previous decoded verification exhaustion, the
+current cap and "prior cap not recorded". See
+[Retained-source failure and local proof](./run-recovery.md#retained-source-failure-and-local-proof)
+and [ADR-1197's amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-11--2743)
+for the reported offline measurement and policy history.
 
 ### Worker disk safety (PRD #1809)
 
