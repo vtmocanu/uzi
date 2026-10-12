@@ -169,7 +169,7 @@ func TestPressureRecycleMigrationRoundtripLiveDB(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if err := store.MigrateDownTo(ctx, dsn, 329); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 331); err != nil {
 		t.Fatal(err)
 	}
 	for i, id := range ids {
