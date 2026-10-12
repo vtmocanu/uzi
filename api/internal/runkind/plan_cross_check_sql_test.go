@@ -28,7 +28,7 @@ func TestPlanCrossCheckInsertParity(t *testing.T) {
 	others := map[string]bool{
 		"CreateChatRun": true, "CreateChatContinueRun": true, "CreateJobRun": true,
 		"CreateJudgeRun": true, "CreateTaskRun": true, "CreateThenFixRun": true,
-		"CreateTaskReviewRun": true, "CreatePlanCrossCheckChild": true,
+		"CreateTaskReviewRun": true, "CreatePlanCrossCheckChild": true, "CreateCodeCrossCheckChild": true,
 	}
 	paths, err := filepath.Glob(filepath.Join("..", "store", "queries", "*.sql"))
 	if err != nil {

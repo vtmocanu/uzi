@@ -36,7 +36,7 @@ func (s *Service) preflightCrossCheckPins(ctx context.Context, worker store.Work
 	if err != nil {
 		return nil, err
 	}
-	if row.Stage != "plan" || (row.CheckerHarness.String != "codex" && row.CheckerHarness.String != "claude") || run.Harness != row.CheckerHarness.String || run.UserID != worker.UserID {
+	if (row.Stage != "plan" && row.Stage != "code") || (row.CheckerHarness.String != "codex" && row.CheckerHarness.String != "claude") || run.Harness != row.CheckerHarness.String || run.UserID != worker.UserID {
 		return nil, ErrCrossCheckRefused
 	}
 	for _, field := range []struct {

@@ -501,6 +501,15 @@ export interface RunContext {
    * Absent on the stub/test executors (treated as `proceed`).
    */
   secretRemediationGate?(): Promise<SecretRemediationDecision>;
+  /** Advisory code gate at a finalizing done exit; permits one repair pass. `repairAvailable: false` means no
+   *  implementation iteration remains: the gate must not start a repair (findings stay unreported) and never
+   *  extends the iteration budget. Absent is treated as available. */
+  codeCrossCheckGate?(completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }): Promise<import("./code-cross-check-gate.js").CodeCrossCheckDecision>;
+  /** Lead registration: worker-owned identity/generation; available only during the single repair. */
+  codeCrossCheckRepairActive?(): boolean;
+  codeCrossCheckRepair?(): Promise<import("./code-cross-check-contract.js").CodeCrossCheckRecord | undefined>;
+  reportCrossCheckDispositions?(batch: import("./code-cross-check-contract.js").CodeCrossCheckDispositionBatch): Promise<import("./code-cross-check-contract.js").CodeCrossCheckStatus>;
+  codeCrossCheckSummary?(): Promise<import("./code-cross-check-gate.js").CodeCrossCheckSummary | undefined>;
   /**
    * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
    * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a
@@ -719,6 +728,7 @@ export interface RunContext {
 }
 
 export interface ExecutorResult {
+  codeCrossCheckSummary?: import("./code-cross-check-gate.js").CodeCrossCheckSummary;
   /** The branch to report as completed. The runner pushes it + opens the MR. */
   branch: string;
   /** ci_fix only (PRD #6): "not_code" when the agent judged the failure NOT a code
@@ -792,6 +802,8 @@ export interface ExecutorResult {
    *  it on an MR-path completion only. It is never part of any persisted message.
    *  StubExecutor never sets it. */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
    *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
    *  latched from the LAST successful generation of this run. Absent whenever that pass did not

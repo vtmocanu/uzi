@@ -176,19 +176,33 @@ proof does not prove independent recovery, remote durability or custody
 release. Predecessor sources, pins, journals and descriptors stay retained
 until the existing verified final disposition or explicit discard.
 
-Local verification checks reachable object contents under a 1 GiB delivered
-decoded-history cap and the existing deadline. History above that cap keeps
+Local verification checks the full reachable object history, including
+prerequisite history and object hashes, under the worker's configured delivered
+decoded-history cap (default **8 GiB**, or 8589934592 bytes) and the existing
+deadline. Missing or corrupt objects are refused. History above that cap keeps
 work and custody and fails with a recorded blocker in `uzi run recovery`
 and the worker log, even when the thin archive is below 64 MiB. Overflow,
 timeout, corruption and interruption never authorize custody release or
 source cleanup.
 
-The 1 GiB budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads. The delivered-byte
-cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
-does not isolate this verifier from sibling runs. The resulting residual
-resource-exhaustion risk is deferred scope, as authorized by the human
-review on 2026-10-09 (#2512).
+The configured budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads; nested operations
+share the same delivered-byte counter. Object contents stream through a pipe
+chunk and bounded header, without content buffers proportional to the cap.
+Metadata listings retain the existing 64 MiB output cap (`GIT_MAX_BUFFER`);
+object arrays remain bounded by that listing. The delivered-byte cap is **not a
+RAM limit** and does **not** bound Git-internal delta decompression memory. The
+deadline limits duration, and the shared worker cgroup does not isolate this
+verifier from sibling runs. The resulting residual resource-exhaustion risk
+remains deferred scope, as authorized by the human review on 2026-10-09 (#2512).
+
+See [Recovery decoded-history limit](./configuration.md#recovery-decoded-history-limit)
+for worker startup configuration. Recorded cap errors show exact bytes and GiB
+when the cap is at least 1 GiB. Raising the cap and restarting does not unblock
+an already blocked journal: it reports previous decoded verification exhaustion,
+the current cap, and that the prior cap was not recorded. Cancellation, existing
+deadlines, encoded archive caps and storage quotas remain unchanged; there is
+no deduplication or history exclusion.
 
 Retained recovery uses a genuinely fenced fresh successor path and model
 session on external restarts too, including on unwired workers. Losing the

@@ -126,3 +126,21 @@ func TestRepoRemoveNotFound(t *testing.T) {
 		t.Fatalf("exit = %d, want ExitNotFound (%d)", code, uzicli.ExitNotFound)
 	}
 }
+
+func TestRepoListCrossCheckGuidance(t *testing.T) {
+	body := "SECRET-GUIDANCE-BODY"
+	fc := &uzicli.FakeClient{Repos: []apitypes.RepoDTO{
+		{ID: "r1", PathWithNamespace: "org/a", CodeCrossCheckGuidance: &body, CrossCheckRepoInstructionsEnabled: true},
+		{ID: "r2", PathWithNamespace: "org/b"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "repo", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(out, "set (20 bytes)") || !strings.Contains(out, "none") {
+		t.Errorf("want set/none guidance cells: %q", out)
+	}
+	if strings.Contains(out, body) {
+		t.Errorf("guidance body printed: %q", out)
+	}
+}

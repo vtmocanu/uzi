@@ -1,9 +1,37 @@
 import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
 
-export const RECOVERY_DECODED_LIMIT = 1024 * 1024 * 1024;
+export const RECOVERY_DECODED_LIMIT = 8 * 1024 ** 3;
+const RECOVERY_DECODED_LIMIT_CEILING = 64 * 1024 ** 3;
+const limitContract = "UZI_RECOVERY_DECODED_LIMIT_BYTES must be decimal bytes in the range 1..68719476736";
+
+export function validateRecoveryDecodedLimitBytes(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > RECOVERY_DECODED_LIMIT_CEILING) {
+    throw new Error(limitContract);
+  }
+  return value;
+}
+
+export function parseRecoveryDecodedLimitBytes(value: string | undefined): number {
+  if (value === undefined) return RECOVERY_DECODED_LIMIT;
+  const trimmed = value.trim();
+  if (!/^[0-9]+$/.test(trimmed)) throw new Error(limitContract);
+  return validateRecoveryDecodedLimitBytes(Number(trimmed));
+}
+
+export function formatRecoveryDecodedLimit(limit: number): string {
+  const gib = limit / 1024 ** 3;
+  return `${limit} bytes${gib >= 1 ? ` (${gib} GiB)` : ""}`;
+}
+
+export function recoveryClosureLimitDetail(limit: number): string {
+  return `reachable recovery history exceeds the ${formatRecoveryDecodedLimit(limit)} decoded verification limit`;
+}
+
 export class RecoveryClosureLimitError extends Error {
-  constructor() { super("reachable recovery history exceeds the 1 GiB decoded verification limit"); }
+  constructor(readonly limit: number = RECOVERY_DECODED_LIMIT) {
+    super(recoveryClosureLimitDetail(limit));
+  }
 }
 export interface ClosureBudget { delivered: number; limit: number }
 export interface ClosureObject { oid: string; type: string; size: number }
@@ -43,7 +71,7 @@ export async function verifyClosureFrames(
     while (remaining > 0) {
       if (!await available()) throw new Error("truncated recovery object contents");
       const length = Math.min(remaining, chunk.length - offset);
-      if (length > budget.limit - budget.delivered) throw new RecoveryClosureLimitError();
+      if (length > budget.limit - budget.delivered) throw new RecoveryClosureLimitError(budget.limit);
       budget.delivered += length;
       hash.update(chunk.subarray(offset, offset + length));
       offset += length;

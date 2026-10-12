@@ -2,6 +2,7 @@
 // a fake queryFn (no live session); the fake stands in for the CLI and, where a test needs
 // it, calls the configured PreToolUse hooks exactly as the CLI would before a tool runs.
 
+import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -102,6 +103,62 @@ function ctx(emitted: EmittedMessage[] = []): IsolatedContext {
     timeoutMs: 30_000,
   };
 }
+
+it("isolated oversized timeout rearms and aborts only at full deadline M1", async t => {
+  const clock = overflowClock(t);
+  const input = ctx();
+  input.timeoutMs = REPRO_DELAY;
+  const aborted: boolean[] = [];
+  const { queryFn } = fakeQuery([realInit() as SDKMessage, async options => {
+    const signal = options.abortController!.signal;
+    clock.move(1); clock.deliver(); await drain();
+    aborted.push(signal.aborted);
+    clock.move(NATIVE_LIMIT - 1); clock.deliver(); await drain();
+    aborted.push(signal.aborted);
+    clock.move(98_999_353); clock.deliver(); await drain();
+    aborted.push(signal.aborted);
+    clock.move(1); clock.deliver(); await drain();
+    aborted.push(signal.aborted);
+  }]);
+  await assert.rejects(new IsolatedExecutor(nullLogger(), {
+    queryFn, secretPaths: SECRET_PATHS, timeoutNow: clock.now,
+  }).run(input), { message: "isolated run exceeded its wall-clock limit" });
+  assert.deepEqual(aborted, [false, false, false, true], "no early abort; only full expiry aborts");
+  clock.assertSafe();
+  assert.ok(clock.requests.every(r => r.unrefs === 1));
+  assert.equal(clock.pending().length, 0);
+});
+
+for (const mode of ["finish", "cancel"] as const) it(
+  `isolated oversized timeout cleanup cancels rearmed chunk on ${mode} M1`, async t => {
+    const clock = overflowClock(t);
+    const controller = new AbortController();
+    const input = ctx();
+    input.timeoutMs = REPRO_DELAY;
+    input.signal = controller.signal;
+    let rearmed = false;
+    let signal: AbortSignal | undefined;
+    const { queryFn } = fakeQuery([realInit() as SDKMessage, async options => {
+      signal = options.abortController!.signal;
+      clock.move(NATIVE_LIMIT); clock.deliver(); await drain();
+      rearmed = clock.pending().some(r => r.delay === REPRO_DELAY - NATIVE_LIMIT);
+      if (mode === "cancel") controller.abort();
+    }, resultSuccess()]);
+    const running = new IsolatedExecutor(nullLogger(), {
+      queryFn, secretPaths: SECRET_PATHS, timeoutNow: clock.now,
+    }).run(input);
+    if (mode === "cancel") await assert.rejects(running, { message: "isolated run cancelled" });
+    else await running;
+    assert.equal(rearmed, true, "cleanup starts with a live second chunk");
+    assert.equal(clock.pending().length, 0, "terminal cleanup cancels the rearmed timeout");
+    // Observe abort calls even though the provider signal is already terminal.
+    const abortCalls = t.mock.method(AbortController.prototype, "abort");
+    clock.move(REPRO_DELAY - NATIVE_LIMIT); clock.deliver(); await drain();
+    assert.equal(abortCalls.mock.callCount(), 0, "old remainder cannot abort after cleanup");
+    assert.equal(signal?.aborted, true);
+    clock.assertSafe();
+  },
+);
 
 function options(gate = { passed: false }): SdkOptions {
   const fetch = buildFetchToolsServer({ fetcherUrl: "https://127.0.0.1:1", ca: "", credential: "cred", workspace, log: nullLogger() });

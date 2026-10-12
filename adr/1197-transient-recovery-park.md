@@ -170,7 +170,9 @@ needed prerequisites locally available and verified, permits local adoption
 and model execution despite unknown remote publication. Nonempty
 prerequisites alone are not a blocker. Content verification reads only the
 reachable object closure and verifies object hashes within the recovery
-deadline. A decoded history above 1 GiB fails closed with custody retained,
+deadline. Under the original #2512 policy (superseded by the
+[2026-10-11 amendment](#amendment-2026-10-11--2743) below), decoded history above
+1 GiB failed closed with custody retained,
 even when its thin archive is below 64 MiB; the recorded reason is visible
 in `uzi run recovery` and the worker log. Local proof establishes neither
 independent recovery nor remote durability and grants no custody release. Predecessor
@@ -197,6 +199,10 @@ download API or failed-run Resume. Downgrade during pending recovery is
 unsupported: older workers may drop the durable recovery fields.
 
 ## Amendment 2026-10-09 — #2512: bounded reachable integrity verification
+
+**Historical cap policy:** the 1 GiB limit in this section is superseded by the
+[2026-10-11 amendment](#amendment-2026-10-11--2743). The integrity, custody and
+residual-risk boundaries remain in force.
 
 The human review authorizes a 1 GiB delivered decoded-history limit for
 local recovery verification, separate from the 64 MiB encoded archive cap.
@@ -239,3 +245,78 @@ work and custody like every other terminal discovery failure.
 The extra allowance is about 2 x codexBoundaryDeadlineMs plus 3 x
 recoveryRetryMs of scheduled time (about 63 s at defaults). It is not a
 wall-clock guarantee, since I/O settlement can add to it.
+
+## Amendment 2026-10-11 — #2743
+
+The delivered decoded-history cap is now worker-configurable through
+`UZI_RECOVERY_DECODED_LIMIT_BYTES`, with a default of **8589934592 bytes
+(8 GiB)** and a fixed ceiling of **68719476736 bytes (64 GiB)**. This replaces
+the historical 1 GiB policy in the #2512 sections above. The finite ceiling is
+eight times the default: it permits larger histories while retaining exact
+safe-integer arithmetic and existing deadlines, without promising a memory
+bound.
+
+### Reported offline measurement
+
+The following measurement was reported **OFFLINE on 2026-10-11** in the
+[issue #2743 measurement report](https://github.com/vtmocanu/uzi/issues/2743),
+not reproduced on a hosted worker as part of this change:
+
+| History or verification sequence | Decoded object bytes |
+|---|---:|
+| Base `4d28d412` | 1,469,170,456 |
+| Tip `ca44b5c1` | 1,477,164,071 |
+| Union of both actual archives, unique objects | 1,477,164,741 |
+| Base + failed archive, cumulative reads | 2,946,334,838 |
+| Previous archive + base + failed archive, cumulative reads | 4,423,499,268 |
+
+The old 1 GiB cap could not fit even one unique pass. The new 8 GiB default
+fits this reported sequence by decoded bytes; that is not a hosted success or
+deadline guarantee. Repeated reads remain chargeable and can still exhaust
+the cap.
+
+### Configuration and failure boundary
+
+The worker parses the variable once in `loadConfig` at startup and injects it
+through the main GitCache factory into a readonly instance setting. An unset
+variable selects the default. A set value is trimmed and must contain decimal
+digits representing a positive safe integer in `1..68719476736`; leading
+zeroes are accepted. Blank, malformed, fractional, exponent, signed, zero,
+negative, nonfinite, unsafe-integer and above-ceiling values reject worker
+startup. The error names the variable and range without echoing the raw value.
+Changing the setting requires restarting the worker.
+
+This is worker/operator configuration, not server, API, repository or model
+input. Inject it into a standalone container or an explicit operator container
+environment override; setting it in `.env`, the API or controller alone does
+not set the worker variable. The bundled hosted Helm chart and docker-compose
+do **not** expose this environment variable yet and use the 8 GiB default.
+This issue changes neither deployment manifest. See
+[operator configuration](../docs/configuration.md#recovery-decoded-history-limit).
+
+Outer recovery operations and closure checks without an operation context use
+the configured cap; nested recovery operations share their parent's cumulative
+delivered-byte counter. Verification continues to hash the **full reachable
+history**, including prerequisites, with no deduplication across repeated
+reads or history exclusion. Missing or corrupt objects are refused.
+Cancellation and existing deadlines remain in force. Cap exhaustion fails
+closed, preserving local work and custody; encoded archive limits and storage
+quotas are unchanged. Local proof still grants neither remote durability nor
+custody release.
+
+Cap errors report exact bytes, adding GiB when the cap is at least 1 GiB.
+A journal already blocked for decoded-history exhaustion stays blocked after
+restart or a cap increase. Its reason reports previous decoded verification
+exhaustion and the current cap, with "prior cap not recorded"; it does not
+attribute that earlier failure to the new cap or automatically retry it.
+
+### Memory and residual risk
+
+Object contents stream through a pipe chunk and bounded header; content buffers
+do not grow in proportion to the configured cap. Metadata listings still have
+the 64 MiB output cap (`GIT_MAX_BUFFER`), and the object arrays remain bounded
+by that existing listing. The delivered-byte cap is **not a RAM limit**:
+Git-internal delta decompression is not bounded by it. Existing deadlines limit
+duration, and the shared worker cgroup does not isolate sibling runs. The
+residual worker resource-exhaustion risk accepted in #2512 on 2026-10-09 remains
+deferred; this amendment does not claim to solve it.

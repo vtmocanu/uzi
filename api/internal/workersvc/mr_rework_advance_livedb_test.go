@@ -22,7 +22,7 @@ func TestCreateAutoMRReworkRunAndAdvanceFirstFireAndRefusalsLiveDB(t *testing.T)
 	seedEligibleIssue(t, env, repoID, n)
 	source := seedCompletedSourceRun(t, env, userID, repoID, n, 234710)
 	res := reviewResultOf(sampleReviewSnapshot()) // one actionable comment, id 120
-	ledger := func() (store.MrReworkLedger, error) {
+	ledger := func() (store.GetMRReworkLedgerRow, error) {
 		return env.q.GetMRReworkLedger(env.ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: branch})
 	}
 
@@ -47,8 +47,11 @@ func TestCreateAutoMRReworkRunAndAdvanceFirstFireAndRefusalsLiveDB(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if led.AttemptCount != 1 || led.HighWater != 120 {
-		t.Fatalf("ledger = %+v, want attempt_count 1 and high_water 120", led)
+	if led.AttemptCount != 1 || led.HighWater != 120 || led.Legacy {
+		t.Fatalf("ledger = %+v, want a non-legacy row with attempt_count 1 and high_water 120", led)
+	}
+	if st, err := LedgerStateFromRow(led); err != nil || st.Marks[testNS] != 120 {
+		t.Fatalf("ledger state = %+v, %v, want mark 120 in %s", st, err, testNS)
 	}
 
 	// Once that run is terminal, the same (now consumed) result is refused under the lock and the
@@ -70,7 +73,7 @@ func TestCreateAutoMRReworkRunAndAdvanceCapUnderLockLiveDB(t *testing.T) {
 	branch := agentIssueBranch(n)
 	seedEligibleIssue(t, env, repoID, n)
 	source := seedCompletedSourceRun(t, env, userID, repoID, n, 234720)
-	if err := env.q.UpsertMRReworkLedger(env.ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: branch, HighWater: 50}); err != nil {
+	if _, err := env.q.UpsertMRReworkLedger(env.ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: branch, HighWater: 50, Marks: []byte(`{"` + testNS + `":50}`)}); err != nil {
 		t.Fatal(err)
 	}
 	env.exec(`UPDATE mr_rework_ledger SET attempt_count = 2 WHERE repo_id = $1 AND ref = $2`, repoID, branch)

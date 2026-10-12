@@ -16,6 +16,8 @@ export interface User {
   autopilot_enabled: boolean;
   // Per-user consent for the required plan cross-check on new auto-approved runs.
   plan_cross_check_enabled?: boolean;
+  /** Independent advisory code-check consent; absent on older APIs means disabled. */
+  code_cross_check_enabled?: boolean;
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
@@ -131,7 +133,7 @@ export interface SecretMeta {
 // the per-user UI theme override; null means "use the instance default" (PRD
 // #21).
 export interface CrossCheckPinDTO {
-  stage: "plan";
+  stage: "plan" | "code";
   harness: Harness;
   model: string | null;
   effort: string | null;
@@ -212,7 +214,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
-  cross_check_pins?: { stage: "plan"; harness: Harness; model?: string | null; effort?: string | null }[];
+  cross_check_pins?: { stage: "plan" | "code"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
    *  send this. Kept only for the bounded stale-client bridge, where the server routes it
@@ -515,6 +517,9 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  /** Separate checker consent; absent on older APIs means off. */
+  cross_check_repo_instructions_enabled?: boolean;
+  code_cross_check_guidance?: string | null;
   id: string;
   connection_id: string;
   forge_project_id: number;
@@ -2860,12 +2865,16 @@ export interface Run {
   issue_input_reason?: string | null;
   /** The run's snapshot of the owner's plan cross-check setting. */
   plan_cross_check_required: boolean;
+  /** Independent creation-time code-check consent snapshot. */
+  code_cross_check_required?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
   plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
   plan_cross_check_summary?: PlanCrossCheckSummary;
+  /** Owner-only persisted code evidence, independent of plan approval. */
+  code_cross_check_summary?: CodeCrossCheckSummary;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
    *  judge_rerun, resume, cross_check). A NOT NULL server column (DEFAULT 'manual'), so it is
@@ -3548,6 +3557,32 @@ export interface PlanCrossCheckFinding {
   severity: string;
   summary: string;
   rationale: string;
+}
+
+export interface CodeCrossCheckSummary {
+  custom_guidance_applied?: boolean;
+  guidance_digest?: string;
+  repo_instructions_enabled?: boolean;
+  repo_instructions_digest?: string;
+  usage?: RunUsage | null;
+  stage: string;
+  round: number;
+  candidate_generation: number;
+  base_commit: string | null;
+  head_commit: string | null;
+  candidate_digest: string;
+  checker_run_id: string | null;
+  checker_harness: string | null;
+  checker_model: string | null;
+  checker_effort: string | null;
+  outcome: string;
+  reason_class: string | null;
+  findings: unknown;
+  /** Older APIs may omit this field; validate its untrusted contents before display. */
+  dispositions?: unknown;
+  interrupted_at: string | null;
+  finalized_at: string | null;
+  deadline_at: string;
 }
 
 export interface PlanCrossCheckSummary {

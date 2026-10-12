@@ -75,7 +75,7 @@ func TestReviewInteractiveSharedTotalDeadline(t *testing.T) {
 					f.deadlines = []time.Duration{2 * time.Second, 2 * time.Second, 2 * time.Second, 4 * time.Second, 5 * time.Second}
 				}
 				p := workersvc.ReviewAssessParams{
-					RepoID: uuid.New(), Ref: "agent/issue-7", ProjectID: 42, BotForgeUserID: botID, Lookup: f, HighWater: 10,
+					RepoID: uuid.New(), Ref: "agent/issue-7", ProjectID: 42, BotForgeUserID: botID, Lookup: f, Ledger: raState(10),
 					Comments: []forge.MRComment{
 						inline(11, memberID, "carol", "eligible trigger", start),
 						inline(12, outsiderID, "mallory", "OUTSIDER_RAW", start.Add(time.Second)),

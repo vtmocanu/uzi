@@ -25,6 +25,53 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("cross-check preference request bodies", () => {
+  it.each([true, false])("sends only code=%s through the production setter", async (code) => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { user: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.setCodeCrossCheckEnabled(code);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/me/cross-check");
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(init?.body as string)).toEqual({ code });
+  });
+  it.each([true, false])("sends only plan=%s through the existing setter", async (plan) => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { user: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.setPlanCrossCheckEnabled(plan);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/me/cross-check");
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(init?.body as string)).toEqual({ plan });
+  });
+});
+
+describe("repo code cross-check inputs request", () => {
+  it.each([
+    [{ code_cross_check_guidance: "Check migrations.", cross_check_repo_instructions_enabled: true }],
+    [{ code_cross_check_guidance: null }],
+    [{ cross_check_repo_instructions_enabled: false }],
+  ])("sends exactly %j in one PATCH to the repo", async (inputs) => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { repo: { id: "r1" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    const out = await api.setRepoCodeCrossCheckInputs("r1", inputs);
+    expect(out.repo.id).toBe("r1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/repos/r1");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init?.body as string)).toEqual(inputs);
+  });
+});
+
 describe("testSecret request", () => {
   it("posts to the selected credential without a provider body and returns the flat verdict", async () => {
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { status: "inconclusive", reason: "vault_locked" }));

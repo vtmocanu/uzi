@@ -1,7 +1,103 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { it } from "node:test";
 import { WorkerClient, RequestError, isStrictDecodeError, isTransient, type PlanCrossCheckCandidate } from "../src/client.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, makeClaim } from "./helpers.js";
+
+it("cleanup metadata rejects ordinary ownership and nonexact identities", async (t) => {
+  const lead = "11111111-1111-4111-8111-111111111111";
+  const valid = { protocol: "code_snapshot_cleanup_v1", lead_run_id: lead,
+    lead_status: "running", owned_by_worker: true, row_present: true, lead_claim_generation: 3,
+    head_commit: "a".repeat(40), outcome: "completed", child_present: true,
+    checker_run_id: "22222222-2222-4222-8222-222222222222",
+    checker_claim_generation: 1, checker_status: "completed" };
+  t.mock.method(globalThis, "fetch", async (url: Parameters<typeof fetch>[0]) => {
+    assert.match(String(url), /ownership\?purpose=code_snapshot/);
+    return Response.json(valid);
+  });
+  assert.deepEqual(await client().getCodeSnapshotCleanup(lead), valid);
+  for (const body of [{ status: "completed", claim_generation: 1 },
+    { ...valid, extra: true }, { ...valid, head_commit: valid.head_commit + "\\n" },
+    { ...valid, checker_claim_generation: -1 }, { ...valid, lead_claim_generation: 0 },
+    { ...valid, lead_claim_generation: undefined }, { ...valid, child_present: false },
+    { ...valid, row_present: false }]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(body));
+    await assert.rejects(client().getCodeSnapshotCleanup(lead), /invalid code snapshot cleanup/);
+  }
+});
+
+it("legacy plan claims and statuses decode without code-stage fields", async (t) => {
+  const legacy = makeClaim({ kind: "cross_check", cross_check: { stage: "plan", lead_run_id: "lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "legacy plan", milestones: [], required_capabilities: [], required_tools: [],
+    size_class: "s", base_commit: "a".repeat(40), planning_diff: "" } });
+  t.mock.method(globalThis, "fetch", async () => Response.json(legacy, { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+  const decoded = await client().claimCrossCheck();
+  assert.equal(decoded?.cross_check?.stage, "plan");
+  assert.equal(decoded?.code_cross_check_required, undefined);
+  assert.equal(decoded?.cross_check && "head_commit" in decoded.cross_check, false);
+  t.mock.method(globalThis, "fetch", async () => Response.json(wire()));
+  const status = await client().planCrossCheckStatus("lead", 3);
+  assert.equal(status.result, "candidate");
+  assert.equal("head_commit" in status, false);
+});
+
+it("production dedicated claim client discriminates stages and retains plan requirements", async (t) => {
+  const plan = makeClaim({ kind: "cross_check", cross_check: { stage: "plan", lead_run_id: "lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "plan", milestones: [], required_capabilities: [], required_tools: [],
+    size_class: "s", base_commit: "a".repeat(40), planning_diff: "" } });
+  for (const cross_check of [
+    { ...plan.cross_check, stage: "unknown" },
+    { ...plan.cross_check, planning_diff: undefined },
+    { ...plan.cross_check, milestones: undefined },
+    { ...plan.cross_check, stage: "code", head_commit: "bad", code_context: {} },
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...plan, cross_check },
+      { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+    await assert.rejects(client().claimCrossCheck(), /invalid cross-check claim/);
+  }
+  t.mock.method(globalThis, "fetch", async () => Response.json({ ...plan, cross_check: {
+    ...plan.cross_check, stage: "code", head_commit: "d".repeat(40), code_context: {},
+    planning_diff: undefined, guidance_snapshot: undefined,
+  } }, { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+  assert.equal((await client().claimCrossCheck())?.cross_check?.stage, "code");
+});
+
+it("production code claim rejects lead identifiers with trailing newline or controls", async (t) => {
+  const cross_check = { stage: "code", lead_run_id: "valid_lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "plan", base_commit: "a".repeat(40), head_commit: "d".repeat(40), code_context: {} };
+  for (const suffix of ["", "\n", "\r", "\u0000", "\u001b", "\u202e"]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(makeClaim({ kind: "cross_check",
+      cross_check: { ...cross_check, lead_run_id: cross_check.lead_run_id + suffix } as NonNullable<ReturnType<typeof makeClaim>["cross_check"]> }),
+      { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+    if (suffix) await assert.rejects(client().claimCrossCheck(), /invalid cross-check claim/);
+    else assert.equal((await client().claimCrossCheck())?.cross_check?.lead_run_id, "valid_lead");
+  }
+});
+
+it("production code verdict client rejects duplicate IDs, non-ASCII IDs and actual UTF-8 bounds before HTTP", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({}));
+  const finding = { id: "F1", severity: "major" as const, path: "source.ts", line: 1, title: "defect", detail: "" };
+  const valid = { ...finding, detail: "é".repeat(900) };
+  const c = client();
+  await c.reportCodeCrossCheckVerdict("child", 1, { outcome: "completed", findings: [valid] });
+  assert.equal(fetch.mock.callCount(), 1);
+  for (const findings of [
+    [finding, finding],
+    [{ ...finding, id: "é" }],
+    [{ ...finding, id: "valid_ID\n" }],
+    [{ ...finding, id: "valid_ID\r" }],
+    [{ ...finding, id: "control\u0000" }],
+    [{ ...finding, id: "ansi\u001b[31m" }],
+    [{ ...finding, id: "bidi\u202e" }],
+    [{ ...finding, detail: "é".repeat(1024) }],
+    Array.from({ length: 21 }, (_, i) => ({ ...finding, id: String(i) })),
+    Array.from({ length: 20 }, (_, i) => ({ ...valid, id: String(i) })),
+  ]) await assert.rejects(c.reportCodeCrossCheckVerdict("child", 1, { outcome: "completed", findings }), /invalid code/);
+  assert.equal(fetch.mock.callCount(), 1, "invalid output never reaches HTTP");
+});
 
 const candidate: PlanCrossCheckCandidate = { plan_md: "plan", planning_diff: "", milestones: [],
   required_capabilities: [], required_tools: [], size_class: "s", base_commit: "a".repeat(40) };
@@ -186,4 +282,253 @@ it("strict checked state rejects missing negotiation or generation without sendi
   for (const claim_generation of [undefined, 0, -1, 1.5, NaN, Infinity])
     await assert.rejects(c.reportPlanCrossCheckGateState("run", { status: "running", claim_generation }));
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+const codeFinding = { id: "F_1-", severity: "major" as const, path: "src/code.ts", line: 1,
+  title: "defect", detail: "details" };
+const disposition = { finding_id: codeFinding.id, disposition: "addressed" as const, reason: "fixed" };
+const codeWire = () => ({ stage: "code", round: 1, candidate_generation: 3,
+  base_commit: "a".repeat(40), head_commit: "b".repeat(40), candidate_digest: "c".repeat(64),
+  checker_run_id: "22222222-2222-4222-8222-222222222222", checker_harness: "codex",
+  checker_model: "fixture-model", checker_effort: "high", outcome: "completed",
+  reason_class: null, findings: [codeFinding], dispositions: null,
+  interrupted_at: null, finalized_at: null, deadline_at: "2030-01-01T00:00:00Z" });
+const finalizedCodeWire = () => ({ ...codeWire(), dispositions: [disposition],
+  finalized_at: "2030-01-01T00:00:00Z" });
+
+it("code disposition POST sends literal keys, allows empty finalizer, and preserves abort", async (t) => {
+  const controller = new AbortController();
+  t.mock.method(globalThis, "fetch", async (url: unknown, init?: RequestInit) => {
+    assert.equal(String(url), "http://example.com/api/worker/runs/lead/cross-checks/code/dispositions");
+    assert.equal(init?.method, "POST");
+    const body = JSON.parse(init!.body as string);
+    assert.deepEqual(body, { claim_generation: 3, dispositions: [disposition] });
+    assert.ok(init?.signal);
+    controller.abort();
+    assert.equal(init.signal.aborted, true);
+    return Response.json(finalizedCodeWire());
+  });
+  const result = await client().reportCodeCrossCheckDispositions("lead", 3, [disposition], controller.signal);
+  assert.ok("dispositions" in result);
+  assert.deepEqual(result.dispositions, [disposition]);
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    assert.deepEqual(JSON.parse(init!.body as string), { claim_generation: 3, dispositions: [] });
+    return Response.json({ ...finalizedCodeWire(),
+      dispositions: [{ finding_id: codeFinding.id, disposition: "not_reported", reason: "" }] });
+  });
+  const empty = await client().reportCodeCrossCheckDispositions("lead", 3, []);
+  assert.ok("dispositions" in empty);
+  assert.equal(empty.dispositions?.[0]?.disposition, "not_reported");
+});
+
+it("code dispositions validate generation, ASCII IDs and UTF-8 reason bytes before HTTP", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json(finalizedCodeWire()));
+  const c = client();
+  const exact = "é".repeat(512);
+  await c.reportCodeCrossCheckDispositions("lead", 3, [{ ...disposition, reason: exact }]);
+  assert.equal(Buffer.byteLength(exact), 1024);
+  for (const generation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])
+    await assert.rejects(c.reportCodeCrossCheckDispositions("lead", generation, []), /invalid code/);
+  const bad = [
+    [disposition, disposition], [{ ...disposition, reason: exact + "a" }],
+    [{ ...disposition, reason: " " }], [{ ...disposition, reason: "\uD800" }],
+    [{ ...disposition, disposition: "not_reported", reason: "" }],
+    [{ ...disposition, id: codeFinding.id }], null, {},
+    Array.from({ length: 21 }, (_, i) => ({ ...disposition, finding_id: String(i) })),
+    ...["", "é", "a".repeat(65), "F1\n", "F1\r", "F1\u0000", "F1\u001b", "F1\u202e", " F1"]
+      .map(finding_id => [{ ...disposition, finding_id }]),
+  ];
+  for (const batch of bad)
+    await assert.rejects(c.reportCodeCrossCheckDispositions("lead", 3,
+      batch as Parameters<WorkerClient["reportCodeCrossCheckDispositions"]>[2]), /invalid code/);
+  assert.equal(fetch.mock.callCount(), 1, "invalid batches never reach HTTP");
+});
+
+// Unicode White_Space, the set used by Go strings.TrimSpace (not JavaScript trim).
+const goWhitespace = [
+  "\u0009", "\u000a", "\u000b", "\u000c", "\u000d", "\u0020", "\u0085", "\u00a0",
+  "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005", "\u2006",
+  "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000",
+];
+
+it("code dispositions refuse all Go whitespace including U+0085 before HTTP and in persisted status", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json(finalizedCodeWire()));
+  const c = client();
+  for (const reason of ["", "\u0085", ...goWhitespace, goWhitespace.join("")]) {
+    for (const kind of ["addressed", "declined"] as const) {
+      await assert.rejects(c.reportCodeCrossCheckDispositions("lead", 3,
+        [{ ...disposition, disposition: kind, reason }]), /invalid code cross-check dispositions/);
+      assert.equal(fetch.mock.callCount(), 0, "Go-blank reasons never reach HTTP");
+    }
+  }
+  for (const reason of ["", ...goWhitespace, goWhitespace.join("")]) {
+    for (const kind of ["addressed", "declined"] as const) {
+      t.mock.method(globalThis, "fetch", async () => Response.json({
+        ...finalizedCodeWire(), dispositions: [{ ...disposition, disposition: kind, reason }],
+      }));
+      await assert.rejects(c.codeCrossCheckStatus("lead", 3), /invalid code cross-check dispositions/);
+    }
+  }
+});
+
+it("code dispositions preserve U+FEFF and Unicode whitespace edges exactly in POST and persisted status", async (t) => {
+  const c = client();
+  for (const reason of ["\ufeff", goWhitespace.join("") + "\ufeff" + goWhitespace.join(""),
+    ...goWhitespace.map(space => space + "normal reason" + space)]) {
+    for (const kind of ["addressed", "declined"] as const) {
+      const d = { ...disposition, disposition: kind, reason };
+      const body = { ...finalizedCodeWire(), dispositions: [d] };
+      const fetch = t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+        if (init?.method === "POST")
+          assert.deepEqual(JSON.parse(init.body as string), { claim_generation: 3, dispositions: [d] });
+        return Response.json(body);
+      });
+      for (const call of [() => c.reportCodeCrossCheckDispositions("lead", 3, [d]),
+        () => c.codeCrossCheckStatus("lead", 3)]) {
+        await assert.doesNotReject(async () => {
+          const status = await call();
+          assert.ok("dispositions" in status);
+          assert.deepEqual(status.dispositions, [d]);
+        });
+      }
+      assert.equal(fetch.mock.callCount(), 2);
+    }
+  }
+});
+
+it("code status keeps M1 rollout compatibility and interrupted worker projection", async (t) => {
+  for (const body of [
+    { ...codeWire(), dispositions: undefined, finalized_at: undefined },
+    { ...codeWire(), dispositions: undefined, finalized_at: "2030-01-01T00:00:00Z" },
+    codeWire(),
+    { ...finalizedCodeWire(), findings: [], dispositions: null, reason_class: "interrupted",
+      interrupted_at: "2030-01-01T00:00:00Z" },
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(body));
+    const status = await client().codeCrossCheckStatus("lead", 3);
+    assert.ok("findings" in status);
+    assert.equal(status.dispositions, null);
+    if (body.interrupted_at) assert.deepEqual(status.findings, []);
+    else assert.equal(status.finalized_at, null);
+  }
+});
+
+it("code response refuses invalid, incomplete or unknown persisted dispositions through real clients", async (t) => {
+  const exact = "é".repeat(512);
+  const invalid = [
+    { ...finalizedCodeWire(), dispositions: null },
+    { ...finalizedCodeWire(), dispositions: [] },
+    { ...finalizedCodeWire(), dispositions: [disposition, disposition] },
+    { ...finalizedCodeWire(), dispositions: {} },
+    { ...finalizedCodeWire(), finalized_at: null },
+    { ...finalizedCodeWire(), finalized_at: "invalid" },
+    { ...finalizedCodeWire(), outcome: "failed", findings: [] },
+    { ...finalizedCodeWire(), interrupted_at: "2030-01-01T00:00:00Z", findings: [] },
+    ...["unknown", "", "é", "a".repeat(65), "F1\n", "F1\r", "F1\u0000", "F1\u001b", "F1\u202e"]
+      .map(finding_id => ({ ...finalizedCodeWire(), dispositions: [{ ...disposition, finding_id }] })),
+    ...["", " ", exact + "a", "\uD800"].map(reason =>
+      ({ ...finalizedCodeWire(), dispositions: [{ ...disposition, reason }] })),
+    { ...finalizedCodeWire(), dispositions: [{ ...disposition, disposition: "unknown" }] },
+    { ...finalizedCodeWire(), dispositions: [{ ...disposition, disposition: "not_reported" }] },
+    { ...finalizedCodeWire(), dispositions: [{ ...disposition, id: codeFinding.id }] },
+  ];
+  for (const call of [
+    (c: WorkerClient) => c.codeCrossCheckStatus("lead", 3),
+    (c: WorkerClient) => c.submitCodeCrossCheck("lead", 3, { base_commit: "a".repeat(40), head_commit: "b".repeat(40) }),
+    (c: WorkerClient) => c.reportCodeCrossCheckDispositions("lead", 3, [disposition]),
+  ]) {
+    for (const body of invalid) {
+      t.mock.method(globalThis, "fetch", async () => Response.json(body));
+      await assert.rejects(call(client()), /invalid code cross-check/);
+    }
+    for (const d of [{ ...disposition, reason: exact }, { ...disposition, disposition: "declined", reason: exact },
+      { ...disposition, disposition: "not_reported", reason: "" }]) {
+      t.mock.method(globalThis, "fetch", async () => Response.json({ ...finalizedCodeWire(), dispositions: [d] }));
+      const status = await call(client());
+      assert.ok("dispositions" in status);
+      assert.deepEqual(status.dispositions, [d]);
+    }
+  }
+});
+
+it("code disposition response uses the bounded reader despite false Content-Length", async (t) => {
+  const stream = streamedAck(ackMaxBytes + 1, "1");
+  const fetch = t.mock.method(globalThis, "fetch", async () => stream.response);
+  await assert.rejects(client().reportCodeCrossCheckDispositions("lead", 3, []), /response body exceeds/);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(stream.cancellations(), 1);
+});
+
+// PRD #2170: the no-row body is exactly what WorkerCodeCrossCheckStatus replies (Go handler test
+// TestCodeCrossCheckNoRowBodyKeys pins the same three keys on the server side).
+it("code status decodes the real no-row body and returns the consent flag", async (t) => {
+  for (const enabled of [true, false]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ stage: "code", result: "no_row", repo_instructions_enabled: enabled }));
+    assert.deepEqual(await client().codeCrossCheckStatus("lead", 3),
+      { stage: "code", result: "no_row", repo_instructions_enabled: enabled });
+    t.mock.method(globalThis, "fetch", async () => Response.json({ stage: "code", result: "no_row", repo_instructions_enabled: enabled }));
+    assert.deepEqual(await client().submitCodeCrossCheck("lead", 3, { base_commit: "a".repeat(40), head_commit: "b".repeat(40) }),
+      { stage: "code", result: "no_row", repo_instructions_enabled: enabled });
+  }
+  for (const body of [
+    { stage: "code", result: "no_row" },
+    { stage: "code", result: "no_row", repo_instructions_enabled: "true" },
+    { stage: "code", result: "no_row", repo_instructions_enabled: null },
+    { stage: "code", result: "no_row", repo_instructions_enabled: true, extra: 1 },
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json(body));
+    await assert.rejects(client().codeCrossCheckStatus("lead", 3), /invalid code cross-check response/);
+  }
+});
+
+it("code status types the frozen guidance metadata on a decided row", async (t) => {
+  const meta = { custom_guidance_applied: true, guidance_digest: "a".repeat(64),
+    repo_instructions_enabled: true, repo_instructions_digest: "b".repeat(64) };
+  t.mock.method(globalThis, "fetch", async () => Response.json({ ...codeWire(), ...meta }));
+  const status = await client().codeCrossCheckStatus("lead", 3);
+  assert.ok("outcome" in status);
+  assert.deepEqual({ ...status }, { ...status, ...meta });
+  for (const bad of [{ custom_guidance_applied: "yes" }, { guidance_digest: "xyz" }, { guidance_digest: "A".repeat(64) },
+    { repo_instructions_enabled: 1 }, { repo_instructions_digest: "" }, { repo_instructions_digest: null }]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...codeWire(), ...meta, ...bad }));
+    await assert.rejects(client().codeCrossCheckStatus("lead", 3), /invalid code cross-check response/);
+  }
+});
+
+it("code claim verifies guidance and instruction digests and refuses text while disabled", async (t) => {
+  const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+  const guidance = "Check rate limits.";
+  const text = "# Repo rules\n";
+  const base = { stage: "code", lead_run_id: "valid_lead", round: 1, candidate_digest: "b".repeat(64),
+    deadline_at: "2030-01-01T00:00:00Z", plan_md: "plan", base_commit: "a".repeat(40), head_commit: "d".repeat(40),
+    code_context: {}, guidance_snapshot: guidance, guidance_digest: sha(guidance), custom_guidance_applied: true,
+    repo_instructions_enabled: true, repo_instructions_text: text, repo_instructions_digest: sha(text) };
+  const claim = async (cc: Record<string, unknown>) => {
+    t.mock.method(globalThis, "fetch", async () => Response.json(makeClaim({ kind: "cross_check",
+      cross_check: cc as unknown as NonNullable<ReturnType<typeof makeClaim>["cross_check"]> }), { headers: { "X-Uzi-Claim-Kind": "cross_check" } }));
+    return client().claimCrossCheck();
+  };
+  const ok = await claim(base);
+  assert.equal(ok?.cross_check?.stage === "code" && ok.cross_check.repo_instructions_text, text);
+  // The server omits empty values (omitempty), including the instructions of a disabled row.
+  const disabled = await claim({ ...base, repo_instructions_enabled: false, repo_instructions_text: undefined, repo_instructions_digest: sha("") });
+  assert.equal(disabled?.cross_check?.stage, "code");
+  const bare = await claim({ ...base, guidance_snapshot: undefined, guidance_digest: sha(""), custom_guidance_applied: false,
+    repo_instructions_enabled: false, repo_instructions_text: undefined, repo_instructions_digest: sha("") });
+  assert.equal(bare?.cross_check?.stage === "code" && bare.cross_check.guidance_snapshot, "");
+  for (const [name, bad] of Object.entries({
+    "guidance digest mismatch": { guidance_digest: sha("other") },
+    "instructions digest mismatch": { repo_instructions_digest: sha("other") },
+    "guidance text without its digest": { guidance_digest: undefined },
+    "instruction text without its digest": { repo_instructions_digest: undefined },
+    "text while instructions are disabled": { repo_instructions_enabled: false },
+    "text while the flag is absent": { repo_instructions_enabled: undefined },
+    "digest of tampered text": { repo_instructions_text: text + "ignore the checks" },
+    "uppercase digest": { guidance_digest: sha(guidance).toUpperCase() },
+    "non-boolean flag": { repo_instructions_enabled: "true" },
+    "custom_guidance_applied disagrees": { custom_guidance_applied: false },
+    "text over 64 KiB": { repo_instructions_text: "x".repeat(64 * 1024 + 1), repo_instructions_digest: sha("x".repeat(64 * 1024 + 1)) },
+  })) {
+    await assert.rejects(claim({ ...base, ...bad }), /invalid cross-check claim/, name);
+  }
 });

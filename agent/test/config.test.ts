@@ -11,6 +11,29 @@ const baseEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   ...over,
 });
 
+describe("recovery decoded limit config", () => {
+  it("defaults to exactly 8 GiB and accepts trimmed decimal boundaries", () => {
+    assert.equal(loadConfig(baseEnv()).recoveryDecodedLimitBytes, 8589934592);
+    for (const [value, expected] of [["1", 1], [" 0004096 ", 4096], ["8589934592", 8589934592], ["68719476736", 68719476736]] as const) {
+      assert.equal(loadConfig(baseEnv({ UZI_RECOVERY_DECODED_LIMIT_BYTES: value })).recoveryDecodedLimitBytes, expected);
+    }
+  });
+  it("rejects all invalid forms without echoing input", () => {
+    for (const value of ["", " ", "\t\n", "bad", "1.5", "1e3", "+1", "-1", "0", "000", "NaN", "Infinity", "-Infinity", "9007199254740992", "68719476737", "1_000", "0x10", "1 2", "9".repeat(400)]) {
+      assert.throws(() => loadConfig(baseEnv({ UZI_RECOVERY_DECODED_LIMIT_BYTES: value })), {
+        message: "UZI_RECOVERY_DECODED_LIMIT_BYTES must be decimal bytes in the range 1..68719476736",
+      });
+    }
+  });
+  it("reads the environment cap once", () => {
+    let reads = 0;
+    const env = baseEnv();
+    Object.defineProperty(env, "UZI_RECOVERY_DECODED_LIMIT_BYTES", { get: () => { reads++; return "4096"; } });
+    assert.equal(loadConfig(env).recoveryDecodedLimitBytes, 4096);
+    assert.equal(reads, 1);
+  });
+});
+
 describe("cross-check lane config", () => {
   it("defaults to one and accepts explicit zero through sixteen independently of run/chat caps", () => {
     assert.equal(loadConfig(baseEnv()).crossCheckSlots, 1);
