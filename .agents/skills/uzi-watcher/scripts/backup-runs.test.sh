@@ -950,6 +950,21 @@ rc="$(backup_rc "$D_ME" completed-1)"
 [ "$rc" -eq 0 ] || fail "marker-e ledger: exit $rc, want 0"
 tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
   || fail "marker-e ledger: a ledger attempt displaced the marker-named canonical"
+# A journal-current on-branch attempt of the terminal run is ignored too: the marker
+# canonical wins (kills a mutation of the terminal-mode journal/ledger clearing).
+reset_layout
+make_clone "$CANON" agent/issue-4242 kept-canon
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal completed-1 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" completed-1 "$RB/issue-4242.attempt-$A2" live
+stopped_marker completed-1 agent/issue-4242 issue-4242 "$CANON"
+D_ME2="$WORK/out.marker-e2"
+rc="$(backup_rc "$D_ME2" completed-1)"
+[ "$rc" -eq 0 ] || fail "marker-e journal-current: exit $rc, want 0"
+tar -xOzf "$D_ME2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
+  || fail "marker-e journal-current: marker canonical not captured; log: $(cat "$D_ME2/latest-attempt/backup.log")"
+tar -xOzf "$D_ME2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+live-attempt' \
+  && fail "marker-e journal-current: the journal-current attempt was captured for a terminal run"
 echo "PASS marker-e: completed run captures the marker-named canonical; journal alone stays status-only"
 
 echo "ALL PASS"

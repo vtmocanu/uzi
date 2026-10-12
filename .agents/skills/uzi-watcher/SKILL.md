@@ -485,7 +485,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   A `failed` run bound to a worker is captured while its clone or owned tracking ref
   survives (recovery custody can keep an ephemeral worker alive), else `SNAP`; a search
   that could not complete (a kubectl listing or exec failed) is `FAIL`, never `SNAP`;
-  `completed` and `cancelled` runs are always `SNAP`.
+  `completed` and `cancelled` runs are captured when an exact protected descriptor or a
+  matching stopped marker names a surviving source, else `SNAP`.
   Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the

@@ -155,6 +155,7 @@ interface Rig {
   served: Promise<void>;
   quiesceRequests: QuiesceRunRequest[];
   holdsCalls: string[];
+  ownershipCalls: string[];
 }
 
 function shortDir(prefix = "rso-"): string {
@@ -185,6 +186,7 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
   instrumentGit(events);
   const quiesceRequests: QuiesceRunRequest[] = [];
   const holdsCalls: string[] = [];
+  const ownershipCalls: string[] = [];
   const runner = new RunRunner({} as unknown as WorkerClient, git, () => ({ executor: {} as never }), nullLogger(), 20, undefined, {
     pollMs: 5,
     quiesceRun: async (req) => {
@@ -225,6 +227,7 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
       },
       getRunOwnership: async (runId: string) => {
         events.push("ownership_read");
+        ownershipCalls.push(runId);
         return o.ownership ? o.ownership(runId) : { status: "completed", claim_generation: 1 };
       },
     },
@@ -235,7 +238,7 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
   const served = server.serve(ac.signal);
   await server.ready;
   return {
-    server, gate, runner, events, sock: server.path, dataDir, idle, served, quiesceRequests, holdsCalls,
+    server, gate, runner, events, sock: server.path, dataDir, idle, served, quiesceRequests, holdsCalls, ownershipCalls,
     abort: async () => { ac.abort(); await served; },
   };
 }
@@ -829,6 +832,7 @@ describe("inspect", () => {
     assert.equal(aggregate.sources.length, 1);
     assert.equal(aggregate.sources[0].disposition, undefined, "an aggregate view has no per-run disposition");
     assert.equal(rig.holdsCalls.length, 1, "holds are read only for a selected run");
+    assert.deepEqual(rig.ownershipCalls, [a.runId], "inspect reads ownership for the selected run only");
   });
 
   it("a failed holds read is unknown with no disposition", async () => {
@@ -938,6 +942,8 @@ describe("a canonical source left under its plain journal, through the real sock
     assert.equal(fs.existsSync(c.path), false);
     assert.equal(journalRaw(c.branch), "");
     assert.equal(rig.gate.claimsClosed(), false);
+    assert.ok(rig.ownershipCalls.length >= 2, "ownership was read on inspect and on discard");
+    assert.deepEqual([...new Set(rig.ownershipCalls)], [c.runId], "ownership is read only for the selected run");
   });
 
   it("a 404 from the ownership probe (a run this worker does not hold) keeps the leftover: inspect and discard refuse and delete nothing", async () => {

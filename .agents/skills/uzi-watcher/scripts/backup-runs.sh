@@ -61,11 +61,13 @@
 #   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
 # A failed run with a worker binding is captured like an active one while its clone or
 # owned tracking ref survives; once that source is gone it is status-only (SNAP).
-# Completed and cancelled runs capture exact protected sources when present;
-# otherwise they are status-only.
+# Completed and cancelled runs capture an exact protected source when one is present,
+# or the kept canonical clone named by a matching uzi-stopped marker; otherwise they
+# are status-only.
 # Exit: 0 when every active target produced a verified recovery artifact (terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
-# surviving source could not be captured intact; 2 for bad usage.
+# surviving source could not be captured intact, or a completed/cancelled run's
+# uzi-stopped marker is unparseable (inconclusive search); 2 for bad usage.
 set -u
 
 KUBECTL="${UZI_KUBECTL:-kubectl}"
@@ -441,10 +443,15 @@ select_clone(){
     git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
   probe_absent "$rc" || ledger=""
   # Stopped-source markers (uzi-stopped.<runId>.entry, appended with --add). Each value
-  # must be a marker of the worker's exact shape (agent/src/git.ts parseStoppedMarker):
-  # anything else is unreadable evidence, not absence. A well-formed marker for another
-  # run, branch, key or non-canonical path is skipped; a match names the key's
+  # must pass the jq check below: the exact key set plus the field types/shapes it lists,
+  # a subset of agent/src/git.ts parseStoppedMarker (it does not validate `at` as a date,
+  # the 4096-byte cap, the per-run cap, or the branch/key format). Anything failing that
+  # check is unreadable evidence, not absence. Identity is pinned by runId, branch, key
+  # and the constructed canonical path, not by that check. A well-formed marker for
+  # another run, branch, key or non-canonical path is skipped; a match names the key's
   # canonical clone as a retained candidate.
+  # A marker schema change (version bump) must update this validator first: an
+  # unrecognised value makes the pod's search inconclusive.
   rc=0
   stopped="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --local --no-includes --get-all "uzi-stopped.$rid.entry")" || rc=$?
