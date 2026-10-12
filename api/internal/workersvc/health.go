@@ -1083,7 +1083,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		slog.Error("health: read current worker eligibility", "run_id", r.ID, "error", eligibilityErr)
 	} else if reason := rollWaitReason(now, eligibility); reason != "" {
 		return reason
-	} else if eligibility.DrainingEligible > 0 && eligibility.NonDrainingEligible == 0 && eligibility.SuitableOwnDraining == 0 {
+	} else if DrainOnlyEligibleForHealth(eligibility) {
 		return ReasonWorkersUpgrading
 	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)

@@ -218,6 +218,7 @@ func TestHealthPacingDrainOnlyLiveDB(t *testing.T) {
 		{"replacement-gap", "active", PhaseRolling, false, false, false},
 		{"offline-replacement", "active", PhaseSettled, true, false, false},
 		{"drain-and-offline-replacement", "active", PhaseSettled, false, true, false},
+		{"drain-and-unreported-offline", "active", PhaseSettled, false, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)
@@ -237,15 +238,20 @@ func TestHealthPacingDrainOnlyLiveDB(t *testing.T) {
 			if tc.mixed {
 				peer := e.seedHeartbeatWorker(t, nil)
 				e.exec(t, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base',capabilities='{gpu}',status='offline',last_heartbeat_at=$2 WHERE id=$1", peer, now.Add(-time.Hour))
-				if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: peer, Kind: "fleet", Phase: PhaseRolling, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: "active", TargetImage: "repo:new"}}); err != nil {
-					t.Fatal(err)
+				if tc.name != "drain-and-unreported-offline" {
+					if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: peer, Kind: "fleet", Phase: PhaseRolling, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: "active", TargetImage: "repo:new"}}); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run))
 			if tc.legacy && got != ReasonWorkersUpgrading {
 				t.Fatalf("active drain-only exemption lost: %q", got)
 			}
-			if !tc.legacy && !strings.Contains(got, "worker roll") {
+			if tc.name == "drain-and-unreported-offline" && got == ReasonWorkersUpgrading {
+				t.Fatalf("unreported suitable offline peer restored drain exemption: %q", got)
+			}
+			if !tc.legacy && tc.name != "drain-and-unreported-offline" && !strings.Contains(got, "worker roll") {
 				t.Fatalf("replacement/held wait incorrectly exempted: %q", got)
 			}
 			svc.healthSettings = defaultHealthSettings()

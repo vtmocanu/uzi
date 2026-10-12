@@ -171,6 +171,41 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		return c
 	}
 
+	var (
+		failed          int
+		anyFreshSignal  bool
+		stuckSince      time.Time
+		haveStuckSince  bool
+		blockingReason  string
+		blockingCont    string
+		targetTag       string
+		firstStuckName  string
+		haveStuckWorker bool
+	)
+	for _, w := range hosted {
+		signalFresh := w.RollPhase.Valid && w.RollPhase.String != "" &&
+			w.RollObservedAt.Valid && now.Sub(w.RollObservedAt.Time) <= rollSignalTTL
+		if signalFresh {
+			anyFreshSignal = true
+		}
+		if signalFresh && w.RollPhase.String == workersvc.PhaseStuck {
+			failed++
+			if !haveStuckWorker {
+				haveStuckWorker = true
+				firstStuckName = w.Worker.Name
+				blockingReason = w.RollBlockingReason.String
+				blockingCont = w.RollBlockingContainer.String
+				targetTag = w.RollWorkerImageTag.String
+			}
+			// Oldest phase_since across the stuck workers is the best "since" the source
+			// carries (for a stuck pod it is the pod creation time, not the transition).
+			if w.RollPhaseSince.Valid && (!haveStuckSince || w.RollPhaseSince.Time.Before(stuckSince)) {
+				stuckSince = w.RollPhaseSince.Time
+				haveStuckSince = true
+			}
+		}
+	}
+
 	// Pacing has its own API receipt. A readiness report cannot renew a hold.
 	var pacing *workersvc.PacingReport
 	var pacingID uuid.UUID
@@ -226,6 +261,15 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		if pacing.State == "override" {
 			c.Summary = fmt.Sprintf("Worker roll override to %s: pacing protection bypassed; retained capacity is at risk.", safe(pacing.TargetImage))
 		}
+		// Pacing adds containment details; it cannot lower the existing
+		// all-workers-stuck danger signal or suppress its instance alerts.
+		if failed == len(hosted) {
+			c.Severity = sevDanger
+			c.Summary = fmt.Sprintf("Worker roll %s at %s: %s. All %d hosted workers are stuck.", pacing.State, safe(pacing.TargetImage), cause, failed)
+			if haveStuckSince {
+				c.Since = sincePtr(stuckSince)
+			}
+		}
 		keys := make([]string, 0, len(retained))
 		for key := range retained {
 			keys = append(keys, key)
@@ -241,41 +285,6 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 			{Label: "Retained image / version coverage", Value: safe(strings.Join(coverage, "; "))},
 		}
 		return c
-	}
-
-	var (
-		failed          int
-		anyFreshSignal  bool
-		stuckSince      time.Time
-		haveStuckSince  bool
-		blockingReason  string
-		blockingCont    string
-		targetTag       string
-		firstStuckName  string
-		haveStuckWorker bool
-	)
-	for _, w := range hosted {
-		signalFresh := w.RollPhase.Valid && w.RollPhase.String != "" &&
-			w.RollObservedAt.Valid && now.Sub(w.RollObservedAt.Time) <= rollSignalTTL
-		if signalFresh {
-			anyFreshSignal = true
-		}
-		if signalFresh && w.RollPhase.String == workersvc.PhaseStuck {
-			failed++
-			if !haveStuckWorker {
-				haveStuckWorker = true
-				firstStuckName = w.Worker.Name
-				blockingReason = w.RollBlockingReason.String
-				blockingCont = w.RollBlockingContainer.String
-				targetTag = w.RollWorkerImageTag.String
-			}
-			// Oldest phase_since across the stuck workers is the best "since" the source
-			// carries (for a stuck pod it is the pod creation time, not the transition).
-			if w.RollPhaseSince.Valid && (!haveStuckSince || w.RollPhaseSince.Time.Before(stuckSince)) {
-				stuckSince = w.RollPhaseSince.Time
-				haveStuckSince = true
-			}
-		}
 	}
 
 	if !anyFreshSignal {

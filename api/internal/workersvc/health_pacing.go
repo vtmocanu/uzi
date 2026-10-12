@@ -43,3 +43,12 @@ func rollWaitReason(now time.Time, counts store.CountOnlineWorkersClaimableForRu
 	}
 	return fmt.Sprintf("waiting for worker roll (%s) to %s: %s", p.State, p.TargetImage, reason)
 }
+
+// DrainOnlyEligibleForHealth retains the legacy eligibility predicate when no
+// fresh pacing is available. Once pacing identifies a roll, every suitable
+// provider must be a healthy active drainer before the upgrade exemption applies.
+// Callers independently validate the stored reason and finite overlap timestamps.
+func DrainOnlyEligibleForHealth(counts store.CountOnlineWorkersClaimableForRunRow) bool {
+	return counts.DrainingEligible > 0 && counts.NonDrainingEligible == 0 && counts.SuitableOwnDraining == 0 &&
+		(counts.DiagnosticRolling == 0 || counts.DiagnosticDrainingOnly == counts.DiagnosticSuitable)
+}

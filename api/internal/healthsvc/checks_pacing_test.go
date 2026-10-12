@@ -44,9 +44,29 @@ func TestFleetHeldPacingCoverage(t *testing.T) {
 		t.Fatalf("stale %+v", check)
 	}
 	one.RollPacingObservedAt.Time = now
+	one.RollPhase.String = workersvc.PhaseSettled
 	one.RollPacing = []byte(`{"state":"override","target_image":"repo:bad"}`)
 	check = s.checkFleetRoll(now, []store.ListAllWorkersRow{one}, true)
 	if check.Severity != sevWarn || !strings.Contains(check.Summary, "at risk") {
 		t.Fatalf("override %+v", check)
+	}
+}
+
+func TestFleetPacingPreservesAllStuckDanger(t *testing.T) {
+	for _, state := range []string{"held", "override"} {
+		for _, size := range []int{1, 3} {
+			workers := make([]store.ListAllWorkersRow, 0, size)
+			for i := 0; i < size; i++ {
+				row := hostedRow("failed", workersvc.PhaseStuck, 0, "ImagePullBackOff", "agent", "bad")
+				row.Worker.ID = uuid.New()
+				row.RollPacing = []byte(`{"state":"` + state + `","target_image":"repo:bad"}`)
+				row.RollPacingObservedAt = pgtype.Timestamptz{Time: fixedNow, Valid: true}
+				workers = append(workers, row)
+			}
+			check := New(Config{HostedWorkerVersion: "bad"}).checkFleetRoll(fixedNow, workers, true)
+			if check.Severity != sevDanger || !strings.Contains(check.Summary, "ImagePullBackOff") {
+				t.Fatalf("state=%s size=%d suppressed fleet failure: %+v", state, size, check)
+			}
+		}
 	}
 }
