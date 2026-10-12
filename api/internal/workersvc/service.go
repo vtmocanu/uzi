@@ -4069,9 +4069,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
-	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
-	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
-	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
+	// legacy untyped park). forge_unreachable and provider_outage use dedicated park
+	// transactions below; provider_outage carries its own streak accounting (PRD #1733).
+	// empty_turn remains reserved (D9) and takes the ordinary untyped park, which writes
+	// cause NULL. vault_locked (issue #1766 M2) takes the same
 	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
 	// own counted park transaction; disk_park_preventive is valid only alongside it.
 	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable &&

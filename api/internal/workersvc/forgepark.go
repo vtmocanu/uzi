@@ -17,9 +17,10 @@ import (
 // matching migration 00232's runs_recovery_wait_cause_check. SetState validates a non-nil
 // cause against this set BEFORE any state SQL, so an unknown value is a 400 rather than a
 // constraint violation at the park write. NULL (an absent cause) is the LEGACY/untyped park
-// and is not a member here — the empty-turn park writes NULL. Only 'forge_unreachable' drives
-// the dedicated park transaction today; 'empty_turn'/'provider_outage' are reserved (D9,
-// #1088 adopts provider_outage) and, if reported, take the ordinary untyped park. Issue #1766
+// and is not a member here — the empty-turn park writes NULL. 'forge_unreachable' and
+// 'provider_outage' use dedicated park transactions; provider parks have their own streak
+// accounting and owner hold (PRD #1733). 'empty_turn' remains reserved (D9) and, if reported,
+// takes the ordinary untyped park. Issue #1766
 // M2: 'vault_locked' (migration 00257) is reported by a worker whose codex refresh/release was
 // answered 409 vault_locked (the owner's vault is locked); it takes the ordinary park too, but
 // it is the ONE cause that park persists (recoveryCauseStored), so the surfaces can say "waiting

@@ -820,7 +820,8 @@ type RunDTO struct {
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; the run resumes at its next retry, see DiskParkCount);
-	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
+	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
@@ -1632,7 +1633,8 @@ type RunSummaryItemDTO struct {
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; the run resumes at its next retry, see DiskParkCount);
-	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
+	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`

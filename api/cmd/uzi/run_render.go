@@ -130,6 +130,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if line := codexAccountActionLine(r); line != "" {
 		rows = append(rows, []string{"CODEX_ACCOUNT", line})
 	}
+	if line := providerParkLine(r); line != "" {
+		rows = append(rows, []string{"PROVIDER", line})
+	}
 	// VAULT (issue #1766): a vault_locked park, emit-only-when-parked, with its next retry.
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
@@ -484,13 +487,18 @@ func completionRows(r apitypes.RunDTO) [][]string {
 // The milestone clause is dropped when the run carries no frozen milestones (a prompt-kind park),
 // and the extend clause rides ONLY the wall park (a completion hold resumes through its own
 // decision, not by extending the clock). hold_reason is unconstrained text on the wire, so an
-// UNRECOGNISED value (a newer server than this binary) is passed through sanitizeTTY as a neutral
+// UNRECOGNISED value (a newer server than this binary) is passed through cellText as a neutral
 // label rather than dropped — the same terminal-safety obligation the HOLD_CONTEXT row above
 // carries — so a future hold still surfaces honestly instead of vanishing.
 //
 // It takes now so the parked-since clock unit-tests deterministically, matching pausedSummary.
 func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	if r.HoldReason == nil || *r.HoldReason == "" {
+		return nil
+	}
+	// Resume retains this marker through queued/claimed until the running report.
+	// Only the paused state is still an owner hold.
+	if *r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r) {
 		return nil
 	}
 	clauses := []string{holdReasonLabel(*r.HoldReason), holdParkedClause(r, now)}
@@ -502,14 +510,14 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
 		clauses = append(clauses, credentialDisabledAction(r))
+	case holdProviderUnavailable:
+		clauses = append(clauses, providerHoldAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
 
-// holdReasonLabel maps a run.HoldReason to its human label for the HOLD row. The two known
-// values get the same words every #1497 surface uses; an unrecognised value (a newer server)
-// is passed through sanitizeTTY so a future hold reads as its raw-but-terminal-safe reason
-// rather than being dropped or trusted.
+// holdReasonLabel maps known holds to human labels. cellText folds controls and newlines
+// in unknown reasons so a newer server still gets one terminal-safe notice.
 func holdReasonLabel(reason string) string {
 	switch reason {
 	case holdBudgetExhausted:
@@ -518,8 +526,10 @@ func holdReasonLabel(reason string) string {
 		return "completion blocked"
 	case holdCredentialDisabled:
 		return "credential disabled"
+	case holdProviderUnavailable:
+		return "provider unavailable"
 	default:
-		return sanitizeTTY(reason)
+		return cellText(reason)
 	}
 }
 
@@ -573,6 +583,8 @@ func pausedHoldNotice(r apitypes.RunDTO) string {
 		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
 	case holdCredentialDisabled:
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	case holdProviderUnavailable:
+		return "held, provider unavailable; " + providerHoldAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -2268,6 +2280,53 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 		s += " (credential disabled)"
 	}
 	return s
+}
+
+// providerParkLine is CLI retry wording; shared TUI glyphs remain unchanged.
+func providerParkLine(r apitypes.RunDTO) string {
+	if r.Status != statusRecoveryWait || strOr(r.RecoveryWaitCause, "") != providerOutageCause {
+		return ""
+	}
+	start, retry := "unknown", "unknown"
+	if r.ProviderParkStreakStartedAt != nil {
+		start = r.ProviderParkStreakStartedAt.Format(time.RFC3339)
+	}
+	if r.RecoveryRetryNotBefore != nil {
+		retry = r.RecoveryRetryNotBefore.Format(time.RFC3339)
+	}
+	return "provider outage; counted parks: " + itoa(r.ProviderParkCount) + "; streak started: " + start + "; next retry: " + retry
+}
+
+func isProviderUnavailableHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdProviderUnavailable
+}
+
+// providerCommandID keeps command hints single-line and shell-inert even for malformed IDs.
+// Valid opaque IDs retain their familiar unquoted spelling; other values are quoted.
+func providerCommandID(id string) string {
+	id = cellText(id)
+	if id != "" && !strings.HasPrefix(id, "-") && strings.IndexFunc(id, func(c rune) bool {
+		return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_')
+	}) == -1 {
+		return id
+	}
+	return "'" + strings.ReplaceAll(id, "'", "'\\''") + "'"
+}
+
+func providerHoldAction(r apitypes.RunDTO) string {
+	id := providerCommandID(r.ID)
+	action := "waiting for the owner; no automatic retry deadline; issue lock and worker affinity retained; clone and session files kept on the worker; recovery depends on the worker or a verified recovery copy; owner Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id
+	done, total, _ := milestoneProgress(r)
+	if r.CanStopAtProviderHold {
+		return action + "; Stop: uzi run scope " + id + " --through " + itoa(done) + "; then, only if scope succeeds, Resume: uzi run resume " + id
+	}
+	reason := "server does not permit Stop (including interactive or otherwise refused runs)"
+	if r.Kind != "issue" || total == 0 {
+		reason = "non-milestone issue run"
+	} else if done == 0 {
+		reason = "no completed milestone"
+	}
+	return action + "; Stop unavailable: " + reason
 }
 
 // forgeParkLine is the shared "waiting for the forge, retry at HH:MM (N of MAX)" wording
