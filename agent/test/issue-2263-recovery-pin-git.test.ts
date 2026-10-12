@@ -454,6 +454,8 @@ it("non-bare sibling refuses complete attribution", async () => {
 for (const symbolic of [false, true]) it("prepared cleanup inside supervised boundary, symbolic race=" + symbolic, async () => {
   let active = 0;
   let transaction = false;
+  let lastProbeTimeout: number | undefined;
+  const violations: string[] = [];
   const timeouts: number[] = [];
   const spawner: BoundaryProcessSpawner = async request => {
     if (request.argv.includes("update-ref") && request.argv.includes("--stdin")) {
@@ -462,9 +464,17 @@ for (const symbolic of [false, true]) it("prepared cleanup inside supervised bou
     }
     // Probes keep the plain 30 s deadline; only the update-ref transaction adds the 5 s abort grace backstop.
     if (request.argv.includes("update-ref") && request.argv.includes("--stdin")) {
-      assert.ok(request.timeoutMs && request.timeoutMs > 30_000 && request.timeoutMs <= 35_000, "transaction timeout " + request.timeoutMs);
+      // Load-insensitive: the transaction's budget is the remaining deadline plus the grace, so it must
+      // exceed the (decaying) budget of the probe that ran just before it, however slow earlier probes were.
+      // Recorded, not asserted here: an assertion thrown inside the spawner is swallowed by the cleanup's own
+      // failure handling and would leave the symbolic-race case (which expects a retain anyway) green.
+      if (lastProbeTimeout === undefined) violations.push("no probe precedes the transaction");
+      else if (!(request.timeoutMs && request.timeoutMs > lastProbeTimeout && request.timeoutMs <= 35_000)) {
+        violations.push("transaction timeout " + request.timeoutMs + " vs preceding probe " + lastProbeTimeout);
+      }
     } else {
-      assert.ok(request.timeoutMs && request.timeoutMs > 0 && request.timeoutMs <= 30_000, "probe timeout " + request.timeoutMs);
+      if (!(request.timeoutMs && request.timeoutMs > 0 && request.timeoutMs <= 30_000)) violations.push("probe timeout " + request.timeoutMs);
+      lastProbeTimeout = request.timeoutMs;
     }
     timeouts.push(request.timeoutMs!);
     const child = spawn(request.argv[0]!, request.argv.slice(1), {
@@ -484,6 +494,7 @@ for (const symbolic of [false, true]) it("prepared cleanup inside supervised bou
   };
   const result = await cache.withBoundaryProcessSpawner(spawner, new AbortController().signal, () => cleanup());
   assert.equal(transaction, true);
+  assert.deepEqual(violations, []);
   assert.ok(timeouts.length > 0);
   assert.equal(active, 0, "all supervised children completed before cleanup returned");
   if (symbolic) {

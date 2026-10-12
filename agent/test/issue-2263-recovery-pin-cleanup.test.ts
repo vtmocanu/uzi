@@ -192,6 +192,44 @@ for (const mode of ["boot", "live"] as const) it(`${mode}: a recreated exact pin
   assert.equal(present(9), true);
 });
 
+for (const mode of ["boot", "live"] as const) it(`${mode}: a pin recreated after deletion is deleted by a restarted (fresh) coordinator, with no journal update in between`, async () => {
+  const record = await journal();
+  archive.uploadError = undefined;
+  await coord(withoutCleanup()).captureAndUpload({ record, barePath: bare, defaultBranch: "main" });
+  await retry(coord(), mode);
+  assert.equal(present(4), false, "first process deleted the pin");
+  const bytes = await fs.readFile(file(record));
+  // The runner re-anchors the exact pin; the process then dies before anything is journaled.
+  assert.equal(await cache.anchorRecoveryHead(bare, RUN, 4, sha), true);
+  assert.equal(present(4), true);
+  assert.deepEqual(await fs.readFile(file(record)), bytes, "no journal write after recreation");
+  infos.length = 0;
+  const restarted = coord(); // fresh process: empty in-memory attempt/backoff state
+  if (mode === "boot") {
+    const snapshot = await restarted.snapshotBootRecords();
+    await restarted.resumePending(undefined, snapshot);
+  } else {
+    await retry(restarted, "live");
+  }
+  assert.equal(present(4), false, "the restarted coordinator deletes the recreated pin");
+  assert.equal(present(9), true);
+  assert.deepEqual(cleanupLogs(infos).map(l => (l.fields as { state: string }).state), ["deleted"]);
+  assert.deepEqual(await fs.readFile(file(record)), bytes);
+});
+
+for (const mode of ["boot", "live"] as const) it(`${mode}: an already-uploaded self-contained record without recoveryPinBareDir or bareDir loses its surviving pin via discovery`, async () => {
+  const uploaded = await survivor();
+  const { recoveryPinBareDir: _p, bareDir: _b, ...old } = uploaded;
+  await raw(old);
+  const bytes = await fs.readFile(file(old as RecoveryRecord));
+  assert.equal(present(4), true, "pre-upgrade + crash: the pin survived");
+  await retry(coord(), mode); // fresh coordinator
+  assert.equal(present(4), false, "found under the repos root and deleted");
+  assert.equal(present(9), true);
+  assert.deepEqual(cleanupLogs(infos).map(l => (l.fields as { state: string }).state), ["deleted"]);
+  assert.deepEqual(await fs.readFile(file(old as RecoveryRecord)), bytes);
+});
+
 it("retains and warns when the archive proof does not hold (not self-contained)", async () => {
   const record = await journal();
   archive.uploadError = undefined;
@@ -386,13 +424,24 @@ it("quarantine latched at capture retains; unlatched later pass cleans", async (
   await retry(coord(), "boot");
   assert.equal(present(4), false);
 });
-for (const mode of ["boot", "live"] as const) it(`quarantine latched before a ${mode} pass keeps the pin`, async () => {
+it("boot: quarantine latched before the pass retains quarantined at the cleanup check, and cleans once unlatched", async () => {
   await survivor();
   latchResidueQuarantine({ cause: "c", runId: RUN, site: "terminal_drive" }, nullLogger());
-  await retry(coord(), mode);
+  await retry(coord(), "boot");
   assert.equal(present(4), true);
+  assert.deepEqual(retainedReasons(), ["quarantined"], "boot reaches the cleanup check, which refuses");
   resetResidueQuarantineForTests();
-  await retry(coord(), mode);
+  await retry(coord(), "boot");
+  assert.equal(present(4), false, "cleaned once the latch is gone");
+});
+it("live: quarantine latched before the pass is skipped by resumeLive's quarantine early return, and cleans once unlatched", async () => {
+  await survivor();
+  latchResidueQuarantine({ cause: "c", runId: RUN, site: "terminal_drive" }, nullLogger());
+  await retry(coord(), "live");
+  assert.equal(present(4), true);
+  assert.deepEqual(retainedReasons(), [], "the early return never reaches the cleanup check");
+  resetResidueQuarantineForTests();
+  await retry(coord(), "live");
   assert.equal(present(4), false, "cleaned once the latch is gone");
 });
 
@@ -452,8 +501,20 @@ for (const mode of ["boot", "live"] as const) it(`${mode}: an aborted budget whi
   const holding = holder.withJournalLock(RUN, async () => { held(); await gate; });
   await acquired;
   const stop = new AbortController();
-  const pass = retry(coord(), mode, stop.signal);
-  await new Promise(r => setTimeout(r, 100));
+  // Evidence the pass is queued on the journal lock: the abortable acquire registers its waiter
+  // synchronously inside this call, so aborting after `waiting` resolves can only cancel a queued waiter.
+  const passCoord = coord();
+  const pc = passCoord as unknown as { withJournalLock: <T>(run: string, fn: () => Promise<T>, signal?: AbortSignal) => Promise<T> };
+  const realLock = pc.withJournalLock.bind(passCoord);
+  let queued!: () => void;
+  const waiting = new Promise<void>(r => { queued = r; });
+  pc.withJournalLock = (run, fn, signal) => {
+    const result = realLock(run, fn, signal);
+    if (run === RUN && signal) queued();
+    return result;
+  };
+  const pass = retry(passCoord, mode, stop.signal);
+  await waiting;
   stop.abort();
   await pass; // must not throw
   release();
