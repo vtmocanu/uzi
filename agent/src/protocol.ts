@@ -2977,11 +2977,49 @@ export interface RecoveryReleaseResponse {
  *  the hold it took at that claim generation; a v1 worker omits it (settle by run+worker).
  *  The call sites that populate it are M2's — M1 only freezes the shape. */
 export interface RecoveryFinalDisposition {
-  kind: "archive" | "settled";
+  kind: "archive" | "settled" | "held_publication";
   capture_id?: string;
+  /** Issue #2545: the held publication's id (kind "held_publication" only). */
+  publication_id?: string;
   source_sha?: string;
   coverage_digest: string;
 }
+
+/** Issue #2545 step A: the api's answer to POST /api/worker/runs/{id}/held-publication. Mirrors
+ *  api/internal/apitypes/held_publication.go. ONLY `state === "created"` means the work is on the
+ *  forge at `tip`; every other state sends the worker to the archive path. */
+export interface HeldPublicationResponse {
+  publication_id: string;
+  ref: string;
+  tip: string;
+  state: string;
+  reason?: string;
+}
+
+/** Issue #2545 step B: the bounded reasons a held_publication FINAL may be retained with. Pinned to
+ *  fixtures/api-contract/recovery_held_final.reasons.json by client-held-publication.test.ts. */
+export const HELD_FINAL_RETAINED_REASONS = [
+  "held_publication_unsupported",
+  "held_publication_unavailable",
+  "held_publication_ref_missing",
+  "held_publication_ref_mismatch",
+  "held_publication_not_eligible",
+] as const;
+export type HeldFinalRetainedReason = (typeof HELD_FINAL_RETAINED_REASONS)[number];
+
+/** The retained reasons after which the worker clears its journaled held FINAL and falls back to the
+ *  archive. `held_publication_unavailable` (the forge could not be listed) is the one transient
+ *  reason: a held FINAL is never cleared for lack of fresh proof.
+ *  DEVIATION NOTE: the api fixture marks `held_publication_unsupported` non-definitive on the SERVER
+ *  side (its capability or switch may return); the worker still archives on it, because an archive
+ *  FINAL is always an available, safe disposition and waiting forever on a withdrawn feature would
+ *  strand the hold. */
+export const HELD_FINAL_FALLBACK_REASONS: ReadonlySet<string> = new Set([
+  "held_publication_unsupported",
+  "held_publication_ref_missing",
+  "held_publication_ref_mismatch",
+  "held_publication_not_eligible",
+]);
 
 export interface RecoveryReleaseRequest {
   final_disposition?: RecoveryFinalDisposition;

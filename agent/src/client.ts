@@ -28,6 +28,7 @@ import {
   type RawPrDescriptionFields,
   type ClaimRequest,
   type PublishResponse,
+  type HeldPublicationResponse,
   type PublishResult,
   type ChatClaimResponse,
   type ClaimResponse as ProtocolClaimResponse,
@@ -300,6 +301,30 @@ export interface InputReceipt {
 }
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
+/** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
+ *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
+ *  30 s of margin lets an answer written at the server's deadline still arrive. */
+export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
+
+/** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
+export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
+
+/** Issue #2545: a held_publication FINAL was requested but this client's negotiated features do not
+ *  include {@link HELD_PUBLICATION_FEATURE}. Thrown BEFORE anything is sent, so it is non-definitive:
+ *  the journaled FINAL stays and is replayed once the feature is back. */
+export class HeldFeatureUnavailableError extends Error {
+  constructor() {
+    super("held publication feature unavailable; held final release retained");
+    this.name = "HeldFeatureUnavailableError";
+  }
+}
+
+/** The typed outcome of {@link WorkerClient.publishHeld}. `ok: true` only means the api answered 2xx
+ *  with a well-formed body; the caller must still require `body.state === "created"`. */
+export type HeldPublishResult =
+  | { ok: true; body: HeldPublicationResponse }
+  | { ok: false; httpStatus?: number; reason: string };
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -1936,6 +1961,64 @@ export class WorkerClient {
     return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
+  /**
+   * Issue #2545 step A: upload one raw, non-thin pack of a failed run's held work; the api creates
+   * `refs/uzi-held/<run-id>/<generation>` at `tip` with the stored credential (the worker never
+   * sends one). Modeled on {@link publishCheckpoint}: the pack is the `application/octet-stream`
+   * body, the tip, generation and coverage digest ride the `X-Uzi-Held-*` headers.
+   *
+   * Never throws for an HTTP outcome: any non-2xx is `{ ok: false, httpStatus, reason }`, where
+   * `reason` is the api's bounded refusal token (a 409/422/413/503) or a local token such as
+   * `http_429`. A transport error or the {@link HELD_PUBLICATION_TIMEOUT_MS} timeout throws, and the
+   * caller treats a throw exactly like a refusal: nothing is on the forge until the answer says
+   * `created`. Without {@link HELD_PUBLICATION_FEATURE} nothing is sent (`unsupported_feature`).
+   */
+  async publishHeld(
+    runId: string,
+    generation: number,
+    tip: string,
+    coverage: string,
+    pack: Readable | Buffer,
+    signal?: AbortSignal,
+  ): Promise<HeldPublishResult> {
+    if (!this.hasFeature(HELD_PUBLICATION_FEATURE)) return { ok: false, reason: "unsupported_feature" };
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/held-publication`;
+    const timeout = AbortSignal.timeout(HELD_PUBLICATION_TIMEOUT_MS);
+    const init: RequestInit = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Held-Tip": tip,
+        "X-Uzi-Held-Generation": String(generation),
+        "X-Uzi-Held-Coverage": coverage,
+      },
+      body: pack as RequestInit["body"],
+      // undici requires `duplex: "half"` for a streamed (Readable) request body.
+      duplex: "half",
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    };
+    const res = await fetch(this.baseUrl + path, init);
+    const text = await res.text().catch(() => "");
+    if (res.status < 200 || res.status >= 300) {
+      let reason = `http_${res.status}`;
+      try {
+        const parsed = JSON.parse(text) as { reason?: unknown };
+        if (typeof parsed.reason === "string" && /^[a-z0-9_]{1,64}$/.test(parsed.reason)) reason = parsed.reason;
+      } catch { /* a non-JSON refusal keeps the status-derived token */ }
+      return { ok: false, httpStatus: res.status, reason };
+    }
+    let body: Partial<HeldPublicationResponse> | undefined;
+    try { body = JSON.parse(text) as Partial<HeldPublicationResponse>; } catch { body = undefined; }
+    if (!body || typeof body !== "object" || typeof body.publication_id !== "string" ||
+        typeof body.ref !== "string" || typeof body.tip !== "string" || typeof body.state !== "string" ||
+        (body.reason !== undefined && typeof body.reason !== "string")) {
+      return { ok: false, httpStatus: res.status, reason: "malformed_response" };
+    }
+    return { ok: true, body: body as HeldPublicationResponse };
+  }
+
   // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
   // The Bearer-authenticated worker↔API archive endpoints. Shapes are the M1-frozen
   // protocol types (agent/src/protocol.ts, mirrored from apitypes/recovery.go). The bundle
@@ -2077,6 +2160,11 @@ export class WorkerClient {
         throw new Error("final inventory release requires an exact positive safe generation");
       }
       if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; final release retained");
+      // Issue #2545: a held_publication FINAL names a ref on the forge; without the negotiated
+      // feature nothing is sent, and the typed error keeps the journaled FINAL (non-definitive).
+      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE)) {
+        throw new HeldFeatureUnavailableError();
+      }
       body.final_disposition = finalDisposition;
     }
     if (releaseEvidence !== undefined) body.release_evidence = releaseEvidence;

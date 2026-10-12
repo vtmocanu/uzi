@@ -24,7 +24,7 @@ import { constants, createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 
-import { RUN_KINDS } from "./protocol.js";
+import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS } from "./protocol.js";
 import { RequestError, isRunOwnershipLost } from "./client.js";
 import type { Logger } from "./log.js";
 import { residueQuarantine } from "./residue-quarantine.js";
@@ -204,6 +204,10 @@ export interface RecoveryOutcome {
   state: RecoveryLocalState;
   captureId: string;
   reason?: string;
+  /** Issue #2545: set only by a held_publication FINAL attempt. `acked` = the api released the hold
+   *  against the forge ref; `kept` = the journaled held FINAL stays (non-definitive); `fallback` = the
+   *  held FINAL was cleared (definitive refusal or a downgrade 400) and the caller must capture. */
+  held?: "acked" | "kept" | "fallback";
 }
 
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
@@ -714,6 +718,9 @@ export async function classifyUploadFailure(err: unknown, record?: RecoveryRecor
 // into the derived key keeps this MAC unusable for any other worker-token-keyed purpose.
 const JOURNAL_KEY_LABEL = "uzi-recovery-journal-v1";
 const JOURNAL_VERSION = 1 as const;
+
+/** A held publication id is the api's UUID (lowercase hex, hyphenated). */
+const HELD_PUBLICATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Stable, key-sorted JSON so the MAC is deterministic regardless of insertion order. Shared
  *  with the issue #1582 settlement journal (recovery-settlement.ts). */
@@ -1251,7 +1258,10 @@ export class RecoveryCoordinator {
         !(await this.inactiveInventory(record))) return;
     // Archive FINAL releases local custody only with positive, retained-byte evidence.
     // Settled FINAL has its own independently verified empty-inventory proof.
-    if (record.finalRequest?.disposition.kind !== "settled") {
+    // Issue #2545: a held_publication FINAL rests on the forge ref the api verified, not on retained
+    // archive bytes, so it needs no bundle; every other check below still applies to it.
+    const heldFinal = record.finalRequest?.disposition.kind === "held_publication";
+    if (record.finalRequest?.disposition.kind !== "settled" && !heldFinal) {
       if (record.selfContained !== true || !Array.isArray(record.prerequisiteShas) ||
           record.prerequisiteShas.length !== 0 || !record.bundlePath) return;
       try {
@@ -1311,7 +1321,7 @@ export class RecoveryCoordinator {
     // Validate the archive before both minting and replaying FINAL. A committed receipt
     // remains authoritative when its capture has expired or its status is unusable.
     let observedStatus: RecoveryCaptureStatusResponse | undefined;
-    if (record.finalRequest?.disposition.kind !== "settled") {
+    if (record.finalRequest?.disposition.kind !== "settled" && !heldFinal) {
       if (record.state !== "uploaded" || !record.serverCaptureId) return;
       try { observedStatus = await this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId); }
       catch { if (reconcile) return this.reconcileInventory(record, prove); return; }
@@ -1329,6 +1339,7 @@ export class RecoveryCoordinator {
       }));
     }
     const request = record.finalRequest!;
+    if (request.disposition.kind === "held_publication") return this.releaseHeldFinal(record, request, prove);
     // The journaled identity was frozen under the exact open guarded hold.
     // Publication proof was checked at minting; replay grants no reserve/upload authority.
     try {
@@ -1363,6 +1374,122 @@ export class RecoveryCoordinator {
     }
   }
 
+  /**
+   * Issue #2545: send the journaled held_publication FINAL and classify the answer.
+   *  - released exactly once: record the ACK and run the same local cleanup as an archive FINAL;
+   *  - retained with a definitive reason (the forge ref is gone or foreign, the hold is no longer
+   *    eligible, the api withdrew the feature) or a downgrade 400 from an api that does not know the
+   *    kind: clear the held request and report `fallback`, so the caller captures an archive;
+   *  - anything else (`held_publication_unavailable`, a transport error, an unreadable answer, a
+   *    client-side feature absence thrown before sending): keep the journaled request and the open
+   *    hold. A held FINAL is never cleared for lack of fresh proof.
+   * The caller holds the record's capture-cycle lock.
+   */
+  private async releaseHeldFinal(record: RecoveryRecord, request: NonNullable<RecoveryRecord["finalRequest"]>,
+    prove: () => Promise<boolean>): Promise<RecoveryOutcome | void> {
+    const kept = (reason?: string): RecoveryOutcome => ({ state: record.state, captureId: record.captureId,
+      ...(reason ? { reason } : {}), held: "kept" });
+    const clearHeld = async (why: string): Promise<RecoveryOutcome> => {
+      const cleared = await this.writeExistingRecord(record, cur =>
+        !cur.finalAcknowledged && canonicalJson(cur.finalRequest) === canonicalJson(request)
+          ? (() => { const next = { ...cur }; delete next.finalRequest; delete next.reason; return next; })()
+          : undefined);
+      if (cleared.finalRequest !== undefined) return kept(why);
+      this.log.warn("recovery: held publication final cleared; falling back to the archive", {
+        run_id: record.runId, generation: record.generation, reason: why });
+      return { state: cleared.state, captureId: cleared.captureId, reason: why, held: "fallback" };
+    };
+    try {
+      if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return kept();
+      if (!await prove() || !await this.inactiveInventory(record)) return kept();
+      if (residueQuarantine() !== undefined) return { ...quarantinedOutcome(record.captureId), held: "kept" };
+      const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
+      if (!ack || typeof ack !== "object") return kept("held_publication_unreadable_answer");
+      if (ack.retained === true) {
+        const reason = typeof ack.reason === "string" && (HELD_FINAL_RETAINED_REASONS as readonly string[]).includes(ack.reason)
+          ? ack.reason : undefined;
+        if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== false ||
+            ack.holds_released !== 0 || reason === undefined) return kept("held_publication_unreadable_answer");
+        if (HELD_FINAL_FALLBACK_REASONS.has(reason)) return await clearHeld(reason);
+        this.log.warn("recovery: held publication final retained by the api; exact request kept", {
+          run_id: record.runId, generation: record.generation, reason });
+        return kept(reason);
+      }
+      if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true || ack.holds_released !== 1) {
+        return kept("held_publication_unreadable_answer");
+      }
+      if (residueQuarantine() !== undefined) {
+        this.log.warn("recovery: held final release returned while the worker is quarantined; local evidence kept unacknowledged",
+          { run_id: record.runId, generation: record.generation });
+        return { ...quarantinedOutcome(record.captureId), held: "kept" };
+      }
+      await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
+      this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
+      await this.forgetGenerationWithinCycle(record.runId, record.generation!);
+      return { state: record.state, captureId: record.captureId, held: "acked" };
+    } catch (err) {
+      // 400 is the strict-decode refusal of an api that rolled back past this kind. Everything else
+      // (transport, timeout, 5xx, the typed client-side feature absence) proves nothing: keep.
+      if (err instanceof RequestError && err.status === 400) return await clearHeld("held_publication_downgrade_400");
+      this.log.warn("recovery: held publication final ACK pending; exact request retained", {
+        run_id: record.runId, generation: record.generation, error: errText(err) });
+      const cls = await classifyUploadFailure(err, record);
+      if (cls.kind === "credential") this.credentialBlockedAt = this.now();
+      return kept(cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason);
+    }
+  }
+
+  /**
+   * Issue #2545: journal and (when the run has stopped executing) send a held_publication FINAL for
+   * the frozen record whose `publicationId` the api created on the forge (step A answered `created`).
+   *
+   * The FINAL is MINTED here, under the exact open guarded hold, on the caller's local quiescence
+   * proof (the same proof `freezeInventory` accepts with `locallyQuiescent`): the record then carries
+   * the identity for a crash or a lost ACK to replay verbatim. It is SENT here only when this
+   * coordinator no longer sees the run executing; in a live flight the runner's source boundary
+   * would refuse the proof, so the journaled request is left for the live re-drive after execute().
+   *  - `acked`: the api released the hold against the forge ref; local cleanup ran.
+   *  - `kept`: the journaled held request and the open hold stay (pending, non-definitive).
+   *  - `fallback`: nothing held is journaled (it could not be minted, or the api definitively refused
+   *    and the request was cleared); the caller captures an archive on the SAME record.
+   * Never throws.
+   */
+  async releaseHeldPublication(record: RecoveryRecord, publicationId: string): Promise<"acked" | "kept" | "fallback"> {
+    if (!this.enabled || !HELD_PUBLICATION_ID_RE.test(publicationId)) return "fallback";
+    if (residueQuarantine() !== undefined) return "kept";
+    try {
+      return await runCaptureCycle(await this.cycleKey(record), "wait", async () => {
+        let latest = await this.readLatest(record);
+        if (latest.kind !== "ok") return "kept" as const;
+        let cur = latest.record;
+        if (cur.finalAcknowledged) return "acked" as const;
+        if (!cur.inventoryGuarded || !cur.coverageDigest || cur.captureId !== record.captureId ||
+            typeof cur.generation !== "number" || !this.client.hasFeature?.("recovery_inventory_v1")) return "fallback" as const;
+        if (cur.finalRequest && cur.finalRequest.disposition.kind !== "held_publication") return "kept" as const;
+        if (!cur.finalRequest) {
+          if (!(await this.openInventoryHold(cur)) || residueQuarantine() !== undefined) return "fallback" as const;
+          cur = await this.writeExistingRecord(cur, c => c.finalRequest || c.finalAcknowledged ? undefined : ({
+            ...c, finalRequest: { disposition: { kind: "held_publication", publication_id: publicationId,
+              source_sha: c.sourceSha, coverage_digest: c.coverageDigest! } },
+          }));
+          if (cur.finalRequest?.disposition.kind !== "held_publication") return "kept" as const;
+        }
+        // The replayed identity wins over a differing caller id: it is what the api may already hold.
+        if (this.isExecuting(cur.runId)) return "kept" as const;
+        const outcome = await this.finalizeInventory(cur, false);
+        if (outcome?.held) return outcome.held;
+        latest = await this.readLatest(cur);
+        if (latest.kind !== "ok") return "kept" as const;
+        if (latest.record.finalAcknowledged) return "acked" as const;
+        return latest.record.finalRequest?.disposition.kind === "held_publication" ? "kept" as const : "fallback" as const;
+      });
+    } catch (err) {
+      this.log.warn("recovery: held publication final not completed; custody retained", {
+        run_id: record.runId, generation: record.generation, error: errText(err) });
+      return "kept";
+    }
+  }
+
   /** One atomic reconciliation attempt; failures keep custody and every saved identity. */
   private async reconcileInventory(record: RecoveryRecord, prove: () => Promise<boolean>, status?: RecoveryCaptureStatusResponse): Promise<RecoveryOutcome | void> {
     if (!record.serverCaptureId || !record.coverageDigest || !record.generation ||
@@ -1386,9 +1513,14 @@ export class RecoveryCoordinator {
               typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
             (receipt.kind === "settled" && (receipt.capture_id !== undefined || receipt.source_sha !== undefined ||
               !["publication", "forge_no_output"].includes(response.release_evidence ?? ""))) ||
+            // Issue #2545: the api echoes a held receipt with its publication id; it is accepted only
+            // when it equals the saved request exactly (the equality below), never on its own.
+            (receipt.kind === "held_publication" && (receipt.capture_id !== undefined ||
+              typeof receipt.publication_id !== "string" || !HELD_PUBLICATION_ID_RE.test(receipt.publication_id) ||
+              typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
             canonicalJson(receipt) !== canonicalJson(saved.disposition) ||
             response.release_evidence !== saved.evidence ||
-            (receipt.kind !== "archive" && receipt.kind !== "settled")) return;
+            (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return;
         if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
@@ -1455,6 +1587,7 @@ export class RecoveryCoordinator {
     }
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged || !(await this.inactiveInventory(record))) return;
     if (record.finalRequest || record.state === "uploaded") {
+      const wasHeld = record.finalRequest?.disposition.kind === "held_publication";
       const outcome = await this.finalizeInventory(record);
       // An acknowledged FINAL forgets the generation, so its record may already be gone.
       try {
@@ -1463,7 +1596,9 @@ export class RecoveryCoordinator {
         if (err instanceof RecordGoneError && err.absent) return outcome;
         throw err;
       }
-      if (record.state !== "bundled" || record.finalRequest || record.finalAcknowledged) return outcome;
+      // Issue #2545: a held FINAL cleared by a definitive refusal continues into the capture below.
+      const heldCleared = wasHeld && !record.finalRequest && !record.finalAcknowledged;
+      if (!heldCleared && (record.state !== "bundled" || record.finalRequest || record.finalAcknowledged)) return outcome;
     }
     const barePath = record.bareDir && await this.git.resolveRecoveryBareDir?.(record.bareDir);
     if (!barePath) return;
@@ -1506,6 +1641,11 @@ export class RecoveryCoordinator {
         const probe = { runId: ctx.runId, generation: ctx.generation } as RecoveryRecord;
         if (!(await this.inactiveInventory(probe))) continue;
         const existing = await this.listRecords(ctx.runId);
+        // Issue #2545: a generation with a journaled held_publication FINAL has its identity fixed by
+        // that request. A second snapshot (it would differ in its original source) would only mint a
+        // redundant archive beside the held release, so the pending request is replayed instead.
+        if (existing.some(r => r.generation === ctx.generation && r.inventoryGuarded && !r.finalAcknowledged &&
+            r.finalRequest?.disposition.kind === "held_publication")) continue;
         const original = existing.find(r => r.generation === ctx.generation && !r.coverageDigest);
         const frozenContext = existing.find(r => r.generation === ctx.generation && r.coverageContext)?.coverageContext;
         // A generation has one stable snapshot authority even when its original roots
@@ -1606,9 +1746,14 @@ export class RecoveryCoordinator {
         return { state: "needs_action", captureId: record.captureId, reason: "inventory_hold_closed" };
       }
       if (record.finalRequest || record.state === "uploaded") {
+        const wasHeld = record.finalRequest?.disposition.kind === "held_publication";
         const finalOutcome = record.inventoryGuarded ? await this.finalizeInventory(record) : undefined;
         record = await this.requireRecord(record);
-        if (record.state !== "bundled" || record.finalRequest || record.finalAcknowledged) {
+        // Issue #2545: a held FINAL the api definitively refused is cleared by the replay above; the
+        // record then has no request and no bundle yet, and falls through to the archive capture
+        // below on this very pass.
+        const heldCleared = wasHeld && !record.finalRequest && !record.finalAcknowledged;
+        if (!heldCleared && (record.state !== "bundled" || record.finalRequest || record.finalAcknowledged)) {
           return finalOutcome ?? { state: record.state, captureId: record.captureId };
         }
       }
@@ -3370,7 +3515,13 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
     const req = obj.finalRequest as RecoveryRecord["finalRequest"];
     if (!record.coverageDigest || !req || !req.disposition ||
         req.disposition.coverage_digest !== record.coverageDigest ||
-        !["archive", "settled"].includes(req.disposition.kind)) return null;
+        !["archive", "settled", "held_publication"].includes(req.disposition.kind)) return null;
+    // Issue #2545: a held FINAL names the forge publication and the frozen source; it never carries
+    // an archive capture id and needs no bundle, so only these facts authenticate it.
+    if (req.disposition.kind === "held_publication" &&
+        (typeof req.disposition.publication_id !== "string" || !HELD_PUBLICATION_ID_RE.test(req.disposition.publication_id) ||
+         req.disposition.source_sha !== record.sourceSha || req.disposition.capture_id !== undefined ||
+         req.evidence !== undefined)) return null;
     if (req.disposition.kind === "archive" &&
         (req.disposition.capture_id !== record.serverCaptureId || req.disposition.source_sha !== record.sourceSha)) return null;
     if (req.disposition.kind === "settled" && (record.originalRoots?.length !== 0 ||

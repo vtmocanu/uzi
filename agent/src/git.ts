@@ -5611,10 +5611,19 @@ export class GitCache {
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string; extraFloors?: string[] } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string } = {},
   ): Promise<CheckpointRange | null> {
     try {
-      const tipSha = await this.trackingTip(barePath, branch);
+      // Issue #2545: a held publication names its tip explicitly (the frozen record's aggregate
+      // commit, which is no branch's tracking ref). It must resolve to itself as a commit; every
+      // floor rule below is unchanged.
+      let tipSha: string | null;
+      if (opts.tipSha !== undefined) {
+        tipSha = SHA40_RE.test(opts.tipSha) && (await this.revParse(barePath, `${opts.tipSha}^{commit}`)) === opts.tipSha
+          ? opts.tipSha : null;
+      } else {
+        tipSha = await this.trackingTip(barePath, branch);
+      }
       if (!tipSha) return null;
       const excludeRef = await this.checkpointExcludeRef(barePath, branch, tipSha);
       const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
@@ -5668,7 +5677,9 @@ export class GitCache {
    * Park/shutdown/pause/capture publishes are NOT scanned by design: the api pushes them UNSCANNED
    * to the forge's refs/uzi-checkpoints/<branch> (Service.Publish in
    * api/internal/workersvc/service.go) — they are the run's last chance to be durable, and a blocked or slow scan
-   * there would lose the work outright. This scan guards the frequent mid-run stream only.
+   * there would lose the work outright. This scan guards the frequent mid-run stream only, plus
+   * the ONE scanned exception: a failed run's held publication (issue #2545), which uploads
+   * work the worker would otherwise archive, so an untrusted result there simply archives instead.
    *
    * Same instrument discipline as the finalize {@link secretScanRange}: gitleaks' embedded default
    * ruleset via an explicit config, the three silencers disabled (`--ignore-gitleaks-allow`, the
@@ -5788,6 +5799,57 @@ export class GitCache {
       return untrusted("scan_untrusted", { error: gitErrorMessage(err) });
     } finally {
       await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Issue #2545 — does any commit of the SCANNED range author a change under `.github/workflows/`?
+   * The held publication is created with the stored credential, which may lack the forge's workflow
+   * scope, so such a range is archived rather than pushed. The revisions are exactly the scan's
+   * (`tip ^exclude ^floors`), so content already public is not counted.
+   *
+   * Each commit is judged by its OWN changes: a non-merge commit by a path-limited full-history
+   * walk, a merge by its contribution (`diff-tree -c`: only paths that differ from EVERY parent), so
+   * a branch that merely merged a newer default branch, or that is stale against it, is `clean`.
+   * `unknown` (a git error, the merge cap, the deadline) is treated as touching by the caller.
+   * Never throws.
+   */
+  async rangeTouchesWorkflows(
+    barePath: string,
+    range: CheckpointRange,
+    opts: { deadlineMs?: number } = {},
+  ): Promise<"touches" | "clean" | "unknown"> {
+    const floors = range.scanFloorShas ?? [];
+    if (!SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha) || floors.some((f) => !SHA40_RE.test(f))) {
+      return "unknown";
+    }
+    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => Math.max(1, deadlineAt - Date.now());
+    const revs = [range.tipSha, `^${range.excludeSha}`, ...floors.map((f) => `^${f}`)];
+    const pathspec = ["--", ".github/workflows"];
+    try {
+      const plain = await this.execScoped("git", withDir(barePath, [
+        "rev-list", "--no-merges", "--full-history", "--max-count=1", ...revs, ...pathspec,
+      ]), { env: gitEnv(), timeout: remaining(), maxBuffer: 4_096 });
+      if (plain.stdout.trim() !== "") return "touches";
+      const merged = await this.execScoped("git", withDir(barePath, ["rev-list", "--merges", ...revs]), {
+        env: gitEnv(), timeout: remaining(),
+      });
+      const merges = merged.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (merges.some((sha) => !SHA40_RE.test(sha)) || merges.length > CHECKPOINT_SCAN_MAX_MERGES) return "unknown";
+      for (const merge of merges) {
+        if (Date.now() >= deadlineAt) return "unknown";
+        const contribution = await this.execScoped("git", withDir(barePath, [
+          "diff-tree", "-c", "-r", "--name-only", "--no-commit-id", merge, ...pathspec,
+        ]), { env: gitEnv(), timeout: remaining(), maxBuffer: 64 * 1024 });
+        if (contribution.stdout.trim() !== "") return "touches";
+      }
+      return "clean";
+    } catch (err) {
+      this.log.warn("workflow-change probe failed; treating the range as touching workflows", {
+        bare: barePath, error: gitErrorMessage(err),
+      });
+      return "unknown";
     }
   }
 

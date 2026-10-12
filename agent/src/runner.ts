@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError } from "./recovery-closure.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
@@ -1716,7 +1716,21 @@ interface RunFlight {
   readonly claimGeneration: number;
   readonly owedDefaultBranch: string | undefined;
   owedContext: Promise<OwedCandidateContext> | undefined;
-  prepareTerminalInventory: () => Promise<void>;
+  /** `pending` names the terminal about to be sent, so a held-eligible failure can defer its archive
+   *  capture (issue #2545); omitted, the pass freezes and captures as before. */
+  prepareTerminalInventory: (pending?: PendingTerminal) => Promise<void>;
+  /** Issue #2545: the captureId of the frozen record whose archive capture was DEFERRED because the
+   *  pending terminal is a held-eligible failure. Every later settle on this generation runs on that
+   *  exact record and never re-freezes (a re-freeze after the send pins a different original source
+   *  and would mint a second record). */
+  heldDeferredCapture?: string;
+  /** Issue #2545: a `failed` terminal this flight sent and the server ACKed as failed, recorded at the
+   *  report choke point. The held step needs it: step A refuses a run the server has not failed. */
+  heldTerminal?: { status: "failed"; fail_origin?: string };
+  /** Issue #2545: the held step already ran once for this flight (it publishes at most once). */
+  heldAttempted?: boolean;
+  /** Issue #2545: the held FINAL was ACKed; the generation is released and cleaned up. */
+  heldAcked?: boolean;
   /** True once the latest {@link prepareTerminalInventory} proved this run's clone quiescent. The
    *  post-report terminal drive reuses that proof: it runs while execute() still holds the run's
    *  execution lane, so the coordinator's own executing check would otherwise reject the freeze. */
@@ -2000,8 +2014,20 @@ function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | 
   return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
 }
 
+/** Issue #2545: the terminal a settle is about to be followed by, as far as the held-publication
+ *  decision needs it. Only a `failed` terminal can defer its archive capture. */
+export interface PendingTerminal {
+  status?: string;
+  fail_origin?: string;
+}
+
+/** Issue #2545: the raw pack a held publication may upload, matching the api's cap on the route. */
+const HELD_PACK_MAX_BYTES = 64 * 1024 * 1024;
+
 /** issue #1597 M2: test-only seams for the mid-turn checkpoint tick and the scanned publish. */
 export interface CheckpointTestHooks {
+  /** Issue #2545: test-only override of the held-publication pack cap (production: 64 MiB). */
+  heldPackMaxBytes?: number;
   /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
   softDeadlineMs?: number;
   /** Test-only expiry control; omit deadlineAt for signal-driven expiry. Production keeps its real 10s budget. */
@@ -4484,7 +4510,7 @@ export class RunRunner {
       await beforeResolve?.();
       const deferred = admitted;
       if (deferred) await this.bindCompletionSource(flight);
-      else await flight.prepareTerminalInventory();
+      else await flight.prepareTerminalInventory({ status: body.status, fail_origin: body.fail_origin });
       const attempt = beginPublicationAttempt(body, deferred);
       try {
         const ack = await send(body);
@@ -4549,7 +4575,15 @@ export class RunRunner {
     const deferred = !!selected && this.eligiblePublicationCompletion(flight, selected) &&
       (preexistingPending || previouslyAttempted || admitted);
     if (deferred) await this.bindCompletionSource(flight);
-    if (!deferred && (installed.journaled || !("deferred" in installed))) await flight.prepareTerminalInventory();
+    // Issue #2545: the defer decision reads the durable first winner (`selected`), never this caller's
+    // own body, which may have lost the install to a different outcome.
+    if (!deferred && (installed.journaled || !("deferred" in installed))) {
+      const winner = selected as { status?: unknown; fail_origin?: unknown } | undefined;
+      await flight.prepareTerminalInventory(winner ? {
+        ...(typeof winner.status === "string" ? { status: winner.status } : {}),
+        ...(typeof winner.fail_origin === "string" ? { fail_origin: winner.fail_origin } : {}),
+      } : undefined);
+    }
     if (installed.journaled && !deferred) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
     if (!installed.journaled && "deferred" in installed) {
       // Preserve finalize and the selected winner; reach the latch before the hook releases its hold.
@@ -4835,7 +4869,12 @@ export class RunRunner {
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
           : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
-    if (reaped && (!opts.keepCustody || flight.completedRetainedSuccessor)) await flight.prepareTerminalInventory();
+    if (reaped && (!opts.keepCustody || flight.completedRetainedSuccessor)) {
+      // Issue #2545: the failed terminal sent below is known here, so a held-eligible failure can
+      // defer its archive capture. A quarantine-stopped run never reports a held-eligible origin.
+      await flight.prepareTerminalInventory(
+        err instanceof ResidueQuarantinedError ? undefined : { status: "failed", fail_origin: failOrigin });
+    }
     await batcher.close().catch(() => undefined);
     // issue #2213: a run that failed because the worker is quarantined keeps a verified local copy of
     // the committed work already in the worker bare (additive, credential-free; see
@@ -8255,7 +8294,7 @@ export class RunRunner {
       keepGuardedInventoryOpen: false,
       terminalInventoryQuiesced: false,
       inventoryGuarded: claim.inventory_guarded === true,
-      prepareTerminalInventory: async () => {
+      prepareTerminalInventory: async (pending?: PendingTerminal) => {
         if (this.completionReceipts.has(this.completionKey(runId, claimGeneration))) return;
         if (flight.retainedLocalCustody) return;
         flight.terminalInventoryQuiesced = false;
@@ -8275,7 +8314,10 @@ export class RunRunner {
             if (head) await this.pinRecoveryGeneration(claim, flight, head);
             return;
           }
-          await this.settleGuardedInventory(claim, flight, source ?? undefined, undefined, undefined, true);
+          // Issue #2545: a held-eligible failure freezes here, at the same strength, and leaves its
+          // archive capture for the post-send held step (or its archive fallback) on this same record.
+          await this.settleGuardedInventory(claim, flight, source ?? undefined, undefined, undefined, true,
+            { deferCapture: this.heldEligibleTerminal(pending) });
         } catch (err) {
           flight.preserveRecoveryClone = true;
           runLog.warn("recovery: preterminal snapshot failed; source retained, reporting continues", { error: errMessage(err) });
@@ -8389,6 +8431,11 @@ export class RunRunner {
         // send, so it lands BEFORE the terminal resolve retires the outbox journal.
         if (body.status === "completed" || body.status === "failed") {
           await this.observeSettlementTerminalAck(runId, flight.claimGeneration, body, ack);
+        }
+        // Issue #2545: the server's own answer says the run is now failed. Only then may the held
+        // step run; an unACKed or superseded send leaves this unset and the deferred record is archived.
+        if (body.status === "failed" && ack.status === "failed") {
+          flight.heldTerminal = { status: "failed", ...(body.fail_origin ? { fail_origin: body.fail_origin } : {}) };
         }
         return ack;
       },
@@ -11485,11 +11532,20 @@ export class RunRunner {
   private async settleGuardedInventory(
     claim: ClaimResponse, flight: RunFlight, originalSourceSha?: string,
     completedBody?: StateRequest, signal?: AbortSignal, locallyQuiescent = false,
+    /** Issue #2545: `deferCapture` runs quiescence, the WIP transfer (the caller's) and the freeze at
+     *  full strength, then stops before the archive capture and remembers the frozen record. */
+    opts: { deferCapture?: boolean } = {},
   ): Promise<void> {
     if (this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) return;
     const barePath = flight.barePath, branch = flight.branch;
     if (flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    // Issue #2545: once a record is deferred, EVERY later settle works on that exact record. It never
+    // re-freezes: the post-send freeze would pin a different original source and mint a second record.
+    if (flight.heldDeferredCapture !== undefined && opts.deferCapture !== true) {
+      await this.settleHeldDeferred(claim, flight, signal);
+      return;
+    }
     try {
       const options = await this.owedOptions(flight, barePath, branch);
       if (options.context.generation === null) return;
@@ -11536,43 +11592,228 @@ export class RunRunner {
           ? { settledEvidence: "publication" as const } : {}),
       });
       if (!record) { flight.preserveRecoveryClone = true; return; }
-      const outcome = await this.recovery.captureAndUpload({
-        record, barePath, defaultBranch: record.defaultBranch!, signal,
-      });
-      // captureAndUpload persists the bundle facts on a newer journal revision.
-      const uploaded = outcome.state === "uploaded"
-        ? (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId)
-        : undefined;
-      // A self-contained upload may still need the terminal quiescence/FINAL pass.
-      // Thin or unknown captures retain the clone; cleanup keeps its independent ACK guard.
-      if (outcome.state !== "uploaded" ||
-          (await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged" &&
-           (uploaded?.state !== "uploaded" || uploaded.selfContained !== true ||
-            !Array.isArray(uploaded.prerequisiteShas) || uploaded.prerequisiteShas.length !== 0))) {
-        flight.preserveRecoveryClone = true;
+      if (opts.deferCapture === true) {
+        flight.heldDeferredCapture = record.captureId;
+        flight.runLog.info("recovery: archive capture deferred for held publication", {
+          generation: claim.claim_generation, capture_id: record.captureId,
+        });
+        return;
       }
-      this.announceOwedHeads(flight, record.originalRoots?.map(r => r.sha) ?? [], outcome.state === "uploaded");
-      if (outcome.state === "uploaded") {
-        if (uploaded?.serverCaptureId && uploaded.state === "uploaded") {
-          const noticeIdentity = JSON.stringify([uploaded.serverCaptureId, uploaded.finalAcknowledged === true]);
-          const text = uploaded.finalAcknowledged
-            ? `Recovery archive ${uploaded.serverCaptureId} covers the frozen inventory; custody transfer confirmed. Use uzi run recovery or uzi run export.`
-            : uploaded.selfContained === false
-              ? `Recovery archive ${uploaded.serverCaptureId} requires retained prerequisites; local sources and custody intentionally retained. Use uzi run recovery or uzi run export.`
-              : `Recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending, local sources retained. Use uzi run recovery or uzi run export.`;
-          if (!flight.inventoryArchiveNotices.has(noticeIdentity)) {
-            flight.inventoryArchiveNotices.add(noticeIdentity);
-            if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
-            else flight.runLog.info(text);
-          }
-        }
-      }
-      flight.runLog.info("recovery: guarded inventory disposition", {
-        generation: claim.claim_generation, capture_id: record.captureId, state: outcome.state, reason: outcome.reason,
-      });
+      await this.captureFrozenInventory(claim, flight, record, signal);
     } catch (err) {
       flight.preserveRecoveryClone = true;
       flight.runLog.warn("recovery: guarded inventory retained; reporting unaffected", { error: errMessage(err) });
+    }
+  }
+
+  /** Capture and upload the archive for an already frozen guarded record, and announce the outcome.
+   *  The one capture tail shared by the ordinary settle and the held publication fallback. Throws on
+   *  an unexpected error; the callers' catch retains the clone. */
+  private async captureFrozenInventory(
+    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
+  ): Promise<void> {
+    const barePath = flight.barePath!;
+    const outcome = await this.recovery.captureAndUpload({
+      record, barePath, defaultBranch: record.defaultBranch!, signal,
+    });
+    // captureAndUpload persists the bundle facts on a newer journal revision.
+    const uploaded = outcome.state === "uploaded"
+      ? (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId)
+      : undefined;
+    // A self-contained upload may still need the terminal quiescence/FINAL pass.
+    // Thin or unknown captures retain the clone; cleanup keeps its independent ACK guard.
+    if (outcome.state !== "uploaded" ||
+        (await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged" &&
+         (uploaded?.state !== "uploaded" || uploaded.selfContained !== true ||
+          !Array.isArray(uploaded.prerequisiteShas) || uploaded.prerequisiteShas.length !== 0))) {
+      flight.preserveRecoveryClone = true;
+    }
+    this.announceOwedHeads(flight, record.originalRoots?.map(r => r.sha) ?? [], outcome.state === "uploaded");
+    if (outcome.state === "uploaded") {
+      if (uploaded?.serverCaptureId && uploaded.state === "uploaded") {
+        const noticeIdentity = JSON.stringify([uploaded.serverCaptureId, uploaded.finalAcknowledged === true]);
+        const text = uploaded.finalAcknowledged
+          ? `Recovery archive ${uploaded.serverCaptureId} covers the frozen inventory; custody transfer confirmed. Use uzi run recovery or uzi run export.`
+          : uploaded.selfContained === false
+            ? `Recovery archive ${uploaded.serverCaptureId} requires retained prerequisites; local sources and custody intentionally retained. Use uzi run recovery or uzi run export.`
+            : `Recovery archive ${uploaded.serverCaptureId} available; custody final ACK pending, local sources retained. Use uzi run recovery or uzi run export.`;
+        if (!flight.inventoryArchiveNotices.has(noticeIdentity)) {
+          flight.inventoryArchiveNotices.add(noticeIdentity);
+          if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+          else flight.runLog.info(text);
+        }
+      }
+    }
+    flight.runLog.info("recovery: guarded inventory disposition", {
+      generation: claim.claim_generation, capture_id: record.captureId, state: outcome.state, reason: outcome.reason,
+    });
+  }
+
+  /**
+   * Issue #2545: may the archive capture of this pending terminal be deferred behind the held
+   * publication? Only a `failed` terminal can be held (step A refuses any other run), never one the
+   * run already knows holds a secret or a worker residue (`push_secret_blocked`,
+   * `worker_residue_blocked`), and only against an api that advertises the feature. Cancelled and
+   * parked runs never reach here with `failed`, so they never defer.
+   */
+  private heldEligibleTerminal(pending?: PendingTerminal): boolean {
+    return pending?.status === "failed" &&
+      pending.fail_origin !== "push_secret_blocked" && pending.fail_origin !== "worker_residue_blocked" &&
+      this.client.hasFeature(HELD_PUBLICATION_FEATURE);
+  }
+
+  /** A held-publication notice carries only the ref, a short sha and a reason code: never file
+   *  contents or finding text, which are untrusted. The feed is closed by the time a run fails. */
+  private heldNotice(flight: RunFlight, text: string): void {
+    if (flight.owedFeedClosed) flight.runLog.info(text);
+    else flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+  }
+
+  /**
+   * Issue #2545: every settle of a generation whose archive capture was deferred. Works on the exact
+   * deferred record, never freezing again.
+   *  - the failed terminal was ACKed (`heldTerminal`) and the held step has not run: run it once;
+   *  - a held FINAL is already journaled: replay it verbatim (the coordinator sends it only when the
+   *    run has stopped executing, else it stays journaled for the live re-drive);
+   *  - anything short of an ACKed or journaled held FINAL: capture the archive on that same record.
+   * Every outcome other than an ACKed FINAL keeps the clone, the pins and the open hold.
+   */
+  private async settleHeldDeferred(claim: ClaimResponse, flight: RunFlight, signal?: AbortSignal): Promise<void> {
+    try {
+      if (flight.heldAcked === true) return;
+      const generation = claim.claim_generation;
+      const record = (await this.recovery.inspect(claim.run_id)).find(r =>
+        r.captureId === flight.heldDeferredCapture && r.generation === generation);
+      if (!record) {
+        flight.preserveRecoveryClone = true;
+        flight.runLog.warn("recovery: deferred held record not found; sources retained", { generation });
+        return;
+      }
+      if (record.finalAcknowledged) { flight.heldAcked = true; return; }
+      let result: "acked" | "kept" | "fallback" = "fallback";
+      const journaled = record.finalRequest?.disposition;
+      if (journaled?.kind === "held_publication" && journaled.publication_id) {
+        result = await this.recovery.releaseHeldPublication(record, journaled.publication_id);
+      } else if (flight.heldTerminal !== undefined && flight.heldAttempted !== true) {
+        flight.heldAttempted = true;
+        result = await this.heldPublicationStep(claim, flight, record, signal);
+      }
+      if (result === "acked") {
+        flight.heldAcked = true;
+        this.heldNotice(flight, "Held work published and custody released; the archive is not needed.");
+        const cleanup = await this.recovery.inventoryCleanupState(claim.run_id, generation!);
+        if (cleanup !== "acknowledged" && cleanup !== "absent") flight.preserveRecoveryClone = true;
+        return;
+      }
+      if (result === "kept") {
+        flight.preserveRecoveryClone = true;
+        return;
+      }
+      const fresh = (await this.recovery.inspect(claim.run_id)).find(r => r.captureId === record.captureId) ?? record;
+      await this.captureFrozenInventory(claim, flight, fresh, signal);
+      // The archive FINAL cannot be sent while this run still executes, so a fallback keeps the clone
+      // with the pins and the hold until that FINAL is ACKed, even for a self-contained upload.
+      const cleanup = await this.recovery.inventoryCleanupState(claim.run_id, generation!).catch(() => "pending" as const);
+      if (cleanup !== "acknowledged") flight.preserveRecoveryClone = true;
+    } catch (err) {
+      flight.preserveRecoveryClone = true;
+      flight.runLog.warn("recovery: deferred held disposition retained; reporting unaffected", { error: errMessage(err) });
+    }
+  }
+
+  /**
+   * Issue #2545: publish a failed run's frozen work to the forge as a held ref, then journal the held
+   * FINAL. Returns `fallback` for EVERYTHING short of a created ref, so the caller archives on the
+   * same record; the held path never sees the forge credential (the api holds its own).
+   *
+   * Order: range -> fresh secret scan -> #1964 remediation hold -> workflow check -> pack (the SAME
+   * range object the scan judged) -> upload. The tip is the frozen record's `sourceSha`, which already
+   * covers every root and the WIP marker commit. A finding, an untrusted result, a deadline, a held
+   * commit, a changed workflow file, a pack over the cap or any uncertain answer archives instead.
+   */
+  private async heldPublicationStep(
+    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
+  ): Promise<"acked" | "kept" | "fallback"> {
+    const barePath = flight.barePath, branch = flight.branch, generation = claim.claim_generation;
+    const sha12 = record.sourceSha.slice(0, 12);
+    const skip = (reason: string): "fallback" => {
+      this.heldNotice(flight, `Held publication of ${sha12} skipped: ${reason}; archiving instead.`);
+      return "fallback";
+    };
+    const origin = flight.heldTerminal?.fail_origin;
+    if (!barePath || !branch || generation === undefined || flight.heldTerminal?.status !== "failed" ||
+        origin === "push_secret_blocked" || origin === "worker_residue_blocked" ||
+        !this.client.hasFeature(HELD_PUBLICATION_FEATURE) || record.generation !== generation ||
+        record.inventoryGuarded !== true || !record.coverageDigest || residueQuarantine() !== undefined) {
+      return "fallback";
+    }
+    try {
+      // (a) The range: tip = the frozen record, floors = forge-present bases the api fetches (the
+      // confirmed checkpoint ref tip, the published branch tips, the default branch). Never an
+      // ambiguous attempted tip or a local-only bridge floor.
+      const range = await this.git.resolveCheckpointRange(barePath, branch, {
+        tipSha: record.sourceSha,
+        confirmedTip: flight.lastCheckpointRefTip,
+        extraFloors: [...(flight.publishedRealTips ?? []), flight.publishedTip]
+          .filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f)),
+      });
+      if (!range) return skip("range_unresolved");
+      // (b) A fresh scan of exactly that range.
+      const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
+      if (scan.findings.length > 0) {
+        if (scan.trusted) this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
+        return skip("secret_found");
+      }
+      if (!scan.trusted) return skip(`scan_untrusted:${scan.reason ?? "unknown"}`);
+      // (c) Findings remembered earlier in this flight hold the candidate (#1964).
+      if (await this.checkpointRemediationHold(flight, barePath, record.sourceSha, true)) return skip("secret_remediation_pending");
+      // (d) The stored credential may lack workflow scope: a range that authors a workflow change archives.
+      const workflows = await this.git.rangeTouchesWorkflows(barePath, range, { deadlineMs: this.scanDeadlineMs() });
+      if (workflows !== "clean") return skip(workflows === "touches" ? "workflow_change" : "workflow_check_unknown");
+      // (e) The pack, over the same range object the scan judged.
+      const packed = await this.git.checkpointPack(barePath, branch, undefined, range, undefined, record.sourceSha);
+      if (!packed || packed.tipOid !== record.sourceSha) {
+        if (packed && !packed.pack.readableEnded) packed.pack.destroy();
+        if (packed) await packed.exited;
+        return skip("pack_tip_mismatch");
+      }
+      const cap = this.checkpointTestHooks?.heldPackMaxBytes ?? HELD_PACK_MAX_BYTES;
+      const chunks: Buffer[] = [];
+      let size = 0, over = false;
+      try {
+        for await (const chunk of packed.pack) {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+          size += buf.length;
+          if (size > cap) { over = true; break; }
+          chunks.push(buf);
+        }
+      } finally {
+        if (!packed.pack.readableEnded) packed.pack.destroy();
+      }
+      const exitCode = await packed.exited;
+      if (over) return skip("pack_too_large");
+      if (exitCode !== 0) return skip("pack_failed");
+      // (f) Upload. Only an answer of `created` for this exact tip and ref continues.
+      let res;
+      try {
+        res = await this.client.publishHeld(flight.runId, generation, record.sourceSha, record.coverageDigest,
+          Buffer.concat(chunks), signal);
+      } catch {
+        return skip("upload_failed");
+      }
+      if (!res.ok) return skip(res.reason);
+      const body = res.body;
+      if (body.state !== "created") return skip(`publication_${body.state}`);
+      if (body.tip !== record.sourceSha || body.ref !== `refs/uzi-held/${flight.runId}/${generation}` ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(body.publication_id)) {
+        return skip("publication_answer_mismatch");
+      }
+      this.heldNotice(flight, `Held work ${sha12} published at ${body.ref}; releasing custody.`);
+      // (g) Journal the held FINAL and release.
+      return await this.recovery.releaseHeldPublication(record, body.publication_id);
+    } catch (err) {
+      flight.runLog.warn("held publication step failed; archiving instead", { error: errMessage(err) });
+      return skip("error");
     }
   }
 
@@ -12127,6 +12368,9 @@ export class RunRunner {
    * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
    * scanned: permitted candidates reach the forge UNSCANNED, but #1964 holds findings
    * remembered in this flight at the shared pack/publish seam before any producer starts.
+   * The ONE scanned exception is a failed run's held publication (issue #2545,
+   * {@link RunRunner.heldPublicationStep}): it uploads work the worker would otherwise archive, so it
+   * runs a fresh scan of its own range and archives on anything but a trusted, finding-free result.
    * (Service.Publish in api/internal/workersvc/service.go) — they are the run's last chance to be
    * durable before the worker stops working on it, and a blocked or slow scan there would lose the
    * work outright. The scan guards the frequent, mid-run checkpoint stream only; a Codex milestone
