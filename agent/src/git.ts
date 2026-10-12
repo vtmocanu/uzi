@@ -7274,9 +7274,10 @@ export class GitCache {
     try {
       if (!SHA40_RE.test(tip)) return null;
       const baseRef = await this.defaultBranchRef(barePath);
-      // Read through the same hardened view verifyRecoveryClosure uses: replacement refs, grafts and
-      // a shallow file must not change which commits or messages this reads.
-      const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" };
+      // Read through the same hardened view verifyRecoveryClosure uses: replacement refs, grafts, a
+      // shallow file and lazy fetches must not change which commits or messages this reads.
+      const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
+        GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
       const read = async (args: string[], input?: string): Promise<string> =>
         (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
           { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
@@ -7301,6 +7302,13 @@ export class GitCache {
         // commit object's own bytes: fail closed rather than trust the truncated %B.
         const raw = await read(["cat-file", "--batch"], commits.map(c => c.sha).join("\n") + "\n");
         if (raw.includes("\u0000")) return null;
+        // A commit with a non-UTF-8 `encoding` header makes %B print a re-encoded (possibly empty)
+        // body while the raw object holds plain text, so the message scan would see nothing. Refuse.
+        const objects = /(?:^|\n)[0-9a-f]{40} commit \d+\n([\s\S]*?)(?:\n\n|$)/g;
+        for (const m of raw.matchAll(objects)) {
+          const enc = /^encoding (.*)$/m.exec(m[1]!);
+          if (enc && !/^utf-?8$/i.test(enc[1]!.trim())) return null;
+        }
       }
       return commits;
     } catch {

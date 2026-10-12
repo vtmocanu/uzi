@@ -102,4 +102,33 @@ describe("publishedCommitMessages (issue #2779)", () => {
     assert.strictEqual(tip, crafted);
     assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
   });
+
+  /** Write a commit object on top of `main` with an `encoding` header and the given body. */
+  function craftEncoded(branch: string, encoding: string, msg: string): string {
+    const parent = git(fx.originPath, "rev-parse", "main");
+    const tree = git(fx.originPath, "rev-parse", "main^{tree}");
+    const body = Buffer.from(
+      `tree ${tree}\nparent ${parent}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\nencoding ${encoding}\n\n${msg}\n`,
+    );
+    const sha = execFileSync("git", ["-C", fx.originPath, "hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+      { env: ENV, input: body, encoding: "utf8" }).trim();
+    git(fx.originPath, "update-ref", `refs/heads/${branch}`, sha);
+    return sha;
+  }
+
+  it("returns null for a commit with a non-UTF-8 encoding header (%B would print an empty body)", async () => {
+    const crafted = craftEncoded("enc16", "UTF-16", "Fixes #12");
+    const { bare, tip } = await bareWith("enc16");
+    assert.strictEqual(tip, crafted);
+    assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
+  });
+
+  it("still reads a commit that declares encoding UTF-8", async () => {
+    const crafted = craftEncoded("enc8", "UTF-8", "clean subject");
+    const { bare, tip } = await bareWith("enc8");
+    const out = await gc.publishedCommitMessages(bare, tip);
+    assert.ok(out);
+    assert.deepStrictEqual(out.map((c) => c.sha), [crafted]);
+    assert.ok(out[0]!.message.startsWith("clean subject"));
+  });
 });

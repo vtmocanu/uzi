@@ -163,6 +163,10 @@ export interface FakeForgeOpts {
   /** Status for a title-only PUT/PATCH (default 200); a non-2xx leaves the title unchanged and
    *  makes updateMergeRequestTitle throw a ForgeError. Description writes keep `putStatus`. */
   titleWriteStatus?: number;
+  /** Per-write statuses for title-only writes, consumed in order before `titleWriteStatus` applies. */
+  titleWriteStatuses?: number[];
+  /** A title-only write answers 2xx but leaves the title unchanged (a forge that drops the edit). */
+  titleWriteIgnored?: boolean;
   /** PRD #1798 M6: called after each successful body write with the fake PR (already updated), so a
    *  test can move the head or edit the description at a given write (or, by changing `headStatus`
    *  on the options object it passed, make later reads fail). */
@@ -232,8 +236,8 @@ function fakeTransport(
         }
       }
       if (hasTitle) {
-        const titleStatus = hasDescription ? status : (opts.titleWriteStatus ?? 200);
-        if (titleStatus >= 200 && titleStatus < 300) pr.title = String(sent["title"]);
+        const titleStatus = hasDescription ? status : (opts.titleWriteStatuses?.shift() ?? opts.titleWriteStatus ?? 200);
+        if (titleStatus >= 200 && titleStatus < 300 && (hasDescription || !opts.titleWriteIgnored)) pr.title = String(sent["title"]);
         status = titleStatus;
       }
       return { status, text: async () => "{}" };

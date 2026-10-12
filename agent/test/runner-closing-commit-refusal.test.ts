@@ -6,7 +6,7 @@ import path from "node:path";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { nullLogger } from "./helpers.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
-import { api, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, fakeGitHub, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
 installHarness();
 
@@ -21,6 +21,9 @@ const BRANCH = "agent/issue-2172";
 function gitIn(dir: string, args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: ENV }).trim();
 }
+
+const githubClaim = (iid: number) =>
+  gitlabClaim(iid, { repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" } });
 
 function fakeGitlab() {
   const forge = rawFakeGitlab({});
@@ -41,13 +44,15 @@ function originHasBranch(): boolean {
   }
 }
 
-/** StubExecutor plus one extra commit carrying `message`; records that commit's SHA. */
-function committing(message: string, obs: { sha?: string }, declare: boolean): Executor {
+/** StubExecutor plus one extra commit carrying `message`; records that commit's SHA. `file` is the
+ *  path the commit writes (a `.github/workflows/` path models a disallowed workflow blob). */
+function committing(message: string, obs: { sha?: string }, declare: boolean, file = "closing.txt"): Executor {
   return new class extends StubExecutor {
     override async run(ctx: RunContext): Promise<ExecutorResult> {
       const result = await super.run(ctx);
-      fs.writeFileSync(path.join(ctx.worktreePath, "closing.txt"), "closing work\n");
-      gitIn(ctx.worktreePath, ["add", "closing.txt"]);
+      fs.mkdirSync(path.dirname(path.join(ctx.worktreePath, file)), { recursive: true });
+      fs.writeFileSync(path.join(ctx.worktreePath, file), "closing work\n");
+      gitIn(ctx.worktreePath, ["add", file]);
       gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", message]);
       obs.sha = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
       return { ...result, ...(declare ? { nonClosing: { reason: "Approved follow-up remains" } } : {}) };
@@ -70,6 +75,50 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     assert.equal(all.length, 0, "no forge request of any kind");
     assert.equal(originHasBranch(), false, "nothing was pushed");
     assert.equal(api.completionHoldRequests.length, 0);
+  });
+
+  it("refuses when the commit range cannot be read (null never passes), pushing nothing", async () => {
+    const { gitlab, all } = fakeGitlab();
+    const obs: { sha?: string } = {};
+    const claim = gitlabClaim(2172);
+    const original = git.publishedCommitMessages;
+    git.publishedCommitMessages = async () => null;
+    try {
+      await runner(committing("Refs #2172", obs, true), gitlab).execute(claim);
+    } finally {
+      git.publishedCommitMessages = original;
+    }
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.match(failureReason(claim.run_id) ?? "", /could not read the commit messages/);
+    assert.equal(all.length, 0);
+    assert.equal(originHasBranch(), false, "nothing was pushed");
+  });
+
+  it("a GitHub declared run with a closing commit is refused by the early check (no push, no forge call)", async () => {
+    const { github, all } = fakeGitHub();
+    const obs: { sha?: string } = {};
+    const claim = githubClaim(2172);
+    await runner(committing("Fixes #2172", obs, true), rawFakeGitlab({}).gitlab, undefined, { github }).execute(claim);
+    const failed = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed);
+    assert.ok((failed.body.failure_reason ?? "").includes(obs.sha!));
+    assert.notEqual(failed.body.fail_origin, "workflow_scope_missing");
+    assert.equal(all.length, 0);
+    assert.equal(originHasBranch(), false);
+  });
+
+  it("a GitHub run with both a disallowed workflow blob and a closing commit reports workflow_scope_missing", async () => {
+    const { github, all } = fakeGitHub();
+    const obs: { sha?: string } = {};
+    const claim = githubClaim(2172);
+    await runner(committing("Fixes #2172", obs, true, ".github/workflows/ci.yml"), rawFakeGitlab({}).gitlab, undefined, { github })
+      .execute(claim);
+    const failed = api.states.filter(s => s.runId === claim.run_id && s.body.status === "failed");
+    assert.equal(failed.length, 1);
+    assert.equal(failed[0]!.body.fail_origin, "workflow_scope_missing");
+    assert.equal(all.length, 0);
+    assert.equal(originHasBranch(), false);
   });
 
   it("without a declaration the same commit delivers and the PR closes the issue", async () => {

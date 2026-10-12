@@ -6604,14 +6604,6 @@ export class RunRunner {
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
     };
-    if (closingGateIid !== undefined) {
-      const hits = await closingCommits(publicationOriginalHead);
-      if (hits === null || hits.length > 0) {
-        await failClosingCommits(hits);
-        return;
-      }
-    }
-
     // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
     // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
     // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
@@ -6735,6 +6727,16 @@ export class RunRunner {
       }
       if (hits && hits.length > 0 && workflowBranchChanges?.some((file) => file.startsWith(".github/workflows/"))) {
         await failWorkflowScope(hits);
+        return;
+      }
+    }
+
+    // Early closing-commit refusal, placed AFTER the GitHub workflow precheck so a workflow-scope
+    // refusal keeps precedence when a run trips both.
+    if (closingGateIid !== undefined) {
+      const hits = await closingCommits(publicationOriginalHead);
+      if (hits === null || hits.length > 0) {
+        await failClosingCommits(hits);
         return;
       }
     }
@@ -7988,18 +7990,19 @@ export class RunRunner {
           const actual = await readTitle();
           if (actual === undefined) return false;
           if (!closingDirectiveFor(actual, scanIid!, repoPath)) return true;
-          const next = nonClosingTitle(actual, scanIid!, repoPath);
+          let written = nonClosingTitle(actual, scanIid!, repoPath);
           try {
-            await writeTitle(next);
+            await writeTitle(written);
           } catch (e) {
             // A forge may refuse the broken title (e.g. a length cap after the inserted characters);
             // one retry with the fixed non-closing fallback, anything else fails closed.
             if (!(e instanceof ForgeError && (e.status === 422 || e.status === 400))) throw e;
-            await writeTitle(`Work on issue #${scanIid}`);
+            written = `Work on issue #${scanIid}`;
+            await writeTitle(written);
           }
           const reread = await readTitle();
           if (reread === undefined || closingDirectiveFor(reread, scanIid!, repoPath)) return false;
-          if (reread !== next) runLog.info("PR title confirmed non-closing but differs from the written title", { run_id: runId });
+          if (reread !== written) runLog.info("PR title confirmed non-closing but differs from the written title", { run_id: runId });
           return true;
         } catch (e) {
           rethrowWorkflowAbort(e);
