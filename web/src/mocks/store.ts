@@ -5,6 +5,7 @@
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import { seedProgressPrototype } from "./data/runProgressPrototype";
 import { deriveMockProgress } from "./runProgress";
 import {
   mockAdmin,
@@ -152,6 +153,7 @@ function seed(): MockState {
   // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
+  seedProgressPrototype(runs, messages);
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();

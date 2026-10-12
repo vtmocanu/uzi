@@ -32,8 +32,7 @@ export const prefs = {
 // Client-side only (the pref is not worth a server round-trip and per-browser is
 // acceptable), keyed by run id under ONE localStorage object so the whole map GCs in a
 // single read. Each entry carries a savedAt; entries older than the TTL are dropped on
-// read, so the store does not grow without bound as runs come and go. DEFAULT EXPANDED:
-// an absent (or GC'd) entry reads as not-collapsed.
+// read, so the store does not grow without bound as runs come and go. An absent entry lets the run page select its state-dependent default.
 const SUMMARY_COLLAPSE_KEY = "uzi.summaryCollapse";
 const SUMMARY_COLLAPSE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -66,13 +65,12 @@ function pruneCollapse(store: CollapseStore, now: number): { pruned: CollapseSto
 }
 
 export const summaryCollapse = {
-  // getCollapsed reads the per-run choice, GC-ing the store as a side effect. Absent =
-  // expanded (false), which is the PRD default.
-  getCollapsed(runId: string, now: number = Date.now()): boolean {
+  // An absent or expired preference is distinct from an explicit expanded choice.
+  getCollapsed(runId: string, now: number = Date.now()): boolean | undefined {
     const store = prefs.get<CollapseStore>(SUMMARY_COLLAPSE_KEY, {});
     const { pruned, changed } = pruneCollapse(store, now);
     if (changed) prefs.set(SUMMARY_COLLAPSE_KEY, pruned);
-    return pruned[runId]?.collapsed ?? false;
+    return pruned[runId]?.collapsed;
   },
   // setCollapsed records the choice with a fresh savedAt, pruning expired siblings in the
   // same write so a long-lived browser never accumulates dead entries.

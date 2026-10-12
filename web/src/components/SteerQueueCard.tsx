@@ -382,16 +382,23 @@ export function SteerQueueCard({
           {/* PRD #1190: Pause ▾ sits beside Stop run, offered only for a RUNNING, pausable
               run with no pause already pending (a pending request has its own chip + actions
               in the header). Unpausable kinds and any parked status show no menu. */}
-          <div className="flex flex-wrap items-center gap-2">
-            {run && onPause && status === "running" && !run.pause_requested_at && isPausableRun(run) && (
-              <PauseMenu run={run} busy={busy} onPause={onPause} />
-            )}
-            <Button variant="danger" disabled={busy} onClick={onStop}>
-              {takesFollowUps ? "Stop run" : "Stop job"}
-            </Button>
-          </div>
+          {run && onPause ? <RunControls run={run} busy={busy} terminal={terminal} canSteer={canSteer} onPause={onPause} onStop={onStop} steerPanel /> : <Button variant="danger" disabled={busy} onClick={onStop}>{takesFollowUps ? "Stop run (steer panel)" : "Stop job (steer panel)"}</Button>}
         </>
       )}
     </Card>
   );
+}
+
+export function RunControls({ run, busy, terminal, canSteer, onPause, onStop, steerPanel = false }: {
+  run: Run; busy: boolean; terminal: boolean; canSteer: boolean;
+  onPause: (mode: "milestone" | "now") => void; onStop: () => void; steerPanel?: boolean;
+}) {
+  if (terminal || !canSteer) return null;
+  return <div className="flex flex-wrap items-center gap-2">
+    {run.status === "running" && !run.pause_requested_at && isPausableRun(run) && <PauseMenu run={run} busy={busy} onPause={onPause} />}
+    <Button variant="danger" size="sm" disabled={busy} onClick={onStop}
+      aria-label={`${run.kind === "job" ? "Stop job" : "Stop run"}${steerPanel ? " (steer panel)" : ""}`}>
+      {run.kind === "job" ? "Stop job" : "Stop run"}
+    </Button>
+  </div>;
 }

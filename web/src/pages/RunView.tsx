@@ -1,8 +1,4 @@
-// Live run view. The header carries the status pill plus a LIVE STAGE label
-// derived from the newest message — a task-status-pill idea that maps the
-// latest tool slug to a human stage: "Running command", "Reading files",
-// "Making edits"…
-// — so you can tell what the agent is doing without reading the feed. Terminal
+// Run-page prototype: current work lives with the milestone rows. Terminal
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
@@ -18,7 +14,6 @@ import {
   type Repo,
   type Run,
   type RunActivity,
-  type RunMessage,
   type Worker,
 } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -39,9 +34,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import {
-  effectiveMilestoneAgents,
   effectiveRunStatus,
-  firstInProgressMilestoneId,
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
@@ -52,9 +45,9 @@ import {
   mrChipTitle,
   shadowSignal,
   shouldShowHealthFlag,
-  uniqueLiveMatchMilestoneId,
 } from "../lib/runBadge";
-import { activityAge, latestActivity } from "../lib/runActivity";
+import { latestActivity } from "../lib/runActivity";
+import { MilestoneRows } from "../components/RunMilestoneRows";
 import { RunProgressCard } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
@@ -78,13 +71,13 @@ import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel, RunUsageTailBlock } from "../components/RunUsage";
 import { RunParkDiskFacts } from "../components/RunParkDiskFacts";
 import { ActivityFeed } from "../components/ActivityFeed";
-import { SteerQueueCard } from "../components/SteerQueueCard";
+import { RunControls, SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { PlanCrossCheck } from "../components/PlanCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
-import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type BadgeTone } from "../components/ui";
+import { Alert, Badge, Button, Card, PageHeader, StatusPill, cx, type BadgeTone } from "../components/ui";
 import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
@@ -104,37 +97,6 @@ export { JudgePanel, JUDGE_POLL_MAX_TRIES, TriageSummary } from "./runView/Judge
 // PRD #1227 M4: the owner completion-decision surface, an exported component re-exported here
 // (mirroring CompletionStatePanel's exported shape) so its tests can import it from ./RunView.
 export { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
-
-// stageForMessages: latest-message → human stage label (a tool-slug → stage
-// map, adapted to uzi's message kinds).
-const TOOL_STAGE: Record<string, string> = {
-  Bash: "Running a command",
-  Read: "Reading files",
-  Glob: "Reading files",
-  Grep: "Searching code",
-  Edit: "Making edits",
-  MultiEdit: "Making edits",
-  Write: "Making edits",
-  NotebookEdit: "Making edits",
-  WebFetch: "Searching the web",
-  WebSearch: "Searching the web",
-  Task: "Delegating to a subagent",
-};
-
-function stageForMessages(messages: RunMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.kind === "tool_result") return "Working";
-    if (m.kind === "tool_use") {
-      const name = (m.payload as { name?: string } | null)?.name ?? "";
-      return TOOL_STAGE[name] ?? "Working";
-    }
-    if (m.kind === "thinking") return "Thinking";
-    if (m.kind === "text") return "Writing";
-    if (m.kind === "plan") return "Planning";
-  }
-  return "Starting up";
-}
 
 // LiveElapsed ticks a wall-clock timer for a still-running run.
 function LiveElapsed({ since }: { since: string }) {
@@ -295,7 +257,7 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
   return `Work already committed is safe: the last checkpoint was pushed ${age} ago${where}.`;
 }
 
-// HealthFlag renders the run-health warn chip next to the LIVE STAGE label (PRD #47
+// HealthFlag renders the run-health warn chip in the header (PRD #47
 // Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
 // only, so health_reason is always present here (no gating needed). It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
@@ -386,292 +348,9 @@ export function MilestoneBadge({ run }: { run: Run }) {
   );
 }
 
-// MilestoneMark is the per-row done / in-progress / left indicator. Kept tiny and
-// aria-labelled so the state is legible to assistive tech, not carried by colour alone.
-function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
-  if (state === "done") return <span className="text-ok" aria-label="done">✓</span>;
-  if (state === "in_progress") return <span className="text-info" aria-label="in progress">◐</span>;
-  return <span className="text-faint" aria-label="not started">○</span>;
-}
-
-// MilestoneNowStrip is the "now" line (PRD #1064 M3, D3/D5): a left-bordered strip that
-// names the lane acting RIGHT NOW under the in-progress milestone (or unattached under
-// the header when a milestone run has activity but nothing declared). Three variants:
-//   - active   — a milestone is in progress. The pulsing green (ok) border + dot are
-//                reserved for a strip backed by a REAL live frame (`live !== null`): it
-//                then shows the role, its task, its last tool, and a client-side age (R7:
-//                a stalled lane reads its real age, not a lie). A declared-owner-only
-//                strip (idle owner, `live === null`) renders QUIET instead — faint border,
-//                muted accent, a static faint dot with no pulse — so it never reads as
-//                "working now" (PRD #1353 M1 honesty fix).
-//   - waiting  — the run is parked on a self-resuming hold (limit_wait/pool_wait, or the
-//                transient-recovery park recovery_wait, issue #1197): a warn border +
-//                a waiting reason and age, so the strip does not pretend the lane
-//                is working while it is blocked.
-//   - unattached — activity exists but no milestone is declared in progress: a faint
-//                border, sitting directly under the header. Always backed by a live frame.
-//
-// 🔴 ALL display fields are folded through stripUnsafeChars here (defense-in-depth): the
-// server caps/strips only detail and agent_label, so agent/role and tool arrive UNSANITIZED
-// on the wire — an auditor note. In the PRD #1224 per-milestone-attribution path (M5) the
-// role/label are the DECLARED agent/agent_label (equally untrusted), so the same fold covers
-// them. The pulsing dot (present only for a live or waiting strip) uses animate-pulse, which
-// index.css neutralizes under prefers-reduced-motion.
-//
-// PRD #1224 M5 (D3): `live` carries the current tool/detail/age. It is non-null for TODAY's
-// activity-driven strip (the D8-fallback path) AND for the single unique-match milestone in
-// the attributed path; it is null for a declared-only strip (a sibling attribution, or every
-// strip when a repeated role makes the live join ambiguous), which then shows role + label
-// only — no tool line, no age. PRD #1353 M1: the dot/border/accent now key on whether a real
-// live frame is present (`live !== null`), NOT on `variant` alone — an idle declared owner
-// renders quiet (faint, no pulse). The `waiting` styling stays keyed on status.
-function MilestoneNowStrip({
-  role,
-  label,
-  live,
-  status,
-  now,
-  variant,
-}: {
-  role: string;
-  label: string;
-  live: { tool: string; detail: string; at: string } | null;
-  status: string;
-  now: number;
-  variant: "active" | "unattached";
-}) {
-  const waiting =
-    status === "limit_wait" || status === "pool_wait" || status === "recovery_wait";
-  const waitingLabel = status === "recovery_wait" ? "waiting to recover" : "waiting on rate limit";
-  const safeRole = stripUnsafeChars(role);
-  const safeLabel = stripUnsafeChars(label);
-  // Live tool/age only when the caller passed a live frame; a declared-only strip shows the
-  // role + label alone (age stays "" so neither the "X ago" token nor a waiting-suffix age
-  // renders).
-  const age = live ? activityAge(live.at, now) : "";
-  const tool = live ? stripUnsafeChars(live.tool) : "";
-  const detail = live ? stripUnsafeChars(live.detail) : "";
-  const toolText = tool ? (detail ? `${tool} ${detail}` : tool) : detail;
-  // The pulse + green styling is reserved for a strip backed by a REAL live frame (M1
-  // honesty fix, PRD #1353): a declared-owner-only strip (idle owner, live === null) reads
-  // QUIET — faint border, muted accent, faint static dot — so it never pretends to be
-  // "working now". `waiting` is orthogonal and keeps its warn styling unchanged. The
-  // unattached variant is always live (its caller passes a live frame), so it keeps its
-  // faint border but a live green dot as before.
-  const isLive = live !== null;
-  const border = waiting
-    ? "border-warning"
-    : !isLive
-      ? "border-faint"
-      : variant === "unattached"
-        ? "border-faint"
-        : "border-ok/50";
-  const accent = waiting ? "text-warning" : isLive ? "text-ok" : "text-muted";
-  const dotBg = waiting ? "bg-warning" : isLive ? "bg-ok" : "bg-faint";
-  const dotPulse = waiting || isLive;
-  return (
-    <div className={cx("mt-1.5 flex items-center gap-2 border-l-2 py-1 pl-3 text-xs", border)}>
-      <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full", dotBg, dotPulse && "animate-pulse")} />
-      <span className={cx("shrink-0 font-medium", accent)}>{safeRole}</span>
-      {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{safeLabel}</span>}
-      {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}
-      <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
-        {waiting ? `${waitingLabel}${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}
-      </span>
-    </div>
-  );
-}
-
-// MilestoneChecklist renders a milestone-structured run's progress (PRD #122): every
-// approved milestone with a done / in-progress / left indicator, driven by the frozen
-// list + the reported-complete and in-progress id sets.
-//
-// 🔴 The header says "reported complete", NEVER "verified" (PRD Decision 6): the worker
-// REPORTS completion and nothing in uzi has verified it, so the copy must not imply it
-// has. Titles are REPO/agent-authored UNTRUSTED text, rendered as PLAIN JSX through
-// stripUnsafeChars — never <Markdown>, the same rule repo_agents follow. Renders nothing
-// for a run with no frozen milestone list. Exported for a direct render test.
-//
-// PRD #1064 M3: `activity` (the run's newest tool_use folded by latestActivity, computed
-// in RunView off the live frames) drives the "now" line and the header's `◐ <id>` marker.
-// It is OPTIONAL and defaults to null, so every pre-#1064 caller (and a run with no
-// tool_use frame) renders EXACTLY as before — the D5 back-compat contract. D4 selection:
-// the FIRST in-progress id by frozen order is the one the header names and the strip
-// attaches under; other in-progress ids render as today's ◐ mark.
+// Prototype compatibility wrapper; the implementation run will migrate its tests.
 export function MilestoneChecklist({ run, activity = null }: { run: Run; activity?: RunActivity | null }) {
-  // useNow ages the "now" line's client-side elapsed token; called before the early
-  // return so the hook order is stable (rules of hooks). A slow cadence is enough — the
-  // strip shows a coarse "40s"/"6m" token, not a live countdown.
-  const now = useNow(30_000);
-  const milestones = run.milestones ?? [];
-  if (milestones.length === 0) return null;
-  const completed = new Set(run.milestones_completed ?? []);
-  const inProgress = new Set(run.milestones_in_progress ?? []);
-  // Single source of truth for the done count — milestoneBadge counts frozen members
-  // present in the completed set (immune to duplicate ids), the same rule this list
-  // renders from. Non-null here since the frozen list is non-empty (checked above).
-  const progress = milestoneBadge(run);
-  const doneCount = progress?.done ?? 0;
-  // PRD #265 M2: a run that reported nothing shows "not reported" (–/N) instead of a
-  // 0/N that reads as failure. The rows below already render every milestone as ○
-  // (not-started) in that case, which is honest; only the header count changes.
-  const reported = progress?.reported ?? false;
-  // D4: the first in-progress id by frozen order is the one the header names and the
-  // strip attaches under. null when nothing is declared in progress.
-  const firstInProgress = firstInProgressMilestoneId(run);
-  // PRD #1224 M5 (D8): "effective attribution" = milestones_agents entries whose milestone
-  // is CURRENTLY in progress, in frozen order. ONLY a non-empty list activates per-milestone
-  // rendering; null / [] / stale-only fall back to the pre-#1224 render below (the M4
-  // baseline guards that path). We branch on this LENGTH, never on milestones_agents != null.
-  const effective = effectiveMilestoneAgents(run);
-  const attributed = effective.length > 0;
-  const effectiveById = new Map(effective.map((e) => [e.id, e]));
-  // D3: live tool/age enriches a strip ONLY when EXACTLY ONE effective attribution's declared
-  // agent byte-matches the live activity agent; zero or 2+ matches (a repeated role) suppress
-  // live on ALL strips — every strip then shows declared role + label only.
-  const uniqueMatchId = activity ? uniqueLiveMatchMilestoneId(effective, activity.agent) : null;
-  // PRD #1353 M4: the server-derived per-in-progress-milestone LIVE LANES (each lane a
-  // subagent working that milestone RIGHT NOW). When ANY milestone has a live lane, this is
-  // the AUTHORITATIVE live display and supersedes the single current_activity now-line: the
-  // declared owner renders QUIET (a non-pulsing "assigned to" line) and one green+pulsing
-  // strip renders per lane, keyed by agent_instance so distinct subagents (reviewer×2) show
-  // as distinct lines. We branch on PRESENCE of a lane (D5 back-compat), never on a nil test —
-  // null / [] / all-empty-lanes ALL fall through to the pre-#1353 render below, byte-for-byte.
-  const milestonesLiveById = new Map((run.milestones_live ?? []).map((e) => [e.milestone_id, e.lanes]));
-  const hasLanes = (run.milestones_live ?? []).some((e) => e.lanes.length > 0);
-  return (
-    <Card className="p-4">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-fg">Milestones (reported complete)</h2>
-        <span
-          className="flex items-center gap-1.5 font-mono text-xs tabular-nums text-faint"
-          title={reported ? undefined : "No milestone completion reported for this run"}
-        >
-          <span>{reported ? `${doneCount}/${milestones.length}` : `–/${milestones.length}`}</span>
-          {/* PRD #1064 M3: the in-progress marker names the first in-progress id by frozen
-              order (D4). Present only while a milestone is in progress. */}
-          {firstInProgress && (
-            <span className="text-info" title={`${firstInProgress} in progress`}>
-              ◐ {firstInProgress}
-            </span>
-          )}
-        </span>
-      </div>
-      {/* Unattached strip: a milestone run with activity but nothing declared in progress
-          shows the "now" line directly under the header (D5's "nothing declared" variant).
-          ONLY in the D8-fallback (unattributed) path — in the attributed path every strip
-          hangs off its own milestone row, so no unattached strip renders (and effective is
-          non-empty only when some milestone is in progress, so firstInProgress is set). */}
-      {!hasLanes && !attributed && !firstInProgress && activity && (
-        <MilestoneNowStrip
-          role={activity.agent}
-          label={activity.agent_label}
-          live={{ tool: activity.tool, detail: activity.detail, at: activity.at }}
-          status={run.status}
-          now={now}
-          variant="unattached"
-        />
-      )}
-      <ul className="mt-2 space-y-1.5">
-        {milestones.map((m) => {
-          const state = completed.has(m.id) ? "done" : inProgress.has(m.id) ? "in_progress" : "left";
-          const attribution = effectiveById.get(m.id);
-          // PRD #1353 M4 (tui-ux dedup): this milestone's live lanes, and whether the DECLARED
-          // owner is itself one of them (the common case — the dispatched owner is the one
-          // working). When it is, the quiet owner strip would DUPLICATE the owner's live lane
-          // strip (same role + label, once quiet + once live), so it is suppressed and the lane
-          // strip carries it. An IDLE owner (agent not among the lanes) still gets its quiet
-          // "assigned to" strip above the lanes.
-          const laneList = milestonesLiveById.get(m.id) ?? [];
-          const ownerIsLive = attribution ? laneList.some((l) => l.agent === attribution.agent) : false;
-          return (
-            <li key={m.id} className="text-sm">
-              <div className="flex items-center gap-2">
-                <MilestoneMark state={state} />
-                <span
-                  title={stripUnsafeChars(m.title)}
-                  className={cx(
-                    "min-w-0 truncate",
-                    state === "done" ? "text-muted line-through" : state === "in_progress" ? "text-fg" : "text-faint",
-                  )}
-                >
-                  {stripUnsafeChars(m.title)}
-                </span>
-              </div>
-              {hasLanes ? (
-                // PRD #1353 M4 LIVE-LANES path (the authoritative live display). For each
-                // in-progress milestone: the DECLARED owner renders QUIET (live=null → M1's
-                // non-pulsing "assigned to" line) ONLY when its agent is NOT already one of the
-                // lanes — otherwise the owner is live and its lane strip carries it, so the quiet
-                // strip is suppressed to avoid drawing the same role + label twice (tui-ux dedup).
-                // ONE live green+pulsing strip renders per lane, keyed by agent_instance. Neither
-                // the D8-fallback/unattached strip nor uniqueMatchId is consulted here — lanes
-                // supersede the current_activity now-line.
-                state === "in_progress" && (
-                  <>
-                    {attribution && !ownerIsLive && (
-                      <MilestoneNowStrip
-                        role={attribution.agent}
-                        label={attribution.agent_label}
-                        live={null}
-                        status={run.status}
-                        now={now}
-                        variant="active"
-                      />
-                    )}
-                    {laneList.map((lane) => (
-                      <MilestoneNowStrip
-                        key={lane.agent_instance}
-                        role={lane.agent}
-                        label={lane.agent_label}
-                        live={{ tool: lane.tool, detail: lane.detail, at: lane.at }}
-                        status={run.status}
-                        now={now}
-                        variant="active"
-                      />
-                    ))}
-                  </>
-                )
-              ) : attributed ? (
-                // PRD #1224 M5 attributed path (D8/D3/D9): every in-progress milestone with an
-                // effective attribution shows its DECLARED role + label; live tool/age is added
-                // ONLY to the single unique-match milestone (D3). The ◐ mark above is untouched
-                // (D9 — attribution is strictly additive).
-                attribution && (
-                  <MilestoneNowStrip
-                    role={attribution.agent}
-                    label={attribution.agent_label}
-                    live={
-                      m.id === uniqueMatchId && activity
-                        ? { tool: activity.tool, detail: activity.detail, at: activity.at }
-                        : null
-                    }
-                    status={run.status}
-                    now={now}
-                    variant="active"
-                  />
-                )
-              ) : (
-                // D8-fallback (unattributed): the "now" line sits under the FIRST in-progress
-                // row only (D4), sourced from the activity prop — structurally today's render.
-                activity &&
-                m.id === firstInProgress && (
-                  <MilestoneNowStrip
-                    role={activity.agent}
-                    label={activity.agent_label}
-                    live={{ tool: activity.tool, detail: activity.detail, at: activity.at }}
-                    status={run.status}
-                    now={now}
-                    variant="active"
-                  />
-                )
-              )}
-            </li>
-          );
-        })}
-      </ul>
-    </Card>
-  );
+  return <MilestoneRows run={run} activity={activity} />;
 }
 
 // CompletionStatePanel renders the HONEST completion-interlock detail (PRD #1226 M5, D8):
@@ -754,7 +433,7 @@ const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string
  * the DTO and this re-renders with no code here.
  *
  * The whole section is collapsible and the choice is remembered PER RUN for 7 days via
- * summaryCollapse (Decision 9); default expanded. All summary text is UNTRUSTED — model
+ * summaryCollapse; the default is expanded at the gate and collapsed afterwards. All summary text is UNTRUSTED — model
  * output over an attacker-influenceable issue/PRD/plan. The intent and plan paragraphs
  * render through the shared hardened <Markdown> sink (issue #423, revising the "rendered as
  * text (web)" clause of Decision 10) — the same untrusted-LLM trust boundary the judge
@@ -770,8 +449,11 @@ const DELTA_KIND: Record<string, { tone: BadgeTone; glyph: string; label: string
  * API mocks to mount, so the card states could not otherwise be asserted.
  */
 export function RunSummary({ run }: { run: Run }) {
-  // The persisted per-run collapse choice, read once on mount (default expanded).
-  const [collapsed, setCollapsed] = useState(() => summaryCollapse.getCollapsed(run.id));
+  // The explicit per-run preference wins over the state-dependent default.
+  const [collapsed, setCollapsed] = useState(() => summaryCollapse.getCollapsed(run.id) ?? run.status !== "awaiting_approval");
+  useEffect(() => {
+    setCollapsed(summaryCollapse.getCollapsed(run.id) ?? run.status !== "awaiting_approval");
+  }, [run.id, run.status]);
 
   const intent = typeof run.summary_intent === "string" ? run.summary_intent.trim() : "";
   const plan = typeof run.summary_plan === "string" ? run.summary_plan.trim() : "";
@@ -801,7 +483,8 @@ export function RunSummary({ run }: { run: Run }) {
   return (
     <Card className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-fg">Run summary</h2>
+        <div className="min-w-0"><h2 className="text-sm font-semibold text-fg">Run summary</h2>
+          {collapsed && <p className="mt-1 truncate text-xs text-muted">{stripUnsafeChars(intent.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/[#*_`>]/g, "")).slice(0, 150)}</p>}</div>
         <button
           type="button"
           onClick={toggle}
@@ -2244,10 +1927,6 @@ export function RunView() {
     }
   };
 
-  const stage = useMemo(
-    () => (run?.status === "running" ? stageForMessages(messages) : null),
-    [run?.status, messages],
-  );
 
   // PRD #40: usage derived client-side from the stream (Decision 5) — a pure
   // reduction re-run as messages grow, so it folds in live (Decision 9) with no
@@ -2428,6 +2107,82 @@ export function RunView() {
   return (
     <div className="space-y-5">
       <PageHeader
+        actions={<>
+          <details className="relative" onKeyDown={(event) => {
+            if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); }
+          }}>
+            <summary className="cursor-pointer rounded-md border border-edge px-3 py-1.5 text-sm text-muted">Run settings</summary>
+            <div className="absolute right-0 z-20 mt-2 grid w-[min(32rem,85vw)] gap-4 rounded-lg border border-edge bg-surface p-4 shadow-xl">
+              {!isCredentialDisabledHold(run) && (
+                <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
+              )}
+
+      {(run.credential_epochs?.length ?? 0) > 1 && <CredentialEpochList epochs={run.credential_epochs} />}      {run.status === "limit_wait" ? (
+        // Parked: keep the full-width countdown card stacked exactly as today (no flex
+        // item → no shrinking). MrReworkPanel still self-hides / renders beneath it via
+        // the page-wide space-y-5 rhythm, unchanged.
+        <>
+          <MrReworkPanel
+            run={run}
+            busy={busy}
+            canSteer={canSteer}
+            userDefault={mrReworkDefault}
+            onToggle={(enabled) =>
+              act(async () => {
+                await api.setRunMrRework(run.id, enabled);
+                // Not a status change, so no WS frame announces it — refetch so the checkbox
+                // reflects the new run value instead of snapping back to the stale one.
+                await refreshRun();
+              })
+            }
+          />
+        </>
+      ) : (
+        // Non-parked: the two simple inline toggles share one row from `sm` up, and stay
+        // cleanly stacked (two lines) on mobile — the two ~87-char labels would wrap
+        // raggedly if we relied on flex-wrap alone at narrow widths, so the breakpoint is
+        // explicit. Gated so no always-present empty <div> adds a stray space-y-5 margin
+        // on terminal runs where both panels render nothing. A job (PRD #1908 D-E) never
+        // parks on a usage limit and has no MR, so neither toggle means anything for it.
+        run.kind !== "job" &&
+        (canToggleWaitOnLimit(run.status) || (canSteer && canToggleMrRework(run))) && (
+          <div className="flex flex-col gap-y-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-6">
+            <LimitWaitPanel
+              run={run}
+              busy={busy}
+              canSteer={canSteer}
+              onStop={() => cancelRun()}
+              onToggle={(enabled) =>
+                act(async () => {
+                  await api.setRunWaitOnLimit(run.id, enabled);
+                  // The flag is not a status change, so no WS frame announces it — without
+                  // this refetch the checkbox would snap back to the stale run on the next
+                  // render, which reads as the write having failed.
+                  await refreshRun();
+                })
+              }
+            />
+            <MrReworkPanel
+              run={run}
+              busy={busy}
+              canSteer={canSteer}
+              userDefault={mrReworkDefault}
+              onToggle={(enabled) =>
+                act(async () => {
+                  await api.setRunMrRework(run.id, enabled);
+                  // Not a status change, so no WS frame announces it — refetch so the checkbox
+                  // reflects the new run value instead of snapping back to the stale one.
+                  await refreshRun();
+                })
+              }
+            />
+          </div>
+        )
+      )}
+</div></details>
+          <RunControls run={run} busy={busy} canSteer={canSteer} terminal={terminal}
+            onStop={() => cancelRun()} onPause={(mode) => act(async () => { await api.pauseRun(run.id, mode); await refreshRun(); })} />
+        </>}
         titleNode={
           <div
             className="min-w-0 run-head"
@@ -2547,9 +2302,6 @@ export function RunView() {
                   terminal run (those 409 server-side). It refreshes the run after a switch. */}
               {/* A credential_disabled hold offers the switch in its own panel, named for
                   what it does there ("Run with another token", PRD #1732 D16). */}
-              {!isCredentialDisabledHold(run) && (
-                <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
-              )}
               {/* PRD #1190: the pending-pause chip. Shown whenever a request is pending
                   (pause_requested_at set) — including on a run overtaken by an involuntary
                   park, where the intent survives (D6). Info-toned and, unlike the status
@@ -2611,12 +2363,7 @@ export function RunView() {
               {/* ci_fix runs (PRD #6): the failing-pipeline link (isHttpsUrl-guarded)
                   and the verdict chip, extracted for isolated testing. */}
               <CIFixRunHeader run={run} terminal={terminal} />
-              {stage && (
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info">
-                  <Spinner /> {stage}…
-                </span>
-              )}
-              {/* Run-health warn chip (PRD #47), next to the LIVE STAGE label. */}
+              {/* Run-health warn chip (PRD #47), in the header. */}
               <HealthFlag run={run} />
               {/* PRD #1189: the conditional Extend action, the way Expedite appears only on a
                   queued run — shown ONLY while the near-timeout ("slow") flag is up, and only when
@@ -2688,16 +2435,6 @@ export function RunView() {
                   stopped", not a live ticker. PRD #1189 adds the budget-remaining clause ("… left
                   when resumed") ahead of it when the run carries a wall budget. */}
               {run.status === "paused" && run.started_at && <PausedElapsed run={run} />}
-              {run.iteration_count > 0 && (
-                <Badge tone="neutral" title="implement ⇄ review iterations">
-                  iteration {run.iteration_count}
-                </Badge>
-              )}
-              {/* PRD #122: the compact milestone progress pill, shown ALONGSIDE the
-                  iteration badge on a milestone-structured run. milestoneBadge returns
-                  null for a run with no frozen list, so a pre-#122 run shows only the
-                  iteration badge — unchanged. */}
-              <MilestoneBadge run={run} />
               {/* PRD #1429 M4a / #1653 D-W5: the run's actual harness, the same round
                   logo chip as the run list, on every run. Placed ahead of the model badge —
                   which harness executed the run is more fundamental than which model within it. */}
@@ -2710,7 +2447,7 @@ export function RunView() {
               {/* PRD #1247 M7: the per-run credential OVERRIDE (the choice) + the pending
                   held-state SWITCH, distinct from RunCredential above (the credential the
                   claim SPENT). Self-hides when the run has neither. */}
-              <RunCredentialOverride run={run} />
+              {run.credential_switch && <RunCredentialOverride run={run} />}
               {/* PRD #300: the per-schedule model this run froze at fire time, shown on
                   EVERY status (not just completed) so a wrong/typo'd model is visible on a
                   FAILED or stopped run too (Risks / SC6). null = inherited the owner's
@@ -2735,27 +2472,6 @@ export function RunView() {
           </div>
         }
       />
-
-      {/* PRD #2602 M2: the progress card under the header's budget facts — percent, the
-          segmented plan track, the active role's phase, or the state flag that replaces a
-          misleading number. Renders nothing without a server-derived progress (terminal
-          runs, older servers). The role line uses the now-line's activity (live frames),
-          falling back to the DTO's current_activity before the first frame arrives. The
-          card itself shows that role only while one is at work (percent, stalled): a
-          waiting, parked, queued or planning run has no active role. */}
-      <RunProgressCard run={run} activity={activity ?? run.current_activity ?? null} />
-
-      {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
-          parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
-          because the panel below already carries the message for everyone else. The
-          effect fires after mount, so the region exists before its content changes even
-          on a page load that arrives at an already-parked run. */}
-      <div className="sr-only" role="status" aria-live="polite">
-        {resumeAnnounce || parkAnnounce}
-      </div>
-
-      <IssueInputHistory run={run} />
-
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
@@ -2764,10 +2480,57 @@ export function RunView() {
         <Alert tone="info" message={gateMismatchMessage(revisionMismatch, false)} />
       )}
 
-      {/* PRD #1391 Run B M3d (D13): a finished outcome is held on the run's worker because
-          the api could not land it. Surface it near the status so the owner knows why the
-          run has not closed and can resolve it — Stop/cancel takes the discard confirmation
-          path (cancelRun → the modal below). Self-hides when nothing is held. */}
+
+      {run.status === "awaiting_approval" && (
+        <PlanPanel
+          key={run.id}
+          run={run}
+          messages={messages}
+          workers={workers}
+          busy={busy}
+          canSteer={canSteer}
+          revisionMismatch={revisionMismatch}
+          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+            void gateAct(expectedGateRevision, () =>
+              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+            )
+          }
+          onReject={(reason, expectedGateRevision) =>
+            void gateAct(expectedGateRevision, () =>
+              submit("reject_plan", reason, undefined, undefined, undefined, expectedGateRevision),
+            )
+          }
+          onRequestChanges={(feedback, expectedGateRevision) =>
+            gateAct(expectedGateRevision, () =>
+              submit("revise_plan", feedback, undefined, undefined, undefined, expectedGateRevision),
+            )
+          }
+          onCancel={() => cancelRun()}
+        />
+      )}
+
+
+      {run.status === "awaiting_input" &&
+        (openQuestion ? (
+          <QuestionPanel
+            open={openQuestion}
+            busy={busy}
+            canSteer={canSteer}
+            onAnswer={(body) => act(() => submit("answer", body))}
+            onCancel={canSteer ? () => cancelRun() : undefined}
+          />
+        ) : (
+          // Parked, but the question is unusable — no question_id, or nothing renderable.
+          // Previously this rendered NOTHING: the run sat at "needs your answer" with no
+          // panel and no explanation until the deadline failed it, and an absent
+          // affordance reads as "not loaded yet", so the reasonable response was to wait.
+          <UnreadableQuestion
+            busy={busy}
+            onCancel={canSteer ? () => cancelRun() : undefined}
+          />
+        ))}
+
+
       {run.outcome_pending && (
         <div
           role="status"
@@ -2796,42 +2559,16 @@ export function RunView() {
         </div>
       )}
 
-      {/* PRD #1247 M7: the applied-switch history — one row per claim, naming the token it
-          spent, why, and when. Self-hides for a run with no epochs. */}
-      <CredentialEpochList epochs={run.credential_epochs} />
 
-      {/* Issue #754: the pool-empty hold + Resume-now. Ordered ABOVE the usage-limit
-          strip deliberately (web-ux should-fix): on a pool_wait run the strip below
-          renders its NON-parked "Wait out future usage limits" toggle, and
-          two recovery controls stacked let a user read that usage-limit checkbox as
-          the way to un-wait the pool hold, which it is not. Putting the pool panel
-          first makes the hold read as one self-contained unit (its own Resume-now is
-          the action), with the unrelated future-limit toggle clearly beneath it. This
-          does NOT disturb the limit_wait layout: PoolWaitPanel self-hides on every
-          status but pool_wait, so on a limit_wait run the strip below is still the
-          first thing rendered here. */}
-      <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
-
-      {/* Issue #1197: the transient-recovery hold. Ordered here beside PoolWaitPanel and
-          above the usage-limit strip for the SAME reason (web-ux): on a recovery_wait run
-          the strip below renders its NON-parked "Wait out future usage limits"
-          toggle, and two recovery controls stacked let a user misread that
-          usage-limit checkbox as the way to un-wait the recovery hold, which it is not.
-          RecoveryWaitPanel self-hides on every status but recovery_wait, so it does not
-          disturb the limit_wait/pool_wait layouts. Transient recovery uses automatic
-          backoff; worker exhaustion offers owner-proven Resume and Cancel controls. */}
-      <RecoveryWaitPanel
+      <CompletionDecisionPanel
         run={run}
-        ownerProof={canSteer && confirmedOwner === true}
+        canSteer={canSteer}
         busy={busy}
-        onResume={() => { void resumeExhaustedRun(); }}
-        onCancel={() => { void cancelRun(); }}
+        act={act}
+        refreshRun={refreshRun}
       />
 
-      {/* PRD #1190: the paused-run panel. Self-hides on every status but `paused`. Resume
-          hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
-          limit-wait panel's own Stop (a cancel input). */}
-      {/* PRD #1732 D14: the credential_disabled hold. Self-hides on every other state. */}
+
       <CredentialDisabledPanel
         run={run}
         canSteer={canSteer}
@@ -2856,9 +2593,7 @@ export function RunView() {
         onExtend={(seconds) => act(() => submit("extend", String(seconds)))}
       />
 
-      {/* PRD #1189: the near-timeout panel — modelled on LimitWaitPanel, rendered under the
-          header while the near-timeout ("slow") flag is up. It explains what will happen, when,
-          and what is already safe, then offers Extend + Stop in one row. Self-hides otherwise. */}
+
       <NearTimeoutPanel
         run={run}
         busy={busy}
@@ -2867,19 +2602,18 @@ export function RunView() {
         onStop={() => cancelRun()}
       />
 
-      {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
-          carries the only thing the user came to find out — when it resumes — and low
-          in weight otherwise, where it is just the per-run opt-in. Renders nothing at
-          all for a terminal run.
-          PRD #841: the per-run MR-review-rework toggle. Self-hides for a non-owner and
-          once the MR is merged/closed; visible on a completed issue run whose MR is
-          still open, because the watcher acts after completion. */}
-      {run.status === "limit_wait" ? (
-        // Parked: keep the full-width countdown card stacked exactly as today (no flex
-        // item → no shrinking). MrReworkPanel still self-hides / renders beneath it via
-        // the page-wide space-y-5 rhythm, unchanged.
-        <>
-          <LimitWaitPanel
+
+      <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
+      <RecoveryWaitPanel
+        run={run}
+        ownerProof={canSteer && confirmedOwner === true}
+        busy={busy}
+        onResume={() => { void resumeExhaustedRun(); }}
+        onCancel={() => { void cancelRun(); }}
+      />
+
+
+{run.status === "limit_wait" && (<>           <LimitWaitPanel
             run={run}
             busy={busy}
             canSteer={canSteer}
@@ -2894,70 +2628,10 @@ export function RunView() {
               })
             }
           />
-          <MrReworkPanel
-            run={run}
-            busy={busy}
-            canSteer={canSteer}
-            userDefault={mrReworkDefault}
-            onToggle={(enabled) =>
-              act(async () => {
-                await api.setRunMrRework(run.id, enabled);
-                // Not a status change, so no WS frame announces it — refetch so the checkbox
-                // reflects the new run value instead of snapping back to the stale one.
-                await refreshRun();
-              })
-            }
-          />
-        </>
-      ) : (
-        // Non-parked: the two simple inline toggles share one row from `sm` up, and stay
-        // cleanly stacked (two lines) on mobile — the two ~87-char labels would wrap
-        // raggedly if we relied on flex-wrap alone at narrow widths, so the breakpoint is
-        // explicit. Gated so no always-present empty <div> adds a stray space-y-5 margin
-        // on terminal runs where both panels render nothing. A job (PRD #1908 D-E) never
-        // parks on a usage limit and has no MR, so neither toggle means anything for it.
-        run.kind !== "job" &&
-        (canToggleWaitOnLimit(run.status) || (canSteer && canToggleMrRework(run))) && (
-          <div className="flex flex-col gap-y-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-6">
-            <LimitWaitPanel
-              run={run}
-              busy={busy}
-              canSteer={canSteer}
-              onStop={() => cancelRun()}
-              onToggle={(enabled) =>
-                act(async () => {
-                  await api.setRunWaitOnLimit(run.id, enabled);
-                  // The flag is not a status change, so no WS frame announces it — without
-                  // this refetch the checkbox would snap back to the stale run on the next
-                  // render, which reads as the write having failed.
-                  await refreshRun();
-                })
-              }
-            />
-            <MrReworkPanel
-              run={run}
-              busy={busy}
-              canSteer={canSteer}
-              userDefault={mrReworkDefault}
-              onToggle={(enabled) =>
-                act(async () => {
-                  await api.setRunMrRework(run.id, enabled);
-                  // Not a status change, so no WS frame announces it — refetch so the checkbox
-                  // reflects the new run value instead of snapping back to the stale one.
-                  await refreshRun();
-                })
-              }
-            />
-          </div>
-        )
-      )}
+ </>)}
+      <CompletionStatePanel run={run} />
 
-      {/* PRD #362 M4: the plain-English run summary — intent, proposed/approved plan, and
-          deltas from the original ask. Self-hides until a summary lands (the issue-title
-          header carries the run until then), collapsible + remembered per run. */}
-      <RunSummary run={run} />
 
-      {/* Terminal hero: the outcome, front and center. */}
       {run.status === "completed" && (
         <div className="rounded-xl border border-ok/40 bg-ok/10 p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -2998,36 +2672,6 @@ export function RunView() {
         </div>
       )}
 
-      {terminal && incidentalSummary?.runId === run.id && incidentalSummary.count > 0 && (
-        <Card className="flex flex-wrap items-center justify-between gap-2 p-3 text-sm">
-          <span>Incidental findings: {incidentalSummary.count} open</span>
-          <Link className="text-brand hover:underline" to={`/findings?run=${encodeURIComponent(run.id)}`}>
-            View findings
-          </Link>
-        </Card>
-      )}
-
-      {/* issue #279: a report-only run's deliverable is report_md. Render it right
-          under the completed hero, above the retrospective.
-
-          report_md is UNTRUSTED worker/model-authored text. It is DELIBERATELY rendered
-          as escaped plain text (React's default + whitespace-pre-wrap), never through
-          <Markdown> — the ingest scrub does NOT cover markdown/link injection, exactly as
-          review.summary_md is rendered below. If this is ever switched to a markdown/HTML
-          renderer, add sanitization first. See lib/safeText.ts. */}
-      {run.status === "completed" &&
-        run.report_only &&
-        run.report_md != null &&
-        run.report_md.trim() !== "" && (
-          <Card className="space-y-2 p-4">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Findings</h2>
-            {/* Cap a long summary and scroll it, like SeededPlanPanel, so the Activity feed
-                below stays reachable without a long page scroll. */}
-            <p className="max-h-96 overflow-auto whitespace-pre-wrap text-sm text-muted">
-              {stripUnsafeChars(run.report_md)}
-            </p>
-          </Card>
-        )}
 
       {terminal && run.status !== "completed" && (
         <div
@@ -3092,6 +2736,63 @@ export function RunView() {
         </div>
       )}
 
+
+      <RunProgressCard run={run} activity={activity ?? run.current_activity ?? null} usage={usage} />
+
+      {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
+          parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
+          because the panel below already carries the message for everyone else. The
+          effect fires after mount, so the region exists before its content changes even
+          on a page load that arrives at an already-parked run. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {resumeAnnounce || parkAnnounce}
+      </div>
+
+      <IssueInputHistory run={run} />
+
+      {/* PRD #1391 Run B M3d (D13): a finished outcome is held on the run's worker because
+          the api could not land it. Surface it near the status so the owner knows why the
+          run has not closed and can resolve it — Stop/cancel takes the discard confirmation
+          path (cancelRun → the modal below). Self-hides when nothing is held. */}
+      {/* PRD #1190: the paused-run panel. Self-hides on every status but `paused`. Resume
+          hits the widened /resume-now (api.resumeRun) then refetches; Stop mirrors the
+          limit-wait panel's own Stop (a cancel input). */}
+      {/* PRD #1732 D14: the credential_disabled hold. Self-hides on every other state. */}
+      {/* PRD #1189: the near-timeout panel — modelled on LimitWaitPanel, rendered under the
+          header while the near-timeout ("slow") flag is up. It explains what will happen, when,
+          and what is already safe, then offers Extend + Stop in one row. Self-hides otherwise. */}
+      <RunSummary run={run} />
+      {terminal && incidentalSummary?.runId === run.id && incidentalSummary.count > 0 && (
+        <Card className="flex flex-wrap items-center justify-between gap-2 p-3 text-sm">
+          <span>Incidental findings: {incidentalSummary.count} open</span>
+          <Link className="text-brand hover:underline" to={`/findings?run=${encodeURIComponent(run.id)}`}>
+            View findings
+          </Link>
+        </Card>
+      )}
+
+      {/* issue #279: a report-only run's deliverable is report_md. Render it right
+          under the completed hero, above the retrospective.
+
+          report_md is UNTRUSTED worker/model-authored text. It is DELIBERATELY rendered
+          as escaped plain text (React's default + whitespace-pre-wrap), never through
+          <Markdown> — the ingest scrub does NOT cover markdown/link injection, exactly as
+          review.summary_md is rendered below. If this is ever switched to a markdown/HTML
+          renderer, add sanitization first. See lib/safeText.ts. */}
+      {run.status === "completed" &&
+        run.report_only &&
+        run.report_md != null &&
+        run.report_md.trim() !== "" && (
+          <Card className="space-y-2 p-4">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Findings</h2>
+            {/* Cap a long summary and scroll it, like SeededPlanPanel, so the Activity feed
+                below stays reachable without a long page scroll. */}
+            <p className="max-h-96 overflow-auto whitespace-pre-wrap text-sm text-muted">
+              {stripUnsafeChars(run.report_md)}
+            </p>
+          </Card>
+        )}
+
       {/* Durable run recovery (PRD #1296 M5, D6/D7). A TOP-LEVEL section, deliberately
           NOT nested in the failed-card conditional above and NOT gated on captures.length:
           the panel fetches its own owner-scoped summary and decides truthfully — from the
@@ -3115,34 +2816,6 @@ export function RunView() {
           re-run action; it renders nothing for a non-terminal or ineligible run. */}
       {terminal && <JudgePanel run={run} />}
 
-      {run.status === "awaiting_approval" && (
-        <PlanPanel
-          key={run.id}
-          run={run}
-          messages={messages}
-          workers={workers}
-          busy={busy}
-          canSteer={canSteer}
-          revisionMismatch={revisionMismatch}
-          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
-            void gateAct(expectedGateRevision, () =>
-              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
-            )
-          }
-          onReject={(reason, expectedGateRevision) =>
-            void gateAct(expectedGateRevision, () =>
-              submit("reject_plan", reason, undefined, undefined, undefined, expectedGateRevision),
-            )
-          }
-          onRequestChanges={(feedback, expectedGateRevision) =>
-            gateAct(expectedGateRevision, () =>
-              submit("revise_plan", feedback, undefined, undefined, undefined, expectedGateRevision),
-            )
-          }
-          onCancel={() => cancelRun()}
-        />
-      )}
-
       {run.status !== "awaiting_approval" && <PlanCrossCheck run={run} />}
 
       {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the
@@ -3160,59 +2833,15 @@ export function RunView() {
           the window before the `question` message replays (the worker flushes it first,
           but a reconnecting client can read the status back first), and the question
           alone would keep offering a composer after the run resumed. */}
-      {run.status === "awaiting_input" &&
-        (openQuestion ? (
-          <QuestionPanel
-            open={openQuestion}
-            busy={busy}
-            canSteer={canSteer}
-            onAnswer={(body) => act(() => submit("answer", body))}
-            onCancel={canSteer ? () => cancelRun() : undefined}
-          />
-        ) : (
-          // Parked, but the question is unusable — no question_id, or nothing renderable.
-          // Previously this rendered NOTHING: the run sat at "needs your answer" with no
-          // panel and no explanation until the deadline failed it, and an absent
-          // affordance reads as "not loaded yet", so the reasonable response was to wait.
-          <UnreadableQuestion
-            busy={busy}
-            onCancel={canSteer ? () => cancelRun() : undefined}
-          />
-        ))}
-
       {/* Read-only record of which agents the run used, once a selection is made
           (at the gate or by an autopilot default). Shown for a live/terminal run;
           the picker above owns the awaiting_approval state. PRD #37 Decision 3(b). */}
       {run.status !== "awaiting_approval" && run.agent_source && (
         <AgentRosterSummary run={run} />
       )}
-
-      {/* PRD #122: the milestone checklist — done / in-progress / left, driven by the
-          frozen list + the reported-complete/in-progress id sets. Renders nothing for a
-          run with no milestones. */}
-      <MilestoneChecklist run={run} activity={activity} />
-
-      {/* PRD #1226 M5 (D8): the honest completion-interlock detail — the bounded unmet
-          milestone ids, the structural attempt count, and the same-worker-only hold
-          context. Renders nothing for a non-interlocked run (completion_phase "" and no
-          hold), so a run that predates or opts out of the interlock looks as today. */}
-      <CompletionStatePanel run={run} />
-
-      {/* PRD #1227 M4: the owner completion-decision controls — continue / reduce scope /
-          accept criteria, plus the immutable decision history. Self-hides unless the run is
-          completion-blocked (completion_phase === "blocked"). Gated on canSteer: a non-owner
-          sees inert text, never a button that would 404. Writes go through `act` so errors land
-          on the page banner and buttons disable on `busy`, then refreshRun re-reads the DTO. */}
-      <CompletionDecisionPanel
-        run={run}
-        canSteer={canSteer}
-        busy={busy}
-        act={act}
-        refreshRun={refreshRun}
-      />
-
       {(usage.hasLiveTokens || usage.hasConfirmed || hasSideUsage(usage)) && (
-        <Card className="p-4">
+        <Card className="p-4" >
+          <div id="run-full-usage" />
           {/* PRD #1429 M4b (D7): the server-truthed per-run cost_status, distinct from
               the client-derived `usage` above — "" on a pre-M1 run reads defensively
               as cost-unavailable inside the panel, never as a complete $0. */}
