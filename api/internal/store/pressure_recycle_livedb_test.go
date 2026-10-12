@@ -138,13 +138,13 @@ func TestPressureRecycleMigrationLockLiveDB(t *testing.T) {
 	if _, err := migration.Exec(ctx, "SET LOCAL lock_timeout = '100ms'"); err != nil {
 		t.Fatal(err)
 	}
-	// This is 00330's first statement; its failure leaves the constraint intact.
+	// This is 00332's first statement; its failure leaves the constraint intact.
 	_, err = migration.Exec(ctx, "ALTER TABLE workers DROP CONSTRAINT workers_draining_reason_check")
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
 		t.Fatalf("expected migration lock timeout behind a reader, got %v", err)
 	}
-	t.Log("00330 constraint replacement blocks behind a worker-table reader; deployment needs ACCESS EXCLUSIVE")
+	t.Log("00332 constraint replacement blocks behind a worker-table reader; deployment needs ACCESS EXCLUSIVE")
 }
 
 func TestPressureRecycleMigrationRoundtripLiveDB(t *testing.T) {
