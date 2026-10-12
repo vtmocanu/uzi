@@ -2270,7 +2270,22 @@ export interface WorkerRunDisk {
   sampled_at: string;
 }
 
+// Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
+// members are optional for skew and its recorded empty-object contract fixture.
+export interface WorkerRollPacing {
+  state?: "active" | "held" | "waiting_evidence" | "override";
+  target_image?: string;
+  target_version?: string;
+  canary_id?: string;
+  blocking_worker_id?: string;
+  blocking_reason?: string;
+  retained_image?: string;
+  retained_version?: string;
+}
+
 export interface Worker {
+  // Omitted when absent, invalid or older than the API's independent receipt TTL.
+  roll_pacing?: WorkerRollPacing;
   id: string;
   name: string;
   status: string; // "offline" | "online"
@@ -3564,6 +3579,7 @@ export interface CodeCrossCheckSummary {
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;
   repo_instructions_digest?: string;
+  repo_instructions_commit?: string | null;
   usage?: RunUsage | null;
   stage: string;
   round: number;

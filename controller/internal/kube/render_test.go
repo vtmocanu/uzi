@@ -25,6 +25,7 @@ func testConfig() RenderConfig {
 		ServiceAccountName: "uzi-hosted-worker",
 		APIURL:             "https://api.uzi.svc.cluster.local:8443",
 		StorageClass:       "standard",
+		RollTargetVersion:  "1.0.0", // authoritative stamp for the synthetic resolver pin
 	}
 }
 

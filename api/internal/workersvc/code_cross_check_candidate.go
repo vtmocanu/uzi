@@ -18,7 +18,7 @@ func codeCandidateDigest(cc store.CrossCheck) ([]byte, error) {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(cc.CodeContext))
 	decoder.DisallowUnknownFields()
-	if len(cc.CodeContext) > 2*262144 || decoder.Decode(&context) != nil ||
+	if (cc.RepoInstructionsCommit.Valid && (!validCodeSHA(cc.RepoInstructionsCommit.String) || !cc.HeadCommit.Valid || !cc.BaseCommit.Valid)) || len(cc.CodeContext) > 2*262144 || decoder.Decode(&context) != nil ||
 		validateCrossCheckContext(context.IssueTitle, context.IssueDescription) != nil ||
 		len(cc.PlanMd.String) > 256*1024 || !utf8.ValidString(cc.PlanMd.String) ||
 		len(cc.Milestones) > 256*1024 || len(cc.RequiredCapabilities) > 64 ||
@@ -51,6 +51,9 @@ func codeCandidateDigest(cc store.CrossCheck) ([]byte, error) {
 		"context": context, "plan_md": cc.PlanMd.String, "milestones": normalizedMilestones,
 		"required_capabilities": cc.RequiredCapabilities, "required_tools": cc.RequiredTools,
 		"size_class": cc.SizeClass.String, "guidance": cc.GuidanceSnapshot.String,
+	}
+	if cc.RepoInstructionsCommit.Valid {
+		binding["repo_instructions_commit"] = cc.RepoInstructionsCommit.String
 	}
 	// Legacy empty/off candidates retain their exact canonical bytes.
 	if cc.GuidanceSnapshot.String != "" || cc.RepoInstructionsEnabled {

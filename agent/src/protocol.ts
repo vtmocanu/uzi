@@ -1217,6 +1217,8 @@ export interface ClaimPlanCrossCheck {
 export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
   stage: "code";
   head_commit: string;
+  /** Fresh default tip bound independently of repository-instructions consent; absent on legacy claims. */
+  repo_instructions_commit?: string;
   code_context: unknown;
   guidance_snapshot: string;
   /** Frozen repository-instructions consent and text (PRD #2170); text is "" unless enabled. */

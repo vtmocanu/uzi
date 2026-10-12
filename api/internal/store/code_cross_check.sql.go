@@ -16,7 +16,7 @@ const bankCodeCrossCheckWait = `-- name: BankCodeCrossCheckWait :execrows
 WITH credited AS (
  UPDATE cross_checks cc SET wait_credited = true
  WHERE cc.id = $1 AND cc.stage = 'code' AND cc.outcome <> 'pending'
- AND cc.decided_at IS NOT NULL AND NOT cc.wait_credited RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+ AND cc.decided_at IS NOT NULL AND NOT cc.wait_credited RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit
 )
 UPDATE runs lead SET budget_paused_seconds = lead.budget_paused_seconds +
  GREATEST(0, CEIL(EXTRACT(EPOCH FROM (cc.decided_at - cc.created_at)))::int)
@@ -261,7 +261,7 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
  AND lead.claim_generation = cc.lead_claim_generation AND lead.worker_id = child.worker_id
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND now() < cc.deadline_at
-RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit
 `
 
 type DecideCodeCrossCheckParams struct {
@@ -324,6 +324,7 @@ func (q *Queries) DecideCodeCrossCheck(ctx context.Context, arg DecideCodeCrossC
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -337,13 +338,13 @@ WITH expired AS (
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND cc.lead_claim_generation = lead.claim_generation AND cc.stage = 'code'
  AND cc.outcome = 'pending' AND cc.deadline_at <= now()
- RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+ RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit
 ), cancelled AS (
  UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
  claim_released_at = now() FROM expired cc WHERE child.id = cc.checker_run_id
  AND child.status NOT IN ('completed','failed','cancelled')
 )
-SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at FROM expired
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at, repo_instructions_commit FROM expired
 `
 
 type ExpireCodeCrossCheckParams struct {
@@ -393,6 +394,7 @@ type ExpireCodeCrossCheckRow struct {
 	RepoInstructionsDigest  []byte             `json:"repo_instructions_digest"`
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
+	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
 }
 
 func (q *Queries) ExpireCodeCrossCheck(ctx context.Context, arg ExpireCodeCrossCheckParams) (ExpireCodeCrossCheckRow, error) {
@@ -439,6 +441,7 @@ func (q *Queries) ExpireCodeCrossCheck(ctx context.Context, arg ExpireCodeCrossC
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -453,7 +456,7 @@ WHERE lead.id = cc.lead_run_id AND child.id = cc.checker_run_id
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND cc.lead_claim_generation = lead.claim_generation
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND child.status IN ('completed','failed','cancelled')
-RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit
 `
 
 type FailDeadCodeCrossCheckChildParams struct {
@@ -506,6 +509,7 @@ func (q *Queries) FailDeadCodeCrossCheckChild(ctx context.Context, arg FailDeadC
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -519,7 +523,7 @@ WHERE lead.id = cc.lead_run_id AND lead.id = $2
  AND cc.lead_claim_generation = lead.claim_generation
  AND cc.stage = 'code' AND cc.outcome = 'completed' AND cc.decided_at IS NOT NULL
  AND cc.interrupted_at IS NULL AND cc.finalized_at IS NULL AND cc.dispositions IS NULL
-RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit
 `
 
 type FinalizeCodeCrossCheckDispositionsParams struct {
@@ -578,12 +582,13 @@ func (q *Queries) FinalizeCodeCrossCheckDispositions(ctx context.Context, arg Fi
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
 
 const getCodeCrossCheck = `-- name: GetCodeCrossCheck :one
-SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at FROM cross_checks WHERE lead_run_id = $1 AND stage = 'code' FOR UPDATE
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at, repo_instructions_commit FROM cross_checks WHERE lead_run_id = $1 AND stage = 'code' FOR UPDATE
 `
 
 func (q *Queries) GetCodeCrossCheck(ctx context.Context, leadRunID uuid.UUID) (CrossCheck, error) {
@@ -630,12 +635,13 @@ func (q *Queries) GetCodeCrossCheck(ctx context.Context, leadRunID uuid.UUID) (C
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
 
 const getCodeCrossCheckForOwner = `-- name: GetCodeCrossCheckForOwner :one
-SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
+SELECT cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit FROM cross_checks cc JOIN runs lead ON lead.id = cc.lead_run_id
 WHERE cc.lead_run_id = $1 AND lead.user_id = $2 AND cc.stage = 'code'
 `
 
@@ -688,6 +694,7 @@ func (q *Queries) GetCodeCrossCheckForOwner(ctx context.Context, arg GetCodeCros
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -718,7 +725,7 @@ func (q *Queries) GetCodeCrossCheckRepoInputsForUpdate(ctx context.Context, arg 
 }
 
 const getCrossCheckByChild = `-- name: GetCrossCheckByChild :one
-SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at FROM cross_checks WHERE checker_run_id = $1
+SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at, repo_instructions_commit FROM cross_checks WHERE checker_run_id = $1
 `
 
 func (q *Queries) GetCrossCheckByChild(ctx context.Context, childID pgtype.UUID) (CrossCheck, error) {
@@ -765,6 +772,7 @@ func (q *Queries) GetCrossCheckByChild(ctx context.Context, childID pgtype.UUID)
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -774,20 +782,20 @@ INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, head
  base_commit, candidate_digest, checker_run_id, checker_harness, deadline_at, verdict,
  outcome, code_context, guidance_snapshot, plan_md, milestones, required_capabilities,
  required_tools, size_class, guidance_text, guidance_digest,
- repo_instructions_enabled, repo_instructions_text, repo_instructions_digest)
+ repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, repo_instructions_commit)
 SELECT lead.id, 'code', 1, lead.claim_generation, $1::text, $2::text,
  $3::bytea, child.id, child.harness, $4::timestamptz, 'failed',
  'pending', $5::jsonb, $6::text, lead.plan_md, lead.milestones_frozen,
  lead.required_capabilities, lead.required_tools, lead.size_class,
  $6::text, sha256(convert_to($6::text, 'UTF8')),
- $7::boolean, $8::text, sha256(convert_to($8::text, 'UTF8'))
-FROM runs lead JOIN runs child ON child.id = $9
-WHERE lead.id = $10 AND child.target_run_id = lead.id AND child.kind = 'cross_check'
+ $7::boolean, $8::text, sha256(convert_to($8::text, 'UTF8')), $9::text
+FROM runs lead JOIN runs child ON child.id = $10
+WHERE lead.id = $11 AND child.target_run_id = lead.id AND child.kind = 'cross_check'
  AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
  AND child.harness <> lead.harness
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = lead.id AND cc.stage = 'code')
-RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at
+RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at, repo_instructions_commit
 `
 
 type InsertCodeCrossCheckParams struct {
@@ -799,6 +807,7 @@ type InsertCodeCrossCheckParams struct {
 	GuidanceText            string             `json:"guidance_text"`
 	RepoInstructionsEnabled bool               `json:"repo_instructions_enabled"`
 	RepoInstructionsText    string             `json:"repo_instructions_text"`
+	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
 	CheckerRunID            uuid.UUID          `json:"checker_run_id"`
 	LeadRunID               uuid.UUID          `json:"lead_run_id"`
 }
@@ -813,6 +822,7 @@ func (q *Queries) InsertCodeCrossCheck(ctx context.Context, arg InsertCodeCrossC
 		arg.GuidanceText,
 		arg.RepoInstructionsEnabled,
 		arg.RepoInstructionsText,
+		arg.RepoInstructionsCommit,
 		arg.CheckerRunID,
 		arg.LeadRunID,
 	)
@@ -858,6 +868,7 @@ func (q *Queries) InsertCodeCrossCheck(ctx context.Context, arg InsertCodeCrossC
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -866,25 +877,25 @@ const insertFailedCodeCrossCheck = `-- name: InsertFailedCodeCrossCheck :one
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
  base_commit, head_commit, candidate_digest, verdict, outcome, reason_class,
  code_context, guidance_snapshot, guidance_text, guidance_digest,
- repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, deadline_at, decided_at,
+ repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, repo_instructions_commit, deadline_at, decided_at,
  wait_credited, plan_md, milestones, required_capabilities, required_tools, size_class)
 SELECT lead.id, 'code', 1, lead.claim_generation,
  $1::text, $2::text,
  $3::bytea, 'failed', 'failed', $4::text,
  $5::jsonb, $6::text, $6::text, sha256(convert_to($6::text, 'UTF8')),
- $7::boolean, $8::text, sha256(convert_to($8::text, 'UTF8')), now(), now(), true,
+ $7::boolean, $8::text, sha256(convert_to($8::text, 'UTF8')), $9::text, now(), now(), true,
  CASE WHEN $2::text IS NOT NULL THEN lead.plan_md END,
  CASE WHEN $2::text IS NOT NULL THEN lead.milestones_frozen END,
  CASE WHEN $2::text IS NOT NULL THEN lead.required_capabilities ELSE '{}' END,
  CASE WHEN $2::text IS NOT NULL THEN lead.required_tools ELSE '{}' END,
  CASE WHEN $2::text IS NOT NULL THEN lead.size_class END
-FROM runs lead WHERE lead.id = $9 AND lead.worker_id = $10
- AND lead.user_id = $11 AND lead.claim_generation = $12
+FROM runs lead WHERE lead.id = $10 AND lead.worker_id = $11
+ AND lead.user_id = $12 AND lead.claim_generation = $13
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.claim_released_at IS NULL
  AND lead.code_cross_check_required AND NOT lead.report_only
  AND lead.fix_verdict IS DISTINCT FROM 'not_code'
  AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
-RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at
+RETURNING id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at, repo_instructions_commit
 `
 
 type InsertFailedCodeCrossCheckParams struct {
@@ -896,6 +907,7 @@ type InsertFailedCodeCrossCheckParams struct {
 	GuidanceText            string      `json:"guidance_text"`
 	RepoInstructionsEnabled bool        `json:"repo_instructions_enabled"`
 	RepoInstructionsText    string      `json:"repo_instructions_text"`
+	RepoInstructionsCommit  pgtype.Text `json:"repo_instructions_commit"`
 	LeadRunID               uuid.UUID   `json:"lead_run_id"`
 	WorkerID                pgtype.UUID `json:"worker_id"`
 	UserID                  uuid.UUID   `json:"user_id"`
@@ -912,6 +924,7 @@ func (q *Queries) InsertFailedCodeCrossCheck(ctx context.Context, arg InsertFail
 		arg.GuidanceText,
 		arg.RepoInstructionsEnabled,
 		arg.RepoInstructionsText,
+		arg.RepoInstructionsCommit,
 		arg.LeadRunID,
 		arg.WorkerID,
 		arg.UserID,
@@ -959,6 +972,7 @@ func (q *Queries) InsertFailedCodeCrossCheck(ctx context.Context, arg InsertFail
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }
@@ -1214,7 +1228,7 @@ WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
  AND lead.harness <> cc.checker_harness
  AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
  AND now() < cc.deadline_at
-RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at
+RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit
 `
 
 type RecordCodeCrossCheckClaimParams struct {
@@ -1279,6 +1293,7 @@ func (q *Queries) RecordCodeCrossCheckClaim(ctx context.Context, arg RecordCodeC
 		&i.RepoInstructionsDigest,
 		&i.Dispositions,
 		&i.FinalizedAt,
+		&i.RepoInstructionsCommit,
 	)
 	return i, err
 }

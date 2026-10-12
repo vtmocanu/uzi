@@ -146,7 +146,7 @@ it("fetchDefaultTip refreshes a literal plus-leading branch instead of treating 
     assert.equal(git(bare, "rev-parse", "refs/remotes/origin/+release"), fresh);
     const fetch = remoteCommands(requests).find((r) => r.argv.includes("fetch"));
     assert.ok(fetch);
-    assert.deepEqual(fetch.argv.slice(fetch.argv.indexOf("fetch")), ["fetch", "--", "origin", "refs/heads/+release"]);
+    assert.deepEqual(fetch.argv.slice(fetch.argv.indexOf("fetch")), ["fetch", "--", "origin", "+refs/heads/+release:refs/remotes/origin/+release"]);
   } finally { fx.cleanup(); }
 });
 

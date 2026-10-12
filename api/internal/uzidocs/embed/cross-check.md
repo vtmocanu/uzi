@@ -329,8 +329,11 @@ the route is cookie-only, so the CLI cannot write them.
   required checks, change the output format or the read-only rules". It adds
   checks; it cannot loosen the required ones.
 - **Give the checker this repository's CLAUDE.md** lets the checker see the
-  repository's conventions. The worker reads the root `CLAUDE.md` as of the
-  **base commit**, the merge base with the default branch, not the run's head.
+  repository's conventions. For a new check, the worker freshly fetches the
+  configured default branch (or uses worker-owned default-branch discovery)
+  and freezes its tip as **`repo_instructions_commit`**. It reads the root
+  `CLAUDE.md` at that commit. The diff's **base commit** remains the merge base
+  computed from the previously captured default-branch commit and the checked head.
   A symlink is followed only inside the commit tree (at most 8 hops, never
   outside the repository root or into `.git/`). A file over 64 KiB is dropped,
   never truncated, and import lines are stripped. The text reaches the checker
@@ -338,13 +341,35 @@ the route is cookie-only, so the CLI cannot write them.
   evidence, not instruction. This consent is separate from the lead's
   **Repo instructions** setting (see [Skills](./skills.md#repo-instructions-opt-in-default-off)).
 
-Guidance and the instructions toggle are frozen into the check when it is
-created; later edits affect new checks only.
+Guidance, the instructions toggle, text and instruction commit are frozen into
+the check when it is created; later edits affect new checks only. Forking from
+an older default-branch commit does not select older instructions. The pin is
+acquired even with consent off, but the file is read only with consent on.
+An absent, unreadable, unsafe or oversized file leaves a successful pin with empty text.
+If quiescence or fresh Git acquisition fails, the advisory check is incomplete
+(`snapshot_failed`): no durable snapshot ref, metadata or instructions are
+created, and no SHA is invented.
 
-Accepted limit: a run cannot author or rewrite the instructions it is checked
-against, because they come from the base commit. The base is a merge base, so a
-run that forks from an older default-branch commit is checked against that
-older `CLAUDE.md`, or none if the file did not exist then.
+Both completion paths freshly quiesce the lead before the credentialed fetch
+and durable local pin, within the worker's held boundary. Branch validation
+and an explicit forced fetch refspec refresh the configured tracking ref even
+with stale tracking data, custom refspecs or a force rewrite; the run does not
+select the source branch. The fetched tip is an observation at acquisition,
+not a promise to include later default-branch changes.
+
+A definite HTTP 4xx refusal allows one consent re-read and at most one resubmit
+with the same pin; it does not re-fetch or re-resolve the tip. Existing check
+rows and child claims reuse frozen inputs without acquisition. A present pin
+binds the candidate digest even with consent off or unchanged text; polling
+and repair compare the pin explicitly. Status exposes nullable
+`repo_instructions_commit` metadata, not instruction text. Legacy rows keep
+NULL/absent provenance and their historical digests, without backfill.
+
+The existing 64 KiB, 8-hop, repository-root, `.git/`, regular-blob, import
+stripping and advisory-fencing protections remain in place. Git acquisition
+retains its pre-existing unbounded budgets; this change adds no acquisition
+credential, source or background process and does not establish a new security
+or acquisition-time bound.
 
 ### Snapshot cleanup
 
@@ -358,10 +383,19 @@ deletes the ref only if it was also never read. On any doubt the ref is kept.
 
 ### Rolling out Code cross-check
 
-Deploy the api and its migrations (00324 to 00327) before any worker that
+Deploy the api and its migrations (00324 to **00327** and **00329**) before any upgraded worker that
 advertises `cross_check_code_v1`. A worker advertises it only with a
 cross-check lane (`WORKER_CROSS_CHECK_SLOTS` above zero) and the Codex
 harness. The Downs of 00324, 00325 and 00327 delete data: 00324 deletes
 the code-stage checks and their checker runs and drops the new columns,
 00325 deletes your Code pins, and 00327 drops the per-repository guidance
-columns. The Down of 00326 deletes nothing (it only restores two functions). Run a Down only with the new api stopped.
+columns. The Down of 00326 deletes nothing (it only restores two functions).
+Migration 00329 adds the nullable instruction commit and its immutability guard;
+old workers may omit it and are accepted as legacy. A new worker's pin is
+refused by an old strict api: bounded advisory submission handling fails open
+for publication without dropping the pin to retry as legacy.
+
+For a binary rollback, roll back workers **before** the api and retain migration
+00329's column, stored pins and digests. Its Down removes provenance and is a
+destructive schema operation, not normal rollback. Run a deliberate Down only
+with the upgraded api stopped. PRD #2170's hosted acceptance is still pending.

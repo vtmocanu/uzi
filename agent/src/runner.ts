@@ -11089,36 +11089,46 @@ export class RunRunner {
           const decision = await this.runGatedSink(flight, async () => {
             codeGate ??= new CodeCrossCheckGate({
             client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
-            readInstructions: async (baseCommit: string, signal: AbortSignal) => {
+            readInstructions: async (instructionsCommit: string, signal: AbortSignal) => {
               if (!barePath) return "";
-              const read = await readRepoInstructionsAtCommit(this.git, barePath, baseCommit, { timeoutMs: 15_000, signal });
+              const read = await readRepoInstructionsAtCommit(this.git, barePath, instructionsCommit, { timeoutMs: 15_000, signal });
               if (!("text" in read)) runLog.warn("code cross-check repository instructions not read", { reason: read.dropped });
               return "text" in read ? read.text : "";
             },
             snapshot: async () => {
               if (!barePath) return { reason_class: "snapshot_failed" as const };
-              if (!completion.interlocked) {
-                codeSnapshot = undefined;
-                try {
-                  // A local-only checkpoint boundary: no overlay, publication or origin preparation.
-                  await this.reapForSink(executor,
-                    { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: "done_checkpoint" },
-                    async () => {
+              if (!completion.interlocked) codeSnapshot = undefined;
+              let snapshot: { head_commit: string; base_commit: string; repo_instructions_commit: string } | undefined;
+              try {
+                // Both completion paths prove fresh quiescence and retain the credentialed fetch
+                // and durable pin inside reapForSink's held boundary/process spawner.
+                await this.reapForSink(executor,
+                  { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: "done_checkpoint" },
+                  async () => {
+                    if (!completion.interlocked) {
                       const original = await this.git.branchTip(runnerClone.path, runnerClone.branch);
                       const imported = await this.fetchBackBestEffort(barePath!, runnerClone.path, runnerClone.branch, flight, runLog);
                       if (imported.kind === "updated") await captureImportedCodeHead(original);
-                    }, flight, { keepClone: false });
-                } catch (err) { runLog.warn("code snapshot unavailable", { error: errMessage(err) }); }
+                    }
+                    if (codeEmptyPrompt || !codeSnapshot || !codeDefaultCommit) return;
+                    const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath!);
+                    if (!defaultBranch) throw new Error("code instructions default branch unavailable");
+                    const instructionsCommit = await this.git.fetchDefaultTip(
+                      barePath!, defaultBranch, claim.secrets.forge_pat,
+                      claim.repo.clone_url, claim.secrets.forge_username,
+                    );
+                    // codeDefaultCommit remains the captured diff input even if default advanced.
+                    const pinned = await this.git.pinCodeSnapshot(barePath!, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
+                    codeFreshReceipt = pinned.freshReceipt;
+                    snapshot = { head_commit: pinned.head_commit, base_commit: pinned.base_commit,
+                      repo_instructions_commit: instructionsCommit };
+                  }, flight, { keepClone: false });
+              } catch (err) {
+                runLog.warn("code snapshot unavailable", { error: errMessage(err) });
+                return { reason_class: "snapshot_failed" as const };
               }
               if (codeEmptyPrompt) return undefined;
-              if (codeSnapshot && codeDefaultCommit) {
-                try {
-                  const pinned = await this.git.pinCodeSnapshot(barePath, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
-                  codeFreshReceipt = pinned.freshReceipt;
-                  return { head_commit: pinned.head_commit, base_commit: pinned.base_commit };
-                } catch { return { reason_class: "snapshot_failed" as const }; }
-              }
-              return { reason_class: "snapshot_failed" as const };
+              return snapshot ?? { reason_class: "snapshot_failed" as const };
             },
             });
             return codeGate.done({ repairAvailable: completion.repairAvailable !== false });
@@ -14150,12 +14160,14 @@ export class RunRunner {
         forgeUsername: claim.secrets.forge_username,
         signal,
       });
-      // issue #1507 — a durable replacement now exists on the SUCCESS outcomes (the bundle is
-      // archived, or the head was already forge-published — both surface state "uploaded"), so the
-      // transient bare pin can go. On any retain (needs_action) LEAVE it as the durable anchor that
-      // keeps the retained source's exact head reachable in the bare.
-      if (outcome.state === "uploaded") {
-        await this.git.deleteRecoveryPin(barePath, claim.run_id, generation);
+      // issue #1507 — the transient bare pin goes only once a durable replacement exists. An archive
+      // upload's pin is deleted by the recovery coordinator itself (cleanupUploadedRecoveryPin, after
+      // verifying the archive proof under the journal lock) once the run is no longer executing (live pass or boot), never here.
+      // Only the already-published outcome (head on the forge, nothing archived) is deleted here, and
+      // with the pinned head as the expected SHA so a moved ref is retained. On any retain
+      // (needs_action) LEAVE it as the durable anchor that keeps the retained source reachable.
+      if (outcome.state === "uploaded" && outcome.reason === "already_published") {
+        await this.git.deleteRecoveryPin(barePath, claim.run_id, generation, record.sourceSha);
       }
       runLog.info("recovery: park/early-terminal disposition outcome", {
         run_id: claim.run_id,

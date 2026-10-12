@@ -85,6 +85,7 @@
   "code_cross_check_summary": {
     "custom_guidance_applied": true,
     "guidance_digest": "x",
+    "repo_instructions_commit": "x",
     "repo_instructions_enabled": true,
     "repo_instructions_digest": "x",
     "stage": "x",

@@ -297,6 +297,7 @@ type CrossCheck struct {
 	RepoInstructionsDigest  []byte             `json:"repo_instructions_digest"`
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
+	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -1522,6 +1523,9 @@ type Worker struct {
 	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
 	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
 	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
+	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason           pgtype.Text        `json:"draining_reason"`
 }
 
 type WorkerActiveRun struct {
@@ -1569,4 +1573,6 @@ type WorkerUpgradeReport struct {
 	WorkerImageTag       pgtype.Text        `json:"worker_image_tag"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	Pacing               []byte             `json:"pacing"`
+	PacingObservedAt     pgtype.Timestamptz `json:"pacing_observed_at"`
 }

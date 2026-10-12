@@ -2348,7 +2348,11 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 }
 
 // RegisterWithCrossCheckSlots validates the independently advertised checker budget.
-func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns, maxCrossCheckSlots *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns, maxCrossCheckSlots *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot, podUID ...uuid.UUID) (store.Worker, string, error) {
+	var registeredPodUID pgtype.UUID
+	if wkr.Kind == "hosted" && len(podUID) == 1 && podUID[0] != uuid.Nil {
+		registeredPodUID = pgconv.UUID(podUID[0])
+	}
 	if maxCrossCheckSlots != nil && (*maxCrossCheckSlots < 0 || *maxCrossCheckSlots > 16) {
 		return store.Worker{}, "", errors.New("max_cross_check_slots must be between 0 and 16")
 	}
@@ -2386,6 +2390,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// it here — which correctly makes it unable to claim an interlocked run.
 	protocolCaps := capability.FilterProtocol(protocolCapabilities)
 	regParams := store.RegisterWorkerParams{
+		RegisteredPodUid:      registeredPodUID,
 		Version:               pgconv.TextOrNull(version),
 		TemplateReported:      pgconv.TextOrNull(template),
 		Capabilities:          storedCaps,
@@ -2764,6 +2769,14 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		missingRequeued []store.FrozenRequeueRunsMissingFromSnapshotRow
 	)
 	if applied {
+		if updated.Kind == "hosted" && updated.RegisteredPodUid.Valid {
+			updated.RollHeartbeatAt, err = qtx.StampWorkerRollHeartbeat(ctx, store.StampWorkerRollHeartbeatParams{
+				ID: updated.ID, RegisterNonce: updated.SnapshotRegisterNonce, SnapshotEpoch: snapshot.SnapshotEpoch,
+			})
+			if err != nil {
+				return store.Worker{}, err
+			}
+		}
 		frozen, parents, err := locks.parameters()
 		if err != nil {
 			return store.Worker{}, err

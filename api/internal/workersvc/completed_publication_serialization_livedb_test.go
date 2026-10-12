@@ -252,6 +252,12 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	// This fixture tests migration 320's publication semantics with the current DAO.
+	// Later nullable worker evidence is unrelated to that migration; provide its
+	// default-null projection without applying or testing later migrations here.
+	if _, err := pool.Exec(ctx, "ALTER TABLE workers ADD COLUMN registered_pod_uid uuid, ADD COLUMN roll_heartbeat_at timestamptz, ADD COLUMN draining_reason text"); err != nil {
+		t.Fatal(err)
+	}
 	// The sqlc queries these paths drive track head, but this private database sits
 	// below the code cross-check migrations (00324 and 00327), so add the columns
 	// those queries select as inert shims: plain columns with the migrations' types
@@ -270,6 +276,7 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 			ADD COLUMN IF NOT EXISTS repo_instructions_enabled boolean NOT NULL DEFAULT false,
 			ADD COLUMN IF NOT EXISTS repo_instructions_text text,
 			ADD COLUMN IF NOT EXISTS repo_instructions_digest bytea,
+			ADD COLUMN IF NOT EXISTS repo_instructions_commit text,
 			ADD COLUMN IF NOT EXISTS dispositions jsonb,
 			ADD COLUMN IF NOT EXISTS finalized_at timestamptz`,
 	} {
@@ -341,9 +348,13 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		fresh.pool, fresh.q = pool, store.New(pool)
 		return fresh
 	}
-	// isolatedPublicationDB's code cross-check shims stand in for columns 00324 and 00327 add;
+	// isolatedPublicationDB's shims stand in for the code cross-check columns 00324, 00327 and 00329 add
+	// and the worker roll columns 00330 adds;
 	// drop them so the walk to head adds the real columns instead of colliding with the shims.
 	for _, ddl := range []string{
+		`ALTER TABLE workers DROP COLUMN IF EXISTS registered_pod_uid,
+			DROP COLUMN IF EXISTS roll_heartbeat_at,
+			DROP COLUMN IF EXISTS draining_reason`,
 		"ALTER TABLE users DROP COLUMN IF EXISTS code_cross_check_enabled",
 		"ALTER TABLE runs DROP COLUMN IF EXISTS code_cross_check_required",
 		`ALTER TABLE repos DROP COLUMN IF EXISTS code_cross_check_guidance,
@@ -357,6 +368,7 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 			DROP COLUMN IF EXISTS repo_instructions_enabled,
 			DROP COLUMN IF EXISTS repo_instructions_text,
 			DROP COLUMN IF EXISTS repo_instructions_digest,
+			DROP COLUMN IF EXISTS repo_instructions_commit,
 			DROP COLUMN IF EXISTS dispositions,
 			DROP COLUMN IF EXISTS finalized_at`,
 	} {

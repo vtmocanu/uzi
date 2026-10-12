@@ -49,8 +49,8 @@ import (
 // tests substitute a fake.
 //
 // It is nil-safe by design: a nil Cordoner DISABLES cordoning, so a busy drifted
-// worker is simply DEFERRED (never rolled) rather than hard-killed, and the no-drift
-// uncordon step is skipped the same way. That keeps the whole feature fail-safe even
+// worker is simply DEFERRED (never rolled) rather than hard-killed, and any
+// provenance-aware release is skipped the same way. That keeps the whole feature fail-safe even
 // in a build or config where the channel is absent — the one thing that must never
 // happen is Recreate-killing a busy worker.
 type Cordoner interface {
@@ -62,11 +62,12 @@ type Cordoner interface {
 // roll despite the M4 cordon-then-defer default (PRD #422 M5). Both are controller config
 // (a chart value + a controller env), not wire data, per Decision 4:
 //
-//   - Deadline bounds how long a cordoned busy worker delays its roll. Once
-//     now-DrainingSince >= Deadline the controller rolls it anyway (its in-flight run
-//     requeues), so a worker parked at an approval gate cannot hold the old image forever.
-//   - ForceRoll, when true, rolls every drifted worker immediately regardless of busy —
-//     the emergency override (e.g. a CVE), accepting the in-flight requeue.
+//   - Deadline bounds busy deferral only after admission. An elapsed image-roll
+//     drain may requeue an in-flight run, but never bypasses pacing, coverage or hold.
+//     Independent maintenance retains its own fences and deadline policy.
+//   - ForceRoll explicitly bypasses pacing, hold, incarnation proof and busy
+//     deferral, accepting lost capacity and in-flight requeue. Existing custody
+//     and independent maintenance protections still apply.
 type DrainPolicy struct {
 	Deadline  time.Duration
 	ForceRoll bool
@@ -97,6 +98,7 @@ type RecyclePolicy struct {
 const pvcBindTimeout = 10 * time.Minute
 
 type Materializer struct {
+	pacing   map[string]*protocol.Pacing
 	client   kubernetes.Interface
 	cfg      RenderConfig
 	resolver preset.Resolver
@@ -262,6 +264,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o := get(id)
 		o.HasDeployment = true
 		o.DeploymentUID = string(d.UID)
+		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
 		if img := workerImage(d); img != "" {
 			targetImages[id] = img
@@ -559,12 +562,51 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	}
 
 	var errs []error
+	tick, order := m.planRoll(ctx, desired, observedByID)
+	errs = append(errs, tick.errors...)
+	ctx = context.WithValue(ctx, rollTickKey{}, tick)
+	uncertain := tick.uncertain
 
 	// Pass 2: create / roll the renderable workers. A failure here is collected and
 	// the loop continues: one worker's bad day must not stall the fleet.
-	for _, w := range desired {
-		if err := m.reconcileWorker(ctx, w, observedByID[w.ID]); err != nil {
+	for _, w := range order {
+		obs := observedByID[w.ID]
+		e := tick.entries[w.ID]
+		if e != nil {
+			key := coverageKey(e.coverage)
+			if uncertain[key] {
+				continue // Unknown mutations require a new observation before sibling work.
+			}
+			if !e.admitted {
+				// Independent fenced maintenance is allowed even while image admission waits.
+				if ns, err := m.cfg.Placement(w); err == nil {
+					if spec, err := m.resolver.Resolve(w.Template, w.Size); err == nil {
+						if e.blocked == "" {
+							if _, err := m.reconcileDinD(ctx, w, obs, ns, spec); err != nil {
+								uncertain[key] = true
+								errs = append(errs, err)
+							}
+						}
+					}
+				}
+				continue
+			}
+			if err := m.confirmAdmission(ctx, tick, e); err != nil {
+				uncertain[key] = true
+				tick.outcomes[w.ID].State = "waiting_evidence"
+				tick.outcomes[w.ID].BlockingReason = pacingText("reservation mutation unconfirmed")
+				errs = append(errs, fmt.Errorf("worker %s: %w", w.ID, err))
+				continue
+			}
+			obs = e.o
+		}
+		if err := m.reconcileWorker(ctx, w, obs); err != nil {
 			errs = append(errs, fmt.Errorf("worker %s: %w", w.ID, err))
+			if e != nil {
+				uncertain[coverageKey(e.coverage)] = true
+				tick.outcomes[w.ID].State = "held"
+				tick.outcomes[w.ID].BlockingReason = pacingText("mutation unconfirmed; re-poll required")
+			}
 		}
 	}
 
@@ -592,12 +634,13 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 // size-drift arm, {Nix, Data} for legacy disk pressure. DinD is handled by its
 // separately fenced lifecycle; legacy deletion refuses selectors containing it.
 type recycleVolumes struct {
-	Nix  bool
-	Data bool
-	DinD bool
+	Pressure bool
+	Nix      bool
+	Data     bool
+	DinD     bool
 }
 
-// recycleWorkerVolumes tears a worker's Deployment and the selected PVC(s) down so the
+// recycleWorkerVolumes stops a worker and tears selected PVC(s) down so the
 // next tick reprovisions them in place — a delete + recreate, NOT a live PVC resize
 // (PVC specs are near-immutable). It keeps the Secret, the worker row/uuid, and any
 // PVC not named in vols.
@@ -610,7 +653,8 @@ type recycleVolumes struct {
 //   - Phase 0 reuses reconcileWorker's EXACT busy-guard: a busy worker with no roll
 //     override is cordoned (if not already draining) and the recycle DEFERRED — nothing
 //     is deleted this tick. Fail-safe on every cordoner outcome, exactly as the roll path.
-//   - Phase 1 deletes the Deployment (so nothing mounts the doomed volume mid-delete).
+//   - Phase 1 retains reserved Deployment metadata at replicas zero, then waits for
+//     fresh pod absence. Unreserved force overrides use conditioned deletion.
 //   - Phase 2 deletes each selected, LIVE PVC. A nil NixPVCSize means the nix PVC is
 //     already Terminating or absent, so it is skipped rather than re-deleted.
 func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, vols recycleVolumes) error {
@@ -622,13 +666,24 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// Phase 0: drain-if-busy. Identical guard to reconcileWorker's roll path — a busy
 	// worker is cordoned + deferred rather than having its volumes torn out from under a
 	// live run, unless an override (force-roll, or the elapsed drain deadline) says roll.
-	rollDespiteBusy := m.drain.ForceRoll ||
-		(w.DrainingSince != nil && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline)
+	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
+	if w.Busy && rollDespiteBusy {
+		allowed, err := m.confirmExpiredImageDrain(ctx, w)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return nil
+		}
+	}
 	if w.Busy && !rollDespiteBusy {
-		if w.DrainingSince == nil {
+		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			if m.cordoner != nil {
-				if err := m.cordoner.RequestDrain(ctx, w.ID); err != nil {
+				if err := m.requestRecycleDrain(ctx, w, vols); err != nil {
 					m.log.Warn("cordon request failed; deferring recycle (fail-safe)", "worker_id", w.ID, "error", err)
+					if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
+						return fmt.Errorf("image-roll recycle cordon unconfirmed; re-poll required: %w", err)
+					}
 				} else {
 					m.log.Info("hosted worker needs a volume recycle but is busy; cordoned, deferring", "worker_id", w.ID)
 				}
@@ -659,11 +714,43 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 
 	var errs []error
 
-	// Phase 1: delete the Deployment so no pod mounts the volume while it is being
-	// reprovisioned. NotFound is success — a partial recycle converges next tick.
-	if obs.HasDeployment {
-		if err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(w.ID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("delete deployment for recycle: %w", err))
+	// Keep Deployment metadata through legacy recycling, including /data pressure
+	// recycling. A conditioned scale-down is observed on a later tick; every pod,
+	// including a terminating one, must be absent before any PVC is deleted.
+	retained := false
+	if e := rollFrom(ctx, w.ID); e != nil {
+		if err := m.reserveMaintenanceRoll(e); err != nil {
+			return err
+		}
+	}
+	if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
+		retained = true
+		if e.dep == nil || e.dep.DeletionTimestamp != nil {
+			return fmt.Errorf("recycle reservation deployment unavailable")
+		}
+		if e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 0 {
+			body, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion}, "spec": map[string]any{"replicas": 0}})
+			if err != nil {
+				return err
+			}
+			got, err := m.client.AppsV1().Deployments(ns).Patch(ctx, e.dep.Name, types.MergePatchType, body, metav1.PatchOptions{})
+			if err != nil || got == nil || got.UID != e.dep.UID || got.ResourceVersion == "" || got.ResourceVersion == e.dep.ResourceVersion || got.Spec.Replicas == nil || *got.Spec.Replicas != 0 || got.Annotations[annotationRoll] != e.dep.Annotations[annotationRoll] {
+				return fmt.Errorf("recycle scale-down unconfirmed; re-poll required")
+			}
+			return nil
+		}
+		if len(e.pods) != 0 {
+			return nil
+		}
+	}
+	// Phase 1: optimistic deletion fences a delayed recycle after a pin change.
+	if obs.HasDeployment && !retained {
+		if obs.DeploymentUID == "" || obs.DeploymentResourceVersion == "" {
+			return fmt.Errorf("recycle requires deployment UID/resourceVersion")
+		}
+		uid, rv := types.UID(obs.DeploymentUID), obs.DeploymentResourceVersion
+		if err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(w.ID), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv}}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete deployment for recycle unconfirmed: %w", err)
 		} else {
 			m.log.Info("recycling hosted worker volumes: deleted deployment", "worker_id", w.ID, "namespace", ns)
 		}
@@ -682,6 +769,18 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// proxy).
 	if vols.Data && obs.HasDataPVC && obs.DataPVCLive {
 		names = append(names, dataPVCName(w.ID))
+	}
+	// rollSnapshot scans every namespace pod, including terminating and unmanaged
+	// pods. Unknown snapshot evidence or any selected mount defers this tick.
+	if e := rollFrom(ctx, w.ID); e != nil {
+		if e.volumeRefs == nil {
+			return fmt.Errorf("recycle volume references unavailable")
+		}
+		for _, name := range names {
+			if e.volumeRefs[name] {
+				return nil
+			}
+		}
 	}
 	for _, name := range names {
 		if err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
@@ -797,7 +896,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// discard it. It falls through to normal reconcile (like the cooldown case) with a fixed
 	// deferral token, rather than recycling. recycleWorkerVolumes itself also refuses to drop
 	// a held /data volume, so this arm is doubly guarded.
-	if legacy && m.recycle.Enabled && w.DiskPressure && !w.Ephemeral {
+	if legacy && m.recycle.Enabled && w.DiskPressure && !w.Ephemeral && obs.HasNixPVC && obs.HasDataPVC {
 		switch {
 		case w.CustodyHeld:
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-custody worker=%s", w.ID))
@@ -806,7 +905,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
 			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
 		default:
-			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true})
+			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true, Pressure: true})
 		}
 	}
 
@@ -853,7 +952,20 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 
 	// The Deployment.
 	dep := RenderDeployment(m.cfg, w, spec)
+	if e := rollFrom(ctx, w.ID); e != nil {
+		dep = e.target.DeepCopy()
+	}
 	if !obs.HasDeployment {
+		if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
+			raw, err := json.Marshal(e.marker)
+			if err != nil {
+				return err
+			}
+			if dep.Annotations == nil {
+				dep.Annotations = map[string]string{}
+			}
+			dep.Annotations[annotationRoll] = string(raw)
+		}
 		// Suppress the (re)create while a nix PVC EXISTS but is not LIVE-at-desired-size
 		// (Terminating, or mid-recycle). Never place the Deployment over a doomed/undersized
 		// volume. When the nix PVC is ABSENT (HasNixPVC==false: first-create or post-reap
@@ -878,24 +990,16 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 
 	// Drift (Decision 9): two independent sources, either of which must roll the pod.
 	wantHash := dep.Spec.Template.Annotations[AnnotationSpecHash]
-	if obs.Generation == w.Generation && obs.SpecHash == wantHash {
-		// No drift. But a worker cordoned on a PREVIOUS tick's drift whose drift was then
-		// REVERTED (operator reset workers.image.tag mid-rollout) has nothing left to roll,
-		// and draining_since is otherwise cleared ONLY by RegisterWorker on an actual roll
-		// (api runtime.sql) — so without this it would stay cordoned, idled by the claim
-		// gate, forever (issue #458). Clearing here is safe because draining_since has a
-		// SINGLE writer and a single meaning — the controller's own drift-cordon (there is
-		// no user/admin/node-maintenance drain) — so "no drift + draining" can only be a
-		// reverted drift or a just-committed roll, both correct to clear. Fail-safe and
-		// idempotent: on error we log and let the next tick retry (the condition persists);
-		// a nil cordoner (cordoning disabled) skips it, as with RequestDrain.
-		if w.DrainingSince != nil && m.cordoner != nil {
-			if err := m.cordoner.ClearDrain(ctx, w.ID); err != nil {
-				m.log.Warn("uncordon (clear draining_since) failed; will retry next tick", "worker_id", w.ID, "error", err)
-			} else {
-				m.log.Info("hosted worker no longer drifted; cleared cordon", "worker_id", w.ID)
-			}
+	paused := false
+	if e := rollFrom(ctx, w.ID); e != nil && e.dep != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 {
+		paused = true
+		if len(e.pods) != 0 || !obs.HasNixPVC || obs.NixPVCSize == nil || obs.NixPVCSize.Cmp(spec.NixSize) < 0 || !obs.HasDataPVC || !obs.DataPVCLive || (w.Docker && (!obs.HasDinDDataPVC || !obs.DinDPVCLive)) {
+			return nil
 		}
+	}
+	if obs.Generation == w.Generation && obs.SpecHash == wantHash && !paused {
+		// Provenance-aware suspended-admission release is handled by planPool.
+		// No-drift alone proves neither API health nor ownership of a drain.
 		return nil
 	}
 	// Drift. PRD #422 M5: a busy worker is normally cordoned + deferred (M4), BUT two
@@ -903,14 +1007,25 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// (emergency, e.g. a CVE), and the bounded drain deadline (a worker parked at an
 	// approval gate must not hold the old image forever). Both measured/flagged controller-
 	// side; the deadline elapses from the api-supplied draining_since (this loop is stateless).
-	rollDespiteBusy := m.drain.ForceRoll ||
-		(w.DrainingSince != nil && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline)
+	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
+	if w.Busy && rollDespiteBusy {
+		allowed, err := m.confirmExpiredImageDrain(ctx, w)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return nil
+		}
+	}
 	if w.Busy && !rollDespiteBusy {
-		if w.DrainingSince == nil {
+		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			// not yet cordoned — request the cordon (fail-safe: any failure still defers)
 			if m.cordoner != nil {
-				if err := m.cordoner.RequestDrain(ctx, w.ID); err != nil {
+				if err := m.requestWorkerDrain(ctx, w); err != nil {
 					m.log.Warn("cordon request failed; deferring roll (fail-safe)", "worker_id", w.ID, "error", err)
+					if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
+						return fmt.Errorf("image-roll cordon unconfirmed; re-poll required: %w", err)
+					}
 				} else {
 					m.log.Info("hosted worker drifted but busy; cordoned, deferring roll", "worker_id", w.ID)
 				}
@@ -936,6 +1051,11 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		"worker_id", w.ID,
 		"generation_observed", obs.Generation, "generation_desired", w.Generation,
 		"spec_hash_changed", obs.SpecHash != wantHash)
+	if obs.DeploymentUID == "" || obs.DeploymentResourceVersion == "" {
+		return fmt.Errorf("template mutation requires observed UID/resourceVersion")
+	}
+	dep.UID = types.UID(obs.DeploymentUID)
+	dep.ResourceVersion = obs.DeploymentResourceVersion
 	patch, err := patchFor(dep)
 	if err != nil {
 		return err
@@ -964,7 +1084,9 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 // this ever needs to be true in general.
 func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 	patch := map[string]any{
+		"metadata": map[string]any{"uid": dep.UID, "resourceVersion": dep.ResourceVersion},
 		"spec": map[string]any{
+			"replicas": 1,
 			"template": dep.Spec.Template,
 			// revisionHistoryLimit is a spec-level SIBLING of template, not inside it
 			// (a merge patch treats an absent key as "leave alone", so it would never

@@ -201,11 +201,8 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Version string `json:"version"`
-		// Name is accepted for wire compatibility (the M2 worker announces both
-		// name and version) but deliberately ignored: the authoritative worker
-		// name is the user-chosen label set at token issuance, not something the
-		// worker may overwrite. DecodeJSON rejects unknown fields, so this must be
-		// declared even though nothing reads it.
+		// Name never overwrites the user-chosen label. Hosted workers may carry
+		// reserved pod identity evidence in uzi-pod:<UUID>.
 		Name string `json:"name"`
 		// Template is the worker's self-reported image template (PRD #18). Unlike
 		// Name, it IS read + persisted (as template_reported): it is observability
@@ -303,7 +300,17 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("worker register active snapshot dropped: parse rejected", "worker_id", wkr.ID.String())
 		}
 	}
-	updated, registerNonce, err := h.wsvc.RegisterWithCrossCheckSlots(r.Context(), wkr, version, reported, advertisedCap, req.MaxCrossCheckSlots, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
+	var podUID uuid.UUID
+	// UI sanitization must not turn a different (or truncated) build version into
+	// exact roll proof. Keep ordinary registration unchanged, but withhold the
+	// incarnation binding when the version cannot be preserved verbatim.
+	if wkr.Kind == "hosted" && version != "" && req.Version == version && strings.HasPrefix(req.Name, "uzi-pod:") {
+		candidate := strings.TrimPrefix(req.Name, "uzi-pod:")
+		if len(candidate) == 36 {
+			podUID, _ = uuid.Parse(candidate)
+		}
+	}
+	updated, registerNonce, err := h.wsvc.RegisterWithCrossCheckSlots(r.Context(), wkr, version, reported, advertisedCap, req.MaxCrossCheckSlots, req.Capabilities, req.ProtocolCapabilities, regSnapshot, podUID)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

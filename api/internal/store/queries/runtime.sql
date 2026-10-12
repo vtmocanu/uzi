@@ -132,6 +132,8 @@ SELECT w.*,
        -- and not handing it to the classifier is how it stays that way.
        rh.observed_at        AS roll_observed_at,
        rh.upgrading_since    AS roll_upgrading_since,
+       rh.pacing             AS roll_pacing,
+       rh.pacing_observed_at AS roll_pacing_observed_at,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 LEFT JOIN user_secrets s ON s.id = w.anthropic_secret_id AND s.user_id = w.user_id
@@ -251,6 +253,9 @@ WITH prev AS (
         -- while any delayed high-epoch snapshot from the PREVIOUS process is rejected by the
         -- now-stale nonce — not by epoch. The nonce must live on the row (not in memory)
         -- because it is checked exactly when an api restart has forgotten everything else.
+        registered_pod_uid = sqlc.narg('registered_pod_uid')::uuid,
+        roll_heartbeat_at = NULL,
+        draining_reason = NULL,
         snapshot_register_nonce = @snapshot_register_nonce,
         snapshot_epoch      = 0,
         last_heartbeat_at   = now(),
@@ -838,6 +843,8 @@ SELECT sqlc.embed(w),
        rh.last_exit_code     AS roll_last_exit_code,
        rh.observed_at        AS roll_observed_at,
        rh.upgrading_since    AS roll_upgrading_since,
+       rh.pacing             AS roll_pacing,
+       rh.pacing_observed_at AS roll_pacing_observed_at,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 JOIN users u ON u.id = w.user_id
@@ -9570,7 +9577,22 @@ WHERE w.user_id = @user_id
 -- Issue #2184: preserve the advisory availability projection separately from strict health
 -- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
 WITH candidates AS (
-SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
+SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
+       (w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= @heartbeat_cutoff)::boolean AS heartbeat_recent,
+       (run.egress_profile_id IS NULL)::boolean AS diagnostic_lane,
+       (run.kind <> 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
+        OR run.updated_at < @cross_check_affinity_cutoff::timestamptz)::boolean AS diagnostic_affinity,
+       (w.kind = 'hosted' AND rh.pacing_observed_at <= @cross_check_evaluated_at::timestamptz
+        AND rh.pacing_observed_at >= (@cross_check_evaluated_at::timestamptz) - interval '60 seconds'
+        AND rh.pacing->>'state' IN ('held','active','waiting_evidence','override')
+        AND NOT w.maintenance_fenced AND NOT w.maintenance_owns_drain
+        AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+        AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
+        AND (w.draining_since IS NULL OR w.draining_reason = 'image_roll')
+        AND (w.status <> 'online' OR w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < @heartbeat_cutoff
+             OR (w.draining_since IS NOT NULL AND w.draining_reason = 'image_roll')
+             OR rh.phase IN ('rolling','stuck'))) IS TRUE AS through_roll,
+       CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
        (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
@@ -9602,6 +9624,7 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
 FROM runs run
 JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
+LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
     WHERE pr.worker_id = w.id
@@ -9610,8 +9633,6 @@ CROSS JOIN LATERAL (
 ) wa
 WHERE run.id = @run_id
   AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
-  AND w.last_heartbeat_at IS NOT NULL
-  AND w.last_heartbeat_at >= @heartbeat_cutoff
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
         @docker_repo_allowlist::uuid[],
@@ -9678,12 +9699,20 @@ WHERE run.id = @run_id
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
-SELECT count(*) FILTER (WHERE online AND affinity AND strict_binding)::bigint AS strict_eligible,
-       count(*) FILTER (WHERE (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
-       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
-       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
-       max(draining_since) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+SELECT count(*) FILTER (WHERE heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE heartbeat_recent AND (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
+       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
+       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
+                             AND heartbeat_recent AND online AND draining_since IS NOT NULL
+                             AND pacing->>'state' = 'active' AND phase = 'settled')::bigint AS diagnostic_draining_only
+       , (SELECT jsonb_build_object('pacing', c.pacing, 'observed_at', c.pacing_observed_at, 'blocking_reason', c.blocking_reason)
+          FROM candidates c WHERE c.diagnostic_lane AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.through_roll
+          ORDER BY (c.pacing->>'state' = 'held') DESC, c.id LIMIT 1)::jsonb AS diagnostic_roll_context
 FROM candidates;
 
 -- name: ListDockerBlockedReposForUser :many
