@@ -9426,7 +9426,6 @@ SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
         AND rh.pacing->>'state' IN ('held','active','waiting_evidence','override')
         AND NOT w.maintenance_fenced AND NOT w.maintenance_owns_drain
         AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
-        AND w.stats_disk_pressure_streak < 2 AND w.dind_pressure_streak < 2
         AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
         AND (w.draining_since IS NULL OR w.draining_reason = 'image_roll')
         AND (w.status <> 'online' OR w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < @heartbeat_cutoff
