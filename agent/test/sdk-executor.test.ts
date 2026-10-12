@@ -6822,6 +6822,24 @@ describe("M3 Claude bounded park controls", () => {
       });
     }
   }
+  for (const supported of [undefined, false]) {
+    it(`M3 optional park callback preserves legacy clarification support=${supported}`, async () => {
+      const script = fakeTurns([
+        [askUserTurn("Ready?"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+        kind: "issue", parkRunSupported: supported, requestParkRun: undefined,
+        config: { max_iterations: 1 },
+        askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+      assert.equal(result.pausedAt, undefined);
+      assert.equal(script.turns.length, 2);
+      assert.deepEqual(probe.iterations, [1, 1]);
+    });
+  }
   it("cancels through the existing clarification handling", async () => {
     const script = fakeTurns([[askUserTurn("Ready?"), resultSuccess()]]);
     const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",

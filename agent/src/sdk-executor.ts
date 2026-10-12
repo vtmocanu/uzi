@@ -2985,7 +2985,7 @@ export class SdkExecutor implements Executor {
             // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
             // askUserOrContinue — keep waiting), never a terminal failure.
             const askStep = await this.runThroughSwitch(ctx, state, () =>
-              this.askUserOrContinue(ctx, asked, budget.asked, parkAt, requestPark),
+              this.askUserOrContinue(ctx, asked, budget.asked, parkAt, ctx.requestParkRun ? requestPark : undefined),
             );
             if ("released" in askStep) {
               switchReleased = true;
