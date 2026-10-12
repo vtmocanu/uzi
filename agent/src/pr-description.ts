@@ -867,6 +867,19 @@ function breakClosingKeywords(s: string, mode: "all" | "directives"): string {
   return out;
 }
 
+/**
+ * A PR title that publishes no closing keyword for `issueIid`, for a run whose lead declared the
+ * delivery non-closing. A title that already scans clean is returned byte-identical. Otherwise the
+ * closing keywords are broken (zero-width space), and when even that still scans as closing the
+ * fixed `Work on issue #N` stands in; the result never closes the issue.
+ */
+export function nonClosingTitle(title: string, issueIid: number, repoPath?: string): string {
+  if (!closingDirectiveFor(title, issueIid, repoPath)) return title;
+  const broken = breakClosingKeywords(title, "directives");
+  if (!closingDirectiveFor(broken, issueIid, repoPath)) return broken;
+  return `Work on issue #${issueIid}`;
+}
+
 /** The api's breakMentions: U+200B after every `@` not preceded by an ASCII letter or digit, unless
  *  it ends the text or a space follows it. */
 function breakMentions(s: string): string {

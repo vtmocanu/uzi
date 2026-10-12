@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Provider outages have a bounded automatic recovery streak ([#1733](https://github.com/vtmocanu/uzi/issues/1733)).**
   Claude and Codex provider outages now retry under a separate elapsed streak, including Codex’s exact `rateLimitExceeded` token (#2361). After the default 24 hours, the next qualifying park waits for the owner without failing the run; `0` disables the hold. Completed model turns restart the streak, and owner Resume clears it. CLI, TUI, web and Slack distinguish automatic retries from owner attention, with Resume, Cancel and eligible Stop-then-Resume actions. Work remains on the assigned worker, subject to storage and recovery-copy availability; the hold has no automatic expiry.
 
+### Fixed
+
+- **A non-closing issue delivery can no longer close its issue through a commit message or the PR title ([#2779](https://github.com/vtmocanu/uzi/issues/2779)).**
+  When the lead declares the delivery non-closing, uzi now checks the messages of every commit the push would publish (merge commits included, re-checked on the exact commit being pushed) with the same matcher as the PR body. On a hit it pushes nothing, opens or updates no PR, rewrites no history, and fails the run naming the offending commit SHA(s); if the messages cannot be read (including commits whose header declares a non-UTF-8 encoding) it refuses the same way but names no SHA. The committed work is preserved for recovery, and fixing the commits needs a history rewrite left to the owner. A new PR's title is the issue title with any closing keyword neutralised (a zero-width space after its first letter, or `Work on issue #N` if that is not enough), and after the PR is created or adopted uzi reads its title back and retitles it if it still closes the issue. If the title cannot be read or updated, or still closes after re-reading, the run fails closed; the PR stays open and must not be merged as-is. Runs without a declaration, including owner-partial and scope-capped ones, keep today's title and commit behaviour, and the PR-body enforcement is unchanged.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

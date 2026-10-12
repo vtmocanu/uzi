@@ -10805,6 +10805,24 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       assert.match(pr.description, /Approved Codex follow-up remains/);
       assert.equal(m2ClosingDirective(pr.description, 2172, "org/repo"), false);
     });
+    it("m2 non-closing actual broker callback retitles a closing issue title (issue #2779)", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [
+        (th, tn) => [done(2172, th, tn, { non_closing: { reason: "Approved Codex follow-up remains" } })],
+      ])]);
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const delivery: Executor = { run: async ctx => {
+        commitInTree(ctx.worktreePath, "m2.txt", "delivered work\n");
+        return executor.run(ctx);
+      } };
+      const { gitlab, pr } = m2Runner.fakeGitlab();
+      m2FollowPush(m2Runner.git, pr);
+      const claim = m2Runner.gitlabClaim(2172, { kind: "issue", issue_title: "Fixes #2172", plan_md: "Approved plan permits leaving the issue open", plan_approved: true, plan_source: "seeded" });
+      await m2Runner.runner(delivery, gitlab).execute(claim);
+      assert.ok(m2Runner.api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"),
+        JSON.stringify(m2Runner.api.states.filter(s => s.runId === claim.run_id)));
+      assert.equal(m2ClosingDirective(pr.title, 2172, "org/repo"), false, "the created PR title does not close the issue");
+      assert.ok(pr.title.includes("#2172"));
+    });
     it("m2 non-closing guidance reaches the Codex implement builder", () => {
       const prompt = m1Prompt("persisted", m1Context());
       assert.match(prompt, /issue runs only/i);
