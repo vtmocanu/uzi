@@ -13,7 +13,6 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
-import { parkLabel } from "../lib/runBadge";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -563,9 +562,9 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_blocked: "Completion blocked",
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
-  // Reuse the parked wording that runBadge and the progress readers already display.
-  provider_unavailable: parkLabel({ status: "provider_unavailable" }),
-  provider_outage: parkLabel({ status: "provider_outage" }),
+  // Kept in step with runBadge's parked wording by the label-agreement test.
+  provider_unavailable: "provider unavailable: owner hold",
+  provider_outage: "waiting for provider",
 };
 
 export function StatusPill({ status }: { status: string }) {
