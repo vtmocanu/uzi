@@ -238,13 +238,19 @@ Every case keeps the source. What a later run sees depends on where the failure 
   - a bound journal whose digest no longer matches the marker (state `mismatch`);
   - separately, the fresh seed's existing seed-mode quiescence finding unattributed processes
     in the key's footprint (the #1783 residue rule), which this amendment does not change.
-- **Nothing recorded.** `markStoppedCanonical` returns `unknown` before the marker exists (a
-  persistence failure, malformed or overflowing marker evidence of the run, or a journal that is
-  no longer the exact plain one). The source is kept under its plain journal and routes as
+- **Nothing recorded.** Writing the attempt mode or the marker fails, so `markStoppedCanonical`
+  returns `unknown` with no marker. The source is kept under its plain journal and routes as
   before: the same run's next claim enters ordinary retained recovery
   (`recoverRetainedClaim`), a different run goes through the existing foreign-journal handling
   (`ForeignCaptureBlockedError`, then terminal-orphan handling), and inspect lists it as a
-  marker-less plain-journal leftover.
+  marker-less plain-journal leftover. (Malformed or overflowing marker evidence of the run is
+  the refused case above, not this one.)
+- **Journal no longer names the source.** When the active journal is absent or already names
+  another source when the stop is recorded, nothing is written and that journal keeps its own
+  routing. The kept clone is then not under any journal or marker and inspect does not list it;
+  the next claim never reuses the canonical path once the key is in attempt mode, but nothing
+  attributes the clone (a narrow race: custody-held flights return before this call). A stale
+  marker already naming the path is the `mismatch` case above.
 - **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a failed write
   during the discovery heal, fails the run closed with "Retained recovery blocked: corrupt
   journal or unsafe local recovery storage" (the default `fail_origin`, not

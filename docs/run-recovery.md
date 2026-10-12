@@ -397,12 +397,16 @@ The source is kept in every fail-closed case, but what a later run sees differs:
   malformed or over its cap, or the journal digest bound to a marker no longer
   matches. Separately, the fresh seed's existing quiescence check finding
   unattributed processes in the key's footprint is refused the same way.
-- **Nothing recorded.** If persisting the attempt mode or the marker fails, or
-  the journal is no longer the exact plain one, no marker exists. The clone stays
+- **Nothing recorded.** If persisting the attempt mode or the marker fails, no
+  marker exists. The clone stays
   under its plain journal and routes as before: the same run's next claim enters
   ordinary retained recovery, a different run goes through the existing
   foreign-journal handling (terminal-orphan handling), and inspect lists it as a
   marker-less plain-journal leftover.
+- **Journal no longer names the source.** If, when the stop is recorded, the
+  journal is absent or already names another source, nothing is written and that
+  journal keeps its own routing. Inspect then does not list the kept clone (a
+  narrow race; an already-stale marker for the path is the refused case above).
 - **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a
   failed write while discovery completes a detachment, fails the run closed with
   "Retained recovery blocked: corrupt journal or unsafe local recovery storage"
