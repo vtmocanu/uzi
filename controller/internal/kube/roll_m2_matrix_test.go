@@ -493,6 +493,7 @@ func TestM2MatrixDelayedDrainEventsRestart(t *testing.T) {
 	since := m5Now.Add(-48 * time.Hour)
 	workers[0].DrainingSince = &since
 	workers[0].DrainingReason = token("image_roll")
+	cordon.confirmWorkers = map[string]protocol.DesiredWorker{workers[0].ID: workers[0]}
 	m = matrixRestart(m)
 	matrixUnknownTick(t, m, workers)
 	if len(cordon.calls) != 2 || len(templatePatches(c)) != 0 {

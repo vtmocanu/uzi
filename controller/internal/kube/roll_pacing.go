@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -118,16 +119,18 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 	}
 	for _, e := range t.entries {
-		if e.blocked != "" || e.marker == nil || !e.marker.Completed || !e.drift || e.dep == nil {
+		if e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
 			continue
 		}
-		pending := false
+		pending, drift := false, e.drift
 		for _, peer := range t.entries {
+			c, ok := coverageOf(peer.w, peer.ns)
+			drift = drift || (ok && c.Owner == e.marker.Coverage.Owner && c.Lane == e.marker.Coverage.Lane && peer.drift)
 			if peer.marker != nil && !peer.marker.Completed && coverageKey(peer.marker.Coverage) == coverageKey(e.marker.Coverage) {
 				pending = true
 			}
 		}
-		if pending {
+		if pending || !drift {
 			continue
 		}
 		if e.claim != nil && e.claim.Annotations[annotationRoll] != "" {
@@ -437,7 +440,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 				e.blocked = "participant roll health stuck"
 			}
 		}
-		if active && !e.drift && e.marker == nil && e.dep != nil && !maintenanceActive(e.w) {
+		if active && !e.drift && e.marker == nil && e.dep != nil && !maintenanceActive(e.w) && !m.currentUsable(t, e) {
 			blocker = e.w.ID
 			e.blocked = "target template has no reservation proof"
 		}
@@ -594,9 +597,9 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 			continue
 		}
 		if e.marker != nil {
-			usable = usable || m.promoted(t, e)
-		} else if !e.admitted {
-			usable = usable || m.oldUsable(t, e)
+			usable = usable || m.promoted(t, e) || m.currentUsable(t, e)
+		} else if !e.admitted || m.currentUsable(t, e) {
+			usable = usable || m.currentUsable(t, e) || m.oldUsable(t, e)
 		}
 	}
 	if population > 1 && !usable {
@@ -605,17 +608,20 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 	if len(pool) == 1 {
 		return true
 	}
-	for _, e := range pool {
-		if e == candidate || e.admitted {
+	for _, e := range t.entries {
+		if e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" {
+			continue
+		}
+		if e == candidate || (e.admitted && !m.currentUsable(t, e) && !m.promoted(t, e)) {
 			continue
 		}
 		if e.marker != nil {
-			if m.promoted(t, e) {
+			if m.promoted(t, e) || m.currentUsable(t, e) {
 				return true
 			}
 			continue
 		}
-		if m.oldUsable(t, e) {
+		if m.currentUsable(t, e) || m.oldUsable(t, e) {
 			return true
 		}
 	}
@@ -717,6 +723,54 @@ func (m *Materializer) rollDespiteBusy(ctx context.Context, w protocol.DesiredWo
 	// Independent pressure recycling retains its own drain policy.
 	return w.DrainingSince != nil && m.drain.Deadline > 0 && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline
 }
+
+type imageRollDrainConfirmer interface {
+	ConfirmImageRollDrain(context.Context, string) (protocol.DesiredWorker, error)
+}
+
+// confirmExpiredImageDrain permits a busy image turn only after a bounded
+// re-cordon/Poll exchange. One failed exchange stops this pool for the tick.
+func (m *Materializer) confirmExpiredImageDrain(ctx context.Context, w protocol.DesiredWorker) (bool, error) {
+	e := rollFrom(ctx, w.ID)
+	if m.drain.ForceRoll || e == nil || (!e.drift && (e.marker == nil || e.marker.Completed) && !imageRollDrain(w)) {
+		return true, nil
+	}
+	c, ok := m.cordoner.(imageRollDrainConfirmer)
+	if !ok {
+		return false, fmt.Errorf("image-roll deadline confirmation unavailable; explicit recovery required")
+	}
+	start := m.now()
+	fresh, err := c.ConfirmImageRollDrain(ctx, w.ID)
+	if err != nil {
+		return false, fmt.Errorf("image-roll deadline confirmation unconfirmed; re-poll required: %w", err)
+	}
+	if !reflect.DeepEqual(drainShape(w), drainShape(fresh)) {
+		return false, fmt.Errorf("image-roll deadline desired state changed; re-poll required")
+	}
+	p := fresh.RollEvidence
+	// Ordinary API liveness confirms the old process's drain, independently of
+	// the stronger incarnation heartbeat required to promote its replacement.
+	if !imageRollDrain(fresh) || p == nil || p.LivenessValidUntil == nil ||
+		!freshUntil(m.now(), start, p.EvaluatedAt, *p.LivenessValidUntil) ||
+		fresh.DrainingSince.After(p.EvaluatedAt) {
+		return false, fmt.Errorf("image-roll deadline evidence unconfirmed; re-poll required")
+	}
+	return p.EvaluatedAt.Sub(*fresh.DrainingSince) >= m.drain.Deadline, nil
+}
+
+// Compare the desired identity and every independent fence without interpreting
+// credentials. Poll evaluation and heartbeat times normally advance between reads.
+func drainShape(w protocol.DesiredWorker) protocol.DesiredWorker {
+	w.DrainingSince, w.DrainingReason = nil, nil
+	if w.RollEvidence != nil {
+		p := *w.RollEvidence
+		p.EvaluatedAt, p.ValidUntil = time.Time{}, time.Time{}
+		p.HeartbeatAt, p.LivenessValidUntil = nil, nil
+		w.RollEvidence = &p
+	}
+	return w
+}
+
 func (m *Materializer) retainRollReservation(ctx context.Context, e *rollEntry) error {
 	if e.marker == nil {
 		return nil
@@ -773,7 +827,13 @@ func coverageOf(w protocol.DesiredWorker, ns string) (rollCoverage, bool) {
 	if e == nil || e.Version != 1 || e.OwnerID == "" || e.SchedulingCapabilities == nil || e.ProtocolCapabilities == nil {
 		return rollCoverage{}, false
 	}
-	return rollCoverage{Owner: e.OwnerID, Lane: ns, Scheduling: canonicalCaps(e.SchedulingCapabilities), Protocol: canonicalCaps(e.ProtocolCapabilities), Ordinary: e.OrdinaryCoverage, Checker: e.CheckerCoverage}, true
+	scheduling := append([]string{}, e.SchedulingCapabilities...)
+	// Match fn_effective_worker_caps: API-authorized Docker placement grants
+	// Docker claim coverage even when registration omitted the self-report.
+	if w.Docker {
+		scheduling = append(scheduling, "docker")
+	}
+	return rollCoverage{Owner: e.OwnerID, Lane: ns, Scheduling: canonicalCaps(scheduling), Protocol: canonicalCaps(e.ProtocolCapabilities), Ordinary: e.OrdinaryCoverage, Checker: e.CheckerCoverage}, true
 }
 func coverageKey(c rollCoverage) string { b, _ := json.Marshal(c); return string(b) }
 func covers(w protocol.DesiredWorker, c rollCoverage) bool {
@@ -891,10 +951,32 @@ func freshUntil(now, start time.Time, evaluated, expiry time.Time) bool {
 }
 func (m *Materializer) oldUsable(t *rollTick, e *rollEntry) bool {
 	proof := e.w.RollEvidence
-	return e.blocked == "" && liveWorkerPod(e) && proof != nil && proof.Registered && proof.LivenessValidUntil != nil &&
+	return e.blocked == "" && liveWorkerPod(e) && proof != nil && (workerImage(e.dep) != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != e.target.Spec.Template.Annotations[AnnotationSpecHash] || m.currentUsable(t, e)) && proof.LivenessValidUntil != nil &&
 		freshUntil(m.now(), t.start, proof.EvaluatedAt, *proof.LivenessValidUntil) &&
 		!e.w.DiskPressure && !e.w.CustodyHeld && !maintenanceActive(e.w) &&
 		e.w.DrainingSince == nil && covers(e.w, e.coverage)
+}
+
+// currentUsable requires current incarnation proof even without roll history.
+// It borrows the promotion seam with an empty prior nonce; the current nonce must
+// still be nonempty and proven by the heartbeat for the single physical pod.
+func (m *Materializer) currentUsable(t *rollTick, e *rollEntry) bool {
+	if e.dep == nil || workerImage(e.dep) != workerImage(e.target) {
+		return false
+	}
+	c, ok := coverageOf(e.w, e.ns)
+	if !ok {
+		return false
+	}
+	copy := *e
+	copy.marker = &rollMarker{Hash: e.dep.Spec.Template.Annotations[AnnotationSpecHash], Image: workerImage(e.target), TargetVersion: targetVersion(m.cfg, workerImage(e.target)), Coverage: c}
+	if e.marker != nil {
+		if e.marker.Hash != copy.marker.Hash || e.marker.Image != copy.marker.Image || e.marker.TargetVersion != copy.marker.TargetVersion {
+			return false
+		}
+		copy.marker.Nonce = e.marker.Nonce
+	}
+	return m.promoted(t, &copy)
 }
 func liveWorkerPod(e *rollEntry) bool {
 	if e.dep == nil || e.dep.DeletionTimestamp != nil || e.dep.UID == "" {

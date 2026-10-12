@@ -873,10 +873,11 @@ func keysOf(m map[string]bool) []string {
 // ClearDrain (uncordon), and can force either write to fail, so a test can prove
 // the fail-safe defer path and the no-drift uncordon-and-retry path.
 type fakeCordoner struct {
-	calls      []string
-	err        error
-	clearCalls []string
-	clearErr   error
+	confirmWorkers map[string]protocol.DesiredWorker
+	calls          []string
+	err            error
+	clearCalls     []string
+	clearErr       error
 }
 
 func (f *fakeCordoner) RequestDrain(_ context.Context, workerID string) error {
@@ -1187,6 +1188,7 @@ func TestDriftBusyDeadlineExceededRolls(t *testing.T) {
 	c := &fakeCordoner{}
 	since := m5Now.Add(-2 * time.Hour) // draining for 2h ...
 	w, obs, dep := driftedWorker(t, true, &since)
+	c.confirmWorkers = map[string]protocol.DesiredWorker{w.ID: w}
 	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Hour}, dep) // ... against a 1h deadline
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1209,6 +1211,7 @@ func TestDriftBusyDeadlineExactlyReachedRolls(t *testing.T) {
 	deadline := time.Hour
 	since := m5Now.Add(-deadline) // now - since == Deadline, exactly
 	w, obs, dep := driftedWorker(t, true, &since)
+	c.confirmWorkers = map[string]protocol.DesiredWorker{w.ID: w}
 	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: deadline}, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)

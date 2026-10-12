@@ -666,6 +666,15 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// worker is cordoned + deferred rather than having its volumes torn out from under a
 	// live run, unless an override (force-roll, or the elapsed drain deadline) says roll.
 	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
+	if w.Busy && rollDespiteBusy {
+		allowed, err := m.confirmExpiredImageDrain(ctx, w)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return nil
+		}
+	}
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			if m.cordoner != nil {
@@ -686,11 +695,6 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 		return nil
 	}
 
-	if e := rollFrom(ctx, w.ID); w.Busy && e != nil && (e.drift || (e.marker != nil && !e.marker.Completed)) && !m.drain.ForceRoll {
-		if err := m.rollDrain(ctx, w.ID); err != nil {
-			return fmt.Errorf("recycle cordon confirmation unconfirmed: %w", err)
-		}
-	}
 	// Custody guard (PRD #1296 D3), INDEPENDENT of rollDespiteBusy above. A worker
 	// holding unpublished committed work under a durable-recovery custody hold must
 	// never have its /data PVC discarded — not by ForceRoll, and not by an elapsed
@@ -1003,6 +1007,15 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// approval gate must not hold the old image forever). Both measured/flagged controller-
 	// side; the deadline elapses from the api-supplied draining_since (this loop is stateless).
 	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
+	if w.Busy && rollDespiteBusy {
+		allowed, err := m.confirmExpiredImageDrain(ctx, w)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return nil
+		}
+	}
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			// not yet cordoned — request the cordon (fail-safe: any failure still defers)
@@ -1024,11 +1037,6 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		return nil
 	}
 	if w.Busy {
-		if e := rollFrom(ctx, w.ID); e != nil && !m.drain.ForceRoll {
-			if err := m.rollDrain(ctx, w.ID); err != nil {
-				return fmt.Errorf("deadline cordon confirmation unconfirmed: %w", err)
-			}
-		}
 		// rolling a busy worker: its in-flight run(s) will requeue (Decision 4 fallback).
 		reason := "drain deadline exceeded"
 		if m.drain.ForceRoll {
