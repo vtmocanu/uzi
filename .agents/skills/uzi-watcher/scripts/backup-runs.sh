@@ -63,11 +63,12 @@
 # owned tracking ref survives; once that source is gone it is status-only (SNAP).
 # Completed and cancelled runs capture an exact protected source when one is present,
 # or the kept canonical clone named by a matching uzi-stopped marker; otherwise they
-# are status-only.
+# are status-only, unless the source search itself could not complete (FAIL).
 # Exit: 0 when every active target produced a verified recovery artifact (terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
-# surviving source could not be captured intact, or a completed/cancelled run's
-# uzi-stopped marker is unparseable (inconclusive search); 2 for bad usage.
+# surviving source could not be captured intact, or a bound completed/cancelled run's
+# source search was inconclusive (a failed kubectl listing or exec, an unparseable
+# uzi-stopped marker, an invalid protected descriptor); 2 for bad usage.
 set -u
 
 KUBECTL="${UZI_KUBECTL:-kubectl}"

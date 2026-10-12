@@ -278,7 +278,8 @@ if [ "$(id -u)" -ne 0 ]; then
     || fail "failed run, unnamed locked dir: expected SNAP; got: $(cat "$D_INC/latest-attempt/backup.log")"
   chmod 755 "$LOCKED"; rm -rf "$LOCKED"
 fi
-# A completed run stays status-only even when a clone for it still exists.
+# A completed run (no stopped marker, no protected descriptor) stays status-only even
+# when a clone for it still exists.
 git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
   "{\"runId\":\"completed-1\",\"clonePath\":\"$RUNNER\"}"
 run_backup 1.completed completed-1 >/dev/null
@@ -951,7 +952,8 @@ rc="$(backup_rc "$D_ME" completed-1)"
 tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
   || fail "marker-e ledger: a ledger attempt displaced the marker-named canonical"
 # A journal-current on-branch attempt of the terminal run is ignored too: the marker
-# canonical wins (kills a mutation of the terminal-mode journal/ledger clearing).
+# canonical wins (kills a mutation that drops the terminal-mode journal clearing; the ledger clearing
+# matters only for an unreadable ledger-named dir, which this case does not stage).
 reset_layout
 make_clone "$CANON" agent/issue-4242 kept-canon
 make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
