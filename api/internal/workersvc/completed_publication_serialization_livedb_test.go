@@ -342,7 +342,7 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		fresh.pool, fresh.q = pool, store.New(pool)
 		return fresh
 	}
-	// isolatedPublicationDB's code cross-check shims stand in for columns 00324 and 00327 add;
+	// isolatedPublicationDB's code cross-check shims stand in for columns 00324, 00327 and 00329 add;
 	// drop them so the walk to head adds the real columns instead of colliding with the shims.
 	for _, ddl := range []string{
 		"ALTER TABLE users DROP COLUMN IF EXISTS code_cross_check_enabled",
@@ -358,6 +358,7 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 			DROP COLUMN IF EXISTS repo_instructions_enabled,
 			DROP COLUMN IF EXISTS repo_instructions_text,
 			DROP COLUMN IF EXISTS repo_instructions_digest,
+			DROP COLUMN IF EXISTS repo_instructions_commit,
 			DROP COLUMN IF EXISTS dispositions,
 			DROP COLUMN IF EXISTS finalized_at`,
 	} {
