@@ -116,7 +116,7 @@ describe("publishedCommitMessages (issue #2779)", () => {
     return sha;
   }
 
-  it("returns null for a commit with a non-UTF-8 encoding header (%B would print an empty body)", async () => {
+  it("returns null for a commit with a non-UTF-8 encoding header (%B would print an empty or garbled body)", async () => {
     const crafted = craftEncoded("enc16", "UTF-16", "Fixes #12");
     const { bare, tip } = await bareWith("enc16");
     assert.strictEqual(tip, crafted);

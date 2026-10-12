@@ -7270,7 +7270,7 @@ export class GitCache {
    * any failure to resolve the base, run git or parse its output, so callers fail CLOSED and
    * refuse to publish rather than treat unreadable history as clean. A commit whose `%e` encoding
    * is non-empty and not UTF-8 (git re-encodes `--format` output to UTF-8 and such a header can
-   * blank `%B`, so `%e` is the gate), or whose object holds a NUL byte, also yields null.
+   * blank or garble `%B`, so `%e` is the gate), or whose object holds a NUL byte, also yields null.
    */
   async publishedCommitMessages(barePath: string, tip: string): Promise<{ sha: string; message: string }[] | null> {
     try {
@@ -7283,10 +7283,10 @@ export class GitCache {
       const read = async (args: string[], input?: string): Promise<string> =>
         (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
           { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
-      // git re-encodes `--format` output to UTF-8, and a non-UTF-8 `encoding` header can blank `%B`
-      // (a UTF-16-labelled `Fixes #12` prints empty), so the `%e` refusal below is the gate: never
-      // drop it as redundant. `--encoding=none` only stops i18n.logOutputEncoding re-encoding the
-      // output. `%e` is git's own per-commit reading of that header (empty when absent), so no
+      // git re-encodes `--format` output to UTF-8, and a non-UTF-8 `encoding` header can blank or
+      // garble `%B` (a UTF-16-labelled `Fixes #12` prints empty without `--encoding=none` and as
+      // `a6ar` with it), so the `%e` refusal below is the gate: never drop it as redundant.
+      // `--encoding=none` does NOT yield raw message bytes. `%e` is git's own per-commit reading of that header (empty when absent), so no
       // framing can be forged in a message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
       // (sha, encoding, message) triples. A commit OBJECT can still carry a NUL inside its message
       // (git hash-object --literally writes one, and %B stops printing at it), which would hide the
