@@ -82,7 +82,21 @@ type stateRequestMinusGateRevision struct {
 	SizeClass                 *string                    `json:"size_class"`
 	RecoveryCause             *string                    `json:"recovery_cause"`
 	DiskParkPreventive        *bool                      `json:"disk_park_preventive"`
+	ProductiveTurns           *int32                     `json:"productive_turns"`
+	ProviderProgressTurns     *int32                     `json:"provider_progress_turns"`
 	CheckpointContainsLatest  *bool                      `json:"checkpoint_contains_latest"`
+}
+
+func TestWorkerStateDecodesProviderProgress(t *testing.T) {
+	body := "{\"status\":\"recovery_wait\",\"claim_generation\":2,\"provider_progress_turns\":3}"
+	r := httptest.NewRequest("POST", "/api/worker/runs/"+uuid.NewString()+"/state", strings.NewReader(body))
+	var req workersvc.StateRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.ProviderProgressTurns == nil || *req.ProviderProgressTurns != 3 {
+		t.Fatalf("progress=%v", req.ProviderProgressTurns)
+	}
 }
 
 // gateRevisionStateFields are the StateRequest fields PRD #1795 added (the only difference

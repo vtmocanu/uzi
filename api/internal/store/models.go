@@ -297,6 +297,7 @@ type CrossCheck struct {
 	RepoInstructionsDigest  []byte             `json:"repo_instructions_digest"`
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
+	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -1027,21 +1028,23 @@ type Run struct {
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 	JobProtocol              pgtype.Int2 `json:"job_protocol"`
 	// Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset by resume paths that grant a fresh wall.
-	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
-	PlanCrossCheckRequired    bool               `json:"plan_cross_check_required"`
-	PlanCrossCheckGateReason  pgtype.Text        `json:"plan_cross_check_gate_reason"`
-	IssueRawDigest            pgtype.Text        `json:"issue_raw_digest"`
-	IssueSavedBody            pgtype.Text        `json:"issue_saved_body"`
-	IssueInputReason          pgtype.Text        `json:"issue_input_reason"`
-	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
-	PlanCrossCheckDiffRefusal pgtype.Text        `json:"plan_cross_check_diff_refusal"`
-	WorkerRecoveryEpisode     int64              `json:"worker_recovery_episode"`
-	RequeueEpisodeBaseline    int32              `json:"requeue_episode_baseline"`
-	WorkerRecoveryEvidence    []byte             `json:"worker_recovery_evidence"`
-	CrossCheckLane            bool               `json:"cross_check_lane"`
-	CrossCheckLaneGeneration  pgtype.Int8        `json:"cross_check_lane_generation"`
-	CompletionFinalHead       pgtype.Text        `json:"completion_final_head"`
-	CodeCrossCheckRequired    bool               `json:"code_cross_check_required"`
+	FirstStartedAt              pgtype.Timestamptz `json:"first_started_at"`
+	PlanCrossCheckRequired      bool               `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason    pgtype.Text        `json:"plan_cross_check_gate_reason"`
+	IssueRawDigest              pgtype.Text        `json:"issue_raw_digest"`
+	IssueSavedBody              pgtype.Text        `json:"issue_saved_body"`
+	IssueInputReason            pgtype.Text        `json:"issue_input_reason"`
+	AutoApproveBlockedReasons   []string           `json:"auto_approve_blocked_reasons"`
+	PlanCrossCheckDiffRefusal   pgtype.Text        `json:"plan_cross_check_diff_refusal"`
+	WorkerRecoveryEpisode       int64              `json:"worker_recovery_episode"`
+	RequeueEpisodeBaseline      int32              `json:"requeue_episode_baseline"`
+	WorkerRecoveryEvidence      []byte             `json:"worker_recovery_evidence"`
+	CrossCheckLane              bool               `json:"cross_check_lane"`
+	CrossCheckLaneGeneration    pgtype.Int8        `json:"cross_check_lane_generation"`
+	CompletionFinalHead         pgtype.Text        `json:"completion_final_head"`
+	CodeCrossCheckRequired      bool               `json:"code_cross_check_required"`
+	ProviderParkCount           int32              `json:"provider_park_count"`
+	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
 }
 
 type RunCompletionAttempt struct {

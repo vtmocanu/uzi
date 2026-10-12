@@ -120,6 +120,26 @@ remaining budget on resume is exactly what it was at the moment you paused
 it — unlike a usage-limit wait, whose resume gives the run a fresh full
 clock.
 
+## Held after provider outages
+
+A run can also pause without an owner request after a provider-outage
+streak reaches its elapsed bound (default 24h): `paused` with
+`hold_reason: provider_unavailable`. This policy stops automatic retry
+without failing the run. **Resume** queues a fresh attempt and clears the
+streak; **Cancel** ends it. Eligible **Stop** sets the scope ceiling first,
+then requires **Resume** after success, rather than an atomic Stop endpoint.
+It requires a non-interactive milestone issue run with at least one
+completed milestone; the surfaces explain unavailable actions.
+
+This hold retains the claim, worker affinity and the issue lock for issue
+runs, and satisfies and clears pending pause requests. The worker keeps
+clone and HOME; a verified capture may still be unpublished. The owner-pause
+publication rule above does not guarantee publication for this involuntary
+hold. Losing the worker's storage can lose unpublished work; another worker
+needs published work or an available verified recovery copy. See
+[Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for progress resets, detection timing and compatibility.
+
 ## Not the same as a completion hold
 
 A `paused` run is not always a pause **you** asked for. A run with the

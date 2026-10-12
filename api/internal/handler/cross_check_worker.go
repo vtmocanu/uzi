@@ -23,13 +23,14 @@ import (
 type planCrossCheckRequest struct {
 	instructionFields       bool
 	planFields              bool
-	RepoInstructionsEnabled *bool  `json:"repo_instructions_enabled,omitempty"`
-	RepoInstructionsText    string `json:"repo_instructions_text,omitempty"`
-	HeadCommit              string `json:"head_commit"`
-	ReasonClass             string `json:"reason_class"`
-	Round                   *int32 `json:"round"`
-	Stage                   string `json:"stage"`
-	ClaimGeneration         *int64 `json:"claim_generation"`
+	RepoInstructionsCommit  *string `json:"repo_instructions_commit,omitempty"`
+	RepoInstructionsEnabled *bool   `json:"repo_instructions_enabled,omitempty"`
+	RepoInstructionsText    string  `json:"repo_instructions_text,omitempty"`
+	HeadCommit              string  `json:"head_commit"`
+	ReasonClass             string  `json:"reason_class"`
+	Round                   *int32  `json:"round"`
+	Stage                   string  `json:"stage"`
+	ClaimGeneration         *int64  `json:"claim_generation"`
 	workersvc.PlanCrossCheckCandidate
 }
 
@@ -54,7 +55,7 @@ func (req *planCrossCheckRequest) UnmarshalJSON(raw []byte) error {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
-	for _, key := range []string{"repo_instructions_enabled", "repo_instructions_text"} {
+	for _, key := range []string{"repo_instructions_enabled", "repo_instructions_text", "repo_instructions_commit"} {
 		if value, present := fields[key]; present {
 			req.instructionFields = true
 			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
@@ -168,7 +169,7 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 			}
 			cc, err = h.wsvc.RecordCodeCrossCheckFailure(r.Context(), worker, id, *req.ClaimGeneration, "", "", req.ReasonClass)
 		} else {
-			cc, err = h.wsvc.SubmitCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.BaseCommit, req.HeadCommit, workersvc.CodeCrossCheckInstructions{RepoInstructionsEnabled: req.RepoInstructionsEnabled, RepoInstructionsText: req.RepoInstructionsText})
+			cc, err = h.wsvc.SubmitCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.BaseCommit, req.HeadCommit, workersvc.CodeCrossCheckInstructions{RepoInstructionsCommit: req.RepoInstructionsCommit, RepoInstructionsEnabled: req.RepoInstructionsEnabled, RepoInstructionsText: req.RepoInstructionsText})
 		}
 		if err != nil {
 			crossCheckError(w, err)

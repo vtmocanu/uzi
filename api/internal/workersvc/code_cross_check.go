@@ -140,7 +140,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 			}
 			return store.Run{}, e
 		}
-		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, GuidanceText: frozen.GuidanceText.String, RepoInstructionsEnabled: frozen.RepoInstructionsEnabled, RepoInstructionsText: frozen.RepoInstructionsText.String, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
+		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, GuidanceText: frozen.GuidanceText.String, RepoInstructionsCommit: frozen.RepoInstructionsCommit, RepoInstructionsEnabled: frozen.RepoInstructionsEnabled, RepoInstructionsText: frozen.RepoInstructionsText.String, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
 		return child, e
 	})
 	if errors.Is(err, retry) {
@@ -233,6 +233,7 @@ func (s *Service) DecideCodeCrossCheck(ctx context.Context, worker store.Worker,
 // CodeCrossCheckInstructions is worker-provided text plus the consent observed
 // before reading it. An absent expected consent means off for legacy callers.
 type CodeCrossCheckInstructions struct {
+	RepoInstructionsCommit  *string
 	RepoInstructionsEnabled *bool
 	RepoInstructionsText    string
 }
@@ -245,7 +246,7 @@ func codeCrossCheckInstructions(inputs []CodeCrossCheckInstructions) (CodeCrossC
 	if len(inputs) == 1 {
 		input = inputs[0]
 	}
-	if len(input.RepoInstructionsText) > 65536 || !utf8.ValidString(input.RepoInstructionsText) ||
+	if (input.RepoInstructionsCommit != nil && !validCodeSHA(*input.RepoInstructionsCommit)) || len(input.RepoInstructionsText) > 65536 || !utf8.ValidString(input.RepoInstructionsText) ||
 		(!input.enabled() && input.RepoInstructionsText != "") {
 		return input, ErrCrossCheckRefused
 	}
@@ -255,7 +256,7 @@ func (input CodeCrossCheckInstructions) enabled() bool {
 	return input.RepoInstructionsEnabled != nil && *input.RepoInstructionsEnabled
 }
 func (input CodeCrossCheckInstructions) matches(cc store.CrossCheck) bool {
-	return input.enabled() == cc.RepoInstructionsEnabled && input.RepoInstructionsText == cc.RepoInstructionsText.String
+	return pgconv.TextPtr(input.RepoInstructionsCommit) == cc.RepoInstructionsCommit && input.enabled() == cc.RepoInstructionsEnabled && input.RepoInstructionsText == cc.RepoInstructionsText.String
 }
 func freezeCodeCrossCheckInputs(ctx context.Context, q *store.Queries, lead store.Run, input CodeCrossCheckInstructions) (store.CrossCheck, error) {
 	var cc store.CrossCheck
@@ -274,6 +275,7 @@ func freezeCodeCrossCheckInputs(ctx context.Context, q *store.Queries, lead stor
 	cc.GuidanceText = cc.GuidanceSnapshot
 	guidanceDigest := sha256.Sum256([]byte(guidance))
 	cc.GuidanceDigest = guidanceDigest[:]
+	cc.RepoInstructionsCommit = pgconv.TextPtr(input.RepoInstructionsCommit)
 	cc.RepoInstructionsEnabled = input.enabled()
 	cc.RepoInstructionsText = pgtype.Text{String: input.RepoInstructionsText, Valid: true}
 	instructionsDigest := sha256.Sum256([]byte(input.RepoInstructionsText))

@@ -312,6 +312,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		ForgeParkMax:           forgeParkMax,
 		// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 		DiskParkCount: int(r.DiskParkCount),
+		// PRD #1733: the open provider-park streak (count, and when it began; null when none).
+		ProviderParkCount:           int(r.ProviderParkCount),
+		ProviderParkStreakStartedAt: timePtr(r.ProviderParkStreakStartedAt.Valid, r.ProviderParkStreakStartedAt.Time),
 		// PRD #1809 M6 (D8): the latest park's checkpoint-durability report (absent = not reported).
 		CheckpointContainsLatest: boolPtrValue(r.CheckpointContainsLatest),
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
@@ -506,6 +509,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// after MilestonesCompleted is decoded above so len() is the real completed count.
 	dto.CanStopAtWall = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "budget_exhausted" &&
 		r.Kind == "issue" && !r.Interactive && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
+	// PRD #1733: the server-derived Stop gate for a provider hold — a paused 'provider_unavailable'
+	// milestone ISSUE run with >= 1 completed milestone (Stop is the scope ceiling plus the owner's
+	// resume, which would finalize nothing otherwise; SubmitInput refuses the same case).
+	dto.CanStopAtProviderHold = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "provider_unavailable" &&
+		r.Kind == "issue" && !r.Interactive && len(dto.MilestonesCompleted) >= 1
 	// PRD #634 M2: the operator scope ceiling rides the running-report ACK and the claim
 	// payload (both built here) so the worker honors it at the loop top and across a
 	// re-claim. pgtype.Int4 → *int, null (unbounded) when no scope directive was written.
