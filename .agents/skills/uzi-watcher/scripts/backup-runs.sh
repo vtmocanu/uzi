@@ -19,8 +19,12 @@
 # or attempt ledger (uzi-attempts.<branch>.entry, last value per attemptId wins)
 # names it for THIS run, and its .git reports the run's
 # branch. The journal-named candidate wins, else the newest valid attemptId (the
-# canonical dir counts as oldest). .uzi-residue-* / .uzi-skills-* siblings are never
-# candidates. The host resolves the concrete dir and passes it to the capture.
+# canonical dir counts as oldest). A kept canonical clone that a stopped run left
+# detached has no journal or ledger name (the worker clears the plain journal once it
+# writes the stopped-source marker uzi-stopped.<runId>.entry); that marker, when it
+# names THIS run, branch, key and the key's exact canonical path, makes the canonical
+# dir a retained candidate (never journal-current, and never an attempt dir).
+# .uzi-residue-* / .uzi-skills-* siblings are never candidates. The host resolves the concrete dir and passes it to the capture.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
 # worker roll or a cross-worker migration), then searches every running worker pod
@@ -417,6 +421,7 @@ select_clone(){
   local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
   local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_ok journal_ok="" journal_current="" retained="" path br name aid
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
+  local stopped="" marker_path="" marker_verdict=""
   [ -n "$branch" ] || return 1
   local rc=0
   # rc 3: listed, but some candidate's .git could not be read; keep the readable ones.
@@ -435,6 +440,35 @@ select_clone(){
   ledger="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
   probe_absent "$rc" || ledger=""
+  # Stopped-source markers (uzi-stopped.<runId>.entry, appended with --add). Each value
+  # must be a marker of the worker's exact shape (agent/src/git.ts parseStoppedMarker):
+  # anything else is unreadable evidence, not absence. A well-formed marker for another
+  # run, branch, key or non-canonical path is skipped; a match names the key's
+  # canonical clone as a retained candidate.
+  rc=0
+  stopped="$(kexec_probe "$ns" "$pod" \
+    git --git-dir="$bare" config --local --no-includes --get-all "uzi-stopped.$rid.entry")" || rc=$?
+  case "$rc" in 0|1) ;; *) probe_inconclusive; return 1 ;; esac
+  if [ "$rc" -eq 0 ]; then
+    # shellcheck disable=SC2016
+    marker_verdict="$(printf '%s\n' "$stopped" | "$JQ" -Rrn --arg rid "$rid" --arg branch "$branch" \
+      --arg stem "$stem" --arg path "$RUNNER_BASE/$stem" '
+      def integer: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+      def str: type == "string";
+      inputs | (try fromjson catch null) as $m
+      | if ($m | type) == "object"
+          and ($m | keys) == ["at","branch","clonePath","generation","journalDigest","key","reason","runId","version"]
+          and $m.version == 1 and ($m.at | str) and ($m.at | length) <= 40
+          and ($m.branch | str) and ($m.clonePath | str) and ($m.key | str) and ($m.runId | str)
+          and ($m.generation == null or ($m.generation | integer))
+          and ($m.journalDigest | str) and ($m.journalDigest | test("^[0-9a-f]{64}$"))
+          and ($m.reason | str) and ($m.reason | test("^[A-Za-z0-9_.:-]{1,64}$"))
+        then (if $m.runId == $rid and $m.branch == $branch and $m.key == $stem and $m.clonePath == $path
+              then "match" else "skip" end)
+        else "bad" end' 2>/dev/null)" || { probe_inconclusive; return 1; }
+    if printf '%s\n' "$marker_verdict" | grep -qxF bad; then probe_inconclusive; return 1; fi
+    if printf '%s\n' "$marker_verdict" | grep -qxF match; then marker_path="$RUNNER_BASE/$stem"; fi
+  fi
   rc=0
   protected="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --local --no-includes --get-all "uzi-retained.$rid.journal")" || rc=$?
@@ -514,7 +548,10 @@ select_clone(){
         probe_inconclusive; return 1;
       }
   elif [ "${terminal_capture:-0}" -eq 2 ]; then
-    return 1
+    # A completed/cancelled run is captured only from protected custody or a valid
+    # stopped marker; the live journal and ledger names are ignored for it.
+    [ -n "$marker_path" ] || return 1
+    journal=""; ledger=""
   fi
   # The journal also keeps canonical predecessors, which have no ledger identity.
   # Only worker attribution is accepted; a recorded successor is not execution authority.
@@ -537,6 +574,9 @@ select_clone(){
   fi
   if [ -n "$protected_ok" ]; then journal_ok="$protected_ok"; fi
   journal_current="${journal_ok%%$'\n'*}"
+  # The marker-named canonical dir joins the retained set only now, so it can never
+  # be journal-current.
+  if [ -n "$marker_path" ]; then journal_ok="${journal_ok:+$journal_ok$'\n'}$tab$marker_path"; fi
   # Ledger: the LAST value per attemptId wins. Keep "<attemptId><TAB><clonePath>" for
   # each attempt whose winning entry names this run; unparseable values are skipped.
   # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
@@ -570,6 +610,10 @@ select_clone(){
     fi
     [ "$br" = "$branch" ] || continue
     if [ "$journal_current" = "$aid$tab$path" ]; then
+      if [ -n "$marker_path" ] && [ "$marker_path" != "$path" ] \
+         && printf '%s\n' "$listing" | grep -qF -- "$marker_path$tab"; then
+        log "WARN $rid kept canonical $marker_path not captured (journal names a live clone)" >&2
+      fi
       printf '%s\n' "$path"
       return 0
     fi

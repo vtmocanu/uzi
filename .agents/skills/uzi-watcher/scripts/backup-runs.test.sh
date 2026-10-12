@@ -473,6 +473,10 @@ reset_layout() {
   git --git-dir="$BARE" config --unset-all "$JKEY" 2>/dev/null || :
   git --git-dir="$BARE" config --unset-all "$LKEY" 2>/dev/null || :
   git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242 2>/dev/null || :
+  local r
+  for r in run-4242 failed-1 completed-1; do
+    git --git-dir="$BARE" config --unset-all "uzi-stopped.$r.entry" 2>/dev/null || :
+  done
   git --git-dir="$BARE" config 'uzi-trackowner.agent/issue-4242.owner' run-4242
 }
 # make_clone <dir> <branch> <marker>: a clone on <branch> with an uncommitted marker.
@@ -844,5 +848,108 @@ tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -q
 tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.meta.txt | grep -qF "clone=$predecessor" \
   || fail "protected singleton: original path missing"
 echo "PASS protected completed singleton: episode-free old dirty bytes survive newer active run"
+
+# --- stopped-source marker (issue 1786): a detached kept canonical clone ---------
+# markStoppedCanonical clears the plain journal and appends uzi-stopped.<runId>.entry;
+# the marker alone then names the kept canonical dir for this run.
+DIG="$(printf 'ab%.0s' $(seq 32))"
+# stopped_marker <runId> <branch> <key> <clonePath> [runId-in-value]: append one marker.
+stopped_marker() {
+  git --git-dir="$BARE" config --add "uzi-stopped.$1.entry" "$(jq -cn \
+    --arg rid "${5:-$1}" --arg b "$2" --arg k "$3" --arg p "$4" --arg d "$DIG" \
+    '{version:1,runId:$rid,generation:null,branch:$b,key:$k,clonePath:$p,journalDigest:$d,reason:"stop",at:"2026-10-12T00:00:00Z"}')"
+}
+
+# case M-a: no journal (cleared value, then absent) + a valid marker -> canonical dirty bytes.
+reset_layout
+make_clone "$RB/issue-4242" agent/issue-4242 kept-canon
+git --git-dir="$BARE" config "$JKEY" ""
+stopped_marker run-4242 agent/issue-4242 issue-4242 "$RB/issue-4242"
+expect_pick marker-a1 "$RB/issue-4242" kept-canon
+git --git-dir="$BARE" config --unset-all "$JKEY"
+expect_pick marker-a2 "$RB/issue-4242" kept-canon
+echo "PASS marker-a: cleared/absent journal + valid marker -> kept canonical captured"
+
+# case M-b: a newer valid ledger attempt of the same run does not displace it.
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 newer-attempt
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+expect_pick marker-b "$RB/issue-4242" kept-canon
+echo "PASS marker-b: marker-named canonical beats a newer ledger attempt"
+
+# case M-c: well-formed markers that do not attribute this key are ignored; the
+# older fallback (the ledger attempt) is picked as before.
+CANON="$RB/issue-4242"
+for variant in other-run other-branch other-key attempt-path; do
+  reset_layout
+  make_clone "$CANON" agent/issue-4242 kept-canon
+  make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+  ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+  case "$variant" in
+    other-run) stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON" other-run ;;
+    other-branch) stopped_marker run-4242 agent/issue-other issue-4242 "$CANON" ;;
+    other-key) stopped_marker run-4242 agent/issue-4242 issue-other "$CANON" ;;
+    attempt-path) stopped_marker run-4242 agent/issue-4242 issue-4242 "$RB/issue-4242.attempt-$A1" ;;
+  esac
+  expect_pick "marker-c-$variant" "$RB/issue-4242.attempt-$A1" a1
+done
+echo "PASS marker-c: markers for another run/branch/key or an attempt path are not used"
+
+# A value that is not a marker of the exact shape is unreadable evidence: the search
+# is inconclusive (FAIL, retry), never a silent fallback. Extra field, bad digest,
+# wrong version and non-JSON all count. failed-1 is a failed run, which reports it.
+for bad in 'not json' '{"version":1}' \
+  "{\"version\":2,\"runId\":\"failed-1\",\"generation\":null,\"branch\":\"agent/issue-4242\",\"key\":\"issue-4242\",\"clonePath\":\"$CANON\",\"journalDigest\":\"$DIG\",\"reason\":\"stop\",\"at\":\"t\"}" \
+  "{\"version\":1,\"runId\":\"failed-1\",\"generation\":null,\"branch\":\"agent/issue-4242\",\"key\":\"issue-4242\",\"clonePath\":\"$CANON\",\"journalDigest\":\"XYZ\",\"reason\":\"stop\",\"at\":\"t\"}" \
+  "{\"version\":1,\"runId\":\"failed-1\",\"generation\":null,\"branch\":\"agent/issue-4242\",\"key\":\"issue-4242\",\"clonePath\":\"$CANON\",\"journalDigest\":\"$DIG\",\"reason\":\"stop\",\"at\":\"t\",\"extra\":1}"; do
+  reset_layout
+  make_clone "$CANON" agent/issue-4242 kept-canon
+  journal failed-1 "$CANON"
+  git --git-dir="$BARE" config --add "uzi-stopped.failed-1.entry" "$bad"
+  D_MB="$WORK/out.marker-bad"
+  rc="$(backup_rc "$D_MB" failed-1)"
+  [ "$rc" -eq 1 ] || fail "marker-bad ($bad): exit $rc, want 1"
+  grep -q 'FAIL failed-1 .*inconclusive' "$D_MB/latest-attempt/backup.log" \
+    || fail "marker-bad ($bad): expected an inconclusive FAIL; got: $(cat "$D_MB/latest-attempt/backup.log")"
+done
+echo "PASS marker-c: a value that is not an exact-shape marker -> inconclusive"
+
+# case M-d: the journal names a live attempt: live work is captured first and the
+# gap (the kept canonical) is logged.
+reset_layout
+make_clone "$CANON" agent/issue-4242 kept-canon
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
+expect_pick marker-d "$RB/issue-4242.attempt-$A2" live-attempt
+grep -qF "WARN run-4242 kept canonical $CANON not captured (journal names a live clone)" \
+  "$WORK/out.marker-d/latest-attempt/backup.log" \
+  || fail "marker-d: missing WARN; got: $(cat "$WORK/out.marker-d/latest-attempt/backup.log")"
+echo "PASS marker-d: journal-current attempt wins and the uncaptured kept canonical is logged"
+
+# case M-e: a completed run (terminal_capture=2) captures only through a marker; a
+# journal alone stays status-only.
+reset_layout
+make_clone "$CANON" agent/issue-4242 kept-canon
+journal completed-1 "$CANON"
+D_ME="$WORK/out.marker-e"
+rc="$(backup_rc "$D_ME" completed-1)"
+[ "$rc" -eq 0 ] || fail "marker-e journal-only: exit $rc, want 0"
+grep -q 'SNAP completed-1 .*status=completed' "$D_ME/latest-attempt/backup.log" \
+  || fail "marker-e journal-only: expected SNAP; got: $(cat "$D_ME/latest-attempt/backup.log")"
+[ ! -e "$D_ME/latest-attempt/issue-4242.tgz" ] || fail "marker-e journal-only: a terminal run was captured from the journal"
+stopped_marker completed-1 agent/issue-4242 issue-4242 "$CANON"
+rc="$(backup_rc "$D_ME" completed-1)"
+[ "$rc" -eq 0 ] || fail "marker-e marker: exit $rc, want 0"
+tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
+  || fail "marker-e marker: kept canonical dirty bytes not captured; log: $(cat "$D_ME/latest-attempt/backup.log")"
+# A ledger attempt of the terminal run stays ignored even with the marker.
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 newer-attempt
+ledger "$A2" completed-1 "$RB/issue-4242.attempt-$A2" live
+rc="$(backup_rc "$D_ME" completed-1)"
+[ "$rc" -eq 0 ] || fail "marker-e ledger: exit $rc, want 0"
+tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
+  || fail "marker-e ledger: a ledger attempt displaced the marker-named canonical"
+echo "PASS marker-e: completed run captures the marker-named canonical; journal alone stays status-only"
 
 echo "ALL PASS"

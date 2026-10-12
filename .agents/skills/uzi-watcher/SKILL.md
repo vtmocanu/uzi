@@ -475,7 +475,7 @@ and falling back to the durable bare tracking ref when no clone survives:
   commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
   plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
   DONE vs LEFT, `log-tail.ndjson`). It picks the clone (canonical or `.attempt-*`) by
-  the bare's journal/ledger identity plus branch, resolves worker→pod FRESH each call, searches all
+  the bare's journal/ledger identity plus branch (a detached kept canonical clone is attributed by its `uzi-stopped.<runId>.entry` marker, which names only that key's canonical dir), resolves worker→pod FRESH each call, searches all
   persistent workers when the current pod lost the clone, and falls back to the durable
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
