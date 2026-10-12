@@ -21,9 +21,7 @@ torn down. For guarded generations, release normally requires final acknowledgme
 of a covering, prerequisite-free archive or a verified empty inventory.
 Eligible completed issue, MR-rework and self-improvement runs can instead
 release their exact completing-generation hold after the API verifies the
-published final commit against the run's branch and MR (see below). A `failed`
-run can instead release its hold against a published held ref (see
-[Publishing a failed run's held work](#publishing-a-failed-runs-held-work)). Legacy generations can release on proof that their
+published final commit against the run's branch and MR (see below). Legacy generations can release on proof that their
 recorded work is published. If the boundary cannot verify and resolve the
 source, it keeps the source held for you to decide (see below). A hard
 crash with no shutdown window — a killed node, an out-of-memory kill — is
@@ -37,7 +35,7 @@ when publishing is not possible. See
 
 This is a safety net for a run that already produced real commits, not a
 guarantee against every possible failure. It does **not** cover uncommitted
-files, the SDK transcript, the worker's HOME directory, or a worker that
+files (except the work-in-progress commit a failed run's held ref carries), the SDK transcript, the worker's HOME directory, or a worker that
 died before it reached this protected boundary.
 
 For operators investigating checkpoint acknowledgement failures, see
@@ -873,15 +871,18 @@ A run qualifies when all of these hold:
 ### What gets published
 
 The ref points at the run's final tip: the commits made since the last
-checkpoint or published branch tip uzi could confirm on the forge, plus one
-work-in-progress commit holding the clone's uncommitted and untracked changes.
+checkpoint or published branch tip uzi could confirm on the forge, plus a
+work-in-progress commit holding the clone's uncommitted and untracked changes
+when the clone had any.
 Gitignored files are never included. Fetching the ref brings the full history
 that leads to it, not only the new commits.
 
 ### How it happens
 
 1. **The worker scans and uploads.** After the failed terminal is recorded,
-   the worker freshly secret-scans exactly the range it is about to pack, and
+   the worker secret-scans the run's new commits and work-in-progress (commits
+   this flight already published can ride along unscanned; see
+   [ADR-2545](../adr/2545-failed-run-held-publication.md)), and
    applies the same remembered-finding gate as checkpoints (a commit flagged
    earlier in the run is held back). It rejects a range that changes a
    workflow file, because the stored credential may lack workflow scope, and
@@ -917,7 +918,15 @@ open until an archive final disposition is acknowledged:
 - the pack is over 64 MiB;
 - the forge refuses the push or is unreachable, or the upload fails;
 - the server predates held publication (no `recovery_held_publication_v1`),
-  or `UZI_HELD_PUBLICATION` is off.
+  or `UZI_HELD_PUBLICATION` is off;
+- the release step gives a definitive refusal: `held_publication_unsupported`,
+  `held_publication_ref_missing`, `held_publication_ref_mismatch` or
+  `held_publication_not_eligible`, or a 400 from an older API that does not know
+  the held release.
+
+A transient answer to the release step (`held_publication_unavailable`, a
+transport error or a lost ACK) does not archive: the journaled release is kept,
+the hold stays open, and the worker retries it.
 
 The worker logs a short notice naming the reason code (never file contents or
 finding text), for example
@@ -959,8 +968,10 @@ inspect the commit, but it only sets `FETCH_HEAD`.
 
 The publication states are `prepared`, `invoked`, `created`, `create_unknown`,
 `refused`, `acknowledged`, `delete_unknown`, `deleted` and `abandoned`. Only
-`created` and `acknowledged` have a ref on the forge worth fetching. `refused`
-means the forge rejected the create and no ref exists; `create_unknown` and
+`created`, `acknowledged` and `delete_unknown` (the delete is unconfirmed, so the
+ref may still be on the forge) have a ref worth fetching. `refused`
+means the forge rejected the create and no ref of uzi's exists (a ref at another
+commit may); `create_unknown` and
 `delete_unknown` are outcomes uzi has not been able to confirm yet and will
 reconcile; `abandoned` means the ref now points at a commit uzi did not
 publish, which uzi leaves untouched.

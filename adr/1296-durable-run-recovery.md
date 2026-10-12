@@ -631,7 +631,9 @@ and publication locks.
 
 Cancelled and parked runs, completed runs (still #2507's receipt policy) and
 every unproved failed case keep the archive path, which is unchanged. Every
-step-A or step-B outcome short of an ACKed held FINAL falls back to capturing an
-archive on the same frozen record. Retention for the held ref runs from
+step-A outcome, and every definitive step-B refusal, short of an ACKed or
+still-journaled held FINAL falls back to capturing an archive on the same frozen
+record; a transient step-B answer keeps the journaled FINAL and the open hold,
+with no archive, and retries. Retention for the held ref runs from
 acknowledgement for `UZI_RECOVERY_READY_RETENTION`. #2544 quota and #2506 failed
 thin release remain excluded.

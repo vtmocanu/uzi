@@ -324,8 +324,10 @@ declared tip before release. It therefore does not need the self-contained,
 prerequisite-free bundle that an archive FINAL needs. Every other covering check
 still applies: the inventory is inactive, every unresolved root and retained
 source head is an ancestor of the FINAL's source SHA, clone heads are verified,
-and quarantine blocks physical destruction. The ACK must exactly match the
-journaled request (publication id, source SHA, coverage digest) before the
+and quarantine blocks physical destruction. The API releases only when its
+stored receipt exactly matches the request (publication id, source SHA, coverage
+digest), which the worker sends verbatim from its journal; the worker checks the
+ACK's run, generation and release flags before the
 record is marked acknowledged and the generation is retired. A retained or
 cleared held FINAL grants no destruction authority, and the worker keeps the
 clone, pins and open hold. A transient retention keeps the journaled request

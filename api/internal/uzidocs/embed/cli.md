@@ -1211,7 +1211,8 @@ uzi run held <run-id> [--json]
   ``fetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire <run-id>` ``.
 - **No publication.** Prints `run <run-id> has no held publications` (nothing under
   `--quiet`). That is also the answer for a run that was cancelled, parked, or failed on
-  an excluded origin, or whose work fell back to the archive.
+  an excluded origin, or whose work fell back to the archive before anything was sent to the forge. A refused
+  create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
 - **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
   `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
   `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty

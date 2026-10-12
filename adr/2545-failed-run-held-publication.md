@@ -153,11 +153,14 @@ The API answer order is binding:
 2. immutable ownership, then the receipt compare with no mutable read, so an
    exact replay of a released receipt gets the original ACK even after the
    switch, capabilities or forge went away (replay-first);
-3. mutable gates (capabilities, switch, `UZI_RECOVERY_READY_RETENTION` ≥ 1 s);
+3. mutable gates (capabilities and the switch only);
 4. one forge listing of the held ref, outside every database lock and behind a
    per-worker limiter;
 5. one transaction locking worker, run, hold and publication. It re-compares
-   the receipt first, then re-checks eligibility, then releases the hold with
+   the receipt first, then re-checks eligibility, the switch and capabilities
+   again, and `UZI_RECOVERY_READY_RETENTION` ≥ 1 s (the retention check exists
+   only here, after the listing, so with retention below 1 s and the forge down
+   the answer is `held_publication_unavailable`), then releases the hold with
    `release_evidence = final_disposition = 'held_publication'` and
    `final_publication_id`, and acknowledges the publication in the same
    commit.
@@ -224,8 +227,8 @@ secret-scrubbed before it is stored or shown.
 - The ref is deleted when retention expires (or after an owner early expiry),
   the same bounded lifetime as an archive.
 - **Accepted limit: `create_unknown` has no terminal exit on absence.** It
-  stays reconcile-only until a listing finds the ref at the tip or a refusal
-  is proven. Until then its `live_run_id` keeps blocking removal of the repo
+  stays reconcile-only until a listing finds the ref at the tip; no code path
+  records a refusal from `create_unknown`, so that listing is the only exit. Until then its `live_run_id` keeps blocking removal of the repo
   and the forge connection, and the owner has no abandon path for it.
 - **Accepted limit: the worker treats `held_publication_unsupported` as
   definitive** and falls back to the archive, although the server considers it
