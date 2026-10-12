@@ -535,7 +535,7 @@ Initial settings right anchoring failed the actual mock page at 390px (left -189
 
 The nested token picker failed at 320px: right 321 versus outer-panel right 288. Capping the root/picker widths and wrapping its action row fixed that defect. Shipping browser coverage opens BOTH outer and nested disclosures and checks every nested button/select/input within the picker, plus Escape/focus return. Five widths pass: 320, 390, 768, 1024, 1280. Credential and disabled-panel behavior tests: 36 passed.
 
-[Light header/mobile settings comparison](2789-m2-header-parity-light.png) · [Dark comparison](2789-m2-header-parity-dark.png). Actual mock-mode Chromium checks Enter/Space/Escape and focus return, settings and Pause bounds across five widths; no page errors. The mock capture-only [hidden] rule remains as documented for M1. Native palette/typeface/components, sample identity/token/model/time values differ; effective nondefault toggle chips are required by D14. Final four-state attention/footer matrix remains for M3.
+[Light header/mobile settings comparison](2789-m2-header-parity-light.png) · [Dark comparison](2789-m2-header-parity-dark.png). Actual mock-mode Chromium checks Enter/Space/Escape and focus return in both themes, settings bounds at 390/768/1024/1280px and Pause bounds at 320/390/768/1024/1280px; no page errors. The shipping production RunView browser test separately checks settings and its nested picker at all five widths. The mock capture-only [hidden] rule remains as documented for M1. Native palette/typeface/components, sample identity/token/model/time values differ; effective nondefault toggle chips are required by D14. Final four-state attention/footer matrix remains for M3.
 
 ## Integration and review
 
