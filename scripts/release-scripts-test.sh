@@ -78,18 +78,23 @@ cat > "$GH_STUB/gh" <<'STUB'
 # New release queries are isolated from the #1327 closing-issue response.
 if [ "${GHCR_STUB:-}" = 1 ]; then
   [ -z "${GHCR_QUERY_LOG:-}" ] || printf '%s\n' "$*" >> "$GHCR_QUERY_LOG"
+  endpoint=""
+  for arg in "$@"; do
+    case "$arg" in */packages/container/*/versions) endpoint="$arg" ;; esac
+  done
+  if [ -n "$endpoint" ]; then
+    case "$endpoint" in
+      *uzi%2Fagent-base/versions) out="${GHCR_BASE_OUT-}"; rc="${GHCR_BASE_RC:-1}" ;;
+      *uzi%2Fagent-jvm/versions) out="${GHCR_JVM_OUT-}"; rc="${GHCR_JVM_RC:-1}" ;;
+      *) out="${GHCR_OTHER_OUT-}"; rc="${GHCR_OTHER_RC:-1}" ;;
+    esac
+    printf '%s\n' "$out"; exit "$rc"
+  fi
   case "$*" in
     'repo view --json owner,name '*)
       printf '%s\n' "${GHCR_IDENTITY-test uzi}"; exit "${GHCR_IDENTITY_RC:-1}" ;;
     'api users/test --jq .type')
       printf '%s\n' "${GHCR_KIND-User}"; exit "${GHCR_KIND_RC:-1}" ;;
-    *'/packages/container/'*'/versions '*)
-      case "$*" in
-        *'uzi%2Fagent-base/versions '*) out="${GHCR_BASE_OUT-}"; rc="${GHCR_BASE_RC:-1}" ;;
-        *'uzi%2Fagent-jvm/versions '*) out="${GHCR_JVM_OUT-}"; rc="${GHCR_JVM_RC:-1}" ;;
-        *) out="${GHCR_OTHER_OUT-}"; rc="${GHCR_OTHER_RC:-1}" ;;
-      esac
-      printf '%s\n' "$out"; exit "$rc" ;;
     'run list '*) printf '123\n'; exit 0 ;;
     'run view 123 --log') printf 'Pushing signature to: fixture\n'; exit 0 ;;
     *'/releases/latest '*) printf 'v0.2.0\n'; exit 0 ;;
@@ -856,7 +861,7 @@ ghcr_outcome() {
   if [ -n "$found" ]; then pass "$label $image $outcome"; else fail "$label $image $outcome"; fi
 }
 ghcr_cut_case() {
-  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner
+  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner out_lower
   local failures_before="$FAILS"
   # M2 mutation runners may select one named priority/pin case without changing fixtures.
   [ -z "${GHCR_CASE_FILTER:-}" ] || [ "$name" = "$GHCR_CASE_FILTER" ] || return 0
@@ -887,13 +892,14 @@ ghcr_cut_case() {
     auto-promote-only) version=0.3.0; verb=--promote ;;
   esac
   if [ -n "$verb" ]; then run_rc "$d" "$version" "$verb"; else run_rc "$d" "$version"; fi
+  out_lower="$(printf '%s' "$RC_OUT" | tr '[:upper:]' '[:lower:]')"
   if [ "$base" != absent ] && [ "$jvm" != absent ] &&
      [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ]; then
     assert_eq "$name succeeds" 0 "$RC_RC"
     case "$name" in
       both-error|present-error|unresolved-owner|identity-rc-present)
-        assert_contains "$name warning diagnostic" 'warning:' "${RC_OUT,,}"
-        assert_contains "$name publish gate warning" 'publish gate' "${RC_OUT,,}"
+        assert_contains "$name warning diagnostic" 'warning:' "$out_lower"
+        assert_contains "$name publish gate warning" 'publish gate' "$out_lower"
         assert_contains "$name warning selects HEAD pin" 0.1.1 "$RC_OUT"
         ghcr_absent "$name no publication repair on error" "the pinned tag's publication did not complete" "$RC_OUT" ;;
       *) ghcr_absent "$name present is silent" 'worker pin pre-flight' "$RC_OUT" ;;
@@ -929,8 +935,8 @@ ghcr_cut_case() {
     case "$name" in
       empty-head-pin|unreadable-head-pin)
         ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
-        assert_contains "$name instrument failure diagnostic" 'instrument' "${RC_OUT,,}"
-        assert_contains "$name pin read failure diagnostic" 'read' "${RC_OUT,,}" ;;
+        assert_contains "$name instrument failure diagnostic" 'instrument' "$out_lower"
+        assert_contains "$name pin read failure diagnostic" 'read' "$out_lower" ;;
       *)
         ghcr_queries "$name" "$log" "$owner"
         ghcr_outcome "$name" agent-base "$base" "$RC_OUT"
@@ -939,9 +945,9 @@ ghcr_cut_case() {
         assert_contains "$name absent priority" absent "$RC_OUT"
         assert_contains "$name publication repair" "the pinned tag's publication did not complete" "$RC_OUT"
         assert_contains "$name release workflow repair" 'release.yml' "$RC_OUT"
-        assert_contains "$name verify repair hint" 'verify' "${RC_OUT,,}"
-        assert_contains "$name rerun cut hint" 're-run' "${RC_OUT,,}"
-        assert_contains "$name cut repair hint" 'cut' "${RC_OUT,,}"
+        assert_contains "$name verify repair hint" 'verify' "$out_lower"
+        assert_contains "$name rerun cut hint" 're-run' "$out_lower"
+        assert_contains "$name cut repair hint" 'cut' "$out_lower"
         assert_contains "$name selects HEAD pin rather than requested version or RC tree" 0.1.1 "$RC_OUT" ;;
     esac
   fi
