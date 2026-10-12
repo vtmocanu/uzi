@@ -1053,9 +1053,9 @@ func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 			if allowed[name] {
 				continue
 			}
-			// Roll-release lifecycle checks preserve the debounced pressure fence only;
+			// Drain-release lifecycle checks preserve the debounced pressure fence only;
 			// raw display telemetry remains forbidden, including in these queries.
-			if name == "UncordonHostedWorker" || name == "UncordonHostedWorkerImageRoll" {
+			if name == "UncordonHostedWorker" || name == "UncordonHostedWorkerImageRoll" || name == "UncordonHostedWorkerPressureRecycle" {
 				block = strings.ReplaceAll(block, "stats_disk_pressure_streak", "")
 			}
 			if strings.Contains(block, "stats_") {
@@ -1102,7 +1102,7 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 		for _, block := range blocks[1:] { // blocks[0] is the file preamble
 			name := strings.Fields(block)[0]
 			// The release checks may retain the debounced lifecycle fence, never raw disk stats.
-			if name == "UncordonHostedWorker" || name == "UncordonHostedWorkerImageRoll" {
+			if name == "UncordonHostedWorker" || name == "UncordonHostedWorkerImageRoll" || name == "UncordonHostedWorkerPressureRecycle" {
 				block = strings.ReplaceAll(block, "stats_disk_pressure_streak", "")
 			}
 			if !strings.Contains(block, "stats_disk_") {
