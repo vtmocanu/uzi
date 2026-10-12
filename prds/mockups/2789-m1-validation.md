@@ -1,6 +1,6 @@
 # #2789 M1 validation and assertion migrations
 
-Status: source review and focused checks complete; final integration gates pending. M2, M3 and M4 remain pending.
+Status: M1 source review, focused checks, web/repository gates and production build passed; corrected evidence review is tracked separately below. M2, M3 and M4 remain pending.
 
 Code reviewed and tested: `bffcbb77e92b4a58937cd0cc114585a39f574b83`. Cumulative M1 review base: `2bf9a00e6eac5e3989097bdb7167cd3143a092df`; published prototype floor: `3bef77073807e55d01e097f7f60a43d583d6ee21`. The default branch was integrated by merge, preserving published history.
 
@@ -55,6 +55,607 @@ Selected commands: npm run typecheck; npm exec -- vitest run <the affected count
 | control-owner-terminal | 0 | 1 (expected failure) |
 | control-busy | 0 | 1 (expected failure) |
 | stage-prototype | 0 | 1 (expected failure) |
+
+## Exact deliberate breaks and observed predicate failures
+
+### count-offset
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "badge.reported ? badge.done : \"–\"",
+    "(badge.reported ? badge.done + 1 : \"–\")"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:74`; TestingLibraryElementError: Unable to find an element with the text: 2 of 3 reported complete. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### unreported-positive
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "badge.reported ? badge.done : \"–\"",
+    "badge.reported ? badge.done : \"?\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:33`; AssertionError: expected '≈11%·? of 4 reported' to be '≈11%·– of 4 reported' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### unreported-negative
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "{badge && <span data-progress-what",
+    "{badge && <><span data-progress-what"
+  ],
+  [
+    "src/components/RunProgressCard.tsx",
+    "{badge.reported ? \"reported complete\" : \"reported\"}</span>}",
+    "{badge.reported ? \"reported complete\" : \"reported\"}</span>{!badge.reported && <span>0 of {badge.total} reported complete</span>}</> }"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:33`; AssertionError: expected '≈11%·– of 4 reported0 of 4 reported c…' to be '≈11%·– of 4 reported' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### count-foreign-members
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/lib/runBadge.ts",
+    "const done = frozen.reduce((n, m) => (completed.has(m.id) ? n + 1 : n), 0);",
+    "const done = completed.size;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:43`; TestingLibraryElementError: Unable to find an element with the text: 1 of 4 reported complete. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### mark-completed
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "aria-label=\"reported complete\"",
+    "aria-label=\"not started\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:45`; AssertionError: expected  to have a length of 1 but got +0. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### mark-in-progress
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "const inProgress = new Set(run.milestones_in_progress ?? []);",
+    "const inProgress = new Set<string>();"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:78`; TestingLibraryElementError: Unable to find an element with the text: reviewer. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### mark-unattached-negative
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "inProgress.has(m.id) ? \"in_progress\"",
+    "true ? \"in_progress\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.nowline.test.tsx:132`; TestingLibraryElementError: Found multiple elements with the text of: in progress. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### fallback-sibling-negative
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "m.id === firstInProgress && (",
+    "(m.id === firstInProgress || m.id === \"m3\") && ("
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.nowline.test.tsx:118`; TestingLibraryElementError: Found multiple elements with the text: coder. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### fallback-first-positive
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "m.id === firstInProgress && (",
+    "m.id === firstInProgress && m.id === \"no-fallback-destination\" && ("
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.nowline.test.tsx:118`; TestingLibraryElementError: Unable to find an element with the text: coder. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### rows-missing
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "if (milestones.length === 0) return null;",
+    "if (milestones.length >= 0) return null;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.nowline.test.tsx:117`; TestingLibraryElementError: Unable to find an element with the text: m2. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### rows-duplicate
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "<MilestoneRows run={run} activity={live} activeContent={<>{phaseLine}{nowLine}</>} />",
+    "<><MilestoneRows run={run} activity={live} activeContent={<>{phaseLine}{nowLine}</>} /><MilestoneRows run={run} activity={live} /></>"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:31`; AssertionError: expected …(2) to have a length of 1 but got 2. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### track-accessibility
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "aria-label={trackLabel}",
+    "aria-label={trackLabel + \" broken\"}"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:76`; AssertionError: expected 'Plan approved; 2 of 3 milestones repo…' to be 'Plan approved; 2 of 3 milestones repo…' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### track-titles
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "data-seg={state} title={title}",
+    "data-seg={state} title={title + \" broken\"}"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:80`; AssertionError: expected [ …(4) ] to deeply equal [ [ 'done', 'Plan approved' ], …(3) ]. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### activity-label
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "const safeLabel = stripUnsafeChars(label);",
+    "const safeLabel = stripUnsafeChars(label).replace(/./g, \"x\");"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:87`; AssertionError: expected 'leadxxxxxxxxxxxxxxBash1m ago' to contain 'running a gate'. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### phase-text
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "phase && `phase: ${stripUnsafeChars(phase)}`",
+    "phase && `current phase: ${stripUnsafeChars(phase)}`"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:103`; AssertionError: expected 'current phase: review' to be 'phase: review' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### unknown-phase-negative
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "? p.phase : \"\";",
+    "? p.phase : \"implement\";"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:112`; AssertionError: expected <div …(4)></div> to be null. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### row-tooltip
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "title={stripUnsafeChars(m.title)}",
+    "title={stripUnsafeChars(m.title) + \" broken\"}"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:165`; AssertionError: expected 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…' to be 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### row-id
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "{stripUnsafeChars(m.id)}</span>",
+    "{stripUnsafeChars(m.id) + \"broken\"}</span>"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:171`; AssertionError: expected 'recovery-docs-validationbrokenxxxxxxx…' to be 'recovery-docs-validationxxxxxxxxxxxxx…' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### track-min-width
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "className=\"grid min-w-0 gap-1.5\"",
+    "className=\"grid gap-1.5\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:173`; AssertionError: expected 'grid gap-1.5' to contain 'min-w-0'. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### missing-percent-negative
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "? Math.max(0, Math.min(100, Math.round(p.pct))) : null;",
+    "? Math.max(0, Math.min(100, Math.round(p.pct))) : 11;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:217`; TestingLibraryElementError: Unable to find an element with the text: limit wait · resumes 09:00 PM. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### hint-tooltip
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "title=\"A question mentions this run; this is a hint, not a recorded dependency.\"",
+    "title=\"Not a hint\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:284`; AssertionError: expected 'Not a hint' to be 'A question mentions this run; this is…' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### sanitizer-inert-reversal
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/lib/safeText.ts",
+    "return s.replace(UNSAFE_CHAR, \"\");",
+    "return s.replace(UNSAFE_CHAR, \"$&\");"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:315`; TestingLibraryElementError: Unable to find an element with the text: eviltxt.exe-step. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### segment-visible-copy
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "      />\n\n    </div>",
+    "      >{title}</div>\n\n    </div>"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:37`; AssertionError: expected false to be true // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### active-track-title
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "active milestone: ${stripUnsafeChars(milestones.find(m => m.id === active)?.title ?? active)}",
+    "active milestone: broken${stripUnsafeChars(milestones.find(m => m.id === active)?.title ?? active)}"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:76`; AssertionError: expected 'Plan approved; 2 of 3 milestones repo…' to be 'Plan approved; 2 of 3 milestones repo…' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### activity-clean-label
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "const safeLabel = stripUnsafeChars(label);",
+    "const safeLabel = stripUnsafeChars(label).replace(\"fix it\", \"different task\");"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.test.tsx:325`; AssertionError: expected 'coderdifferent taskBash1m ago' to contain 'fix it'. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### preference-absence
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/lib/prefs.ts",
+    "return pruned[runId]?.collapsed;",
+    "return pruned[runId]?.collapsed ?? false;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/lib/prefs.test.ts:78`; AssertionError: expected false to be undefined. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### summary-collapse-body
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/pages/RunView.tsx",
+    "{!collapsed && (",
+    "{true && ("
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/runView/DeliveredCard.test.tsx:322`; AssertionError: expected <section …(2)>…(7)</section> to be null. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### summary-collapse-excerpt
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/pages/RunView.tsx",
+    "{collapsed && <p",
+    "{false && collapsed && <p"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.test.tsx:832`; TestingLibraryElementError: Unable to find an element with the text: Some intent.. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### summary-collapse-persistence
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/lib/prefs.ts",
+    "return pruned[runId]?.collapsed;",
+    "return pruned[runId] ? undefined : undefined;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.test.tsx:847`; AssertionError: expected <h3 …(1)></h3> to be null. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### summary-expanded-body
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/pages/RunView.tsx",
+    "{!collapsed && (",
+    "{collapsed && ("
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.test.tsx:740`; TestingLibraryElementError: Unable to find an element with the text: What this run will implement. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### tooltip-neutral
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "\"No milestone completion reported for this run\"",
+    "\"Wrong neutral tooltip\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.test.tsx:5699`; AssertionError: expected 'Wrong neutral tooltip' to be 'No milestone completion reported for …' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### tooltip-zero
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunProgressCard.tsx",
+    "\"Milestones reported complete of the approved plan\"",
+    "\"Wrong zero tooltip\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.test.tsx:5702`; AssertionError: expected 'Wrong zero tooltip' to be 'Milestones reported complete of the a…' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### owner-dedup
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/RunMilestoneRows.tsx",
+    "const ownerIsLive = attribution ? laneList.some((l) => l.agent === attribution.agent) : false;",
+    "const ownerIsLive = attribution ? laneList.some((l) => l.agent === attribution.agent) && false : false;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/RunProgressCard.m1.test.tsx:77`; AssertionError: expected [ <span></span>, <span></span> ] to have a length of 1 but got 2. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### repeated-role
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/lib/runBadge.ts",
+    "if (match !== null) return null; // two-or-more → ambiguous, suppress on all",
+    "if (match !== null) return match; // deliberately wrong repeated-role join"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/pages/RunView.attribution.test.tsx:219`; AssertionError: expected <span …(1)></span> to be null. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### control-owner-terminal
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/SteerQueueCard.tsx",
+    "if (terminal || !canSteer) return null;",
+    "if (terminal && !canSteer) return null;"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/SteerQueueCard.test.tsx:281`; AssertionError: expected <button …(2)></button> to be null. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### control-busy
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/components/SteerQueueCard.tsx",
+    "disabled={busy}",
+    "disabled={false && busy}",
+    "all"
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/components/SteerQueueCard.test.tsx:654`; AssertionError: expected false to be true // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
+### stage-prototype
+
+Each edit below is file, original text, replacement text, optional all-occurrences flag. Each original anchor was checked before replacement.
+
+```json
+[
+  [
+    "src/lib/runStage.ts",
+    "typeof name === \"string\" && Object.prototype.hasOwnProperty.call(TOOL_STAGE, name) ? TOOL_STAGE[name] : \"Working\"",
+    "typeof name === \"string\" ? TOOL_STAGE[name] ?? \"Working\" : \"Working\""
+  ]
+]
+```
+
+Observed original predicate failure: `web/src/lib/runStage.test.ts:9`; AssertionError: expected [Function Object] to be 'Working' // Object.is equality. Typecheck exit 0; focused mutation test exit 1; unmodified selected run exit 0 (185 tests).
+
 
 ## Exhaustive changed-assertion inventory
 
@@ -844,7 +1445,7 @@ Combined affected-scope evidence: 119 passing tests (18 prefs + 48 SteerQueueCar
 
 ## Gate failure comparison and remaining integration work
 
-The first full web gate on 986e2178 returned exit 201: 19 failed, 6625 passed. Its five failing files concerned the seeded prototype's controls and summary preference/body defaults. A narrowed equivalent selection failed five tests on that candidate and passed six on default-branch base 2bf9a00e (same lockfile, dependencies and TZ). These were task-owned branch regressions, not unrelated failures. Test-only maintenance preserved the behaviors on the already-seeded components. The final full task gate:web passed at b05cc1b7 (source identical to the code SHA above), exit 0, including browser tests (14 tests across four files). Repo and bundler gates remain pending.
+The first full web gate on 986e2178 returned exit 201: 19 failed, 6625 passed. Its five failing files concerned the seeded prototype's controls and summary preference/body defaults. A narrowed equivalent selection failed five tests on that candidate and passed six on default-branch base 2bf9a00e (same lockfile, dependencies and TZ). These were task-owned branch regressions, not unrelated failures. Test-only maintenance preserved the behaviors on the already-seeded components. The final full task gate:web passed at b05cc1b7 (source identical to the code SHA above), exit 0, including browser tests (14 tests across four files). task gate:repo at 60e5ccc1 passed, exit 0, including canary-checked secret and Semgrep scans. npm run build from web at 60e5ccc1 passed, exit 0, with the existing large-chunk warning. Full web totals: 6659 unit tests and 14 browser tests passed.
 
 Focused lead checks passed, including 34 stage/row regressions and the docs-mirror drift test with -count=1; gofmt -l returned no paths for the four comment-only Go files. Later full-gate results supersede focused totals rather than implying those totals were full-suite results.
 
