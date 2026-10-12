@@ -590,11 +590,23 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 export function Spinner({ className = "" }: { className?: string }) {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
-    const id = setInterval(
-      () => setFrame((f) => (f + 1) % SPINNER_FRAMES.length),
-      80,
-    );
-    return () => clearInterval(id);
+    const preference = typeof window.matchMedia === "function"
+      ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const update = () => {
+      if (timer !== undefined) clearInterval(timer);
+      timer = undefined;
+      setFrame(0);
+      if (!preference?.matches) {
+        timer = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 80);
+      }
+    };
+    update();
+    preference?.addEventListener?.("change", update);
+    return () => {
+      if (timer !== undefined) clearInterval(timer);
+      preference?.removeEventListener?.("change", update);
+    };
   }, []);
   return (
     <span

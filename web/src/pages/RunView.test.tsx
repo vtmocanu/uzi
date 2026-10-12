@@ -2218,6 +2218,7 @@ describe("MrReworkPanel — on-demand rework + past-cap surface (PRD #1202)", ()
       </MemoryRouter>,
     );
     await screen.findByText("Add rate limiting");
+    fireEvent.click(screen.getByRole("button", { name: "Run settings ▾" }));
     fireEvent.click(await screen.findByRole("button", { name: REWORK_NOW }));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /start rework/i }));

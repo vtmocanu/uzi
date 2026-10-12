@@ -636,8 +636,10 @@ scenarios are mutually exclusive by construction. Known values:
   documenter and spec-keeper are live, exercising the quiet
   `Assigned owner:` strip. Approval has candidate rows but no frozen list;
   failed and completed retain frozen rows with null progress and no live
-  lanes or Now note. These routes cover the M1 card; header settings,
-  attention order, cost-footer and summary-collapse changes (M2/M3), and
+  lanes or Now note. These routes cover the unified card and
+  header settings/controls. Open Run settings to inspect the token epochs
+  and toggles; the assigned fixture includes one recorded pin and its time.
+  Attention order, cost-footer and summary-collapse changes (M3), and
   Now summarizer wording changes (M4), remain pending.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).

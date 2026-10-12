@@ -6,14 +6,14 @@ import { Badge, Button, Card, cx, type BadgeTone } from "./ui";
 import { FollowUpComposer } from "./FollowUpComposer";
 
 // SteerQueueCard is the run's steering surface (PRD #95): the follow-up queue with
-// per-entry delivery status, plus — while the run is live — the composer + Stop control.
+// per-entry delivery status, plus — while the run is live — the composer.
 //
 // Critically, this card is rendered UNCONDITIONALLY by RunView — including for a terminal
 // run — and its `inputs` are lifted into useRunStream (Decision 7/B1). That is what lets
 // the queue survive the run completing and still show "Not delivered — run finished" or "Not confirmed — run finished"; it
 // could never do that from inside the !terminal-gated composer, which unmounts on
-// completion. The composer + Stop, by contrast, are only meaningful for a live run, so
-// they are gated on !terminal.
+// completion. The composer is only meaningful for a live run, so it is gated on
+// !terminal.
 //
 // Delivery state (Decision 7, issue #1800) is derived CLIENT-SIDE from the input's receipt
 // timestamps and run.status: consumed_at is the worker having received it (Received),
@@ -279,12 +279,9 @@ export function SteerQueueCard({
   // empty (the 404 leaves it []), so the whole card collapses to nothing below.
   canSteer?: boolean;
   busy: boolean;
-  // Legacy test-call compatibility until the implementation run migrates callers.
-  onStop?: () => void;
   onSend: (text: string) => void;
   // The run kind controls whether a follow-up composer is meaningful.
   run?: Run;
-  onPause?: (mode: "milestone" | "now") => void;
 }) {
   // Render nothing when there is no queue to show AND no composer to offer: a finished
   // run with an empty queue (matching the pre-v2 "no composer once terminal" behavior),
@@ -390,8 +387,8 @@ export function RunControls({ run, busy, terminal, canSteer, onPause, onStop }: 
   return <div className="flex flex-wrap items-center gap-2">
     {run.status === "running" && !run.pause_requested_at && isPausableRun(run) && <PauseMenu run={run} busy={busy} onPause={onPause} />}
     <Button variant="danger" size="sm" disabled={busy} onClick={onStop}
-      aria-label={run.kind === "job" ? "Stop job" : "Stop run"}>
-      {run.kind === "job" ? "Stop job" : "Stop run"}
+      aria-label={run.kind === "job" ? "Stop this job" : "Stop run"}>
+      {run.kind === "job" ? "Stop this job" : "Stop run"}
     </Button>
   </div>;
 }

@@ -512,6 +512,16 @@ Where it appears:
 
 ### Run page and TUI detail
 
+The run header keeps identity, state, harness/model and the spent token. A
+requested or released switch also shows its chosen token. Pause and Stop
+are in the header; the queue and composer point there. Run settings holds
+token switching, all recorded token epochs (including a single pin and its
+time), and run toggles. Enter/Space opens the disclosure; Escape closes it
+and returns focus to the trigger. Parked limit-wait controls remain visible
+in their attention panel. Effective nondefault toggle states remain neutral
+header chips. The settings panel stays within narrow viewports, and Spinner
+uses a static frame under reduced motion.
+
 The run page and the TUI run detail show the estimate in more depth. The two
 differ in what they carry; the run page has more.
 

@@ -97,6 +97,41 @@ export { JudgePanel, JUDGE_POLL_MAX_TRIES, TriageSummary } from "./runView/Judge
 // (mirroring CompletionStatePanel's exported shape) so its tests can import it from ./RunView.
 export { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 
+function RunSettingsDisclosure({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const close = () => {
+    setOpen(false);
+    trigger.current?.focus();
+  };
+  return (
+    <div className="relative" onKeyDown={(event) => {
+      if (event.key === "Escape" && open) {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }
+    }}>
+      <button ref={trigger} type="button"
+        className="whitespace-nowrap rounded-md border border-edge px-3 py-1.5 text-sm text-muted"
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            if (open) close();
+            else setOpen(true);
+          }
+        }} aria-expanded={open}
+        aria-controls="run-settings" onClick={() => open ? close() : setOpen(true)}>
+        Run settings ▾
+      </button>
+      <div id="run-settings" hidden={!open}
+        className={cx("absolute left-0 z-20 mt-2 w-[min(32rem,85vw)] gap-4 lg:left-auto lg:right-0 rounded-lg border border-edge bg-surface p-4 shadow-xl", open ? "grid" : "hidden")}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 // LiveElapsed ticks a wall-clock timer for a still-running run.
 function LiveElapsed({ since }: { since: string }) {
   const now = useNow(1000);
@@ -144,14 +179,14 @@ function RunBudgetElapsed({ run }: { run: Run }) {
   );
 }
 
-// PRD #1189/#1190: a paused run's elapsed. The clock is stopped, so it is a STATIC span, not a
+// ParkedElapsed shows a parked run's elapsed. The clock is stopped, so it is a STATIC span, not a
 // ticker: the frozen used time over the budget, then how much of the budget remains when the run
 // resumes (the deadline itself is omitted — it moves with the pause). A run with no wall budget
-// keeps today's plain "· clock stopped" line, measured from the first start to when the pause landed
+// keeps today's plain "· clock stopped" line, measured from the first start to when the hold landed
 // (status_since, issue #1727, with the updated_at fallback; the same instant PausedPanel shows).
-function PausedElapsed({ run }: { run: Run }) {
+function ParkedElapsed({ run }: { run: Run }) {
   if (!run.started_at) return null;
-  const view = extendBudgetView(run, Date.now());
+  const view = extendBudgetView({ ...run, status: "paused" }, Date.now());
   if (!view) {
     // Issue #2004: the no-budget line is a plain wall span, so it anchors on the first start.
     // The `?? run.started_at` only narrows the type: firstStartIso already falls back to it.
@@ -2093,78 +2128,25 @@ export function RunView() {
       <PageHeader
         actionsBesideTitle
         actions={<>
-          <details className="relative" onKeyDown={(event) => {
-            if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); }
-          }}>
-            <summary className="list-none cursor-pointer whitespace-nowrap rounded-md border border-edge px-3 py-1.5 text-sm text-muted [&::-webkit-details-marker]:hidden">Run settings ▾</summary>
-            <div className="absolute right-0 z-20 mt-2 grid w-[min(32rem,85vw)] gap-4 rounded-lg border border-edge bg-surface p-4 shadow-xl">
-              {!isCredentialDisabledHold(run) && (
-                <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
-              )}
-
-      <CredentialEpochList epochs={run.credential_epochs} />      {run.status === "limit_wait" ? (
-        // Parked: keep the full-width countdown card stacked exactly as today (no flex
-        // item → no shrinking). MrReworkPanel still self-hides / renders beneath it via
-        // the page-wide space-y-5 rhythm, unchanged.
-        <>
-          <MrReworkPanel
-            run={run}
-            busy={busy}
-            canSteer={canSteer}
-            userDefault={mrReworkDefault}
-            onToggle={(enabled) =>
-              act(async () => {
-                await api.setRunMrRework(run.id, enabled);
-                // Not a status change, so no WS frame announces it — refetch so the checkbox
-                // reflects the new run value instead of snapping back to the stale one.
-                await refreshRun();
-              })
-            }
-          />
-        </>
-      ) : (
-        // Non-parked: the two simple inline toggles share one row from `sm` up, and stay
-        // cleanly stacked (two lines) on mobile — the two ~87-char labels would wrap
-        // raggedly if we relied on flex-wrap alone at narrow widths, so the breakpoint is
-        // explicit. Gated so no always-present empty <div> adds a stray space-y-5 margin
-        // on terminal runs where both panels render nothing. A job (PRD #1908 D-E) never
-        // parks on a usage limit and has no MR, so neither toggle means anything for it.
-        run.kind !== "job" &&
-        (canToggleWaitOnLimit(run.status) || (canSteer && canToggleMrRework(run))) && (
-          <div className="flex flex-col gap-y-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-6">
-            <LimitWaitPanel
-              run={run}
-              busy={busy}
-              canSteer={canSteer}
-              onStop={() => cancelRun()}
-              onToggle={(enabled) =>
-                act(async () => {
+          <RunSettingsDisclosure>
+            {!isCredentialDisabledHold(run) && (
+              <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
+            )}
+            <CredentialEpochList epochs={run.credential_epochs} />
+            {run.kind !== "job" && run.status !== "limit_wait" && (
+              <LimitWaitPanel run={run} busy={busy} canSteer={canSteer}
+                onStop={() => cancelRun()}
+                onToggle={(enabled) => act(async () => {
                   await api.setRunWaitOnLimit(run.id, enabled);
-                  // The flag is not a status change, so no WS frame announces it — without
-                  // this refetch the checkbox would snap back to the stale run on the next
-                  // render, which reads as the write having failed.
                   await refreshRun();
-                })
-              }
-            />
-            <MrReworkPanel
-              run={run}
-              busy={busy}
-              canSteer={canSteer}
-              userDefault={mrReworkDefault}
-              onToggle={(enabled) =>
-                act(async () => {
-                  await api.setRunMrRework(run.id, enabled);
-                  // Not a status change, so no WS frame announces it — refetch so the checkbox
-                  // reflects the new run value instead of snapping back to the stale one.
-                  await refreshRun();
-                })
-              }
-            />
-          </div>
-        )
-      )}
-</div></details>
+                })} />
+            )}
+            <MrReworkPanel run={run} busy={busy} canSteer={canSteer} userDefault={mrReworkDefault}
+              onToggle={(enabled) => act(async () => {
+                await api.setRunMrRework(run.id, enabled);
+                await refreshRun();
+              })} />
+          </RunSettingsDisclosure>
           <RunControls run={run} busy={busy} canSteer={canSteer} terminal={terminal}
             onStop={() => cancelRun()} onPause={(mode) => act(async () => { await api.pauseRun(run.id, mode); await refreshRun(); })} />
         </>}
@@ -2417,10 +2399,10 @@ export function RunView() {
                   deadline in the tooltip) when the run carries one; a null-budget kind keeps
                   today's plain elapsed. */}
               {run.status === "running" && run.started_at && <RunBudgetElapsed run={run} />}
-              {/* PRD #1190/#1189: a paused run's elapsed is the STATIC active span with "· clock
+              {/* PRD #1190/#1189: a parked run's elapsed is the STATIC active span with "· clock
                   stopped", not a live ticker. PRD #1189 adds the budget-remaining clause ("… left
                   when resumed") ahead of it when the run carries a wall budget. */}
-              {run.status === "paused" && run.started_at && <PausedElapsed run={run} />}
+              {["paused", "limit_wait", "pool_wait", "recovery_wait"].includes(run.status) && run.started_at && <ParkedElapsed run={run} />}
               {/* PRD #1429 M4a / #1653 D-W5: the run's actual harness, the same round
                   logo chip as the run list, on every run. Placed ahead of the model badge —
                   which harness executed the run is more fundamental than which model within it. */}
@@ -2430,10 +2412,11 @@ export function RunView() {
                   for every claimed run, and the usage panel only appears once a run
                   has reported usage. */}
               <RunCredential run={run} />
-              {/* PRD #1247 M7: the per-run credential OVERRIDE (the choice) + the pending
-                  held-state SWITCH, distinct from RunCredential above (the credential the
-                  claim SPENT). Self-hides when the run has neither. */}
-              {run.credential_switch && <RunCredentialOverride run={run} />}
+              {/* Only a requested or released switch adds a second token chip. The
+                  stored choice and applied history live in Run settings. */}
+              {(run.credential_switch === "requested" || run.credential_switch === "released") && (
+                <RunCredentialOverride run={run} />
+              )}
               {/* PRD #300: the per-schedule model this run froze at fire time, shown on
                   EVERY status (not just completed) so a wrong/typo'd model is visible on a
                   FAILED or stopped run too (Risks / SC6). null = inherited the owner's
@@ -2859,7 +2842,7 @@ export function RunView() {
 
       {/* Steer queue + composer (PRD #95). Rendered UNCONDITIONALLY — including for a
           terminal run — so the queue survives the run finishing (Decision 7/B1); the card
-          gates the composer/Stop on !terminal internally. Its inputs are lifted into
+          gates the composer on !terminal internally. Its inputs are lifted into
           useRunStream, not held here or in the composer. */}
       <SteerQueueCard
         inputs={inputs}

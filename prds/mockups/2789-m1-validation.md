@@ -1,5 +1,7 @@
 # #2789 M1 validation and assertion migrations
 
+Historical M1 checkpoint record; later milestone status is tracked in the PRD.
+
 Status: M1 source review, focused checks, web/repository gates and production build passed; corrected evidence review is tracked separately below. M2, M3 and M4 remain pending.
 
 Code reviewed and tested: `bffcbb77e92b4a58937cd0cc114585a39f574b83`. Cumulative M1 review base: `2bf9a00e6eac5e3989097bdb7167cd3143a092df`; published prototype floor: `3bef77073807e55d01e097f7f60a43d583d6ee21`. The default branch was integrated by merge, preserving published history.
