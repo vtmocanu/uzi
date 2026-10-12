@@ -4662,6 +4662,32 @@ export class GitCache {
   }
 
   /**
+   * True when every present component of the pin's loose ref and reflog paths is a real directory
+   * (or, for the leaf, a regular file) and none is a symlink. Absent entries are fine; checking
+   * stops below the first absent level. Git unlinks these paths by name, so a symlinked component
+   * would let `update-ref -d` delete a file in another repository.
+   */
+  private async recoveryPinMetadataSafe(barePath: string, pinRef: string): Promise<boolean> {
+    const parts = pinRef.split("/");
+    for (const top of ["logs", ""]) {
+      let cur = barePath;
+      const comps = top ? [top, ...parts] : parts;
+      for (let i = 0; i < comps.length; i++) {
+        cur = path.join(cur, comps[i]!);
+        let st: Stats;
+        try { st = await fs.lstat(cur); } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") break;
+          return false;
+        }
+        if (st.isSymbolicLink()) return false;
+        const leaf = i === comps.length - 1;
+        if (leaf ? !st.isFile() : !st.isDirectory()) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
    * replacement exists (the bundle was archived, or the head is already forge-published). Never
    * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
@@ -4669,7 +4695,23 @@ export class GitCache {
    */
   async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
     if (expectedSha === undefined) {
-      await this.tryGit(barePath, ["update-ref", "-d", recoveryPinRef(runId, generation)]);
+      const pinRef = recoveryPinRef(runId, generation);
+      try {
+        // No lock is taken here: callers may already hold this bare's lock, as before.
+        if (!(await this.recoveryPinMetadataSafe(barePath, pinRef))) {
+          this.log.warn("recovery: recovery pin retained", {
+            bare: barePath, run_id: runId, generation, reason: "unsafe_metadata",
+          });
+          return;
+        }
+        // Residual userspace TOCTOU: a symlink planted between the check above and Git's
+        // unlink of the ref or reflog is not detected here (same as the archived path).
+        await this.tryGit(barePath, ["update-ref", "-d", pinRef]);
+      } catch (err) {
+        this.log.warn("recovery: recovery pin cleanup failed", {
+          bare: barePath, run_id: runId, generation, error: gitErrorMessage(err),
+        });
+      }
       return;
     }
     const root = path.resolve(this.reposRoot);

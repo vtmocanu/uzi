@@ -51,6 +51,10 @@ beforeEach(async () => {
   bare = path.join(repos, "one.git");
   await fs.mkdir(bare, { recursive: true });
   git(bare, "init", "--bare");
+  // A detached auto-gc/maintenance run would mutate bare directory metadata mid-test.
+  for (const [k, v] of [["gc.auto", "0"], ["gc.autoDetach", "false"], ["receive.autogc", "false"], ["maintenance.auto", "false"]] as const) {
+    git(bare, "config", k, v);
+  }
   const work = path.join(root, "work");
   await fs.mkdir(work);
   git(work, "init");
@@ -642,4 +646,45 @@ it("4-argument deleteRecoveryPin logs a path outside the repos root", async () =
   assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
     level: "warn", msg: "recovery: recovery pin retained", bare: outside, run_id: runId, generation: 4, reason: "invalid_identity",
   }]);
+});
+
+it("3-argument deleteRecoveryPin deletes the pin without a reflog", async () => {
+  await cache.deleteRecoveryPin(bare, runId, 4);
+  assert.throws(() => present());
+  assert.equal(present(bare, "refs/uzi-recovery-pin/archived-run/9"), sha);
+});
+it("3-argument deleteRecoveryPin deletes the pin with a real reflog", async () => {
+  git(bare, "update-ref", "-d", ref);
+  git(bare, "-c", "core.logAllRefUpdates=always", "update-ref", ref, sha);
+  assert.equal(existsSync(path.join(bare, "logs", ref)), true);
+  await cache.deleteRecoveryPin(bare, runId, 4);
+  assert.throws(() => present());
+  assert.equal(existsSync(path.join(bare, "logs", ref)), false);
+});
+it("3-argument deleteRecoveryPin refuses a symlinked reflog directory and spares the foreign pin", async () => {
+  const { logger, lines } = recordingLogger();
+  const logged = new GitCache(path.join(root, "data"), logger, undefined, testGitCacheOptions());
+  const foreign = path.join(root, "foreign.git");
+  await fs.mkdir(foreign);
+  git(foreign, "init", "--bare");
+  git(foreign, "fetch", bare, sha + ":refs/heads/main");
+  git(foreign, "-c", "core.logAllRefUpdates=always", "update-ref", ref, sha);
+  await fs.mkdir(path.join(bare, "logs", "refs", "uzi-recovery-pin"), { recursive: true });
+  symlinkSync(path.join(foreign, "logs", "refs", "uzi-recovery-pin", "archived-run"),
+    path.join(bare, "logs", "refs", "uzi-recovery-pin", "archived-run"));
+  await logged.deleteRecoveryPin(bare, runId, 4);
+  assert.equal(present(foreign), sha);
+  assert.equal(present(), sha);
+  assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
+    level: "warn", msg: "recovery: recovery pin retained", bare, run_id: runId, generation: 4, reason: "unsafe_metadata",
+  }]);
+});
+it("3-argument deleteRecoveryPin refuses a symlinked loose ref directory", async () => {
+  git(bare, "pack-refs", "--all", "--prune");
+  const foreign = path.join(root, "foreign2.git");
+  await fs.mkdir(path.join(foreign, "x"), { recursive: true });
+  await fs.mkdir(path.join(bare, "refs", "uzi-recovery-pin"), { recursive: true });
+  symlinkSync(foreign, path.join(bare, "refs", "uzi-recovery-pin", "archived-run"));
+  await cache.deleteRecoveryPin(bare, runId, 4);
+  assert.equal(present(), sha);
 });
