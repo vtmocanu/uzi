@@ -6594,12 +6594,12 @@ export class RunRunner {
       const shown = (shas ?? []).slice(0, 5).join(", ");
       const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
       const failureReason = shas === null
-        ? "non-closing delivery refused: could not read the commit messages to publish; nothing was pushed"
-        : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); nothing was pushed; correcting them needs a history rewrite, left to the owner`;
+        ? "non-closing delivery refused: could not read the commit messages to publish; publication stopped"
+        : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); publication stopped; correcting them needs a history rewrite, left to the owner`;
       batcher.emit({ kind: "status", agent: "worker", payload: {
         text: shas === null
-          ? "non-closing delivery refused: the commit messages to publish could not be read; nothing was pushed"
-          : "non-closing delivery refused: a commit message closes the issue; nothing was pushed",
+          ? "non-closing delivery refused: the commit messages to publish could not be read; publication stopped"
+          : "non-closing delivery refused: a commit message closes the issue; publication stopped",
       } });
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });

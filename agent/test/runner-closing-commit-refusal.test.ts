@@ -72,6 +72,8 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     const reason = failureReason(claim.run_id) ?? "";
     assert.ok(reason.includes(obs.sha!), `failure_reason names the full commit SHA: ${reason}`);
     assert.ok(!reason.includes("Fixes"), "the reason carries no commit text");
+    // A lost push ACK can retry after a publish, so the reason must not claim nothing was pushed.
+    assert.ok(reason.includes("publication stopped") && !reason.includes("nothing was pushed"), reason);
     assert.equal(all.length, 0, "no forge request of any kind");
     assert.equal(originHasBranch(), false, "nothing was pushed");
     assert.equal(api.completionHoldRequests.length, 0);

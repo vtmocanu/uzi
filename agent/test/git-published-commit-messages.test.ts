@@ -153,4 +153,22 @@ describe("publishedCommitMessages (issue #2779)", () => {
     assert.strictEqual(tip, child);
     assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
   });
+
+  for (const answer of ["missing", "malformed"] as const) {
+    it(`refuses when the raw commit read is ${answer} even though git exits zero`, async () => {
+      git(fx.originPath, "checkout", "-b", "work");
+      const c = commit(fx.originPath, "a.txt", "plain subject");
+      git(fx.originPath, "checkout", "main");
+      const { bare, tip } = await bareWith("work");
+      assert.ok(await gc.publishedCommitMessages(bare, tip), "control: the clean commit reads");
+      const original = Reflect.get(gc, "execScoped").bind(gc);
+      Reflect.set(gc, "execScoped", async (command: string, args: string[], options: unknown) => {
+        if (command === "git" && args.includes("cat-file")) {
+          return { stdout: answer === "missing" ? `${c} missing\n` : "author t <t@t> 0 +0000\n\nplain subject\n", stderr: "" };
+        }
+        return original(command, args, options);
+      });
+      assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
+    });
+  }
 });

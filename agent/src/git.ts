@@ -7305,12 +7305,13 @@ export class GitCache {
         if (enc !== "" && !/^utf-?8$/i.test(enc)) return null;
         commits.push({ sha, message: tokens[i + 2]! });
       }
-      if (commits.length > 0) {
-        // `cat-file --batch` prints framing as text, so a NUL anywhere in its output came from a
-        // commit object's own bytes: fail closed rather than trust the truncated %B. This is a
-        // whole-buffer check, so message text cannot hide a NUL from it.
-        const raw = await read(["cat-file", "--batch"], commits.map(c => c.sha).join("\n") + "\n");
-        if (raw.includes("\u0000")) return null;
+      // Read each commit object raw: a NUL in its bytes would hide the message text after it from
+      // %B, so fail closed. `cat-file commit` exits non-zero on a missing object, and the content
+      // must open with a tree header; `cat-file --batch` instead answers `<sha> missing` with exit 0,
+      // which a NUL-only check would accept as clean.
+      for (const { sha } of commits) {
+        const raw = await read(["cat-file", "commit", sha]);
+        if (!/^tree [0-9a-f]{40}\n/.test(raw) || raw.includes("\u0000")) return null;
       }
       return commits;
     } catch {

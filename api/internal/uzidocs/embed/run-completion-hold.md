@@ -191,8 +191,8 @@ something goes wrong or a human has touched the request in between:
   same failure falls through to the same blind whole-body rewrite the
   unreadable case uses, and is accepted on the same terms. This scan and
   rewrite apply to legacy runs too, not only interlocked ones.
-- **On a delivery the lead declared non-closing** — via `non_closing` on
-  `signal_done` — uzi also keeps the title and commit messages from closing
+- **On a delivery the lead declared non-closing** (via `non_closing` on
+  `signal_done`), uzi also keeps the title and commit messages from closing
   the issue, since both reach the default branch in the squash commit.
   Before pushing, it checks the messages of every commit the push would
   publish (relative to the default branch, merge commits included, and again
