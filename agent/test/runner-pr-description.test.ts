@@ -1,4 +1,8 @@
 import { followSuccessfulPush } from "./publication-fixture.js";
+import fs from "node:fs";
+import path from "node:path";
+import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { assistant, resultOk, homeDir, input } from "./runner-harness.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -579,5 +583,160 @@ describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD
     assert.ok(statuses(claim.run_id).includes("completed"));
     assert.equal(closingDirectiveFor(pr.description, 1932, "org/repo"), false);
     assert.ok(pr.description.length < 1_048_576, "the body was rewritten whole");
+  });
+});
+
+
+describe("m2 non-closing delivery", () => {
+  function declaring(reason?: string, scopeCapped?: { completedCount: number; total?: number }) {
+    return new class extends StubExecutor {
+      override async run(ctx: RunContext): Promise<ExecutorResult> {
+        const result = await super.run(ctx);
+        return { ...result, ...(reason === undefined ? {} : { nonClosing: { reason } }), scopeCapped };
+      }
+    }(nullLogger());
+  }
+
+  for (const interlocked of [false, true]) {
+    for (const existing of [undefined, "Closes #2172", "Fixes #2172", "Resolves #2172"]) {
+      it(`m2 non-closing ${interlocked ? "verified reconcile" : "legacy creation"} ${existing ?? "fresh"}`, async () => {
+        const { gitlab, pr, all } = fakeGitlab({ existing: existing && adoptedBody(2172, existing) });
+        const claim = interlocked ? interlockedClaim(2172) : gitlabClaim(2172);
+        api.setCompletionPermitResponse(true);
+        await runner(declaring("Approved follow-up remains"), gitlab).execute(claim);
+        assert.ok(statuses(claim.run_id).includes("completed"));
+        assert.match(pr.description, /Approved follow-up remains/, "declared reason is visible");
+        assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false, "no closing directive anywhere");
+        if (interlocked) assert.ok(all.filter(c => c.method === "GET").length >= 2, "both head checks remain");
+      });
+    }
+  }
+
+  for (const interlocked of [false, true]) {
+    it(`m2 non-closing redacts registered exact and control-split secrets ${interlocked}`, async () => {
+      const secret = "inert-run-secret-2172";
+      const splitSecret = ["inert-split-", "secret-", "2172"].join("");
+      const reason = `Follow-up ${secret} and ${splitSecret.slice(0, 7)}\u202E${splitSecret.slice(7)} remains`;
+      const { gitlab, pr } = fakeGitlab({ existing: adoptedBody(2172, "Fixes #2172") });
+      const claim = interlocked ? interlockedClaim(2172) : gitlabClaim(2172);
+      claim.secrets.forge_pat = secret;
+      claim.secrets.anthropic_oauth_token = splitSecret;
+      api.setCompletionPermitResponse(true);
+      await runner(declaring(reason), gitlab).execute(claim);
+      assert.ok(statuses(claim.run_id).includes("completed"));
+      assert.match(pr.description, /Follow-up .* remains/);
+      assert.ok(!pr.description.includes(secret), "exact registered secret is redacted");
+      assert.ok(!pr.description.includes(splitSecret), "control-split registered secret is redacted before controls are dropped");
+      assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
+    });
+  }
+
+  it("m2 non-closing refuses an adopted closing body that cannot be rewritten", async () => {
+    const { gitlab } = fakeGitlab({ putStatus: 403, existing: adoptedBody(2172, "Resolves #2172") });
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 0);
+  });
+
+  it("m2 non-closing still holds on a failed first head check", async () => {
+    const { gitlab, pr } = fakeGitlab({ head: OTHER });
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.match(pr.description, /Follow-up remains/);
+    assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
+  });
+
+  it("m2 non-closing still holds if the head moves during the verified write", async () => {
+    let writes = 0;
+    let gets = 0;
+    const { gitlab, pr } = fakeGitlab({
+      existing: adoptedBody(2172, "Maintainer notes."),
+      // Refuse only the publisher read so the interlock must refresh the old canonical block.
+      intercept: req => req.method === "GET" && ++gets === 1 ? { status: 403, text: async () => "{}" } : undefined,
+      onWrite: p => {
+        assert.ok(gets >= 2, "the first head read precedes the verified write");
+        if (++writes === 1) p.head = OTHER;
+      },
+    });
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(writes >= 1, "the non-closing verified body changed and triggered head movement");
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
+  });
+
+  it("m2 non-closing mr_rework refresh preserves existing completion semantics", async () => {
+    const completion = [COMPLETION_START, "Related to #2172.", "", "Closes #2172", "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
+    const { gitlab, pr } = fakeGitlab({ existing: `Intro.\n\n${SIZE_REGION}\n\n${completion}\n\nBot text.` });
+    const claim = gitlabClaim(2172, { kind: "mr_rework", branch: "agent/issue-2172", base_branch: "main" });
+    await runner(declaring("must be ignored"), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    const parsed = parseOwnedBlocks(pr.description);
+    assert.ok(parsed.kind === "ok");
+    assert.equal(parsed.completion, completion, "refresh keeps the existing closing block byte-for-byte");
+    assert.notEqual(parsed.region, SIZE_REGION, "refresh updates the description region");
+    assert.ok(!pr.description.includes("must be ignored"));
+    assert.ok(pr.description.startsWith("Intro.\n\n") && pr.description.endsWith("\n\nBot text."));
+  });
+
+  for (const partial of ["owner", "cap"] as const) {
+    it(`m2 non-closing ${partial} annotation retains the declaration`, async () => {
+      const claim = partial === "owner" ? interlockedClaim(2172, { deferred: [{ milestone_id: "m2", title: "Later", reason: "owner deferred" }] }) : interlockedClaim(2172);
+      const { gitlab, pr } = fakeGitlab();
+      api.setCompletionPermitResponse(true);
+      await runner(declaring("Approved follow-up remains", partial === "cap" ? { completedCount: 1, total: 2 } : undefined), gitlab).execute(claim);
+      assert.match(pr.description, partial === "owner" ? /owner scope decision/ : /operator scope directive/);
+      assert.match(pr.description, /Approved follow-up remains/);
+      assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
+    });
+  }
+
+  it("m2 non-closing no declaration retains closing semantics", async () => {
+    const { gitlab, pr } = fakeGitlab();
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runner(declaring(), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.match(pr.description, /Closes #2172/);
+  });
+
+  it("m2 non-closing ci_fix without pipeline ignores an issue declaration", async () => {
+    const { gitlab, pr } = fakeGitlab();
+    const claim = gitlabClaim(2172, { kind: "ci_fix" });
+    await runner(declaring("must be ignored"), gitlab).execute(claim);
+    assert.match(pr.description, /Closes #2172/);
+    assert.ok(!pr.description.includes("must be ignored"));
+  });
+
+  it("m2 non-closing raw Claude frames through SdkExecutor deliver a real non-closing PR", async () => {
+    const { gitlab, pr } = fakeGitlab();
+    const claim = gitlabClaim(2172);
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    let turn = 0;
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      if (turn++ === 0) {
+        yield assistant([{ type: "tool_use", id: "plan", name: "mcp__uzi__submit_plan", input: { plan_md: "Approved follow-up remains open" } }]);
+      } else {
+        const cwd = params.options.cwd!;
+        fs.writeFileSync(path.join(cwd, "m2.txt"), "delivered work\n");
+        execFileSync("git", ["-C", cwd, "add", "m2.txt"]);
+        execFileSync("git", ["-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "-m", "m2 work"]);
+        yield assistant([{ type: "tool_use", id: "done", name: "mcp__uzi__signal_done", input: { non_closing: { reason: "Approved follow-up remains" } } }]);
+      }
+      yield resultOk();
+    })();
+    await runnerWith(() => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn }), homeDir }), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.match(pr.description, /Approved follow-up remains/);
+    assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
   });
 });

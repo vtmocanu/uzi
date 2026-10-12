@@ -589,6 +589,8 @@ interface TurnResult {
   prSummary?: PrSummaryClaim;
   /** Issue #2083: forwarded as ExecutorResult.decisionsMemo (last-wins). */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -2531,6 +2533,7 @@ export class SdkExecutor implements Executor {
       let declaredPrSummary: PrSummaryClaim | undefined;
       // Issue #2083: hoisted for the same reason; last-wins across signal_done turns.
       let declaredDecisionsMemo: string | undefined;
+      let declaredNonClosing: { reason: string } | undefined;
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
@@ -3022,6 +3025,7 @@ export class SdkExecutor implements Executor {
           declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
         }
         if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
+        if (isIssueRun && turn.nonClosing !== undefined) declaredNonClosing = turn.nonClosing;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -3623,6 +3627,7 @@ export class SdkExecutor implements Executor {
       // OMITTED-not-undefined like the siblings above.
       if (declaredPrSummary !== undefined) result.prSummary = declaredPrSummary;
       if (declaredDecisionsMemo !== undefined) result.decisionsMemo = declaredDecisionsMemo;
+      if (declaredNonClosing !== undefined) result.nonClosing = declaredNonClosing;
       // PRD #1798 M2: the last plan summary + deltas the api accepted this run, if any. Absent
       // on a resume past the gate or when the advisory pass never succeeded.
       if (this.latestPlanSummary !== undefined) {
