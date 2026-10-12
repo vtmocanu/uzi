@@ -448,6 +448,9 @@ func (s *Service) heldInvoke(ctx context.Context, wkr store.Worker, runID uuid.U
 	return pub, winner, nil
 }
 
+// SanitizeHeldText is sanitizeHeldText for callers outside the package (the owner DTOs).
+func SanitizeHeldText(s string) string { return sanitizeHeldText(s) }
+
 var (
 	heldANSIRe = regexp.MustCompile("\x1b(?:\\[[0-9;?]*[ -/]*[@-~]|\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-_])")
 )

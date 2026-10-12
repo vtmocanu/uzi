@@ -1069,6 +1069,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// BEFORE any SQL. This disposes a HELD SOURCE (custody), distinct from the
 				// archive-artifact DELETE above.
 				r.Delete("/{id}/recovery-holds/{holdID}", h.DiscardRecoveryHold)
+				// Held-work publication — owner side (issue #2545): the forge refs a failed run's
+				// work was published to, and an early expiry of the acknowledged ones. Same
+				// RequireUser group and strict GetRun owner-or-404 gate as the hold discard above, so
+				// `uzi run held` reaches both from a uzc_ Bearer and a worker token is refused. The
+				// expiry deletes nothing: it makes the rows due, and the held_publication sweeper
+				// pass deletes the refs. Not gated by UZI_HELD_PUBLICATION (cleanup never is).
+				r.Get("/{id}/held-publications", h.ListRunHeldPublications)
+				r.Post("/{id}/held-publications/expire", h.ExpireRunHeldPublications)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

@@ -119,6 +119,41 @@ func (q *Queries) CountOpenHoldsForRun(ctx context.Context, runID uuid.UUID) (in
 	return count, err
 }
 
+const deferHeldPublication = `-- name: DeferHeldPublication :execrows
+UPDATE run_held_publications
+SET next_attempt_at = $1::timestamptz,
+    last_error = COALESCE(left($2::text, 512), last_error),
+    attempts = attempts + $3::int,
+    updated_at = now()
+WHERE id = $4 AND state = $5::text
+  AND state IN ('invoked', 'create_unknown', 'created', 'acknowledged', 'delete_unknown')
+`
+
+type DeferHeldPublicationParams struct {
+	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError     pgtype.Text        `json:"last_error"`
+	AttemptBump   int32              `json:"attempt_bump"`
+	ID            uuid.UUID          `json:"id"`
+	ExpectedState string             `json:"expected_state"`
+}
+
+// A scheduling-only write, in its own short transaction: push the row's next attempt out (a skipped
+// item: busy run, open hold; or a failed forge step) and, when given, record a sanitized error.
+// The state is a CAS on what the caller observed, so a row that moved on is left alone.
+func (q *Queries) DeferHeldPublication(ctx context.Context, arg DeferHeldPublicationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferHeldPublication,
+		arg.NextAttemptAt,
+		arg.LastError,
+		arg.AttemptBump,
+		arg.ID,
+		arg.ExpectedState,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getHeldPublication = `-- name: GetHeldPublication :one
 SELECT id, run_id, generation, hold_id, user_id, repo_id, worker_id, live_run_id, ref, tip, coverage_digest, state, attempts, created_at, updated_at, create_invoked_at, ref_created_at, acknowledged_at, expires_at, owner_expired_at, deleted_at, next_attempt_at, last_error, refusal_reason FROM run_held_publications WHERE id = $1
 `
@@ -259,6 +294,7 @@ func (q *Queries) GetHeldPublicationHold(ctx context.Context, arg GetHeldPublica
 const listHeldPublicationsDueExpiry = `-- name: ListHeldPublicationsDueExpiry :many
 SELECT id, run_id, generation, hold_id, user_id, repo_id, worker_id, live_run_id, ref, tip, coverage_digest, state, attempts, created_at, updated_at, create_invoked_at, ref_created_at, acknowledged_at, expires_at, owner_expired_at, deleted_at, next_attempt_at, last_error, refusal_reason FROM run_held_publications
 WHERE state = 'acknowledged' AND expires_at <= $1::timestamptz
+  AND COALESCE(next_attempt_at, '-infinity'::timestamptz) <= $1::timestamptz
 ORDER BY expires_at ASC, id ASC
 LIMIT $2::int
 `
@@ -269,7 +305,9 @@ type ListHeldPublicationsDueExpiryParams struct {
 }
 
 // The expiry lane: the only lane that deletes an ACKNOWLEDGED publication. Owner expiry sets
-// expires_at to the expiry time, so both reasons are one predicate.
+// expires_at to the expiry time, so both reasons are one predicate. A row the cleanup skipped
+// (busy run, open hold) carries next_attempt_at in the future and drops out until it is due, so it
+// cannot head-of-line block the rows behind it.
 func (q *Queries) ListHeldPublicationsDueExpiry(ctx context.Context, arg ListHeldPublicationsDueExpiryParams) ([]RunHeldPublication, error) {
 	rows, err := q.db.Query(ctx, listHeldPublicationsDueExpiry, arg.Now, arg.Lim)
 	if err != nil {
@@ -318,15 +356,23 @@ func (q *Queries) ListHeldPublicationsDueExpiry(ctx context.Context, arg ListHel
 const listHeldPublicationsDueOrphan = `-- name: ListHeldPublicationsDueOrphan :many
 SELECT p.id, p.run_id, p.generation, p.hold_id, p.user_id, p.repo_id, p.worker_id, p.live_run_id, p.ref, p.tip, p.coverage_digest, p.state, p.attempts, p.created_at, p.updated_at, p.create_invoked_at, p.ref_created_at, p.acknowledged_at, p.expires_at, p.owner_expired_at, p.deleted_at, p.next_attempt_at, p.last_error, p.refusal_reason FROM run_held_publications p
 WHERE p.state = 'created'
+  AND COALESCE(p.next_attempt_at, '-infinity'::timestamptz) <= $1::timestamptz
   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = p.run_id AND h.state = 'open')
+  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_publication_id = p.id)
 ORDER BY p.updated_at ASC, p.id ASC
-LIMIT $1::int
+LIMIT $2::int
 `
 
-// The orphan lane: a created ref that was never acknowledged and whose run has no open hold.
-// It never selects an acknowledged row.
-func (q *Queries) ListHeldPublicationsDueOrphan(ctx context.Context, lim int32) ([]RunHeldPublication, error) {
-	rows, err := q.db.Query(ctx, listHeldPublicationsDueOrphan, lim)
+type ListHeldPublicationsDueOrphanParams struct {
+	Now pgtype.Timestamptz `json:"now"`
+	Lim int32              `json:"lim"`
+}
+
+// The orphan lane: a created ref that was never acknowledged and whose run has no open hold, and
+// that no hold names as its receipt. It never selects an acknowledged row. A skipped row is
+// deferred through next_attempt_at, as in the expiry lane.
+func (q *Queries) ListHeldPublicationsDueOrphan(ctx context.Context, arg ListHeldPublicationsDueOrphanParams) ([]RunHeldPublication, error) {
+	rows, err := q.db.Query(ctx, listHeldPublicationsDueOrphan, arg.Now, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
@@ -622,6 +668,22 @@ func (q *Queries) LockHeldPublicationByRunGeneration(ctx context.Context, arg Lo
 	return i, err
 }
 
+const lockRunForHeldCleanup = `-- name: LockRunForHeldCleanup :one
+SELECT repo_id FROM runs WHERE id = $1 FOR NO KEY UPDATE NOWAIT
+`
+
+// The cleanup's run lock (second in the worker, run, hold, publication order). FOR NO KEY UPDATE
+// conflicts with ClaimRun's FOR UPDATE SKIP LOCKED (the only place a hold is inserted) and with
+// step B's run lock, but not with the FK KEY SHARE a heartbeat's worker_active_runs insert takes.
+// NOWAIT: a busy run is skipped, never queued behind. Returns the run's repo for the identity
+// check.
+func (q *Queries) LockRunForHeldCleanup(ctx context.Context, id uuid.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockRunForHeldCleanup, id)
+	var repo_id pgtype.UUID
+	err := row.Scan(&repo_id)
+	return repo_id, err
+}
+
 const markHeldCreateInvoked = `-- name: MarkHeldCreateInvoked :one
 UPDATE run_held_publications
 SET create_invoked_at = now(), state = 'invoked', attempts = attempts + 1, updated_at = now()
@@ -667,6 +729,7 @@ const ownerExpireHeldPublications = `-- name: OwnerExpireHeldPublications :many
 UPDATE run_held_publications
 SET owner_expired_at = COALESCE(owner_expired_at, now()),
     expires_at = LEAST(COALESCE(expires_at, now()), now()),
+    next_attempt_at = NULL,
     updated_at = now()
 WHERE run_id = $1 AND user_id = $2 AND state = 'acknowledged'
 RETURNING id, run_id, generation, hold_id, user_id, repo_id, worker_id, live_run_id, ref, tip, coverage_digest, state, attempts, created_at, updated_at, create_invoked_at, ref_created_at, acknowledged_at, expires_at, owner_expired_at, deleted_at, next_attempt_at, last_error, refusal_reason

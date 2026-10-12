@@ -144,7 +144,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 		if err != nil || !containsHeld(due, row.ID) {
 			t.Fatalf("expiry lane after expiry = %v, %v", ids(due), err)
 		}
-		orphans, err := q.ListHeldPublicationsDueOrphan(ctx, 50)
+		orphans, err := q.ListHeldPublicationsDueOrphan(ctx, store.ListHeldPublicationsDueOrphanParams{Now: tstz(time.Now()), Lim: 50})
 		if err != nil || containsHeld(orphans, row.ID) {
 			t.Fatalf("orphan lane selected an acknowledged row: %v %v", ids(orphans), err)
 		}
@@ -171,7 +171,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 		if _, err := q.RecordHeldCreateOutcome(ctx, store.RecordHeldCreateOutcomeParams{State: "created", ID: row.ID}); err != nil {
 			t.Fatal(err)
 		}
-		orphans, err := q.ListHeldPublicationsDueOrphan(ctx, 50)
+		orphans, err := q.ListHeldPublicationsDueOrphan(ctx, store.ListHeldPublicationsDueOrphanParams{Now: tstz(time.Now()), Lim: 50})
 		if err != nil || containsHeld(orphans, row.ID) {
 			t.Fatalf("orphan lane selected a created row whose hold is open: %v %v", ids(orphans), err)
 		}
@@ -180,7 +180,7 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, `UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,
 			release_evidence='publication',released_at=now() WHERE id=$1`, f.hold)
 		mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER recovery_inventory_hold_guard`)
-		orphans, err = q.ListHeldPublicationsDueOrphan(ctx, 50)
+		orphans, err = q.ListHeldPublicationsDueOrphan(ctx, store.ListHeldPublicationsDueOrphanParams{Now: tstz(time.Now()), Lim: 50})
 		if err != nil || !containsHeld(orphans, row.ID) {
 			t.Fatalf("orphan lane after the hold closed = %v, %v", ids(orphans), err)
 		}
@@ -244,6 +244,73 @@ func TestHeldPublicationQueriesLiveDB(t *testing.T) {
 		due, err := q.ListHeldPublicationsDueExpiry(ctx, store.ListHeldPublicationsDueExpiryParams{Now: tstz(time.Now().Add(time.Second)), Lim: 50})
 		if err != nil || !containsHeld(due, row.ID) {
 			t.Fatalf("owner-expired row is not due: %v %v", ids(due), err)
+		}
+	})
+
+	t.Run("a deferred row drops out of the expiry and orphan lanes until due", func(t *testing.T) {
+		f, row := newRow()
+		if _, err := q.MarkHeldCreateInvoked(ctx, row.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := q.RecordHeldCreateOutcome(ctx, store.RecordHeldCreateOutcomeParams{State: "created", ID: row.ID}); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds DISABLE TRIGGER recovery_inventory_hold_guard`)
+		mustExec(ctx, t, pool, `UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,
+			release_evidence='publication',released_at=now() WHERE id=$1`, f.hold)
+		mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER recovery_inventory_hold_guard`)
+		orphan := func(at time.Time) bool {
+			t.Helper()
+			rows, err := q.ListHeldPublicationsDueOrphan(ctx, store.ListHeldPublicationsDueOrphanParams{Now: tstz(at), Lim: 50})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return containsHeld(rows, row.ID)
+		}
+		if !orphan(time.Now()) {
+			t.Fatal("the orphan row is not due")
+		}
+		due := time.Now().Add(10 * time.Minute)
+		n, err := q.DeferHeldPublication(ctx, store.DeferHeldPublicationParams{
+			NextAttemptAt: tstz(due), ID: row.ID, ExpectedState: "created",
+			LastError: pgtype.Text{String: "run busy", Valid: true},
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("defer: rows=%d err=%v", n, err)
+		}
+		if orphan(time.Now()) || !orphan(due.Add(time.Second)) {
+			t.Fatal("a deferred orphan row is not hidden until its next_attempt_at")
+		}
+		if n, err := q.DeferHeldPublication(ctx, store.DeferHeldPublicationParams{NextAttemptAt: tstz(due), ID: row.ID, ExpectedState: "acknowledged"}); err != nil || n != 0 {
+			t.Fatalf("defer with the wrong expected state: rows=%d err=%v", n, err)
+		}
+		got, err := q.GetHeldPublication(ctx, row.ID)
+		if err != nil || got.State != "created" || got.LastError.String != "run busy" {
+			t.Fatalf("deferred row = %+v, %v", got, err)
+		}
+	})
+
+	t.Run("the cleanup run lock is NOWAIT", func(t *testing.T) {
+		f, _ := newRow()
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = holder.Rollback(ctx) }()
+		if _, err := store.New(holder).LockRunForHeldCleanup(ctx, f.run); err != nil {
+			t.Fatalf("first lock: %v", err)
+		}
+		other, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = other.Rollback(ctx) }()
+		start := time.Now()
+		if _, err := store.New(other).LockRunForHeldCleanup(ctx, f.run); err == nil {
+			t.Fatal("a second cleanup lock succeeded while the first was held")
+		}
+		if time.Since(start) > 3*time.Second {
+			t.Fatalf("the second lock waited %v: it must fail at once (NOWAIT)", time.Since(start))
 		}
 	})
 

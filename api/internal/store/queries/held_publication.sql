@@ -93,18 +93,24 @@ RETURNING *;
 
 -- name: ListHeldPublicationsDueExpiry :many
 -- The expiry lane: the only lane that deletes an ACKNOWLEDGED publication. Owner expiry sets
--- expires_at to the expiry time, so both reasons are one predicate.
+-- expires_at to the expiry time, so both reasons are one predicate. A row the cleanup skipped
+-- (busy run, open hold) carries next_attempt_at in the future and drops out until it is due, so it
+-- cannot head-of-line block the rows behind it.
 SELECT * FROM run_held_publications
 WHERE state = 'acknowledged' AND expires_at <= @now::timestamptz
+  AND COALESCE(next_attempt_at, '-infinity'::timestamptz) <= @now::timestamptz
 ORDER BY expires_at ASC, id ASC
 LIMIT @lim::int;
 
 -- name: ListHeldPublicationsDueOrphan :many
--- The orphan lane: a created ref that was never acknowledged and whose run has no open hold.
--- It never selects an acknowledged row.
+-- The orphan lane: a created ref that was never acknowledged and whose run has no open hold, and
+-- that no hold names as its receipt. It never selects an acknowledged row. A skipped row is
+-- deferred through next_attempt_at, as in the expiry lane.
 SELECT p.* FROM run_held_publications p
 WHERE p.state = 'created'
+  AND COALESCE(p.next_attempt_at, '-infinity'::timestamptz) <= @now::timestamptz
   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = p.run_id AND h.state = 'open')
+  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_publication_id = p.id)
 ORDER BY p.updated_at ASC, p.id ASC
 LIMIT @lim::int;
 
@@ -142,6 +148,7 @@ WHERE id = @id AND state = ANY(@from_states::text[])
 UPDATE run_held_publications
 SET owner_expired_at = COALESCE(owner_expired_at, now()),
     expires_at = LEAST(COALESCE(expires_at, now()), now()),
+    next_attempt_at = NULL,
     updated_at = now()
 WHERE run_id = @run_id AND user_id = @user_id AND state = 'acknowledged'
 RETURNING *;
@@ -190,3 +197,23 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE c.id = @connection_id::uuid AND c.user_id = @user_id::uuid
 ORDER BY s.created_at ASC, s.run_id ASC
 LIMIT @lim::int;
+
+-- name: LockRunForHeldCleanup :one
+-- The cleanup's run lock (second in the worker, run, hold, publication order). FOR NO KEY UPDATE
+-- conflicts with ClaimRun's FOR UPDATE SKIP LOCKED (the only place a hold is inserted) and with
+-- step B's run lock, but not with the FK KEY SHARE a heartbeat's worker_active_runs insert takes.
+-- NOWAIT: a busy run is skipped, never queued behind. Returns the run's repo for the identity
+-- check.
+SELECT repo_id FROM runs WHERE id = @id FOR NO KEY UPDATE NOWAIT;
+
+-- name: DeferHeldPublication :execrows
+-- A scheduling-only write, in its own short transaction: push the row's next attempt out (a skipped
+-- item: busy run, open hold; or a failed forge step) and, when given, record a sanitized error.
+-- The state is a CAS on what the caller observed, so a row that moved on is left alone.
+UPDATE run_held_publications
+SET next_attempt_at = @next_attempt_at::timestamptz,
+    last_error = COALESCE(left(sqlc.narg(last_error)::text, 512), last_error),
+    attempts = attempts + @attempt_bump::int,
+    updated_at = now()
+WHERE id = @id AND state = @expected_state::text
+  AND state IN ('invoked', 'create_unknown', 'created', 'acknowledged', 'delete_unknown');

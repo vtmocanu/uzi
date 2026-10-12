@@ -529,6 +529,11 @@ var wantRouteMounts = []routeMount{
 	// and same owner-or-404 gate as the archive DELETE above. Owner-scoped, no forge call, no
 	// token spend → noLimiter; the ?confirm=discard mutation gate is the handler's, not a limiter.
 	{"DELETE", "/api/runs/{id}/recovery-holds/{holdID}", noLimiter},
+	// Issue #2545: the owner held-publication list and early expiry, in the same RequireUser /runs
+	// group and owner-or-404 gate as the hold DISCARD above. Local DB read and write, no forge
+	// call (the sweeper pass deletes the refs) and no spend -> noLimiter.
+	{"GET", "/api/runs/{id}/held-publications", noLimiter},
+	{"POST", "/api/runs/{id}/held-publications/expire", noLimiter},
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},

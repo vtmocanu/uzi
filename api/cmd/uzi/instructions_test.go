@@ -582,6 +582,31 @@ var knownInstructions = []knownInstruction{
 			"names it. Not executed against a booted API.",
 	},
 	{
+		command:  "uzi run held",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH issue #2545. The `uzi run held <run-id>` verb's own usage line; help text
+		// only, so the bar is that its path resolves in the cobra tree.
+		note: "HELP: the held-work list verb's own usage (`uzi run held <run-id>`).",
+	},
+	{
+		command:  "uzi run held expire",
+		evidence: evidenceGoTest,
+		where:    "TestRunHeldRenders",
+		// ARRIVED WITH issue #2545. renderHeldPublications prints `uzi run held expire <run-id>`
+		// as the early-retention-end hint when a listed ref is still on the forge.
+		//
+		// RUNTIME, derived: the hint sits inside a Printf argument, which classifyKind reads as an
+		// emitter (STDOUT). EXECUTED by TestRunHeldRenders, which drives the real cobra parse of
+		// `run held run1` against a fake client with an acknowledged publication and asserts the
+		// OUTCOME: exit 0 and the exact `uzi run held expire run1` hint in the output. The expire
+		// verb's own paths (--yes, the prompt, the non-TTY refusal) are TestRunHeldExpire*. Its
+		// honest limit: executed against a FAKE client, so it proves the rendering and the argv
+		// shape, not a booted API.
+		note: "RUNTIME: `uzi run held` prints `uzi run held expire <run-id>` as the " +
+			"early-retention-end hint (STDOUT). EXECUTED by TestRunHeldRenders, which asserts the " +
+			"hint. Not executed against a booted API.",
+	},
+	{
 		command:  "uzi schedule clone",
 		evidence: evidenceGoTest,
 		where:    "TestScheduleEditDefaultCatalogOwnedFlagsRejected",
