@@ -45,13 +45,36 @@ const GENERIC_VIEW: StateView = { badge: "Held", tone: "neutral" };
 // Only these states can have a ref on the forge worth fetching.
 const FETCHABLE_STATES = new Set(["acknowledged", "created"]);
 
-// Mirrors the CLI's onForge: a row in one of these states may still have its ref on the forge.
-const ON_FORGE_STATES = new Set(["acknowledged", "created", "delete_unknown"]);
 // States that settle on their own: the panel re-fetches while any row is in one.
 const IN_PROGRESS_STATES = new Set(["created", "invoked", "create_unknown", "delete_unknown"]);
 const REFRESH_MS = 20_000;
 // About ten minutes of polling per mount.
 const MAX_POLLS = 30;
+
+// leadLine is the per-row, state-keyed sentence beside the badge. It states only what that
+// row's state establishes; the panel makes no aggregate claim across rows. Unknown and
+// prepared states get none.
+function leadLine(pub: HeldPublication): string | null {
+  switch (pub.state) {
+    case "acknowledged":
+      return "On the forge; deleted when retention expires.";
+    case "created":
+      return "On the forge; waiting for the run's custody to be released.";
+    case "delete_unknown":
+      return "Being removed from the forge.";
+    case "deleted":
+      return pub.ref_created_at || pub.acknowledged_at ? "Was on the forge; since removed." : "Not on the forge.";
+    case "abandoned":
+      return "The ref now points at a commit uzi did not publish; uzi leaves it untouched.";
+    case "refused":
+      return "The forge refused the publication; the recovery archive path applies.";
+    case "invoked":
+    case "create_unknown":
+      return "Waiting for the forge to confirm; the recovery archive path applies.";
+    default:
+      return null;
+  }
+}
 
 function safeHeldRef(runId: string, pub: HeldPublication): string | null {
   const ref = pub.ref;
@@ -62,6 +85,7 @@ function safeHeldRef(runId: string, pub: HeldPublication): string | null {
 export function HeldPublicationPanel({ run }: { run: Run }) {
   const failed = run.status === "failed";
   const [pubs, setPubs] = useState<HeldPublication[]>([]);
+  const [pollsExhausted, setPollsExhausted] = useState(false);
 
   // One chain per (failed, run.id): fetch, then, while a row is still settling, schedule the
   // next fetch only after this one has settled, so requests never overlap and an older response
@@ -69,6 +93,7 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
   // never terminal by design), at the first settled answer, on unmount and on a run change.
   useEffect(() => {
     setPubs([]);
+    setPollsExhausted(false);
     if (!failed) return;
     let live = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -90,7 +115,11 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
         });
     };
     const schedule = (again: boolean) => {
-      if (!again || polls >= MAX_POLLS) return;
+      if (!again) return;
+      if (polls >= MAX_POLLS) {
+        setPollsExhausted(true);
+        return;
+      }
       polls += 1;
       timer = setTimeout(load, REFRESH_MS);
     };
@@ -102,10 +131,8 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
   }, [failed, run.id]);
 
   if (!failed || pubs.length === 0) return null;
-  const onForge = pubs.some((p) => ON_FORGE_STATES.has(p.state));
   const acknowledged = pubs.some((p) => p.state === "acknowledged");
-  const everAcknowledged = pubs.some((p) => !!p.acknowledged_at);
-  const unconfirmed = pubs.some((p) => p.state === "invoked" || p.state === "create_unknown");
+  const capped = pollsExhausted && pubs.some((p) => IN_PROGRESS_STATES.has(p.state));
 
   return (
     <Card id="held-publication" className="scroll-mt-20 space-y-3 p-4">
@@ -114,30 +141,17 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
         <SectionTitle>Held work</SectionTitle>
       </div>
       <p className="text-sm text-muted">
-        {onForge ? (
-          <>
-            This failed run's commits and uncommitted changes were secret-scanned and published to a
-            run-scoped ref.
-          </>
-        ) : everAcknowledged ? (
-          <>
-            This failed run's held work was published to a run-scoped ref and has since been removed
-            from the forge.
-          </>
-        ) : unconfirmed ? (
-          <>The forge has not confirmed this publication yet; the worker kept this run's recovery archive.</>
-        ) : (
-          <>This failed run's held work was not published to the forge; its recovery archive applies.</>
-        )}
+        A failed run's commits and uncommitted changes, after a fresh secret scan, can be published to a
+        run-scoped ref on the forge instead of kept only as a recovery archive.
         {acknowledged && (
           <>
             {" "}
-            The ref is deleted when retention expires; run{" "}
-            <code className="font-mono text-xs">uzi run held expire {stripUnsafeChars(run.id)}</code>{" "}
-            to delete it sooner.
+            Delete it sooner with{" "}
+            <code className="font-mono text-xs">uzi run held expire {stripUnsafeChars(run.id)}</code>.
           </>
         )}
       </p>
+      {capped && <p className="text-xs text-faint">Reload the page to refresh.</p>}
       <ul className="space-y-3">
         {pubs.map((p) => (
           <li key={p.id}>
@@ -153,6 +167,7 @@ function PublicationRow({ runId, pub }: { runId: string; pub: HeldPublication })
   const now = useNow(60_000);
   const view = STATE_VIEWS[pub.state] ?? GENERIC_VIEW;
   const ref = safeHeldRef(runId, pub);
+  const lead = leadLine(pub);
   const tip = pub.tip ? stripUnsafeChars(shortSha(pub.tip)) : null;
   const expiresAt = pub.expires_at ?? null;
   const expiresMs = expiresAt ? Date.parse(expiresAt) : NaN;
@@ -168,6 +183,7 @@ function PublicationRow({ runId, pub }: { runId: string; pub: HeldPublication })
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2">
         <Badge tone={view.tone}>{view.badge}</Badge>
+        {lead && <span className="text-xs text-muted">{lead}</span>}
         {ref && (
           <span className="break-all font-mono text-xs text-muted">
             {ref}

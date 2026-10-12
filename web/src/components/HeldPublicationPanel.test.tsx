@@ -113,20 +113,26 @@ describe("HeldPublicationPanel", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  it("shows the published sentence and expire hint only when the rows warrant them", async () => {
+  it("always shows the neutral intro and the expire hint only with an acknowledged row", async () => {
     serve([pub({ state: "refused", refusal_reason: "create_refused" })]);
     const { container, unmount } = render(<HeldPublicationPanel run={aRun()} />);
     expect(await screen.findByText("Not published")).toBeTruthy();
-    expect(container.textContent).toContain("not published to the forge");
-    expect(container.textContent).not.toContain("published to a run-scoped ref");
+    expect(container.textContent).toContain("after a fresh secret scan, can be published to a run-scoped ref");
     expect(container.textContent).not.toContain("uzi run held expire");
     unmount();
 
     serve([pub({ state: "created" })]);
     const second = render(<HeldPublicationPanel run={aRun()} />);
     expect(await screen.findByText("Publishing")).toBeTruthy();
-    expect(second.container.textContent).toContain("uncommitted changes were secret-scanned and published");
+    expect(second.container.textContent).toContain("after a fresh secret scan, can be published to a run-scoped ref");
     expect(second.container.textContent).not.toContain("uzi run held expire");
+    second.unmount();
+
+    serve([pub({ state: "acknowledged" })]);
+    const third = render(<HeldPublicationPanel run={aRun()} />);
+    expect(await screen.findByText("Published")).toBeTruthy();
+    expect(third.container.textContent).toContain("after a fresh secret scan, can be published to a run-scoped ref");
+    expect(third.container.textContent).toContain("Delete it sooner with uzi run held expire");
   });
 
   it.each(["deleted", "abandoned", "refused"])("hides Expires for a %s row with a past expiry", async (state) => {
@@ -158,6 +164,7 @@ describe("HeldPublicationPanel", () => {
         await vi.advanceTimersByTimeAsync(60_000);
       });
       expect(spy).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText("Reload the page to refresh.")).toBeNull();
       unmount();
     } finally {
       vi.useRealTimers();
@@ -184,30 +191,28 @@ describe("HeldPublicationPanel", () => {
 
   const ACK = "2026-01-01T00:05:00Z";
 
-  it.each(["deleted", "abandoned"])("says the work was removed from the forge for a %s row that was acknowledged", async (state) => {
-    serve([pub({ state, acknowledged_at: ACK })]);
-    const { container } = render(<HeldPublicationPanel run={aRun()} />);
-    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
-    expect(container.textContent).toContain("has since been removed from the forge");
-    expect(container.textContent).not.toContain("not published to the forge");
-    expect(container.textContent).not.toContain("uzi run held expire");
+  it.each<[string, Partial<HeldPublication>, string]>([
+    ["acknowledged", {}, "On the forge; deleted when retention expires."],
+    ["created", {}, "On the forge; waiting for the run's custody to be released."],
+    ["delete_unknown", {}, "Being removed from the forge."],
+    ["deleted", { ref_created_at: ACK }, "Was on the forge; since removed."],
+    ["deleted", { acknowledged_at: ACK }, "Was on the forge; since removed."],
+    ["deleted", {}, "Not on the forge."],
+    ["abandoned", {}, "The ref now points at a commit uzi did not publish; uzi leaves it untouched."],
+    ["refused", {}, "The forge refused the publication; the recovery archive path applies."],
+    ["invoked", {}, "Waiting for the forge to confirm; the recovery archive path applies."],
+    ["create_unknown", {}, "Waiting for the forge to confirm; the recovery archive path applies."],
+  ])("state %s %j shows the lead line %s", async (state, over, line) => {
+    serve([pub({ state, ...over })]);
+    render(<HeldPublicationPanel run={aRun()} />);
+    expect(await screen.findByText(line)).toBeTruthy();
   });
 
-  it.each(["invoked", "create_unknown"])("says the forge has not confirmed a %s publication", async (state) => {
+  it.each(["prepared", "from_the_future"])("shows no lead line for a %s row", async (state) => {
     serve([pub({ state })]);
     const { container } = render(<HeldPublicationPanel run={aRun()} />);
-    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
-    expect(container.textContent).toContain("The forge has not confirmed this publication yet");
-    expect(container.textContent).not.toContain("not published to the forge");
-  });
-
-  it("counts delete_unknown as on the forge", async () => {
-    serve([pub({ state: "delete_unknown", acknowledged_at: ACK })]);
-    const { container } = render(<HeldPublicationPanel run={aRun()} />);
-    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
-    expect(container.textContent).toContain("were secret-scanned and published to a run-scoped ref");
-    expect(container.textContent).not.toContain("since been removed");
-    expect(container.textContent).not.toContain("uzi run held expire");
+    expect(await screen.findByText("Held")).toBeTruthy();
+    expect(container.textContent).not.toMatch(/On the forge|Not on the forge|Was on the forge|forge refused|Waiting for the forge|Being removed/);
   });
 
   it("does not start the next poll while a request is pending", async () => {
@@ -251,25 +256,25 @@ describe("HeldPublicationPanel", () => {
         await vi.advanceTimersByTimeAsync(40 * 20_000);
       });
       expect(spy).toHaveBeenCalledTimes(31);
+      expect(screen.getByText("Reload the page to refresh.")).toBeTruthy();
       unmount();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("clears the previous run's rows when the run changes", async () => {
+  it("clears the previous run's rows when the run changes and ignores its late response", async () => {
     const OTHER = "11111111-2222-4333-8444-555555555555";
-    let release: (v: { publications: HeldPublication[] }) => void = () => {};
+    let releaseOld: (v: { publications: HeldPublication[] }) => void = () => {};
     vi.spyOn(api, "getRunHeldPublications")
-      .mockResolvedValueOnce({ publications: [pub()] })
-      .mockImplementationOnce(() => new Promise((res) => (release = res)));
+      .mockImplementationOnce(() => new Promise((res) => (releaseOld = res)))
+      .mockResolvedValue({ publications: [] });
     const { rerender, container } = render(<HeldPublicationPanel run={aRun()} />);
-    expect(await screen.findByText("Published")).toBeTruthy();
     rerender(<HeldPublicationPanel run={aRun({ id: OTHER })} />);
-    await waitFor(() => expect(container.innerHTML).toBe(""));
     await act(async () => {
-      release({ publications: [] });
+      releaseOld({ publications: [pub()] });
     });
     expect(container.innerHTML).toBe("");
+    expect(screen.queryByText("Published")).toBeNull();
   });
 });
