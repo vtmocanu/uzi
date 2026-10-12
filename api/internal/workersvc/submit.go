@@ -314,9 +314,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// An `extend` (PRD #1189 M1) is an owner-only request to add wall-clock time ON TOP of the
 	// frozen budget. It ADDS @secs to runs.budget_extension_seconds (never mutating the immutable
 	// budget_wall_seconds) and writes a kind='extend' audit row in ONE statement. The admin setting
-	// run_extension_cap_seconds is the PER-REQUEST maximum (0 = extending disabled); the total is
-	// bounded only technically (MaxRunWallSeconds). Like `scope` the control
-	// is server-only — served to the worker as the column on the ACK/claim, excluded from
+	// run_extension_cap_seconds is the PER-REQUEST maximum (0 = extending disabled); admission
+	// also requires room under MaxRunWallSeconds. Later served totals are not capped by it.
+	// Like `scope` the control is server-only — served to the worker as the column on the ACK/claim, excluded from
 	// ConsumeRunInputs — so it never routes through the worker's steering queue. A 0-row result
 	// is disambiguated into the 409 classes from the already-loaded run (extendRefusalReason).
 	// The projected total and deadline are computed BEFORE the CTE from the fetched row, so the
@@ -1311,10 +1311,10 @@ func (s *Service) runExtensionCap(ctx context.Context) (int, error) {
 	return s.healthSettings.RunExtensionCapSeconds(ctx)
 }
 
-// baseWallUpperSeconds is the service-side upper bound on the wall a run can still be scaled to
-// (the immutable-column fallback and the scaling ceiling): max(RunTimeout, RunWallCeiling,
-// MaxRunWallCeiling), in seconds. The extend predicates take GREATEST of it and the persisted
-// budget_wall_seconds.
+// baseWallUpperSeconds is the service-side wall reserve for extension admission:
+// max(current RunTimeout, current RunWallCeiling, MaxRunWallCeiling), in seconds. The extend
+// predicates take GREATEST of it and the persisted budget_wall_seconds. It does not cap the
+// served total after a later configuration increase.
 func (s *Service) baseWallUpperSeconds() int32 {
 	return budgetDurationSeconds(max(s.p.RunTimeout, s.p.RunWallCeiling, MaxRunWallCeiling))
 }
@@ -1329,20 +1329,19 @@ func (s *Service) extendRefusal(run store.Run, secs, capSeconds int) error {
 	return extendRefusalReason(run, secs, capSeconds, s.p.RunTimeout, s.p.RunWallCeiling)
 }
 
-// ExtensionRoomSeconds is how many more seconds of extension a run can take before its served
-// wall total could exceed MaxRunWallSeconds (the worker's timer range). It mirrors the SQL
-// predicate in CreateExtendInput / ExtendAndResumeWallPark and is the same arithmetic:
+// ExtensionRoomSeconds is how many more seconds extension admission permits under the retained
+// MaxRunWallSeconds limit. It mirrors the SQL predicate in CreateExtendInput /
+// ExtendAndResumeWallPark and is the same arithmetic:
 //
 //	room = MaxRunWallSeconds - wallUpper - finalizeUpper - extension, clamped at 0
 //
-// wallUpper is the largest wall the run may be served: max(persisted budget_wall_seconds when set,
-// runTimeout, wallCeiling, MaxRunWallCeiling) - a NULL-wall run can still be scaled up to the
-// ceiling at plan approval, and an operator may later raise RUN_WALL_CEILING (to at most
-// MaxRunWallCeiling), so the room reserves the larger of the frozen wall and that maximum for every
-// run, rather than the current setting. The only uncovered case is RUN_TIMEOUT raised above
-// MaxRunWallCeiling later for a run with no frozen wall. finalizeUpper is max(finalize,
-// WallParkFinalizeSeconds): the one-time Stop allowance is reserved before it is granted. Pure;
-// the SQL is authoritative.
+// wallUpper is the admission reserve: max(persisted budget_wall_seconds when set, current
+// runTimeout, current wallCeiling, MaxRunWallCeiling). The 72h reserve covers later plan scaling
+// of a NULL wall or a RUN_WALL_CEILING increase within its validated range. A later RUN_TIMEOUT
+// increase above 72h can still raise the served total for a NULL-wall run; that larger total is
+// honored without clamping by shared chunked monotonic relative timers (#2761), not capped here.
+// finalizeUpper is max(finalize, WallParkFinalizeSeconds): the one-time Stop allowance is reserved
+// before it is granted. Existing extensions consume admission room. Pure; the SQL is authoritative.
 func ExtensionRoomSeconds(wall pgtype.Int4, ext, finalize int32, runTimeout, wallCeiling time.Duration) int {
 	wallUpper := int(budgetDurationSeconds(max(runTimeout, wallCeiling, MaxRunWallCeiling)))
 	if wall.Valid {
@@ -1358,8 +1357,8 @@ func ExtensionRoomSeconds(wall pgtype.Int4, ext, finalize int32, runTimeout, wal
 // collapses into "0 rows". Terminal first (the run is dead, the clock is already stopped),
 // then a kind that never times out (chat/judge, or an interactive task - the runWallClock
 // exclusion set), then the per-request cap (secs > capSeconds), then the residual cause: the
-// total-time room under MaxRunWallSeconds. Same accepted TOCTOU as pauseRefusalReason: a run that
-// changed between GetRun and the CTE is reported as the guard the stale row suggests.
+// extension-admission room under MaxRunWallSeconds. Same accepted TOCTOU as pauseRefusalReason:
+// a run that changed between GetRun and the CTE is reported as the guard the stale row suggests.
 func extendRefusalReason(run store.Run, secs, capSeconds int, runTimeout, wallCeiling time.Duration) error {
 	if terminalStatuses[run.Status] {
 		return ErrRunTerminal

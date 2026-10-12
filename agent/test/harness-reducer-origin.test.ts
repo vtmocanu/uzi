@@ -47,6 +47,13 @@ async function reduceRaw(frames: Record<string, unknown>[]) {
   return { result: reducer.finish({ kind: "exhausted" }).result, messages, contextRequests };
 }
 
+
+test("m1 non-closing reducer keeps latest valid reason through omission and rejection", async () => {
+  const done = (input: unknown) => ({ type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__uzi__signal_done", input }] } });
+  const out = await reduceRaw([done({ non_closing: { reason: " first " } }), done({ non_closing: { reason: " latest " } }), done({}), done({ non_closing: null })]);
+  assert.deepEqual((out.result as unknown as { nonClosing: unknown }).nonClosing, { reason: "latest" });
+});
+
 test("Claude main assistant text and usage retain lead finalText and request context once", async () => {
   const out = await reduceRaw([assistant("main first"), assistant("main second")]);
   assert.equal(out.result.finalText, "main first\nmain second");

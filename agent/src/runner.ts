@@ -7640,7 +7640,7 @@ export class RunRunner {
     const renderCloses = !interlocked;
     // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
     // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
-    // verification. It is threaded to reconcileMrDescription(!isOwnerPartial) below so the verified-head
+    // verification. It joins nonClosingDelivery below so the verified-head
     // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
     // (agent/src/pr-description.ts), which never writes Closes on a partial arm, decides the rendered Closes
     // line itself (renderCloses/withCloses go into issueArm), and nonClosingDelivery below gates the
@@ -7704,6 +7704,9 @@ export class RunRunner {
     // The completion block this run writes, with or without `Closes #N` and the unverified banner.
     // mrCompletionBlock's wording; the publisher and the reconcile compose the region and the
     // preserved text around it.
+    const runKind = resolveRunKind(claim.kind);
+    const declaration = runKind === "issue" ? result.nonClosing : undefined;
+    const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
     const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
       mrCompletionBlock(
         claim,
@@ -7718,8 +7721,8 @@ export class RunRunner {
         claim.config?.completion_scope,
         bridged,
         opts,
+        effectiveNonClosing,
       );
-    const runKind = resolveRunKind(claim.kind);
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
     // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
     const refreshRun =
@@ -7727,10 +7730,10 @@ export class RunRunner {
       (runKind === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
     const repoPath = repoPathFromUrl(claim.repo.url);
     // Amended D10: an issue run whose completion block is non-closing (an interlocked run until its
-    // head is verified, an owner partial, a scope-capped run) has its whole body scanned for a
+    // head is verified, an owner partial, a scope-capped run, an explicit declaration) has its whole body scanned for a
     // closing directive for the issue.
     const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
-    // The ONE non-closing-delivery predicate: this run delivers less than its issue asked for, so no
+    // The ONE non-closing-delivery predicate: this delivery must leave its issue open, so no
     // body it writes may close the issue, verified head or not. It gates the closing-directive scans,
     // strips and fail-closed paths below (the publisher's non-closing scan via createCloses, the
     // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
@@ -7739,7 +7742,7 @@ export class RunRunner {
     // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
     // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
     // own completion block), and this flag set here rather than its own check at one of those sites.
-    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
     // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
@@ -7983,18 +7986,19 @@ export class RunRunner {
       // Verified: ADD the canonical `Closes #N` body. The interlocked MR was created WITHOUT Closes,
       // so this is the ONLY place a completion's closing line is written (it is also a REPAIR on an
       // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
-      // requires the merged MR to carry Closes, so if this add is not confirmed we strip it and hold
+      // requires a confirmed closing body unless nonClosingDelivery requests a non-closing body.
+      // If the requested body is not confirmed we strip closing directives and hold
       // (failing closed when the strip is not confirmed) rather than report completion.
       // PRD #1227 M2: an OWNER PARTIAL (scope_reduced) run must NEVER close its issue even on a verified
       // head, so it re-renders its NON-closing partial body here (reconcileMrDescription(false)) instead
       // of adding Closes; the head is still verified (permit binding) — only the Closes-add is
-      // suppressed. An accept-only/full-delivery run has isOwnerPartial=false and adds Closes as before.
+      // suppressed. Explicit declarations and scope caps also suppress Closes via nonClosingDelivery.
       // PRD #1798 M6 (amended D10): the partial's non-closing write is scanned; a closing directive it
       // cannot remove fails the run closed rather than holding or completing a closing MR.
-      const verified = await reconcileMrDescription(!isOwnerPartial);
+      const verified = await reconcileMrDescription(!nonClosingDelivery);
       // PRD #1798 M6 (ADR 1225): whether this reconcile ADDED `Closes #N` (reconcileMrDescription's
       // own `closes`: always !nonClosingDelivery here, since the verified reconcile asks for Closes
-      // unless the delivery is partial).
+      // unless the delivery must leave its issue open).
       const addedCloses = !nonClosingDelivery;
       if (verified === "closing") {
         await failInterlockedClosed("could not remove a closing directive from a non-closing MR");
@@ -17453,6 +17457,7 @@ export function mrCompletionBlock(
   // `git merge -s ours <P>` bridge is equally possible.
   bridged = false,
   opts?: MrDescriptionOptions,
+  nonClosing?: ExecutorResult["nonClosing"],
 ): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
@@ -17470,6 +17475,7 @@ export function mrCompletionBlock(
     closes: renderCloses,
     completionScope,
     scopeCapped,
+    nonClosing: resolveRunKind(claim.kind) === "issue" ? nonClosing : undefined,
     repoAgents: agentSelection?.source === "repo",
     gatesUnverified,
     gatesDiscoveryTruncated,

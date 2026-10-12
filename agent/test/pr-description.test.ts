@@ -755,3 +755,32 @@ describe("renderBody", () => {
     assert.equal(renderBody(undefined, COMPLETION), COMPLETION);
   });
 });
+
+
+describe("m2 non-closing deterministic rendering", () => {
+  for (const reason of ["Approved follow-up remains", "Fixes #7\n@owner <!-- uzi:completion:start -->", "\u202E\u2066"]) {
+    it(`m2 non-closing renderer reason ${JSON.stringify(reason)}`, () => {
+      const input = { issueIid: 7, branch: "b", closes: true, nonClosing: { reason } };
+      const block = renderCompletionBlock(input);
+      assert.equal(closingDirectiveFor(block, 7, "org/repo"), false, "declaration structurally prevents closing");
+      assert.match(block, /Issue remains open/);
+      if (reason === "\u202E\u2066") assert.match(block, /U\+202E U\+2066/);
+      else if (reason.startsWith("Fixes")) {
+        assert.ok(!block.includes("@owner"));
+        assert.ok(!block.includes("<!-- uzi:completion:start -->"));
+        assert.equal(block.split(COMPLETION_START).length, 2);
+      } else assert.match(block, /Approved follow-up remains/);
+    });
+  }
+  it("m2 non-closing mrCompletionBlock guards ci_fix issue-arm fallback", () => {
+    const issue = makeClaim({ kind: "issue", issue_iid: 7 });
+    const args = [issue, "b", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, undefined, { reason: "Follow-up remains" }];
+    const body = Reflect.apply(mrCompletionBlock, undefined, args) as string;
+    assert.match(body, /Follow-up remains/);
+    assert.equal(closingDirectiveFor(body, 7, "org/repo"), false);
+    args[0] = makeClaim({ kind: "ci_fix", issue_iid: 7 });
+    const ci = Reflect.apply(mrCompletionBlock, undefined, args) as string;
+    assert.match(ci, /Closes #7/);
+    assert.ok(!ci.includes("Follow-up remains"));
+  });
+});

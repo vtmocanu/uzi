@@ -14,6 +14,21 @@ function grants(allowedTools: readonly string[]): RunGrants {
   };
 }
 
+
+describe("m1 non-closing dynamic schema", () => {
+  it("requires a string reason structurally without a raw maxLength cap", () => {
+    const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;
+    const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
+    const declaration = props["non_closing"]!;
+    assert.equal(declaration.type, "object");
+    assert.deepEqual(declaration.required, ["reason"]);
+    assert.equal(declaration.additionalProperties, false);
+    assert.deepEqual(declaration.properties, { reason: { type: "string" } });
+    assert.match(String(declaration.description), /Issue runs only/);
+    assert.ok(!(spec.inputSchema.required as string[] | undefined)?.includes("non_closing"));
+  });
+});
+
 describe("buildCodexDynamicTools: worker-owned app-server callback surface", () => {
   it("registers the deterministic granted subset and hides code-mode lifecycle callback names", () => {
     const specs = buildCodexDynamicTools(grants([

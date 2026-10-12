@@ -26,6 +26,7 @@
 #
 # M2a/M2b extend this file to drive release-cut.sh through its verbs.
 # --shipping-paths-only runs the #1466 regressions without the full release suite.
+# --identity-only [oracle-path] runs identity fixtures, optionally against a frozen oracle.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -36,7 +37,7 @@ SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
 mkdir -p "$TMPDIR"
 export TMPDIR
-ORACLE="$SCRIPTS_DIR/assert-changelog-covers-release.sh"
+ORACLE="${2:-$SCRIPTS_DIR/assert-changelog-covers-release.sh}"
 SECTION="$SCRIPTS_DIR/changelog-section.sh"
 
 for s in "$ORACLE" "$SECTION"; do
@@ -303,7 +304,106 @@ oracle_prev() {
 # oracle_run <ref> <version> — run with derived PREV; echoes rc into $? via caller
 oracle_run() { ( cd "$REPO" && bash "$ORACLE" "$1" "" "$2" >/dev/null 2>&1 ); }
 
+# Identity extraction uses the real oracle, git history and the offline gh stub.
+identity_fixture() {
+  git_c init -q
+  git_c config user.email t@example.com
+  git_c config user.name test
+  git_c symbolic-ref HEAD refs/heads/main
+  put api/base.go <<<'package main'
+  chart 0.1.0
+  put CHANGELOG.md <<<'## [0.1.0]
+- Initial'
+  commit "chore(release): v0.1.0"
+  git_c tag v0.1.0
+}
+
+identity_case() { # label subject body expected-rc expected-refs [escape]
+  local label="$1" subject="$2" body="$3" expected="$4" refs="$5" escape="${6:-}"
+  local short citation out rc diagnostic
+  git_c reset -q --hard v0.1.0
+  put api/change.go <<<'package main // change'
+  if [ "$escape" = touched ]; then put CHANGELOG.md <<<'## [0.1.0]
+- Changed'; fi
+  commit "$subject
+
+$body"
+  short="$(git_c rev-parse --short HEAD)"
+  citation="#1317"
+  [ "$escape" != sha ] || citation="$short"
+  put CHANGELOG.md <<<"## [0.2.0]
+- Released ($citation)
+
+## [0.1.0]
+- Initial"
+  chart 0.2.0
+  commit "chore(release): v0.2.0"
+  out="$(cd "$REPO" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; rc=$?
+  assert_eq "$label exit" "$expected" "$rc"
+  if [ "$expected" = 1 ]; then
+    if [ -z "$refs" ]; then
+      diagnostic="        changed api/change.go but cites no issue number; cite #<issue> or the short SHA $short in the section"
+    else
+      diagnostic="        changed api/change.go; neither $refs nor the short SHA $short appears in the section"
+    fi
+    assert_eq "$label diagnostic" "$diagnostic" "$(printf '%s\n' "$out" | sed -n '/^        changed /p')"
+    assert_contains "$label failure header" "FAIL: merges not accounted for in the [0.2.0] section:" "$out"
+    assert_contains "$label commit identity" "  $short  $subject" "$out"
+  fi
+}
+
+identity_regressions() {
+  local REPO
+  REPO="$(mktemp -d)"
+  identity_fixture
+  identity_case "unrelated issue prose" "Ship (#902)" "Unrelated issue #1317" 1 "#902"
+  identity_case "unrelated issue prose without subject refs" "Ship" "Unrelated issue #1317" 1 ""
+  identity_case "see prose without subject refs" "Ship" "See #1317" 1 ""
+  local subject body keyword
+  for body in "other/repo#1317" "Closes other/repo#1317" "Fixes test/uzi#1317" "agent/issue-1317" \
+    "See api/1317/change.go" "See 2026/1317/11" "See https://example.com/issues/1317" \
+    "* Prior change (#1317)" "encloses #1317" "prefixes #1317" "unresolved #1317" \
+    "Fixes#1317" "ClosesSuffix #1317" "xFixes #1317" "Fixes #1317suffix" "Closes #1317x" "Resolved #1317suffix"; do
+    identity_case "body rejected: $body" "Ship" "$body" 1 ""
+  done
+  for subject in "Ship api/1317/change.go" "Ship 2026/1317/11" \
+    "Ship https://example.com/issues/1317" "Ship issue-1317suffix" \
+    "Ship PRD 1317suffix" "Ship #1317suffix" "Ship tissue-1317" "Ship xPRD 1317"; do
+    identity_case "subject rejected: $subject" "$subject" "" 1 ""
+  done
+  identity_case "zero refs" "Ship" "" 1 ""
+  for subject in "Ship (#1317)" "Ship #1317" "Ship issue 1317" "Ship ISSUE-1317" \
+    "Ship PRD 1317" "Ship pRd #1317" "Merge agent/issue-1317" \
+    "Ship https://example.com/issue-1317" "Ship api/PRD 1317/file" \
+    "Ship https://example.com/page#1317" "Ship api/file#1317" \
+    "Ship #902,#1317" "Ship #902#1317" "Ship issue-902;issue-1317" "Ship PRD 902,PRD #1317"; do
+    identity_case "subject accepted: $subject" "$subject" "" 0 ""
+  done
+  for keyword in close cLoSeS CLOSED fix FiXeS FIXED resolve ReSoLvEs RESOLVED; do
+    identity_case "body keyword: $keyword" "Ship" "$keyword #1317" 0 ""
+  done
+  identity_case "body newline whitespace" "Ship" $'Fixes\n#1317' 0 ""
+  identity_case "adjacent body references" "Ship" "Fixes #902;Closes #1317" 0 ""
+  identity_case "space adjacent body references" "Ship" "Fixes #902 fixes #1317" 0 ""
+  identity_case "squash subcommit subjects" "Ship (#902)" $'* First change (#1317)\n* Second change (#1318)' 1 "#902"
+  identity_case "union and dedup diagnostic" "Ship #902,issue-903,#902" "Fixes #904;Closes #903" 1 "#902, #903, #904"
+  identity_case "SHA without refs" "Ship" "" 0 "" sha
+  identity_case "SHA with wrong refs" "Ship (#902)" "Fixes #903" 0 "" sha
+  identity_case "Changelog none body" "Ship" "Changelog: none" 0 ""
+  identity_case "Changelog none subject" "Changelog: none" "" 0 ""
+  identity_case "CHANGELOG touched" "Ship" "" 0 "" touched
+  rm -rf "$REPO"
+}
+
+if [ "${1:-}" = "--identity-only" ]; then
+  identity_regressions
+  echo "=== release-scripts-test: $PASSES passed, $FAILS failed ==="
+  [ "$FAILS" -eq 0 ]
+  exit $?
+fi
+
 if [ "${1:-}" != "--shipping-paths-only" ]; then
+identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
 
