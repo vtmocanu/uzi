@@ -557,7 +557,7 @@ describe("FINAL inventory of a kept canonical source", () => {
     assert.deepEqual(other.foreignOwners, ["run-inv"]);
   });
 
-  it("a missing kept clone makes its own run's inventory unknown, as a journaled missing path does", async () => {
+  it("a missing kept clone makes its own run's inventory unknown, until discard, which is stricter than a plain own-run journal", async () => {
     const c = await markedCanonical("run-inv", 2801, 3);
     fs.rmSync(c.path, { recursive: true, force: true });
     const own = await git.readInventoryCloneHeads(bare, "run-inv");
@@ -1391,6 +1391,133 @@ describe("protected-source disposition", () => {
 });
 
 // ─── review rework of M0a ──────────────────────────────────────────────────────────────────
+
+describe("a canonical source left under its plain journal (no marker)", () => {
+  const lone = async (runId: string, iid: number) => {
+    const c = await seedCanonical(runId, iid);
+    fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
+    const skills = path.join(path.dirname(c.path), `.uzi-skills-${path.basename(c.path)}`);
+    fs.mkdirSync(skills, { recursive: true });
+    fs.writeFileSync(path.join(skills, "plugin.json"), "{}");
+    const sel: RetainedSourceSelector = { runId, generation: "none", attempt: "canonical" };
+    return { ...c, skills, sel };
+  };
+
+  it("is listed by the aggregate and selector views, and a terminal leftover with no hold is discardable; the key then seeds fresh", async () => {
+    const c = await lone("run-t", 2900);
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    const listed = all.sources.filter((s) => s.runId === "run-t");
+    assert.equal(listed.length, 1);
+    assert.deepEqual([listed[0]!.kind, listed[0]!.markerState, listed[0]!.journalState, listed[0]!.disposition],
+      ["canonical", "none", "plain", undefined]);
+    const ev = await inspectOne(c.sel);
+    assert.deepEqual(ev.holds, { state: "read", ids: [] });
+    assert.deepEqual(ev.localRecords, []);
+    assert.ok(ev.consumers.includes("run_state:not_known_locally"), ev.consumers.join());
+    assert.equal(ev.consumers.some((x) => x.startsWith("blocker:")), false);
+    assert.equal(ev.descriptor, listed[0]!.descriptor);
+    assert.deepEqual(ev.disposition, { kind: "local_discard" });
+    const result = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor));
+    assert.deepEqual(result, { kind: "done", sources: [{ clonePath: c.path, outcome: "removed" }], metadata: "retired" });
+    assert.equal(fs.existsSync(c.path), false);
+    assert.equal(fs.existsSync(c.skills), false);
+    assert.equal(journalRaw(c.branch), "", "the journal that named it is cleared");
+    assert.equal((await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive })).sources.length, 0);
+    const reseed = await git.createOrAttachRunnerClone(bare, 2900, noProofReseed, "run-next");
+    assert.ok(fs.existsSync(reseed.path), "a later canonical seed succeeds fresh");
+    assert.equal(fs.existsSync(path.join(reseed.path, "dirty.txt")), false);
+  });
+
+  it("an actively parked source (open hold of the run) is the owner's to discard and a discard deletes nothing", async () => {
+    const c = await lone("run-p", 2901);
+    const hold: RetainedHoldsSnapshot = { state: "read", holds: [{ id: "hold-5", generation: 1 }] };
+    const ev = await inspectOne(c.sel, hold);
+    assert.deepEqual(ev.disposition, { kind: "owner_hold_discard", holdIds: ["hold-5"] });
+    const journal = journalRaw(c.branch);
+    const refused = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, { holds: hold }));
+    assert.deepEqual([refused.kind, refused.kind === "refused" && refused.disposition?.kind], ["refused", "owner_hold_discard"]);
+    assert.ok(fs.existsSync(c.path) && fs.existsSync(c.skills));
+    assert.equal(journalRaw(c.branch), journal);
+    for (const holds of [{ state: "unknown" } as RetainedHoldsSnapshot]) {
+      assert.equal((await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, { holds }))).kind, "refused");
+    }
+    assert.ok(fs.existsSync(c.path));
+  });
+
+  it("a local recovery record is resolve_local_record and refuses; terminal protection is named too", async () => {
+    const c = await lone("run-l", 2902);
+    fs.mkdirSync(path.join(fx.dataDir, "recovery", "run-l"), { recursive: true });
+    fs.writeFileSync(path.join(fx.dataDir, "recovery", "run-l", "capture-1.json"), JSON.stringify({ generation: 1 }));
+    const ev = await inspectOne(c.sel);
+    assert.equal(ev.disposition?.kind, "resolve_local_record");
+    assert.deepEqual(ev.localRecords.map((r) => [r.kind, r.name]), [["recovery", "capture-1.json"]]);
+    assert.equal((await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor))).kind, "refused");
+    assert.ok(fs.existsSync(c.path));
+    assert.notEqual(journalRaw(c.branch), "");
+    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ terminalRecordProtection: async () => true }));
+    fs.rmSync(path.join(fx.dataDir, "recovery", "run-l"), { recursive: true });
+    const terminal = await inspectOne(c.sel);
+    assert.equal(terminal.disposition?.kind, "resolve_local_record");
+    assert.deepEqual(terminal.localRecords.map((r) => r.kind), ["terminal"]);
+  });
+
+  it("a live flight's clone refuses", async () => {
+    const c = await lone("run-v", 2903);
+    const ev = await inspectOne(c.sel);
+    const live = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, { isLivePath: (p: string) => p === c.path }));
+    assert.deepEqual([live.kind, live.kind === "refused" && live.consumers.some((x) => x.startsWith("live:"))], ["refused", true]);
+    assert.ok(fs.existsSync(c.path));
+    assert.equal((await inspectOne(c.sel, NO_HOLDS, (p) => p === c.path)).disposition?.kind, "refused");
+  });
+
+  it("a journal that changed between inspect and discard is descriptor_changed", async () => {
+    const c = await lone("run-d", 2904);
+    const ev = await inspectOne(c.sel);
+    const changed = JSON.stringify({ clonePath: c.path, runId: "run-d" });
+    assert.notEqual(changed, journalRaw(c.branch));
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, changed]);
+    const r = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor));
+    assert.deepEqual([r.kind, r.kind === "refused" && r.reason], ["refused", "descriptor_changed"]);
+    assert.ok(fs.existsSync(c.path));
+  });
+
+  it("a discard never clears a journal that no longer names that source", async () => {
+    const c = await lone("run-s", 2905);
+    const ev = await inspectOne(c.sel);
+    const successor = JSON.stringify({ runId: "run-next", clonePath: `${c.path}.attempt-${attemptIdAt(9, 3)}`, attemptId: attemptIdAt(9, 3) });
+    const r = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, {
+      quiesce: async () => {
+        gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, successor]);
+        return true;
+      },
+    }));
+    assert.equal(r.kind, "done");
+    assert.equal(fs.existsSync(c.path), false);
+    assert.equal(journalRaw(c.branch), successor, "the successor's journal is untouched");
+  });
+
+  it("a marker that names the path (valid or malformed text) keeps it out of this view", async () => {
+    const c = await lone("run-m", 2906);
+    gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-other.entry", `not json ${c.path}`]);
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    assert.equal(all.sources.filter((s) => s.runId === "run-m").length, 0);
+    assert.equal((await git.inspectRetainedSources({ selector: c.sel, holds: NO_HOLDS, isLivePath: notLive, barePath: bare })).sources.length, 0);
+  });
+});
+
+describe("a read-only status of a kept clone", () => {
+  it("worktreeStatus leaves the clone's .git/index bytes unchanged when a tracked file's mtime moved", async () => {
+    const c = await seedCanonical("run-idx", 2950);
+    const file = gitIn(c.path, ["ls-files"]).split("\n")[0]!;
+    // Make the index stat cache stale: the file's mtime moves, its content does not.
+    const when = new Date(Date.now() + 5000);
+    fs.utimesSync(path.join(c.path, file), when, when);
+    const idx = path.join(c.path, ".git", "index");
+    const before = fs.readFileSync(idx);
+    assert.deepEqual(await git.worktreeStatus(c.path), []);
+    assert.ok(before.equals(fs.readFileSync(idx)), "git did not refresh the kept clone's index");
+  });
+});
 
 describe("rework: local custody, holds and stale markers", () => {
   const recordFile = (root: string, runId: string, name: string, body: object): void => {

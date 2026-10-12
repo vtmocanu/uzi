@@ -862,6 +862,8 @@ const SHA40_RE = /^[0-9a-f]{40}$/;
 /** Env that stops replace refs from bending reachability or tree reads in the stopped-source proof. */
 const NO_REPLACE_ENV: NodeJS.ProcessEnv = { GIT_NO_REPLACE_OBJECTS: "1" };
 const NO_REPLACE = { env: NO_REPLACE_ENV };
+/** Read-only `status` of a kept clone: GIT_OPTIONAL_LOCKS=0 stops git rewriting the clone's .git/index stat cache. */
+const READ_ONLY_STATUS = { env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" } as NodeJS.ProcessEnv };
 /** Bounds for the stopped-source ref proof: shas per rev-list argv, and refs beyond which coverage is not claimed. */
 const LOCAL_REF_REVLIST_CHUNK = 500;
 const MAX_LOCAL_REF_SHAS = 20000;
@@ -6158,7 +6160,7 @@ export class GitCache {
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], NO_REPLACE);
+      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], READ_ONLY_STATUS);
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], NO_REPLACE);
       for (const entry of flags.split("\0")) {
@@ -6347,6 +6349,32 @@ export class GitCache {
       });
     }
 
+    // Canonical sources left under their PLAIN journal with no marker (a park or terminal exit that
+    // kept the clone, retainStoppedSource with record "none"). They need the same explicit reclaim
+    // path as a marked source. Evidence is conservative: any marker that could name the path (valid,
+    // malformed by raw text, or any overflowing run) keeps the record out of this view, and a path
+    // that a protected record owns is that record's.
+    const markerTexts = [...markers.valid.map((x) => x.raw), ...markers.malformed.map((x) => x.raw)];
+    for (const [branch, a] of active) {
+      const j = a.journal;
+      if (!j || j.attemptId !== undefined || j.recovery || j.retainedSources?.length) continue;
+      if (markers.overflow.size > 0 || owned.has(j.clonePath)) continue;
+      const key = path.basename(j.clonePath);
+      if (!/^[A-Za-z0-9_-]+$/.test(key)) continue;
+      const shape = this.clonePathShape(j.clonePath, this.runnerClonePath(barePath, key));
+      if (!shape || shape.attemptId !== undefined) continue;
+      const escaped = JSON.stringify(j.clonePath).slice(1, -1);
+      if (markers.valid.some((x) => x.marker.clonePath === j.clonePath) ||
+          markerTexts.some((t) => t.includes(j.clonePath) || t.includes(escaped))) continue;
+      const p = await part(j.clonePath, undefined, null);
+      records.push({
+        kind: "canonical", runId: j.runId, branch, key, parts: [p], journal: j, activeRaw: a.raw,
+        descriptorRaw: undefined, descriptorSnapshot: undefined, journalState: "plain", markerState: "none",
+        markerRaw: undefined, ledgerRaw: undefined, problems: runProblems(j.runId), namers,
+        digest: sha256Hex(["retained-source-v1", "canonical-plain", a.raw, p.devIno].join("\n")),
+      });
+    }
+
     // Attempt sources: the ledger's last value per attempt id, not owned by a protected record.
     for (const e of ledger.values()) {
       if (e.state === "retired" || owned.has(e.clonePath)) continue;
@@ -6494,11 +6522,18 @@ export class GitCache {
         }
       }
     } else if (rec.kind === "canonical") {
-      consumers.push(`marker:${rec.markerState}`);
-      if (rec.markerState !== "bound" && rec.markerState !== "detached") blockers.push(`marker_${rec.markerState}`);
-      // Only an active journal that names this source can be wrong about it; a successor's journal
-      // elsewhere on the branch is not this source's journal.
-      if (rec.journalState !== "none" && rec.journalState !== "plain") blockers.push("journal_not_plain");
+      if (rec.markerState === "none") {
+        // A canonical source left under its plain journal: no marker, and the journal is plain by
+        // construction. The worker cannot know whether the run is still parked; the server hold
+        // read decides that (an open hold is the owner's to discard).
+        consumers.push("run_state:not_known_locally");
+      } else {
+        consumers.push(`marker:${rec.markerState}`);
+        if (rec.markerState !== "bound" && rec.markerState !== "detached") blockers.push(`marker_${rec.markerState}`);
+        // Only an active journal that names this source can be wrong about it; a successor's journal
+        // elsewhere on the branch is not this source's journal.
+        if (rec.journalState !== "none" && rec.journalState !== "plain") blockers.push("journal_not_plain");
+      }
       try {
         if ((await this.classifyOwnerClonePath(g.barePath, rec.branch, rec.key, rec.runId, rec.parts[0]!.clonePath)) !== "canonical") {
           blockers.push("attribution_unknown");
@@ -6868,6 +6903,21 @@ export class GitCache {
               // raw is unchanged; a detached marker never touches a successor's journal.
               if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
                 await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+              } else if (rec.markerState === "none") {
+                // A plain-journal source: clear the journal only while its raw is unchanged AND it
+                // still names exactly this (runId, clonePath) plain canonical source.
+                const raw = await this.readRecoveryCaptureRaw(bare, rec.branch);
+                if (raw !== undefined && raw === rec.activeRaw) {
+                  let still = false;
+                  try {
+                    const j = parseRecoveryJournal(raw);
+                    still = j.attemptId === undefined && !j.recovery && !j.retainedSources?.length &&
+                      sameRecoverySource(j, { runId: rec.runId, clonePath: rec.parts[0]!.clonePath });
+                  } catch {
+                    still = false;
+                  }
+                  if (still) await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+                }
               }
             }
             for (const p of rec.parts) {
@@ -6876,7 +6926,7 @@ export class GitCache {
                   { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
               }
             }
-            if (rec.kind === "canonical") {
+            if (rec.kind === "canonical" && rec.markerState !== "none") {
               const target = rec.parts[0]!.clonePath;
               // The exact marker value, or one whose PARSED path is exactly this source's; a malformed
               // value is never matched by text (a path that is a prefix of another is not a match).
@@ -6998,8 +7048,9 @@ export class GitCache {
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
         // issue #1786: a kept canonical clone is attributed by its stopped marker once the journal is
-        // cleared, so a valid marker of this run names its path exactly as the plain journal did
-        // (a missing path is the same physical failure as a journaled missing one).
+        // cleared, so a valid marker of this run names its path as the plain journal did. A marker's
+        // path joins ownRetainedPaths, so a missing marker-kept clone makes the run's inventory
+        // unknown until discard: stricter than a plain own-run journal, whose missing path is skipped.
         for (const { marker } of (await atFailure("git_or_filesystem_error", () => this.readStoppedMarkers(barePath, entries))).valid) {
           if (marker.runId !== runId) { foreignOwners.add(marker.runId); continue; }
           ownRetainedPaths.add(marker.clonePath);
@@ -9062,7 +9113,9 @@ export class GitCache {
    */
   async worktreeStatus(cwd: string): Promise<string[] | null> {
     try {
-      const out = await this.runGitAsRunner(cwd, ["status", "--porcelain"]);
+      // GIT_OPTIONAL_LOCKS=0: the inventory boundary reads a kept clone, and a plain status would
+      // refresh (rewrite) its .git/index stat cache.
+      const out = await this.runGitAsRunner(cwd, ["status", "--porcelain"], { env: { GIT_OPTIONAL_LOCKS: "0" } });
       return out.split("\n").filter((l) => l.length > 0);
     } catch (err) {
       this.log.debug("fingerprint git status failed (→ null, cannot assert unchanged)", {

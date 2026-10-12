@@ -549,7 +549,7 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     assertRecoverable(r.clone(), late!, "row 8 transient");
   });
 
-  it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is not", async () => {
+  it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is listed too and, with no hold, is discardable", async () => {
     const attempt = transientRig(17928, { dockerHost: true });
     const canonical = transientRig(17929);
     const hook = afterVerifiedCapture((wt) => { writeLateChange(wt); });
@@ -570,9 +570,26 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     const ours = result.sources.filter((s) => s.runId === attempt.claim.run_id);
     assert.equal(ours.length, 1, "the attempt park clone is listed via its ledger entry");
     assert.equal(ours[0]!.presence, "present");
-    assert.equal(result.sources.filter((s) => s.runId === canonical.claim.run_id).length, 0,
-      "a canonical clone kept under its plain journal is not listed and cannot be discarded through the channel");
+    const kept = result.sources.filter((s) => s.runId === canonical.claim.run_id);
+    assert.equal(kept.length, 1, "a canonical clone kept under its plain journal is listed");
+    assert.deepEqual([kept[0]!.kind, kept[0]!.markerState, kept[0]!.journalState], ["canonical", "none", "plain"]);
     assert.equal(journalCount(17929), 1, "its plain journal stays for the same run's resume");
+    const sel = { runId: canonical.claim.run_id, generation: "none" as const, attempt: "canonical" };
+    const open = { state: "read" as const, holds: [{ id: "hold-1", generation: 1 }] };
+    const view = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false, selector: sel, holds: open });
+    assert.deepEqual(view.sources[0]!.disposition, { kind: "owner_hold_discard", holdIds: ["hold-1"] }, "an open hold is the owner's to discard");
+    const none = { state: "read" as const, holds: [] };
+    const idle = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false, selector: sel, holds: none });
+    assert.deepEqual(idle.sources[0]!.disposition, { kind: "local_discard" });
+    const refused = await git.discardStoppedSource({ selector: sel, confirm: idle.sources[0]!.descriptor, holds: open, isLivePath: () => false,
+      quiesce: async () => true, barePath: bareOf() });
+    assert.equal(refused.kind, "refused");
+    assert.ok(fs.existsSync(canonical.clone()), "an open hold deletes nothing");
+    const done = await git.discardStoppedSource({ selector: sel, confirm: idle.sources[0]!.descriptor, holds: none, isLivePath: () => false,
+      quiesce: async () => true, barePath: bareOf() });
+    assert.equal(done.kind, "done");
+    assert.equal(fs.existsSync(canonical.clone()), false);
+    assert.equal(journalCount(17929), 0, "the journal that named it is cleared with it");
   });
 
   it("a retained attempt clone whose emptyDir path is later deleted is reported missing by inspect, never empty", async () => {

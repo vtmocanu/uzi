@@ -910,6 +910,44 @@ describe("protected-source discard through the real socket channel", () => {
   });
 });
 
+describe("a canonical source left under its plain journal, through the real socket channel", () => {
+  const plainCanonical = async (runId: string, iid: number) => {
+    const branch = `agent/issue-${iid}`;
+    const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, runId);
+    await git.markRecoveryCapture(bare, clone.path, branch, runId);
+    fs.writeFileSync(path.join(clone.path, "unpreserved.txt"), "kept bytes\n");
+    return { branch, runId, path: clone.path };
+  };
+
+  it("with no server hold it is listed and discarded; the plain journal goes with it", async () => {
+    const c = await plainCanonical("run-plain", 2810);
+    const rig = await rigOf();
+    const ev = await inspectOne(rig, { runId: c.runId }, "none");
+    assert.deepEqual([ev.kind, ev.markerState, ev.journalState], ["canonical", "none", "plain"]);
+    assert.equal(ev.disposition.kind, "local_discard");
+    assert.ok(ev.consumers.includes("run_state:not_known_locally"));
+    const r = await send(rig.sock, { op: "discard", run: c.runId, generation: "none", attempt: "canonical", confirm: ev.descriptor });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.result.kind, "done");
+    assert.equal(fs.existsSync(c.path), false);
+    assert.equal(journalRaw(c.branch), "");
+    assert.equal(rig.gate.claimsClosed(), false);
+  });
+
+  it("an open server hold means the run is still parked: the discard refuses and deletes nothing", async () => {
+    const c = await plainCanonical("run-parked", 2811);
+    const rig = await rigOf({ holds: (runId) => ({ run_id: runId, holds: [{ hold_id: "hold-parked", generation: 1 } as never] }) });
+    const ev = await inspectOne(rig, { runId: c.runId }, "none");
+    assert.deepEqual(ev.disposition, { kind: "owner_hold_discard", holdIds: ["hold-parked"] });
+    const journal = journalRaw(c.branch);
+    const r = await send(rig.sock, { op: "discard", run: c.runId, generation: "none", attempt: "canonical", confirm: ev.descriptor });
+    assert.equal(r.ok, false);
+    assert.equal(r.result.kind, "refused");
+    assert.ok(fs.existsSync(c.path));
+    assert.equal(journalRaw(c.branch), journal);
+  });
+});
+
 // ─── socket setup, limits and the wire ───────────────────────────────────────────────────────
 
 describe("the socket and its directory", () => {
